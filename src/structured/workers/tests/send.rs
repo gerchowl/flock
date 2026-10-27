@@ -287,3 +287,5 @@ fn narrow(p: AgentSendParams) -> crate::app::StructuredSendParams {
 }
 
 mod local_messages;
+
+mod shell_panes;

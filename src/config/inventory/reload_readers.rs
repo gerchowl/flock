@@ -20,15 +20,125 @@ fn test_only(attrs: &[syn::Attribute]) -> bool {
     })
 }
 
-fn production_items(path: &Path, output: &mut Vec<syn::Item>) {
-    fn collect(items: Vec<syn::Item>, base: &Path, output: &mut Vec<syn::Item>) {
+/// Resolve only proven config paths/imports, retaining each module's scope.
+/// Other type aliases/re-exports need explicit audit support, not suffix matching.
+fn config_type_names(items: &[syn::Item], parent: &BTreeSet<String>) -> BTreeSet<String> {
+    fn imports(tree: &syn::UseTree, prefix: &str, out: &mut Vec<(String, String)>) {
+        match tree {
+            syn::UseTree::Path(p) => imports(&p.tree, &format!("{prefix}{}::", p.ident), out),
+            syn::UseTree::Group(g) => {
+                for tree in &g.items {
+                    imports(tree, prefix, out);
+                }
+            }
+            syn::UseTree::Name(n) => {
+                let path = if n.ident == "self" {
+                    prefix.trim_end_matches("::").to_string()
+                } else {
+                    format!("{prefix}{}", n.ident)
+                };
+                let name = path.rsplit("::").next().unwrap().to_string();
+                out.push((path, name));
+            }
+            syn::UseTree::Rename(r) => {
+                let path = if r.ident == "self" {
+                    prefix.trim_end_matches("::").to_string()
+                } else {
+                    format!("{prefix}{}", r.ident)
+                };
+                out.push((path, r.rename.to_string()));
+            }
+            syn::UseTree::Glob(_) => out.push((format!("{prefix}*"), "*".into())),
+        }
+    }
+    let canonical = BTreeSet::from([
+        "crate::config::Config".to_string(),
+        "crate::config::model::Config".to_string(),
+    ]);
+    let mut names = canonical.clone();
+    let mut uses = Vec::new();
+    for item in items {
+        if let syn::Item::Use(item) = item {
+            imports(&item.tree, "", &mut uses);
+        }
+    }
+    for (path, binding) in &uses {
+        let (path, candidates) = if let Some(path) = path.strip_prefix("super::") {
+            (path, parent)
+        } else {
+            (path.as_str(), &canonical)
+        };
+        let prefix = path.trim_end_matches('*').trim_end_matches("::");
+        for real in candidates {
+            if binding == "*" {
+                if prefix.is_empty() {
+                    names.insert(real.clone());
+                } else if let Some(tail) = real.strip_prefix(&format!("{prefix}::")) {
+                    names.insert(tail.into());
+                }
+            } else if real == path {
+                names.insert(binding.clone());
+            } else if let Some(tail) = real.strip_prefix(&format!("{path}::")) {
+                names.insert(format!("{binding}::{tail}"));
+            }
+        }
+    }
+    // Explicit names shadow glob imports, including an unrelated Config.
+    for item in items {
+        let local = match item {
+            syn::Item::Struct(i) => Some(&i.ident),
+            syn::Item::Enum(i) => Some(&i.ident),
+            syn::Item::Type(i) => Some(&i.ident),
+            syn::Item::Union(i) => Some(&i.ident),
+            _ => None,
+        };
+        if let Some(local) = local {
+            let local = local.to_string();
+            names.retain(|p| p.split("::").next().unwrap() != local);
+        }
+    }
+    for (path, binding) in uses {
+        if binding != "*"
+            && !canonical
+                .iter()
+                .any(|p| p == &path || p.starts_with(&format!("{path}::")))
+            && !path.strip_prefix("super::").is_some_and(|p| {
+                parent
+                    .iter()
+                    .any(|real| real == p || real.starts_with(&format!("{p}::")))
+            })
+        {
+            names.retain(|p| p.split("::").next().unwrap() != binding);
+        }
+    }
+    names
+}
+
+struct SourceItem {
+    item: syn::Item,
+    config_types: BTreeSet<String>,
+}
+
+fn production_items(path: &Path, parent: &BTreeSet<String>, output: &mut Vec<SourceItem>) {
+    fn collect(
+        items: Vec<syn::Item>,
+        base: &Path,
+        parent: &BTreeSet<String>,
+        output: &mut Vec<SourceItem>,
+    ) {
+        let config_types = config_type_names(&items, parent);
         for item in items {
             if let syn::Item::Mod(module) = item {
                 if test_only(&module.attrs) {
                     continue;
                 }
                 if let Some((_, items)) = module.content {
-                    collect(items, &base.join(module.ident.to_string()), output);
+                    collect(
+                        items,
+                        &base.join(module.ident.to_string()),
+                        &config_types,
+                        output,
+                    );
                 } else {
                     let explicit = module.attrs.iter().find_map(|a| {
                         if let syn::Meta::NameValue(value) = &a.meta {
@@ -52,10 +162,13 @@ fn production_items(path: &Path, output: &mut Vec<syn::Item>) {
                             base.join(module.ident.to_string()).join("mod.rs")
                         }
                     });
-                    production_items(&path, output);
+                    production_items(&path, &config_types, output);
                 }
             } else {
-                output.push(item);
+                output.push(SourceItem {
+                    item,
+                    config_types: config_types.clone(),
+                });
             }
         }
     }
@@ -66,7 +179,7 @@ fn production_items(path: &Path, output: &mut Vec<syn::Item>) {
     } else {
         path.with_extension("")
     };
-    collect(items, &base, output);
+    collect(items, &base, parent, output);
 }
 
 fn derived_clone_models(items: &[syn::Item]) -> BTreeSet<String> {
@@ -113,6 +226,7 @@ fn helper_lookup_accepts_lifetimes_without_weakening_declared_types() {
 
 struct Readers<'a> {
     aliases: BTreeMap<String, String>,
+    config_types: &'a BTreeSet<String>,
     fields: &'a BTreeSet<String>,
     derived_clones: &'a BTreeSet<String>,
     models: &'a BTreeMap<String, String>,
@@ -143,8 +257,25 @@ impl Readers<'_> {
                 continue;
             };
             if path.qself.is_none()
-                && path.path.segments.last().is_some_and(|s| {
-                    s.ident == "Config" && matches!(s.arguments, syn::PathArguments::None)
+                && path
+                    .path
+                    .segments
+                    .iter()
+                    .all(|s| matches!(s.arguments, syn::PathArguments::None))
+                && self.config_types.contains(
+                    &path
+                        .path
+                        .segments
+                        .iter()
+                        .map(|s| s.ident.to_string())
+                        .collect::<Vec<_>>()
+                        .join("::"),
+                )
+                && !signature.generics.type_params().any(|param| {
+                    path.path
+                        .segments
+                        .first()
+                        .is_some_and(|s| s.ident == param.ident)
                 })
             {
                 self.aliases
@@ -181,6 +312,14 @@ impl Readers<'_> {
                         .unwrap_or(path),
                 )
             }
+            syn::Expr::MethodCall(call) if call.method == "clone" && call.args.is_empty() => {
+                let path = self.path(&call.receiver)?;
+                let section = path.strip_prefix("@config.")?;
+                self.models
+                    .get(section)
+                    .filter(|model| self.derived_clones.contains(*model))
+                    .map(|_| path)
+            }
             syn::Expr::Call(call)
                 if field_path(&call.func).is_some_and(|p| p.ends_with("Config::load")) =>
             {
@@ -216,12 +355,14 @@ impl<'ast> Visit<'ast> for Readers<'_> {
     }
 
     fn visit_local(&mut self, local: &'ast syn::Local) {
+        syn::visit::visit_local(self, local);
         if let (syn::Pat::Ident(name), Some(init)) = (&local.pat, &local.init) {
             if let Some(path) = self.path(&init.expr) {
                 self.aliases.insert(name.ident.to_string(), path);
+            } else {
+                self.aliases.remove(&name.ident.to_string());
             }
         }
-        syn::visit::visit_local(self, local);
     }
 
     fn visit_expr_assign(&mut self, assign: &'ast syn::ExprAssign) {
@@ -347,10 +488,10 @@ fn assert_msg_spawn_leaf_owners(catalog: &Catalog) {
         .collect();
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut items = Vec::new();
-    production_items(&root.join("app/mod.rs"), &mut items);
-    production_items(&root.join("mcp/mod.rs"), &mut items);
+    production_items(&root.join("app/mod.rs"), &BTreeSet::new(), &mut items);
+    production_items(&root.join("mcp/mod.rs"), &BTreeSet::new(), &mut items);
     let mut helper_items = syn::parse_file(include_str!("../model.rs")).unwrap().items;
-    helper_items.extend(items.clone());
+    helper_items.extend(items.iter().map(|item| item.item.clone()));
     let derived_clones = derived_clone_models(&declarations().into_values().collect::<Vec<_>>());
     let helpers = helper_items
         .iter()
@@ -373,6 +514,7 @@ fn assert_msg_spawn_leaf_owners(catalog: &Catalog) {
         .collect();
     let mut readers = Readers {
         aliases: BTreeMap::new(),
+        config_types: &BTreeSet::new(),
         fields: &fields,
         derived_clones: &derived_clones,
         models: &models,
@@ -385,7 +527,8 @@ fn assert_msg_spawn_leaf_owners(catalog: &Catalog) {
         function: String::new(),
     };
     for item in &items {
-        let functions: Vec<_> = match item {
+        readers.config_types = &item.config_types;
+        let functions: Vec<_> = match &item.item {
             syn::Item::Fn(f) if !test_only(&f.attrs) => vec![(&f.sig, &*f.block)],
             syn::Item::Impl(i) if !test_only(&i.attrs) => i
                 .items
@@ -463,8 +606,11 @@ fn constructor_evidence(source: &str) -> (BTreeSet<String>, BTreeSet<String>, us
         "#[derive(Clone)] struct MsgConfig { channel_push: bool }",
     )
     .unwrap()]);
+    let file = syn::parse_file(source).unwrap();
+    let config_types = config_type_names(&file.items, &BTreeSet::new());
     let mut readers = Readers {
         aliases: BTreeMap::new(),
+        config_types: &config_types,
         fields: &fields,
         derived_clones: &derived_clones,
         models: &models,
@@ -476,8 +622,11 @@ fn constructor_evidence(source: &str) -> (BTreeSet<String>, BTreeSet<String>, us
         command_context: false,
         function: String::new(),
     };
-    let function: syn::ItemFn = syn::parse_str(source).unwrap();
-    readers.function(&function.sig, &function.block);
+    for item in &file.items {
+        if let syn::Item::Fn(function) = item {
+            readers.function(&function.sig, &function.block);
+        }
+    }
     (readers.live, readers.command, readers.startup_loads)
 }
 
@@ -529,9 +678,98 @@ fn constructor_evidence_rejects_relocated_command_loads() {
 #[test]
 fn constructor_evidence_does_not_count_derived_section_copies_as_consumers() {
     let (live, command, loads) =
-        constructor_evidence("fn copy_config(config: &Config) { let copy = config.msg.clone(); }");
+        constructor_evidence("use crate::config::Config; fn copy_config(config: &Config) { let copy = config.msg.clone(); }");
     assert!(live.is_empty() && command.is_empty());
     assert_eq!(loads, 0);
+}
+
+#[test]
+fn cloned_live_sections_preserve_leaf_read_evidence() {
+    for source in [
+        "fn compare(config: &crate::config::Config) {
+            let snap = (config.msg.clone());
+            let alias = &snap;
+            let read = alias.channel_push;
+        }",
+        "fn compare(&self) {
+            let snap = self.state.config.msg.clone();
+            let read = snap.channel_push;
+        }",
+    ] {
+        let (live, command, loads) = constructor_evidence(source);
+        assert_eq!(
+            live,
+            BTreeSet::from(["msg.channel_push".into()]),
+            "{source}"
+        );
+        assert!(command.is_empty());
+        assert_eq!(loads, 0);
+    }
+}
+
+#[test]
+fn unrelated_qualified_config_is_not_live_evidence() {
+    let (live, command, _) = constructor_evidence(
+        "fn compare(config: &unrelated::Config) { let read = config.msg.channel_push; }",
+    );
+    assert!(
+        live.is_empty(),
+        "an unrelated Config must not supply evidence"
+    );
+    assert!(command.is_empty());
+}
+
+#[test]
+fn config_parameters_require_proven_module_imports() {
+    for (imports, ty) in [
+        ("use crate::config::Config;", "Config"),
+        ("use crate::config::{Config as Live};", "Live"),
+        ("use crate::config as settings;", "settings::Config"),
+        ("use crate::config::{self as settings};", "settings::Config"),
+        ("use crate::config::*;", "Config"),
+        ("", "crate::config::model::Config"),
+    ] {
+        let (live, _, _) = constructor_evidence(&format!(
+            "{imports} fn compare(config: &{ty}) {{ let read = config.msg.channel_push; }}"
+        ));
+        assert_eq!(
+            live,
+            BTreeSet::from(["msg.channel_push".into()]),
+            "{imports} {ty}"
+        );
+    }
+    for source in [
+        "struct Config; fn compare(config: &Config) { let read = config.msg.channel_push; }",
+        "use unrelated::Config; fn compare(config: &Config) { let read = config.msg.channel_push; }",
+        "use crate::config::Config; fn compare<Config>(config: &Config) { let read = config.msg.channel_push; }",
+    ] {
+        let (live, _, _) = constructor_evidence(source);
+        assert!(live.is_empty(), "{source}");
+    }
+}
+
+#[test]
+fn config_imports_are_scoped_and_explicit_names_shadow_parent_globs() {
+    let names = |source: &str, parent: &BTreeSet<String>| {
+        config_type_names(&syn::parse_file(source).unwrap().items, parent)
+    };
+    let parent = names("use crate::config::Config;", &BTreeSet::new());
+    assert!(parent.contains("Config"));
+    assert!(!names("", &parent).contains("Config"));
+    assert!(names("use super::Config as Live;", &parent).contains("Live"));
+    let parent_module = names("use crate::config as settings;", &BTreeSet::new());
+    assert!(names("use super::settings;", &parent_module).contains("settings::Config"));
+    assert!(names("use super::*;", &parent).contains("Config"));
+    assert!(!names("use super::*; struct Config;", &parent).contains("Config"));
+    assert!(!names("use super::*; use unrelated::Config;", &parent).contains("Config"));
+}
+
+#[test]
+fn restart_reporting_cites_the_reload_decision() {
+    let source = include_str!("../../app/mod.rs");
+    assert!(!source.contains("ADR-0041 decision 4"));
+    assert!(source.contains("ADR-0041 §5: server reload cannot renegotiate MCP sessions."));
+    assert!(source.contains("ADR-0041 §5: these server policies are read at use time."));
 }
 
 #[test]

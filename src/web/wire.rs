@@ -40,8 +40,8 @@ const MAX_MESSAGE: usize = 65_536;
 const CONNECTIONS: u32 = 16;
 /// Pending unauthenticated sockets; leave capacity for authenticated sessions.
 const PENDING_HELLOS: usize = 4;
-/// Registered sockets per verified token principal, including pending welcome.
-const PRINCIPAL_CONNECTIONS: usize = 4;
+/// Registered sockets per authenticated bearer digest, including pending welcome.
+const CREDENTIAL_CONNECTIONS: usize = 4;
 /// Maximum queued control messages per socket.
 const PRIORITY_CAPACITY: usize = 4;
 /// Maximum queued data messages per socket.
@@ -82,7 +82,7 @@ impl Shared {
     fn revoke(&self, session: &Session) {
         if let Ok(clients) = self.clients.lock() {
             for client in clients.values() {
-                if client.session.info.principal == session.info.principal {
+                if client.session.same_credential(session) {
                     let _ = client.revoke.send(true);
                 }
             }
@@ -430,9 +430,9 @@ async fn connection(
     if let Ok(mut clients) = shared.clients.lock() {
         if clients
             .values()
-            .filter(|c| c.session.info.principal == principal)
+            .filter(|c| c.session.same_credential(&session))
             .count()
-            >= PRINCIPAL_CONNECTIONS
+            >= CREDENTIAL_CONNECTIONS
         {
             let _ = socket.send(close(GOING_AWAY_CLOSE)).now_or_never();
             return;

@@ -17,6 +17,8 @@ pub(crate) use api::mesh_routes::Completion as MeshRoutesCompletion;
 pub(crate) use api::responses::encode_error_with_data;
 pub(crate) use api::structured_queue::SendParams as StructuredSendParams;
 pub(crate) use api::LocalOperator;
+mod local_operator;
+pub(crate) use local_operator::LocalPeer;
 pub(crate) mod fleet_pause;
 pub(crate) mod guarded_submit;
 pub(crate) mod hibernation;
@@ -391,6 +393,7 @@ pub struct App {
     pub(crate) suppressed_repeat_keys:
         HashSet<(crossterm::event::KeyCode, crossterm::event::KeyModifiers)>,
     pub(crate) input_writes: input_writes::InputWrites,
+    directory_snapshot: directory::DirectorySnapshot,
     pub(crate) structured_workers: crate::structured::workers::Workers,
     queue_events: queue_events::QueueEvents,
     pub(crate) structured_sends: api::structured_queue::Sends,
@@ -1150,6 +1153,7 @@ impl App {
             input_rx: None,
             last_terminal_size: terminal::size().ok(),
             input_writes: input_writes::InputWrites::default(),
+            directory_snapshot: directory::DirectorySnapshot::default(),
             structured_workers: crate::structured::workers::Workers::new(render_notify.clone()),
             queue_events: queue_events::QueueEvents::default(),
             structured_sends: api::structured_queue::Sends::default(),
@@ -1529,6 +1533,8 @@ impl App {
             if self.handle_scheduled_tasks(now, needs_render) {
                 needs_render = true;
             }
+
+            self.sync_directory_events();
 
             // #361: advertise flock's state to the host terminal. Monolithic
             // mode owns the terminal itself, so the write happens right here.
@@ -1951,7 +1957,7 @@ impl App {
             diagnostics.push("sessions.queue_rewrite_bytes changed: restart required to apply the worker queue policy; keeping current threshold".into());
         }
 
-        // ADR-0041 decision 4: server reload cannot renegotiate MCP sessions.
+        // ADR-0041 §5: server reload cannot renegotiate MCP sessions.
         if !invalid_section("msg")
             && crate::mcp::channel::ChannelOptions::from_config(&config.msg)
                 != crate::mcp::channel::ChannelOptions::from_config(&self.state.config.msg)
@@ -1996,7 +2002,7 @@ impl App {
             self.state.config.channels = config.channels.clone();
             crate::channels::issue_tokens(&config.channels, &short_host_name());
         }
-        // ADR-0041 decision 4: these server policies are read at use time.
+        // ADR-0041 §5: these server policies are read at use time.
         // Existing admissions and process environment snapshots stay intact.
         if !invalid_section("msg") {
             self.state.config.msg = config.msg.clone();

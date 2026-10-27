@@ -1184,6 +1184,7 @@ pub struct AgentRenameParams {
 /// Execution mode; omitted selectors preserve the terminal start contract.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub enum AgentRuntime {
     /// Traditional terminal-backed launch.
     #[default]
@@ -2752,6 +2753,8 @@ pub enum EventMatch {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EventKind {
+    /// ADR-0028 §3: re-read the merged directory after this durable invalidation.
+    DirectoryChanged,
     StructuredGrantRevoked,
     /// ADR-0036 §4: committed queue item transition, linked to its queue cursor.
     QueueItemState,
@@ -2888,7 +2891,8 @@ impl EventKind {
     /// story; every lifecycle + lineage kind persists.
     pub fn is_persisted(self) -> bool {
         match self {
-            Self::StructuredGrantRevoked
+            Self::DirectoryChanged
+            | Self::StructuredGrantRevoked
             | Self::QueueItemState
             | Self::WorkspaceCreated
             | Self::WorkspaceUpdated
@@ -3225,6 +3229,13 @@ pub enum ResponseResult {
         /// status-line sampler (no extra sampling cost).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         system: Option<PeerSystemSummary>,
+        /// Pane-free identities; optional for mixed-version fleets (mesh v5).
+        #[serde(
+            default,
+            skip_serializing_if = "Vec::is_empty",
+            deserialize_with = "crate::api::peer_discovery::deserialize"
+        )]
+        structured_agents: Vec<PeerStructuredAgentSummary>,
         workspaces: Vec<PeerWorkspaceSummary>,
         /// Gossip v3 (#101): the answering server's OWN polled peers, so the
         /// polling hub can render two-hop fleet visibility (hub polls spoke2,
@@ -3914,7 +3925,9 @@ pub struct FleetAgentInfo {
     pub host: String,
     /// Public pane id **on that host**. A routing detail, not an address:
     /// meaningless as a `{"type":"pane"}` target unless `local` is true.
-    pub pane_id: String,
+    /// Absent for a pane-free structured identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_id: Option<String>,
     /// `true` when the agent is on the server that answered. Only these are
     /// addressable by pane id; the rest need `agent_id`.
     pub local: bool,
@@ -3930,6 +3943,9 @@ pub struct FleetAgentInfo {
     /// convenience and does not travel with the gossip summary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Pane-free remote agents report structured; older summaries omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<AgentRuntime>,
     pub status: AgentStatus,
     /// The agent's `state` (#1019). A local row carries the full record's
     /// value. A remote row is all `unknown`: the mesh summary carries no
@@ -4410,6 +4426,8 @@ pub struct AgentPhaseEvent {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum EventData {
+    /// Payload-free directory invalidation; the envelope sequence is its version.
+    DirectoryChanged {},
     StructuredGrantRevoked {
         agent_id: String,
         generation: u64,
@@ -5266,12 +5284,24 @@ pub struct PeerWorkspaceSummary {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerAgentSummary {
     pub agent_id: String,
-    /// Public pane id on the owning server. A routing detail, not a name.
+    /// Public pane id on the owning server, always present even when empty (v5).
     pub pane_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[serde(deserialize_with = "crate::terminal::agent_name::deserialize")]
     pub agent: Option<String>,
     pub status: AgentStatus,
+}
+
+/// A pane-free identity in the additive JSON discovery list (ADR-0008).
+/// Kept separate so workspace rows retain their required v5 pane field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerStructuredAgentSummary {
+    pub agent_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::terminal::agent_name::deserialize")]
+    pub agent: Option<String>,
+    pub status: AgentStatus,
+    pub runtime: crate::structured::registry::StructuredRuntime,
 }
 
 /// `peers.hub_fleet` — down-gossip from a hub to a spoke it polls (#410).
@@ -5328,6 +5358,13 @@ pub struct RelayedFleetPeer {
     pub system: Option<PeerSystemSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latency_ms: Option<u64>,
+    /// Pane-free agent directory, relayed unchanged by supporting peers.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "crate::api::peer_discovery::deserialize"
+    )]
+    pub structured_agents: Vec<PeerStructuredAgentSummary>,
     #[serde(default)]
     pub workspaces: Vec<PeerWorkspaceSummary>,
     /// Seconds since the origin's last successful poll, at relay capture time.
