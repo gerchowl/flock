@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { strict as assert } from "node:assert";
 
 import type { FixtureLine } from "../src/gen/FixtureLine";
-import { ExecutionLedger, assertInventory, PENDING_PART_2B, coverage, loadS7MinScripts, runTrace, type CheckedStep, type StepHandlers, type TraceScript } from "./wire/endpoint-runner";
+import { ExecutionLedger, WIRED_SCRIPTS, assertInventory, PENDING_PART_2B, coverage, loadS7MinScripts, runTrace, type CheckedStep, type StepHandlers, type TraceScript } from "./wire/endpoint-runner";
 import { VirtualClock, parseScript } from "./wire/harness";
 
 const ROOT = `${import.meta.dir}/../test/fixtures/wire`;
@@ -19,11 +19,11 @@ const base: StepHandlers = {
 
 test("selection uses covers containment, including multi-label headers", async () => {
   const selected = await loadS7MinScripts(ROOT);
-  assertInventory(selected, ["token-refused"]);
-  expect(Object.keys(PENDING_PART_2B).sort()).toEqual(["agent-gap", "agent-send", "clean", "heartbeat-missed", "permission-decision", "ping-pong", "token-revoked", "unknown-subscription"]);
+  assertInventory(selected, WIRED_SCRIPTS);
+  expect(Object.keys(PENDING_PART_2B).sort()).toEqual(["agent-gap", "agent-send", "clean", "heartbeat-missed", "ping-pong", "token-revoked", "unknown-subscription"]);
   expect(() => assertInventory(selected, [])).toThrow();
-  expect(() => assertInventory(selected, ["token-refused", "clean"])).toThrow();
-  expect(() => assertInventory([...selected, { ...selected[0]!, name: "new-unclassified" }], ["token-refused"])).toThrow();
+  expect(() => assertInventory(selected, [...WIRED_SCRIPTS, "clean"])).toThrow();
+  expect(() => assertInventory([...selected, { ...selected[0]!, name: "new-unclassified" }], WIRED_SCRIPTS)).toThrow();
   const clientOnly = { name: "client-fleet", lines: parseScript(await Bun.file(`${ROOT}/fleet-lite.jsonl`).text()) };
   expect(coverage(clientOnly)).toEqual(["client-only"]);
   expect(selected.map((value) => value.name)).not.toContain("fleet-lite");

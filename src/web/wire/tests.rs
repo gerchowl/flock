@@ -102,6 +102,12 @@ impl Server {
         Self::with_clock(|clock| Arc::new(clock)).await
     }
     async fn with_clock(wrap: impl FnOnce(TestClock) -> Arc<dyn Clock>) -> Self {
+        Self::with_setup(wrap, |_| ()).await
+    }
+    async fn with_setup(
+        wrap: impl FnOnce(TestClock) -> Arc<dyn Clock>,
+        setup: impl FnOnce(&mut Core),
+    ) -> Self {
         let root =
             crate::structured::launch::SessionConfigDir::create(&std::env::temp_dir()).unwrap();
         let dir = root.path().join("client-tokens");
@@ -119,12 +125,13 @@ impl Server {
         }
         let clock = TestClock::new();
         let wake = Arc::new(tokio::sync::Notify::new());
-        let core = Core::with_clock(
+        let mut core = Core::with_clock(
             TokenStore::open(root.path()).unwrap(),
             wrap(clock.clone()),
             wake.clone(),
         )
         .unwrap();
+        setup(&mut core);
         let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let bind = socket.local_addr().unwrap();
         let router = core.router();

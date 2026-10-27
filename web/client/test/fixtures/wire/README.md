@@ -202,5 +202,15 @@ not a digest of the bearer, a runtime substitution, or a dynamic matcher.
 
 `endpoint-runner.ts` checks every ordered step and bounds silent producers.
 `endpoint-auth.ts` runs all eight `token-refused` steps through a real endpoint
-and client. Its typed pending-part-2b set is tested against the other eight
-selected scripts; later providers must shrink it. Gaps and overlap fail.
+and client. `endpoint-permission.ts` runs the complete permission-decision trace.
+The tested pending-part-2b set contains the other seven selected scripts; later
+providers must shrink it. Gaps and overlap fail.
+
+The permission fixture resumes after the bootstrap prefix and raw request (cursor 3),
+then checks durable open at 4 and close at 5. The issued permission handle is 3. Its worker suppresses the fixture-only
+stdin echo, so the trace contains only product permission records. Timestamp
+proof reads the actual session JSONL by sequence and compares the raw payload.
+The open window spans producer injection to the owner's durable-open receipt;
+the close window spans browser decision to its actual wire ack. Neither uses
+product clock injection. Literal version/epoch/principal fields are compared
+unchanged; the fixture's version literal must follow a package-version change.
