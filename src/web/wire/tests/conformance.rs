@@ -1,27 +1,170 @@
 //! Server selection follows authored coverage, including multi-label headers.
 use super::*;
-use crate::structured_wire::fixture::{FixtureCoverage, FixtureLine, FixtureStep};
+use crate::structured_wire::fixture::{ClientAction, FixtureCoverage, FixtureLine, FixtureStep};
 
+fn fixture_root() -> PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("web/client/test/fixtures/wire")
+}
 fn selected() -> Vec<(String, Vec<FixtureLine>)> {
-    let root =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("web/client/test/fixtures/wire");
+    selected_from(&fixture_root())
+}
+fn selected_from(root: &std::path::Path) -> Vec<(String, Vec<FixtureLine>)> {
     let mut scripts = Vec::new();
     for entry in fs::read_dir(root).unwrap() {
         let path = entry.unwrap().path();
         if path.extension().is_none_or(|ext| ext != "jsonl") {
             continue;
         }
+        let name = path.file_stem().unwrap().to_str().unwrap().to_owned();
         let lines = FixtureLine::parse_script(&fs::read_to_string(&path).unwrap()).unwrap();
-        if matches!(&lines[0].step, FixtureStep::Given { covers, .. } if covers.contains(&FixtureCoverage::S7Min))
-        {
-            scripts.push((
-                path.file_stem().unwrap().to_str().unwrap().to_owned(),
-                lines,
-            ));
+        let FixtureStep::Given { covers, .. } = &lines[0].step else {
+            panic!("{name}: missing coverage header")
+        };
+        assert!(!covers.is_empty(), "{name}: uncovered fixture");
+        assert!(
+            covers
+                .iter()
+                .enumerate()
+                .all(|(i, label)| !covers[..i].contains(label)),
+            "{name}: duplicate coverage"
+        );
+        if covers.contains(&FixtureCoverage::S7Min) {
+            assert!(
+                !covers.contains(&FixtureCoverage::ClientOnly),
+                "{name}: conflicting coverage"
+            );
+            scenario(&name, &lines);
+            scripts.push((name, lines));
         }
+        // Other inventory entries explicitly cover full S7 or client-only behavior.
     }
     scripts.sort_by(|a, b| a.0.cmp(&b.0));
     scripts
+}
+#[derive(Debug, PartialEq)]
+enum Scenario {
+    ClientOpen,
+    Scoped,
+    Refusal,
+}
+fn scenario(name: &str, lines: &[FixtureLine]) -> Scenario {
+    let command = lines.iter().any(|line| {
+        matches!(
+            &line.step,
+            FixtureStep::Expect {
+                frame: ClientFrame::Cmd { .. },
+                ..
+            } | FixtureStep::Client {
+                action: ClientAction::Command { .. }
+            }
+        ) || matches!(&line.step, FixtureStep::Given { outbox, .. } if !outbox.is_empty())
+    });
+    let welcome = lines.iter().any(|line| {
+        matches!(
+            &line.step,
+            FixtureStep::Send {
+                frame: ServerFrame::Welcome { .. },
+                ..
+            }
+        )
+    });
+    if command {
+        assert!(welcome, "{name}: command fixture lacks welcome coverage");
+        Scenario::ClientOpen
+    } else if welcome {
+        Scenario::Scoped
+    } else {
+        assert!(
+            lines
+                .iter()
+                .any(|line| matches!(line.step, FixtureStep::TokenRefused { code: 4401 })),
+            "{name}: uncovered minimal fixture"
+        );
+        Scenario::Refusal
+    }
+}
+
+/// Restore every sandboxed path, including on a failed conformance assertion.
+struct Environment(Vec<(&'static str, Option<std::ffi::OsString>)>);
+impl Environment {
+    fn sandbox(root: &std::path::Path) -> Self {
+        let keys = [
+            "HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_STATE_HOME",
+            "XDG_DATA_HOME",
+            "XDG_RUNTIME_DIR",
+            "FLOCK_CONFIG_PATH",
+        ];
+        let guard = Self(
+            keys.iter()
+                .map(|&key| (key, std::env::var_os(key)))
+                .collect(),
+        );
+        for key in keys {
+            if key == "FLOCK_CONFIG_PATH" {
+                std::env::remove_var(key);
+            } else {
+                std::env::set_var(key, root);
+            }
+        }
+        guard
+    }
+}
+impl Drop for Environment {
+    fn drop(&mut self) {
+        for (key, value) in &self.0 {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+}
+async fn client_open_server() -> (Server, Bearer, Environment) {
+    let root = crate::structured::launch::SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+    let environment = Environment::sandbox(root.path());
+    let data = crate::session::data_dir();
+    fs::create_dir_all(&data).unwrap();
+    let server = Server::from_store(root, TokenStore::open(&data).unwrap(), |clock| {
+        Arc::new(clock)
+    })
+    .await;
+    let mut config = crate::config::Config::default();
+    config.client.bind = Some(server.bind);
+    let mut app = crate::app::App::new(
+        &config,
+        true,
+        None,
+        mpsc::unbounded_channel().1,
+        crate::api::EventHub::default(),
+    );
+    // Kernel-attested operator, not a forged authority bit or fixture credential.
+    let (peer, _client) = std::os::unix::net::UnixStream::pair().unwrap();
+    let peer = crate::platform::peer::credentials(&peer);
+    app.runtime_config.uid_policy = crate::structured::identity::UidPolicy {
+        operator: crate::platform::peer::effective_uid(),
+        dedicated: Ok(None).into(),
+    };
+    app.current_api_peer_pid = peer.pid;
+    app.current_api_peer_birth = Some(peer.birth);
+    app.current_api_peer_uid = Some(peer.uid);
+    let response: Value =
+        serde_json::from_str(&app.handle_api_request(crate::api::schema::Request {
+            id: "conformance-client-open".into(),
+            method: crate::api::schema::Method::ClientOpen(crate::api::schema::EmptyParams {}),
+        }))
+        .unwrap();
+    let url = response["result"]["url"]
+        .as_str()
+        .expect("ClientOpen issues a browser handoff");
+    let code = url.split_once("#code=").expect("ClientOpen handoff code").1;
+    let bearer = app
+        .client_codes
+        .exchange(code, Instant::now())
+        .expect("production exchange redeems ClientOpen once");
+    assert!(app.client_codes.exchange(code, Instant::now()).is_none());
+    (server, bearer, environment)
 }
 
 #[test]
@@ -38,27 +181,82 @@ fn server_conformance_selection_contains_no_client_only_fixture() {
             "multi-label header {required}"
         );
     }
+    assert!(scripts
+        .iter()
+        .any(|(_, lines)| scenario("inventory", lines) == Scenario::Refusal));
 }
 
 #[test]
+fn new_command_fixtures_are_covered_without_a_filename_allowlist() {
+    let root = crate::structured::launch::SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+    fs::copy(
+        fixture_root().join("agent-send.jsonl"),
+        root.path().join("new-command.jsonl"),
+    )
+    .unwrap();
+    let scripts = selected_from(root.path());
+    assert_eq!(scripts.len(), 1);
+    assert_eq!(scenario(&scripts[0].0, &scripts[0].1), Scenario::ClientOpen);
+}
+#[test]
+fn uncovered_inventory_entries_are_rejected() {
+    let root = crate::structured::launch::SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+    let source = fs::read_to_string(fixture_root().join("clean.jsonl")).unwrap();
+    fs::write(
+        root.path().join("uncovered.jsonl"),
+        source.replace("[\"s7-min\"]", "[]"),
+    )
+    .unwrap();
+    assert!(std::panic::catch_unwind(|| selected_from(root.path())).is_err());
+    fs::write(root.path().join("uncovered.jsonl"), "{\"v\":1,\"step\":\"given\",\"cursors\":{},\"outbox\":[],\"covers\":[\"s7-min\"]}\n{\"v\":1,\"step\":\"quiet\",\"ceiling_ms\":1}\n").unwrap();
+    assert!(std::panic::catch_unwind(|| selected_from(root.path())).is_err());
+}
+#[test]
 fn selected_welcome_capabilities_match_the_actual_endpoint() {
+    let (_lock, _scrub) = crate::config::test_config_env_guard();
     runtime(async {
         for (name, lines) in selected() {
-            let Some(expected) = lines.iter().find_map(|line| match &line.step {
-                FixtureStep::Send {
-                    frame: frame @ ServerFrame::Welcome { .. },
-                    ..
-                } => Some(serde_json::to_value(frame).unwrap()),
-                _ => None,
-            }) else {
+            let kind = scenario(&name, &lines);
+            let hello = lines
+                .iter()
+                .find_map(|line| match &line.step {
+                    FixtureStep::Expect {
+                        frame: frame @ ClientFrame::Hello { .. },
+                        ..
+                    } => Some(serde_json::to_value(frame).unwrap()),
+                    _ => None,
+                })
+                .expect("selected fixture has a hello");
+            if kind == Scenario::Refusal {
+                let server = Server::new().await;
+                let mut client = Socket::open(&server).await;
+                let mut refused = hello;
+                refused["token"] = json!("0".repeat(64));
+                client.send(refused).await;
+                assert!(
+                    matches!(client.receive().await, Received::Close(4401)),
+                    "{name}: actual auth refusal"
+                );
+                server.finish().await;
                 continue;
+            }
+            let expected = lines
+                .iter()
+                .find_map(|line| match &line.step {
+                    FixtureStep::Send {
+                        frame: frame @ ServerFrame::Welcome { .. },
+                        ..
+                    } => Some(serde_json::to_value(frame).unwrap()),
+                    _ => None,
+                })
+                .expect("scenario classification requires welcome");
+            let (server, bearer, _environment) = if kind == Scenario::ClientOpen {
+                let (server, bearer, environment) = client_open_server().await;
+                (server, bearer, Some(environment))
+            } else {
+                (Server::new().await, Bearer("a".repeat(64)), None)
             };
-            let server = Server::new().await;
-            // Command scenarios use ClientOpen's actual grants, independently of
-            // the fixture. Other scenarios intentionally use narrower credentials.
-            let scopes = if ["agent-send", "permission-decision", "token-revoked"]
-                .contains(&name.as_str())
-            {
+            let scopes = if kind == Scenario::ClientOpen {
                 let grants =
                     serde_json::to_value(crate::api::client_tokens::operator_scopes()).unwrap();
                 assert_eq!(
@@ -67,26 +265,17 @@ fn selected_welcome_capabilities_match_the_actual_endpoint() {
                 );
                 grants
             } else {
+                let path = server._root.path().join("client-tokens/one.token");
+                let mut token: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+                token["scopes"] = expected["capabilities"].clone();
+                fs::write(path, serde_json::to_vec(&token).unwrap()).unwrap();
                 expected["capabilities"].clone()
             };
-            let path = server._root.path().join("client-tokens/one.token");
-            let mut token: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-            token["scopes"] = scopes.clone();
-            fs::write(path, serde_json::to_vec(&token).unwrap()).unwrap();
-            let protocol = lines
-                .iter()
-                .find_map(|line| match &line.step {
-                    FixtureStep::Expect {
-                        frame: ClientFrame::Hello { protocol, .. },
-                        ..
-                    } => Some(*protocol),
-                    _ => None,
-                })
-                .expect("selected welcome has a client hello");
             let mut client = Socket::open(&server).await;
-            let actual = client.hello(protocol, &"a".repeat(64)).await;
+            let actual = client
+                .hello(hello["protocol"].as_u64().unwrap() as u32, &bearer.0)
+                .await;
             server.finish().await;
-            // Opaque server identities differ; operation capabilities are semantic.
             assert_eq!(
                 actual["capabilities"], scopes,
                 "{name}: granted welcome capabilities"
