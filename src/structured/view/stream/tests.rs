@@ -142,6 +142,10 @@ async fn canonical_refresh_and_retirement_drop_old_prompts_and_cursors() {
             && s.model.snapshot.queue.is_empty()
             && s.model.snapshot.composer.text.is_empty()
     );
+    assert!(matches!(
+        s.model.snapshot.admission,
+        Admission::Refused(ErrorCode::AgentNotFound)
+    ));
     assert!(!s.next().await.unwrap());
 }
 
@@ -157,4 +161,105 @@ async fn replacement_queue_is_published_only_when_complete() {
     );
     assert!(s.next().await.unwrap());
     assert_eq!(s.model.snapshot.queue.len(), 2);
+}
+
+fn poll<T>(future: std::pin::Pin<&mut impl std::future::Future<Output = T>>) -> std::task::Poll<T> {
+    future.poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+}
+async fn lag_recovery(busy: bool, replacement: bool) {
+    use crate::structured::workers::queue::publication::view_test::Fixture;
+    let (_app, _case, mut s) = fixture("s10b-live-lifecycle-exit").await;
+    let mut owner = Fixture::new();
+    owner.append(0);
+    owner.append(1);
+    s.source = owner.source.clone();
+    s.queue = Some(s.source.subscribe(None).unwrap());
+    s.queue_wake = s.queue.as_ref().unwrap().waker();
+    s.ended = [true, true, false];
+    owner.capture();
+    assert!(s.next().await.unwrap());
+    assert!(s.next().await.unwrap());
+    if !replacement {
+        assert!(s.next().await.unwrap());
+    }
+    for n in 2..7 {
+        owner.append(n);
+    }
+    if busy {
+        owner.locked(|| {
+            let mut step = std::pin::pin!(s.next());
+            assert!(
+                matches!(poll(step.as_mut()), std::task::Poll::Ready(Ok(true))),
+                "lag must discard its spent reader before fallible capture"
+            );
+        });
+        {
+            let mut step = std::pin::pin!(s.next());
+            owner.locked(|| {
+                assert!(
+                    poll(step.as_mut()).is_pending(),
+                    "transient busy must wait for readiness"
+                )
+            });
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_secs(10), step)
+                    .await
+                    .expect("source wake never arrived")
+                    .unwrap()
+            );
+        }
+        assert!(!s.ended[2]);
+    } else {
+        assert!(s.next().await.unwrap());
+        let mut step = std::pin::pin!(s.next());
+        assert!(poll(step.as_mut()).is_pending());
+        owner.capture();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(10), step)
+                .await
+                .expect("capture wake never arrived")
+                .unwrap()
+        );
+    }
+    owner.finish(false);
+    drain(&mut s).await;
+    assert_eq!(
+        s.model
+            .snapshot
+            .queue
+            .iter()
+            .map(|v| v.item_id.as_str())
+            .collect::<Vec<_>>(),
+        (0..7).map(|n| format!("item-{n}")).collect::<Vec<_>>()
+    );
+    assert!(s.replacement.is_none());
+}
+#[tokio::test]
+async fn queue_lag_resubscribes_without_loss_or_duplicates() {
+    lag_recovery(false, false).await;
+}
+#[tokio::test]
+async fn queue_lag_busy_keeps_the_queue_live() {
+    lag_recovery(true, false).await;
+}
+#[tokio::test]
+async fn queue_lag_busy_preserves_replacement() {
+    lag_recovery(true, true).await;
+}
+#[tokio::test]
+async fn queue_refusal_stays_a_refusal() {
+    use crate::structured::workers::queue::publication::view_test::Fixture;
+    let (_app, _case, mut s) = fixture("s10b-live-lifecycle-exit").await;
+    let mut owner = Fixture::new();
+    owner.finish(true);
+    s.queue = Some(owner.source.subscribe(None).unwrap());
+    s.queue_wake = s.queue.as_ref().unwrap().waker();
+    for _ in 0..2 {
+        let error = s.next().await.unwrap_err();
+        assert_eq!(
+            error.get_ref().unwrap().downcast_ref::<ErrorCode>(),
+            Some(&ErrorCode::InternalError)
+        );
+        assert!(!s.ended[2]);
+    }
 }
