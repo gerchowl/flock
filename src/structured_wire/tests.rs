@@ -732,3 +732,17 @@ fn dynamic_timestamp_is_typed_and_restricted_to_event_wall_time() {
         assert!(FixtureLine::parse(&invalid.to_string()).is_err());
     }
 }
+
+#[test]
+fn permission_fixture_principal_is_a_literal_valid_token_identity() {
+    let lines = include_str!("../../web/client/test/fixtures/wire/permission-decision.jsonl");
+    let close = lines
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|line| line["frame"]["ev"]["state"] == "closed")
+        .unwrap();
+    assert_eq!(
+        close["frame"]["ev"]["principal"],
+        "0123456789abcdef0123456789abcdef"
+    );
+}

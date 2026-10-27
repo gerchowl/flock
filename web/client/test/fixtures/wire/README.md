@@ -218,3 +218,8 @@ such traces. Its client-script tests pin that rejection rather than fabricate a
 timestamp; actual-endpoint execution owns their complete coverage. Rust parsing
 and the TypeScript fixture generator validate the marker's schema. This changes
 fixture authoring only, with no product clock injection.
+
+`permission-decision` authors token principal
+`0123456789abcdef0123456789abcdef`, a deterministic valid 32-hex identity.
+Its scenario token must be minted with exactly that literal; the principal is
+not a digest of the bearer, a runtime substitution, or a dynamic matcher.

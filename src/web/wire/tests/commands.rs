@@ -64,8 +64,13 @@ impl Case {
                 Instant::now(),
             )
             .await;
+        let server = Server::new().await;
+        let path = server._root.path().join("client-tokens/one.token");
+        let mut token: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        token["principal"] = json!("0123456789abcdef0123456789abcdef");
+        fs::write(path, token.to_string()).unwrap();
         Self {
-            server: Server::new().await,
+            server,
             app,
             worker,
             notify,

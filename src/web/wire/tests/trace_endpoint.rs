@@ -30,7 +30,17 @@ async fn replay(name: &str, seq: u64) {
     let path = case.server._root.path().join("client-tokens/one.token");
     let mut token: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
     token["scopes"] = scopes.clone();
+    token["principal"] = json!("0123456789abcdef0123456789abcdef");
     fs::write(path, token.to_string()).unwrap();
+    assert_eq!(
+        TokenStore::open(case.server._root.path())
+            .unwrap()
+            .authenticate(&Bearer("a".repeat(64)))
+            .unwrap()
+            .info
+            .principal,
+        "0123456789abcdef0123456789abcdef"
+    );
     let dropped = std::env::var("S7_TRACE_DROP_STEP").unwrap_or_default(); // guardrails-ok(hermetic): explicit test-only fail-first control for #2467
     let mut child = tokio::process::Command::new("bun")
         .arg(root.join("web/client/tests/wire/endpoint-client.ts"))

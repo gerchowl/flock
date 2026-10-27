@@ -88,6 +88,7 @@ const handlers: StepHandlers = {
   send: async (line) => {
     assert(line.step === "send");
     const actual = await net().current().next();
+    if (actual.t === "welcome") assert.equal(actual.principal, "0123456789abcdef0123456789abcdef", "scenario token identity");
     await matcher.check(actual, line.frame);
     harness.acceptServerFrame(actual, line.socket ?? "current");
     return checked("server");

@@ -158,3 +158,11 @@ for (const name of ["permission-decision", "agent-send", "token-revoked"]) {
       .toEqual(["read", "send", "answer", "operate"]);
   });
 }
+
+test("permission principal is a literal deterministic token identity", async () => {
+  const events = (await load("permission-decision")).flatMap((line) =>
+    line.step === "send" && line.frame.t === "ev" ? [line.frame.ev] : []);
+  const close = events.find((event) => event !== null && typeof event === "object" && "state" in event && event.state === "closed");
+  expect(close !== null && typeof close === "object" && "principal" in close && close.principal)
+    .toBe("0123456789abcdef0123456789abcdef");
+});

@@ -496,7 +496,7 @@ export const fixtureExamples = {
 {"action":{"args":{"agent":"fixture","decision":"deny","message":"operator reason","request_id":"typed-request","request_seq":1},"cmd_id":"c1","kind":"command","verb":"agent.decide"},"step":"client","v":1},
 {"absent":[],"fields":["cmd_id","verb","args","resume_only"],"frame":{"args":{"agent":"fixture","decision":"deny","message":"operator reason","request_id":"typed-request","request_seq":1},"cmd_id":"c1","resume_only":false,"t":"cmd","verb":"agent.decide"},"step":"expect","v":1},
 {"frame":{"cmd_id":"c1","ok":true,"result":{"decision":"deny","request_id":"typed-request"},"t":"ack"},"step":"send","v":1},
-{"frame":{"ev":{"decision":"deny","message":"operator reason","principal":"fixture-client","request_id":"typed-request","request_seq":1,"source":"token","state":"closed","type":"flk_permission_request"},"seq":3,"stream":"agent/fixture","sub_id":"s1","t":"ev","ts_ms":{"$dynamic":"ts_ms","source":"persisted"}},"step":"send","v":1},
+{"frame":{"ev":{"decision":"deny","message":"operator reason","principal":"0123456789abcdef0123456789abcdef","request_id":"typed-request","request_seq":1,"source":"token","state":"closed","type":"flk_permission_request"},"seq":3,"stream":"agent/fixture","sub_id":"s1","t":"ev","ts_ms":{"$dynamic":"ts_ms","source":"persisted"}},"step":"send","v":1},
 {"connection":"Live","outbox":{"c1":"acked"},"step":"observe","streams":{"s1":{"cursor":3,"state":"Current"}},"v":1},
 {"ceiling_ms":1000,"step":"quiet","v":1},
 ],
@@ -783,5 +783,5 @@ export const fixtureExamples = {
 export const permissionLifecycle = [
 ({"request":{"input":{"command":"true"},"subtype":"can_use_tool","tool_name":"Bash","tool_use_id":"tool-example"},"request_id":"typed-request","request_seq":1,"state":"open","type":"flk_permission_request"}) satisfies PermissionRecord,
 ({"decision":"deny","request_id":"typed-request"}) satisfies AgentDecideResult,
-({"decision":"deny","message":"operator reason","principal":"fixture-client","request_id":"typed-request","request_seq":1,"source":"token","state":"closed","type":"flk_permission_request"}) satisfies PermissionRecord,
+({"decision":"deny","message":"operator reason","principal":"0123456789abcdef0123456789abcdef","request_id":"typed-request","request_seq":1,"source":"token","state":"closed","type":"flk_permission_request"}) satisfies PermissionRecord,
 ] as const;
