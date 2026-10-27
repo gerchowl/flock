@@ -215,8 +215,8 @@ connect assertion has its explicit virtual interval, and final quiet retains its
 authored virtual ceiling; neither advances server time or waits on a wall-clock
 sleep. There are no runtime event timestamps in this script, so it needs no
 persisted timestamp marker. All selected dynamic timestamps still require their
-explicit bound. The tested pending set now contains six scripts: agent-gap,
-agent-send, clean, heartbeat-missed, ping-pong and token-revoked. Later providers
+explicit bound. The tested pending set now contains five scripts: agent-gap,
+agent-send, heartbeat-missed, ping-pong and token-revoked. Later providers
 must shrink it. Gaps and overlap fail.
 
 The permission fixture resumes after bootstrap and raw request (cursor 3), then
@@ -231,3 +231,21 @@ mismatch fails; package bumps require no fixture edit. The pure virtual harness
 refuses this marker because it has no compiled-server oracle. All literal
 objects, including frame envelopes and nested payloads, require exact key sets
 and values; extra keys fail. Protocol transport decoding remains additive.
+
+
+`endpoint-clean.ts` executes all fourteen fresh-subscription steps through a real
+worker and endpoint. It retains the `sub` assertion that `after` is absent, then
+replays the real hook-start, init and assistant records before `synced@3` and the
+`Current@3` observation. Each timestamp declares `record_delivery`: its lower
+bound is captured before the worker starts (bootstrap) or before its driver writes
+(assistant), and its upper bound is captured in the native WebSocket callback.
+The independently read durable sequence, payload and timestamp must match exactly,
+with zero slack. The native delivery port is shared with permission-decision.
+
+The Rust test always runs four causal controls as well as the complete positive
+trace: corrupt persisted time, an invalid delivery window, a restored zero cursor
+that incorrectly adds `after`, and withholding the client's synced application.
+Each must fail for its specific assertion, so CI proves the provider can fail.
+All async steps retain the five-second interpreter ceiling; connect and quiet
+retain their authored virtual bounds. Quiet checks buffered output and virtual
+client behavior, without claiming future wall-clock silence (ADR-0036 §5a).
