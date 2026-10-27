@@ -122,3 +122,50 @@ fn composer_preserves_utf8_draft_and_disables_uncertain_send() {
     assert!(text(&draw(&p)).contains("pending; retain draft"));
     assert_eq!(s.composer.text, "界e\u{301}\nsecond\u{202e}");
 }
+
+macro_rules! narrow_consent {
+    ($test:ident, $width:expr) => {
+        #[test]
+        fn $test() {
+            let mut s = snapshot();
+            s.permissions = vec![request(1, "inspect this request")];
+            let area = Rect::new(2, 3, $width, 4);
+            let p = permission(&s, area);
+            let has = |decision| p.hits.iter().any(|(_, a)| matches!(a, Action::Decide { decision: d, .. } if *d == decision));
+            let approval = has(PermissionDecision::AllowOnce) || has(PermissionDecision::AllowAlways);
+            assert!(!approval || has(PermissionDecision::Deny), "approval without Deny");
+            assert!(matches!(p.hit(2, 6), Some(Action::Decide { decision: PermissionDecision::Deny, .. })));
+            assert!(!approval, "partial decision row must offer inspection instead");
+            assert!(p.hits.iter().any(|(_, a)| matches!(a, Action::InspectPermission(h) if h.request_seq == 1)));
+            assert!(text(&draw(&p)).contains("[Deny]"));
+        }
+    };
+}
+narrow_consent!(consent_width_12_keeps_deny_and_inspection, 12);
+narrow_consent!(consent_width_18_keeps_deny_and_inspection, 18);
+narrow_consent!(consent_width_34_keeps_deny_and_inspection, 34);
+narrow_consent!(consent_width_40_keeps_deny_and_inspection, 40);
+#[test]
+fn button_geometry_measures_display_columns() {
+    let mut p = Panel::default();
+    p.buttons(Rect::new(2, 3, 3, 1), vec![("界é", Action::Close)]);
+    assert_eq!(p.hits.len(), 1);
+    assert_eq!(p.hits[0].0.width, 3);
+    assert!(matches!(p.hit(4, 3), Some(Action::Close)));
+    let b = draw(&p);
+    assert_eq!(b[(2, 3)].symbol(), "界");
+    assert_eq!(b[(4, 3)].symbol(), "é");
+}
+#[test]
+fn button_coordinates_refuse_overflow_without_wrapping() {
+    let mut p = Panel::default();
+    let area = Rect {
+        x: u16::MAX - 1,
+        y: 0,
+        width: 4,
+        height: 1,
+    };
+    p.buttons(area, vec![("a", Action::Close), ("b", Action::Stop)]);
+    assert_eq!(p.hits.len(), 1);
+    assert_eq!(p.hits[0].0.x, area.x);
+}

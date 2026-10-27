@@ -3,6 +3,7 @@ use super::markdown::{lines, safe, wrap, DisplayLine};
 use crate::structured::view::contracts::{Action, Card, CardId, Content};
 use ratatui::{layout::Rect, text::Line, widgets::Paragraph, Frame};
 use std::collections::{BTreeMap, BTreeSet};
+use unicode_width::UnicodeWidthStr;
 
 /// Visible physical rows and exact button rectangles, computed together before painting.
 pub(crate) struct Transcript {
@@ -50,8 +51,11 @@ fn content(card: &Card, tools: &BTreeMap<&str, &str>) -> (String, Vec<Line<'stat
             is_error,
         } => (
             format!(
-                "Tool result: {} ({tool_use_id}){}",
-                tools.get(tool_use_id.as_str()).unwrap_or(&"unknown tool"),
+                "Tool result: {}{}",
+                tools
+                    .get(tool_use_id.as_str())
+                    .map(|name| format!("{name} ({tool_use_id})"))
+                    .unwrap_or_else(|| tool_use_id.clone()),
                 if *is_error { " [error]" } else { "" }
             ),
             safe(text),
@@ -99,18 +103,22 @@ pub(crate) fn compute(
         ));
         let folded = collapsed.contains(&card.id);
         let toggle = if folded { "[Expand]" } else { "[Collapse]" };
-        let mut x = 0;
+        let mut x: u16 = 0;
         let mut controls = String::new();
         for (label, action) in [
             (toggle, Action::ToggleFold(card.id)),
             ("[Details]", Action::InspectCard(card.id)),
         ] {
-            let width = label.len() as u16;
-            if x + width <= area.width {
+            let Ok(width) = u16::try_from(label.width()) else {
+                continue;
+            };
+            if x.checked_add(width)
+                .is_some_and(|right| right <= area.width)
+            {
                 buttons.push((rows.len(), x, width, action));
                 controls.push_str(label);
                 controls.push(' ');
-                x += width + 1;
+                x = x.saturating_add(width.saturating_add(1));
             }
         }
         rows.extend(wrap(
@@ -136,7 +144,12 @@ pub(crate) fn compute(
         .filter(|(row, _, _, _)| *row >= start && *row < end)
         .map(|(row, x, width, action)| {
             (
-                Rect::new(area.x + x, area.y + (row - start) as u16, width, 1),
+                Rect::new(
+                    area.x.saturating_add(x),
+                    area.y.saturating_add((row - start) as u16),
+                    width,
+                    1,
+                ),
                 action,
             )
         })

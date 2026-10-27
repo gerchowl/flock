@@ -364,3 +364,51 @@ fn sibling_card_ids_fold_independently_and_results_use_observed_tool_identity() 
         .iter()
         .any(|(_, a)| matches!(a, Action::InspectCard(id) if *id == cards[1].id)));
 }
+
+#[test]
+fn result_without_retained_invocation_uses_original_tool_id() {
+    let cards = [card(
+        3,
+        Content::ToolResult {
+            tool_use_id: "original-use".into(),
+            text: "ok".into(),
+            is_error: false,
+        },
+    )];
+    let b = draw(&compute(
+        &cards,
+        &BTreeSet::new(),
+        None,
+        Rect::new(0, 0, 60, 3),
+    ));
+    assert!(text(&b).contains("Tool result: original-use"));
+    assert!(!text(&b).contains("unknown tool"));
+}
+#[test]
+fn result_correlates_invocation_beyond_visible_rows() {
+    let cards = [
+        card(
+            1,
+            Content::ToolUse(
+                serde_json::from_value(serde_json::json!({"id":"use-1","name":"Bash","input":{}}))
+                    .unwrap(),
+            ),
+        ),
+        card(
+            3,
+            Content::ToolResult {
+                tool_use_id: "use-1".into(),
+                text: "ok".into(),
+                is_error: false,
+            },
+        ),
+    ];
+    let b = draw(&compute(
+        &cards,
+        &BTreeSet::new(),
+        Some(3),
+        Rect::new(0, 0, 60, 3),
+    ));
+    assert!(text(&b).contains("Tool result: Bash (use-1)"));
+    assert!(!text(&b).contains("Tool: Bash"));
+}

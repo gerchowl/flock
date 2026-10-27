@@ -3,10 +3,12 @@ use super::markdown::{wrap, DisplayLine};
 use crate::structured::view::contracts::{Action, Admission, Composer, PermissionHandle, Snapshot};
 use crate::structured_wire::{PermissionDecision, PermissionState};
 use ratatui::{layout::Rect, text::Line, widgets::Paragraph, Frame};
+use unicode_width::UnicodeWidthStr;
 
 /// Sanitized physical rows and their exact intent rectangles, computed together.
 /// Regions require four rows; smaller regions omit controls rather than clipping hits.
 /// Full-input intents retain the exact handle; S10e owns inspection and confirmation.
+/// Narrow decision rows expose Deny and inspection; approvals require the whole row.
 #[derive(Default)]
 pub(crate) struct Panel {
     rows: Vec<(Rect, Vec<DisplayLine>)>,
@@ -43,12 +45,20 @@ impl Panel {
     pub(super) fn buttons(&mut self, area: Rect, actions: Vec<(&str, Action)>) {
         let mut x: u16 = 0;
         for (label, action) in actions {
-            let width = label.len() as u16;
-            if area.height > 0 && x.saturating_add(width) <= area.width {
-                let rect = Rect::new(area.x + x, area.y, width, 1);
+            let Ok(width) = u16::try_from(label.width()) else {
+                continue;
+            };
+            if area.height > 0
+                && x.checked_add(width)
+                    .is_some_and(|right| right <= area.width)
+            {
+                let Some(left) = area.x.checked_add(x) else {
+                    continue;
+                };
+                let rect = Rect::new(left, area.y, width, 1);
                 self.text(rect, label.into());
                 self.hits.push((rect, action));
-                x = x.saturating_add(width + 1);
+                x = x.saturating_add(width.saturating_add(1));
             }
         }
     }
@@ -109,35 +119,50 @@ pub(crate) fn permission(s: &Snapshot, area: Rect) -> Panel {
                 ),
             );
         }
+        let inspect = if usize::from(area.width) >= "[Full input]".width() {
+            "[Full input]"
+        } else {
+            "[View]"
+        };
         p.buttons(
             row(area, 2),
             vec![
-                ("[Full input]", Action::InspectPermission(handle(record))),
+                (inspect, Action::InspectPermission(handle(record))),
                 (
                     "[Next]",
                     Action::SelectPermission(handle(open[(i + 1) % open.len()])),
                 ),
             ],
         );
+        let decisions = [
+            ("[Deny]", PermissionDecision::Deny),
+            ("[Allow once]", PermissionDecision::AllowOnce),
+            ("[Always (session)...]", PermissionDecision::AllowAlways),
+        ];
+        let needed = decisions
+            .iter()
+            .map(|(label, _)| label.width())
+            .sum::<usize>()
+            + decisions.len()
+            - 1;
         p.buttons(
             row(area, 3),
-            [
-                ("[Allow once]", PermissionDecision::AllowOnce),
-                ("[Always (session)...]", PermissionDecision::AllowAlways),
-                ("[Deny]", PermissionDecision::Deny),
-            ]
-            .into_iter()
-            .map(|(label, decision)| {
-                (
-                    label,
-                    Action::Decide {
-                        handle: handle(record),
-                        decision,
-                        message: None,
-                    },
-                )
-            })
-            .collect(),
+            decisions
+                .into_iter()
+                .filter(|(_, decision)| {
+                    *decision == PermissionDecision::Deny || usize::from(area.width) >= needed
+                })
+                .map(|(label, decision)| {
+                    (
+                        label,
+                        Action::Decide {
+                            handle: handle(record),
+                            decision,
+                            message: None,
+                        },
+                    )
+                })
+                .collect(),
         );
     } else {
         p.text(preview(area), "Permission: none selected / closed".into());
