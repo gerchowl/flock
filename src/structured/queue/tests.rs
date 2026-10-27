@@ -162,7 +162,7 @@ fn failed_append_or_sync_never_folds_or_publishes_and_requires_reopen() {
     peer.shutdown(Shutdown::Write).unwrap();
     let mut recovery = root.open();
     recovery.file = file;
-    recovery.items.clear();
+    recovery.items = Default::default();
     recovery.records.clear();
     recovery.seq = 0;
     assert!(
@@ -874,7 +874,14 @@ fn assert_missing_variant_name(raw: Value) {
 
 #[test]
 fn object_form_known_producers_reject_numeric_payloads() {
-    for tag in ["human", "agent", "channel", "system", "fork"] {
+    for tag in [
+        "human",
+        "agent",
+        "node_asserted",
+        "channel",
+        "system",
+        "fork",
+    ] {
         assert_corrupt_item_read_only("producer", json!({tag:42}));
     }
 }
@@ -991,7 +998,7 @@ fn unstamped_v1_gains_a_version_stamp_on_checkpoint() {
     assert_eq!(fs::read(root.path()).unwrap(), before);
     journal.checkpoint().unwrap();
     let header: Value = serde_json::from_slice(&root.identity_prefix()).unwrap();
-    assert_eq!(header["format_version"], 2);
+    assert_eq!(header["format_version"], FORMAT_VERSION);
 }
 
 #[test]
@@ -1537,5 +1544,68 @@ fn queue_global_facts_never_publish_failed_write_or_sync() {
         assert!(j.take_facts().is_empty());
         assert_eq!(j.items()[0].state, State::Delivered);
         drop(peer);
+    }
+}
+
+#[test]
+fn custody_completion_real_v2_upgrades_on_first_write_and_v2_refuses_v3() {
+    let root = Root::new();
+    let mut bytes =
+        encode(&json!({"kind":"queue_identity","agent_id":"fixture-agent","format_version":2}))
+            .unwrap();
+    bytes.extend(
+        encode(&Record {
+            seq: 1,
+            change: upsert("v2-item", 0),
+        })
+        .unwrap(),
+    );
+    drop(root.open());
+    fs::write(root.path(), &bytes).unwrap();
+    let mut current = root.open();
+    assert_eq!(current.format_version(), 2);
+    assert_eq!(current.items().len(), 1);
+    current.append(upsert("v3-item", 1)).unwrap();
+    assert_eq!(current.format_version(), 3);
+    drop(current);
+    let bytes = fs::read(root.path()).unwrap();
+    let mut old = Journal::open_inner(&root.0, "fixture-agent", None, true, 2).unwrap();
+    assert_eq!(
+        old.read_only(),
+        Some(ReadOnly::Newer(QueueJournalNewer {
+            found: 3,
+            supported: 2
+        }))
+    );
+    assert!(old
+        .append(upsert("old-item", 2))
+        .unwrap_err()
+        .to_string()
+        .contains("queue_journal_newer"));
+    assert!(old.checkpoint().is_err());
+    assert_eq!(fs::read(root.path()).unwrap(), bytes);
+}
+
+#[test]
+fn no_production_queue_removals() {
+    // Retained committed items are the proof behind a definite custody absence.
+    // These three references only decode/fold old records, never construct one.
+    let remove = regex::Regex::new(r"(?:Change|Self)\s*::\s*Remove\b").unwrap();
+    for (path, source) in crate::cli::exit::tests::production_sources() {
+        if path.contains("/tests/") {
+            continue;
+        }
+        let allowed = if path.ends_with("/structured/queue/model.rs") {
+            2
+        } else if path.ends_with("/structured/queue/mod.rs") {
+            1
+        } else {
+            0
+        };
+        assert_eq!(
+            remove.find_iter(&source).count(),
+            allowed,
+            "production removal would invalidate retained custody proof: {path}"
+        );
     }
 }

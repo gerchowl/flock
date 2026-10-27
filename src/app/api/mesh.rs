@@ -179,19 +179,11 @@ impl App {
     /// Kernel UID is checked before ancestry (ADR-0036 §1a): detached dedicated
     /// agents never become operators. Same-UID PTYs remain cooperative (#1177).
     pub(super) fn caller_is_local_operator(&mut self) -> bool {
-        self.current_api_peer_uid.is_none_or(|uid| {
+        let uid_allowed = self.current_api_peer_uid.is_none_or(|uid| {
             self.runtime_config.uid_policy.classify(uid)
                 == crate::structured::identity::Principal::Operator
-        }) && self.lease_caller() == crate::structured::lease::Caller::Unrelated
-            && self.current_api_peer_pid.is_some()
-            && self.caller_pane_candidate().is_none()
-            && self
-                .inbound
-                .edge(
-                    self.current_api_peer_pid,
-                    crate::platform::process_start_time,
-                )
-                .is_none()
+        });
+        uid_allowed && self.local_operator_origin(self.current_api_peer_pid, self.lease_caller())
     }
 
     pub(super) fn handle_peers_enroll_reset(

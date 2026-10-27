@@ -609,10 +609,19 @@ async fn startup_with_relative_socket_keeps_legacy_routes_available() {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        assert!(
-            fs::read_dir(cwd.path()).unwrap().next().is_none(),
-            "fixture listener must clean up"
-        );
+        // ADR-0036 pathname ownership retains the lock inode after listener cleanup.
+        let entries: Vec<_> = fs::read_dir(cwd.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, [OsString::from("relative.sock.lock")]);
+        let socket = cwd.path().join("relative.sock");
+        assert!(!socket.exists(), "fixture listener must remove its socket");
+        assert!(fs::symlink_metadata(socket.with_extension("sock.lock"))
+            .unwrap()
+            .is_file());
+        crate::ipc::SocketOwner::acquire(&socket)
+            .expect("fixture listener must release pathname ownership");
         return;
     }
     let _guard = crate::config::test_config_env_guard();
@@ -724,5 +733,30 @@ fn endpoint_warning_has_a_closed_path_free_reason() {
             "structured.mcp.endpoint_unavailable"
         );
         assert!(log["fields"].get("path").is_none());
+    }
+}
+
+#[tokio::test]
+async fn directory_change_is_emitted_once_for_a_real_structured_launch() {
+    let _guard = crate::config::test_config_env_guard();
+    let mut fixture = AdmissionFixture::new("s4-accepted-silent", 5000);
+    fixture.start().await;
+    let changes = |app: &App| {
+        app.event_hub
+            .ring_snapshot_after(0)
+            .into_iter()
+            .filter(|(_, event)| {
+                serde_json::to_value(event).unwrap()["event"] == "directory_changed"
+            })
+            .count()
+    };
+    assert_eq!(
+        changes(&fixture.app),
+        1,
+        "the launch must invalidate discovery"
+    );
+    for _ in 0..2 {
+        fixture.request(Method::AgentList(Default::default())).await;
+        assert_eq!(changes(&fixture.app), 1, "unchanged reads must not emit");
     }
 }

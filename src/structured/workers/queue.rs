@@ -12,6 +12,7 @@ use crate::structured::{
 };
 pub(crate) mod publication;
 pub(crate) mod recovery;
+use crate::structured::queue::custody::Unknown;
 use std::{
     cell::RefCell,
     io,
@@ -21,6 +22,44 @@ use std::{
 };
 /// Fixed notification bound, separate from one peek and the terminal fact tail.
 pub(crate) const COMPLETION_CAPACITY: usize = 4;
+type CommittedCustody = Arc<parking_lot::Mutex<CustodyIndex>>;
+struct CustodyIndex {
+    items: Arc<Vec<Item>>,
+    pending: std::collections::HashMap<crate::mesh::key::MessageKey, usize>,
+    uncertain: Option<Unknown>,
+    #[cfg(test)]
+    hold_admission: bool,
+}
+/// Instance-scoped test fault: keep requests pending before their journal commit.
+/// Dropping the guard always lets the owner resume, including on assertion failure.
+#[cfg(test)]
+pub(crate) struct AdmissionHold(CommittedCustody);
+#[cfg(test)]
+impl Drop for AdmissionHold {
+    fn drop(&mut self) {
+        self.0.lock().hold_admission = false;
+    }
+}
+impl CustodyIndex {
+    fn finish(&mut self, key: crate::mesh::key::MessageKey, unknown: Option<Unknown>) {
+        let remove = self.pending.get_mut(&key).is_some_and(|count| {
+            *count -= 1;
+            *count == 0
+        });
+        if remove {
+            self.pending.remove(&key);
+        }
+        self.uncertain = self.uncertain.or(unknown);
+    }
+}
+
+fn custody_key(item: &Item) -> Option<crate::mesh::key::MessageKey> {
+    let key: crate::mesh::key::MessageKey =
+        serde_json::from_value(item.metadata.get("message_key")?.clone()).ok()?;
+    (item.kind == crate::structured::queue::model::Kind::Message
+        && item.item_id == key.lifecycle_id())
+    .then_some(key)
+}
 type FinalFacts = Arc<parking_lot::Mutex<Vec<crate::api::queue_event::QueueItemState>>>;
 
 /// S4 projection after reducing every session record through this sequence.
@@ -64,15 +103,62 @@ pub(in crate::structured) struct Client {
     updates: mpsc::Receiver<Update>,
     peeked: RefCell<Option<Box<Update>>>,
     final_facts: FinalFacts,
+    committed_custody: CommittedCustody,
 }
 impl Client {
+    /// Pause this test instance before commit until its admission guard drops.
+    #[cfg(test)]
+    pub(crate) fn hold_admission(&self) -> AdmissionHold {
+        let mut index = self.committed_custody.lock();
+        assert!(!index.hold_admission, "admission is already held");
+        index.hold_admission = true;
+        AdmissionHold(self.committed_custody.clone())
+    }
+
+    pub fn custody_committed(&self, key: &crate::mesh::key::MessageKey) -> Result<bool, Unknown> {
+        // Only clone the committed fold under the lock; lookup is linear in
+        // retained items, with no file I/O or extra historical-key allocation.
+        let (items, uncertain) = {
+            let index = self.committed_custody.lock();
+            (
+                index.items.clone(),
+                index.uncertain.or_else(|| {
+                    index
+                        .pending
+                        .contains_key(key)
+                        .then_some(Unknown::AdmissionPending)
+                }),
+            )
+        };
+        if items
+            .iter()
+            .any(|item| custody_key(item).as_ref() == Some(key))
+        {
+            Ok(true)
+        } else if let Some(reason) = uncertain {
+            Err(reason)
+        } else {
+            Ok(false)
+        }
+    }
     /// Full returns session_busy; disconnection returns agent_not_found. Success
     /// accepts only the buffer slot; the completion acknowledges durability.
     pub fn enqueue(&self, request: Request) -> Result<(), ErrorCode> {
-        self.requests.try_send(request).map_err(|e| match e {
+        let key = custody_key(&request.item);
+        let mut index = self.committed_custody.lock();
+        if let Some(key) = &key {
+            *index.pending.entry(key.clone()).or_default() += 1;
+        }
+        let result = self.requests.try_send(request).map_err(|e| match e {
             mpsc::TrySendError::Full(_) => ErrorCode::SessionBusy,
             mpsc::TrySendError::Disconnected(_) => ErrorCode::AgentNotFound,
-        })
+        });
+        if result.is_err() {
+            if let Some(key) = key {
+                index.finish(key, None);
+            }
+        }
+        result
     }
     pub fn state(&self, state: Snapshot) -> bool {
         self.states.try_send(state).is_ok()
@@ -135,6 +221,7 @@ pub(in crate::structured) struct Service {
     updates: mpsc::SyncSender<Update>,
     pending: Option<Update>,
     final_facts: FinalFacts,
+    committed_custody: CommittedCustody,
     state: AgentState,
     covered: u64,
     required: u64,
@@ -148,6 +235,9 @@ pub(in crate::structured) struct Service {
 impl Service {
     pub fn open(data: &Path, agent: &str, bytes: NonZeroU64) -> Result<(Self, Client), Failure> {
         let journal = Journal::open_with_policy(data, agent, RewritePolicy::new(bytes))?;
+        if journal.read_only().is_none() {
+            crate::structured::queue::inbox::project(agent, journal.items())?;
+        }
         let mut scheduler = Scheduler::new(Admission::new(journal, MAX_BATCH)?)?;
         scheduler.fail_stale_openings()?;
         let (publisher, source) =
@@ -157,6 +247,13 @@ impl Service {
         // Same four-completion bound as the session stream; no unbounded spool.
         let (updates, rx) = mpsc::sync_channel(COMPLETION_CAPACITY);
         let final_facts = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let committed_custody = Arc::new(parking_lot::Mutex::new(CustodyIndex {
+            items: scheduler.journal().item_snapshot(),
+            pending: Default::default(),
+            uncertain: scheduler.journal().commitment_unknown(),
+            #[cfg(test)]
+            hold_admission: false,
+        }));
         Ok((
             Self {
                 publisher,
@@ -166,6 +263,7 @@ impl Service {
                 states,
                 updates,
                 final_facts: final_facts.clone(),
+                committed_custody: committed_custody.clone(),
                 pending: None,
                 state: AgentState::unknown(),
                 covered: 0,
@@ -183,6 +281,7 @@ impl Service {
                 states: state_tx,
                 updates: rx,
                 final_facts,
+                committed_custody,
                 peeked: RefCell::new(None),
             },
         ))
@@ -263,6 +362,10 @@ impl Service {
     /// Whether this operation failed at the stdin boundary.
     pub fn tick(&mut self, input: &InputHandle, stopped: bool, notify: &impl Fn()) -> bool {
         self.capture(notify);
+        #[cfg(test)]
+        if self.committed_custody.lock().hold_admission {
+            return false;
+        }
         let mut changed = self.initial;
         if let Ok(state) = self.states.try_recv() {
             if state.through >= self.required {
@@ -275,6 +378,7 @@ impl Service {
         let admitted = self.requests.try_recv().ok().map(|request| {
             changed = true;
             let id = request.item.item_id.clone();
+            let key = custody_key(&request.item);
             let result = if stopped {
                 Err(failure(ErrorCode::AgentNotFound))
             } else {
@@ -283,6 +387,11 @@ impl Service {
                         .enqueue(request.item, request.principal, request.gate)
                 })
             };
+            if let Some(key) = key {
+                let mut index = self.committed_custody.lock();
+                index.items = self.scheduler.journal().item_snapshot();
+                index.finish(key, self.scheduler.journal().commitment_unknown());
+            }
             (id, result)
         });
         if changed {
@@ -302,6 +411,19 @@ impl Service {
         let result = self
             .policy()
             .and_then(|_| self.scheduler.observe(&received.event));
+        let result = result.and_then(|()| {
+            if matches!(&received.event, crate::structured::claude::SessionEvent::CommandLifecycle(e) if e.state == "started") {
+                crate::structured::queue::inbox::project(
+                    self.scheduler.journal().agent(), self.scheduler.journal().items())?;
+            }
+            Ok(())
+        });
+        if result
+            .as_ref()
+            .is_err_and(|e| e.code == ErrorCode::MailStoreUnavailable)
+        {
+            self.blocked = Some(ErrorCode::MailStoreUnavailable);
+        }
         self.publish(input, stopped, None, result.err())
     }
     fn policy(&mut self) -> Result<(), Failure> {
@@ -364,6 +486,13 @@ impl Service {
             .as_ref()
             .err()
             .map(|e| (e.code, e.source.as_ref().map(|s| (s.kind(), s.to_string()))));
+        {
+            let mut index = self.committed_custody.lock();
+            index.items = self.scheduler.journal().item_snapshot();
+            index.uncertain = index
+                .uncertain
+                .or(self.scheduler.journal().commitment_unknown());
+        }
         let facts = self.scheduler.take_facts();
         let changed = !facts.is_empty()
             || self.initial

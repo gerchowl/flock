@@ -116,6 +116,42 @@ impl Case {
         })
         .collect()
     }
+    async fn observed_inputs(&mut self) -> Vec<Value> {
+        let mut events: Vec<Value> = Vec::new();
+        self.queue
+            .until(|r| {
+                let session = &r
+                    .app
+                    .state
+                    .structured_agents
+                    .get(&r.case.id)
+                    .unwrap()
+                    .0
+                    .session_id;
+                let path = r
+                    .case
+                    .fixture
+                    .root
+                    .path()
+                    .join("sessions")
+                    .join(&r.case.id)
+                    .join(format!("{session}.jsonl"));
+                events = fs::read_to_string(path)
+                    .unwrap()
+                    .lines()
+                    .map(|line| {
+                        let record: Value = serde_json::from_str(line).unwrap();
+                        serde_json::from_str(record["raw"].as_str().unwrap()).unwrap()
+                    })
+                    .collect();
+                // ADR-0036 §3/§5: admission acks do not order harness consumption.
+                ["fixture_input", "fixture_control_input"]
+                    .iter()
+                    .all(|kind| events.iter().any(|v| v["type"] == *kind))
+            })
+            .await;
+        events
+    }
     fn scopes(&self, scopes: Value) {
         let path = self.server._root.path().join("client-tokens/one.token");
         let mut record: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
@@ -604,6 +640,23 @@ fn send_and_decide_both_ack_on_the_same_socket() {
     runtime(async {
         let mut case = Case::new(183120).await;
         let mut socket = case.open().await;
+        // Keep the user turn queued while the permission response can reach stdin.
+        // ADR-0036 §3: an acknowledgement is admission, not harness delivery.
+        case.queue.control(json!({"op":"lifecycle","state":"started","uuid":"00000000-0000-4000-8000-000000183120"}));
+        case.queue
+            .until(|r| {
+                r.app
+                    .state
+                    .structured_agents
+                    .get(&r.case.id)
+                    .unwrap()
+                    .1
+                    .update
+                    .state
+                    .turn
+                    == crate::api::agent_state::Turn::Working
+            })
+            .await;
         let send = case
             .command(
                 &mut socket,
@@ -678,7 +731,19 @@ fn send_and_decide_both_ack_on_the_same_socket() {
                     .contains("fixture_control_input")
             })
             .await;
-        let events = case.events();
+        assert!(!case.events().iter().any(|v| v["type"] == "fixture_input"));
+        {
+            // Poll once with the producer alive and the user turn still held.
+            // A control-response-only barrier incorrectly completes here.
+            let pending = case.observed_inputs();
+            tokio::pin!(pending);
+            assert!(
+                futures_util::poll!(&mut pending).is_pending(),
+                "input barrier completed before the held user turn arrived"
+            );
+        }
+        case.queue.control(json!({"op":"result"}));
+        let events = case.observed_inputs().await;
         assert_eq!(
             events
                 .iter()
@@ -767,6 +832,64 @@ fn local_pty_only_target_is_unsupported_for_agent() {
         );
         assert_eq!(case.journal(), before);
         assert!(!case.events().iter().any(|v| v["type"] == "fixture_input"));
+        case.stop().await;
+    });
+}
+
+#[test]
+fn app_remint_deduplicates_the_same_command_without_a_second_queue_effect() {
+    runtime(async {
+        let (server, mut mint_app, _owner) = super::app_sessions::fixture().await;
+        let mut case = Case {
+            server,
+            queue: AppQueue::new(244215, |_| max_policy()).await,
+            next: 0,
+        };
+        case.queue
+            .until(|r| {
+                matches!(
+                    r.app.queue_observation(&r.case.id),
+                    Some(crate::app::queue_events::Observation::Status(None, None))
+                )
+            })
+            .await;
+        let a = super::app_sessions::mint(&mut mint_app).await;
+        let mut first = Socket::open(&case.server).await;
+        first.hello(WIRE_JSON_VERSION, &a.0).await;
+        let command = send_script("agent-send", &case.queue.case.id);
+        first.send(command.clone()).await;
+        assert_eq!(case.ack(&mut first).await["ok"], true);
+        case.queue
+            .until(|r| {
+                let record = r.app.state.structured_agents.get(&r.case.id).unwrap().0;
+                let path = r
+                    .case
+                    .fixture
+                    .root
+                    .path()
+                    .join("sessions")
+                    .join(&r.case.id)
+                    .join(format!("{}.jsonl", record.session_id));
+                fs::read_to_string(path).unwrap().contains("fixture_input")
+            })
+            .await;
+        let journal = case.journal();
+        let b = super::app_sessions::mint(&mut mint_app).await;
+        let mut renewed = Socket::open(&case.server).await;
+        renewed.hello(WIRE_JSON_VERSION, &b.0).await;
+        renewed.send(command).await;
+        assert_eq!(
+            case.ack(&mut renewed).await["error"]["code"],
+            "session_unconfirmed"
+        );
+        assert_eq!(case.journal(), journal);
+        assert_eq!(
+            case.events()
+                .iter()
+                .filter(|v| v["type"] == "fixture_input")
+                .count(),
+            1
+        );
         case.stop().await;
     });
 }

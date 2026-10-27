@@ -217,7 +217,9 @@ flk config reset-keys
 | `1` | loaded, with advisory warnings (removed or unknown keys, deprecated keys, keybinding conflicts) |
 | `2` | did not load — a session would fall back to built-in defaults |
 
-`--json` emits an object with `path`, `exit_code`, and `diagnostics` on stdout. Removed and unknown keys include file and line locations. Removed keys always produce exit `1`, even though the configuration loads successfully.
+`--json` emits an object with `path`, `exit_code`, and `diagnostics` on stdout. Removed and unknown-key diagnostics include source categories and numeric locations. Private map entries use `<key>`, and unknown spellings are withheld behind the nearest declared schema container. The `path` metadata still identifies the file being checked. Removed keys always produce exit `1`, even though the configuration loads successfully.
+
+Loader and file-key diagnostics withhold source filenames, rejected values and parser excerpts. Syntax errors and unknown-key warnings retain byte line/column positions when available. Peer-entry refusals identify the zero-based array index and say `entry dropped`. CLI edit parse refusals retain static repair hints, and a failed output guard identifies flock's own edit as the cause.
 
 Every diagnostic is printed, unlike the in-app warning banner, which truncates to four lines. The check resolves keybindings in full, so conflicts and deprecation renames are caught rather than just TOML syntax errors.
 
@@ -567,6 +569,16 @@ Without `--split`, `--workspace` replaces the workspace’s only pane when it is
 **Every agent records where its questions go** (`questions`, ADR-0034 §2): `ask_human` (the harness shows its dialog to whoever watches the pane), `ask_operator` (nobody watches the pane, so questions go to the operator's queue), `route` (questions go to the architect) or `deny` (questions are refused with a reason). `agent start`, `agent fork` and `delegate start` default it from the starter: an agent started from an agent's pane reads `route`, one started by the operator reads `ask_human`, and one started with `--unattended` (or, once they exist, by the server itself for a cron, trigger or owner episode) reads `ask_operator`. `--questions` sets it explicitly. An agent may only narrow, to `route` or `deny`: asking for `ask_human` or `ask_operator`, or passing `--unattended`, from an agent's pane is refused with `questions_widening_refused` and **exit 13**, before anything is created. The policy is shown in `agent get` and `delegate list`, kept across a restart, a resume, a hibernation and a live handoff, and stamped into the agent's pane as `FLOCK_QUESTIONS=<policy>` on every launch (no variable for `ask_human`). The variable is only a hint for when the server cannot answer, never authority. An agent recorded before this release reads `ask_human`. Against a server too old to record a policy, the CLI says so on stderr and starts without it. Nothing acts on the policy yet: the question hooks that read it come in later releases.
 
 `agent start` registers the name it returns itself, before the child has printed anything and independently of any hook the agent runs. The `name` in the `agent_started` result resolves with `agent get`, `agent read`, `agent send` and `agent wait` straight away, so `agent_not_found` for a just-started name is a real failure rather than a race. An agent name cannot look like a pane ID: targets resolve as a pane ID first, so a name written `1:p1` or `p_1_2` is read as that pane.
+
+For a structured caller without a pane, `flk msg list` peeks at its own unread
+inbox and `flk msg read` consumes it once. Identity and session come from the
+attested connection or MCP lease. `--pane self`, the stable native id, or an
+unambiguous native name may name that same inbox; another target is refused as
+`inbox_not_owner` (retry `never`, exit 13), and ambiguous names are refused as
+`agent_target_ambiguous`. Invalid and revoked leases both return `not_authorized`.
+The operator's global `msg list` is unchanged. Reads return only live entries from
+a mixed expired/live batch, once; each expired entry emits one durable
+`dropped_undeliverable` event. Reading the projection does not submit another turn.
 
 The stop-hook mail nudge names `flock_msg_read` and, if the MCP tool is unavailable, `flk msg read --pane <pane_id>` with the stopping pane’s ID filled in. Both read and consume the same inbox.
 
@@ -1000,9 +1012,9 @@ Exposed tools:
 | `flock_delegate_list` | `delegate.list` | The delegates an architect started, the rows of `flk delegate list`. `architect` is `self` (default), `all` or an agent id; `branch` returns the owning edge. Read-only. |
 | `flock_msg_send` | `msg.send` | `to` accepts a bare pane id, terminal id, unique agent name or fleet agent id, or a tagged `pane`, `repo_pane` or `agent` object. Queued to the recipient's inbox, which it reads itself; it is nudged at its next turn boundary, so an already-idle recipient waits. Target `{"type":"agent","agent":"<agent_id>"}` to reach another host. `intent` is required: `fyi` (no wake), `needs_reply` (nudged at its next turn boundary), or `blocking` (also operator-visible; past a small per-sender budget it is delivered as `needs_reply`). |
 | `flock_msg_reply` | `msg.reply` | Uses the stored return binding; direct cross-host answers are held for origin collection. `intent` is optional here and defaults to `fyi`. A sender with no inbox gets the reply held for it (`state: "held"`). |
-| `flock_msg_list` | `msg.list` | Unread messages with local wake attempt evidence. |
+| `flock_msg_list` | `msg.list` | Peek at the attested structured inbox, or the operator global list; includes local wake attempt evidence. |
 | `flock_msg_status` | `msg.status` | Sender view by `correlation_id`: mailbox state and submission attempts, including unconfirmed or abandoned reasons. |
-| `flock_msg_read` | `msg.read` | Read and consume your inbox — this is how agent messages arrive; they are not typed into the session. |
+| `flock_msg_read` | `msg.read` | Consume your attested pane or structured inbox once; no additional harness delivery. |
 | `flock_self_compact` | `pane.arm_self_compact` | Compact your OWN context and carry on, unattended: you supply the handoff prompt for your next self, the call arms and returns having typed nothing, and flock completes it at your next turn boundary. `abort: true` drops an arming instead. Optional `instructions` steers what the summary keeps (`/compact <instructions>`; `instructions: true` in the answer confirms they were stored). `state` is `armed` / `aborted` / `pending`; `pending` means refused because one was already armed. Claude Code only. |
 | `flock_msg_wait_reply` | `msg.wait_reply` | Block until a message you sent is answered: `outcome` `replied`/`deferred`/`expired`/`timeout`, with the answer in `reply`. Holds the MCP session for up to `timeout_ms` (default 60 s, at most 10 min); run `flk wait reply <id>` as a background task to wait longer. `flock_msg_send` with `await: true` returns the id and that command. |
 | `flock_events_read` | `events.read` | Durable events with `seq > after`, filtered by `kinds` and `subjects`; resume from `next_after`. `wait_ms` holds the call until a matching event lands, capped at 9 min (below the MCP tool timeout); run `flk events wait` as a background task to wait longer. Read-only. |
@@ -1111,7 +1123,7 @@ Remove these settings and callers:
   route through the mesh or queue while offline. New sends outside the gossip
   horizon with no stored owner hint are refused as unknown.
 
-Removed config keys and unknown future keys produce warnings. Run `flk config check --json` before a rollout to list removed and unknown keys with file and line locations; exit `1` means warnings, including removed keys. Startup, live handoff, and reload ignore removed keys and apply the remaining settings.
+Removed config keys and unknown future keys produce warnings. Run `flk config check --json` before a rollout to list removed and unknown-key warnings with safe schema shapes, source categories and line locations; exit `1` means warnings, including removed keys. Startup, live handoff, and reload ignore removed keys and apply the remaining settings.
 
 Existing peer lists become a mesh with fewer edges; reciprocal SSH access is
 not required. `[msg] allow_from` names are the authenticated origin's local

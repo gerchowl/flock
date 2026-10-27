@@ -1172,6 +1172,32 @@ automatic attempts in that server. Focus does not retry a failed deferred plan;
 `agent resume` is the explicit retry. Rationale: preserving a resumable binding
 under §1/§3 does not turn a past execution failure into a hibernation request.
 
+#### Directory invalidation (#2549)
+
+`directory_changed` is a durable, payload-free invalidation of the merged
+agent directory (local PTY identities, local structured identities and accepted
+remote summaries). Its envelope `seq` is the version; no second counter or mesh
+message kind is introduced. Membership, identity/name, harness and location/route
+changes invalidate; status ages, latency and repeated identical summaries do
+not. One recompute emits at most one event, and unchanged recomputes emit none.
+A fresh server starts with an empty comparison baseline, so restored rows cause
+one startup invalidation. The event reports committed local directory state,
+not a remote arrival before validation or an authoritative cross-host snapshot. Existing peer-summary
+transport and refresh cadence remain unchanged.
+
+Read a cursor **before** listing, then list, then hold `events.read` with
+`kinds: ["directory_changed"]`, `after` and `wait_ms`, with no subject filter
+(the invalidation is global). Advance using `next_after`
+and re-read the listing after an invalidation or explicit retention gap. This
+ordering closes the list/wait race; events are at-least-once and may coalesce
+multiple row changes in one recompute. An empty wait is a deadline, not evidence
+that a producer succeeded. Consumers still enforce their own liveness ceiling.
+
+The CLI/MCP event paths preserve raw JSON; the persisted-log reader skips unknown
+kinds under §3a. Strict Rust `EventKind`/`EventData` response deserialization does
+not itself ignore unknown kinds: typed consumers must filter to known kinds or
+upgrade. No claim of unknown-kind tolerance is made for those strict enums.
+
 ### 3a. Mixed fleets: every change here is additive on the wire
 
 Clients and servers of different versions meet daily: a CLI updated before the

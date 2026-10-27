@@ -2,6 +2,8 @@
 //! Composer and authenticated S7-min dispatchers call `App::structured_send`.
 //! Socket/CLI dispatch adapts its verified ancestry, never a producer string.
 //! A ticket succeeds only after the single journal owner commits admission.
+mod shell_identity;
+
 use super::responses::{encode_error, encode_success};
 use crate::{
     api::{
@@ -12,7 +14,7 @@ use crate::{
     structured::{
         permissions::Principal,
         queue::{
-            admission::{Failure, Gate},
+            admission::{Failure, Gate, Principal as QueuePrincipal},
             model::{Delivery, Kind, Priority, Producer, State},
             Item,
         },
@@ -39,6 +41,13 @@ pub(crate) struct SendParams {
 }
 type Key = (String, u64, String);
 type ResultId = Result<crate::api::schema::AgentSendResult, ErrorCode>;
+// Admission response and optional post-commit custody settlement.
+type Parked = (
+    String,
+    Receiver<ResultId>,
+    Sender<String>,
+    Option<super::structured_messages::Ack>,
+);
 /// Pending durable admission. Dropping a ticket never cancels a committed item.
 /// No delivery deadline or automatic retry exists. Reuse `item_id` after inspecting
 /// an uncertain result; identical committed retries are idempotent.
@@ -48,15 +57,32 @@ pub(crate) struct Ticket {
     /// Completion from the journal owner, not bounded-channel acceptance.
     pub committed: Receiver<ResultId>,
 }
-pub(crate) struct Staged(String, Ticket);
+pub(crate) struct Staged(
+    pub(super) String,
+    pub(super) Ticket,
+    pub(super) Option<super::structured_messages::Ack>,
+);
 /// Bounded response routing attached to the existing sole completion consumer.
 #[derive(Default)]
 pub(crate) struct Sends {
+    #[cfg(test)]
+    pub(super) custody_attempts: usize,
     waiting: HashMap<Key, Sender<ResultId>>,
-    parked: Vec<(String, Receiver<ResultId>, Sender<String>)>,
+    parked: Vec<Parked>,
+    pub(super) acknowledged: Vec<super::structured_messages::Ack>,
+    pub(super) recovering: Vec<crate::mesh::store::Envelope>,
+    pub(super) retries: HashMap<crate::mesh::key::MessageKey, super::mesh_routes::Retry>,
+    pub(super) failed: Vec<(super::structured_messages::Ack, ErrorCode)>,
     pub staged: Option<Staged>,
 }
 impl Sends {
+    /// Recovery without a backoff is due now; paused fleets do not call this.
+    pub(crate) fn recovery_deadline(&self, now: std::time::Instant) -> Option<std::time::Instant> {
+        self.recovering
+            .iter()
+            .map(|signed| self.retries.get(&signed.key).map_or(now, |r| r.at))
+            .min()
+    }
     fn full(&self, operator: bool) -> bool {
         self.waiting.len() + self.parked.len() >= if operator { 128 } else { 112 }
     }
@@ -75,12 +101,12 @@ impl Sends {
             );
         }
     }
-    pub(crate) fn park(&mut self, Staged(id, ticket): Staged, reply: Sender<String>) {
+    pub(crate) fn park(&mut self, Staged(id, ticket, ack): Staged, reply: Sender<String>) {
         tracing::debug!(
             item_id = ticket.item_id.as_str(),
             "waiting for durable queue admission"
         );
-        self.parked.push((id, ticket.committed, reply));
+        self.parked.push((id, ticket.committed, reply, ack));
     }
     /// Fences unresolved acknowledgements when their original worker disappears.
     /// Such an admission may have committed: report unknown, never auto-resend.
@@ -95,24 +121,39 @@ impl Sends {
                 true
             }
         });
-        self.parked.retain(|(id, receipt, reply)| {
+        let acknowledged = &mut self.acknowledged;
+        let failed = &mut self.failed;
+        self.parked.retain_mut(|(id, receipt, reply, ack)| {
             let result = match receipt.try_recv() {
                 Ok(result) => result,
                 Err(TryRecvError::Empty) => return true,
                 Err(TryRecvError::Disconnected) => Err(ErrorCode::InputWriteUnknown),
             };
             let response = match result {
-                Ok(result) => encode_success(
-                    id.clone(),
-                    ResponseResult::AgentQueued {
-                        item_id: result.item_id,
-                    },
-                ),
-                Err(code) => encode_error(
-                    id.clone(),
-                    code.as_str(),
-                    "structured admission refused or uncertain",
-                ),
+                Ok(result) => {
+                    let response = if let Some(ack) = ack.take() {
+                        let response = ack.response(result.item_id);
+                        acknowledged.push(ack);
+                        response
+                    } else {
+                        ResponseResult::AgentQueued {
+                            item_id: result.item_id,
+                        }
+                    };
+                    encode_success(id.clone(), response)
+                }
+                Err(code) => match ack.take() {
+                    Some(ack) => {
+                        let response = ack.refusal(id.clone(), code, workers);
+                        failed.push((ack, code));
+                        response
+                    }
+                    None => encode_error(
+                        id.clone(),
+                        code.as_str(),
+                        "structured admission refused or uncertain",
+                    ),
+                },
             };
             let _ = reply.send(response);
             false
@@ -177,20 +218,32 @@ impl App {
         params: crate::app::StructuredSendParams,
         principal: &Principal<'_>,
     ) -> Result<Ticket, ErrorCode> {
+        self.structured_send_via_pane(params, principal, None)
+    }
+
+    fn structured_send_via_pane(
+        &mut self,
+        params: crate::app::StructuredSendParams,
+        principal: &Principal<'_>,
+        pane: Option<crate::layout::PaneId>,
+    ) -> Result<Ticket, ErrorCode> {
         if !params.submit {
             return Err(ErrorCode::StructuredSubmitRequired);
         }
-        let origin = principal.queue_origin()?;
+        let mut origin = principal.queue_origin()?;
+        if let Some(pane) = pane {
+            if !origin.is_operator() {
+                return Err(ErrorCode::NotAuthorized);
+            }
+            origin = QueuePrincipal::OperatorViaPane(pane.raw());
+        }
         let (agent, generation) = self
             .structured_send_target(&params.target)?
             .ok_or(ErrorCode::AgentNotFound)?;
         if matches!(principal, Principal::Agent(id) | Principal::Lease(id) if *id == agent) {
             return Err(ErrorCode::SelfMessageForbidden);
         }
-        let operator = matches!(
-            origin,
-            crate::structured::queue::admission::Principal::Operator
-        );
+        let operator = origin.is_operator();
         let item_id = match params.item_id {
             Some(id) => id,
             None => {
@@ -199,11 +252,6 @@ impl App {
         };
         if !crate::structured::queue::admission::canonical_uuid(&item_id) {
             return Err(ErrorCode::InvalidRequest);
-        }
-        let key = (agent.clone(), generation, item_id.clone());
-        if self.structured_sends.full(operator) || self.structured_sends.waiting.contains_key(&key)
-        {
-            return Err(ErrorCode::SessionBusy);
         }
         let item = Item {
             item_id: item_id.clone(),
@@ -222,6 +270,23 @@ impl App {
             attachments: vec![],
             metadata: Default::default(),
         };
+        self.structured_enqueue(agent, generation, item, origin)
+    }
+    /// Single owner admission for authenticated adapters, including local custody.
+    pub(super) fn structured_enqueue(
+        &mut self,
+        agent: String,
+        generation: u64,
+        item: Item,
+        origin: QueuePrincipal,
+    ) -> Result<Ticket, ErrorCode> {
+        let operator = origin.is_operator();
+        let item_id = item.item_id.clone();
+        let key = (agent.clone(), generation, item_id.clone());
+        if self.structured_sends.full(operator) || self.structured_sends.waiting.contains_key(&key)
+        {
+            return Err(ErrorCode::SessionBusy);
+        }
         self.structured_workers.enqueue(
             &self.state.structured_agents,
             &agent,
@@ -236,6 +301,51 @@ impl App {
         self.structured_sends.waiting.insert(key, waiter);
         Ok(Ticket { item_id, committed })
     }
+    /// ADR-0036 §1a: a root shell's immediate socket child, never inferred
+    /// from unknown detection. All evidence is reread for this request.
+    fn operator_shell_send_pane(&mut self) -> Option<crate::layout::PaneId> {
+        let caller = shell_identity::Caller {
+            uid: self.current_api_peer_uid.flatten(),
+            pid: self.current_api_peer_pid,
+            birth: self.current_api_peer_birth.flatten(),
+            scoped: self.current_api_scope.is_some(),
+            unrelated: self.lease_caller() == crate::structured::lease::Caller::Unrelated,
+            relay: self
+                .inbound
+                .edge(
+                    self.current_api_peer_pid,
+                    crate::platform::process_start_time,
+                )
+                .is_some(),
+        };
+        let panes = self
+            .state
+            .workspaces
+            .iter()
+            .flat_map(|ws| &ws.tabs)
+            .flat_map(|tab| &tab.panes)
+            .filter_map(|(id, pane)| {
+                let terminal = self.state.terminals.get(&pane.attached_terminal_id)?;
+                let runtime = self.terminal_runtimes.get(&pane.attached_terminal_id)?;
+                Some(shell_identity::Pane {
+                    id: id.raw(),
+                    root_shell: pane.created_as_root_shell,
+                    agent: terminal.is_agent_terminal(),
+                    default_shell: runtime.was_spawned_with_default_shell(),
+                    pid: runtime.child_pid(),
+                    birth: runtime.child_birth(),
+                    reaped: runtime.child_exit().is_some_and(|exit| exit.is_reaped()),
+                })
+            });
+        shell_identity::admit(
+            caller,
+            self.runtime_config.uid_policy.operator,
+            panes,
+            crate::platform::live_process_facts,
+        )
+        .map(crate::layout::PaneId::from_raw)
+    }
+
     pub(super) fn handle_structured_send(&mut self, id: String, params: AgentSendParams) -> String {
         if !params.submit {
             return encode_error(
@@ -252,11 +362,13 @@ impl App {
             );
         }
         let operator = self.caller_is_local_operator();
+        let pane = self.operator_shell_send_pane();
         let caller = self.spawn_caller();
         let principal = match &caller {
-            super::SpawnCaller::Operator { .. } if operator => Principal::Operator,
-            super::SpawnCaller::Agent { agent_id, .. }
-            | super::SpawnCaller::Structured {
+            super::SpawnCaller::Operator { .. } if operator || pane.is_some() => {
+                Principal::Operator
+            }
+            super::SpawnCaller::Structured {
                 agent_id: Some(agent_id),
                 ..
             } => Principal::Agent(agent_id),
@@ -268,17 +380,19 @@ impl App {
                 )
             }
         };
-        match self.structured_send(
-            SendParams {
-                target: params.target,
-                text: params.text,
-                submit: params.submit,
-                item_id: params.item_id,
-            },
-            &principal,
-        ) {
+        let params = SendParams {
+            target: params.target,
+            text: params.text,
+            submit: params.submit,
+            item_id: params.item_id,
+        };
+        let result = match pane {
+            Some(pane) => self.structured_send_via_pane(params, &principal, Some(pane)),
+            None => self.structured_send(params, &principal),
+        };
+        match result {
             Ok(ticket) => {
-                self.structured_sends.staged = Some(Staged(id, ticket));
+                self.structured_sends.staged = Some(Staged(id, ticket, None));
                 String::new()
             }
             Err(code) => encode_error(id, code.as_str(), "structured admission refused"),
@@ -347,3 +461,7 @@ mod tests {
         assert!(sends.full(true));
     }
 }
+
+#[cfg(test)]
+#[path = "structured_queue_refusal_tests.rs"]
+mod refusal_tests;

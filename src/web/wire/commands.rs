@@ -320,7 +320,7 @@ pub(super) async fn execute(
         }
     }
     .await;
-    // ADR-0036 §5a: a lost ack must not suppress principal-wide revocation.
+    // ADR-0036 §5a: a lost ack must not suppress revocation of this credential’s sockets.
     if revoked {
         shared.revoke(&session);
     }

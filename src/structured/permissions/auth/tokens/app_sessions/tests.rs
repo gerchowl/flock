@@ -51,7 +51,8 @@ fn private_issue_is_fixed_operator_scoped_memory_only_and_renews_fresh() {
         .unwrap());
     let renewed = store.issue(&authority).unwrap();
     assert_ne!(renewed.token, first.token);
-    assert_ne!(renewed.info.principal, first.info.principal);
+    assert_eq!(renewed.info.principal, first.info.principal);
+    assert_ne!(renewed.info.name, first.info.name);
     assert!(store.authenticate(&first.token).is_ok());
 }
 #[test]
@@ -266,6 +267,7 @@ fn exact_revocation_keeps_a_renewed_credential_independent() {
     let second = store.issue(&authority).unwrap();
     let first_session = store.authenticate(&first.token).unwrap();
     let second_session = store.authenticate(&second.token).unwrap();
+    assert_eq!(first.info.principal, second.info.principal);
     store.revoke(&first_session).unwrap();
     assert!(*first_session.revoked.borrow());
     assert!(!*second_session.revoked.borrow());
@@ -341,4 +343,49 @@ fn an_exited_prearmed_peer_cannot_receive_a_credential() {
         Err(IssueError::PeerProcessChanged(_))
     ));
     assert!(store.entries.lock().unwrap().is_empty());
+}
+
+#[test]
+fn issued_lifetime_matches_enforced_deadline_in_the_injected_clock() {
+    let (_root, files, store, clock, mut app) = fixture();
+    let authority = app.client_token_authority().unwrap();
+    for elapsed in [Duration::ZERO, Duration::from_millis(1731)] {
+        clock.advance(elapsed);
+        let issue_time = clock.now();
+        let issued = store.issue(&authority).unwrap();
+        let session = store.authenticate(&issued.token).unwrap();
+        let expected =
+            u64::try_from(session.expires.duration_since(issue_time).as_millis()).unwrap();
+        let wire = serde_json::to_value(&issued).unwrap();
+        assert_eq!(wire["info"]["expires_in_ms"].as_u64(), Some(expected));
+        assert_eq!(session.expires, issue_time + TTL);
+    }
+    let file = files
+        .issue(&authority, "persistent", [Scope::Read].into())
+        .unwrap();
+    assert!(serde_json::to_value(file).unwrap()["info"]
+        .get("expires_in_ms")
+        .is_none());
+    let old = serde_json::json!({"name":"old","principal":"old-principal","scopes":["read"]});
+    let info: TokenInfo = serde_json::from_value(old.clone()).unwrap();
+    assert_eq!(serde_json::to_value(info).unwrap(), old);
+}
+
+#[test]
+fn operator_identity_survives_a_store_restart_without_reusing_credentials() {
+    let (_root, files, store, clock, mut app) = fixture();
+    let authority = app.client_token_authority().unwrap();
+    let first = store.issue(&authority).unwrap();
+    let principal = first.info.principal.clone();
+    assert_eq!(
+        principal,
+        format!("app:operator:{}", authority.peer_credentials().uid.unwrap())
+    );
+    drop(store);
+    let restarted = Store::new(files, clock);
+    assert!(restarted.authenticate(&first.token).is_err());
+    let second = restarted.issue(&authority).unwrap();
+    assert_eq!(second.info.principal, principal);
+    assert_ne!(second.token, first.token);
+    assert_ne!(second.info.name, first.info.name);
 }

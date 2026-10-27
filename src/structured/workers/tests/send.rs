@@ -14,24 +14,7 @@ fn params(target: &str, n: u32, text: &str) -> AgentSendParams {
         .unwrap()
 }
 fn inputs(r: &AppQueue) -> Vec<Value> {
-    let path = r
-        .case
-        .fixture
-        .root
-        .path()
-        .join("sessions")
-        .join(&r.case.id)
-        .join(format!("{}.jsonl", r.case.session));
-    fs::read_to_string(path)
-        .unwrap_or_default()
-        .split_inclusive('\n')
-        .filter(|line| line.ends_with('\n'))
-        .map(|line| {
-            let record: Value = serde_json::from_str(line).unwrap();
-            serde_json::from_str::<Value>(record["raw"].as_str().unwrap()).unwrap()
-        })
-        .filter(|v| v["type"] == "fixture_input")
-        .collect()
+    r.inputs()
 }
 fn disk(r: &AppQueue) -> Vec<u8> {
     fs::read(
@@ -302,3 +285,7 @@ fn narrow(p: AgentSendParams) -> crate::app::StructuredSendParams {
         item_id: p.item_id,
     }
 }
+
+mod local_messages;
+
+mod shell_panes;

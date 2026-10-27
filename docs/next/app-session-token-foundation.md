@@ -30,7 +30,13 @@ revokes every app credential before stopping its sockets. Persistent file
 credentials remain valid across these boundaries.
 
 Each credential expires exactly 12 monotonic hours after issuance, with no
-sliding renewal. Renewal issues an independent bearer and principal. At most
+sliding renewal. Renewal issues an independent bearer and token name with the same operator
+principal, `app:operator:<uid>` (decimal kernel-attested UID). Identity survives
+restart and handoff while credentials do not. Revocation fanout is per
+credential; each mint has four registered-socket slots keyed by its bearer
+digest, including pending welcome. A fully occupied old mint cannot starve a
+fresh mint's socket budget. The four unauthenticated hello slots and sixteen
+upgraded sockets remain global. At most
 128 app entries live. Issuance first reclaims expired/exited entries; capacity
 or admission contention refuses with `session_busy`. No failed mint discloses
 a credential. Storage/entropy failures return `internal_error`.
@@ -55,5 +61,48 @@ Failed watch registration or bounded retirement work closes fail-closed with
 issuance reclaims them. Revocation notifications happen after earlier shared
 admissions drain.
 
-Shell-origin admission and pre-auth limits remain #2442 PR2. There are no
-`desktop/` changes in this server slice.
+The captured shell Origin/header pair is admitted only on `/v1/ws` (#2442).
+The sibling listener, pre-auth UID attribution and revised transport budgets
+belong to the next approved #2500 slice. Existing pending-hello and connection
+limits are unchanged here. There are no `desktop/` changes in this server slice.
+
+The server's transport-neutral `App::admit_local_peer` checks explicit kernel
+credentials rather than borrowing the current CLI request's caller context.
+It requires a known operator UID, the original live PID/birth, and no pane,
+structured-agent or mesh-edge origin. Complete ancestry is supported through
+sixteen stable process links, matching the pane-origin resolver; unavailable,
+reused or truncated ancestry cannot establish operator authority. The proof owns
+its exit watch, which admission rechecks before publishing any registration,
+including an exit during the ancestry walk. The watch stays private; `process()`
+lends a shared reference so callers cannot replace it while retaining the peer's
+credentials.
+
+`server::Store::admit_peer` holds the existing shared admission/revocation fence
+through its registration callback. Local app credentials must match the minting
+PID and birth; a missing peer proof cannot admit one. Persistent credentials
+retain exactly their current grants, including send-only credentials. Watch or
+store I/O failures remain distinct from process-instance refusal. This primitive
+is staged for the sibling-listener integration in #2500; the TCP hello behavior
+switches together with that listener, not in this preparatory slice.
+
+The next preparatory slice supplies `local_listener::Listener`, reusing the
+existing HTTP server over Unix streams and capturing credentials from the
+accepted kernel socket. `prepare` binds without accepting, `activate` starts
+serving only when explicitly called, and `stop` cancels the acceptor and its
+owned HTTP tasks. Production startup does not call these methods yet, so this
+slice creates no new reachable endpoint and does not change TCP authentication.
+Owner admission and the TCP app-session refusal will activate together in the
+following #2500 slice.
+
+`socket_path` derives `flock-ws.sock` beside `flock.sock`; an API override such
+as `custom.sock` instead derives `custom-ws.sock`, keeping separate instances
+in one directory distinct. Preparation requires an existing, real,
+operator-owned parent directory without group/other write permission. Callers
+must provide a trusted ancestor chain, as for the API socket namespace. It
+refuses unsafe parents without creating or repairing them. The socket uses the
+API's `0600` mode constant and permanent `SocketOwner` lock. `owner` retains a
+rollback reference; its duplicate can pass through the existing SCM_RIGHTS
+handoff machinery and be adopted before `prepare`. `unlink` and destruction
+remove only the recorded binding's inode. Exporter/importer orchestration and
+its manifest extension belong to the activation slice; no new descriptor is
+exported by production handoff in this foundation.

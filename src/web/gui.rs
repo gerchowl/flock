@@ -10,7 +10,7 @@
 
 use axum::{
     extract::State,
-    http::{header, HeaderMap, StatusCode, Uri},
+    http::{header, HeaderMap, HeaderValue, StatusCode, Uri},
     response::{IntoResponse, Response},
     routing::get,
     Json, Router,
@@ -47,7 +47,7 @@ fn router_for<A: RustEmbed + 'static>(bind: SocketAddr) -> io::Result<Router> {
     }
     Ok(Router::new()
         .fallback(get(serve::<A>))
-        .with_state(bind.to_string()))
+        .with_state((bind.to_string(), document_policy(bind))))
 }
 
 fn refusal(status: StatusCode, code: ErrorCode, message: &'static str) -> Response {
@@ -88,6 +88,25 @@ pub(super) fn origin_allowed(headers: &HeaderMap, authority: &str) -> bool {
     })
 }
 
+/// Captured shell headers are admitted only by the listener's exact WS route.
+pub(super) fn shell_origin_allowed(headers: &HeaderMap, authority: &str) -> bool {
+    if headers.get_all(header::ORIGIN).iter().count() != 1
+        || headers
+            .get(header::ORIGIN)
+            .is_none_or(|v| v != "tauri://localhost")
+        || headers.get_all("sec-fetch-site").iter().count() != 1
+        || headers
+            .get("sec-fetch-site")
+            .is_none_or(|v| v != "cross-site")
+    {
+        return false;
+    }
+    let mut same_origin = headers.clone();
+    same_origin.remove(header::ORIGIN);
+    same_origin.remove("sec-fetch-site");
+    origin_allowed(&same_origin, authority)
+}
+
 fn immutable(path: &str) -> bool {
     // Anchor Vite's default flat assets/[name]-[hash:8].[ext] pattern.
     let Some(name) = path.strip_prefix("assets/") else {
@@ -108,6 +127,33 @@ fn immutable(path: &str) -> bool {
         && suffix[1..].iter().all(name_char)
         && !extension.is_empty()
         && extension.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
+/// The entry document's policy, with `LISTENER` for the numeric authority.
+/// `web/client/e2e/csp.test.ts` serves these same bytes to the production
+/// bundle in Chromium and fails on any violation (#1848).
+const DOCUMENT_POLICY: &str = include_str!("gui/document-policy.txt");
+
+/// Policy for every listener response other than the entry document: API
+/// replies, assets and refusals are never pages that may load anything.
+pub(super) const RESOURCE_POLICY: &str =
+    "default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+
+/// Restrict the entry document to bundled resources and its listener's transport.
+///
+/// CSP3's `'self'` matches same-host/port WebSockets; the explicit IPv4
+/// source also covers browsers with older matching rules. It names the bound
+/// address, never request headers. IPv6 literals are invalid CSP host sources,
+/// so an IPv6 document relies on `'self'` alone and fails closed on older
+/// browsers.
+fn document_policy(bind: SocketAddr) -> HeaderValue {
+    let template = DOCUMENT_POLICY.trim_end();
+    let policy = if bind.is_ipv4() {
+        template.replace("LISTENER", &bind.to_string())
+    } else {
+        template.replace(" ws://LISTENER/v1/ws", "")
+    };
+    HeaderValue::from_str(&policy).expect("numeric listener authority yields a valid CSP header")
 }
 
 fn content_type(path: &str) -> &'static str {
@@ -131,7 +177,7 @@ fn content_type(path: &str) -> &'static str {
 }
 
 async fn serve<A: RustEmbed>(
-    State(authority): State<String>,
+    State((authority, policy)): State<(String, HeaderValue)>,
     uri: Uri,
     headers: HeaderMap,
 ) -> Response {
@@ -188,6 +234,9 @@ async fn serve<A: RustEmbed>(
         file.data.into_owned().into_response()
     };
     let output = response.headers_mut();
+    if path == "index.html" {
+        output.insert(header::CONTENT_SECURITY_POLICY, policy);
+    }
     output.insert(
         header::CACHE_CONTROL,
         cache.parse().expect("constant cache header"),

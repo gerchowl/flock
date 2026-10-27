@@ -40,8 +40,8 @@ const MAX_MESSAGE: usize = 65_536;
 const CONNECTIONS: u32 = 16;
 /// Pending unauthenticated sockets; leave capacity for authenticated sessions.
 const PENDING_HELLOS: usize = 4;
-/// Registered sockets per verified token principal, including pending welcome.
-const PRINCIPAL_CONNECTIONS: usize = 4;
+/// Registered sockets per authenticated bearer digest, including pending welcome.
+const CREDENTIAL_CONNECTIONS: usize = 4;
 /// Maximum queued control messages per socket.
 const PRIORITY_CAPACITY: usize = 4;
 /// Maximum queued data messages per socket.
@@ -82,7 +82,7 @@ impl Shared {
     fn revoke(&self, session: &Session) {
         if let Ok(clients) = self.clients.lock() {
             for client in clients.values() {
-                if client.session.info.principal == session.info.principal {
+                if client.session.same_credential(session) {
                     let _ = client.revoke.send(true);
                 }
             }
@@ -198,16 +198,20 @@ impl Core {
     pub(crate) fn service_commands(&mut self, app: &mut crate::app::App) {
         self.command_owner.service(app);
     }
-    /// Cancel transport work and wait for every connection lease, including hello.
+    /// Stop and drain every transport lease even when app revocation fails.
+    /// Return the revocation failure after bounded cleanup, logging it first.
     pub(crate) async fn shutdown(&self) -> io::Result<()> {
         let store = self.shared.store.clone();
-        super::store_io::shared()
+        let revocation = super::store_io::shared()
             .run(move || store.shutdown())
             .await
-            .ok_or_else(|| io::Error::other("app revocation worker unavailable"))?
-            .map_err(io::Error::other)?;
+            .ok_or_else(|| io::Error::other("app revocation worker unavailable"))
+            .and_then(|out| out.map_err(io::Error::other));
+        if let Err(error) = &revocation {
+            crate::logging::client_app_revocation_failed(error);
+        }
         self.shared.stop.send_replace(true);
-        tokio::time::timeout(SHUTDOWN_WAIT, async {
+        let drained = tokio::time::timeout(SHUTDOWN_WAIT, async {
             let _ = self
                 .shared
                 .slots
@@ -218,7 +222,8 @@ impl Core {
         })
         .await
         .map(|_| ())
-        .map_err(io::Error::other)
+        .map_err(io::Error::other);
+        revocation.and(drained)
     }
 }
 /// Keep credentials and transport deadlines in the same injected monotonic domain.
@@ -425,9 +430,9 @@ async fn connection(
     if let Ok(mut clients) = shared.clients.lock() {
         if clients
             .values()
-            .filter(|c| c.session.info.principal == principal)
+            .filter(|c| c.session.same_credential(&session))
             .count()
-            >= PRINCIPAL_CONNECTIONS
+            >= CREDENTIAL_CONNECTIONS
         {
             let _ = socket.send(close(GOING_AWAY_CLOSE)).now_or_never();
             return;
@@ -570,7 +575,10 @@ async fn connection(
             _ = running.join_next() => (),
         }
     }
-    if code == AUTH_REVOKED_CLOSE && session.app().is_some_and(|s| !*s.revoked.borrow()) {
+    if code == AUTH_REVOKED_CLOSE
+        && !*shared.stop.borrow()
+        && session.app().is_some_and(|s| !*s.revoked.borrow())
+    {
         let store = shared.store.clone();
         let session = session.clone();
         if !matches!(

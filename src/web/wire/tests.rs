@@ -157,7 +157,7 @@ impl Drop for Server {
         self.task.abort();
     }
 }
-pub(crate) struct Socket(tokio::net::TcpStream);
+pub(crate) struct Socket(pub(crate) tokio::net::TcpStream);
 #[derive(Debug)]
 pub(crate) enum Received {
     Text(Value),
@@ -1034,12 +1034,12 @@ async fn revoke_during_hello(at: u64, registered: usize) {
 }
 
 #[test]
-fn per_principal_quota_preserves_siblings_and_global_sixteen_socket_limit() {
+fn per_credential_quota_preserves_siblings_and_global_sixteen_socket_limit() {
     runtime(async {
         let server = Server::new().await;
         let mut sockets = Vec::new();
         for token in ["a", "d", "b", "1"] {
-            for _ in 0..PRINCIPAL_CONNECTIONS {
+            for _ in 0..CREDENTIAL_CONNECTIONS {
                 let mut client = Socket::open(&server).await;
                 client.hello(1, &token.repeat(64)).await;
                 sockets.push(client);

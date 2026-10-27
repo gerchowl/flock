@@ -9,7 +9,9 @@
 //! The worker exposes committed cuts and transitions through one completion owner.
 #![deny(missing_docs)]
 pub(crate) mod admission;
+pub(crate) mod custody;
 mod facts;
+pub(in crate::structured) mod inbox;
 pub mod model;
 mod policy;
 pub use policy::RewritePolicy;
@@ -27,7 +29,7 @@ use std::path::{Path, PathBuf};
 
 /// Journal format understood by this writer. Unstamped journals are version 1.
 /// Bump for every new record kind, top-level field or enum variant name.
-pub const FORMAT_VERSION: u64 = 2;
+pub const FORMAT_VERSION: u64 = 3;
 
 const LINE_LIMIT: u64 = 2 * 1024 * 1024;
 
@@ -57,12 +59,14 @@ pub struct Journal {
     agent: String,
     directory: File,
     file: File,
-    items: Vec<Item>,
+    items: std::sync::Arc<Vec<Item>>,
     facts: Vec<crate::api::queue_event::QueueItemState>,
     records: Vec<Value>,
     seq: u64,
     checkpoint: Option<(u64, u64)>,
     version: u64,
+    // Writer capability, never taken from the persisted stamp.
+    supported: u64,
     future: bool,
     corrupt: Option<QueueJournalCorrupt>,
     opaque: HashSet<String>,
@@ -108,6 +112,11 @@ fn track_opaque(change: &Change, unknown: bool, opaque: &mut HashSet<String>) {
     }
 }
 impl Journal {
+    /// The owning agent namespace, never a producer claim.
+    pub(crate) fn agent(&self) -> &str {
+        &self.agent
+    }
+
     /// Acquire exclusive `queue/<agent>` ownership and recover committed state.
     /// Components are ASCII identifiers, never paths. Uppercase letters use an
     /// injective, case-insensitive-safe encoding; the journal verifies the original
@@ -117,13 +126,14 @@ impl Journal {
     /// Unknown data are logged and preserved raw, never interpreted for delivery.
     /// Only a supported journal's unterminated final tail is repaired.
     pub fn open(data: &Path, agent: &str) -> io::Result<Self> {
-        Self::open_inner(data, agent, None, true)
+        Self::open_inner(data, agent, None, true, FORMAT_VERSION)
     }
     fn open_inner(
         data: &Path,
         agent: &str,
         rewrite: Option<RewritePolicy>,
         create: bool,
+        supported: u64,
     ) -> io::Result<Self> {
         if agent.is_empty()
             || !agent
@@ -172,12 +182,13 @@ impl Journal {
             agent: agent.to_owned(),
             directory: File::open(dir)?,
             file,
-            items: Vec::new(),
+            items: Default::default(),
             facts: Vec::new(),
             records: Vec::new(),
             seq: 0,
             checkpoint: None,
-            version: FORMAT_VERSION,
+            version: supported,
+            supported,
             future: false,
             corrupt: None,
             opaque: HashSet::new(),
@@ -221,6 +232,26 @@ impl Journal {
     pub fn items(&self) -> &[Item] {
         &self.items
     }
+    /// Share the existing committed fold without copying items or indexing keys.
+    /// Appends already fold on a private vector and publish it only after sync.
+    pub(crate) fn item_snapshot(&self) -> std::sync::Arc<Vec<Item>> {
+        self.items.clone()
+    }
+    /// Why retained items cannot prove absence of a committed item, if unknown.
+    /// Opaque records, read-only state and uncertain writes prevent that proof.
+    pub(crate) fn commitment_unknown(&self) -> Option<custody::Unknown> {
+        use custody::Unknown;
+        if self.poisoned {
+            Some(Unknown::WriteUncertain)
+        } else if let Some(reason) = self.read_only() {
+            Some(match reason {
+                ReadOnly::Newer(_) => Unknown::JournalNewer,
+                ReadOnly::Corrupt(_) => Unknown::JournalCorrupt,
+            })
+        } else {
+            self.future.then_some(Unknown::JournalOpaque)
+        }
+    }
     /// Committed encoded size for the worker's configured rewrite threshold.
     pub fn bytes(&self) -> io::Result<u64> {
         self.healthy()?;
@@ -234,9 +265,9 @@ impl Journal {
     /// Typed read-only status. Reads remain available; mutations must not retry.
     pub fn read_only(&self) -> Option<ReadOnly> {
         self.corrupt.map(ReadOnly::Corrupt).or_else(|| {
-            (self.version > FORMAT_VERSION).then_some(ReadOnly::Newer(QueueJournalNewer {
+            (self.version > self.supported).then_some(ReadOnly::Newer(QueueJournalNewer {
                 found: self.version,
-                supported: FORMAT_VERSION,
+                supported: self.supported,
             }))
         })
     }
@@ -271,9 +302,9 @@ impl Journal {
     /// snapshot, rather than assuming append always advances by exactly one.
     pub fn append(&mut self, change: Change) -> io::Result<Record> {
         self.writable()?;
-        let mut items = self.items.clone();
+        let mut items = self.items.as_ref().clone();
         change.apply(&mut items)?;
-        let needs_checkpoint = self.version < FORMAT_VERSION || self.rewrite_required()?;
+        let needs_checkpoint = self.version < self.supported || self.rewrite_required()?;
         let snapshot = if needs_checkpoint {
             self.items.len() as u64
         } else {
@@ -302,7 +333,7 @@ impl Journal {
             &items,
             record.seq,
         ));
-        self.items = items;
+        self.items = std::sync::Arc::new(items);
         track_opaque(
             &record.change,
             record.change.has_unknown(),
@@ -388,7 +419,7 @@ impl Journal {
                 })
             })
             .collect::<Result<_, _>>()?;
-        let mut bytes = encode(&self.identity(FORMAT_VERSION))?;
+        let mut bytes = encode(&self.identity(self.supported))?;
         bytes.extend(encode(
             &json!({"kind":"queue_checkpoint","before":before,"high_water":high}),
         )?);
@@ -408,7 +439,7 @@ impl Journal {
             this.file = private_fs::open_append_file(&this.path)?;
             Ok(())
         })?;
-        self.version = FORMAT_VERSION;
+        self.version = self.supported;
         self.seq = high;
         self.records = records;
         self.checkpoint = Some((before, high));
@@ -465,7 +496,7 @@ impl Journal {
                         break;
                     }
                 }
-                if self.version <= FORMAT_VERSION {
+                if self.version <= self.supported {
                     return Err(if good == 0 || !line.ends_with(b"\n") {
                         problem("oversize queue record")
                     } else {
@@ -482,7 +513,7 @@ impl Journal {
             let value: Value = match serde_json::from_slice(&line) {
                 Ok(value) => value,
                 Err(_error) if good > 0 => {
-                    if self.version <= FORMAT_VERSION {
+                    if self.version <= self.supported {
                         return Err(corrupt(good, None, "invalid_json"));
                     }
                     self.future = true;
@@ -538,7 +569,7 @@ impl Journal {
                 self.checkpoint = Some((before, high));
             } else {
                 let Some(seq) = value["seq"].as_u64() else {
-                    if self.version <= FORMAT_VERSION {
+                    if self.version <= self.supported {
                         return Err(corrupt(good, None, "missing_sequence"));
                     }
                     self.future = true;
@@ -557,7 +588,7 @@ impl Journal {
                     serde_json::from_value::<Record>(value.clone())
                         .map_err(io::Error::other)
                         .and_then(|record| {
-                            let mut items = self.items.clone();
+                            let mut items = self.items.as_ref().clone();
                             record.change.apply(&mut items)?;
                             let unknown = record.change.has_unknown()
                                 || serde_json::to_value(&record)? != value;
@@ -569,17 +600,17 @@ impl Journal {
                                     "unknown_data",
                                 );
                             }
-                            self.items = items;
+                            self.items = std::sync::Arc::new(items);
                             Ok(())
                         })
                 } else {
                     Err(problem("unknown queue kind"))
                 };
                 if recovered.is_err() {
-                    if known && self.version <= FORMAT_VERSION {
+                    if known && self.version <= self.supported {
                         return Err(corrupt(good, Some(seq), "malformed_known_record"));
                     }
-                    if !known && !value["kind"].is_string() && self.version <= FORMAT_VERSION {
+                    if !known && !value["kind"].is_string() && self.version <= self.supported {
                         return Err(corrupt(good, Some(seq), "missing_kind"));
                     }
                     self.future = true;
@@ -614,7 +645,7 @@ impl Journal {
         if self.checkpoint.is_some_and(|(_, high)| self.seq < high) {
             return Err(corrupt(good, None, "incomplete_checkpoint"));
         }
-        if self.version < FORMAT_VERSION || self.rewrite_required()? {
+        if self.version < self.supported || self.rewrite_required()? {
             self.checkpointable()?;
         }
         if good < self.file.metadata()?.len() {

@@ -224,12 +224,14 @@ impl App {
             now,
             crate::app::notifications::now_ms(),
         );
-        self.queue_events.poll(
+        let published = self.queue_events.poll(
             &self.structured_workers,
             &self.state.structured_agents,
             &self.event_hub,
             &mut self.structured_sends,
-        ) || changed
+        );
+        self.finish_structured_messages(changed || published, now);
+        published || changed
     }
 
     pub(crate) fn handle_scheduled_tasks(&mut self, now: Instant, geometry_dirty: bool) -> bool {
@@ -749,6 +751,9 @@ impl App {
             // ADR-0028 §5: a wait expires on time in a quiet loop.
             self.waits.next_deadline(),
             self.input_writes.next_deadline(),
+            (!self.fleet_pause.paused)
+                .then(|| self.structured_sends.recovery_deadline(now))
+                .flatten(),
             self.structured_workers
                 .next_deadline(&self.state.structured_agents),
             // #540: the same, for an armed self-compaction — the Enter of a

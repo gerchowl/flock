@@ -4,6 +4,8 @@ mod peer_uid_tests;
 mod scoped_mcp_tests;
 #[cfg(test)]
 mod structured_lease_tests;
+#[cfg(test)]
+mod structured_relay_tests;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
@@ -27,6 +29,9 @@ mod mesh_replies;
 pub(crate) mod mesh_routes;
 mod mesh_spokes;
 pub(super) mod messages;
+mod native_inbox;
+#[cfg(test)]
+mod native_inbox_caller_tests;
 mod owner;
 mod owners;
 mod panes;
@@ -36,7 +41,9 @@ mod revert;
 mod spawn;
 mod structured_agents;
 mod structured_grants;
+pub(crate) mod structured_messages;
 pub(crate) mod structured_queue;
+mod structured_relay;
 mod structured_start;
 mod tabs;
 pub(crate) mod workspaces;
@@ -542,6 +549,7 @@ impl App {
                     }
                     summary.latency_ms = Some(payload.latency_ms);
                     summary.workspaces = payload.workspaces;
+                    summary.structured_agents = payload.structured_agents;
                     summary.last_ok = Some(std::time::Instant::now());
                     summary.error = None;
                     if let crate::peers::DialLog::Recovered {
@@ -610,6 +618,7 @@ impl App {
             // Only meaningful now that carried freshness decays.
             self.note_mesh_owners();
             self.state.evict_expired_relayed_entries();
+            self.sync_directory_events();
             self.render_dirty.store(true, Ordering::Release);
             self.render_notify.notify_one();
             return;
@@ -1421,6 +1430,7 @@ impl App {
         // ADR-0005) before the response goes out, so a socket caller sees its
         // own event on the stream.
         self.drain_pending_ui_events();
+        self.sync_directory_events();
         response
     }
 
@@ -2064,6 +2074,7 @@ mod tests {
                 peer: "kiln".into(),
                 stream_error: None,
                 result: Ok(crate::peers::PeerSummaryPayload {
+                    structured_agents: Vec::new(),
                     node_id: None,
                     outbound_pending: false,
                     host: "kiln-host".into(),
@@ -2225,6 +2236,7 @@ mod tests {
                 crate::peers::PeerSummaryFetch {
                     peer: "atlas".into(),
                     result: Ok(crate::peers::PeerSummaryPayload {
+                        structured_agents: Vec::new(),
                         node_id: None,
                         outbound_pending: false,
                         host: "atlas".into(),
@@ -2290,6 +2302,7 @@ mod tests {
                 peer: "kiln".into(),
                 stream_error: None,
                 result: Ok(crate::peers::PeerSummaryPayload {
+                    structured_agents: Vec::new(),
                     node_id: None,
                     outbound_pending: false,
                     host: "kiln-host".into(),
@@ -3584,6 +3597,7 @@ mod tests {
                 peer: "kiln".into(),
                 stream_error: None,
                 result: Ok(crate::peers::PeerSummaryPayload {
+                    structured_agents: Vec::new(),
                     node_id: None,
                     outbound_pending: false,
                     host: "kiln-host".into(),

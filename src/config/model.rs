@@ -815,9 +815,10 @@ pub enum KeyDiagnosticKind {
     Unknown,
 }
 
-/// A config diagnostic about one key. `key` is dotted and canonical
-/// (`msg.future`, `peers.summary_command`, `toast`), so the same key reported
-/// by the loader and by the source scan compares equal.
+/// A config diagnostic with a safe canonical schema location. Unknown names
+/// stop at the nearest declared container, map entries use `<key>`, arrays use
+/// `[]`, and unknown roots use `document root`. Removed historical keys keep
+/// their closed schema spelling so loader/source-scan warnings compare equal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeyDiagnostic {
     pub kind: KeyDiagnosticKind,
@@ -1458,6 +1459,9 @@ pub struct AdvancedConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct MsgConfig {
+    /// Native tool-inbox read window after first harness delivery, in milliseconds.
+    /// Defaults to the pane mailbox window (24 hours). Custody is independent.
+    pub inbox_retention_ms: u64,
     /// Accept agent-to-agent messages at all. Default: true.
     ///
     /// A node that sets this false still SENDS — this governs what it is
@@ -1535,6 +1539,7 @@ pub struct MsgConfig {
 impl Default for MsgConfig {
     fn default() -> Self {
         Self {
+            inbox_retention_ms: crate::app::mailboxes::UNDELIVERED_TTL_MS,
             enabled: true,
             allow_from: vec!["*".to_string()],
             mute_reason_max_chars: 200,
