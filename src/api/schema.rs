@@ -2753,6 +2753,8 @@ pub enum EventMatch {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EventKind {
+    /// ADR-0028 §3: re-read the merged directory after this durable invalidation.
+    DirectoryChanged,
     StructuredGrantRevoked,
     /// ADR-0036 §4: committed queue item transition, linked to its queue cursor.
     QueueItemState,
@@ -2889,7 +2891,8 @@ impl EventKind {
     /// story; every lifecycle + lineage kind persists.
     pub fn is_persisted(self) -> bool {
         match self {
-            Self::StructuredGrantRevoked
+            Self::DirectoryChanged
+            | Self::StructuredGrantRevoked
             | Self::QueueItemState
             | Self::WorkspaceCreated
             | Self::WorkspaceUpdated
@@ -4423,6 +4426,8 @@ pub struct AgentPhaseEvent {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum EventData {
+    /// Payload-free directory invalidation; the envelope sequence is its version.
+    DirectoryChanged {},
     StructuredGrantRevoked {
         agent_id: String,
         generation: u64,

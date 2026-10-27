@@ -139,12 +139,11 @@ impl Listener {
         socket.set_nonblocking(true)?;
         let acceptor = tokio::net::TcpListener::from_std(socket.try_clone()?)?;
         let core = Core::new_shared(data.clone(), wake, credentials).await?;
-        let csp = HeaderValue::from_str(&format!("default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self' ws://{actual}/v1/ws; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'")).map_err(io::Error::other)?;
         let router = core
             .router()
             .merge(client_exchange::router(codes, data, actual).map_err(io::Error::other)?)
             .merge(gui::router(actual)?)
-            .layer(middleware::from_fn_with_state((actual, csp), guard));
+            .layer(middleware::from_fn_with_state(actual, guard));
         Ok(Some(Self {
             health,
             socket,
@@ -186,24 +185,28 @@ impl Listener {
     }
 }
 async fn guard(
-    State((bind, csp)): State<(SocketAddr, HeaderValue)>,
+    State(bind): State<SocketAddr>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     request: Request,
     next: Next,
 ) -> Response {
     let authority = bind.to_string();
     let headers = request.headers();
-    if peer.ip() != Ipv4Addr::LOCALHOST
+    let mut response = if peer.ip() != Ipv4Addr::LOCALHOST
         || !(gui::origin_allowed(headers, &authority)
             || (request.uri().path() == "/v1/ws" && gui::shell_origin_allowed(headers, &authority)))
         || (request.uri().path().starts_with("/v1/") && !headers.contains_key(header::ORIGIN))
     {
-        return StatusCode::FORBIDDEN.into_response();
-    }
-    let mut response = next.run(request).await;
+        StatusCode::FORBIDDEN.into_response()
+    } else {
+        next.run(request).await
+    };
+    // The GUI entry document carries its own policy (#1848); nothing else
+    // this listener returns is a page that may load or embed anything.
     response
         .headers_mut()
-        .insert(header::CONTENT_SECURITY_POLICY, csp);
+        .entry(header::CONTENT_SECURITY_POLICY)
+        .or_insert(HeaderValue::from_static(gui::RESOURCE_POLICY));
     response
 }
 /// Inspect forwarding targets while tolerating unrelated configuration metadata.
