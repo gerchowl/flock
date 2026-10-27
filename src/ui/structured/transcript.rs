@@ -1,8 +1,8 @@
 //! Source-anchored transcript compute/paint; no subscriptions, file reads or authority.
 use super::markdown::{lines, safe, wrap, DisplayLine};
-use crate::structured::view::contracts::{Action, Card, Content};
+use crate::structured::view::contracts::{Action, Card, CardId, Content};
 use ratatui::{layout::Rect, text::Line, widgets::Paragraph, Frame};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Visible physical rows and exact button rectangles, computed together before painting.
 pub(crate) struct Transcript {
@@ -30,15 +30,19 @@ impl Transcript {
     }
 }
 
-fn content(card: &Card) -> (String, Vec<Line<'static>>) {
+fn content(card: &Card, tools: &BTreeMap<&str, &str>) -> (String, Vec<Line<'static>>) {
     let (title, body) = match &card.content {
         Content::Markdown(t) => return ("Assistant".into(), lines(t)),
         Content::Text(t) => ("Assistant".into(), safe(t)),
         Content::Thinking(t) => ("Thinking".into(), safe(t)),
         Content::RawJson { raw, .. } => ("Unknown / extra JSON".into(), safe(raw)),
         Content::ToolRequest(r) => (
-            format!("Tool: {} ({})", r.tool_name, r.tool_use_id),
+            format!("Permission request: {} ({})", r.tool_name, r.tool_use_id),
             safe(&serde_json::Value::Object(r.input.clone()).to_string()),
+        ),
+        Content::ToolUse(t) => (
+            format!("Tool: {} ({})", t.name, t.id),
+            safe(&serde_json::Value::Object(t.input.clone()).to_string()),
         ),
         Content::ToolResult {
             tool_use_id,
@@ -46,7 +50,8 @@ fn content(card: &Card) -> (String, Vec<Line<'static>>) {
             is_error,
         } => (
             format!(
-                "Tool result: {tool_use_id}{}",
+                "Tool result: {} ({tool_use_id}){}",
+                tools.get(tool_use_id.as_str()).unwrap_or(&"unknown tool"),
                 if *is_error { " [error]" } else { "" }
             ),
             safe(text),
@@ -68,16 +73,23 @@ fn content(card: &Card) -> (String, Vec<Line<'static>>) {
 /// Work scales with the supplied bounded cut. Only visible rows are retained for painting.
 pub(crate) fn compute(
     cards: &[Card],
-    collapsed: &BTreeSet<u64>,
+    collapsed: &BTreeSet<CardId>,
     anchor: Option<u64>,
     area: Rect,
 ) -> Transcript {
     let mut rows = vec![];
     let mut starts = vec![];
     let mut buttons = vec![];
+    let tools = cards
+        .iter()
+        .filter_map(|c| match &c.content {
+            Content::ToolUse(t) => Some((t.id.as_str(), t.name.as_str())),
+            _ => None,
+        })
+        .collect();
     for card in cards {
         starts.push((card.seq, rows.len()));
-        let (title, body) = content(card);
+        let (title, body) = content(card, &tools);
         rows.extend(wrap(
             vec![Line::from(format!(
                 "{title}{}",
@@ -85,13 +97,13 @@ pub(crate) fn compute(
             ))],
             area.width,
         ));
-        let folded = collapsed.contains(&card.seq);
+        let folded = collapsed.contains(&card.id);
         let toggle = if folded { "[Expand]" } else { "[Collapse]" };
         let mut x = 0;
         let mut controls = String::new();
         for (label, action) in [
-            (toggle, Action::ToggleFold(card.seq)),
-            ("[Details]", Action::InspectCard(card.seq)),
+            (toggle, Action::ToggleFold(card.id)),
+            ("[Details]", Action::InspectCard(card.id)),
         ] {
             let width = label.len() as u16;
             if x + width <= area.width {

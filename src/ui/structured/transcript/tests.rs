@@ -6,6 +6,7 @@ use ratatui::{
 };
 fn card(seq: u64, content: Content) -> Card {
     Card {
+        id: CardId { seq, ordinal: 0 },
         seq,
         content,
         streaming: false,
@@ -79,7 +80,7 @@ fn folds_inspection_and_paused_anchor_share_the_drawn_geometry() {
             },
         ),
     ];
-    let folds = BTreeSet::from([1, 2, 3]);
+    let folds = BTreeSet::from([1, 2, 3].map(|seq| CardId { seq, ordinal: 0 }));
     let area = Rect::new(2, 3, 58, 6);
     let before = compute(&cards, &folds, Some(1), area);
     let picture = draw(&before);
@@ -92,7 +93,7 @@ fn folds_inspection_and_paused_anchor_share_the_drawn_geometry() {
             Action::ToggleFold(seq) | Action::InspectCard(seq) => seq,
             _ => panic!("unexpected hit"),
         };
-        assert_eq!(*seq, i as u64 / 2 + 1);
+        assert_eq!(seq.seq, i as u64 / 2 + 1);
         let label = if matches!(action, Action::ToggleFold(_)) {
             "[Expand]"
         } else {
@@ -321,4 +322,45 @@ fn raw_c1_in_inline_html_displays_escape_without_terminal_control() {
         "\u{9b}",
         "\\u{9b}",
     );
+}
+
+#[test]
+fn sibling_card_ids_fold_independently_and_results_use_observed_tool_identity() {
+    let mut tool = card(
+        7,
+        Content::ToolUse(crate::structured::view::contracts::ObservedToolUse {
+            id: "use-7".into(),
+            name: "Bash".into(),
+            input: serde_json::from_value(serde_json::json!({"command":"check"})).unwrap(),
+            raw: "original".into(),
+        }),
+    );
+    tool.id.ordinal = 1;
+    let cards = [
+        card(7, Content::Thinking("folded thinking".into())),
+        tool,
+        card(
+            8,
+            Content::ToolResult {
+                tool_use_id: "use-7".into(),
+                text: "- old\n+ new".into(),
+                is_error: false,
+            },
+        ),
+    ];
+    let view = compute(
+        &cards,
+        &BTreeSet::from([cards[0].id]),
+        Some(7),
+        Rect::new(0, 0, 60, 15),
+    );
+    let b = draw(&view);
+    assert!(!text(&b).contains("folded thinking"));
+    for expected in ["Tool: Bash (use-7)", "check", "Tool result: Bash (use-7)"] {
+        assert!(text(&b).contains(expected));
+    }
+    assert!(view
+        .hits
+        .iter()
+        .any(|(_, a)| matches!(a, Action::InspectCard(id) if *id == cards[1].id)));
 }
