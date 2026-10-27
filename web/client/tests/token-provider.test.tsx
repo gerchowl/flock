@@ -1060,6 +1060,10 @@ for (const mode of MODES) {
   describe(`the ${mode} driver on a bare connection`, () => {
   /** A Live connection (given → hello → welcome), a driver on it, and every delay it armed. */
   function driven(...replies: Reply[]) {
+    return drivenWithRandom(() => 0, ...replies);
+  }
+
+  function drivenWithRandom(random: () => number, ...replies: Reply[]) {
     const h = new Harness();
     const tokens = provider(mode, ...replies);
     if (mode === "provider") live(h);
@@ -1078,10 +1082,78 @@ for (const mode of MODES) {
     const browserDelay = (ms: number): number => (ms > 2 ** 31 - 1 ? 0 : ms);
     const clock = { ...h.clock, now: () => h.clock.now(), wallNow: () => h.clock.wallNow(), clearTimeout: (handle: Parameters<typeof h.clock.clearTimeout>[0]) => h.clock.clearTimeout(handle), setTimeout: (callback: () => void, ms: number) => (delays.push(ms), h.clock.setTimeout(callback, browserDelay(ms))) };
     const config = tokens.config;
-    if ("openBridge" in config) driveBridge(h.connection, config.openBridge, clock, () => 0, () => undefined);
-    else driveTokenProvider(h.connection, config.tokenProvider, clock, () => 0, () => undefined);
-    return { h, tokens, delays };
+    const driver = "openBridge" in config
+      ? driveBridge(h.connection, config.openBridge, clock, random, () => undefined)
+      : driveTokenProvider(h.connection, config.tokenProvider, clock, random, () => undefined);
+    return { h, tokens, delays, driver };
   }
+
+  test("a successful renewal after Disconnect leaves no renewal timer", async () => {
+    const { h, tokens, driver } = driven({ token: "t2", expiresInMs: 20 }, "deferred");
+    dispose = () => { driver.dispose(); h.connection.disconnect(); };
+    h.step(step({ step: "token_refused", code: 4403 }));
+    await tick();
+    h.step(step({ step: "open" }));
+    send(h, WELCOME);
+    h.clock.advanceTo(15);
+    await tick();
+    expect(tokens.calls).toBe(2);
+    h.connection.disconnect();
+    expect(h.clock.pendingTimers).toBe(0);
+    tokens.resolve("late", 40);
+    await tick();
+    expect([h.connection.state, h.clock.pendingTimers]).toEqual(["Disconnected", 0]);
+    h.clock.advanceTo(45);
+    await tick();
+    expect(tokens.calls).toBe(2);
+  });
+
+  test("the re-mint cap cancels a pending wait and keeps its error", async () => {
+    const { h, tokens, driver } = driven("t2", "unexpected");
+    dispose = () => { driver.dispose(); h.connection.disconnect(); };
+    h.step(step({ step: "token_refused", code: 4403 }));
+    await tick();
+    h.step(step({ step: "open" }));
+    send(h, WELCOME);
+    h.step(step({ step: "token_refused", code: 4403 }));
+    expect(h.clock.pendingTimers).toBe(1);
+    // Deliberate session-handoff fault injection: each already-open session
+    // arrives during the same pending re-mint, then the server revokes it.
+    for (let revoked = 3; revoked <= MAX_REMINTS + 1; revoked++) {
+      if (mode === "bridge") h.connection.setSocket(tokens.open("handoff"));
+      else h.connection.setToken("handoff");
+      h.step(step({ step: "open" }));
+      send(h, WELCOME);
+      h.step(step({ step: "token_refused", code: 4403 }));
+    }
+    const atCap = [driver.error, h.clock.pendingTimers, tokens.calls];
+    h.clock.advanceTo(30_000);
+    await tick();
+    expect([atCap, driver.error, tokens.calls, driver.asking]).toEqual([[REMINTS_SPENT, 0, 1], REMINTS_SPENT, 1, false]);
+  });
+
+  test("re-mint jitter uses the injected non-zero random value without opening early", async () => {
+    const { h, tokens, driver } = drivenWithRandom(() => 0.5, "t2", "t3", "t4");
+    dispose = () => { driver.dispose(); h.connection.disconnect(); };
+    h.step(step({ step: "token_refused", code: 4403 }));
+    await tick();
+    // Equal jitter at random 0.5 gives 375 ms, then 750 ms (not the minima).
+    for (const [beforeCalls, delay] of [[1, 375], [2, 750]] as const) {
+      h.step(step({ step: "open" }));
+      send(h, WELCOME);
+      h.step(step({ step: "token_refused", code: 4403 }));
+      const due = h.clock.now() + delay;
+      h.clock.advanceTo(due - 1);
+      await tick();
+      expect(tokens.calls).toBe(beforeCalls);
+      h.clock.advanceTo(due);
+      await tick();
+      expect(tokens.calls).toBe(beforeCalls + 1);
+    }
+    driver.dispose();
+    h.connection.disconnect();
+    expect(h.clock.pendingTimers).toBe(0);
+  });
 
   test("a renewal timer is armed only for a token with expiresInMs, at RENEW_AT of it", async () => {
     const plain = driven("t2");

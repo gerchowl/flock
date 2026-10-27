@@ -49,10 +49,10 @@
  *   retried.
  * - **Bounded re-mints.** Consecutive re-mints back off on §3's reconnect
  *   backoff: the first is immediate, the next ones wait `backoffDelay(0…)`.
- *   After {@link MAX_REMINTS} in a row the provider is not asked again until
- *   the person asks. A session that stayed Live for §3's healthy period (the
- *   one that resets its backoff), or an `ack`ed command since the streak
- *   began, ends the streak.
+ *   After {@link MAX_REMINTS} in a row, pending waits and owed work are cleared:
+ *   the provider is not asked again until the person asks. A session that stayed
+ *   Live for §3's healthy period (the one that resets its backoff), or an
+ *   `ack`ed command since the streak began, ends the streak.
  *
  * @module
  */
@@ -241,7 +241,8 @@ function driveShell<T>(connection: WireConnection, source: Source<T>, clock: Clo
       const at = clock.now() + Math.floor(expiresInMs * RENEW_AT);
       due = due === null ? at : Math.min(due, at);
     }
-    if (due !== null && !spent) renewAt(due);
+    // A late result may be kept for the next Connect, but Disconnect owns no timers.
+    if (due !== null && !spent && running()) renewAt(due);
   };
   /**
    * One provider call: a `renew`al, a `mint` (a new bearer: the connect from
@@ -324,6 +325,8 @@ function driveShell<T>(connection: WireConnection, source: Source<T>, clock: Clo
     if (connection.acks > acksAtStreak) streak = 0;
     if (streak === 0) acksAtStreak = connection.acks;
     if (streak >= MAX_REMINTS) {
+      waiting = cancelWaiting();
+      owed = null;
       error = REMINTS_SPENT;
       forget();
       return changed();
