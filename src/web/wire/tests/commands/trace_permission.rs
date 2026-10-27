@@ -1,15 +1,14 @@
 //! Full permission script with real worker, durable history and browser client.
 use super::*;
-use tokio::io::AsyncBufReadExt;
+use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::io::{AsyncBufReadExt, BufReader};
 #[test]
 fn permission_script_checks_persisted_timestamps_outbox_and_cursor() {
     runtime(async {
+        let epoch = "00000000000000000000000000000001";
         let server = Server::with_setup(
             |clock| Arc::new(clock),
-            |core| {
-                Arc::get_mut(&mut core.shared).unwrap().epoch =
-                    "00000000000000000000000000000001".into();
-            },
+            |core| Arc::get_mut(&mut core.shared).unwrap().epoch = epoch.into(),
         )
         .await;
         let mut case = Case::with_server(246703, server, "queue-permission").await;
@@ -18,20 +17,12 @@ fn permission_script_checks_persisted_timestamps_outbox_and_cursor() {
             .iter()
             .find(|line| line["frame"]["ev"]["state"] == "open")
             .unwrap()["frame"]["ev"];
-        let wall = || {
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis()
-        };
-        let before = wall();
-        let request = json!({"type":"control_request","request_id":open["request_id"],"request":open["request"]});
-        within(
-            case.driver
-                .write_all(format!("{}\n", json!({"op":"event","event":request})).as_bytes()),
-        )
-        .await
-        .unwrap();
+        let wall = || SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+        let before = wall().as_millis();
+        let event = json!({"op":"event","event":{"type":"control_request","request_id":open["request_id"],"request":open["request"]}});
+        within(case.driver.write_all(format!("{event}\n").as_bytes()))
+            .await
+            .unwrap();
         case.until(|c| {
             let handles = c.handles();
             if handles.is_empty() {
@@ -41,27 +32,14 @@ fn permission_script_checks_persisted_timestamps_outbox_and_cursor() {
             true
         })
         .await;
-        let after = wall();
-        assert_eq!(
-            case.events().len(),
-            4,
-            "bootstrap prefix, raw request and durable open"
-        );
-        let record = case
-            .app
-            .state
-            .structured_agents
-            .get(&case.worker.id)
-            .unwrap()
-            .0;
-        let path = case
-            .worker
-            .fixture
-            .root
-            .path()
-            .join("sessions")
-            .join(&case.worker.id)
-            .join(format!("{}.jsonl", record.session_id));
+        let after = wall().as_millis();
+        assert_eq!(case.events().len(), 4);
+        let agents = &case.app.state.structured_agents;
+        let (record, _, _) = agents.get(&case.worker.id).unwrap();
+        let path = case.worker.fixture.root.path().join(format!(
+            "sessions/{}/{}.jsonl",
+            case.worker.id, record.session_id
+        ));
         let control = std::env::var("S7_PERMISSION_CONTROL").unwrap_or_default(); // guardrails-ok(hermetic): explicit test-only fail-first control
         let child = tokio::process::Command::new("bun")
             .arg(concat!(
@@ -70,9 +48,7 @@ fn permission_script_checks_persisted_timestamps_outbox_and_cursor() {
             ))
             .arg(format!("ws://{}/v1/ws", case.server.bind))
             .arg(&path)
-            .arg(before.to_string())
-            .arg(after.to_string())
-            .arg(control)
+            .args([before.to_string(), after.to_string(), control])
             .env_clear()
             .env("PATH", std::env::var_os("PATH").unwrap())
             .env("HOME", case.server._root.path())
@@ -89,11 +65,11 @@ fn permission_script_checks_persisted_timestamps_outbox_and_cursor() {
                 changed.as_mut().enable();
                 produced.as_mut().enable();
                 case.service();
+                let active = &case.app.structured_workers;
+                let agent = &case.worker.id;
+                let generation = case.worker.generation;
                 assert!(
-                    case.app
-                        .structured_workers
-                        .report(&case.worker.id, case.worker.generation)
-                        .is_none(),
+                    active.report(agent, generation).is_none(),
                     "worker exited before trace completed"
                 );
                 tokio::select! { biased;
@@ -116,14 +92,13 @@ fn permission_script_checks_persisted_timestamps_outbox_and_cursor() {
             assert_eq!(fact["step"], step["step"]);
         }
         let mut receipt = String::new();
-        within(tokio::io::BufReader::new(&mut case.driver).read_line(&mut receipt))
-            .await
-            .unwrap();
+        let mut reader = BufReader::new(&mut case.driver);
+        within(reader.read_line(&mut receipt)).await.unwrap();
         let receipt: Value = serde_json::from_str(&receipt).unwrap();
         assert_eq!(receipt["type"], "control_response");
         assert_eq!(receipt["response"]["request_id"], "typed-request");
         assert_eq!(receipt["response"]["response"]["behavior"], "deny");
-        assert!(case.handles().is_empty());
+        case.until(|c| c.handles().is_empty()).await;
         assert_eq!(case.events().last().unwrap()["state"], "closed");
         case.stop().await;
     });

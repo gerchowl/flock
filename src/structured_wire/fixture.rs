@@ -43,6 +43,18 @@ pub struct PersistedTimestamp {
     pub kind: TimestampKind,
     /// Independent oracle required by the interpreter.
     pub source: TimestampSource,
+    /// Explicit observed upper bound, with zero slack.
+    pub bound: TimestampBound,
+}
+/// Observed upper bound for a persisted event timestamp.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum TimestampBound {
+    /// The action acknowledgement, when persistence precedes it.
+    AfterAck,
+    /// Delivery of the durable record, when ACK only admits the action.
+    RecordDelivery,
 }
 /// Supported wall-clock field; arbitrary dynamic fields are refused.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -178,11 +178,11 @@ Whether send alone should suffice is pending owner decision in #2585.
 ## Runtime timestamp matchers
 
 A genuinely runtime `ev.ts_ms` may be authored as
-`{"$dynamic":"ts_ms","source":"persisted"}` (#2467 timestamp ruling).
+`{"$dynamic":"ts_ms","source":"persisted","bound":"after_ack"}` (#2467).
 The fixture schema permits this marker only at that wall-clock field. The
 actual-endpoint interpreter must verify equality with the corresponding persisted
 record (sequence and event payload included), and membership in its independently
-observed `[before_action, after_ack]` wall-clock window. Missing evidence, an
+observed zero-slack `[before_action, bound]` window. Missing evidence, an
 unsupported source, or a marker elsewhere fails. Literal timestamps and all other
 literal fields stay exact. Receipt wall times are not promised monotonic by
 ADR-0036; event ordering remains sequence-based.
@@ -206,11 +206,9 @@ and client. `endpoint-permission.ts` runs the complete permission-decision trace
 The tested pending-part-2b set contains the other seven selected scripts; later
 providers must shrink it. Gaps and overlap fail.
 
-The permission fixture resumes after the bootstrap prefix and raw request (cursor 3),
-then checks durable open at 4 and close at 5. The issued permission handle is 3. Its worker suppresses the fixture-only
-stdin echo, so the trace contains only product permission records. Timestamp
-proof reads the actual session JSONL by sequence and compares the raw payload.
-The open window spans producer injection to the owner's durable-open receipt;
-the close window spans browser decision to its actual wire ack. Neither uses
-product clock injection. Literal version/epoch/principal fields are compared
-unchanged; the fixture's version literal must follow a package-version change.
+The permission fixture resumes after bootstrap and raw request (cursor 3), then
+checks open at 4, close at 5, and permission handle 3. Its driver acknowledges
+stdin over IPC rather than injecting a fixture-only session echo. The open bound
+is `after_ack` (owner's durable-open receipt); close uses `record_delivery` (the
+WebSocket callback). Missing/unknown bounds fail (ADR-0036 #2224, slice-3 ruling).
+Literal version/epoch/principal remain exact; update the version on package bumps.

@@ -7,13 +7,13 @@ import { FakeNetwork, FakeSocket, Harness } from "./harness";
 import { loadS7MinScripts, runTrace, type CheckedStep, type StepHandlers } from "./endpoint-runner";
 const [url, history, start, ready, control] = process.argv.slice(2);
 assert(url && history && start && ready);
-assert(["", "persisted", "window", "outbox", "cursor"].includes(control ?? ""));
+assert(["", "persisted", "window", "delivery_window", "outbox", "cursor"].includes(control ?? ""));
 let before = Number(start), after = Number(ready);
 let socket: Port;
 class Port extends FakeSocket {
   readonly native: WebSocket;
   readonly ready: Promise<void>;
-  readonly frames: ServerFrame[] = [];
+  readonly frames: { frame: ServerFrame; delivered_at: number }[] = [];
   wake: (() => void) | undefined;
   error: Error | undefined;
   constructor(net: FakeNetwork) {
@@ -25,7 +25,7 @@ class Port extends FakeSocket {
       this.native.onerror = () => { this.error = new Error("transport failed"); reject(this.error); this.wake?.(); };
       this.native.onclose = () => { this.error = new Error("endpoint closed before trace finished"); reject(this.error); this.wake?.(); };
     });
-    this.native.onmessage = (event) => { this.frames.push(JSON.parse(String(event.data))); this.wake?.(); };
+    this.native.onmessage = (event) => { this.frames.push({ delivered_at: Date.now(), frame: JSON.parse(String(event.data)) }); this.wake?.(); };
   }
   override send(text: string): void {
     super.send(text);
@@ -34,7 +34,7 @@ class Port extends FakeSocket {
     this.native.send(JSON.stringify(frame));
   }
   override close(code: number, reason: string): void { super.close(code, reason); this.native.close(code, reason); }
-  async next(): Promise<ServerFrame> {
+  async next(): Promise<{ frame: ServerFrame; delivered_at: number }> {
     if (!this.frames.length && !this.error) await new Promise<void>((resolve) => { this.wake = resolve; });
     this.wake = undefined;
     if (this.error) throw this.error;
@@ -53,12 +53,12 @@ const handlers: StepHandlers = {
   client: async (line) => { assert(line.step === "client"); if (line.action.kind === "command") before = Date.now(); return step("client")(line); },
   open: async (line) => { await socket.ready; return step("client")(line); },
   send: async (line) => {
-    assert(line.step === "send"); const actual = await socket.next();
-    if (actual.t === "ack") after = Date.now();
+    assert(line.step === "send"); const { frame: actual, delivered_at } = await socket.next();
+    if (actual.t === "ack") after = delivered_at;
     await matchFrame(actual, line.frame, async (event) => {
       const records = (await Bun.file(history!).text()).trim().split("\n").map((raw) => JSON.parse(raw));
       const record = records.find((r) => r.seq === event.seq); assert(record, "missing persisted record");
-      return { record: { ...record, received_at_ms: record.received_at_ms + (control === "persisted" ? 1 : 0) }, before_action: control === "window" ? before - 2 : before, after_ack: control === "window" ? before - 1 : after };
+      return { record: { ...record, received_at_ms: record.received_at_ms + (control === "persisted" ? 1 : 0) }, before_action: control === "window" || control === "delivery_window" ? before - 2 : before, after_ack: control === "window" ? before - 1 : after, record_delivery: control === "delivery_window" ? before - 1 : delivered_at };
     });
     if (!(control === "outbox" && actual.t === "ack") && !(control === "cursor" && actual.t === "ev" && actual.seq === 5)) harness.acceptServerFrame(actual);
     return checked("server");
