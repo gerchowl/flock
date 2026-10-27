@@ -12,7 +12,7 @@
  *   script, so the global is absent and the bundle takes same-origin
  *   defaults: the server is the page's origin, `ws:` for `http:` and `wss:`
  *   for `https:` (main's decision on #1880). The served page enforces
- *   `script-src 'self'` with no inline script or eval (#1875), so nothing
+ *   `script-src 'self'` with no inline script or eval (#1848), so nothing
  *   here relies on either. The token comes from the one-time code exchange
  *   (`src/wire/token.ts`).
  * - **Tauri v2 shell** (#1601): an initialization script assigns it before

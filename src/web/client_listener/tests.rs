@@ -86,7 +86,9 @@ pub(crate) async fn failed_listener() -> (crate::test_support::TempDir, Listener
     let health = Health::default();
     health.publish(Status::Listening);
     let task = tokio::spawn(serve(
-        || async { Err(io::Error::from_raw_os_error(libc::EBADF)) },
+        || async {
+            Err::<(tokio::net::TcpStream, SocketAddr), _>(io::Error::from_raw_os_error(libc::EBADF))
+        },
         Router::new(),
         Arc::new(SystemClock),
         health.clone(),
@@ -333,10 +335,16 @@ impl ShellServer {
             .router()
             .merge(client_exchange::router(Codes::default(), root.path().to_owned(), bind).unwrap())
             .route("/fixture", axum::routing::get(|| async { "same-origin" }))
-            .layer(middleware::from_fn_with_state(
-                (bind, HeaderValue::from_static("default-src 'none'")),
-                guard,
-            ));
+            .route(
+                "/document",
+                axum::routing::get(|| async {
+                    (
+                        [(header::CONTENT_SECURITY_POLICY, "default-src 'self'")],
+                        "document",
+                    )
+                }),
+            )
+            .layer(middleware::from_fn_with_state(bind, guard));
         let task = tokio::spawn(serve(
             move || {
                 let listener = listener.clone();
@@ -425,4 +433,62 @@ async fn captured_shell_origin_is_exact_cross_site_and_ws_only() {
     let (_, header) = server.request("/fixture", &origin, "cross-site", "").await;
     assert!(header.starts_with("HTTP/1.1 403"));
     server.core.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn non_document_responses_carry_the_resource_policy_and_documents_keep_theirs() {
+    let server = ShellServer::new().await;
+    let origin = format!("http://{}", server.bind);
+    let policy = |header: &str| {
+        header
+            .lines()
+            .filter_map(|line| line.strip_prefix("content-security-policy: "))
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    let resource = vec![gui::RESOURCE_POLICY.to_owned()];
+    for (path, origin, site, status) in [
+        ("/fixture", origin.as_str(), "same-origin", "HTTP/1.1 200"),
+        ("/v1/ws", origin.as_str(), "same-origin", "HTTP/1.1 101"),
+        (
+            "/v1/client/exchange",
+            origin.as_str(),
+            "same-origin",
+            "HTTP/1.1 405",
+        ),
+        (
+            "/fixture",
+            "https://example.test",
+            "cross-site",
+            "HTTP/1.1 403",
+        ),
+    ] {
+        let (_, header) = server.request(path, origin, site, "").await;
+        assert!(header.starts_with(status), "{path}: {header}");
+        assert_eq!(policy(&header), resource, "{path}: {header}");
+    }
+    let (_, header) = server
+        .request("/document", &origin, "same-origin", "")
+        .await;
+    assert!(header.starts_with("HTTP/1.1 200"), "{header}");
+    assert_eq!(policy(&header), vec!["default-src 'self'".to_owned()]);
+    server.core.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn disabled_public_listener_does_not_create_a_native_endpoint() {
+    let root = crate::test_support::TempDir::socket();
+    let listener = Listener::prepare(
+        None,
+        Codes::default(),
+        root.path().into(),
+        None,
+        Health::default(),
+        Arc::new(tokio::sync::Notify::new()),
+        Default::default(),
+    )
+    .await
+    .unwrap();
+    assert!(listener.is_none());
+    assert!(!super::super::local_listener::socket_path(&root.path().join("flock.sock")).exists());
 }

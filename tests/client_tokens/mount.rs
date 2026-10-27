@@ -163,25 +163,29 @@ fn real_server_mounts_gui_csp_code_exchange_and_authenticated_wire() {
         assert!(index.starts_with("HTTP/1.1 503"));
         assert!(index.contains("server_unavailable"));
     }
-    let csp = index
-        .lines()
-        .find(|line| line.starts_with("content-security-policy:"))
-        .unwrap();
-    for part in [
-        "default-src 'self'",
-        "script-src 'self'",
-        "style-src 'self'",
-        "object-src 'none'",
-        "base-uri 'none'",
-        "frame-ancestors 'none'",
-        "form-action 'none'",
-    ] {
-        assert!(csp.contains(part));
-    }
-    assert!(csp.contains(&format!(
-        "connect-src 'self' ws://{}/v1/ws",
+    let csp = |response: &str| {
+        response
+            .lines()
+            .filter_map(|line| line.strip_prefix("content-security-policy: "))
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    // The entry document's exact policy, and the deny-all policy on every
+    // other response (#1848). A missing bundle's 503 is not the document.
+    let document = format!(
+        "default-src 'self'; script-src 'self'; style-src 'self'; \
+         connect-src 'self' ws://{}/v1/ws; object-src 'none'; base-uri 'none'; \
+         frame-ancestors 'none'; form-action 'none'",
         endpoint.address
-    )));
+    );
+    let resource =
+        "default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+    let expected = if GuiAssets::get("index.html").is_some() {
+        document
+    } else {
+        resource.to_owned()
+    };
+    assert_eq!(csp(&index), vec![expected]);
     let config = http(
         &endpoint,
         "/config.js",
@@ -195,9 +199,11 @@ fn real_server_mounts_gui_csp_code_exchange_and_authenticated_wire() {
         "HTTP/1.1 503"
     };
     assert!(config.starts_with(expected));
+    assert_eq!(csp(&config), vec![resource.to_owned()]);
 
     let token = bearer(&endpoint);
     let used = exchange(&endpoint, &endpoint.code);
+    assert_eq!(csp(&used), vec![resource.to_owned()]);
     let unknown = exchange(&endpoint, &"0".repeat(64));
     assert!(used.starts_with("HTTP/1.1 401"));
     assert_eq!(refusal(&used), refusal(&unknown));
@@ -538,7 +544,7 @@ peer.settimeout(5)
 peer.connect(sys.argv[3])
 peer.sendall(os.environ.pop('FLOCK_HANDOFF_TOKEN').encode()+b'\n')
 manifest=json.loads(peer.makefile('rb').readline(65536))
-Path(OBSERVATION).write_text(json.dumps({'version':manifest['version'],'listener':manifest.get('client_listener',False),'panes':len(manifest['panes'])}))
+Path(OBSERVATION).write_text(json.dumps({'version':manifest['version'],'listener':manifest.get('client_listener',False),'socket_owners':manifest.get('socket_owners',False),'panes':len(manifest['panes'])}))
 if manifest['version'] != 1:
     peer.sendall(b'error: legacy importer refuses descriptor extension\n')
 else:
@@ -558,7 +564,11 @@ PY
         .unwrap()
         .contains("legacy importer refuses descriptor extension"));
     let observed: Value = serde_json::from_slice(&fs::read(observation).unwrap()).unwrap();
-    assert_eq!(observed, json!({"version":2,"listener":true,"panes":0}));
+    // ADR-0036 transfers ownership descriptors under manifest v3, still refused by v1.
+    assert_eq!(
+        observed,
+        json!({"version":3,"listener":true,"socket_owners":true,"panes":0})
+    );
     let mut original = WebSocket::open(&endpoint);
     assert_eq!(original.hello(&token).0, 1);
 }
