@@ -4,7 +4,7 @@ use crate::{
     api::error_code::ErrorCode,
     layout::PaneId,
     structured::view::{
-        contracts::{Action, Intent},
+        contracts::{Action, Composer, Intent},
         Target,
     },
 };
@@ -102,6 +102,30 @@ impl App {
                         },
                     ));
                 }
+                KeyCode::Enter if selection.is_none() => {
+                    let draft = self
+                        .state
+                        .native_frames
+                        .get(&target.agent_id)
+                        .and_then(|f| f.as_ref().ok())
+                        .map(|f| Composer {
+                            text: f.composer.text.clone(),
+                            cursor: f.composer.cursor,
+                        });
+                    let result = draft.ok_or(ErrorCode::SessionBusy).and_then(|draft| {
+                        self.dispatch_native_intent(
+                            id,
+                            Intent {
+                                target,
+                                action: Action::Send(draft),
+                            },
+                        )
+                    });
+                    if let Err(code) = result {
+                        self.structured_error(code);
+                    }
+                }
+                KeyCode::Esc => self.state.mode = Mode::Navigate,
                 KeyCode::Enter => {
                     if let Some(&(x, y)) = positions.get(selected) {
                         self.activate_native(id, x, y);

@@ -1029,3 +1029,72 @@ async fn public_native_keyboard_close_detaches_without_stopping() {
         .runtime(&id, generation)
         .is_some());
 }
+
+#[tokio::test]
+async fn public_native_enter_submits_current_draft_once_without_terminal_bytes() {
+    use crate::structured::{
+        launch::PermissionMode,
+        view::{contracts::Composer, driver::Driver, Target},
+    };
+    use crossterm::event::{KeyCode, KeyModifiers};
+    let _guard = crate::config::test_config_env_guard();
+    let mut fixture = AdmissionFixture::new("init-socket-null", 5000);
+    let (id, generation) = fixture.start().await;
+    let text = "MVP 中文 e\u{301}\nnext";
+    // S10d3 owns editing. Seed only the draft, preserving real public-start sources.
+    let mut stream = fixture
+        .app
+        .open_structured_view(
+            Target {
+                agent_id: id.clone(),
+                generation,
+            },
+            PermissionMode::Default,
+        )
+        .unwrap();
+    stream.model.snapshot.composer = Composer {
+        text: text.into(),
+        cursor: text.len(),
+    };
+    fixture.app.structured_views.insert(
+        id.clone(),
+        Driver::new(stream, fixture.app.render_notify.clone()),
+    );
+    fixture.app.sync_structured_views();
+    fixture.app.state.mode = crate::app::Mode::Terminal;
+    crate::ui::compute_view_with_runtime_registry(
+        &mut fixture.app.state,
+        &fixture.app.terminal_runtimes,
+        ratatui::layout::Rect::new(0, 0, 100, 40),
+    );
+    let enter = crate::input::TerminalKey::new(KeyCode::Enter, KeyModifiers::empty());
+    fixture.app.handle_terminal_key_headless(enter);
+    fixture.app.handle_terminal_key_headless(enter);
+    assert!(
+        matches!(fixture.app.state.toast.as_ref(), Some(t) if t.context == "session_busy"),
+        "second Send must see pending admission"
+    );
+    let wake = fixture.app.render_notify.clone();
+    crate::structured::workers::tests::wait(&wake, || {
+        fixture.app.service_structured_workers(Instant::now());
+        matches!(fixture.app.state.native_frames.get(&id), Some(Ok(f)) if f.queue.iter().any(|i| i.body == text))
+    }).await;
+    crate::structured::workers::tests::wait(&wake, || {
+        fixture.app.service_structured_workers(Instant::now());
+        matches!(fixture.app.state.native_frames.get(&id), Some(Ok(f)) if f.composer.text.is_empty())
+    }).await;
+    let frame = fixture.app.state.native_frames[&id].as_ref().unwrap();
+    assert_eq!(frame.queue.iter().filter(|i| i.body == text).count(), 1);
+    assert!(
+        frame.composer.text.is_empty(),
+        "only the committed draft is cleared"
+    );
+    assert!(fixture.app.state.terminals.is_empty());
+    fixture.app.handle_paste("not a submission".into()).await;
+    assert!(fixture.app.state.native_frames[&id]
+        .as_ref()
+        .unwrap()
+        .composer
+        .text
+        .is_empty());
+}

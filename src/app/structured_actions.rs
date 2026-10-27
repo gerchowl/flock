@@ -17,6 +17,7 @@ impl App {
         crate::ui::structured::validate(&self.state, pane, &intent.target)?;
         let target = intent.target;
         match intent.action {
+            Action::Send(draft) => self.submit_native(target, draft),
             Action::Close => {
                 let workspace = self.state.active.ok_or(ErrorCode::AgentNotFound)?;
                 self.state.focus_pane_in_workspace(workspace, pane);
