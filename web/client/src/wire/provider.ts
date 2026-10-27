@@ -30,7 +30,11 @@
  *   §3's resume path. The timer is armed in steps of at most
  *   {@link MAX_TIMER_DELAY} until the renewal time, so no lifetime is too long.
  *   It is cleared on Disconnect. A late result's deadline waits without a timer
- *   until Connect resumes it. It renews only a running session: in
+ *   until Connect resumes it. If a user Disconnect/Connect invalidates an
+ *   in-flight renewal, token mode reuses the old bearer without a new lifetime
+ *   report; its renewal is reactive on an auth end. Bridge mode derives renewal
+ *   from the fresh open's reported remaining lifetime, never the discarded
+ *   result. It renews only a running session: in
  *   NeedsToken (a spent cap included) the reactive path owns the provider.
  *   A failed renewal is not retried; the session stays Live, the shell's
  *   message is {@link ShellTokens.notice}, and the reactive path takes over
@@ -51,7 +55,8 @@
  * - **Bounded re-mints.** Consecutive re-mints back off on §3's reconnect
  *   backoff: the first is immediate, the next ones wait `backoffDelay(0…)`.
  *   After {@link MAX_REMINTS} in a row, pending waits and owed work are cleared:
- *   unresolved results are discarded until the person asks. A session that stayed
+ *   unresolved results are discarded until the person asks. Only a user Connect
+ *   starts a fresh streak; internal renewal handoffs preserve it. A session that stayed
  *   Live for §3's healthy period (the one that resets its backoff), or an
  *   `ack`ed command since the streak began, ends the streak.
  *
@@ -235,9 +240,8 @@ function driveShell<T>(connection: WireConnection, source: Source<T>, clock: Clo
   const adopt = ({ value, expiresInMs }: { readonly value: T; readonly expiresInMs?: number; readonly fresh?: boolean }, kept: boolean): void => {
     const before = kept ? { due, spent } : { due: null, spent: false };
     const reconnect = running() && !connection.awaitingSession;
-    if (reconnect) connection.disconnect();
-    source.hand(value);
-    if (reconnect) connection.connect();
+    if (reconnect) connection.replaceSession(() => source.hand(value));
+    else source.hand(value);
     renewal = cancel(renewal);
     ({ due, spent } = before);
     if (expiresInMs !== undefined && !spent) {
@@ -350,8 +354,8 @@ function driveShell<T>(connection: WireConnection, source: Source<T>, clock: Clo
     streak = 0;
     error = null;
   };
+  const stopUserConnect = connection.onUserConnect(freshEpoch);
   const stop = connection.onTransition((state) => {
-    if (previous === "Disconnected" && state !== "Disconnected") freshEpoch();
     // A late result keeps an absolute deadline without owning a timer while
     // Disconnected. Connect resumes it, immediately if it is already overdue.
     if (previous === "Disconnected" && running() && due !== null && !spent && renewal === null) renewAt(due);
@@ -401,6 +405,7 @@ function driveShell<T>(connection: WireConnection, source: Source<T>, clock: Clo
     },
     dispose() {
       disposed = true;
+      stopUserConnect();
       stop();
       waiting = cancelWaiting();
       // Release the record; the disposed guard already makes this work unobservable.

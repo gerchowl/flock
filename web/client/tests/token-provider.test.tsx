@@ -1147,6 +1147,52 @@ for (const mode of MODES) {
     });
   }
 
+  test("user Connect during renewal uses the actual bearer and a documented reactive fallback", async () => {
+    const { h, tokens, driver } = driven({ token: "original", expiresInMs: 20 }, "deferred", "reactive");
+    dispose = () => { driver.dispose(); h.connection.disconnect(); };
+    h.step(step({ step: "token_refused", code: 4403 }));
+    await tick();
+    h.step(step({ step: "open" }));
+    send(h, WELCOME);
+    h.clock.advanceTo(15);
+    await tick();
+    expect(tokens.calls).toBe(2);
+    h.connection.disconnect();
+    h.connection.connect();
+    h.clock.advanceTo(16);
+    if (mode === "provider") {
+      h.step(step({ step: "open" }));
+      send(h, WELCOME);
+    }
+    tokens.resolve("discarded", 40);
+    await tick();
+    if (mode === "bridge") {
+      h.step(step({ step: "open" }));
+      send(h, WELCOME);
+      // This fake native side keeps the bearer from its resolved renewal. The
+      // fresh open reports its remaining lifetime; renew at 16 + floor(40*3/4).
+      h.clock.advanceTo(45);
+      await tick();
+      expect(tokens.calls).toBe(2);
+      h.clock.advanceTo(46);
+      await tick();
+      expect(tokens.calls).toBe(3);
+    } else {
+      expect(frames(h, "hello").at(-1)?.["token"]).toBe("original");
+      // Token mode has no new lifetime report on Connect. Discarding the stale
+      // renewal cannot assign its lifetime to original: only auth ends renew it.
+      h.clock.advanceTo(115);
+      await tick();
+      expect([tokens.calls, h.connection.state, h.clock.pendingTimers]).toEqual([2, "Live", 2]);
+      h.step(step({ step: "token_refused", code: 4403 }));
+      await tick();
+      expect(tokens.calls).toBe(3);
+    }
+    driver.dispose();
+    h.connection.disconnect();
+    expect(h.clock.pendingTimers).toBe(0);
+  });
+
   for (const pending of ["mint", "renewal"] as const) {
     test(`the re-mint cap discards an in-flight ${pending} success`, async () => {
       const { h, tokens, driver } = pending === "mint"
@@ -1225,6 +1271,37 @@ for (const mode of MODES) {
       expect(h.clock.pendingTimers).toBe(0);
     });
   }
+
+  test("successful renewals never reset a revoked-token streak or its growing backoff", async () => {
+    const { h, tokens, driver } = driven(...Array.from({ length: 60 }, (_, n) => ({ token: `cycle-${n}`, expiresInMs: 20 })));
+    dispose = () => { driver.dispose(); h.connection.disconnect(); };
+    h.step(step({ step: "token_refused", code: 4403 }));
+    await tick();
+    for (let revoked = 2; revoked <= MAX_REMINTS + 1; revoked++) {
+      h.step(step({ step: "open" }));
+      send(h, WELCOME);
+      h.clock.advanceTo(h.clock.now() + 15);
+      await tick();
+      h.step(step({ step: "open" }));
+      send(h, WELCOME);
+      const beforeEnd = tokens.calls;
+      h.step(step({ step: "token_refused", code: 4403 }));
+      await tick();
+      if (revoked <= MAX_REMINTS) {
+        const due = h.clock.now() + Math.min(30_000, 500 * 2 ** (revoked - 2)) / 2;
+        h.clock.advanceTo(due - 1);
+        await tick();
+        expect(tokens.calls).toBe(beforeEnd);
+        h.clock.advanceTo(due);
+        await tick();
+        expect(tokens.calls).toBe(beforeEnd + 1);
+      }
+    }
+    expect([driver.error, tokens.calls, h.connection.state, h.clock.pendingTimers]).toEqual([REMINTS_SPENT, MAX_REMINTS * 2, "NeedsToken", 0]);
+    h.clock.advanceTo(h.clock.now() + 60_000);
+    await tick();
+    expect(tokens.calls).toBe(MAX_REMINTS * 2);
+  });
 
   test("the re-mint cap cancels a pending wait and keeps its error", async () => {
     const { h, tokens, driver } = driven("t2", "unexpected");
