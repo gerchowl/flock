@@ -43,13 +43,10 @@ fn token() -> Result<Minted, Failure> {
 }
 
 #[test]
-fn operator_only_names_the_pane_launch_and_the_remote_path() {
+fn operator_only_names_the_pane_launch() {
     let (outcome, calls, _) = mint_scripted(vec![Err(refused("operator_only"))], Ok(()));
     let message = outcome.unwrap_err();
-    assert!(
-        message.contains("inside a flk pane") && message.contains("#2293"),
-        "{message}"
-    );
+    assert!(message.contains("inside a flk pane"), "{message}");
     assert_eq!(calls, 1);
 }
 
@@ -122,10 +119,7 @@ fn ptrace_scope_zero_or_unknown_refuses_the_mint() {
     assert!(ptrace_guard(|| Ok("1\n".into())).is_ok());
     assert!(ptrace_guard(|| Ok("3\n".into())).is_ok());
     let zero = ptrace_guard(|| Ok("0\n".into())).unwrap_err();
-    assert!(
-        zero.contains("ptrace_scope is 0") && zero.contains("#2293"),
-        "{zero}"
-    );
+    assert!(zero.contains("ptrace_scope is 0"), "{zero}");
     let missing = ptrace_guard(|| Err(io::Error::from(io::ErrorKind::NotFound))).unwrap_err();
     assert!(missing.contains("is unreadable"), "{missing}");
     assert!(ptrace_guard(|| Ok("x".into()))
@@ -164,29 +158,35 @@ fn the_socket_path_follows_flk() {
         socket_path(|key| vars.get(key).cloned())
     };
     let home = ("HOME", "/h");
+    assert_eq!(path(&[home]), PathBuf::from("/h/.config/flock/flock.sock"));
     assert_eq!(
-        path(&[home]).unwrap(),
-        PathBuf::from("/h/.config/flock/flock.sock")
-    );
-    assert_eq!(
-        path(&[home, ("XDG_CONFIG_HOME", "/x")]).unwrap(),
+        path(&[home, ("XDG_CONFIG_HOME", "/x")]),
         PathBuf::from("/x/flock/flock.sock")
     );
     assert_eq!(
-        path(&[home, ("FLOCK_SOCKET_PATH", "/s.sock")]).unwrap(),
+        path(&[home, ("FLOCK_SOCKET_PATH", "/s.sock")]),
         PathBuf::from("/s.sock")
     );
     assert_eq!(
-        path(&[home, ("FLOCK_SESSION", "work")]).unwrap(),
+        path(&[home, ("FLOCK_SESSION", "work")]),
         PathBuf::from("/h/.config/flock/sessions/work/flock.sock")
     );
-    for ignored in ["default", "..", "a/b"] {
+    // `validate_name`: at most 64 bytes.
+    let longest = "w".repeat(64);
+    assert_eq!(
+        path(&[home, ("FLOCK_SESSION", &longest)]),
+        PathBuf::from(format!("/h/.config/flock/sessions/{longest}/flock.sock"))
+    );
+    let too_long = "w".repeat(65);
+    for ignored in ["default", "..", "a/b", "", too_long.as_str()] {
         assert_eq!(
-            path(&[home, ("FLOCK_SESSION", ignored)]).unwrap(),
-            PathBuf::from("/h/.config/flock/flock.sock")
+            path(&[home, ("FLOCK_SESSION", ignored)]),
+            PathBuf::from("/h/.config/flock/flock.sock"),
+            "{ignored}"
         );
     }
-    assert!(path(&[]).is_err());
+    // `config_dir` with neither XDG_CONFIG_HOME nor HOME: /tmp/flock.
+    assert_eq!(path(&[]), PathBuf::from("/tmp/flock/flock.sock"));
 }
 
 #[cfg(unix)]
@@ -199,7 +199,10 @@ fn one_request_line_on_a_fresh_connection() {
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("flock.sock");
     let _ = std::fs::remove_file(&path);
-    assert!(matches!(unix::request(&path), Err(Failure::NoServer)));
+    assert!(matches!(
+        unix::request(&path, DEADLINE),
+        Err(Failure::NoServer)
+    ));
     let listener = UnixListener::bind(&path).unwrap();
     let server = std::thread::spawn(move || {
         let (stream, _) = listener.accept().unwrap();
@@ -210,7 +213,10 @@ fn one_request_line_on_a_fresh_connection() {
             .unwrap();
         line
     });
-    assert_eq!(unix::request(&path).unwrap().token.secret(), SECRET);
+    assert_eq!(
+        unix::request(&path, DEADLINE).unwrap().token.secret(),
+        SECRET
+    );
     assert_eq!(
         server.join().unwrap(),
         "{\"id\":\"mint\",\"method\":\"client.app.mint\",\"params\":{}}\n"
@@ -233,4 +239,36 @@ fn the_ws_socket_sits_beside_the_api_socket() {
         PathBuf::from("/h/.config/flock/flock-ws.sock")
     );
     assert_eq!(ws("/run/custom.sock"), PathBuf::from("/run/custom-ws.sock"));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_server_that_never_answers_times_the_mint_out() {
+    use std::os::unix::net::UnixListener;
+    use std::time::Instant;
+
+    let dir = std::env::temp_dir().join(format!("flock-desktop-hung-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("flock.sock");
+    let _ = std::fs::remove_file(&path);
+    let listener = UnixListener::bind(&path).unwrap();
+    // Accepts, reads nothing and never answers, until the test ends.
+    let held = std::thread::spawn(move || listener.accept().unwrap());
+    // The deadline is a parameter: the app passes DEADLINE (10 s).
+    let deadline = std::time::Duration::from_millis(200);
+    let started = Instant::now();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let asked = path.clone();
+    std::thread::spawn(move || tx.send(unix::request(&asked, deadline)));
+    // A guard on the test, so a request with no deadline fails it, not hangs it.
+    let outcome = rx.recv_timeout(DEADLINE).expect("the request has no deadline");
+    assert!(matches!(outcome, Err(Failure::Timeout)), "{outcome:?}");
+    assert!(started.elapsed() >= deadline);
+    let (outcome, _, _) = mint_scripted(vec![Err(Failure::Timeout)], Ok(()));
+    assert_eq!(
+        outcome.unwrap_err(),
+        "The flk server did not answer the mint within 10 s."
+    );
+    drop(held.join());
+    std::fs::remove_dir_all(dir).unwrap();
 }

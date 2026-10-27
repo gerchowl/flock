@@ -1,12 +1,15 @@
 // The contract's `openBridge` (web/client/src/config.ts, ADR-0038 §6): one
 // bridged session over the shell's three commands (src/main.rs) and one Tauri
 // channel. The channel delivers in send order by `index`; the events wait for
-// the client's handlers, which it sets once the session resolves.
+// the client's handlers, which it sets once the session resolves. A channel
+// that ends (its native side dropped) without a close closes with 1006.
 ({ renew }) => {
   const ipc = window.__TAURI_INTERNALS__;
   const early = new Map();
   const ready = [];
   let next = 0;
+  let end = null;
+  let closing = false;
   let id = null;
   let onclose = null;
   let scheduled = false;
@@ -50,12 +53,20 @@
       call("bridge_close", { code: code ?? null, reason: reason ?? null });
     },
   };
-  const channel = ipc.transformCallback(({ message, index, end }) => {
-    if (end) return;
-    early.set(index, message);
+  const channel = ipc.transformCallback((payload) => {
+    if (payload.end) end = payload.index;
+    else early.set(payload.index, payload.message);
     while (early.has(next)) {
-      ready.push(early.get(next));
+      const event = early.get(next);
       early.delete(next++);
+      if (closing) continue;
+      closing = event.kind === "close";
+      ready.push(event);
+    }
+    // `end` carries the count of messages sent, so all of them are in.
+    if (end === next && !closing) {
+      closing = true;
+      ready.push({ kind: "close", code: 1006, reason: "" });
     }
     schedule();
   });

@@ -34,7 +34,12 @@ function fakeIpc(opened: () => Promise<unknown>) {
     const [callback] = [...callbacks.values()];
     callback?.({ message, index });
   };
-  return { calls, callbacks, openBridge, deliver, unsettled };
+  /** The native side dropped the channel after `count` messages. */
+  const endChannel = (count: number) => {
+    const [callback] = [...callbacks.values()];
+    callback?.({ end: true, index: count });
+  };
+  return { calls, callbacks, openBridge, deliver, endChannel, unsettled };
 }
 
 type Socket = {
@@ -93,4 +98,35 @@ test("a refusal rejects with the shell's message and frees the channel", async (
   const fake = fakeIpc(() => Promise.reject("The flk server refused this app's connection: pane."));
   await expect(fake.openBridge({ renew: false })).rejects.toBe("The flk server refused this app's connection: pane.");
   expect(fake.callbacks.size).toBe(0);
+});
+
+test("a channel that ends without a close closes once with 1006", async () => {
+  const fake = fakeIpc(() => Promise.resolve({ id: 5 }));
+  const session = await fake.openBridge({ renew: false });
+  const seen: unknown[] = [];
+  const socket = session.socket as Socket;
+  socket.onmessage = (text) => seen.push(["message", text]);
+  socket.onclose = (code, reason) => seen.push(["close", code, reason]);
+  // The end arrives before the one message sent ahead of it.
+  fake.endChannel(1);
+  fake.deliver(0, { kind: "message", data: "{}" });
+  await settle();
+  expect(seen).toEqual([
+    ["message", "{}"],
+    ["close", 1006, ""],
+  ]);
+  expect(fake.callbacks.size).toBe(0);
+});
+
+test("an end after a close adds nothing", async () => {
+  const fake = fakeIpc(() => Promise.resolve({ id: 6 }));
+  const session = await fake.openBridge({ renew: false });
+  const seen: unknown[] = [];
+  const socket = session.socket as Socket;
+  socket.onmessage = () => seen.push("message");
+  socket.onclose = (code) => seen.push(code);
+  fake.deliver(0, { kind: "close", code: 1000, reason: "bye" });
+  fake.endChannel(1);
+  await settle();
+  expect(seen).toEqual([1000]);
 });

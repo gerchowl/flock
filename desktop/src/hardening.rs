@@ -71,6 +71,17 @@ fn navigation_is_locked_to_the_bundle() {
 }
 
 #[test]
+fn a_page_that_goes_away_ends_its_sessions() {
+    let code: String = main_code().split_whitespace().collect();
+    let reload = "ifload.event()==PageLoadEvent::Started{webview.state::<bridge::Bridge>().webview_gone(webview.label());}";
+    let closed = "ifletWindowEvent::Destroyed=event{window.state::<bridge::Bridge>().webview_gone(window.label());}";
+    assert!(code.contains(".on_page_load(") && code.contains(reload));
+    assert!(code.contains(".on_window_event(") && code.contains(closed));
+    assert!(code.contains("events.send(event).is_ok()"));
+    assert!(code.contains("bridge.open(webview.label(),renew,sink)"));
+}
+
+#[test]
 fn devtools_are_off_in_release() {
     let manifest: toml::Table = toml::from_str(include_str!("../Cargo.toml")).unwrap();
     let features = manifest["dependencies"]["tauri"]["features"]

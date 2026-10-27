@@ -34,8 +34,19 @@ server on the same machine"). The init script sets the bundle's
   without a token; the native side adds the bearer and forwards it, then passes
   every frame through unchanged both ways, and every close code and reason as
   the server sent it. A first frame that is not a token-free `hello` is closed
-  with 1008 and never forwarded. Frames come back on one Tauri channel per
-  session; `bridge_send` and `bridge_close` carry the webview's side.
+  with 1008 and never forwarded, as is one with a duplicate top-level key. A
+  binary frame from the server closes the session with 1003 (unsupported
+  data): `/v1/ws` carries JSON text only. Frames come back on one Tauri channel
+  per session; `bridge_send` and `bridge_close` carry the webview's side.
+- **A session belongs to its page.** A reload, a navigation or the window
+  closing ends the old page's sessions with 1001 at the server
+  (`on_page_load`, `WindowEvent::Destroyed`), and so does a channel the page
+  can no longer receive on; nothing lives on until the token's TTL. A channel
+  that ends without a close tells the page 1006.
+- **Deadlines.** The mint exchange and the upgrade each have 10 s, ADR-0038
+  §3's connect deadline. A mint that runs out rejects; an upgrade that runs
+  out resolves and closes with 1006, an outage. No lock is held across either,
+  so one hung attempt never stalls another open.
 - **One current bearer.** The native side mints when it has none, when the
   open renews (`renew: true`, at ¾ of `expiresInMs`), when the bearer has run
   out on a clock that counts sleep, and after the server ends a session on it
@@ -52,8 +63,8 @@ only the three bridge commands, so nothing in the webview can ask for it. The
 server also accepts the bearer only from this process, over the unix socket.
 
 The socket is where `flk` (a release build) puts it: `FLOCK_SOCKET_PATH`, else
-`$XDG_CONFIG_HOME/flock/` or `~/.config/flock/`, under `sessions/<name>/` for
-`FLOCK_SESSION`. With no server there, the shell starts one as `flk server` in
+`$XDG_CONFIG_HOME/flock/`, `~/.config/flock/` or, with neither set,
+`/tmp/flock/`, under `sessions/<name>/` for `FLOCK_SESSION`. With no server there, the shell starts one as `flk server` in
 its own process group, as `flk` itself does, and waits up to 5 s for the socket.
 It runs `FLOCK_DESKTOP_FLK`, else `flk` on PATH; an app opened from Finder gets
 launchd's short PATH, so set `FLOCK_DESKTOP_FLK` or start the server first.
@@ -61,7 +72,9 @@ launchd's short PATH, so set `FLOCK_DESKTOP_FLK` or start the server first.
 ## Refusals
 
 A refusal rejects `openBridge`; the client shows the message in NeedsToken and
-does not retry it. None falls back to anything silently.
+does not retry it. None falls back to anything silently. Each message says why
+and ends by offering the remote path (#2293), added in one place
+(`bridge::rejection`).
 
 - **"…not running as the local operator (it was started from inside a flk
   pane…)"**: the upgrade's 403 `operator_only`. **The pane trap:** `open`,
@@ -70,7 +83,8 @@ does not retry it. None falls back to anything silently.
   Dock, Finder or a launcher, or use the remote path (#2293).
 - **"…started from inside a flk pane, or not from your own session"**: the
   mint's `operator_only`, the same trap.
-- **"…refused this app's connection twice (peer_process_changed: …)"**, or
+- **"…could not bind this app's connection to its process, twice
+  (peer_process_changed: …)"**, or
   the mint's **"…could not bind the token to this app's process"**: the server
   could not bind to this process. The shell has already retried once on a
   fresh connection.
@@ -81,14 +95,15 @@ does not retry it. None falls back to anything silently.
 - **"…could not mint a token (code: message)"**: any other mint refusal.
 - **"…refused this app's connection with HTTP <status> (<code>)…"**: an
   upgrade refusal the contract does not name. A defect: report it.
+- **"…did not answer the mint within 10 s"**: the server accepted but hung.
 - **"No flk server is running, and starting one failed: …"**: why `flk server`
   could not start, or that it did not listen within 5 s.
 - **Linux, "…ptrace_scope is 0"**: any process of yours could read the token
   from the app, so the shell does not mint. Set Yama's `ptrace_scope` to 1 or
   more, or use the remote path.
 
-Two ends are not refusals. An unreachable `flock-ws.sock` (a restart or a
-handoff) resolves the open and closes the socket with 1006; the server's 503
+Two ends are not refusals. An unreachable or silent `flock-ws.sock` (a restart
+or a handoff) resolves the open and closes the socket with 1006; the server's 503
 `preauth_capacity` closes it with 1013. The client reconnects under backoff.
 
 ## Hardening

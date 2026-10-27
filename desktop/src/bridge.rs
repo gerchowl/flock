@@ -3,7 +3,8 @@
 //! `flock-ws.sock`, so the app-session bearer it mints never leaves it. The
 //! init script's `openBridge` (`config.rs`) drives three commands, open, send
 //! and close; each session's frames and close come back on its own Tauri
-//! channel, the [`Sink`].
+//! channel, the [`Sink`]. A session belongs to the webview that opened it and
+//! ends when that page goes away.
 
 use std::{
     collections::HashMap,
@@ -11,26 +12,27 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, MutexGuard,
     },
 };
 
 use futures_util::{SinkExt, StreamExt};
-use serde::Serialize;
+use serde::{de, Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio_tungstenite::{
     tungstenite::{self, protocol::CloseFrame, Message},
     WebSocketStream,
 };
 
-use crate::mint::{Minted, Token, REMOTE};
+use crate::mint::{Minted, Token, DEADLINE, REMOTE};
 
 /// One blocking mint over `flock.sock` (`mint::mint`).
 pub type Mint = Arc<dyn Fn() -> Result<Minted, String> + Send + Sync>;
 /// Milliseconds on a clock that counts suspended time, as the server's TTL does.
 pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
-/// One session's channel to the webview.
-pub type Sink = Arc<dyn Fn(Event) + Send + Sync>;
+/// One session's channel to the webview; `false` when it could not deliver,
+/// because the page that opened the session is gone.
+pub type Sink = Arc<dyn Fn(Event) -> bool + Send + Sync>;
 
 /// What the webview's socket receives: a text frame, or the session's end.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -85,9 +87,13 @@ enum Out {
     Close(Option<CloseFrame>),
     /// The first frame was not a token-free `hello`: 1008, not forwarded.
     Refuse(&'static str),
+    /// The page that opened the session is gone: 1001, and nobody to tell.
+    Gone,
 }
 
 struct Session {
+    /// The label of the webview that opened it.
+    owner: String,
     bearer: Arc<Bearer>,
     hello_sent: bool,
     out: mpsc::UnboundedSender<Out>,
@@ -100,29 +106,35 @@ struct Session {
 pub struct Bridge(Arc<Inner>);
 
 struct Inner {
-    ws: Result<PathBuf, String>,
+    ws: PathBuf,
     mint: Mint,
     now: Clock,
-    current: tokio::sync::Mutex<Current>,
+    current: Mutex<Current>,
     sessions: Mutex<HashMap<u64, Session>>,
     next: AtomicU64,
 }
 
 impl fmt::Debug for Bridge {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let sessions = self.0.sessions.lock().map_or(0, |s| s.len());
         f.debug_struct("Bridge")
             .field("ws", &self.0.ws)
-            .field("sessions", &sessions)
+            .field("sessions", &self.sessions().len())
             .finish_non_exhaustive()
     }
 }
 
 const ENDED: &str = "this bridged session has ended";
+const GONE: &str = "the page that opened this session went away";
+
+/// The one place a rejection's message is made: why, then the remote path
+/// (ADR-0038 §6, "A rejection is a refusal, not an outage").
+fn rejection(why: &str) -> String {
+    format!("{why} {REMOTE}")
+}
 
 impl Bridge {
-    /// `ws` is `flock-ws.sock`, or why its path is unknown.
-    pub fn new(ws: Result<PathBuf, String>, mint: Mint, now: Clock) -> Self {
+    /// `ws` is `flock-ws.sock` (`mint::ws_socket_path`).
+    pub fn new(ws: PathBuf, mint: Mint, now: Clock) -> Self {
         Self(Arc::new(Inner {
             ws,
             mint,
@@ -133,11 +145,16 @@ impl Bridge {
         }))
     }
 
-    /// One session (the contract's `openBridge`). It rejects only for a
-    /// refusal; an unreachable socket resolves and `sink` gets 1006.
-    pub async fn open(&self, renew: bool, sink: Sink) -> Result<Opened, String> {
+    /// One session for the webview `owner` (the contract's `openBridge`).
+    /// It rejects only for a refusal, saying why and offering the remote
+    /// path; an unreachable or silent socket resolves and `sink` gets 1006.
+    pub async fn open(&self, owner: &str, renew: bool, sink: Sink) -> Result<Opened, String> {
+        let opened = self.start(owner, renew, sink).await;
+        opened.map_err(|why| rejection(&why))
+    }
+
+    async fn start(&self, owner: &str, renew: bool, sink: Sink) -> Result<Opened, String> {
         let (bearer, fresh) = self.bearer(renew).await?;
-        let path = self.0.ws.clone()?;
         let id = self.0.next.fetch_add(1, Ordering::Relaxed);
         let opened = Opened {
             id,
@@ -147,7 +164,8 @@ impl Bridge {
         let scrubbed = |text: String| scrub(text, &bearer.token);
         let mut retried = false;
         let ws = loop {
-            match upgrade(&path).await {
+            let attempt = tokio::time::timeout(DEADLINE, upgrade(&self.0.ws)).await;
+            match attempt.unwrap_or(Upgrade::Unreachable) {
                 Upgrade::Open(ws) => break *ws,
                 Upgrade::Unreachable => return Ok(closed(opened, &sink, 1006, "")),
                 Upgrade::Refused {
@@ -159,8 +177,8 @@ impl Bridge {
                     (403, Some("peer_process_changed")) if !retried => retried = true,
                     (403, Some("peer_process_changed")) => {
                         return Err(scrubbed(format!(
-                            "The flk server refused this app's connection twice \
-                             (peer_process_changed: {message}). Restart the app."
+                            "The flk server could not bind this app's connection to its \
+                             process, twice (peer_process_changed: {message})."
                         )))
                     }
                     (503, Some("preauth_capacity")) => {
@@ -169,7 +187,7 @@ impl Bridge {
                     (status, code) => {
                         return Err(scrubbed(format!(
                             "The flk server refused this app's connection with HTTP {status} \
-                             ({}). That is a defect: please report it.",
+                             ({}), which the app does not know: a defect to report.",
                             code.unwrap_or("no error code")
                         )))
                     }
@@ -179,6 +197,7 @@ impl Bridge {
         let (out, rx) = mpsc::unbounded_channel();
         let abandoned = Arc::new(AtomicBool::new(false));
         let session = Session {
+            owner: owner.to_owned(),
             bearer: bearer.clone(),
             hello_sent: false,
             out,
@@ -218,31 +237,54 @@ impl Bridge {
             .map_err(|_| ENDED.into())
     }
 
-    fn sessions(&self) -> std::sync::MutexGuard<'_, HashMap<u64, Session>> {
-        self.0
-            .sessions
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    /// The webview `owner` reloaded, navigated or closed: its sessions end
+    /// with 1001 at the server, and leave the table now.
+    pub fn webview_gone(&self, owner: &str) {
+        let mut sessions = self.sessions();
+        let ids: Vec<u64> = sessions
+            .iter()
+            .filter(|(_, session)| session.owner == owner)
+            .map(|(id, _)| *id)
+            .collect();
+        for session in ids.iter().filter_map(|id| sessions.remove(id)) {
+            session.abandoned.store(true, Ordering::Relaxed);
+            drop(session.out.send(Out::Gone));
+        }
+    }
+
+    fn sessions(&self) -> MutexGuard<'_, HashMap<u64, Session>> {
+        let sessions = self.0.sessions.lock();
+        sessions.unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn current(&self) -> MutexGuard<'_, Current> {
+        let current = self.0.current.lock();
+        current.unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// The current bearer, or a new one when there is none, it has run out,
     /// or the open renews. `true` when the client did not cause the mint.
+    /// The mint runs with no lock held, so a hung server delays this open
+    /// only, up to the mint's deadline; two opens racing may both mint, and
+    /// the bearer replaced is unused until it expires or the app exits (§6).
     async fn bearer(&self, renew: bool) -> Result<(Arc<Bearer>, bool), String> {
-        let mut current = self.0.current.lock().await;
         let now = (self.0.now)();
-        let kept = current
-            .bearer
-            .as_ref()
-            .filter(|b| b.remaining(now) != Some(0));
-        if let (false, Some(bearer)) = (renew, kept) {
-            return Ok((bearer.clone(), false));
-        }
-        let fresh = !renew && !current.ended_in_view;
+        let fresh = {
+            let current = self.current();
+            let kept = current
+                .bearer
+                .as_ref()
+                .filter(|b| b.remaining(now) != Some(0));
+            if let (false, Some(bearer)) = (renew, kept) {
+                return Ok((bearer.clone(), false));
+            }
+            !renew && !current.ended_in_view
+        };
         let mint = self.0.mint.clone();
         let minted = tokio::task::spawn_blocking(move || mint())
             .await
-            .map_err(|error| format!("The mint task failed: {error}"))?;
-        let minted = minted.map_err(|message| match &current.bearer {
+            .map_err(|error| format!("The mint task failed: {error}."))?;
+        let minted = minted.map_err(|message| match &self.current().bearer {
             Some(bearer) => scrub(message, &bearer.token),
             None => message,
         })?;
@@ -251,16 +293,17 @@ impl Bridge {
             expires_in_ms: minted.expires_in_ms,
             minted_at: now,
         });
-        *current = Current {
+        *self.current() = Current {
             bearer: Some(bearer.clone()),
             ended_in_view: false,
         };
         Ok((bearer, fresh))
     }
 
-    /// The server refused or ended `bearer` (4401, 4403): never offer it again.
-    async fn ended(&self, bearer: &Arc<Bearer>, seen: bool) {
-        let mut current = self.0.current.lock().await;
+    /// The server refused or ended `bearer` (4401, 4403): never offer it
+    /// again. An end on an older bearer leaves the current one.
+    fn ended(&self, bearer: &Arc<Bearer>, seen: bool) {
+        let mut current = self.current();
         if current
             .bearer
             .as_ref()
@@ -273,7 +316,8 @@ impl Bridge {
         }
     }
 
-    /// One session's task: frames both ways until either side closes.
+    /// One session's task: frames both ways until either side closes, or
+    /// the page that opened it goes away.
     async fn run(
         self,
         id: u64,
@@ -297,21 +341,26 @@ impl Bridge {
                         drop(ws.close(Some(frame)).await);
                         break (1008, reason.to_owned());
                     }
-                    None => break (1006, String::new()),
+                    Some(Out::Gone) | None => return self.gone(id, ws).await,
                 },
                 frame = ws.next() => match frame {
-                    Some(Ok(Message::Text(text))) => sink(Event::Message {
-                        data: scrub(text.as_str().to_owned(), &bearer.token),
-                    }),
+                    Some(Ok(Message::Text(text))) => {
+                        let data = scrub(text.as_str().to_owned(), &bearer.token);
+                        if !sink(Event::Message { data }) {
+                            return self.gone(id, ws).await;
+                        }
+                    }
                     Some(Ok(Message::Close(frame))) => {
                         let (code, reason) = frame.map_or((1005, String::new()), |f| {
                             (f.code.into(), f.reason.as_str().to_owned())
                         });
                         if matches!(code, 4401 | 4403) {
-                            self.ended(&bearer, !abandoned.load(Ordering::Relaxed)).await;
+                            self.ended(&bearer, !abandoned.load(Ordering::Relaxed));
                         }
                         break (code, reason);
                     }
+                    // `/v1/ws` carries JSON text frames only (§6), so a binary
+                    // frame is RFC 6455's 1003, unsupported data, never text.
                     Some(Ok(Message::Binary(_))) => {
                         let reason = "the server sent a binary frame";
                         let frame = CloseFrame { code: 1003.into(), reason: reason.into() };
@@ -327,19 +376,44 @@ impl Bridge {
         let reason = scrub(reason, &bearer.token);
         sink(Event::Close { code, reason });
     }
+
+    /// The session's page is gone: out of the table, and a 1001 to the
+    /// server, whose close reply ends it, awaited for at most the deadline.
+    async fn gone(&self, id: u64, mut ws: WebSocketStream<Stream>) {
+        self.sessions().remove(&id);
+        let frame = CloseFrame {
+            code: 1001.into(),
+            reason: GONE.into(),
+        };
+        if ws.close(Some(frame)).await.is_ok() {
+            let reply = async {
+                while let Some(Ok(frame)) = ws.next().await {
+                    if frame.is_close() {
+                        break;
+                    }
+                }
+            };
+            drop(tokio::time::timeout(DEADLINE, reply).await);
+        }
+    }
+
+    /// The sessions in the table, for tests.
+    #[cfg(test)]
+    fn live(&self) -> usize {
+        self.sessions().len()
+    }
 }
 
 /// 403 `operator_only`: not the local operator, so the pane trap (`README.md`).
 fn operator_only() -> String {
-    format!(
-        "The flk server refused this app's connection: it is not running as the local \
-         operator (it was started from inside a flk pane, or not from your own session). \
-         Open it from the Dock, Finder or your launcher. {REMOTE}"
-    )
+    "The flk server refused this app's connection: it is not running as the local operator \
+     (it was started from inside a flk pane, or not from your own session). Open it from \
+     the Dock, Finder or your launcher."
+        .into()
 }
 
-/// A session that ends before it starts: 1006 for an unreachable socket,
-/// 1013 for the server's `preauth_capacity`. The bridge makes the close.
+/// A session that ends before it starts: 1006 for an unreachable or silent
+/// socket, 1013 for the server's `preauth_capacity`. The bridge makes the close.
 fn closed(opened: Opened, sink: &Sink, code: u16, reason: &str) -> Opened {
     sink(Event::Close {
         code,
@@ -348,10 +422,36 @@ fn closed(opened: Opened, sink: &Sink, code: u16, reason: &str) -> Opened {
     opened
 }
 
+/// A JSON object with unique top-level keys. serde_json keeps the last of a
+/// duplicate, so `{"t":"cmd","t":"hello"}` would otherwise read as a `hello`.
+struct Strict(serde_json::Map<String, serde_json::Value>);
+
+impl<'de> Deserialize<'de> for Strict {
+    fn deserialize<D: de::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Keys;
+        impl<'de> de::Visitor<'de> for Keys {
+            type Value = Strict;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a JSON object")
+            }
+            fn visit_map<A: de::MapAccess<'de>>(self, mut map: A) -> Result<Strict, A::Error> {
+                let mut object = serde_json::Map::new();
+                while let Some((key, value)) = map.next_entry::<String, serde_json::Value>()? {
+                    if object.insert(key, value).is_some() {
+                        return Err(de::Error::custom("a duplicate key"));
+                    }
+                }
+                Ok(Strict(object))
+            }
+        }
+        deserializer.deserialize_map(Keys)
+    }
+}
+
 /// The `hello` with the bearer added, or why the frame is not forwarded.
 fn hello(text: &str, token: &Token) -> Result<String, &'static str> {
-    let Ok(serde_json::Value::Object(mut hello)) = serde_json::from_str(text) else {
-        return Err("the first frame is not a JSON object, so not a hello");
+    let Ok(Strict(mut hello)) = serde_json::from_str(text) else {
+        return Err("the first frame is not a JSON object with unique keys, so not a hello");
     };
     if hello.get("t").and_then(|t| t.as_str()) != Some("hello") {
         return Err("the first frame is not a hello");
@@ -384,6 +484,7 @@ enum Upgrade {
 
 /// The HTTP/1.1 upgrade to `/v1/ws` on a fresh connection to `path`, with
 /// the typed refusal the server sends instead ("Refusals before the upgrade").
+/// Any other failure, before or during the handshake, is an outage.
 #[cfg(unix)]
 async fn upgrade(path: &Path) -> Upgrade {
     let Ok(stream) = Stream::connect(path).await else {
@@ -405,13 +506,13 @@ async fn upgrade(path: &Path) -> Upgrade {
     }
 }
 
-/// No unix socket here: the mint has already refused, offering [`REMOTE`].
+/// No unix socket here: the mint has already refused.
 #[cfg(not(unix))]
 async fn upgrade(_: &Path) -> Upgrade {
     Upgrade::Refused {
         status: 0,
         code: None,
-        message: REMOTE.into(),
+        message: String::new(),
     }
 }
 

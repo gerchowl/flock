@@ -10,14 +10,17 @@ mod mint;
 
 use std::sync::Arc;
 
-use tauri::{ipc::Channel, State, WebviewUrl, WebviewWindowBuilder};
+use tauri::{
+    ipc::Channel, webview::PageLoadEvent, Manager, State, Webview, WebviewUrl,
+    WebviewWindowBuilder, WindowEvent,
+};
 
 fn main() {
     let context = tauri::generate_context!();
     let dev_url = tauri::is_dev()
         .then(|| context.config().build.dev_url.clone())
         .flatten();
-    let ws = mint::socket_path(|key| std::env::var(key).ok()).map(|api| mint::ws_socket_path(&api));
+    let ws = mint::ws_socket_path(&mint::socket_path(|key| std::env::var(key).ok()));
     let bridge = bridge::Bridge::new(
         ws,
         Arc::new(mint::mint),
@@ -31,8 +34,24 @@ fn main() {
                 .inner_size(1280.0, 800.0)
                 .initialization_script(config::init_script())
                 .on_navigation(move |url| config::navigation_allowed(url, dev_url.as_ref()))
+                // A reload or navigation starts a new page: the old one's
+                // sessions end (`Bridge::webview_gone`), or each would live on.
+                .on_page_load(|webview, load| {
+                    if load.event() == PageLoadEvent::Started {
+                        webview
+                            .state::<bridge::Bridge>()
+                            .webview_gone(webview.label());
+                    }
+                })
                 .build()?;
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            if let WindowEvent::Destroyed = event {
+                window
+                    .state::<bridge::Bridge>()
+                    .webview_gone(window.label());
+            }
         })
         .invoke_handler(tauri::generate_handler![
             bridge_open,
@@ -46,16 +65,18 @@ fn main() {
 // The webview's three commands: the bridge's open, send and close (ADR-0038 §6,
 // "Never in the webview"). None of them returns or reports the bearer.
 
-/// Opens a bridged session; its frames and close arrive on `events`.
+/// Opens a bridged session for this webview; its frames and close arrive
+/// on `events`. A send that fails means the webview is gone.
 #[tauri::command]
 async fn bridge_open(
     bridge: State<'_, bridge::Bridge>,
+    webview: Webview,
     renew: bool,
     events: Channel<bridge::Event>,
 ) -> Result<bridge::Opened, String> {
-    let sink = Arc::new(move |event| drop(events.send(event)));
+    let sink = Arc::new(move |event| events.send(event).is_ok());
     // The refusal, never the bearer: `open` has cut it out of every message.
-    let opened = bridge.open(renew, sink).await;
+    let opened = bridge.open(webview.label(), renew, sink).await;
     opened.inspect_err(|reason| eprintln!("flock-desktop: {reason}"))
 }
 

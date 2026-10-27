@@ -3,15 +3,20 @@
 //! `client.app.mint`, holding the connection itself, because the token binds
 //! to the minting process and a child's exit would revoke it. The token stays
 //! in this process (`bridge.rs`) and is never logged; every refusal becomes a
-//! plain message.
+//! plain message saying why, to which `bridge::rejection` adds the remote path.
 
 use std::{
     fmt, io,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
-/// The remote path the refusals offer instead (#2293).
+/// The remote path every refusal offers instead (#2293).
 pub const REMOTE: &str = "Connect to it with a one-time code instead (the remote path, #2293).";
+
+/// How long one exchange with the server may take: the mint, or the
+/// `/v1/ws` upgrade. ADR-0038 §3's connect deadline, 10 s per attempt.
+pub const DEADLINE: Duration = Duration::from_secs(10);
 
 /// An app-session token: a bearer secret with operator authority while the app
 /// runs. It has no `Display`, and its `Debug` shows nothing of it.
@@ -43,6 +48,8 @@ impl fmt::Debug for Token {
 pub enum Failure {
     /// No socket, or nobody listening on it.
     NoServer,
+    /// The server accepted but did not answer within [`DEADLINE`].
+    Timeout,
     Io(String),
     Refused {
         code: String,
@@ -51,17 +58,19 @@ pub enum Failure {
 }
 
 /// `flock.sock` where `flk` (release) puts it: `src/session.rs`
-/// `active_api_socket_path` over `src/config/io.rs` `config_dir`.
-pub fn socket_path(var: impl Fn(&str) -> Option<String>) -> Result<PathBuf, String> {
+/// `active_api_socket_path` over `src/config/io.rs` `config_dir`, which falls
+/// back to `/tmp/flock` with neither `XDG_CONFIG_HOME` nor `HOME`.
+pub fn socket_path(var: impl Fn(&str) -> Option<String>) -> PathBuf {
     if let Some(path) = var("FLOCK_SOCKET_PATH") {
-        return Ok(path.into());
+        return path.into();
     }
     let dir = match (var("XDG_CONFIG_HOME"), var("HOME")) {
         (Some(config), _) => PathBuf::from(config).join("flock"),
         (None, Some(home)) => PathBuf::from(home).join(".config/flock"),
-        (None, None) => return Err("neither XDG_CONFIG_HOME nor HOME is set".into()),
+        (None, None) => PathBuf::from("/tmp/flock"),
     };
-    // flk ignores the default name and an invalid one (`session::active_name`).
+    // flk ignores the default name and an invalid one (`session::active_name`
+    // over `validate_name`: at most 64 bytes of `[A-Za-z0-9._-]`, not `.` or `..`).
     let named = var("FLOCK_SESSION").filter(|name| {
         !matches!(name.as_str(), "" | "default" | "." | "..")
             && name.len() <= 64
@@ -69,11 +78,11 @@ pub fn socket_path(var: impl Fn(&str) -> Option<String>) -> Result<PathBuf, Stri
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b".-_".contains(&b))
     });
-    Ok(match named {
+    match named {
         Some(name) => dir.join("sessions").join(name),
         None => dir,
     }
-    .join("flock.sock"))
+    .join("flock.sock")
 }
 
 /// The server's unix-socket `/v1/ws` beside `api`: `flock.sock` gives
@@ -92,7 +101,7 @@ pub fn ptrace_guard(read: impl FnOnce() -> io::Result<String>) -> Result<(), Str
         Ok(Ok(scope)) if scope >= 1 => Ok(()),
         found => Err(format!(
             "Not minting a token: /proc/sys/kernel/yama/ptrace_scope {}, so any process of \
-             yours could read it from this app. Set it to 1 or more. {REMOTE}",
+             yours could read it from this app. Set it to 1 or more.",
             match found {
                 Ok(Ok(_)) => "is 0".to_owned(),
                 Ok(Err(_)) => "is not a number".to_owned(),
@@ -102,13 +111,13 @@ pub fn ptrace_guard(read: impl FnOnce() -> io::Result<String>) -> Result<(), Str
     }
 }
 
-/// The plain message for a refusal code (#2493's `client.app.mint` refusals).
+/// Why the server refused (#2493's `client.app.mint` refusals), in plain words.
 pub fn refusal_message(code: &str, message: &str) -> String {
     match code {
-        "operator_only" => format!(
-            "The flk server refused the mint: this app was started from inside a flk pane, or \
-             not from your own session. Open it from the Dock, Finder or your launcher. {REMOTE}"
-        ),
+        "operator_only" => "The flk server refused the mint: this app was started from inside \
+            a flk pane, or not from your own session. Open it from the Dock, Finder or your \
+            launcher."
+            .to_owned(),
         "peer_process_changed" => "The flk server could not bind the token to this app's process \
             (it changed while minting, twice). Restart the app."
             .to_owned(),
@@ -141,6 +150,7 @@ pub fn mint_with(
     }
     reply.map_err(|failure| match failure {
         Failure::NoServer => "No flk server is running, and the one started did not answer.".into(),
+        Failure::Timeout => "The flk server did not answer the mint within 10 s.".into(),
         Failure::Io(reason) => format!("Talking to the flk server failed: {reason}"),
         Failure::Refused { code, message } => refusal_message(&code, &message),
     })
@@ -187,7 +197,7 @@ mod unix {
         time::{Duration, Instant},
     };
 
-    use super::{Failure, Minted};
+    use super::{Failure, Minted, DEADLINE};
 
     /// `src/server/autodetect.rs`: how long `flk` waits for its daemon, and how often it looks.
     const SERVER_READY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -198,17 +208,23 @@ mod unix {
         if cfg!(target_os = "linux") {
             super::ptrace_guard(|| std::fs::read_to_string("/proc/sys/kernel/yama/ptrace_scope"))?;
         }
-        let path = super::socket_path(|key| std::env::var(key).ok())?;
-        super::mint_with(|| request(&path), || start_server(&path))
+        let path = super::socket_path(|key| std::env::var(key).ok());
+        super::mint_with(|| request(&path, DEADLINE), || start_server(&path))
     }
 
-    /// A fresh connection, one `client.app.mint` line and its reply line.
-    pub(super) fn request(path: &Path) -> Result<Minted, Failure> {
+    /// A fresh connection, one `client.app.mint` line and its reply line,
+    /// each way within `deadline`.
+    pub(super) fn request(path: &Path, deadline: Duration) -> Result<Minted, Failure> {
         let stream = UnixStream::connect(path).map_err(|error| match error.kind() {
             io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused => Failure::NoServer,
             _ => Failure::Io(format!("{}: {error}", path.display())),
         })?;
-        let io = |error: io::Error| Failure::Io(error.to_string());
+        let io = |error: io::Error| match error.kind() {
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => Failure::Timeout,
+            _ => Failure::Io(error.to_string()),
+        };
+        stream.set_read_timeout(Some(deadline)).map_err(io)?;
+        stream.set_write_timeout(Some(deadline)).map_err(io)?;
         (&stream)
             .write_all(b"{\"id\":\"mint\",\"method\":\"client.app.mint\",\"params\":{}}\n")
             .map_err(io)?;
@@ -248,7 +264,7 @@ mod unix {
 
 #[cfg(not(unix))]
 pub fn mint() -> Result<Minted, String> {
-    Err(format!("This platform has no flock.sock. {REMOTE}"))
+    Err("This platform has no flock.sock.".into())
 }
 
 #[cfg(test)]
