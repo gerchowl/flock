@@ -44,14 +44,38 @@ pub(crate) struct Snapshot {
     pub scroll_anchor: Option<u64>,
     /// Unseen-output indicator while paused, without moving the anchor.
     pub new_output: bool,
-    /// Folded source card identities, stable across later output.
-    pub collapsed: BTreeSet<u64>,
+    /// Folded card identities, independent of siblings at the same source cursor.
+    pub collapsed: BTreeSet<CardId>,
     /// Exact selected book handle. Closed or stale handles cannot authorize a decision.
     pub selected_permission: Option<PermissionHandle>,
 }
+/// Card identity within one source record's projection.
+/// Ordinals are deterministic for a given record and projection parser version.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct CardId {
+    /// Original source cursor; never a synthetic per-card stream sequence.
+    pub seq: u64,
+    /// Position among cards projected from that source record.
+    pub ordinal: u32,
+}
+/// Observed assistant tool use, separate from permission control and authority.
+#[derive(serde::Deserialize)]
+pub(crate) struct ObservedToolUse {
+    /// Original tool-use identity, matched by tool results.
+    pub id: String,
+    /// Observed tool name, never a request to execute it.
+    pub name: String,
+    /// Typed tool input; exact spelling and future fields remain in `raw`.
+    pub input: serde_json::Map<String, serde_json::Value>,
+    /// Exact source event for inspection, including unknown fields and whitespace.
+    #[serde(skip)]
+    pub raw: String,
+}
 /// One projected card with a stable originating stream identity.
 pub(crate) struct Card {
-    /// Original source cursor, also used for folds and inspection.
+    /// Independent identity used by folding and inspection.
+    pub id: CardId,
+    /// Original source cursor, equal to `id.seq`.
     pub seq: u64,
     /// Untrusted display content. Renderers escape controls and never execute it.
     pub content: Content,
@@ -64,8 +88,10 @@ pub(crate) enum Content {
     Text(String),
     /// Markdown including fenced code, with terminal controls escaped.
     Markdown(String),
-    /// Observed tool invocation, separate from permission-book controls.
+    /// Permission-control payload, never fabricated from an observed invocation.
     ToolRequest(ToolRequest),
+    /// Observed tool invocation, correlated with results by its original id.
+    ToolUse(ObservedToolUse),
     /// Observed result correlated by tool-use identity.
     ToolResult {
         /// Identity of the originating tool invocation.
@@ -166,9 +192,9 @@ pub(crate) enum Action {
     /// Submit the draft durably, retaining it on refusal or uncertainty.
     Send(Composer),
     /// Toggle folding for a source card identity.
-    ToggleFold(u64),
+    ToggleFold(CardId),
     /// Inspect a source card without changing runtime state.
-    InspectCard(u64),
+    InspectCard(CardId),
     /// Inspect the exact permission-book handle without deciding it.
     InspectPermission(PermissionHandle),
     /// Scroll older for negative lines, newer for positive lines, zero does nothing.
