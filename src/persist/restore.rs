@@ -1916,4 +1916,133 @@ mod native_tests {
             assert!(matches!(state.pending_ui_events[0], PaneClosed { .. }));
         }
     }
+
+    fn restore_native_fixture(
+        tabs: serde_json::Value,
+    ) -> (
+        Vec<Workspace>,
+        HashMap<TerminalId, TerminalState>,
+        HashMap<TerminalId, TerminalRuntime>,
+    ) {
+        let (state, _) = fixture();
+        let json =
+            serde_json::json!({"workspaces": [{"identity_cwd": ".", "tabs": tabs}]}).to_string();
+        let mut snap = super::super::snapshot::parse_snapshot(&json).unwrap();
+        snap.structured_agents = state.structured_agents.snapshot();
+        let (events, _) = mpsc::channel(8);
+        restore(
+            &snap,
+            None,
+            24,
+            80,
+            0,
+            &crate::test_support::no_op_program(),
+            crate::config::ShellModeConfig::NonLogin,
+            false,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(AtomicBool::new(false)),
+        )
+    }
+
+    #[test]
+    fn duplicate_agent_retains_second_placement_without_target() {
+        let tab = serde_json::json!({
+            "layout": {"Pane": 7}, "panes": {}, "zoomed": false,
+            "native_views": {"7": {"kind": "structured", "schema": 1, "agent_id": "fixture-agent"}}
+        });
+        let (workspaces, terminals, runtimes) =
+            restore_native_fixture(serde_json::json!([tab, tab]));
+        assert!(terminals.is_empty() && runtimes.is_empty());
+        let tabs = &workspaces[0].tabs;
+        assert_eq!(tabs.len(), 2);
+        assert!(tabs[0].native_views[&tabs[0].root_pane].target().is_some());
+        assert!(matches!(
+            tabs[1].native_views[&tabs[1].root_pane],
+            View::Unavailable {
+                reason: DuplicateAgent,
+                ..
+            }
+        ));
+        let saved = super::super::snapshot::capture_tab(&tabs[1], &terminals, &runtimes.into());
+        assert_eq!(
+            serde_json::to_value(&saved.native_views[&tabs[1].root_pane.raw()]).unwrap(),
+            tab["native_views"]["7"]
+        );
+    }
+
+    #[test]
+    fn unknown_fields_remain_invalid_and_byte_equal_through_restore_save() {
+        let raw = r#"{ "agent_id":"fixture-agent", "future": { "nested": [1, true] }, "schema":1, "kind":"structured" }"#;
+        let json = format!(
+            r#"{{"workspaces":[{{"identity_cwd":".","tabs":[{{"layout":{{"Pane":7}},"panes":{{}},"native_views":{{"7":{raw}}},"zoomed":false}}]}}]}}"#
+        );
+        let (state, _) = fixture();
+        let mut snap = super::super::snapshot::parse_snapshot(&json).unwrap();
+        snap.structured_agents = state.structured_agents.snapshot();
+        let (events, _) = mpsc::channel(8);
+        let (workspaces, terminals, runtimes) = restore(
+            &snap,
+            None,
+            24,
+            80,
+            0,
+            "/bin/sh",
+            crate::config::ShellModeConfig::NonLogin,
+            false,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert!(terminals.is_empty() && runtimes.is_empty());
+        let tab = &workspaces[0].tabs[0];
+        assert!(matches!(
+            tab.native_views[&tab.root_pane],
+            View::Unavailable {
+                reason: InvalidRecord,
+                ..
+            }
+        ));
+        let saved = super::super::snapshot::capture_tab(tab, &terminals, &runtimes.into());
+        assert_eq!(
+            serde_json::to_string(&saved.native_views[&tab.root_pane.raw()]).unwrap(),
+            raw
+        );
+    }
+
+    #[tokio::test]
+    async fn mixed_terminal_and_unavailable_tab_survives_restore_save() {
+        let tab = serde_json::json!({
+            "layout": {"Split": {"direction": "Horizontal", "ratio": 0.5,
+                "first": {"Pane": 7}, "second": {"Pane": 8}}},
+            "panes": {"7": {"cwd": std::env::temp_dir()}}, "zoomed": false,
+            "root_pane": 8, "focused": 8,
+            "native_views": {"8": {"kind": "future", "schema": 1, "agent_id": "x"}}
+        });
+        let (workspaces, terminals, runtimes) = restore_native_fixture(serde_json::json!([tab]));
+        assert_eq!(workspaces.len(), 1);
+        let restored = &workspaces[0].tabs[0];
+        assert!(restored.membership_valid());
+        assert_eq!(restored.panes.len(), 1);
+        assert_eq!(terminals.len(), 1);
+        assert_eq!(runtimes.len(), 1);
+        assert!(matches!(
+            restored.native_views[&restored.root_pane],
+            View::Unavailable {
+                reason: UnknownKind,
+                ..
+            }
+        ));
+        let saved = super::super::snapshot::capture_tab(restored, &terminals, &runtimes.into());
+        assert_eq!(saved.panes.len(), 1);
+        assert_eq!(saved.native_views.len(), 1);
+        assert_eq!(
+            serde_json::to_value(&saved.native_views[&restored.root_pane.raw()]).unwrap(),
+            tab["native_views"]["8"]
+        );
+        assert_eq!(
+            serde_json::to_value(&saved.layout).unwrap()["Split"]["direction"],
+            "Horizontal"
+        );
+    }
 }

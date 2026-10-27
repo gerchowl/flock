@@ -4145,4 +4145,7 @@ including removal of a single-pane tab. Public start/render wiring is S10d.
 Restore uses cold registry generations, never credentials, PIDs or auto-restart.
 Unsupported records remain visible unavailable tiles without attach authority.
 Raw record bytes survive migration/save; native-only tabs survive until explicit close.
-Older builds ignore this field and may replace native tiles with shells on restore.
+Snapshot format version 3 is deliberately unchanged. Older builds ignore this
+additive field and spawn shells in native tile slots; their next save permanently
+drops `native_views`. This placement loss is preferable to a version bump, which
+would make older builds ignore the entire session, including its terminal tabs.
