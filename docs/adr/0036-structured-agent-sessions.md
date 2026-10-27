@@ -3743,8 +3743,18 @@ in that audit trail. This does not expose credentials or change answer policy.
 - **Storage.** App-session tokens live in a second, in-memory store that
   `authenticate` checks beside the file tokens. They are never written under
   `client-tokens/` and never listed as file tokens.
-- **TTL.** A fixed 12 hours from the mint, with no sliding renewal. The shell
-  renews by minting again.
+- **TTL (#2489 owner decision).** A fixed 12 suspend-inclusive elapsed hours
+  from the mint, with no sliding renewal. Linux uses `CLOCK_BOOTTIME`; macOS
+  uses `mach_continuous_time`. Sleep counts, and wall-clock changes cannot
+  extend validity. The shell renews by minting again. `expires_in_ms` is
+  derived from the same clock and deadline.
+- **Idle expiry.** The credential clock also owns its absolute kernel timer
+  (Linux timerfd; macOS continuous-time kqueue timer). An elapsed deadline is
+  ready on resume without polling or occupying a blocking worker. This does
+  not request a hardware wakeup or change the transport heartbeat clock.
+  Clock read failures withhold authorization and mint returns `internal_error`;
+  timer failures close with 1001, without falsely claiming revocation. There
+  is no fallback to an awake-time or settable wall clock.
 - **Restart and handoff.** Both revoke every app-session token. A handoff does
   not carry them or their watches to the successor. This amends the §5a
   matrix row "Restart, handoff…".

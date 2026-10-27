@@ -9,7 +9,7 @@ fn peer(app: &mut crate::app::App, peer: crate::platform::peer::Credentials) {
 #[test]
 fn process_bound_hello_and_registration_require_the_exact_minting_peer() {
     let (_root, files, mut app) = super::super::tests::setup();
-    let store = Store::new(files, Arc::new(app_sessions::SystemClock));
+    let store = Store::new(files, Arc::new(app_sessions::SystemClock::new()));
     let a = Peer::spawn();
     let b = Peer::spawn();
     peer(&mut app, a.credentials);
@@ -58,7 +58,7 @@ fn process_bound_hello_and_registration_require_the_exact_minting_peer() {
 #[test]
 fn ready_peer_exit_prevents_registration_before_notifications_are_serviced() {
     let (_root, files, mut app) = super::super::tests::setup();
-    let store = Store::new(files, Arc::new(app_sessions::SystemClock));
+    let store = Store::new(files, Arc::new(app_sessions::SystemClock::new()));
     let mut child = Peer::spawn();
     peer(&mut app, child.credentials);
     let local = app.admit_local_peer(child.credentials).unwrap();
@@ -86,7 +86,7 @@ fn ready_peer_exit_prevents_registration_before_notifications_are_serviced() {
 #[test]
 fn registered_callback_retains_the_shared_revocation_fence() {
     let (_root, files, mut app) = super::super::tests::setup();
-    let store = Store::new(files, Arc::new(app_sessions::SystemClock));
+    let store = Store::new(files, Arc::new(app_sessions::SystemClock::new()));
     let child = Peer::spawn();
     peer(&mut app, child.credentials);
     let local = app.admit_local_peer(child.credentials).unwrap();
@@ -110,7 +110,7 @@ fn registered_callback_retains_the_shared_revocation_fence() {
 #[test]
 fn persistent_file_bearer_refuses_an_exited_local_peer() {
     let (_root, files, mut app) = super::super::tests::setup();
-    let store = Store::new(files, Arc::new(app_sessions::SystemClock));
+    let store = Store::new(files, Arc::new(app_sessions::SystemClock::new()));
     let mut child = Peer::spawn();
     peer(&mut app, child.credentials);
     let local = app.admit_local_peer(child.credentials).unwrap();

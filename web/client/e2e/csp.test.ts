@@ -129,6 +129,32 @@ describe("served document policy", () => {
     await page.close();
   });
 
+  test("the declared favicon is bundled and loads under the document policy", async () => {
+    const { page, errors } = await open({ transport: "error", message: "favicon probe" });
+    const missing: string[] = [];
+    page.on("response", (response) => {
+      if (response.status() === 404) missing.push(new URL(response.url()).pathname);
+    });
+    await page.goto(`http://127.0.0.1:${site}/`);
+    const icon = page.locator('link[rel="icon"]');
+    expect(await icon.count()).toBe(1);
+    expect(await icon.getAttribute("href")).toMatch(/^\.\/assets\/favicon-[A-Za-z0-9_-]+\.svg$/);
+    // Decode the declared resource under the real document CSP, even in engines
+    // that do not fetch tab icons in headless mode.
+    const loaded = await page.evaluate(async () => {
+      const link = document.querySelector<HTMLLinkElement>('link[rel="icon"]')!;
+      const image = new Image();
+      image.src = link.href;
+      await image.decode();
+      return image.naturalWidth > 0;
+    });
+    expect(loaded).toBe(true);
+    expect(await violations(page)).toEqual([]);
+    expect(missing).toEqual([]);
+    expect(errors).toEqual([]);
+    await page.close();
+  });
+
   test("the fixture workbench renders with no violation", async () => {
     const fixtureJsonl = await Bun.file(FIXTURE).text();
     const { page, errors } = await open({ transport: "fixture", fixtureJsonl, source: "csp-probe" });

@@ -29,7 +29,7 @@ successors create a fresh domain; graceful transport shutdown exclusively
 revokes every app credential before stopping its sockets. Persistent file
 credentials remain valid across these boundaries.
 
-Each credential expires exactly 12 monotonic hours after issuance, with no
+Each credential expires exactly 12 suspend-inclusive elapsed hours after issuance, with no
 sliding renewal. Renewal issues an independent bearer and token name with the same operator
 principal, `app:operator:<uid>` (decimal kernel-attested UID). Identity survives
 restart and handoff while credentials do not. Revocation fanout is per
@@ -52,7 +52,7 @@ and the existing two-second acquisition ceiling. Already-admitted effects are
 not claimed cancelled. Callbacks cannot recursively manage credentials or wait
 for a model.
 
-Idle sessions await the injected monotonic deadline and kernel exit readiness
+Idle sessions await the injected suspend-inclusive deadline and kernel exit readiness
 (kqueue NOTE_EXIT on macOS, pidfd on Linux); no PID liveness polling occurs.
 Each reactor waiter owns a separate descriptor for the same persistent watch.
 For registered sockets, expiry, process exit and explicit revocation use close 4403,
@@ -134,3 +134,16 @@ closes 4403 and reaches all sockets of that credential. File-token verification
 remains lock-free; registration must acquire its shared admission fence. An
 exclusive management fence therefore yields retryable 1001 at registration,
 without treating a valid token as an authentication failure.
+
+The enforcing clock is Linux `CLOCK_BOOTTIME` or macOS `mach_continuous_time`
+(#2489), so sleep counts without trusting a settable wall clock. Absolute
+kernel timers use the same domain; expiry is ready on resume without polling,
+blocking an I/O worker, or waking the machine from sleep. Clock reads fail
+closed through the existing storage/I/O error path (`internal_error` at mint).
+A timer error closes the socket with 1001 rather than claiming revocation.
+No awake-time clock fallback is used. Relative `expires_in_ms` is computed
+from the same issue sample and enforced deadline.
+
+The timer domains follow the [Linux timerfd contract](https://man7.org/linux/man-pages/man2/timerfd_create.2.html)
+and [Darwin continuous-time timer flags](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/sys/event.h).
+
