@@ -35,13 +35,14 @@ if "--model" in sys.argv and sys.argv[sys.argv.index("--model") + 1].startswith(
         for identity, text in [("first", "partial"), ("second", "later")]:
             emit_block(0, "text_delta", "text", text, identity)
     else:
-        for index in range(40 if "burst" in mode else 3):
+        for index in range(40 if "burst" in mode else 2 if "per-block" in mode else 3):
             kind, field, text = [("text_delta", "text", "partial"),
                                  ("thinking_delta", "thinking", "thinking"),
                                  ("text_delta", "text", "tool-result")][index % 3]
-            emit_block(index, kind, field, text)
-    emit_live({"type": "assistant", "message": {"id": "first", "role": "assistant", "content": [
-        {"type": "text", "text": "partial"}, {"type": "thinking", "thinking": "thinking"}]}})
+            emit_block(index, kind, field, text, "first" if "per-block" in mode else None)
+    blocks = [{"type": "text", "text": "partial"}, {"type": "thinking", "thinking": "thinking"}]
+    for content in [[block] for block in blocks] if "per-block" in mode else [blocks]:
+        emit_live({"type": "assistant", "message": {"id": "first", "role": "assistant", "content": content}})
     emit_live({"type": "user", "message": {"role": "user", "content": [
         {"type": "tool_result", "tool_use_id": "fixture-tool", "content": "tool-result"}]}})
     if mode.endswith("exit"):
