@@ -1342,17 +1342,35 @@ impl App {
         };
         let workspace_id = self.state.workspaces[ws_idx].id.clone();
         let terminal_id = self.state.terminal_id_for_pane(ws_idx, pane_id);
-        self.remove_agent_for_pane(
-            ws_idx,
-            pane_id,
-            crate::app::agent_removal::RemovalEvent::Close,
-        );
+        // Capture identity while the placement exists; publish removal only
+        // after checked close succeeds, so a refusal has no lifecycle effects.
+        let removal = terminal_id
+            .as_ref()
+            .and_then(|terminal| self.state.terminals.get(terminal))
+            .and_then(|terminal| {
+                crate::app::agent_removal::capture(
+                    terminal,
+                    crate::app::agent_removal::RemovalEvent::Close,
+                )
+            });
         let should_close_workspace = {
             let Some(ws) = self.state.workspaces.get_mut(ws_idx) else {
                 return pane_not_found(id, &target.pane_id);
             };
-            ws.close_pane(pane_id)
+            match ws.close_pane(pane_id) {
+                Ok(close_workspace) => close_workspace,
+                Err(_) => {
+                    return encode_error(
+                        id,
+                        "internal_error",
+                        "pane layout and content membership disagree; no pane closed",
+                    )
+                }
+            }
         };
+        if let Some(removal) = removal {
+            self.record_agent_removal(removal);
+        }
         if should_close_workspace {
             self.state.close_workspace(ws_idx);
             self.shutdown_detached_terminal_runtimes();
@@ -1551,6 +1569,38 @@ mod tests {
             peer_uid: Some(crate::platform::peer::effective_uid()),
         });
         response
+    }
+
+    #[tokio::test]
+    async fn native_agent_pane_read_returns_runtime_unsupported() {
+        let (mut app, _, _) = app_with_terminal();
+        app.state
+            .structured_agents
+            .register(crate::structured::registry::Record {
+                runtime: crate::structured::registry::StructuredRuntime::Structured,
+                agent_id: "fixture-native".into(),
+                name: Some("native-reader".into()),
+                harness: "claude".into(),
+                session_id: "fixture-session".into(),
+                cwd: std::env::temp_dir(),
+                model: None,
+            })
+            .unwrap();
+        for target in ["fixture-native", "native-reader"] {
+            let response = raw_request(
+                &mut app,
+                "pane.read",
+                serde_json::json!({"pane_id":target,"source":"recent"}),
+            );
+            let value: serde_json::Value =
+                serde_json::from_str(&response.try_recv().unwrap()).unwrap();
+            assert_eq!(
+                value["error"]["code"],
+                crate::api::error_code::ErrorCode::RuntimeUnsupported.as_str(),
+                "{value}"
+            );
+            assert!(value.get("result").is_none(), "{value}");
+        }
     }
 
     #[tokio::test]
@@ -2556,6 +2606,34 @@ mod tests {
                 assert_eq!(seen(&app), start, "{request} changed `seen`");
             }
         }
+    }
+
+    #[test]
+    fn api_pane_close_refuses_invalid_membership_before_side_effects() {
+        let (mut app, terminal, public) = app_with_terminal();
+        app.state
+            .terminals
+            .get_mut(&terminal)
+            .unwrap()
+            .detected_agent = Some(crate::detect::Agent::Claude);
+        let agent = app.state.terminals[&terminal].agent_id.to_string();
+        let root = app.state.workspaces[0].tabs[0].root_pane;
+        let unrelated = crate::layout::PaneId::alloc();
+        app.state.workspaces[0].tabs[0].layout =
+            crate::layout::TileLayout::from_saved(crate::layout::Node::Pane(unrelated), unrelated);
+        let sequence = app.event_hub.current_sequence();
+        let response:serde_json::Value=serde_json::from_str(&app.handle_api_request(serde_json::from_value(serde_json::json!({"id":"close","method":"pane.close","params":{"pane_id":public}})).unwrap())).unwrap();
+        assert_eq!(response["error"]["code"], "internal_error", "{response}");
+        assert_eq!(app.state.workspaces.len(), 1);
+        assert!(app.state.workspaces[0].tabs[0].panes.contains_key(&root));
+        assert_eq!(
+            app.state.workspaces[0].tabs[0].layout.pane_ids(),
+            vec![unrelated]
+        );
+        assert!(app.state.terminals.contains_key(&terminal));
+        assert_eq!(app.state.terminals[&terminal].agent_id.to_string(), agent);
+        assert!(!app.state.terminals[&terminal].agent_identity_retired);
+        assert_eq!(app.event_hub.current_sequence(), sequence);
     }
 
     #[test]
