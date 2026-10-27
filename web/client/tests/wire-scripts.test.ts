@@ -7,8 +7,9 @@
  * `s7-min` is replayed, and so is every `s7` script whose behaviour G3a
  * already implements; the rest are listed with the G3b (#1595) feature
  * they need. A script in no list, or an `s7-min` script left to G3b, fails
- * the suite, so nothing is skipped silently. Fixtures are S7a's, replayed
- * verbatim and never edited.
+ * the suite, so nothing is skipped silently. Literal traces run verbatim.
+ * A runtime timestamp marker is explicitly refused here: only the actual
+ * endpoint port can supply its independent persistence and wall-window oracles.
  *
  * Each script runs twice, with the jitter source at its lowest and highest
  * value, so both ends of every backoff interval are exercised.
@@ -110,7 +111,9 @@ describe("S7a scripts", () => {
     for (const [jitter, random] of Object.entries(JITTER)) {
       test(`${name} (${jitter} jitter)`, async () => {
         const steps = await load(name);
-        new Harness(random).run(steps);
+        if (steps.some((line) => line.step === "send" && line.frame.t === "ev" && typeof line.frame.ts_ms !== "number")) {
+          expect(() => new Harness(random).run(steps)).toThrow("dynamic timestamp requires persisted and wall-window oracles");
+        } else new Harness(random).run(steps);
       });
     }
   }

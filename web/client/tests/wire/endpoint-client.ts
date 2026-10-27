@@ -5,6 +5,7 @@ import type { ServerFrame } from "../../src/gen/ServerFrame";
 import type { FixtureLine } from "../../src/gen/FixtureLine";
 import { FakeNetwork, FakeSocket, Harness, VirtualClock, parseScript } from "./harness";
 import { runTrace, type CheckedStep, type StepHandlers } from "./endpoint-runner";
+import { TimestampMatcher } from "./timestamp-matcher";
 
 class EndpointClosed extends Error { constructor(readonly expected: boolean) { super("endpoint closed"); } }
 class EndpointSocket extends FakeSocket {
@@ -68,23 +69,6 @@ class EndpointNetwork extends FakeNetwork {
   override current(): EndpointSocket { return super.current() as EndpointSocket; }
 }
 
-/** Additive server fields are allowed; every authored semantic value stays exact. */
-function subset(actual: unknown, expected: unknown): void {
-  if (expected !== null && typeof expected === "object" && !Array.isArray(expected)) {
-    assert(actual !== null && typeof actual === "object" && !Array.isArray(actual));
-    for (const [key, value] of Object.entries(expected)) {
-      assert(Object.hasOwn(actual, key), `missing server field ${key}`);
-      subset((actual as Record<string, unknown>)[key], value);
-    }
-  } else assert.deepEqual(actual, expected);
-}
-function compare(actual: ServerFrame, expected: ServerFrame): void {
-  if (actual.t === "welcome" && expected.t === "welcome") {
-    // These three are semantics; version/epoch/principal are server identities.
-    for (const key of ["protocol", "capabilities", "idempotency_window_ms"] as const) assert.deepEqual(actual[key], expected[key]);
-  } else subset(actual, expected);
-}
-
 const [url, file, token, dropped] = process.argv.slice(2);
 assert(url && file && token);
 const script = { name: file.split("/").at(-1)!, lines: parseScript(await Bun.file(file).text()) };
@@ -96,6 +80,7 @@ const net = (): EndpointNetwork => { assert(harness.net instanceof EndpointNetwo
 const synchronous = (source: CheckedStep["source"]) => async (line: Readonly<FixtureLine>): Promise<CheckedStep> => {
   harness.step(line); return checked(source);
 };
+const matcher = new TimestampMatcher();
 const handlers: StepHandlers = {
   given: synchronous("setup"), client: synchronous("client"), expect_connect: synchronous("observation"),
   expect: synchronous("observation"), observe: synchronous("observation"),
@@ -103,7 +88,7 @@ const handlers: StepHandlers = {
   send: async (line) => {
     assert(line.step === "send");
     const actual = await net().current().next();
-    compare(actual, line.frame);
+    await matcher.check(actual, line.frame);
     harness.acceptServerFrame(actual, line.socket ?? "current");
     return checked("server");
   },

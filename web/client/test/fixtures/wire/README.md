@@ -200,3 +200,21 @@ tracked by #2467. Unimplemented handlers fail; no selected script is silently
 allowlisted away. `S7_TRACE_DROP_STEP=observe` is a test-only fail-first control:
 the normal `clean` endpoint test must fail at its unhandled observe step (exit
 100), then pass with the variable absent. No production hook is involved.
+
+### Runtime timestamp matchers
+
+A genuinely runtime `ev.ts_ms` may be authored as
+`{"$dynamic":"ts_ms","source":"persisted"}` (#2467 timestamp ruling).
+The fixture schema permits this marker only at that wall-clock field. The
+actual-endpoint interpreter must verify equality with the corresponding persisted
+record (sequence and event payload included), and membership in its independently
+observed `[before_action, after_ack]` wall-clock window. Missing evidence, an
+unsupported source, or a marker elsewhere fails. Literal timestamps and all other
+literal fields stay exact. Receipt wall times are not promised monotonic by
+ADR-0036; event ordering remains sequence-based.
+
+The pure virtual harness has no persistence/window oracle and explicitly rejects
+such traces. Its client-script tests pin that rejection rather than fabricate a
+timestamp; actual-endpoint execution owns their complete coverage. Rust parsing
+and the TypeScript fixture generator validate the marker's schema. This changes
+fixture authoring only, with no product clock injection.

@@ -17,7 +17,7 @@ fn script(name: &str) -> Vec<Value> {
     };
     let typed: Vec<FixtureLine> = text
         .lines()
-        .map(|line| serde_json::from_str(line).unwrap())
+        .map(|line| FixtureLine::parse(line).unwrap())
         .collect();
     assert!(
         matches!(&typed[0].step, FixtureStep::Given { covers, .. } if covers.contains(&FixtureCoverage::S7Min))
