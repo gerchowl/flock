@@ -2,22 +2,34 @@
 //! process mints an app-session token over `flock.sock` with
 //! `client.app.mint`, holding the connection itself, because the token binds
 //! to the minting process and a child's exit would revoke it. The token stays
-//! in memory and is never logged; every refusal becomes a plain message.
+//! in this process (`bridge.rs`) and is never logged; every refusal becomes a
+//! plain message.
 
-use std::{fmt, io, path::PathBuf};
+use std::{
+    fmt, io,
+    path::{Path, PathBuf},
+};
 
 /// The remote path the refusals offer instead (#2293).
-const REMOTE: &str = "Connect to it with a one-time code instead (the remote path, #2293).";
+pub const REMOTE: &str = "Connect to it with a one-time code instead (the remote path, #2293).";
 
 /// An app-session token: a bearer secret with operator authority while the app
 /// runs. It has no `Display`, and its `Debug` shows nothing of it.
 pub struct Token(String);
 
 impl Token {
-    /// The secret, for the one Tauri command that hands it to the webview.
-    pub fn into_secret(self) -> String {
-        self.0
+    /// The secret, for the bridge's `hello` and nothing that leaves this process.
+    pub fn secret(&self) -> &str {
+        &self.0
     }
+}
+
+/// A mint's token and the remaining lifetime the server reported at issuance
+/// (`issued.info.expires_in_ms`), when it reported one.
+#[derive(Debug)]
+pub struct Minted {
+    pub token: Token,
+    pub expires_in_ms: Option<u64>,
 }
 
 impl fmt::Debug for Token {
@@ -64,6 +76,15 @@ pub fn socket_path(var: impl Fn(&str) -> Option<String>) -> Result<PathBuf, Stri
     .join("flock.sock"))
 }
 
+/// The server's unix-socket `/v1/ws` beside `api`: `flock.sock` gives
+/// `flock-ws.sock`, an override `custom.sock` gives `custom-ws.sock`
+/// (`src/web/local_listener.rs` `socket_path`).
+pub fn ws_socket_path(api: &Path) -> PathBuf {
+    let mut stem = api.file_stem().unwrap_or("flock".as_ref()).to_os_string();
+    stem.push("-ws.sock");
+    api.with_file_name(stem)
+}
+
 /// Linux only: a same-UID process may attach to the shell and read the token
 /// unless Yama's `ptrace_scope` is at least 1 (ADR-0038 §6), so mint only then.
 pub fn ptrace_guard(read: impl FnOnce() -> io::Result<String>) -> Result<(), String> {
@@ -105,9 +126,9 @@ pub fn refusal_message(code: &str, message: &str) -> String {
 /// Mints through `request`, retrying `peer_process_changed` once on a fresh
 /// connection and starting a server through `start` when none runs.
 pub fn mint_with(
-    mut request: impl FnMut() -> Result<Token, Failure>,
+    mut request: impl FnMut() -> Result<Minted, Failure>,
     start: impl FnOnce() -> Result<(), String>,
-) -> Result<Token, String> {
+) -> Result<Minted, String> {
     let mut reply = request();
     if matches!(reply, Err(Failure::NoServer)) {
         start().map_err(|reason| {
@@ -125,9 +146,9 @@ pub fn mint_with(
     })
 }
 
-/// The token in a `client.app.mint` reply line, or its refusal.
-/// No error text quotes the line, which may hold the token.
-pub fn parse_reply(line: &str) -> Result<Token, Failure> {
+/// The token and its `expires_in_ms` in a `client.app.mint` reply line, or its
+/// refusal. No error text quotes the line, which may hold the token.
+pub fn parse_reply(line: &str) -> Result<Minted, Failure> {
     let reply: serde_json::Value =
         serde_json::from_str(line).map_err(|_| Failure::Io("the reply is not JSON".into()))?;
     if let Some(error) = reply.get("error") {
@@ -144,7 +165,10 @@ pub fn parse_reply(line: &str) -> Result<Token, Failure> {
         (serde_json::Value::String(kind), Some(token))
             if kind == "client_token_issued" && !token.is_empty() =>
         {
-            Ok(Token(token.to_owned()))
+            Ok(Minted {
+                token: Token(token.to_owned()),
+                expires_in_ms: reply["result"]["issued"]["info"]["expires_in_ms"].as_u64(),
+            })
         }
         _ => Err(Failure::Io("the reply carries no issued token".into())),
     }
@@ -163,14 +187,14 @@ mod unix {
         time::{Duration, Instant},
     };
 
-    use super::{Failure, Token};
+    use super::{Failure, Minted};
 
     /// `src/server/autodetect.rs`: how long `flk` waits for its daemon, and how often it looks.
     const SERVER_READY_TIMEOUT: Duration = Duration::from_secs(5);
     const SOCKET_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
     /// One mint from this process, starting a server when none runs.
-    pub fn mint() -> Result<Token, String> {
+    pub fn mint() -> Result<Minted, String> {
         if cfg!(target_os = "linux") {
             super::ptrace_guard(|| std::fs::read_to_string("/proc/sys/kernel/yama/ptrace_scope"))?;
         }
@@ -179,7 +203,7 @@ mod unix {
     }
 
     /// A fresh connection, one `client.app.mint` line and its reply line.
-    pub(super) fn request(path: &Path) -> Result<Token, Failure> {
+    pub(super) fn request(path: &Path) -> Result<Minted, Failure> {
         let stream = UnixStream::connect(path).map_err(|error| match error.kind() {
             io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused => Failure::NoServer,
             _ => Failure::Io(format!("{}: {error}", path.display())),
@@ -223,7 +247,7 @@ mod unix {
 }
 
 #[cfg(not(unix))]
-pub fn mint() -> Result<Token, String> {
+pub fn mint() -> Result<Minted, String> {
     Err(format!("This platform has no flock.sock. {REMOTE}"))
 }
 

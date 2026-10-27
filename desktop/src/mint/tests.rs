@@ -1,9 +1,14 @@
-use std::{cell::Cell, collections::HashMap, io, path::PathBuf};
+use std::{
+    cell::Cell,
+    collections::HashMap,
+    io,
+    path::{Path, PathBuf},
+};
 
 use super::*;
 
 const SECRET: &str = "s3cret-app-token";
-const ISSUED: &str = r#"{"id":"mint","result":{"type":"client_token_issued","issued":{"info":{"name":"app:1","principal":"op","scopes":["read","send","answer","operate"]},"token":"s3cret-app-token"}}}"#;
+const ISSUED: &str = r#"{"id":"mint","result":{"type":"client_token_issued","issued":{"info":{"name":"app:1","principal":"op","scopes":["read","send","answer","operate"],"expires_in_ms":43200000},"token":"s3cret-app-token"}}}"#;
 
 fn refused(code: &str) -> Failure {
     Failure::Refused {
@@ -14,9 +19,9 @@ fn refused(code: &str) -> Failure {
 
 /// Mints against scripted replies; returns the outcome and how many requests ran.
 fn mint_scripted(
-    mut replies: Vec<Result<Token, Failure>>,
+    mut replies: Vec<Result<Minted, Failure>>,
     start: Result<(), String>,
-) -> (Result<Token, String>, usize, bool) {
+) -> (Result<Minted, String>, usize, bool) {
     replies.reverse();
     let calls = Cell::new(0);
     let started = Cell::new(false);
@@ -33,7 +38,7 @@ fn mint_scripted(
     (outcome, calls.get(), started.get())
 }
 
-fn token() -> Result<Token, Failure> {
+fn token() -> Result<Minted, Failure> {
     parse_reply(ISSUED)
 }
 
@@ -52,7 +57,7 @@ fn operator_only_names_the_pane_launch_and_the_remote_path() {
 fn peer_process_changed_is_retried_once_on_a_fresh_connection() {
     let (outcome, calls, _) =
         mint_scripted(vec![Err(refused("peer_process_changed")), token()], Ok(()));
-    assert_eq!(outcome.unwrap().into_secret(), SECRET);
+    assert_eq!(outcome.unwrap().token.secret(), SECRET);
     assert_eq!(calls, 2);
     let twice = vec![
         Err(refused("peer_process_changed")),
@@ -90,7 +95,7 @@ fn invalid_params_and_internal_error_carry_the_servers_detail() {
 #[test]
 fn no_server_starts_one_then_mints() {
     let (outcome, calls, started) = mint_scripted(vec![Err(Failure::NoServer), token()], Ok(()));
-    assert_eq!(outcome.unwrap().into_secret(), SECRET);
+    assert_eq!(outcome.unwrap().token.secret(), SECRET);
     assert_eq!((calls, started), (2, true));
     let (outcome, calls, _) = mint_scripted(
         vec![Err(Failure::NoServer)],
@@ -131,7 +136,10 @@ fn ptrace_scope_zero_or_unknown_refuses_the_mint() {
 #[test]
 fn the_token_never_shows_in_debug_or_errors() {
     let issued = token();
-    assert_eq!(format!("{issued:?}"), "Ok(Token(<redacted>))");
+    assert_eq!(
+        format!("{issued:?}"),
+        "Ok(Minted { token: Token(<redacted>), expires_in_ms: Some(43200000) })"
+    );
     let broken = ISSUED.replace("client_token_issued", "other");
     let truncated = &ISSUED[..ISSUED.len() - 3];
     for line in [broken.as_str(), truncated] {
@@ -202,10 +210,27 @@ fn one_request_line_on_a_fresh_connection() {
             .unwrap();
         line
     });
-    assert_eq!(unix::request(&path).unwrap().into_secret(), SECRET);
+    assert_eq!(unix::request(&path).unwrap().token.secret(), SECRET);
     assert_eq!(
         server.join().unwrap(),
         "{\"id\":\"mint\",\"method\":\"client.app.mint\",\"params\":{}}\n"
     );
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn the_reply_carries_expires_in_ms_when_the_server_reports_it() {
+    assert_eq!(token().unwrap().expires_in_ms, Some(43_200_000));
+    let older = ISSUED.replace(r#","expires_in_ms":43200000"#, "");
+    assert_eq!(parse_reply(&older).unwrap().expires_in_ms, None);
+}
+
+#[test]
+fn the_ws_socket_sits_beside_the_api_socket() {
+    let ws = |api: &str| ws_socket_path(Path::new(api));
+    assert_eq!(
+        ws("/h/.config/flock/flock.sock"),
+        PathBuf::from("/h/.config/flock/flock-ws.sock")
+    );
+    assert_eq!(ws("/run/custom.sock"), PathBuf::from("/run/custom-ws.sock"));
 }
