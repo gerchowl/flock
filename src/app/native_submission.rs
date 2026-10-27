@@ -23,6 +23,9 @@ impl App {
         target: Target,
         draft: Composer,
     ) -> Result<(), ErrorCode> {
+        if draft.text.trim().is_empty() {
+            return Err(ErrorCode::InvalidParams);
+        }
         if let Some(pending) = self.native_submissions.get(&target.agent_id) {
             return Err(
                 if pending.outcome == Some(Err(ErrorCode::InputWriteUnknown)) {

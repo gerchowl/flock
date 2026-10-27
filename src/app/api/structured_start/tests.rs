@@ -1097,4 +1097,101 @@ async fn public_native_enter_submits_current_draft_once_without_terminal_bytes()
         .composer
         .text
         .is_empty());
+    fixture.app.handle_terminal_key_headless(enter);
+    assert!(
+        matches!(fixture.app.state.toast.as_ref(),Some(t) if t.context == "invalid_params"),
+        "empty current draft must refuse before queue admission"
+    );
+    assert!(fixture.app.native_submissions.is_empty());
+}
+
+#[tokio::test]
+async fn public_native_mouse_uses_painted_fold_and_rejects_stale_hits() {
+    use crate::structured::view::contracts::Action;
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    let _guard = crate::config::test_config_env_guard();
+    let mut fixture = AdmissionFixture::new("init-socket-null", 5000);
+    let (id, generation) = fixture.start().await;
+    fixture.submit(&id, generation);
+    fixture.app.state.mode = crate::app::Mode::Terminal;
+    let wake = fixture.app.render_notify.clone();
+    crate::structured::workers::tests::wait(&wake, || {
+        fixture.app.service_structured_workers(Instant::now());
+        matches!(fixture.app.state.native_frames.get(&id), Some(Ok(f)) if !f.transcript.is_empty())
+    })
+    .await;
+    let area = ratatui::layout::Rect::new(0, 0, 100, 40);
+    crate::ui::compute_view_with_runtime_registry(
+        &mut fixture.app.state,
+        &fixture.app.terminal_runtimes,
+        area,
+    );
+    let (pane, prepared) = fixture.app.state.view.structured.iter().next().unwrap();
+    let pane_id = *pane;
+    let prepared = prepared.pane.as_ref().unwrap();
+    let (x, y, card) = (0..40)
+        .flat_map(|y| (0..100).map(move |x| (x, y)))
+        .find_map(|(x, y)| match prepared.hit(x, y) {
+            Some(Action::ToggleFold(id)) => Some((x, y, *id)),
+            _ => None,
+        })
+        .unwrap();
+    let click = MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: x,
+        row: y,
+        modifiers: KeyModifiers::empty(),
+    };
+    fixture.app.handle_mouse(click);
+    crate::structured::workers::tests::wait(&wake, || {
+        fixture.app.service_structured_workers(Instant::now());
+        matches!(fixture.app.state.native_frames.get(&id), Some(Ok(f)) if f.collapsed.contains(&card))
+    }).await;
+    assert_eq!(
+        fixture.app.state.workspaces[0].focused_pane_id(),
+        Some(pane_id)
+    );
+    assert!(fixture.app.state.terminals.is_empty());
+    crate::ui::compute_view_with_runtime_registry(
+        &mut fixture.app.state,
+        &fixture.app.terminal_runtimes,
+        area,
+    );
+    let prepared = fixture.app.state.view.structured[&pane_id]
+        .pane
+        .as_ref()
+        .unwrap();
+    let (dx, dy) = prepared
+        .positions()
+        .into_iter()
+        .find(|&(x, y)| matches!(prepared.hit(x,y),Some(Action::InspectCard(id)) if *id == card))
+        .unwrap();
+    fixture.app.handle_mouse(MouseEvent {
+        column: dx,
+        row: dy,
+        ..click
+    });
+    crate::structured::workers::tests::wait(&wake, || {
+        fixture.app.service_structured_workers(Instant::now());
+        matches!(fixture.app.state.native_frames.get(&id),Some(Ok(f)) if !f.collapsed.contains(&card) && f.scroll_anchor == Some(card.seq))
+    }).await;
+    crate::ui::compute_view_with_runtime_registry(
+        &mut fixture.app.state,
+        &fixture.app.terminal_runtimes,
+        area,
+    );
+    fixture
+        .app
+        .state
+        .structured_agents
+        .begin_launch(&id, generation)
+        .unwrap();
+    fixture.app.handle_mouse(click);
+    assert_eq!(
+        fixture.app.state.toast.as_ref().unwrap().context,
+        "agent_not_found"
+    );
+    assert!(fixture.app.state.workspaces[0].tabs[0]
+        .native_views
+        .contains_key(&pane_id));
 }

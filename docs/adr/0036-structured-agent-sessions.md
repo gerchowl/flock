@@ -4316,3 +4316,21 @@ at the following tail is a no-op; End explicitly resumes following from an ancho
 Collapse and scroll state are per-driver and shared between panes showing the same
 agent, rather than per frontend viewport. Permission decisions remain refused for
 UID-only Operator context without reserving or closing the exact live request.
+
+### Amendment: S10d2 current-draft submission
+
+Enter without a selected control submits the current composer; Tab/Shift-Tab and
+Enter continue to activate painted controls. Empty or whitespace-only drafts refuse
+with `invalid_params` before admission. A stale draft or generation refuses
+before admission. Send uses the existing durable queue owner as interactive Operator,
+never raw stdin. One in-flight ticket per view prevents duplicate clicks. Only the
+exact committed draft is cleared; refusal or uncertainty retains it, and unknown
+admission stays latched with its lifecycle ID rather than being blindly resent.
+A receipt acknowledges admission, never delivery or turn completion. Details expands
+the exact card and anchors its source cursor; sibling cards share that cursor. S10e still owns full permission inspection,
+capability-backed decisions and Always confirmation; UID-only decisions refuse.
+
+Text and paste are not submission intents. S10d3 explicitly extends the frozen S10
+contracts with typed composer editing: insert, delete, cursor movement, history and
+bounded paste as one insert. It adds editor/history and admission-receipt UX plus
+idle delivery, rather than interpreting printable or pasted text as Send.
