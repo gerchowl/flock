@@ -1554,6 +1554,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_agent_pane_read_returns_runtime_unsupported() {
+        let (mut app, _, _) = app_with_terminal();
+        app.state
+            .structured_agents
+            .register(crate::structured::registry::Record {
+                runtime: crate::structured::registry::StructuredRuntime::Structured,
+                agent_id: "fixture-native".into(),
+                name: Some("native-reader".into()),
+                harness: "claude".into(),
+                session_id: "fixture-session".into(),
+                cwd: std::env::temp_dir(),
+                model: None,
+            })
+            .unwrap();
+        for target in ["fixture-native", "native-reader"] {
+            let response = raw_request(
+                &mut app,
+                "pane.read",
+                serde_json::json!({"pane_id":target,"source":"recent"}),
+            );
+            let value: serde_json::Value =
+                serde_json::from_str(&response.try_recv().unwrap()).unwrap();
+            assert_eq!(
+                value["error"]["code"],
+                crate::api::error_code::ErrorCode::RuntimeUnsupported.as_str(),
+                "{value}"
+            );
+            assert!(value.get("result").is_none(), "{value}");
+        }
+    }
+
+    #[tokio::test]
     async fn s3c_invalid_timeouts_and_submit_budgets_refuse_without_effect() {
         for method in ["pane.send_text", "pane.write_text", "agent.send"] {
             for timeout in [

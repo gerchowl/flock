@@ -19,6 +19,6 @@ pub(crate) mod identity;
 
 pub(crate) mod publication;
 
-// State contracts are consumed by the following native-view slices.
-#[allow(dead_code)]
+// Lint native placement independently of the parent staging allowance (#1430).
+#[warn(dead_code)]
 pub(crate) mod view;
