@@ -131,7 +131,7 @@ impl Store {
             waiting: Mutex::default(),
         }
     }
-    /// Install a bounded fixture gate before the contended IPC read starts.
+    /// Install a fixture gate before the contended IPC read starts.
     #[cfg(all(test, feature = "web"))]
     pub(crate) fn on_waiting(&self, action: impl FnOnce() + Send + 'static) {
         self.waiting.lock().unwrap().push(Box::new(action));

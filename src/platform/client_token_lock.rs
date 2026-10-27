@@ -124,7 +124,7 @@ impl PendingLock {
     /// Observe a real contended wait before reading its bounded helper acknowledgement.
     /// The callback runs before the IPC read starts its timeout. It must not wait
     /// for the helper or manage the guarded token store. Fixtures may pause here
-    /// with a bounded gate, keeping unrelated test work outside the read budget.
+    /// with a sender-owned gate, keeping unrelated test work outside the read budget.
     pub(crate) fn finish_notifying(
         mut self,
         deadline: Duration,

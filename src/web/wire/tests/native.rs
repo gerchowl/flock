@@ -819,7 +819,8 @@ async fn waiting_hellos_do_not_starve_established_subscriptions() {
 }
 
 /// Pause a real contended helper before its two-second IPC read starts.
-/// Losing either producer or consumer fails within the existing fixture ceiling.
+/// The test owns every release sender; unwinding or a `within` failure drops
+/// them and releases this gate. The gate adds no deadline around later work.
 fn gate_mutation_wait(
     f: &Native,
 ) -> (
@@ -830,8 +831,7 @@ fn gate_mutation_wait(
     let (release, held) = std::sync::mpsc::channel();
     f.server.core.shared.store.on_mutation_waiting(move || {
         ready.send(()).expect("mutation gate observer disappeared");
-        held.recv_timeout(Duration::from_secs(5))
-            .expect("mutation gate producer stayed silent or disappeared");
+        let _ = held.recv();
     });
     (waiting, release)
 }
@@ -914,6 +914,10 @@ async fn waiting_retirements_do_not_starve_established_subscriptions() {
 
 #[tokio::test]
 async fn shutdown_waits_outside_the_store_io_pool() {
+    assert!(
+        std::env::var_os("NEXTEST").is_some(),
+        "capacity baseline requires nextest's per-test process isolation"
+    );
     let mut f = Native::new().await;
     let token = f.mint().await;
     let mut socket = f.open().await;
@@ -939,5 +943,40 @@ async fn shutdown_waits_outside_the_store_io_pool() {
         );
         assert_eq!(close_detail(&mut socket).await.0, AUTH_REVOKED_CLOSE);
     }
+    f.finish().await;
+}
+
+#[tokio::test]
+async fn failed_assertion_releases_the_mutation_gate() {
+    use futures_util::FutureExt;
+    use std::panic::AssertUnwindSafe;
+    let mut f = Native::new().await;
+    let token = f.mint().await;
+    let mut socket = f.open().await;
+    socket.hello(1, &token.0).await;
+    let lock = crate::platform::client_token_lock::LockFile::new(management_lock(&f));
+    let (waiting, release) = gate_mutation_wait(&f);
+    let session = f.server.core.shared.store.authenticate(&token).unwrap();
+    f.server.core.shared.revoke(&session);
+    let failure = AssertUnwindSafe(async move {
+        // The failing scope owns both the lock and the gate's only sender.
+        let _resources = (lock, release);
+        assert!(
+            within(waiting).await.is_err(),
+            "injected assertion failure after mutation gate entry"
+        );
+    })
+    .catch_unwind()
+    .await
+    .expect_err("the injected assertion unexpectedly passed");
+    let message = failure
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| failure.downcast_ref::<&str>().copied())
+        .unwrap_or("");
+    assert!(message.contains("injected assertion failure after mutation gate entry"));
+    // The real retirement must finish after sender drop, bounded by within.
+    assert_eq!(close_detail(&mut socket).await.0, AUTH_REVOKED_CLOSE);
+    assert!(f.server.core.shared.store.authenticate(&token).is_err());
     f.finish().await;
 }
