@@ -844,15 +844,6 @@ Every input to a structured agent is an item in that agent's queue, which is
 an event-log stream (§4) named `queue/<agent>`. Humans and agents feed the
 same queue (owner decision 5): there is no second input path.
 
-Queue-worker permission preflight and stdin admission wait for the permission
-book mutex (#2627). A transient contention refusal cannot be retried by an idle
-agent's event stream: releasing the book produces no event. The synchronous
-session-events worker already owns journal I/O and may block here; operator
-APIs retain nonblocking acquisition. Every book holder must finish its bounded
-in-memory state, JSON or hashing work before any await, I/O, logging or blocking
-channel operation. Audit persistence, pipe writes and notifications happen after
-release. Allocation and OS scheduling still have no hard wall-clock bound.
-
 ```text
 { item_id (uuid; becomes the stream-json message uuid and command_uuid),
   producer: human | agent:<id> | channel:<binding>/<user> | system:<source> | fork:<agent>,
@@ -872,6 +863,15 @@ release. Allocation and OS scheduling still have no hard wall-clock bound.
   relevant_now?: { p, band },         the last relevance check (below)
   body, attachments: [blob refs] }
 ```
+
+Queue-worker permission preflight and stdin admission wait for the permission
+book mutex (#2627). A transient contention refusal cannot be retried by an idle
+agent's event stream: releasing the book produces no event. The synchronous
+session-events worker already owns journal I/O and may block here; operator
+APIs retain nonblocking acquisition. Every book holder must finish its bounded
+in-memory state, JSON or hashing work before any await, I/O, logging or blocking
+channel operation. Audit persistence, pipe writes and notifications happen after
+release. Allocation and OS scheduling still have no hard wall-clock bound.
 
 - **One gate.** Each item passes `queue.gate` once: `send` (deliver per
   `delivery`), `hold` (until a human releases it), `stash` (keep, never
