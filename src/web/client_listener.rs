@@ -30,6 +30,9 @@ use tokio::{
 };
 /// Concurrent HTTP connections before upgrade; upgraded sockets have the core's cap.
 const HTTP_CONNECTIONS: usize = 32;
+/// Independent refusal writers per listener; overload never stalls normal acceptance.
+/// Once these are full, additional over-cap sockets close without a response.
+const HTTP_REFUSALS: usize = 4;
 /// Absolute HTTP lifetime, including headers, body, writes and keepalive before upgrade.
 const HTTP_ADMISSION_DEADLINE: Duration = Duration::from_secs(5);
 /// Maximum time for the startup public-funnel probe.
@@ -50,29 +53,36 @@ where
     P: Clone + Send + Sync + 'static,
 {
     let slots = Arc::new(Semaphore::new(HTTP_CONNECTIONS));
+    let refusals = Arc::new(Semaphore::new(HTTP_REFUSALS));
     let mut clients = JoinSet::new();
     loop {
         while clients.try_join_next().is_some() {}
         let (socket, peer) = accept_next(&mut accept, clock.as_ref(), &health).await?;
         let Ok(permit) = slots.clone().try_acquire_owned() else {
-            // Refuse without reading another header outside the incomplete-HTTP cap.
-            let response =
-                super::local_admission::refusal(crate::api::error_code::ErrorCode::PreauthCapacity);
-            if let Ok(body) = axum::body::to_bytes(response.into_body(), 512).await {
-                use tokio::io::AsyncWriteExt;
-                let mut socket = socket;
-                let header = format!("HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nCache-Control: no-store\r\nConnection: close\r\nContent-Length: {}\r\n\r\n", body.len());
-                let write = async {
-                    socket.write_all(header.as_bytes()).await?;
-                    socket.write_all(&body).await?;
-                    socket.shutdown().await?;
-                    // Drain after half-close so unread request bytes cannot reset the reply.
-                    tokio::io::copy(&mut socket, &mut tokio::io::sink()).await
-                };
-                tokio::select! { biased;
-                    _ = clock.until(clock.now() + HTTP_ADMISSION_DEADLINE) => (),
-                    _ = write => (),
-                }
+            if let Ok(permit) = refusals.clone().try_acquire_owned() {
+                let clock = clock.clone();
+                clients.spawn(async move {
+                    let _permit = permit;
+                    // Refuse without reading another header outside the incomplete-HTTP cap.
+                    let response =
+                        super::local_admission::refusal(super::local_admission::Refusal::Capacity);
+                    if let Ok(body) = axum::body::to_bytes(response.into_body(), 512).await {
+                        use tokio::io::AsyncWriteExt;
+                        let mut socket = socket;
+                        let header = format!("HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nCache-Control: no-store\r\nConnection: close\r\nContent-Length: {}\r\n\r\n", body.len());
+                        let write = async {
+                            socket.write_all(header.as_bytes()).await?;
+                            socket.write_all(&body).await?;
+                            socket.shutdown().await?;
+                            // Drain after half-close so unread request bytes cannot reset the reply.
+                            tokio::io::copy(&mut socket, &mut tokio::io::sink()).await
+                        };
+                        tokio::select! { biased;
+                            _ = clock.until(clock.now() + HTTP_ADMISSION_DEADLINE) => (),
+                            _ = write => (),
+                        }
+                    }
+                });
             }
             continue;
         };

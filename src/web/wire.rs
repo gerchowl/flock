@@ -92,10 +92,13 @@ struct Lease {
 }
 impl Drop for Lease {
     fn drop(&mut self) {
-        if let Ok(mut clients) = self.shared.clients.lock() {
-            self.live.store(false, Ordering::Release);
-            clients.remove(&self.id);
-        }
+        let mut clients = self
+            .shared
+            .clients
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        self.live.store(false, Ordering::Release);
+        clients.remove(&self.id);
     }
 }
 /// Unmounted protocol core. The listener slice owns HTTP hosting guards and binding.
@@ -274,19 +277,21 @@ async fn upgrade(
     peer: Option<Extension<crate::app::LocalPeer>>,
 ) -> Response {
     if local && peer.is_none() {
-        return super::local_admission::refusal(crate::api::error_code::ErrorCode::OperatorOnly);
+        return super::local_admission::refusal(super::local_admission::Refusal::Identity(
+            crate::app::LocalPeerRefusal::OperatorOnly,
+        ));
     }
     if *shared.stop.borrow() {
-        return super::local_admission::refusal(crate::api::error_code::ErrorCode::PreauthCapacity);
+        return super::local_admission::refusal(super::local_admission::Refusal::Capacity);
     }
     let Ok(permit) = shared.slots.clone().try_acquire_owned() else {
-        return super::local_admission::refusal(crate::api::error_code::ErrorCode::PreauthCapacity);
+        return super::local_admission::refusal(super::local_admission::Refusal::Capacity);
     };
     let Ok(hello) = shared.hellos[usize::from(local)]
         .clone()
         .try_acquire_owned()
     else {
-        return super::local_admission::refusal(crate::api::error_code::ErrorCode::PreauthCapacity);
+        return super::local_admission::refusal(super::local_admission::Refusal::Capacity);
     };
     ws.max_frame_size(MAX_MESSAGE)
         .max_message_size(MAX_MESSAGE)
@@ -486,13 +491,10 @@ async fn connection(
         failure => {
             let changed = matches!(failure, Some(Err(PeerAdmissionError::PeerProcessChanged)));
             let code = match failure {
-                // The first verification succeeded: a later credential refusal is revocation.
-                Some(Err(PeerAdmissionError::Token(error))) => {
-                    match HandshakeFailure::from(error) {
-                        HandshakeFailure::Refused => AUTH_REVOKED_CLOSE,
-                        _ => GOING_AWAY_CLOSE,
-                    }
-                }
+                // Nothing has registered yet: a credential refusal is a refused hello.
+                Some(Err(PeerAdmissionError::Token(error))) => HandshakeFailure::from(error)
+                    .hello_code()
+                    .unwrap_or(GOING_AWAY_CLOSE),
                 _ if changed => AUTH_REFUSED_CLOSE,
                 _ => GOING_AWAY_CLOSE,
             };

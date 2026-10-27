@@ -15,7 +15,13 @@ impl Native {
         Self::with_facts(None).await
     }
     async fn with_facts(facts: Option<crate::platform::peer::Credentials>) -> Self {
-        let (server, app, _) = super::app_sessions::fixture_with_origin(false).await;
+        Self::using(facts, |clock| Arc::new(clock)).await
+    }
+    async fn using(
+        facts: Option<crate::platform::peer::Credentials>,
+        wrap: impl FnOnce(TestClock) -> Arc<dyn Clock>,
+    ) -> Self {
+        let (server, app, _) = super::app_sessions::fixture_using(false, wrap).await;
         let root = crate::test_support::TempDir::socket();
         let mut router = server.core.local_router();
         if let Some(facts) = facts {
@@ -404,12 +410,22 @@ async fn global_sixteen_socket_budget_is_shared_and_a_closed_socket_releases_it(
 
 /// The minting child also creates both bridge connections; inherited client fds
 /// let the parent observe the server's revocation after that child has exited.
-pub(super) async fn child_bridge_and_exit() {
+async fn child_sockets(
+    f: &mut Native,
+    pending: bool,
+) -> (
+    crate::platform::process_exit::tests::Peer,
+    Bearer,
+    Vec<Socket<UnixStream>>,
+) {
     use std::os::fd::FromRawFd;
-    let mut f = Native::new().await;
     let request =
         json!({"id":"native-child-mint","method":"client.app.mint","params":{}}).to_string();
-    let mut child = crate::platform::process_exit::tests::Peer::bridge(&request, &f.path());
+    let mut child = if pending {
+        crate::platform::process_exit::tests::Peer::bridge_pending(&request, &f.path())
+    } else {
+        crate::platform::process_exit::tests::Peer::bridge(&request, &f.path())
+    };
     let socket = child.take_stream();
     let control = socket.try_clone().unwrap();
     let (send, mut requests) = tokio::sync::mpsc::unbounded_channel();
@@ -449,6 +465,11 @@ pub(super) async fn child_bridge_and_exit() {
         stream.set_nonblocking(true).unwrap();
         sockets.push(Socket(UnixStream::from_std(stream).unwrap()));
     }
+    (child, token, sockets)
+}
+pub(super) async fn child_bridge_and_exit() {
+    let mut f = Native::new().await;
+    let (mut child, token, mut sockets) = child_sockets(&mut f, false).await;
     assert_eq!(f.server.core.shared.clients.lock().unwrap().len(), 2);
     // A different live process cannot bridge with this child's valid bearer.
     let mut wrong = f.open().await;
@@ -510,5 +531,123 @@ async fn native_owner_refuses_agent_and_mesh_peers_before_upgrade() {
         assert!(f.server.core.shared.clients.lock().unwrap().is_empty());
         drop(lease);
         f.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn ready_child_exit_refuses_hello_while_notification_consumer_is_gated() {
+    let mut f = Native::new().await;
+    let (mut child, token, mut sockets) = child_sockets(&mut f, true).await;
+    let session = f.server.core.shared.store.authenticate(&token).unwrap();
+    let app = session.app().unwrap().clone();
+    let notification = app.revoked.clone();
+    let (ready, observed) = tokio::sync::oneshot::channel();
+    let (release, held) = tokio::sync::oneshot::channel();
+    let store = f.server.core.shared.store.clone();
+    let consumer = tokio::spawn(async move {
+        app.process.wait().await.unwrap();
+        ready.send(()).unwrap();
+        held.await.unwrap();
+        store.retire(&session).unwrap();
+    });
+    child.exit_unreaped();
+    within(observed).await.unwrap();
+    // No registered connection owns a lifetime consumer; the sole consumer is held above.
+    assert!(
+        !*notification.borrow(),
+        "the exit consumer must still be held"
+    );
+    assert!(matches!(
+        f.server.core.shared.store.authenticate(&token),
+        Err(TokenError::Revoked)
+    ));
+    for socket in &mut sockets {
+        socket.send(json!({"t":"hello","protocol":WIRE_JSON_VERSION,"client":{"name":"fixture","version":"1"},"token":token.0})).await;
+        assert_eq!(close_detail(socket).await.0, AUTH_REFUSED_CLOSE);
+    }
+    assert!(f.server.core.shared.clients.lock().unwrap().is_empty());
+    release.send(()).unwrap();
+    within(consumer).await.unwrap();
+    f.finish().await;
+}
+
+#[tokio::test]
+async fn child_exit_races_both_sides_of_fenced_registration() {
+    for registered in [false, true] {
+        let action = Arc::new(Mutex::new(None));
+        let state = Arc::new(AtomicU64::new(0));
+        let calls = state.clone();
+        let gate = action.clone();
+        let mut f = Native::using(None, move |clock| {
+            Arc::new(RegistrationClock {
+                clock,
+                calls,
+                action: gate,
+                at: if registered { 2 } else { 1 },
+            })
+        })
+        .await;
+        let (child, token, mut sockets) = child_sockets(&mut f, true).await;
+        // Keep both sockets pending: an already-welcomed socket would retire the
+        // credential on exit and race the registration fence with an exclusive lock.
+        // Idle registered fanout and a held exit consumer have separate fixtures.
+        let child = Arc::new(Mutex::new(child));
+        let exiting = child.clone();
+        let shared = f.server.core.shared.clone();
+        let fired = Arc::new(AtomicBool::new(false));
+        let observed = fired.clone();
+        *action.lock().unwrap() = Some(Box::new(move || {
+            assert_eq!(
+                shared.clients.lock().unwrap().len(),
+                usize::from(registered)
+            );
+            exiting.lock().unwrap().exit_unreaped();
+            observed.store(true, Ordering::SeqCst);
+        }) as Box<dyn FnOnce() + Send>);
+        state.store(0, Ordering::SeqCst);
+        let mut racing = sockets.remove(0);
+        racing.send(json!({"t":"hello","protocol":WIRE_JSON_VERSION,"client":{"name":"fixture","version":"1"},"token":token.0})).await;
+        assert_eq!(
+            close_detail(&mut racing).await.0,
+            if registered {
+                AUTH_REVOKED_CLOSE
+            } else {
+                AUTH_REFUSED_CLOSE
+            }
+        );
+        assert!(fired.load(Ordering::SeqCst));
+        drop(child);
+        f.finish().await;
+    }
+}
+struct RegistrationClock {
+    clock: TestClock,
+    calls: Arc<AtomicU64>,
+    action: super::Revocation,
+    at: u64,
+}
+impl Clock for RegistrationClock {
+    fn now(&self) -> Instant {
+        self.clock.now()
+    }
+    fn until(&self, end: Instant) -> futures_util::future::BoxFuture<'_, ()> {
+        let handshake = end == self.clock.now() + Duration::from_millis(HANDSHAKE_DEADLINE_MS);
+        let calls = self.calls.clone();
+        let action = self.action.clone();
+        let at = self.at;
+        // Count completed phases, including a read whose future predates the gate.
+        let gate = super::OnVerified(Some(Box::new(move || {
+            if handshake && calls.fetch_add(1, Ordering::SeqCst) == at {
+                let action = action.lock().unwrap().take();
+                if let Some(action) = action {
+                    action();
+                }
+            }
+        })));
+        let wait = self.clock.until(end);
+        Box::pin(async move {
+            let _gate = gate;
+            wait.await
+        })
     }
 }

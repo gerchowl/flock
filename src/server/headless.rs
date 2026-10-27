@@ -4566,18 +4566,45 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
 
 #[cfg(unix)]
 fn wait_for_old_public_sockets_to_close(timeout: Duration) -> io::Result<()> {
-    use std::os::unix::net::UnixStream;
+    wait_for_old_public_sockets_at(api::socket_path(), client_socket_path(), timeout, || {
+        std::thread::sleep(Duration::from_millis(50));
+    })
+}
 
+#[cfg(unix)]
+fn wait_for_old_public_sockets_at(
+    api_socket: PathBuf,
+    client_socket: PathBuf,
+    timeout: Duration,
+    mut wait: impl FnMut(),
+) -> io::Result<()> {
+    let paths = [api_socket, client_socket];
+    #[cfg(feature = "web")]
+    let paths = [
+        paths[0].clone(),
+        paths[1].clone(),
+        crate::web::local_listener::socket_path(&paths[0]),
+    ];
     let deadline = Instant::now() + timeout;
-    let api_socket = api::socket_path();
-    let client_socket = client_socket_path();
     while Instant::now() < deadline {
-        let api_open = api_socket.exists() && UnixStream::connect(&api_socket).is_ok();
-        let client_open = client_socket.exists() && UnixStream::connect(&client_socket).is_ok();
-        if !api_open && !client_open {
+        if !paths.iter().any(|path| {
+            path.exists()
+                && match crate::platform::socket::probe_listener(path) {
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
+                        ) =>
+                    {
+                        false
+                    }
+                    // Full backlogs and uncertain probes are still busy, never proof of unlink.
+                    _ => true,
+                }
+        }) {
             return Ok(());
         }
-        std::thread::sleep(Duration::from_millis(50));
+        wait();
     }
     Err(io::Error::new(
         io::ErrorKind::TimedOut,
@@ -10124,3 +10151,6 @@ next_tab = ""
         );
     }
 }
+
+#[cfg(all(test, feature = "web"))]
+mod native_handoff_tests;

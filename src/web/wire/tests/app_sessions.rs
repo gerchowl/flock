@@ -11,14 +11,21 @@ pub(crate) async fn fixture() -> (Server, App, Owner) {
     fixture_with_origin(true).await
 }
 pub(crate) async fn fixture_with_origin(local: bool) -> (Server, App, Owner) {
+    fixture_using(local, |clock| Arc::new(clock)).await
+}
+pub(super) async fn fixture_using(
+    local: bool,
+    wrap: impl FnOnce(TestClock) -> Arc<dyn Clock>,
+) -> (Server, App, Owner) {
     let root = crate::structured::launch::SessionConfigDir::create(&std::env::temp_dir()).unwrap();
     let clock = TestClock::new();
+    let transport_clock = wrap(clock.clone());
     let owner = Owner::default();
     let store = owner
-        .get(root.path(), Arc::new(AppClock(Arc::new(clock.clone()))))
+        .get(root.path(), Arc::new(AppClock(transport_clock.clone())))
         .unwrap();
     let wake = Arc::new(tokio::sync::Notify::new());
-    let core = Core::from_store(store, Arc::new(clock.clone()), wake.clone()).unwrap();
+    let core = Core::from_store(store, transport_clock, wake.clone()).unwrap();
     let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let bind = socket.local_addr().unwrap();
     let mut app = App::new(

@@ -32,13 +32,17 @@ impl Peer {
         Self::request(None)
     }
     pub(crate) fn request(request: Option<&str>) -> Self {
-        Self::request_to(request, None)
+        Self::request_to(request, None, false)
     }
     #[cfg(feature = "web")]
     pub(crate) fn bridge(request: &str, path: &std::path::Path) -> Self {
-        Self::request_to(Some(request), Some(path))
+        Self::request_to(Some(request), Some(path), false)
     }
-    fn request_to(request: Option<&str>, bridge: Option<&std::path::Path>) -> Self {
+    #[cfg(feature = "web")]
+    pub(crate) fn bridge_pending(request: &str, path: &std::path::Path) -> Self {
+        Self::request_to(Some(request), Some(path), true)
+    }
+    fn request_to(request: Option<&str>, bridge: Option<&std::path::Path>, pending: bool) -> Self {
         let root = crate::test_support::TempDir::socket();
         let path = root.path().join("exit.sock");
         let listener = UnixListener::bind(&path).unwrap();
@@ -55,6 +59,9 @@ impl Peer {
         command.env("FLOCK_TEST_PROCESS_EXIT_SOCKET", &path);
         if let Some(request) = request {
             command.env("FLOCK_TEST_PROCESS_EXIT_REQUEST", request);
+        }
+        if pending {
+            command.env("FLOCK_TEST_BRIDGE_PENDING", "1");
         }
         if let Some(path) = bridge {
             command.env("FLOCK_TEST_NATIVE_BRIDGE", path);
@@ -265,12 +272,14 @@ fn bridge_sockets(control: &UnixStream, path: &std::path::Path, reply: &str) {
                 .unwrap()
                 .starts_with("HTTP/1.1 101"));
             let mut ws = crate::web::wire::tests::Socket(socket);
-            ws.hello(crate::structured_wire::WIRE_JSON_VERSION, token)
-                .await;
+            if std::env::var_os("FLOCK_TEST_BRIDGE_PENDING").is_none() {
+                ws.hello(crate::structured_wire::WIRE_JSON_VERSION, token)
+                    .await;
+            }
             sockets.push(ws.0.into_std().unwrap());
         }
-        // Transfer client descriptors only after the child's own hellos receive welcome.
-        // Keeping them in the parent makes the server's 4403 observable after child exit.
+        // Transfer after both HTTP upgrades (and welcomes unless testing pending hello).
+        // Parent-owned descriptors keep the server's close observable after child exit.
         crate::server::handoff::send_fds(
             control,
             &sockets.iter().map(AsRawFd::as_raw_fd).collect::<Vec<_>>(),

@@ -128,18 +128,23 @@ No valid pong for 45 seconds ends the socket and releases its resources. The
 initial baseline is the successful welcome. A supplied monotonic clock governs
 handshake, write and heartbeat deadlines; wall-clock changes grant no liveness.
 
-There are at most 32 HTTP connections before upgrade, plus at most 16 upgraded
-sockets. HTTP overflow closes the accepted I/O before reading a request. The entire HTTP connection has a five-second ceiling, including headers,
-body receipt, response writes and keepalive. Expiry closes its I/O. Successful
-upgrades leave that HTTP lifetime and use the core's independent deadlines. Only
-four unverified
-hello/recheck attempts may be in flight at once; a verified token principal may
-register at most four sockets. Pending overload refuses upgrade with 503; principal overload closes
-1001. Existing authenticated connections retain capacity when slow hellos fill
-the probation slots. This bounds ownership; repeated local connection spam can
-still delay a new connection. It does not grant per-process fairness before
-credentials are known. Each connection has an eight-message
-data queue and a four-message priority queue.
+Each TCP or Unix listener owns at most 32 incomplete HTTP connections and four
+separate overload-response writers. An available response writer sends typed
+503 `preauth_capacity` without parsing another header, then half-closes and
+drains within the same absolute five-second deadline. When that response budget
+is also full, additional over-cap connections close without allocating work.
+Refusals never block normal acceptance. The HTTP deadline includes headers,
+body receipt, response writes and keepalive. Successful upgrades leave that
+lifetime and use the core's independent deadlines.
+
+The two transports share at most 16 upgraded sockets. Each has four pending
+hello/recheck reservations. Each sealed credential digest may register four
+sockets across both transports, including pending welcome. Renewed app mints
+have independent budgets even when they share an operator principal. Pending
+overload refuses upgrade with typed 503; per-credential overload after upgrade
+closes 1001. Existing authenticated connections retain capacity when slow hellos
+fill the probation slots. These bounds do not promise per-process fairness.
+Each connection has an eight-message data queue and a four-message priority queue.
 The writer checks priority between data writes. Frames and reassembled messages
 are capped at 64 KiB, and outgoing serialization stops at that cap rather than
 first allocating an arbitrarily large JSON string. Compression is never
@@ -147,18 +152,16 @@ negotiated. A blocked write fails within 45 seconds; missing pongs retain their
 independent original ceiling. Saturated internal queues end the connection
 rather than growing a backlog. Oversized server output also ends the socket.
 
-The core owns verified token-to-socket identities until teardown. The future
-command slice calls its 4403 fan-out only after the triggering auth_revoked ack
-has been written, within the existing write/liveness bound. The primitive closes
-all registered sockets for that principal, leaving other principals alone.
-A verified socket registers before welcome and rechecks current token storage
-after registration; revocation in that gap closes 4403 without welcome. A
-store failure or handshake deadline, during either verification, instead closes 1001,
-keeping the credential eligible for reconnect. A failed welcome encode or send drops the
-transport without another send or an auth close. Neither failure proves token
-revocation (ADR-0036 §5a). No
-filesystem watcher or automatic command-time revocation route is added
-here; the command slice must recheck storage before dispatch as ADR-0036 requires.
+The core owns verified token-to-socket identities until teardown. Command
+revocation flushes its triggering `auth_revoked` acknowledgement before 4403,
+within the existing write/liveness bound. Fan-out closes registered sockets of
+that credential, leaving other credentials alone. A refused hello before
+registration closes 4401 without welcome. After registration, storage recheck or
+process-exit revocation closes 4403, including before welcome. A store failure or
+handshake deadline instead closes 1001, preserving the credential for reconnect.
+A failed welcome encode or send drops the transport without another send or an
+authentication close; neither proves revocation (ADR-0036 §5a). Commands recheck
+storage before dispatch under the admission/revocation fence.
 Closing the core cancels pending hellos and authenticated sockets. Explicit
 shutdown waits up to five seconds for connection leases and reports failure to
 release them; it never treats that ceiling as evidence of success.

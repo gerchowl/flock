@@ -892,7 +892,18 @@ fn held_management_lock_does_not_block_valid_or_junk_hello_verification() {
             .unwrap();
         lock.lock().unwrap();
         let mut valid = Socket::open(&server).await;
-        assert_eq!(valid.hello(1, &"a".repeat(64)).await["t"], "welcome");
+        // Lookup stays lock-free; registering must respect the admission/revocation fence.
+        assert!(server
+            .core
+            .shared
+            .store
+            .authenticate(&Bearer("a".repeat(64)))
+            .is_ok());
+        valid.send(json!({"t":"hello","protocol":1,"client":{"name":"fixture","version":"1"},"token":"a".repeat(64)})).await;
+        assert!(matches!(
+            valid.receive().await,
+            Received::Close(GOING_AWAY_CLOSE)
+        ));
         let mut junk = Socket::open(&server).await;
         junk.send(
             json!({"t":"hello","protocol":1,"client":{"name":"f","version":"1"},"token":"invalid"}),
@@ -903,6 +914,8 @@ fn held_management_lock_does_not_block_valid_or_junk_hello_verification() {
             Received::Close(AUTH_REFUSED_CLOSE)
         ));
         drop(lock);
+        let mut available = Socket::open(&server).await;
+        assert_eq!(available.hello(1, &"a".repeat(64)).await["t"], "welcome");
         server.finish().await;
     });
 }
@@ -1028,10 +1041,12 @@ async fn revoke_during_hello(at: u64, registered: usize) {
     }));
     let mut client = Socket::open(&server).await;
     client.send(json!({"t":"hello","protocol":1,"client":{"name":"fixture","version":"1"},"token":"a".repeat(64)})).await;
-    assert!(matches!(
-        client.receive().await,
-        Received::Close(AUTH_REVOKED_CLOSE)
-    ));
+    let expected = if registered == 0 {
+        AUTH_REFUSED_CLOSE
+    } else {
+        AUTH_REVOKED_CLOSE
+    };
+    assert!(matches!(client.receive().await, Received::Close(code) if code == expected));
     assert_eq!(fired.load(Ordering::SeqCst), 1);
     server.finish().await;
 }
@@ -1499,4 +1514,32 @@ mod native;
 
 pub(crate) fn lease_counter(core: &Core) -> Arc<Semaphore> {
     core.shared.slots.clone()
+}
+
+#[test]
+fn poisoned_client_map_still_retires_a_lease() {
+    runtime(async {
+        let server = Server::new().await;
+        let shared = server.core.shared.clone();
+        let live = Arc::new(AtomicBool::new(true));
+        let lease = Lease {
+            shared: shared.clone(),
+            id: 99,
+            live: live.clone(),
+            _permit: shared.slots.clone().try_acquire_owned().unwrap(),
+        };
+        let poisoning = shared.clone();
+        assert!(std::thread::spawn(move || {
+            let _guard = poisoning.clients.lock().unwrap();
+            panic!("fixture poisons only its owned client map");
+        })
+        .join()
+        .is_err());
+        drop(lease);
+        assert!(!live.load(Ordering::Acquire));
+        assert!(shared.clients.lock().err().unwrap().into_inner().is_empty());
+        assert_eq!(shared.slots.available_permits(), CONNECTIONS as usize);
+        shared.clients.clear_poison();
+        server.finish().await;
+    });
 }

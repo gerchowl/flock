@@ -69,7 +69,7 @@ fn refusal(response: &str) -> (&str, &str) {
     let (headers, body) = response.split_once("\r\n\r\n").unwrap();
     assert!(headers
         .lines()
-        .any(|line| line == "cache-control: no-store"));
+        .any(|line| line.eq_ignore_ascii_case("cache-control: no-store")));
     (headers.lines().next().unwrap(), body)
 }
 fn bearer(endpoint: &Endpoint) -> String {
@@ -283,21 +283,24 @@ fn real_server_caps_incomplete_http_connections_and_shutdown_closes_them() {
         held.push(stream(endpoint.address));
     }
     let mut excess = stream(endpoint.address);
-    let sent = write!(
+    write!(
         excess,
         "GET / HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
         endpoint.address
+    )
+    .unwrap();
+    let mut response = String::new();
+    excess.read_to_string(&mut response).unwrap();
+    let (status, body) = refusal(&response);
+    assert!(status.starts_with("HTTP/1.1 503"), "{response}");
+    assert!(response
+        .to_ascii_lowercase()
+        .contains("content-type: application/json"));
+    assert_eq!(
+        serde_json::from_str::<Value>(body).unwrap(),
+        json!({"error":{"code":"preauth_capacity","message":"Pre-authentication capacity exhausted"}})
     );
     let mut byte = [0];
-    match sent.and_then(|_| excess.read(&mut byte)) {
-        Ok(0) => {}
-        Err(error)
-            if matches!(
-                error.kind(),
-                std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
-            ) => {}
-        outcome => panic!("over-capacity HTTP admission must close: {outcome:?}"),
-    }
     assert!(server.api("server.stop", json!({})).get("result").is_some());
     server.owner.wait_exited(Duration::from_secs(10)).unwrap();
     for mut socket in held {

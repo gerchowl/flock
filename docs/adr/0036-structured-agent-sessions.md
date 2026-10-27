@@ -4094,10 +4094,11 @@ are refused rather than followed or removed.
 
 The lock follows the **open file description**, including across SCM_RIGHTS.
 `perform_live_handoff` sends the API and terminal ownership descriptors after
-PTYs and the optional TCP listener, under handoff manifest version 3. Older
-importers refuse that version before transfer. `run_handoff_import_server`
-adopts both descriptors before acknowledging restoration or rebinding the
-public paths; the exporter retains its descriptors for rollback. Public Unix
+PTYs and the optional TCP listener. Internal handoff manifest version 4 also
+appends the native WebSocket ownership descriptor; builds without that extension
+retain version 3. Older importers refuse unsupported versions before transfer.
+`run_handoff_import_server` adopts these ownership descriptors before
+acknowledging restoration or rebinding the public paths; the exporter retains its descriptors for rollback. Public Unix
 listeners are rebound under those same locks; TCP retains its listening fd.
 `restore_public_sockets_after_failed_handoff` also reuses the retained locks.
 There is no unlocked interval during either transition. This changes only the
@@ -4134,3 +4135,11 @@ own upgraded futures. Internal handoff manifest version 4 appends the native
 ownership descriptor after the API and terminal owners; import adopts it before
 preparation and rollback retains the same guard. No mesh or JSON wire version
 changes.
+
+
+PR3b refusal delivery uses four independent writer/drain tasks per listener.
+They do not consume normal HTTP reservations or block acceptance. Each retains
+the same absolute five-second deadline; when that separate budget is exhausted,
+additional over-cap connections are closed without allocating another task.
+A refused hello closes 4401 before registration; an exit after registration
+closes 4403 and includes every socket already admitted under the fence.

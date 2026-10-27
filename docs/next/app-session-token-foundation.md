@@ -51,7 +51,7 @@ for a model.
 Idle sessions await the injected monotonic deadline and kernel exit readiness
 (kqueue NOTE_EXIT on macOS, pidfd on Linux); no PID liveness polling occurs.
 Each reactor waiter owns a separate descriptor for the same persistent watch.
-Expiry, process exit and explicit revocation use the existing close 4403,
+For registered sockets, expiry, process exit and explicit revocation use close 4403,
 with no new authentication error names. An in-flight command that detects revocation
 flushes its `auth_revoked` error acknowledgement before the close. This drain
 uses the existing bounded transport-write window. During server shutdown,
@@ -117,3 +117,16 @@ session. Missing/wrong UID, pane/agent ancestry or a mesh caller receives HTTP
 403 `operator_only`; missing or changed PID/birth receives HTTP 403
 `peer_process_changed`. Both return the ADR-0036 JSON body, no-store cache policy,
 and close the connection. Kernel proof never adds bearer scopes or mints a token.
+
+Each listener also permits at most four concurrent overload-response writers,
+independent of normal admissions. They write the typed 503 and drain after
+half-close within the same five-second bound. A full response-writer budget
+closes additional over-cap connections without allocating work. Existing
+connections and newly available normal admission slots continue independently.
+
+A hello refused before registration, including a minter exit after the
+first verification, closes 4401 without welcome. An exit after registration
+closes 4403 and reaches all sockets of that credential. File-token verification
+remains lock-free; registration must acquire its shared admission fence. An
+exclusive management fence therefore yields retryable 1001 at registration,
+without treating a valid token as an authentication failure.

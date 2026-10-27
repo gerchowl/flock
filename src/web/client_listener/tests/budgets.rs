@@ -8,6 +8,7 @@ struct Pool {
     tcp: Option<SocketAddr>,
     path: PathBuf,
     clock: Arc<TestClock>,
+    completed: Arc<Semaphore>,
     task: JoinHandle<io::Result<()>>,
     _root: crate::test_support::TempDir,
 }
@@ -21,6 +22,11 @@ impl Pool {
         let root = crate::test_support::TempDir::socket();
         let path = root.path().join("http.sock");
         let clock = Arc::new(TestClock::new());
+        let completed = Arc::new(Semaphore::new(0));
+        let transport_clock = Arc::new(CompletionClock {
+            clock: clock.clone(),
+            completed: completed.clone(),
+        });
         let router = Router::new().route("/", axum::routing::get(|| async { "alive" }));
         let (tcp, task) = if tcp {
             let socket = Arc::new(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap());
@@ -38,7 +44,7 @@ impl Pool {
                         }
                     },
                     router,
-                    clock.clone(),
+                    transport_clock.clone(),
                     Health::default(),
                 )),
             )
@@ -57,7 +63,7 @@ impl Pool {
                         }
                     },
                     router,
-                    clock.clone(),
+                    transport_clock.clone(),
                     Health::default(),
                 )),
             )
@@ -66,6 +72,7 @@ impl Pool {
             tcp,
             path,
             clock,
+            completed,
             task,
             _root: root,
         }
@@ -146,5 +153,68 @@ async fn http_pools_are_independent_bounded_and_release_at_the_injected_deadline
             assert!(result.is_ok() || result.unwrap_err().kind() == io::ErrorKind::ConnectionReset);
         }
         assert!(full.response().await.ends_with("alive"));
+    }
+}
+
+#[tokio::test]
+async fn unclosed_over_cap_refusals_cannot_stall_legitimate_acceptance() {
+    for tcp in [true, false] {
+        let pool = Pool::new(tcp).await;
+        let initial = pool.clock.now();
+        let mut pending = Vec::new();
+        for _ in 0..HTTP_CONNECTIONS {
+            pending.push(pool.connect().await);
+        }
+        pool.clock.deadline_count(5_000, HTTP_CONNECTIONS).await;
+        let mut refused = Vec::new();
+        // Hold each client's write side open even after the server half-closes its reply.
+        for _ in 0..HTTP_REFUSALS {
+            let mut socket = pool.connect().await;
+            let mut response = String::new();
+            bounded(socket.read_to_string(&mut response)).await.unwrap();
+            assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+            refused.push(socket);
+        }
+        // A saturated refusal budget cannot allocate another writer or stall acceptance.
+        let mut excess = pool.connect().await;
+        let closed = bounded(excess.read(&mut [0; 1])).await;
+        assert!(
+            matches!(closed, Ok(0))
+                || closed.is_err_and(|e| e.kind() == io::ErrorKind::ConnectionReset)
+        );
+        drop(excess);
+        // Real EOF releases the normal slots without releasing a single refusal writer.
+        drop(pending);
+        let released = bounded(pool.completed.acquire_many(HTTP_CONNECTIONS as u32))
+            .await
+            .unwrap();
+        released.forget();
+        assert!(pool.response().await.ends_with("alive"));
+        assert_eq!(pool.clock.now(), initial);
+        drop(refused);
+    }
+}
+
+struct CompletionClock {
+    clock: Arc<TestClock>,
+    completed: Arc<Semaphore>,
+}
+struct Completed(Arc<Semaphore>);
+impl Drop for Completed {
+    fn drop(&mut self) {
+        self.0.add_permits(1);
+    }
+}
+impl Clock for CompletionClock {
+    fn now(&self) -> std::time::Instant {
+        self.clock.now()
+    }
+    fn until(&self, end: std::time::Instant) -> futures_util::future::BoxFuture<'_, ()> {
+        let wait = self.clock.until(end);
+        let completed = self.completed.clone();
+        Box::pin(async move {
+            let _completed = Completed(completed);
+            wait.await
+        })
     }
 }
