@@ -1,0 +1,30 @@
+┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
+│demo | claude | structured                                                                        │
+│Model: observed (requested: requested)                                                            │
+│Mode: observed-mode (requested: Default)                                                          │
+│New output  [Follow tail] [Earlier history]                                                       │
+│Assistant                                                                                         │
+│[Collapse] [Details]                                                                              │
+│Ready                                                                                             │
+│Thinking                                                                                          │
+│[Expand] [Details]                                                                                │
+│Tool: Bash (tool-12)                                                                              │
+│[Expand] [Details]                                                                                │
+│Tool result: Bash (tool-12)                                                                       │
+│[Collapse] [Details]                                                                              │
+│- old                                                                                             │
+│+ new                                                                                             │
+│Unknown / extra JSON                                                                              │
+│[Expand] [Details]                                                                                │
+│Status: NeedsHuman | turn: Unknown | bg: Unknown                                                  │
+│Tokens I/O: 7/3 | age(ms):150 | #14 synced                                                        │
+│Permission 1/1: Bash permission@9                                                                 │
+│Input: {"command":"check check check check check check check check check check check check check c│
+│[Full input] [Next]                                                                               │
+│[Deny] [Allow once] [Always (session)...]                                                         │
+│Queue: 1 queued for idle | 0 held                                                                 │
+│> Please check                                                                                    │
+│then report.                                                                                      │
+│[Send at idle] [History]                                                                          │
+│Admission: ready                                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
