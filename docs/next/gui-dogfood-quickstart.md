@@ -9,7 +9,7 @@ The disabled New agent, Terminal, Diff and Fork controls are outside this smoke.
 
 Start in a fresh worktree of `origin/dev`, with Python 3 and the Nix devShell
 available. Run `nix build .#flock-web`. The fallback build is
-`CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=/Volumes/build-rd/cargo/ibis-gui-smoke cargo build --features web`;
+`CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 CARGO_TARGET_DIR="$PWD/.local/gui-smoke/target" cargo build --features web`;
 if using it, substitute that target's `debug/flk` below.
 
 Run this setup from the worktree root in Bash. The Python block installs an
