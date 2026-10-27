@@ -10,7 +10,7 @@ import type { KnownSessionEvent } from "../src/gen/KnownSessionEvent";
 import type { SessionEntry, Transport } from "../src/transport";
 import { classifyStoredLine, storedLines } from "../src/transport/fixture";
 import { Transcript } from "../src/views/Transcript";
-import { emptyFold, foldAll, foldEntry, groupTurns, type ToolRun, type TurnFold } from "../src/views/turns";
+import { emptyFold, foldAll, foldEntry, groupTurns, keptEntries, type ToolRun, type TurnFold } from "../src/views/turns";
 import { readFixture } from "./fixture-replay";
 
 let dispose: (() => void) | undefined;
@@ -193,7 +193,7 @@ describe("the turn fold (#1782)", () => {
       expect(sorted(now.runs)).toEqual(sorted(before.runs));
       expect([...now.absorbed].sort()).toEqual([...before.absorbed].sort());
       const one = foldedOneByOne(all);
-      expect(one.turns.map((turn) => turn.entries.map((entry) => entry.seq))).toEqual(before.turns);
+      expect(one.turns.map((turn) => keptEntries(turn).map((entry) => entry.seq))).toEqual(before.turns);
       expect(sorted(new Map(Object.entries(one.runs)))).toEqual(sorted(before.runs));
       expect(Object.keys(one.absorbed).sort()).toEqual([...before.absorbed].sort());
     });
