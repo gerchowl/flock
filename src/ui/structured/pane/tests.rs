@@ -9,7 +9,7 @@ fn card(seq: u64, content: Content) -> Card {
         streaming: false,
     }
 }
-fn snapshot() -> Snapshot {
+fn snapshot() -> impl std::ops::DerefMut<Target = Snapshot> {
     let agent = serde_json::from_value(serde_json::json!({"runtime":"structured","agent_id":"fixture-agent","name":"demo","harness":"claude","lifecycle":"live","status":"unknown","state":crate::api::agent_state::AgentState::unknown(),"session_id":"fixture-session","cwd":".","model":"requested","lease_state":"absent"})).unwrap();
     let mut s = Model::new(
         Target {

@@ -4284,3 +4284,13 @@ it across cancellation. This is not cold recovery: no second writer or loader is
 created. Producer failure and actual page I/O errors stay explicit errors. As with
 a cancelled Pending page, resuming an older opening yields one recheck step so
 an initialization preceding the new wait cannot be missed.
+
+### Amendment: S10d2 prepared native rendering
+
+Desktop and client-sized mobile geometry prepare S10c's pane from the App-owned
+immutable frame. The prepared pane and its owned hit-to-Intent payloads live in
+that ViewState, so paint and later input share one cut and geometry. Paint checks
+canonical generation and current placement again; stale cuts and source refusals
+produce a typed error tile. Ready and unavailable native members never fall
+through to PTY rendering. This slice wires rendering; input dispatch remains the
+next S10d2 slice and Unicode composer/admission semantics remain S10d3.
