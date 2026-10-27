@@ -25,9 +25,12 @@ pub(crate) struct Stream {
     source: Source,
     queue: Reader,
     queue_cursor: u64,
+    // Replacement contents stay private until their exact completion high-water.
+    replacement: Option<(u64, Vec<queue::Item>)>,
     ended: [bool; 3],
 }
 impl Stream {
+    /// Bind the three canonical sources without starting a writer or producer.
     pub fn new(
         model: Model,
         history: History,
@@ -43,6 +46,7 @@ impl Stream {
             source,
             queue,
             queue_cursor: 0,
+            replacement: None,
             ended: [false; 3],
         })
     }
@@ -50,13 +54,13 @@ impl Stream {
     pub fn retire(&mut self) {
         self.ended = [true; 3];
         self.cut = None;
+        self.replacement = None;
+        self.queue_cursor = 0;
         let s = &self.model.snapshot;
-        self.model = Model::new(
-            s.target.clone(),
-            s.agent.clone(),
-            s.requested_permissions,
-            vec![],
-        );
+        let target = s.target.clone();
+        let agent = s.agent.clone();
+        let mode = s.requested_permissions;
+        self.model = Model::new(target, agent, mode, vec![]);
         self.model.snapshot.replay = Replay::Ended;
     }
     fn apply_live(&mut self, item: live::Item) -> bool {
@@ -72,9 +76,8 @@ impl Stream {
         self.model.live(item);
         true
     }
-    /// One bounded step; false means all producers ended. Callers bound their own
-    /// stage wait. A cancelled blocking page keeps its I/O
-    /// permit until completion, even when its async waiter disappears.
+    /// One bounded step; false means all producers ended. Callers bound stage waits.
+    /// Cancelled blocking pages retain their I/O permits through completion.
     pub async fn next(&mut self) -> io::Result<bool> {
         if self.ended == [true; 3] {
             return Ok(false);
@@ -90,13 +93,17 @@ impl Stream {
             let pending = matches!(page, Page::Pending);
             match page {
                 Page::Gap(g) => {
-                    self.model.snapshot.queue.clear();
+                    self.replacement = Some((g.snapshot_to, vec![]));
                     self.queue_cursor = g.to;
                 }
                 Page::Record(v) => {
                     let r: queue::Record = serde_json::from_value(v)?;
                     if r.seq > self.queue_cursor {
-                        r.change.apply(&mut self.model.snapshot.queue)?;
+                        let items = self
+                            .replacement
+                            .as_mut()
+                            .map_or(&mut self.model.snapshot.queue, |(_, items)| items);
+                        r.change.apply(items)?;
                         self.queue_cursor = r.seq;
                     }
                 }
@@ -114,18 +121,25 @@ impl Stream {
                         .subscribe(Some(self.queue_cursor))
                         .map_err(io::Error::other)?
                 }
+                Page::End if self.replacement.is_some() => {
+                    return Err(io::ErrorKind::UnexpectedEof.into())
+                }
                 Page::End => self.ended[2] = true,
                 Page::Pending => (),
                 _ => return Ok(true),
+            }
+            if let Some((_, items)) = self
+                .replacement
+                .take_if(|(through, _)| self.queue_cursor >= *through)
+            {
+                self.model.snapshot.queue = items;
             }
             if !pending {
                 return Ok(true);
             }
         }
         if !self.ended[0] {
-            let permit = IO
-                .try_acquire()
-                .map_err(|_| io::Error::from(io::ErrorKind::WouldBlock))?;
+            let permit = IO.try_acquire().map_err(|_| io::ErrorKind::WouldBlock)?;
             // Static semaphore ownership survives cancellation through the blocking closure.
             let (cut, item) = (self.cut.take(), self.model.snapshot.applied_cursor);
             let source = self.history.clone();

@@ -1,10 +1,8 @@
 //! Canonical metadata/generation adapter for the native subscription owner.
-use crate::{
-    api::error_code::ErrorCode,
-    structured::{
-        launch::PermissionMode,
-        view::{model::Model, stream::Stream, Target},
-    },
+use crate::api::error_code::ErrorCode;
+use crate::structured::{
+    launch::PermissionMode,
+    view::{model::Model, stream::Stream, Target},
 };
 use std::io;
 // S10d (#1430) wires the controller into placement and input dispatch.
@@ -16,9 +14,8 @@ impl super::App {
         target: Target,
         mode: PermissionMode,
     ) -> io::Result<Stream> {
-        target
-            .validate(&self.state)
-            .map_err(|_| io::Error::other(ErrorCode::AgentNotFound))?;
+        let invalid = |_| io::Error::other(ErrorCode::AgentNotFound);
+        target.validate(&self.state).map_err(invalid)?;
         let id = &target.agent_id;
         let agent = self.structured_info(id).map_err(io::Error::other)?;
         let workers = &self.structured_workers;
