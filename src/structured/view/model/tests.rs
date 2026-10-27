@@ -595,3 +595,37 @@ fn unmatched_or_missing_anonymous_blocks_do_not_unfold_another_message() {
         );
     }
 }
+
+#[test]
+fn published_frame_is_immutable_while_model_advances() {
+    let mut m = model();
+    m.history(history::Item::Record(record(
+        1,
+        r#"{"type":"assistant","message":{"content":[{"type":"text","text":"first"}]}}"#,
+        true,
+    )))
+    .unwrap();
+    let (tx, rx) = tokio::sync::watch::channel(Arc::clone(&m.snapshot.0));
+    let held = Arc::clone(&rx.borrow());
+    m.history(history::Item::Record(record(
+        2,
+        r#"{"type":"assistant","message":{"content":[{"type":"text","text":"second"}]}}"#,
+        true,
+    )))
+    .unwrap();
+    tx.send_replace(Arc::clone(&m.snapshot.0));
+    assert_eq!(held.applied_cursor, 1);
+    assert!(!held.transcript.iter().any(|c| c.seq == 2));
+    assert_eq!(rx.borrow().applied_cursor, 2);
+    assert!(rx.borrow().transcript.iter().any(|c| c.seq == 2));
+    assert!(!Arc::ptr_eq(&held, &rx.borrow()));
+}
+#[test]
+fn unshared_frame_mutation_keeps_its_allocation() {
+    let mut m = model();
+    // A second strong Arc would itself create a reader and require copying.
+    let allocation = Arc::as_ptr(&m.snapshot.0);
+    m.snapshot.composer.text.push_str("draft");
+    assert_eq!(Arc::as_ptr(&m.snapshot.0), allocation);
+    assert_eq!(Arc::strong_count(&m.snapshot.0), 1);
+}
