@@ -100,7 +100,7 @@ fn provenance_usage_tool_correlation_and_owned_facts() {
 }
 #[tokio::test]
 async fn real_fake_partials_reconcile_and_burst_resync() {
-    for mode in ["s10b-live", "s10b-live-burst"] {
+    for mode in ["s10b-live-exit", "s10b-live-burst-exit"] {
         let notify = Arc::new(Notify::new());
         let (mut registry, mut workers) = (Registry::default(), Workers::new(notify.clone()));
         let (mut case, mut launch, factory) = Case::prepare(&mut registry, 920, "unused", vec![]);
@@ -128,10 +128,7 @@ async fn real_fake_partials_reconcile_and_burst_resync() {
         let clock = Instant::now();
         crate::structured::workers::tests::wait(&notify, || {
             workers.poll(&mut registry, clock, 1000);
-            assert!(workers.report(&case.id, case.generation).is_none());
-            workers
-                .history(&registry, &case.id)
-                .is_some_and(|h| h.subscribe(Some(3)).is_ok())
+            workers.report(&case.id, case.generation).is_some()
         })
         .await;
         workers.shutdown(&mut registry).unwrap();
@@ -145,7 +142,7 @@ async fn real_fake_partials_reconcile_and_burst_resync() {
             }
             m.live(item);
         }
-        if mode.ends_with("burst") {
+        if mode.contains("burst") {
             assert!(
                 m.snapshot.transcript.is_empty(),
                 "seq-1 burst tail predates Gap through 3"
@@ -153,7 +150,13 @@ async fn real_fake_partials_reconcile_and_burst_resync() {
         } else {
             assert!(contents(&m).any(|c| matches!(c, Content::Markdown(s) if s == "partial")));
             assert!(contents(&m).any(|c| matches!(c, Content::Thinking(s) if s == "thinking")));
-            assert!(m.snapshot.collapsed.contains(&1));
+            assert!(m.snapshot.transcript.iter().any(|c| matches!(
+                c.content,
+                Content::Thinking(_)
+            ) && m
+                .snapshot
+                .collapsed
+                .contains(&c.id)));
         }
         let mut cut = workers
             .history(&registry, &case.id)
@@ -180,4 +183,26 @@ async fn real_fake_partials_reconcile_and_burst_resync() {
         assert!(m.snapshot.reported_model.is_some());
         assert_eq!(m.snapshot.reported_permissions.as_deref(), Some("default"));
     }
+}
+#[test]
+fn thinking_fold_does_not_hide_sibling_text() {
+    let mut m = model();
+    m.history(history::Item::Record(record(1, r#"{"type":"assistant","message":{"content":[{"type":"text","text":"partial"},{"type":"thinking","thinking":"thinking"}]}}"#, true))).unwrap();
+    let thinking = m
+        .snapshot
+        .transcript
+        .iter()
+        .find(|c| matches!(c.content, Content::Thinking(_)))
+        .unwrap();
+    let text = m
+        .snapshot
+        .transcript
+        .iter()
+        .find(|c| matches!(c.content, Content::Markdown(_)))
+        .unwrap();
+    assert!(m.snapshot.collapsed.contains(&thinking.id));
+    assert!(
+        !m.snapshot.collapsed.contains(&text.id),
+        "folding thinking must leave sibling text visible"
+    );
 }

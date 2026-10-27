@@ -20,7 +20,7 @@ if "--model" in sys.argv and sys.argv[sys.argv.index("--model") + 1].startswith(
     init = json.loads((root / "restricted-init.json").read_text())
     init["session_id"] = sys.argv[sys.argv.index("--session-id") + 1]
     emit_live(init)
-    for index in range(40 if mode.endswith("burst") else 3):
+    for index in range(40 if "burst" in mode else 3):
         kind, field, text = [("text_delta", "text", "partial"),
                              ("thinking_delta", "thinking", "thinking"),
                              ("text_delta", "text", "tool-result")][index % 3]

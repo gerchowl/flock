@@ -4149,3 +4149,11 @@ Snapshot format version 3 is deliberately unchanged. Older builds ignore this
 additive field and spawn shells in native tile slots; their next save permanently
 drops `native_views`. This placement loss is preferable to a version bump, which
 would make older builds ignore the entire session, including its terminal tabs.
+
+### Amendment: native card identity and observed tool use
+
+`CardId { seq, ordinal }` separates fold/inspection identity from a shared source
+cursor. Ordinals are deterministic for a given record and projection parser
+version; sibling cards never share a fold key. `ObservedToolUse` retains the
+original id, name, typed input and raw source event, independently of the stdio
+permission `ToolRequest`. Neither observed cards nor their ids grant authority.

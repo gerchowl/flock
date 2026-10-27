@@ -106,10 +106,20 @@ impl Model {
         self.partials.clear();
     }
     fn push(&mut self, seq: u64, content: Content, streaming: bool) {
+        let id = CardId {
+            seq,
+            ordinal: self
+                .snapshot
+                .transcript
+                .iter()
+                .filter(|c| c.seq == seq)
+                .count() as u32,
+        };
         if matches!(content, Content::Thinking(_) | Content::RawJson { .. }) {
-            self.snapshot.collapsed.insert(seq);
+            self.snapshot.collapsed.insert(id);
         }
         self.snapshot.transcript.push(Card {
+            id,
             seq,
             content,
             streaming,
