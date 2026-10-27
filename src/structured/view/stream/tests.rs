@@ -91,7 +91,9 @@ fn partials(s: &Stream) -> usize {
 #[tokio::test]
 async fn real_producer_replay_live_queue_and_death() {
     let (_app, _case, mut s) = fixture("s10b-live-lifecycle-exit").await;
+    s.model.snapshot.admission = Admission::Pending;
     drain(&mut s).await;
+    assert!(matches!(s.model.snapshot.admission, Admission::Pending));
     assert_eq!(s.model.snapshot.applied_cursor, 3);
     assert!(matches!(s.model.snapshot.replay, Replay::Ended));
     assert_eq!(s.model.snapshot.queue.len(), 2);

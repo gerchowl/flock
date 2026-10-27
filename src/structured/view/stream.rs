@@ -1,5 +1,6 @@
 //! Generation-owned subscriptions (ADR-0036 §4/§5/§11). No authority or renderer I/O.
 use super::{contracts::*, model::Model};
+use crate::api::error_code::ErrorCode;
 use crate::structured::{
     history::{self, Cut, History},
     publication::{Provider, Subscription},
@@ -19,6 +20,8 @@ static IO: Semaphore = Semaphore::const_new(32);
 /// writer, guessed queue state, or automatic mutation retry is introduced here.
 pub(crate) struct Stream {
     pub model: Model,
+    /// Queue-owner reservation/refusal; independent of composer admission.
+    pub queue_status: (Option<queue::scheduler::Pending>, Option<ErrorCode>),
     history: History,
     cut: Option<Cut>,
     live: live::Subscription,
@@ -40,6 +43,7 @@ impl Stream {
         let queue = source.subscribe(None).map_err(io::Error::other)?;
         Ok(Self {
             model,
+            queue_status: (None, None),
             history,
             cut: None,
             live,
@@ -56,11 +60,11 @@ impl Stream {
         self.cut = None;
         self.replacement = None;
         self.queue_cursor = 0;
+        self.queue_status = (None, None);
         let s = &self.model.snapshot;
         let target = s.target.clone();
         let agent = s.agent.clone();
-        let mode = s.requested_permissions;
-        self.model = Model::new(target, agent, mode, vec![]);
+        self.model = Model::new(target, agent, s.requested_permissions, vec![]);
         self.model.snapshot.replay = Replay::Ended;
     }
     fn apply_live(&mut self, item: live::Item) -> bool {
@@ -107,13 +111,7 @@ impl Stream {
                         self.queue_cursor = r.seq;
                     }
                 }
-                Page::Status(p, e) => {
-                    self.model.snapshot.admission = match (p, e) {
-                        (_, Some(e)) => Admission::Refused(e),
-                        (Some(_), None) => Admission::Pending,
-                        _ => Admission::Ready,
-                    }
-                }
+                Page::Status(p, e) => self.queue_status = (p, e),
                 Page::Refused(e) => return Err(io::Error::other(e)),
                 Page::Lagged(_) => {
                     self.queue = self
