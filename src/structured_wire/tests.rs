@@ -1,6 +1,6 @@
 use super::*;
 use crate::structured::claude::SessionEvent;
-use fixture::{FixtureLine, FixtureStep};
+use fixture::{FixtureLine, FixtureStep, TOKEN_PRINCIPAL};
 use serde_json::json;
 use std::collections::BTreeSet;
 
@@ -746,8 +746,5 @@ fn permission_fixture_principal_is_a_literal_valid_token_identity() {
         .map(|line| serde_json::from_str::<Value>(line).unwrap())
         .find(|line| line["frame"]["ev"]["state"] == "closed")
         .unwrap();
-    assert_eq!(
-        close["frame"]["ev"]["principal"],
-        "0123456789abcdef0123456789abcdef"
-    );
+    assert_eq!(close["frame"]["ev"]["principal"], TOKEN_PRINCIPAL);
 }

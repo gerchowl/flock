@@ -1,5 +1,6 @@
 use super::*;
 use crate::structured::launch::SessionConfigDir;
+use crate::structured_wire::fixture::TOKEN_PRINCIPAL;
 use std::fs;
 use std::os::fd::FromRawFd;
 use std::time::Instant;
@@ -816,7 +817,7 @@ fn decide(id: &str, decision: permissions::Decision, request_seq: u64) -> AgentD
 }
 fn owner() -> Principal<'static> {
     Principal::Token(crate::structured::permissions::auth::fixture(
-        "fixture-client",
+        TOKEN_PRINCIPAL,
         true,
     ))
 }
@@ -1002,7 +1003,7 @@ fn permission_decisions_are_audited_before_control_stdin_and_keep_turn_busy() {
         let closed: Value = serde_json::from_str(&audit[3].raw).unwrap();
         assert_eq!(closed["state"], "closed");
         assert_eq!(closed["decision"], serde_json::to_value(decision).unwrap());
-        assert_eq!(closed["principal"], "fixture-client");
+        assert_eq!(closed["principal"], TOKEN_PRINCIPAL);
         assert_eq!(audit[3].origin, RecordOrigin::Flk);
         assert_eq!(response["type"], "control_response");
         assert_eq!(response["response"]["request_id"], "request-example");
@@ -1805,7 +1806,7 @@ fn session_grant_matches_canonical_input_but_other_input_and_tools_prompt() {
     assert_eq!(audit["state"], "closed");
     assert_eq!(audit["source"], "session_grant");
     assert_eq!(audit["grant_request_id"], "grant");
-    assert_eq!(audit["principal"], "fixture-client");
+    assert_eq!(audit["principal"], TOKEN_PRINCIPAL);
     assert_eq!(
         input_line(&transport, &mut input)["response"]["response"]["behavior"],
         "allow"
