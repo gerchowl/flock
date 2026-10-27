@@ -39,9 +39,16 @@ fn every_script_parses_and_round_trips_all_frame_kinds() {
                 FixtureStep::Send { frame, .. } => {
                     server.insert(value["frame"]["t"].as_str().unwrap().to_owned());
                     let encoded = serde_json::to_string(&frame).unwrap();
+                    if matches!(frame, fixture::FixtureServerFrame::Dynamic(_)) {
+                        assert!(serde_json::from_str::<ServerFrame>(&encoded).is_err());
+                        continue;
+                    }
                     assert_eq!(
                         serde_json::from_str::<ServerFrame>(&encoded).unwrap(),
-                        frame
+                        match frame {
+                            fixture::FixtureServerFrame::Literal(frame) => frame,
+                            _ => continue,
+                        }
                     );
                 }
                 FixtureStep::Expect { frame, .. } => {
@@ -201,11 +208,11 @@ fn settled_parameters_and_uncertain_ack_use_existing_exit_constant() {
         .unwrap();
     let FixtureStep::Send {
         frame:
-            ServerFrame::Ack {
+            fixture::FixtureServerFrame::Literal(ServerFrame::Ack {
                 error: Some(error),
                 ok: false,
                 ..
-            },
+            }),
         ..
     } = FixtureLine::parse(line).unwrap().step
     else {
@@ -698,4 +705,49 @@ fn sub_id_reused_refusal_is_typed_for_both_live_and_closed_ids() {
         assert_eq!(value["code"], "sub_id_reused");
         assert_eq!(serde_json::from_value::<ServerFrame>(value).unwrap(), frame);
     }
+}
+
+#[test]
+fn dynamic_timestamp_is_typed_and_restricted_to_event_wall_time() {
+    let line = json!({"v":1,"step":"send","frame":{"t":"ev","sub_id":"s","stream":"agent/fixture","seq":1,"ts_ms":{"$dynamic":"ts_ms","source":"persisted"},"ev":{"type":"assistant","message":{}}}});
+    assert!(matches!(
+        FixtureLine::parse(&line.to_string()).unwrap().step,
+        FixtureStep::Send {
+            frame: fixture::FixtureServerFrame::Dynamic(_),
+            ..
+        }
+    ));
+    let non_timestamp = json!({"v":1,"step":"send","frame":{"t":"ping","nonce":"fixture","ts_ms":line["frame"]["ts_ms"]}});
+    assert!(
+        FixtureLine::parse(&non_timestamp.to_string()).is_err(),
+        "ping must not discard a dynamic marker as an additive field"
+    );
+    for field in ["seq", "sub_id", "ev"] {
+        let mut invalid = line.clone();
+        invalid["frame"][field] = line["frame"]["ts_ms"].clone();
+        assert!(FixtureLine::parse(&invalid.to_string()).is_err(), "{field}");
+    }
+    for marker in [
+        json!({"$dynamic":"future","source":"persisted"}),
+        json!({"$dynamic":"ts_ms","source":"socket"}),
+        json!({"$dynamic":"ts_ms","source":"persisted","extra":true}),
+    ] {
+        let mut invalid = line.clone();
+        invalid["frame"]["ts_ms"] = marker;
+        assert!(FixtureLine::parse(&invalid.to_string()).is_err());
+    }
+}
+
+#[test]
+fn permission_fixture_principal_is_a_literal_valid_token_identity() {
+    let lines = include_str!("../../web/client/test/fixtures/wire/permission-decision.jsonl");
+    let close = lines
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|line| line["frame"]["ev"]["state"] == "closed")
+        .unwrap();
+    assert_eq!(
+        close["frame"]["ev"]["principal"],
+        "0123456789abcdef0123456789abcdef"
+    );
 }

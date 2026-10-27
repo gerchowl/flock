@@ -109,10 +109,18 @@ export const fixtureExamples = {
             .expect("fixture script")
             .lines()
         {
+            crate::structured_wire::fixture::FixtureLine::parse(line)
+                .expect("validated typed fixture");
             let value: serde_json::Value = serde_json::from_str(line).expect("fixture JSON");
             if name == "permission-decision" {
                 let frame = &value["frame"];
                 let typed = if frame["t"] == "ev" {
+                    if frame["ev"]["state"] == "closed" {
+                        assert_eq!(
+                            frame["ev"]["principal"], "0123456789abcdef0123456789abcdef",
+                            "literal token identity"
+                        );
+                    }
                     let record: crate::structured_wire::PermissionRecord =
                         serde_json::from_value(frame["ev"].clone())
                             .expect("typed permission fixture");

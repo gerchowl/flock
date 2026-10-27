@@ -22,6 +22,66 @@ pub struct FixtureLine {
     pub step: FixtureStep,
 }
 
+/// Expected server frame, with explicit runtime wall-clock matching for events.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(untagged)]
+pub enum FixtureServerFrame {
+    /// Ordinary frames retain exact literal values.
+    Literal(ServerFrame),
+    /// A dynamic event timestamp requires independent persistence and window oracles.
+    Dynamic(DynamicEvent),
+}
+
+/// The sole dynamic timestamp marker, valid only at an event's `ts_ms` field.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct PersistedTimestamp {
+    /// Explicit wall-clock matcher kind.
+    #[serde(rename = "$dynamic")]
+    pub kind: TimestampKind,
+    /// Independent oracle required by the interpreter.
+    pub source: TimestampSource,
+}
+/// Supported wall-clock field; arbitrary dynamic fields are refused.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub enum TimestampKind {
+    /// Runtime receipt timestamp of an event.
+    #[serde(rename = "ts_ms")]
+    TsMs,
+}
+/// Required timestamp provenance.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum TimestampSource {
+    /// Corresponding durable session record, read independently of the socket.
+    Persisted,
+}
+/// Event fixture whose wall-clock timestamp is matched, never fabricated.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(tag = "t", rename_all = "snake_case", deny_unknown_fields)]
+pub enum DynamicEvent {
+    /// Same event semantics as `ServerFrame::Ev`, with a typed timestamp matcher.
+    Ev {
+        /// Subscription identity.
+        sub_id: String,
+        /// Source stream.
+        stream: String,
+        /// Applied sequence, absent only on a live stream.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(optional, type = "number"))]
+        seq: Option<u64>,
+        /// Runtime wall-clock matcher.
+        ts_ms: PersistedTimestamp,
+        /// Exact typed event payload.
+        ev: WireEvent,
+    },
+}
+
 /// Script operations; their effects are supplied by G3's virtual transport/clock.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -116,7 +176,7 @@ pub enum FixtureStep {
         #[cfg_attr(feature = "ts", ts(optional = nullable))]
         socket: SocketTarget,
         /// Frame to inject; previous-socket callbacks must be ignored.
-        frame: ServerFrame,
+        frame: FixtureServerFrame,
     },
     /// Expect the next client frame, matching t plus the named top-level fields.
     Expect {
@@ -343,6 +403,28 @@ impl FixtureLine {
     /// Parse and validate a line; failures include a visible reason, never a fallback.
     pub fn parse(line: &str) -> Result<Self, String> {
         let raw: Value = serde_json::from_str(line).map_err(|e| e.to_string())?;
+        fn markers(value: &Value, path: &str, event_timestamp: bool) -> Result<(), String> {
+            match value {
+                Value::Object(fields) => {
+                    if fields.contains_key("$dynamic")
+                        && (path != ".frame.ts_ms" || !event_timestamp)
+                    {
+                        return Err("dynamic matcher outside a wall-clock field".into());
+                    }
+                    for (key, child) in fields {
+                        markers(child, &format!("{path}.{key}"), event_timestamp)?;
+                    }
+                }
+                Value::Array(items) => {
+                    for child in items {
+                        markers(child, &format!("{path}[]"), event_timestamp)?;
+                    }
+                }
+                _ => (),
+            }
+            Ok(())
+        }
+        markers(&raw, "", raw["step"] == "send" && raw["frame"]["t"] == "ev")?;
         let parsed: Self = serde_json::from_value(raw.clone()).map_err(|e| e.to_string())?;
         let emitted = serde_json::to_value(&parsed).map_err(|e| e.to_string())?;
         // Serde's flattened unit variants otherwise accept stray script fields.
@@ -426,9 +508,13 @@ impl FixtureLine {
                 }
             }
             FixtureStep::Send {
-                frame: ServerFrame::Ev {
-                    stream, seq, ev, ..
-                },
+                frame:
+                    FixtureServerFrame::Literal(ServerFrame::Ev {
+                        stream, seq, ev, ..
+                    })
+                    | FixtureServerFrame::Dynamic(DynamicEvent::Ev {
+                        stream, seq, ev, ..
+                    }),
                 ..
             } => {
                 let live = stream.starts_with("agent/") && stream.ends_with("/live");
@@ -441,9 +527,9 @@ impl FixtureLine {
             }
             FixtureStep::Send {
                 frame:
-                    ServerFrame::Ack {
+                    FixtureServerFrame::Literal(ServerFrame::Ack {
                         ok, result, error, ..
-                    },
+                    }),
                 ..
             } if (*ok && error.is_some()) || (!ok && (error.is_none() || result.is_some())) => {
                 return Err("ack must carry success/result or failure/error exclusively".into());
