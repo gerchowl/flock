@@ -141,12 +141,21 @@ hellos cannot consume the workers used by established subscriptions.
 App-session retirement and shutdown also wait outside the shared store-I/O
 pool. They publish revocation intent before acquiring exclusive ownership,
 then retain that ownership through removal and notification (ADR-0036 §5a).
-The separate retirement-wait budget allows one worker per live socket plus
-shutdown (seventeen workers); cancellation retains its worker until the helper
-is reaped. The existing two-second lock ceiling is unchanged. Only intent
-publication and the fenced mutation reserve store-I/O capacity. A successful
-retirement still precedes the credential's 4403 close; acquisition or resource
-failure closes fail-closed with 1001 instead of claiming successful revocation.
+The separate retirement-wait pool has seventeen shared slots (the live-socket
+cap plus one), without reserving one for shutdown. Cancellation retains a slot
+until its helper is reaped. Aborted connections can leave helpers running while
+replacement sockets arrive; if they exhaust the pool, shutdown fails closed
+with a worker-unavailable error and still drains the transports. The existing
+two-second lock ceiling is unchanged. Only intent publication and the fenced
+mutation reserve store-I/O capacity.
+
+Retirement acquires capacity separately for each phase. If the shared
+store-I/O pool is full at the finish step, the exclusive fence and intent are
+released without removing the app credential, and the socket closes with 1001.
+A still-live bearer can remain usable until another retirement, process exit,
+or its fixed TTL makes it invalid; the failed transport does not claim
+successful revocation. Successful retirement still precedes the credential's
+4403 close.
 
 The enforcing clock is Linux `CLOCK_BOOTTIME` or macOS `mach_continuous_time`
 (#2489), so sleep counts without trusting a settable wall clock. Absolute

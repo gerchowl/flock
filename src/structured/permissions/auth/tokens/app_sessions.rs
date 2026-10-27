@@ -92,7 +92,7 @@ pub(crate) struct Store {
     entries: Mutex<Entries>,
     clock: Arc<dyn Clock>,
     #[cfg(all(test, feature = "web"))]
-    waiting: Mutex<Vec<tokio::sync::oneshot::Sender<()>>>,
+    waiting: Mutex<Vec<Box<dyn FnOnce() + Send>>>,
 }
 /// Published revocation intent and owned helper, transferable outside store I/O.
 pub(crate) struct PendingMutation {
@@ -131,16 +131,18 @@ impl Store {
             waiting: Mutex::default(),
         }
     }
-    /// Install a one-shot observation of a real contended retirement wait.
+    /// Install a bounded fixture gate before the contended IPC read starts.
     #[cfg(all(test, feature = "web"))]
-    pub(crate) fn on_waiting(&self, ready: tokio::sync::oneshot::Sender<()>) {
-        self.waiting.lock().unwrap().push(ready);
+    pub(crate) fn on_waiting(&self, action: impl FnOnce() + Send + 'static) {
+        self.waiting.lock().unwrap().push(Box::new(action));
     }
     /// Signal only after the helper has entered the contended acquisition path.
     #[cfg(all(test, feature = "web"))]
     pub(crate) fn notify_waiting(&self) {
-        if let Some(ready) = self.waiting.lock().unwrap().pop() {
-            let _ = ready.send(());
+        let action = self.waiting.lock().unwrap().pop();
+        // Release the hook mutex before a gate pauses this worker.
+        if let Some(action) = action {
+            action();
         }
     }
     /// Publish intent and start acquisition without waiting on the store worker.
