@@ -4294,3 +4294,16 @@ canonical generation and current placement again; stale cuts and source refusals
 produce a typed error tile. Ready and unavailable native members never fall
 through to PTY rendering. This slice wires rendering; input dispatch remains the
 next S10d2 slice and Unicode composer/admission semantics remain S10d3.
+
+### Amendment: S10d2 local control routing
+
+Native keyboard and mouse routing consumes only complete painted S10c controls,
+revalidating the original target generation before dispatch. Tab/Shift-Tab selects
+a painted control and Enter activates it; Ctrl-W detaches without stopping the
+worker. PageUp/PageDown move the source-card anchor and End follows the tail.
+Float input, global bindings, prefix commands and overlays retain precedence.
+Presentation edits reach the Model through a bounded driver channel, never an
+App borrow of the Model. Permission decision intents keep their exact handles;
+UID-only interactive context remains `not_authorized` under S6 until S10e supplies
+the approved capability and Always confirmation. Text/paste editing remains S10d3.
+Submission and inspection completion follow in the next S10d2 child under #1430.

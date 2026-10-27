@@ -24,7 +24,7 @@ fn view(app: &AppState, id: PaneId) -> Option<&View> {
         .native_views
         .get(&id)
 }
-fn validate(app: &AppState, id: PaneId, target: &Target) -> Result<(), ErrorCode> {
+pub(crate) fn validate(app: &AppState, id: PaneId, target: &Target) -> Result<(), ErrorCode> {
     target.validate(app).map_err(|_| ErrorCode::AgentNotFound)?;
     let tab = app
         .active
@@ -87,7 +87,16 @@ pub(crate) fn render_native(app: &AppState, frame: &mut Frame, info: &PaneInfo) 
             prepared.pane.as_ref().map_err(|code| *code)
         });
     match result {
-        Ok(pane) => pane.render(frame),
+        Ok(pane) => {
+            pane.render(frame);
+            if let Some((target, index)) = &app.native_control {
+                if view.target() == Some(target) && info.is_focused {
+                    if let Some(&(x, y)) = pane.positions().get(*index) {
+                        frame.buffer_mut()[(x, y)].set_style(Style::default().reversed());
+                    }
+                }
+            }
+        }
         Err(code) => frame.render_widget(
             Paragraph::new(format!("Structured view: {}", code.as_str())).block(Block::bordered()),
             info.rect,

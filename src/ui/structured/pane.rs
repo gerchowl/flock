@@ -138,6 +138,14 @@ impl Pane {
             .find_map(|p| p.hit(x, y))
             .or_else(|| self.transcript.hit(x, y))
     }
+    /// Keyboard activation uses the same complete painted controls as pointer hits.
+    pub fn positions(&self) -> Vec<(u16, u16)> {
+        self.panels
+            .iter()
+            .flat_map(Panel::positions)
+            .chain(self.transcript.positions())
+            .collect()
+    }
     /// Consume this prepared cut into one intent with its original target generation.
     /// Misses and omitted buttons yield nothing. No authority is conferred: the controller
     /// must revalidate generation, permission handles and confirmation before any effect.
