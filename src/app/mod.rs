@@ -55,6 +55,7 @@ pub(crate) mod queue_events;
 mod runtime;
 mod session;
 pub mod state;
+mod structured_placement;
 pub(crate) mod structured_view;
 mod terminal_targets;
 mod theme_sync;

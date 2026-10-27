@@ -4226,3 +4226,13 @@ publisher has stopped. Capture capacity has a separate notification, armed
 before capture, so a full channel cannot self-wake a retry loop.
 A terminal queue refusal also stops history and live retirement. Canonical
 generation refresh still precedes presentation and can retire the failed view.
+
+### Amendment: S10d1 public native placement
+
+Public structured start and focus use the S10a1 placement lifecycle. Start
+attaches to the active tab, or creates a native-only workspace; focus reuses
+one placement and may rebind it to the current registry generation. Reported
+view IDs come from actual layout membership and public numbering. Detaching
+does not stop the worker. Placement preflight precedes worker admission.
+The App-owned subscription controller and renderer/input routing follow in
+separate S10d slices under #1430; placement itself creates no terminal runtime.

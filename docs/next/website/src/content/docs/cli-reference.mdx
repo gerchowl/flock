@@ -469,7 +469,8 @@ The pane defaults to the calling pane. Use `--pane <pane_id>` or a legacy leadin
 Structured session records are listed separately as `structured_agents` in the
 JSON response. `get` and its `status` alias accept the registered agent id or a
 unique name. They return runtime, session identity, lifecycle, canonical state,
-and lease-binding evidence without inventing a pane. `stop` requests asynchronous
+and lease-binding evidence. `view` names the actual native workspace/tab/pane
+placement, and is absent when detached. `stop` requests asynchronous
 cleanup for a structured session; poll `status` for the resulting lifecycle. Only
 the operator or the structured agent itself may stop it. Stopping an Offline
 record is harmless.
@@ -479,7 +480,11 @@ restart (`structured_recovery_required`, retry `after_human`, exit 1).
 Pane-only operations on structured records, including attach, readiness and
 settled waits, return `runtime_unsupported` (retry `never`, exit 2). Use the
 structured state for observation instead. PTY records keep their existing fields.
-Start a pane-free session with `flk agent start NAME --runtime structured --model MODEL --cwd /absolute/checkout -- claude`.
+Start a structured session with `flk agent start NAME --runtime structured --model MODEL --cwd /absolute/checkout -- claude`.
+Start creates and focuses one native view in the active tab (a native-only
+workspace if none exists). Focus reuses that placement, including after resume;
+closing it detaches without stopping the worker. Explicit workspace/tab/split
+selectors, `--here`, labels and dry runs remain unsupported for structured starts.
 The CLI refuses an older server without the `structured_agents` capability
 (`server_version_gap`, retry `after_handoff`, exit 78). CLI starts are idle; the
 narrowed MCP spawn also delivers its framed opening prompt through stream stdin.
@@ -1002,7 +1007,7 @@ Exposed tools:
 | Tool | Wraps | Notes |
 | --- | --- | --- |
 | `flock_agent_list` | `agent.list` | `structured_agents` contains pane-free typed records; `agents` = this server's panes (`blocked` ones need attention); `fleet` = every addressable agent INCLUDING other hosts, with `agent_id`, `host` and `local`. |
-| `flock_agent_get` | `agent.get` | Target is a pane id, terminal id, structured agent id, or unique name. Structured records use `StructuredAgentInfo` and have no placement. |
+| `flock_agent_get` | `agent.get` | Target is a pane id, terminal id, structured agent id, or unique name. Structured records use `StructuredAgentInfo` with an optional real native placement. |
 | `flock_agent_stop` | `agent.stop` | `{target: string}` stops a structured session; operator or that agent itself only. PTY targets return `runtime_unsupported` (never retry, exit 2). |
 | `flock_agent_read` | `agent.read` | The pane's terminal output as drawn. Read-only: it changes no pane state and does not move the operator's attention ordering. |
 | `flock_agent_history` | `agent.history` | The agent's own conversation from its session transcript, not the pane's wrapped output. Safe to poll: it touches no pane state. `detail` picks `reply`/`collapsed`/`full`; hand back `next_cursor` to get only what has been written since. A turn with `after_compaction: true` is the first of a new epoch — everything older was superseded by a compaction, so it is history rather than context. Claude and opencode. |
