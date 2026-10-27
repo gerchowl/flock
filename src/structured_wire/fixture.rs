@@ -11,6 +11,9 @@
 use super::*;
 use std::collections::BTreeMap;
 
+/// Fixed token identity shared by permission fixture producers and wire assertions.
+pub(crate) const TOKEN_PRINCIPAL: &str = "0123456789abcdef0123456789abcdef";
+
 /// One versioned script line. Additive transport fields are allowed, script typos aren't.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
