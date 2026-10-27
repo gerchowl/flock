@@ -6,14 +6,23 @@ use crate::structured::{
     transport::{RecordOrigin, StreamRecord},
     workers::live,
 };
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::{collections::BTreeMap, io};
+// Durable cards use positional ordinals; provisional live cards use a disjoint
+// range until the matching durable message replaces them.
+const LIVE_ORDINAL: u32 = 1 << 31;
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+enum Message {
+    Named(String),
+    Cursor(u64),
+}
 /// Projection plus ephemeral block indexes. Owners supply canonical S4 and queue facts.
 pub(crate) struct Model {
     /// Frozen renderer input; mutation belongs to the controller, never render.
     pub snapshot: Snapshot,
     floor: u64,
-    partials: BTreeMap<u64, usize>,
+    partials: BTreeMap<(Message, Option<u64>), CardId>,
+    blocked_live: Option<u64>,
 }
 impl Model {
     /// Assemble a cold projection; requested policy is supplied, never inferred from output.
@@ -48,6 +57,7 @@ impl Model {
             },
             floor: 0,
             partials: BTreeMap::new(),
+            blocked_live: None,
         }
     }
     /// Apply original history order exactly once; reject missing unannounced ranges.
@@ -56,6 +66,7 @@ impl Model {
             history::Item::Record(r) if r.seq > self.snapshot.applied_cursor => {
                 self.contiguous(r.seq)?;
                 self.record(&r, false);
+                self.prune();
                 self.snapshot.applied_cursor = r.seq;
             }
             history::Item::Gap { from, to, reason } if to > self.snapshot.applied_cursor => {
@@ -64,7 +75,16 @@ impl Model {
                     return Err(io::ErrorKind::InvalidData.into());
                 }
                 self.clear_partials();
-                self.push(to, Content::Gap { from, to, reason }, false);
+                self.push(
+                    CardId {
+                        seq: to,
+                        ordinal: 0,
+                    },
+                    Content::Gap { from, to, reason },
+                    false,
+                    false,
+                );
+                self.prune();
                 self.snapshot.applied_cursor = to;
             }
             history::Item::Synced(through) => self.snapshot.replay = Replay::Synced { through },
@@ -87,7 +107,9 @@ impl Model {
     pub fn live(&mut self, item: live::Item) {
         match item {
             live::Item::Delta { record, .. }
-                if record.seq >= self.floor && record.seq >= self.snapshot.applied_cursor =>
+                if record.seq >= self.floor
+                    && record.seq >= self.snapshot.applied_cursor
+                    && self.blocked_live.is_none_or(|through| record.seq > through) =>
             {
                 self.record(&record, true)
             }
@@ -104,84 +126,162 @@ impl Model {
     fn clear_partials(&mut self) {
         self.snapshot.transcript.retain(|card| !card.streaming);
         self.partials.clear();
+        self.prune();
     }
-    fn push(&mut self, seq: u64, content: Content, streaming: bool) {
-        let id = CardId {
-            seq,
-            ordinal: self
-                .snapshot
-                .transcript
-                .iter()
-                .filter(|c| c.seq == seq)
-                .count() as u32,
-        };
-        if matches!(content, Content::Thinking(_) | Content::RawJson { .. }) {
+    fn prune(&mut self) {
+        let cursors: std::collections::BTreeSet<_> =
+            self.snapshot.transcript.iter().map(|c| c.seq).collect();
+        if let Some(&first) = cursors.iter().rev().nth(history::LIVE_RECORDS - 1) {
+            self.snapshot.transcript.retain(|c| c.seq >= first);
+        }
+        let retained: std::collections::BTreeSet<_> =
+            self.snapshot.transcript.iter().map(|c| c.id).collect();
+        self.snapshot.collapsed.retain(|id| retained.contains(id));
+        self.partials.retain(|_, id| retained.contains(id));
+    }
+    fn push(&mut self, id: CardId, content: Content, streaming: bool, fold: bool) {
+        if fold {
             self.snapshot.collapsed.insert(id);
         }
         self.snapshot.transcript.push(Card {
             id,
-            seq,
+            seq: id.seq,
             content,
             streaming,
         });
         self.snapshot.new_output |= self.snapshot.scroll_anchor.is_some();
     }
-    fn record(&mut self, r: &StreamRecord, streaming: bool) {
-        // Always retain the exact payload/provenance, including known extras.
-        self.push(
-            r.seq,
-            Content::RawJson {
-                known: r.known,
-                shape: r.shape.clone(),
-                raw: r.raw.clone(),
-            },
-            streaming,
-        );
-        if r.known != Some(true) {
+    fn raw(r: &StreamRecord) -> Content {
+        Content::RawJson {
+            known: r.known,
+            shape: r.shape.clone(),
+            raw: r.raw.clone(),
+        }
+    }
+    fn message(v: &Value, seq: u64) -> Message {
+        match v
+            .get("api_message_id")
+            .and_then(Value::as_str)
+            .or_else(|| v.pointer("/message/id").and_then(Value::as_str))
+        {
+            Some(id) => Message::Named(id.to_owned()),
+            None => Message::Cursor(seq),
+        }
+    }
+    fn partial(&mut self, r: &StreamRecord, v: &Value) {
+        let delta = v["event"]
+            .get("delta")
+            .unwrap_or(&v["event"]["content_block"]);
+        let (thinking, text) = match delta["type"].as_str() {
+            Some("text_delta" | "text") => (false, delta["text"].as_str()),
+            Some("thinking_delta" | "thinking") => (true, delta["thinking"].as_str()),
+            _ => (false, None),
+        };
+        if text.is_some_and(|s| s.len() > super::super::transport::MAX_LINE_BYTES) {
+            self.overflow(r.seq);
             return;
         }
-        let Ok(v) = serde_json::from_str::<Value>(&r.raw) else {
-            return;
-        };
-        if streaming {
-            let delta = v["event"]
-                .get("delta")
-                .unwrap_or(&v["event"]["content_block"]);
-            let (thinking, text) = match delta["type"].as_str() {
-                Some("text_delta" | "text") => (false, delta["text"].as_str()),
-                Some("thinking_delta" | "thinking") => (true, delta["thinking"].as_str()),
-                _ => (false, None),
-            };
-            if let Some(text) = text {
-                let Some(index) = v["event"]["index"].as_u64() else {
-                    return;
-                };
-                if let Some(&at) = self.partials.get(&index) {
-                    match &mut self.snapshot.transcript[at].content {
-                        Content::Markdown(s) | Content::Thinking(s) => s.push_str(text),
-                        _ => {}
+        self.snapshot.new_output |= self.snapshot.scroll_anchor.is_some();
+        let key = (Self::message(v, r.seq), v["event"]["index"].as_u64());
+        if let Some(id) = self.partials.get(&key) {
+            if let Some(card) = self.snapshot.transcript.iter_mut().find(|c| c.id == *id) {
+                if let (Some(text), Content::Markdown(s) | Content::Thinking(s)) =
+                    (text, &mut card.content)
+                {
+                    if s.len().saturating_add(text.len()) > super::super::transport::MAX_LINE_BYTES
+                    {
+                        self.overflow(r.seq);
+                    } else {
+                        s.push_str(text);
                     }
                 } else {
-                    self.partials.insert(index, self.snapshot.transcript.len());
-                    let content = if thinking {
-                        Content::Thinking(text.into())
-                    } else {
-                        Content::Markdown(text.into())
-                    };
-                    self.push(r.seq, content, true);
+                    card.content = Self::raw(r);
+                    self.snapshot.collapsed.insert(*id);
                 }
             }
             return;
         }
+        if self.partials.len() >= history::LIVE_RECORDS {
+            self.overflow(r.seq);
+            return;
+        }
+        // Transient cards occupy a separate ordinal range. Within it the first
+        // observation order is stable for the same feed and parser version.
+        let Some(ordinal) = self
+            .snapshot
+            .transcript
+            .iter()
+            .filter(|c| c.seq == r.seq && c.streaming)
+            .map(|c| c.id.ordinal)
+            .max()
+            .map_or(Some(LIVE_ORDINAL), |n| n.checked_add(1))
+        else {
+            self.overflow(r.seq);
+            return;
+        };
+        let id = CardId {
+            seq: r.seq,
+            ordinal,
+        };
+        self.partials.insert(key, id);
+        let content = match text {
+            Some(s) if thinking => Content::Thinking(s.into()),
+            Some(s) => Content::Markdown(s.into()),
+            None => Self::raw(r),
+        };
+        let fold = matches!(content, Content::Thinking(_) | Content::RawJson { .. });
+        self.push(id, content, true, fold);
+        self.prune();
+    }
+    fn overflow(&mut self, through: u64) {
+        self.gap(through);
+        self.blocked_live = Some(through);
+    }
+    fn record(&mut self, r: &StreamRecord, streaming: bool) {
+        let parsed = serde_json::from_str::<Value>(&r.raw);
+        if streaming {
+            match parsed {
+                Ok(v) if r.known == Some(true) => self.partial(r, &v),
+                _ => self.partial(r, &Value::Null),
+            }
+            return;
+        }
+        let raw_id = CardId {
+            seq: r.seq,
+            ordinal: 0,
+        };
+        self.push(
+            raw_id,
+            Self::raw(r),
+            false,
+            r.known != Some(true) || parsed.is_err(),
+        );
+        if r.known != Some(true) {
+            return;
+        }
+        let Ok(v) = parsed else {
+            return;
+        };
         if v["type"] == "assistant" {
-            self.clear_partials();
+            let message = Self::message(&v, r.seq);
+            let removed: std::collections::BTreeSet<_> = self
+                .partials
+                .iter()
+                .filter(|((m, _), id)| {
+                    *m == message || matches!(m, Message::Cursor(_)) && id.seq < r.seq
+                })
+                .map(|(_, id)| *id)
+                .collect();
+            self.snapshot
+                .transcript
+                .retain(|c| !removed.contains(&c.id));
+            self.prune();
         }
         if v["type"] == "system" && v["subtype"] == "init" {
             self.snapshot.reported_model = v["model"].as_str().map(str::to_owned);
             self.snapshot.reported_permissions = v["permissionMode"].as_str().map(str::to_owned);
         }
-        let usage = v.get("usage").or_else(|| v.pointer("/message/usage"));
-        if let Some(u) = usage {
+        if let Some(u) = v.get("usage").or_else(|| v.pointer("/message/usage")) {
             self.snapshot.usage = Some(Usage {
                 observed_seq: r.seq,
                 input_tokens: u["input_tokens"].as_u64(),
@@ -191,21 +291,66 @@ impl Model {
             });
         }
         if r.origin == RecordOrigin::Flk && v["type"] == "flk_permission_request" {
-            if let Ok(permission) = serde_json::from_value(v.clone()) {
-                self.snapshot.permissions.push(permission);
+            match serde_json::from_value(v.clone()) {
+                Ok(permission) => {
+                    self.snapshot.permissions.push(permission);
+                    if self.snapshot.permissions.len() > history::LIVE_RECORDS {
+                        self.snapshot.permissions.remove(0);
+                    }
+                }
+                Err(_) => {
+                    self.snapshot.collapsed.insert(raw_id);
+                }
             }
         }
         if let Some(blocks) = v.pointer("/message/content").and_then(Value::as_array) {
-            for b in blocks {
+            let raw: std::sync::Arc<str> = r.raw.as_str().into();
+            for (index, b) in blocks.iter().enumerate() {
                 let content = match b["type"].as_str() {
                     Some("text") => b["text"].as_str().map(|s| Content::Markdown(s.into())),
                     Some("thinking") => b["thinking"].as_str().map(|s| Content::Thinking(s.into())),
-                    Some("tool_use") => serde_json::from_value(json!({"subtype":"can_use_tool", "tool_name":b["name"], "tool_use_id":b["id"], "input":b["input"]})).ok().map(Content::ToolRequest),
-                    Some("tool_result") => b["tool_use_id"].as_str().map(|id| Content::ToolResult { tool_use_id: id.into(), text: b["content"].as_str().map(str::to_owned).unwrap_or_else(|| b["content"].to_string()), is_error: b["is_error"].as_bool().unwrap_or(false) }),
-                    _ => serde_json::from_value(b.clone()).ok().map(Content::Attachment),
+                    Some("tool_use") => {
+                        match serde_json::from_value::<ObservedToolUse>(b.clone()) {
+                            Ok(mut tool) => {
+                                tool.raw = raw.clone();
+                                Some(Content::ToolUse(tool))
+                            }
+                            Err(_) => None,
+                        }
+                    }
+                    Some("tool_result") => {
+                        b["tool_use_id"].as_str().map(|id| Content::ToolResult {
+                            tool_use_id: id.into(),
+                            text: b["content"]
+                                .as_str()
+                                .map(str::to_owned)
+                                .unwrap_or_else(|| b["content"].to_string()),
+                            is_error: b["is_error"].as_bool().unwrap_or(false),
+                        })
+                    }
+                    _ => match serde_json::from_value(b.clone()) {
+                        Ok(blob) => Some(Content::Attachment(blob)),
+                        Err(_) => None,
+                    },
                 };
-                if let Some(content) = content {
-                    self.push(r.seq, content, false);
+                match content {
+                    Some(content) => {
+                        let fold = matches!(content, Content::Thinking(_));
+                        self.push(
+                            CardId {
+                                seq: r.seq,
+                                ordinal: index as u32 + 1,
+                            },
+                            content,
+                            false,
+                            fold,
+                        );
+                    }
+                    // The exact source event remains inspectable, with its original
+                    // classifier provenance, even when a block cannot be projected.
+                    None => {
+                        self.snapshot.collapsed.insert(raw_id);
+                    }
                 }
             }
         }

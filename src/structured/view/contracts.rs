@@ -50,7 +50,9 @@ pub(crate) struct Snapshot {
     pub selected_permission: Option<PermissionHandle>,
 }
 /// Card identity within one source record's projection.
-/// Ordinals are deterministic for a given record and projection parser version.
+/// Durable ordinals are deterministic for a given record and projection parser
+/// version. Live cards use a disjoint provisional range in first-observation
+/// order within the same source cursor; history replaces them on reconciliation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct CardId {
     /// Original source cursor; never a synthetic per-card stream sequence.
@@ -67,9 +69,9 @@ pub(crate) struct ObservedToolUse {
     pub name: String,
     /// Typed tool input; exact spelling and future fields remain in `raw`.
     pub input: serde_json::Map<String, serde_json::Value>,
-    /// Exact source event for inspection, including unknown fields and whitespace.
+    /// Shared exact source event for inspection, including unknown fields and whitespace.
     #[serde(skip)]
-    pub raw: String,
+    pub raw: std::sync::Arc<str>,
 }
 /// One projected card with a stable originating stream identity.
 pub(crate) struct Card {
