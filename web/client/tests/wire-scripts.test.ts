@@ -144,3 +144,12 @@ test("server conformance selection excludes the client-only fleet fixture", asyn
   expect(server).not.toContain("fleet-lite");
   expect(coverage("fleet-lite", await load("fleet-lite"))).toEqual(["client-only"]);
 });
+
+// ADR-0036 #2461 and #2579: the successful decision scenario needs answer.
+test("permission fixture declares its exact decision grants", async () => {
+  const welcome = (await load("permission-decision")).find(
+    (line) => line.step === "send" && line.frame.t === "welcome",
+  );
+  expect(welcome?.step === "send" && welcome.frame.t === "welcome" && welcome.frame.capabilities)
+    .toEqual(["read", "send", "answer"]);
+});

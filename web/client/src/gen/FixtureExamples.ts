@@ -489,7 +489,7 @@ export const fixtureExamples = {
 {"not_before_ms":0,"step":"expect_connect","v":1,"within_ms":1},
 {"step":"open","v":1},
 {"absent":[],"fields":["protocol","token"],"frame":{"client":{"name":"fixture","version":"1"},"protocol":1,"t":"hello","token":"fixture-token"},"step":"expect","v":1},
-{"frame":{"capabilities":["read","send"],"idempotency_window_ms":86400000,"principal":"fixture-principal","protocol":1,"server_epoch":"fixture-epoch","server_version":"fixture","t":"welcome"},"step":"send","v":1},
+{"frame":{"capabilities":["read","send","answer"],"idempotency_window_ms":86400000,"principal":"fixture-principal","protocol":1,"server_epoch":"fixture-epoch","server_version":"fixture","t":"welcome"},"step":"send","v":1},
 {"absent":["after"],"fields":["sub_id","stream"],"frame":{"stream":"agent/fixture","sub_id":"s1","t":"sub"},"step":"expect","v":1},
 {"frame":{"ev":{"request":{"input":{"command":"true"},"subtype":"can_use_tool","tool_name":"Bash","tool_use_id":"tool-example"},"request_id":"typed-request","request_seq":1,"state":"open","type":"flk_permission_request"},"seq":2,"stream":"agent/fixture","sub_id":"s1","t":"ev","ts_ms":1},"step":"send","v":1},
 {"frame":{"seq":2,"sub_id":"s1","t":"synced"},"step":"send","v":1},
