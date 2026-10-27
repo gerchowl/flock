@@ -1182,6 +1182,50 @@ for (const mode of MODES) {
     });
   }
 
+  for (const settlement of ["success", "failure"] as const) {
+    test(`Connect behind a capped mint recovers after its stale ${settlement}`, async () => {
+      const { h, tokens, driver } = driven("deferred", "fresh", "next");
+      dispose = () => { driver.dispose(); h.connection.disconnect(); };
+      h.step(step({ step: "token_refused", code: 4403 }));
+      await tick();
+      // External session handoffs reach the cap without resolving the first mint.
+      for (let revoked = 2; revoked <= MAX_REMINTS + 1; revoked++) {
+        if (mode === "bridge") h.connection.setSocket(tokens.open("handoff"));
+        else h.connection.setToken("handoff");
+        h.step(step({ step: "open" }));
+        send(h, WELCOME);
+        h.step(step({ step: "token_refused", code: 4403 }));
+      }
+      expect(driver.error).toBe(REMINTS_SPENT);
+      h.connection.disconnect();
+      expect(h.clock.pendingTimers).toBe(0);
+      h.connection.connect();
+      await tick();
+      const callsBefore = mode === "bridge" ? tokens.renews.length : tokens.calls;
+      const hellosBefore = frames(h, "hello").length;
+      if (settlement === "success") tokens.resolve("stale");
+      else tokens.reject(PANE);
+      await tick();
+      expect(mode === "bridge" ? tokens.renews.length : tokens.calls).toBe(callsBefore + 1);
+      h.step(step({ step: "open" }));
+      send(h, WELCOME);
+      expect([h.connection.state, driver.error, driver.asking]).toEqual(["Live", null, false]);
+      expect(frames(h, "hello")).toHaveLength(hellosBefore + 1);
+      expect(h.clock.pendingTimers).toBe(2); // Only the wire's liveness/healthy timers.
+      h.clock.advanceTo(250);
+      await tick();
+      const beforeEnd = mode === "bridge" ? tokens.renews.length : tokens.calls;
+      // The fresh epoch's first auth end is immediate, rather than still capped.
+      h.step(step({ step: "token_refused", code: 4403 }));
+      await tick();
+      expect(mode === "bridge" ? tokens.renews.length : tokens.calls).toBe(beforeEnd + 1);
+      expect(driver.error).not.toBe(REMINTS_SPENT);
+      driver.dispose();
+      h.connection.disconnect();
+      expect(h.clock.pendingTimers).toBe(0);
+    });
+  }
+
   test("the re-mint cap cancels a pending wait and keeps its error", async () => {
     const { h, tokens, driver } = driven("t2", "unexpected");
     dispose = () => { driver.dispose(); h.connection.disconnect(); };

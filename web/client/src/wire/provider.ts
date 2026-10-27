@@ -193,6 +193,8 @@ function driveShell<T>(connection: WireConnection, source: Source<T>, clock: Clo
   let error: string | null = null;
   let notice: string | null = null;
   let disposed = false;
+  /** A cap or explicit Connect invalidates calls admitted in an older epoch. */
+  let capEpoch = 0;
   let streak = 0;
   let acksAtStreak = 0;
   let liveSince: number | null = null;
@@ -261,6 +263,7 @@ function driveShell<T>(connection: WireConnection, source: Source<T>, clock: Clo
       waiting = cancelWaiting();
     }
     inFlight = true;
+    const admittedEpoch = capEpoch;
     if (renewing) spent = true;
     else error = null;
     changed();
@@ -268,10 +271,16 @@ function driveShell<T>(connection: WireConnection, source: Source<T>, clock: Clo
       inFlight = false;
       const skipped = owed;
       owed = null;
-      // The cap cancels an unresolved call's authority to hand over its result.
-      if (disposed || error === REMINTS_SPENT) {
+      const resumeOwed = (): void => {
+        if (skipped !== null && stillNeeded(skipped.kind)) request(Math.max(0, skipped.due - clock.now()), skipped.kind);
+      };
+      // Discard only this call's obsolete result, preserving a later Connect's work.
+      if (disposed || admittedEpoch !== capEpoch) {
         if (token !== null) source.discard(token.value);
-        if (!disposed) changed();
+        if (!disposed) {
+          resumeOwed();
+          changed();
+        }
         return;
       }
       if (renewing && failure !== null) notice = failure;
@@ -287,10 +296,7 @@ function driveShell<T>(connection: WireConnection, source: Source<T>, clock: Clo
         // A failed renewal's notice stands until a new bearer: a reconnect's session runs on the same one.
         if (!kept) notice = null;
         adopt(token, kept);
-      } else if (renewing && skipped !== null && stillNeeded(skipped.kind)) {
-        const delay = Math.max(0, skipped.due - clock.now());
-        request(delay, skipped.kind);
-      }
+      } else if (renewing) resumeOwed();
       changed();
     };
     Promise.resolve(renewing)
@@ -328,6 +334,7 @@ function driveShell<T>(connection: WireConnection, source: Source<T>, clock: Clo
     if (connection.acks > acksAtStreak) streak = 0;
     if (streak === 0) acksAtStreak = connection.acks;
     if (streak >= MAX_REMINTS) {
+      capEpoch++;
       waiting = cancelWaiting();
       owed = null;
       error = REMINTS_SPENT;
@@ -338,7 +345,13 @@ function driveShell<T>(connection: WireConnection, source: Source<T>, clock: Clo
     request(streak === 1 ? 0 : backoffDelay(streak - 2, random), "mint");
   };
 
+  const freshEpoch = (): void => {
+    capEpoch++;
+    streak = 0;
+    error = null;
+  };
   const stop = connection.onTransition((state) => {
+    if (previous === "Disconnected" && state !== "Disconnected") freshEpoch();
     // A late result keeps an absolute deadline without owning a timer while
     // Disconnected. Connect resumes it, immediately if it is already overdue.
     if (previous === "Disconnected" && running() && due !== null && !spent && renewal === null) renewAt(due);
@@ -356,12 +369,10 @@ function driveShell<T>(connection: WireConnection, source: Source<T>, clock: Clo
     }
     // A bridged attempt with no session asks for one: the person's Connect starts a fresh streak.
     if (state === "Connecting" && connection.awaitingSession) {
-      if (previous === "Disconnected") streak = 0;
       request(0, "reconnect");
     }
     if (state === "NeedsToken" && !refusing) {
       if (previous === "Disconnected") {
-        streak = 0;
         request(0, "mint");
       } else remint();
     }
@@ -384,8 +395,7 @@ function driveShell<T>(connection: WireConnection, source: Source<T>, clock: Clo
     },
     ask() {
       waiting = cancelWaiting();
-      streak = 0;
-      error = null;
+      freshEpoch();
       request(0, "mint");
       changed();
     },
