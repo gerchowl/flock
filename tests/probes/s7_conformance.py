@@ -18,11 +18,12 @@ def main():
     parser.add_argument("--flk", required=True, type=Path)
     parser.add_argument("--disable", choices=("stream", "send", "permission", "decide", "result", "fleet", "revocation"))
     parser.add_argument("--verify-controls", action="store_true")
+    parser.add_argument("--verify-scopes", action="store_true")
     args = parser.parse_args()
     binary = str(args.flk.resolve(strict=True))
     repo = Path(__file__).resolve().parents[2]
     if args.verify_controls:
-        assert args.disable is None
+        assert args.disable is None and not args.verify_scopes
         evidence = []
         for disabled in (None, "stream", "send", "permission", "decide", "result", "fleet", "revocation"):
             command = [sys.executable, "-I", str(Path(__file__).resolve()), "--flk", binary]
@@ -52,6 +53,9 @@ def main():
         if args.disable:
             (root / "proof-disable").write_text(args.disable)
         scopes = ["read", "send", "answer", "operate"]
+        if args.verify_scopes:
+            assert args.disable is None
+            scopes.remove("operate")
         if args.disable == "send":
             scopes.remove("send")
         if args.disable == "decide":
@@ -60,7 +64,10 @@ def main():
         reader = cli("client", "token", "add", "dogfood-reader", "--scopes", "read", "--show-token")["result"]["issued"]["token"]
         endpoint = api("client.open", {})["result"]["url"].split("#", 1)[0]
         endpoint = endpoint.replace("http://", "ws://").rstrip("/") + "/v1/ws"
-        result = subprocess.run(["bun", str(repo / "web/client/tests/wire/dogfood-server.ts"), endpoint, token, reader, agent, binary, args.disable or "none"],
+        if args.verify_scopes:
+            # The owned local operator creates the real permission request.
+            api("agent.send", {"target": agent, "text": "fixture message", "submit": True})
+        result = subprocess.run(["bun", str(repo / "web/client/tests/wire/dogfood-server.ts"), endpoint, token, reader, agent, binary, "without-operate" if args.verify_scopes else args.disable or "none"],
                                 cwd=root, env=env, capture_output=True, text=True, timeout=30)
         if result.returncode != 0:
             artifacts = repo / ".local" / "1833-r2-server-evidence"
