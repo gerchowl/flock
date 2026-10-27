@@ -62,6 +62,8 @@ pub(crate) enum PeerStage {
     Authenticated,
     /// A kernel lock helper is waiting for management or a revocation intent.
     Waiting,
+    /// The shared management fence was acquired, before queued store I/O.
+    LockAcquired,
     /// Peer checks passed, before invoking the registration callback.
     Checked,
     /// The registration callback returned, before releasing admission ownership.
@@ -69,6 +71,10 @@ pub(crate) enum PeerStage {
 }
 #[cfg(all(test, feature = "web"))]
 type PeerHook = (PeerStage, Box<dyn FnOnce() + Send>);
+/// Owned hello fence, acquired outside the shared store-I/O pool and held through insertion.
+/// Only this store module can construct it; callers cannot substitute an unlocked file.
+#[cfg_attr(not(feature = "web"), allow(dead_code))]
+pub(crate) struct PeerFence(Arc<TokenStore>, LockFile);
 /// One memory domain shared by socket minting and every transport admission.
 pub(crate) struct Store {
     files: Arc<TokenStore>,
@@ -116,13 +122,21 @@ impl Store {
         })
     }
 
-    /// Authenticate and register under one admission/revocation fence. A local
-    /// transport supplies its sealed origin proof; TCP supplies None. App credentials
-    /// require the minting PID and birth, while file credentials retain their grants.
-    /// The callback must stay bounded and must not acquire an exclusive store lock.
-    /// `budget` is the remaining original hello deadline, including all lock waits.
-    // Native registration is optional; non-web binaries still compile the store tests.
+    /// Await management and revocation ownership under the remaining hello deadline.
+    /// Run on the separately bounded hello-wait worker, never the store-I/O pool.
+    // Native registration is compiled but unused without the web transport.
     #[cfg_attr(not(feature = "web"), allow(dead_code))]
+    pub(crate) fn wait_peer(&self, budget: Duration) -> Result<PeerFence, TokenError> {
+        let guard = self.files.hello_lock(budget, || {
+            #[cfg(all(test, feature = "web"))]
+            self.peer_stage(PeerStage::Waiting);
+        })?;
+        #[cfg(all(test, feature = "web"))]
+        self.peer_stage(PeerStage::LockAcquired);
+        Ok(PeerFence(self.files.clone(), guard))
+    }
+    /// Synchronous fixture entry retains the same fence and callback ordering.
+    #[cfg(test)]
     pub(crate) fn admit_peer<T>(
         &self,
         token: &Bearer,
@@ -130,10 +144,23 @@ impl Store {
         budget: Duration,
         register: impl FnOnce(Session) -> T,
     ) -> Result<T, PeerAdmissionError> {
-        let _guard = self.files.hello_lock(budget, || {
-            #[cfg(all(test, feature = "web"))]
-            self.peer_stage(PeerStage::Waiting);
-        })?;
+        self.register_peer(self.wait_peer(budget)?, token, peer, register)
+    }
+    /// Recheck identity and register while retaining the previously acquired fence.
+    /// The callback must stay bounded and must not acquire an exclusive store lock.
+    // Native registration is compiled but unused without the web transport.
+    #[cfg_attr(not(feature = "web"), allow(dead_code))]
+    pub(crate) fn register_peer<T>(
+        &self,
+        fence: PeerFence,
+        token: &Bearer,
+        peer: Option<&crate::app::LocalPeer>,
+        register: impl FnOnce(Session) -> T,
+    ) -> Result<T, PeerAdmissionError> {
+        if !Arc::ptr_eq(&self.files, &fence.0) {
+            return Err(TokenError::Unsafe.into());
+        }
+        let _guard = fence.1;
         let session = self.authenticate(token)?;
         #[cfg(all(test, feature = "web"))]
         self.peer_stage(PeerStage::Authenticated);

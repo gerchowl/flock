@@ -882,7 +882,7 @@ fn unknown_post_hello_operations_and_binary_frames_execute_nothing() {
 }
 
 #[test]
-fn held_management_lock_does_not_block_valid_or_junk_hello_verification() {
+fn held_management_lock_refuses_junk_and_welcomes_valid_hello_after_bounded_wait() {
     runtime(async {
         let server = Server::new().await;
         let lock = fs::OpenOptions::new()
