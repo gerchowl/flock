@@ -1088,4 +1088,6 @@ fn publish<T>(mut received: T, tx: &mpsc::SyncSender<T>, cancel: &AtomicBool) ->
 }
 
 #[cfg(test)]
+mod test_support;
+#[cfg(test)]
 mod tests;
