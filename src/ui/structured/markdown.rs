@@ -74,12 +74,10 @@ pub(super) fn wrap(lines: Vec<Line<'static>>, width: u16) -> Vec<DisplayLine> {
 }
 /// Parser events supply styles and raw decoded text; `wrap` sanitizes every output span.
 pub(super) fn lines(text: &str) -> Vec<Line<'static>> {
-    // Preserve literal CR/tab controls instead of letting Markdown normalize them.
-    let text = safe(text);
     let mut rows = vec![Line::default()];
     let mut styles = vec![Style::default()];
     let mut lists: Vec<Option<u64>> = vec![];
-    for event in Parser::new(&text) {
+    for event in Parser::new(text) {
         let style = styles.last().copied().unwrap_or_default();
         match event {
             Event::Start(tag) => {
