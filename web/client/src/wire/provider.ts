@@ -38,7 +38,9 @@
  *   the same request. A request skipped for the wait or call in flight (a re-mint
  *   after an end, or a bridged reconnect's session) is owed: when the call
  *   settles and the state still needs it, a value counts as that call, and a
- *   failure issues it at once, on its own streak delay.
+ *   failure issues it on its own streak delay. A cancelled wait keeps its
+ *   original due time. There is one owed slot: a later request overwrites an
+ *   earlier one, and `stillNeeded` decides whether it is served.
  * - Its token goes to the connection with `setToken`, which connects only
  *   from NeedsToken; after a Disconnect it is kept for the next Connect.
  * - A rejection, a synchronous throw or a value that is not a
@@ -174,14 +176,14 @@ export function driveBridge(connection: WireConnection, openBridge: OpenBridge, 
 
 function driveShell<T>(connection: WireConnection, source: Source<T>, clock: Clock, random: () => number, changed: () => void): ShellTokens {
   let inFlight = false;
-  let waiting: TimerHandle | null = null;
+  let waiting: { readonly timer: TimerHandle; readonly kind: "mint" | "reconnect"; readonly due: number } | null = null;
   let renewal: TimerHandle | null = null;
   /** The current bearer's renewal time on the monotonic clock, or null for none. */
   let due: number | null = null;
   /** The current bearer's renewal was asked for: it is not asked again, even when a reconnect reports its lifetime. */
   let spent = false;
-  /** A request skipped for a backoff wait or call in flight, with its delay. */
-  let owed: { readonly kind: "mint" | "reconnect"; readonly delay: number } | null = null;
+  /** One slot: later requests overwrite earlier ones; stillNeeded decides at settlement. */
+  let owed: { readonly kind: "mint" | "reconnect"; readonly delay: number; readonly due?: number } | null = null;
   let error: string | null = null;
   let notice: string | null = null;
   let disposed = false;
@@ -194,6 +196,10 @@ function driveShell<T>(connection: WireConnection, source: Source<T>, clock: Clo
 
   const cancel = (timer: TimerHandle | null): null => {
     if (timer !== null) clock.clearTimeout(timer);
+    return null;
+  };
+  const cancelWaiting = (): null => {
+    if (waiting !== null) clock.clearTimeout(waiting.timer);
     return null;
   };
   const running = (): boolean => connection.state !== "NeedsToken" && connection.state !== "Disconnected";
@@ -241,7 +247,11 @@ function driveShell<T>(connection: WireConnection, source: Source<T>, clock: Clo
   const call = (kind: "renew" | "mint" | "reconnect"): void => {
     if (inFlight || disposed) return;
     const renewing = kind === "renew";
-    waiting = null;
+    if (waiting !== null) {
+      // The cancelled request predates anything already owed; keep the later one.
+      owed ??= { kind: waiting.kind, delay: 0, due: waiting.due };
+      waiting = cancelWaiting();
+    }
     inFlight = true;
     if (renewing) spent = true;
     else error = null;
@@ -267,7 +277,10 @@ function driveShell<T>(connection: WireConnection, source: Source<T>, clock: Clo
         // A failed renewal's notice stands until a new bearer: a reconnect's session runs on the same one.
         if (!kept) notice = null;
         adopt(token, kept);
-      } else if (renewing && skipped !== null && stillNeeded(skipped.kind)) request(skipped.delay, skipped.kind);
+      } else if (renewing && skipped !== null && stillNeeded(skipped.kind)) {
+        const delay = skipped.due === undefined ? skipped.delay : Math.max(0, skipped.due - clock.now());
+        request(delay, skipped.kind);
+      }
       changed();
     };
     Promise.resolve(renewing)
@@ -292,7 +305,12 @@ function driveShell<T>(connection: WireConnection, source: Source<T>, clock: Clo
     }
     if (delay === 0) call(kind);
     else {
-      waiting = clock.setTimeout(() => call(kind), delay);
+      const due = clock.now() + delay;
+      const timer = clock.setTimeout(() => {
+        waiting = null;
+        call(kind);
+      }, delay);
+      waiting = { timer, kind, due };
       changed();
     }
   };
@@ -316,7 +334,8 @@ function driveShell<T>(connection: WireConnection, source: Source<T>, clock: Clo
     }
     if (state === "Disconnected") {
       const armed = waiting !== null || renewal !== null;
-      waiting = cancel(waiting);
+      waiting = cancelWaiting();
+      owed = null;
       forget();
       if (armed) changed();
     }
@@ -349,7 +368,7 @@ function driveShell<T>(connection: WireConnection, source: Source<T>, clock: Clo
       changed();
     },
     ask() {
-      waiting = cancel(waiting);
+      waiting = cancelWaiting();
       streak = 0;
       error = null;
       request(0, "mint");
@@ -358,7 +377,8 @@ function driveShell<T>(connection: WireConnection, source: Source<T>, clock: Clo
     dispose() {
       disposed = true;
       stop();
-      waiting = cancel(waiting);
+      waiting = cancelWaiting();
+      owed = null;
       forget();
     },
   };

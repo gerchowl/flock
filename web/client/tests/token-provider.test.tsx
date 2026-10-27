@@ -1149,7 +1149,8 @@ describe("a bridged connection", () => {
     return { h, shell, open: (token: string) => shell.open(token) };
   }
 
-  test("a reconnect requested during re-mint backoff is owed when a renewal overlaps it, without a connect deadline", async () => {
+  /** A deferred renewal at 649 ms overlaps a re-mint scheduled for 750 ms. */
+  async function renewalDuringRemint() {
     const h = new Harness();
     h.conn = new WireConnection({ bridged: true, client: { name: "fixture", version: "1" }, clock: h.clock, random: () => 0, store: h.store });
     const shell = provider("bridge", "t1", "t2", { token: "t3", expiresInMs: 533 }, "deferred");
@@ -1179,6 +1180,11 @@ describe("a bridged connection", () => {
     h.clock.advanceTo(649);
     await tick();
     expect(shell.renews).toEqual([false, false, false, true]);
+    return { h, shell, driver };
+  }
+
+  test("a reconnect requested during re-mint backoff is owed when a renewal overlaps it, without a connect deadline", async () => {
+    const { h, shell, driver } = await renewalDuringRemint();
     h.clock.advanceTo(750);
     shell.reject(PANE);
     await tick();
@@ -1186,6 +1192,38 @@ describe("a bridged connection", () => {
     if (h.connection.state === "Hello") send(h, WELCOME);
     h.clock.advanceTo(500 + DEADLINES.connect);
     expect([servedAt, h.connection.state, h.connection.error, shell.renews]).toEqual([750, "Live", null, [false, false, false, true, false]]);
+    driver.dispose();
+    h.connection.disconnect();
+    expect(h.clock.pendingTimers).toBe(0);
+  });
+
+  test("a successful renewal cancels the waiting mint: exactly one openBridge and Live, with no timer left after cleanup", async () => {
+    const { h, shell, driver } = await renewalDuringRemint();
+    shell.resolve("renewed");
+    await tick();
+    send(h, WELCOME);
+    // While Live, only the wire's liveness and healthy timers remain.
+    const timersWhileLive = h.clock.pendingTimers;
+    h.clock.advanceTo(750);
+    await tick();
+    const settled = [h.connection.state, shell.renews.slice(3)];
+    driver.dispose();
+    h.connection.disconnect();
+    expect([timersWhileLive, settled, h.clock.pendingTimers]).toEqual([2, ["Live", [true]], 0]);
+  });
+
+  test("Disconnect during renewal cancels the waiting mint even when renewal fails, with no pending timers", async () => {
+    const { h, shell, driver } = await renewalDuringRemint();
+    h.connection.disconnect();
+    shell.reject(PANE);
+    await tick();
+    const timersAfterDisconnect = h.clock.pendingTimers;
+    h.clock.advanceTo(750);
+    await tick();
+    const settled = [h.connection.state, shell.renews.slice(3), h.clock.pendingTimers];
+    driver.dispose();
+    h.connection.disconnect();
+    expect([timersAfterDisconnect, settled, h.clock.pendingTimers]).toEqual([0, ["Disconnected", [true], 0], 0]);
   });
 
   test("a held session replaced by another is closed", () => {
