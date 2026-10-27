@@ -6,6 +6,7 @@
  *
  * @module
  */
+import type { BridgeSocket } from "../config";
 
 /** An opaque timer handle from {@link Clock.setTimeout}. */
 export type TimerHandle = { readonly __timer: unique symbol };
@@ -51,6 +52,26 @@ export type SocketFactory = (url: string) => SocketLike;
  * the token is never compressed.
  */
 export const browserSockets: SocketFactory = (url) => new WebSocket(url) as unknown as SocketLike;
+
+/**
+ * A shell's bridged socket as a {@link SocketLike} (ADR-0038 §6): frames and
+ * close codes pass through unchanged. It is open already, so `onopen` never
+ * fires; the connection starts its `hello` on it at once.
+ */
+export function bridgeSocket(socket: BridgeSocket): SocketLike {
+  const like: SocketLike = {
+    send: (text) => socket.send(text),
+    close: (code, reason) => socket.close(code, reason),
+    onopen: null,
+    onmessage: null,
+    onclose: null,
+    onerror: null,
+  };
+  socket.onmessage = (text) => like.onmessage?.({ data: text });
+  socket.onclose = (code, reason) => like.onclose?.({ code, reason });
+  socket.onerror = () => like.onerror?.();
+  return like;
+}
 
 /** String storage for the outbox. `localStorage` satisfies it. */
 export interface KeyValueStore {
