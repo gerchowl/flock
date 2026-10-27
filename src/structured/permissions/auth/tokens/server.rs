@@ -122,6 +122,14 @@ impl Store {
         })
     }
 
+    /// Await the app credential's enforcing clock, independently of transport heartbeats.
+    #[cfg(feature = "web")]
+    pub(crate) async fn app_expired(&self, session: &Session) -> io::Result<()> {
+        match session.app() {
+            Some(app) => self.apps.expired(app).await,
+            None => std::future::pending().await,
+        }
+    }
     /// Await management and revocation ownership under the remaining hello deadline.
     /// Run on the separately bounded hello-wait worker, never the store-I/O pool.
     // Native registration is compiled but unused without the web transport.

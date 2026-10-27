@@ -131,7 +131,7 @@ impl Core {
                 owner.get(
                     &data,
                     Arc::new(
-                        crate::structured::permissions::auth::tokens::app_sessions::SystemClock,
+                        crate::structured::permissions::auth::tokens::app_sessions::SystemClock::new(),
                     ),
                 )
             })
@@ -148,7 +148,7 @@ impl Core {
         wake: Arc<tokio::sync::Notify>,
     ) -> io::Result<Self> {
         Self::from_store(
-            Arc::new(Store::new(store, Arc::new(AppClock(clock.clone())))),
+            Arc::new(Store::new(store, Arc::new(AppClock::new(clock.clone())))),
             clock,
             wake,
         )
@@ -245,13 +245,41 @@ impl Core {
         revocation.and(drained)
     }
 }
-/// Keep credentials and transport deadlines in the same injected monotonic domain.
+/// Test adapter: clock waits share an elapsed origin without changing transport timing.
 #[cfg(test)]
-struct AppClock(Arc<dyn Clock>);
+struct AppClock {
+    clock: Arc<dyn Clock>,
+    base: std::sync::OnceLock<Instant>,
+}
+#[cfg(test)]
+impl AppClock {
+    fn new(clock: Arc<dyn Clock>) -> Self {
+        Self {
+            clock,
+            base: std::sync::OnceLock::new(),
+        }
+    }
+}
 #[cfg(test)]
 impl crate::structured::permissions::auth::tokens::app_sessions::Clock for AppClock {
-    fn now(&self) -> Instant {
-        self.0.now()
+    fn now(&self) -> io::Result<Duration> {
+        let now = self.clock.now();
+        now.checked_duration_since(*self.base.get_or_init(|| now))
+            .ok_or_else(|| io::Error::other("test clock reversed"))
+    }
+    fn until(
+        &self,
+        deadline: Duration,
+    ) -> crate::structured::permissions::auth::tokens::app_sessions::Wait<'_> {
+        Box::pin(async move {
+            let at = self
+                .base
+                .get()
+                .and_then(|base| base.checked_add(deadline))
+                .ok_or_else(|| io::Error::other("test deadline has no clock origin"))?;
+            self.clock.until(at).await;
+            Ok(())
+        })
     }
 }
 /// Kernel/clock readiness also revokes idle sockets; no command or heartbeat is needed.
@@ -265,7 +293,9 @@ async fn app_lifetime(shared: &Shared, session: &Session) -> u16 {
     }
     tokio::select! { biased;
         _ = revoked.changed() => AUTH_REVOKED_CLOSE,
-        _ = shared.clock.until(app.expires) => AUTH_REVOKED_CLOSE,
+        expired = shared.store.app_expired(session) => {
+            if expired.is_ok() { AUTH_REVOKED_CLOSE } else { GOING_AWAY_CLOSE }
+        },
         exit = app.process.clone().wait() => {
             if exit.is_err() { GOING_AWAY_CLOSE } else { AUTH_REVOKED_CLOSE }
         },
