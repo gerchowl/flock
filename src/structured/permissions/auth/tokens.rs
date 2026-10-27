@@ -16,6 +16,7 @@ pub(crate) mod server;
 use std::time::Duration;
 use zeroize::Zeroize;
 
+use crate::api::client_tokens::operator_scopes;
 pub(crate) use crate::api::client_tokens::{Bearer, Issued, Listed, Scope, TokenInfo};
 /// Admission failures contain no bearer or file contents.
 #[derive(Debug)]
@@ -103,9 +104,6 @@ impl PendingRevoke<'_> {
         self.store.0.remove_entry(&self.entry)?;
         Ok(())
     }
-}
-fn operator_scopes() -> BTreeSet<Scope> {
-    BTreeSet::from([Scope::Read, Scope::Send, Scope::Answer, Scope::Operate])
 }
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
