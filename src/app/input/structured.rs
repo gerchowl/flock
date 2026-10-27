@@ -123,7 +123,7 @@ impl App {
         true
     }
     pub(super) fn handle_structured_mouse(&mut self, mouse: MouseEvent) -> bool {
-        if self.state.mode != Mode::Terminal {
+        if self.state.mode != Mode::Terminal || self.state.drag.is_some() {
             return false;
         }
         let Some(id) = self.state.pane_at(mouse.column, mouse.row).map(|i| i.id) else {
@@ -134,12 +134,23 @@ impl App {
         };
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) if mouse.modifiers.is_empty() => {
+                let hit = self
+                    .state
+                    .view
+                    .structured
+                    .get(&id)
+                    .and_then(|p| p.pane.as_ref().ok())
+                    .and_then(|p| p.hit(mouse.column, mouse.row));
+                if hit.is_none() {
+                    return false;
+                }
                 if let Err(code) = crate::ui::structured::validate(&self.state, id, &target) {
                     self.structured_error(code);
                     return true;
                 }
                 self.state.focus_pane(id);
                 self.activate_native(id, mouse.column, mouse.row);
+                true
             }
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
                 let action = Action::ScrollLines(if mouse.kind == MouseEventKind::ScrollUp {
@@ -150,9 +161,12 @@ impl App {
                 if let Err(code) = self.dispatch_native_intent(id, Intent { target, action }) {
                     self.structured_error(code);
                 }
+                true
             }
-            _ => {}
+            _ => false,
         }
-        true
     }
 }
+
+#[cfg(test)]
+mod tests;

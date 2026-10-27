@@ -138,6 +138,14 @@ impl Pane {
             .find_map(|p| p.hit(x, y))
             .or_else(|| self.transcript.hit(x, y))
     }
+    /// Exact painted control extent, including every label cell and no gap.
+    pub fn control_rect(&self, index: usize) -> Option<Rect> {
+        self.panels
+            .iter()
+            .flat_map(Panel::rects)
+            .chain(self.transcript.rects())
+            .nth(index)
+    }
     /// Keyboard activation uses the same complete painted controls as pointer hits.
     pub fn positions(&self) -> Vec<(u16, u16)> {
         self.panels

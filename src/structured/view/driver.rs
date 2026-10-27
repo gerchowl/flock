@@ -90,13 +90,14 @@ impl Driver {
                             Action::InspectCard(id) => { s.collapsed.remove(&id); s.scroll_anchor = Some(id.seq); },
                             Action::SelectPermission(h) => s.selected_permission = Some(h),
                             Action::FollowTail => { s.scroll_anchor = None; s.new_output = false; },
-                            Action::ScrollLines(step) => {
+                            Action::ScrollLines(step) if step != 0 && (step < 0 || s.scroll_anchor.is_some()) => {
                                 let at = s.scroll_anchor.and_then(|seq| s.transcript.iter().position(|c| c.seq >= seq))
                                     .unwrap_or_else(|| s.transcript.len().saturating_sub(1));
                                 let i = at.saturating_add_signed(isize::from(step)).min(s.transcript.len().saturating_sub(1));
                                 s.scroll_anchor = s.transcript.get(i).map(|c| c.seq);
                             },
-                            _ => unreachable!("driver accepts only presentation actions"),
+                            Action::ScrollLines(_) => {},
+                            _ => { debug_assert!(false, "non-presentation action bypassed driver whitelist"); },
                         }
                         None
                     },
