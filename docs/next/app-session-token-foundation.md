@@ -35,9 +35,9 @@ principal, `app:operator:<uid>` (decimal kernel-attested UID). Identity survives
 restart and handoff while credentials do not. Revocation fanout is per
 credential; each mint has four registered-socket slots keyed by its bearer
 digest, including pending welcome. A fully occupied old mint cannot starve a
-fresh mint's socket budget. The four unauthenticated hello slots and sixteen
-upgraded sockets remain global. At most
-128 app entries live. Issuance first reclaims expired/exited entries; capacity
+fresh mint's socket budget. Each transport has four unauthenticated hello
+slots; sixteen upgraded sockets are shared server-wide. At most 128 app entries
+live. Issuance first reclaims expired/exited entries; capacity
 or admission contention refuses with `session_busy`. No failed mint discloses
 a credential. Storage/entropy failures return `internal_error`.
 
@@ -62,9 +62,8 @@ issuance reclaims them. Revocation notifications happen after earlier shared
 admissions drain.
 
 The captured shell Origin/header pair is admitted only on `/v1/ws` (#2442).
-The sibling listener, pre-auth UID attribution and revised transport budgets
-belong to the next approved #2500 slice. Existing pending-hello and connection
-limits are unchanged here. There are no `desktop/` changes in this server slice.
+Web-enabled servers also prepare a private sibling HTTP/WebSocket listener.
+There are no `desktop/` changes in this server slice.
 
 The server's transport-neutral `App::admit_local_peer` checks explicit kernel
 credentials rather than borrowing the current CLI request's caller context.
@@ -81,18 +80,19 @@ credentials.
 through its registration callback. Local app credentials must match the minting
 PID and birth; a missing peer proof cannot admit one. Persistent credentials
 retain exactly their current grants, including send-only credentials. Watch or
-store I/O failures remain distinct from process-instance refusal. This primitive
-is staged for the sibling-listener integration in #2500; the TCP hello behavior
-switches together with that listener, not in this preparatory slice.
+store I/O failures remain distinct from process-instance refusal. The native
+listener supplies that proof on every hello; TCP supplies none and
+therefore refuses app-session bearers with close 4401, reason
+`peer_process_changed`. Browser/file credentials remain supported on TCP.
 
-The next preparatory slice supplies `local_listener::Listener`, reusing the
-existing HTTP server over Unix streams and capturing credentials from the
+`local_listener::Listener` reuses the existing HTTP server over Unix streams and capturing credentials from the
 accepted kernel socket. `prepare` binds without accepting, `activate` starts
 serving only when explicitly called, and `stop` cancels the acceptor and its
-owned HTTP tasks. Production startup does not call these methods yet, so this
-slice creates no new reachable endpoint and does not change TCP authentication.
-Owner admission and the TCP app-session refusal will activate together in the
-following #2500 slice.
+owned HTTP tasks. `HeadlessServer` prepares the listener at startup and activates
+it only after handoff commit when importing. The containing `client_listener::Listener::shutdown` also stops
+the shared core, drains upgraded WebSocket leases and retires app-session bearers.
+The native route is only `GET /v1/ws`; it does not serve the GUI, token exchange,
+or minting. It is available independently of the optional TCP bind.
 
 `socket_path` derives `flock-ws.sock` beside `flock.sock`; an API override such
 as `custom.sock` instead derives `custom-ws.sock`, keeping separate instances
@@ -103,6 +103,17 @@ refuses unsafe parents without creating or repairing them. The socket uses the
 API's `0600` mode constant and permanent `SocketOwner` lock. `owner` retains a
 rollback reference; its duplicate can pass through the existing SCM_RIGHTS
 handoff machinery and be adopted before `prepare`. `unlink` and destruction
-remove only the recorded binding's inode. Exporter/importer orchestration and
-its manifest extension belong to the activation slice; no new descriptor is
-exported by production handoff in this foundation.
+remove only the recorded binding's inode. Internal handoff manifest version 4
+appends the native ownership descriptor.
+The importer adopts it before preparing the replacement path; failure rebinds
+under the exporter's retained guard. Older importers refuse before transfer.
+Mesh and WebSocket protocol versions do not change.
+
+TCP and native listeners each own 32 incomplete HTTP reservations and four
+pending hellos with absolute five-second deadlines. They share 16 upgraded
+sockets and four registered sockets per credential digest. Capacity refusal
+before upgrade is HTTP 503 with `preauth_capacity`; it never evicts an existing
+session. Missing/wrong UID, pane/agent ancestry or a mesh caller receives HTTP
+403 `operator_only`; missing or changed PID/birth receives HTTP 403
+`peer_process_changed`. Both return the ADR-0036 JSON body, no-store cache policy,
+and close the connection. Kernel proof never adds bearer scopes or mints a token.

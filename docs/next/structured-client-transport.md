@@ -5,8 +5,19 @@ from #1893 is mounted by #1894 in the real headless-server lifecycle, alongside
 the GUI bundle and browser-code exchange. Build with the `web` feature and set
 `[client] bind = "127.0.0.1:7682"` to opt in. Port 0 asks the OS for a free port;
 `flk client open --print` reports the live address, including after a config
-reload. The listener is off by default. `flk web` remains the separate terminal
-bridge.
+reload. This TCP listener is off by default. `flk web` remains the separate
+terminal bridge.
+
+Web-enabled servers also expose `GET /v1/ws` over the private sibling
+`flock-ws.sock`, independently of the TCP bind. An API override such as
+`custom.sock` derives `custom-ws.sock` in the same protected directory. The
+native process must both mint over the API socket and own the WebSocket
+connection: app bearers are bound to its live PID and process birth. TCP
+refuses app bearers with 4401 `peer_process_changed`; browser/file credentials
+retain their scopes. Native admission additionally requires kernel-verified
+LocalOperator identity and never trusts headers as identity. See the
+[app-session credential contract](app-session-token-foundation.md) for exact
+HTTP refusals and handoff behavior.
 
 The first data message is a generated `hello` frame containing a client token.
 The core opens the store once off the async executor, then verifies current

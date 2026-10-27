@@ -15,7 +15,7 @@ impl Native {
         Self::with_facts(None).await
     }
     async fn with_facts(facts: Option<crate::platform::peer::Credentials>) -> Self {
-        let (server, app, _) = super::app_sessions::fixture().await;
+        let (server, app, _) = super::app_sessions::fixture_with_origin(false).await;
         let root = crate::test_support::TempDir::socket();
         let mut router = server.core.local_router();
         if let Some(facts) = facts {
@@ -469,4 +469,46 @@ pub(super) async fn child_bridge_and_exit() {
     healthy.send(json!({"t":"cmd","cmd_id":"sibling-live","verb":"unknown","args":{},"resume_only":false})).await;
     assert_eq!(healthy.text().await["error"]["code"], "server_version_gap");
     f.finish().await;
+}
+
+#[tokio::test]
+async fn native_owner_refuses_agent_and_mesh_peers_before_upgrade() {
+    for mesh in [false, true] {
+        let mut f = Native::new().await;
+        let _stolen = f.mint().await;
+        let (peer, _other) = std::os::unix::net::UnixStream::pair().unwrap();
+        let facts = crate::platform::peer::credentials(&peer);
+        let mut lease = None;
+        if mesh {
+            f.app
+                .inbound
+                .attach(
+                    facts.pid.unwrap(),
+                    facts.birth.unwrap(),
+                    crate::platform::process_start_time,
+                )
+                .unwrap();
+        } else {
+            let mut reserved = f
+                .app
+                .session_leases
+                .reserve("fixture-agent", "fixture-session", None)
+                .unwrap();
+            reserved.bind_test_peer(facts.pid.unwrap());
+            lease = Some(reserved);
+        }
+        let (mut socket, headers) = f.upgrade("/v1/ws").await;
+        assert!(headers.starts_with("HTTP/1.1 403"), "{headers}");
+        assert!(headers.contains("content-type: application/json"));
+        assert!(headers.contains("cache-control: no-store"));
+        let mut body = String::new();
+        within(socket.0.read_to_string(&mut body)).await.unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&body).unwrap(),
+            json!({"error":{"code":"operator_only","message":"Local operator required"}})
+        );
+        assert!(f.server.core.shared.clients.lock().unwrap().is_empty());
+        drop(lease);
+        f.finish().await;
+    }
 }

@@ -7,7 +7,10 @@ use std::{
     sync::atomic::AtomicBool,
 };
 
-pub(super) async fn fixture() -> (Server, App, Owner) {
+pub(crate) async fn fixture() -> (Server, App, Owner) {
+    fixture_with_origin(true).await
+}
+pub(crate) async fn fixture_with_origin(local: bool) -> (Server, App, Owner) {
     let root = crate::structured::launch::SessionConfigDir::create(&std::env::temp_dir()).unwrap();
     let clock = TestClock::new();
     let owner = Owner::default();
@@ -18,10 +21,6 @@ pub(super) async fn fixture() -> (Server, App, Owner) {
     let core = Core::from_store(store, Arc::new(clock.clone()), wake.clone()).unwrap();
     let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let bind = socket.local_addr().unwrap();
-    let router = core.router();
-    let task = tokio::spawn(async move {
-        axum::serve(socket, router).await.unwrap();
-    });
     let mut app = App::new(
         &crate::config::Config::default(),
         true,
@@ -34,6 +33,20 @@ pub(super) async fn fixture() -> (Server, App, Owner) {
         operator: crate::platform::peer::effective_uid(),
         dedicated: Ok(None).into(),
     };
+    // Unmounted-core lifecycle fixtures supply a sealed proof from a real Unix peer.
+    // Native integration tests instead capture each accepted connection and service admission.
+    let router = if local {
+        let (peer, _other) = UnixStream::pair().unwrap();
+        let proof = app
+            .admit_local_peer(crate::platform::peer::credentials(&peer))
+            .unwrap();
+        core.endpoint(true).layer(axum::Extension(proof))
+    } else {
+        core.router()
+    };
+    let task = tokio::spawn(async move {
+        axum::serve(socket, router).await.unwrap();
+    });
     (
         Server {
             core: Arc::new(core),
@@ -86,7 +99,7 @@ async fn dispatch(app: &mut App, params: Value, alter: impl FnOnce(&mut App)) ->
     worker.join().unwrap();
     serde_json::from_str(&line).unwrap()
 }
-pub(super) async fn mint(app: &mut App) -> Bearer {
+pub(crate) async fn mint(app: &mut App) -> Bearer {
     let reply = dispatch(app, json!({}), |_| {}).await;
     serde_json::from_value(reply["result"]["issued"]["token"].clone())
         .unwrap_or_else(|_| panic!("mint refused: {reply}"))

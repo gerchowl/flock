@@ -49,7 +49,7 @@ impl TestClock {
             .filter(|&&d| d == self.0.base + Duration::from_millis(ms))
             .count()
     }
-    async fn deadline_count(&self, ms: u64, count: usize) {
+    pub(crate) async fn deadline_count(&self, ms: u64, count: usize) {
         let mut signal = self.0.signal.subscribe();
         within(async {
             loop {
@@ -991,7 +991,8 @@ fn revocation_between_verification_and_registration_never_welcomes() {
 }
 #[test]
 fn revocation_after_storage_recheck_never_welcomes() {
-    runtime(revoke_during_hello(3, 1));
+    // The registration deadline precedes the final storage recheck deadline.
+    runtime(revoke_during_hello(4, 1));
 }
 async fn revoke_during_hello(at: u64, registered: usize) {
     let action = Arc::new(Mutex::new(None));
@@ -1070,7 +1071,7 @@ fn registered_recheck_deadline_preserves_the_token_with_a_non_auth_close() {
         .build().unwrap().block_on(async {
             let action = Arc::new(Mutex::new(None));
             let server = Server::with_clock(|clock| Arc::new(RevokeClock {
-                clock, calls: AtomicU64::new(0), at: 1, action: action.clone(),
+                clock, calls: AtomicU64::new(0), at: 2, action: action.clone(),
             })).await;
             let (started, ready) = tokio::sync::oneshot::channel();
             let (release, wait) = std::sync::mpsc::channel();
@@ -1085,7 +1086,7 @@ fn registered_recheck_deadline_preserves_the_token_with_a_non_auth_close() {
             let mut client = Socket::open(&server).await;
             client.send(json!({"t":"hello","protocol":1,"client":{"name":"fixture","version":"1"},"token":"a".repeat(64)})).await;
             within(ready).await.unwrap();
-            server.clock.deadline_count(HANDSHAKE_DEADLINE_MS, 4).await;
+            server.clock.deadline_count(HANDSHAKE_DEADLINE_MS, 5).await;
             assert_eq!(server.core.shared.clients.lock().unwrap().len(), 1);
             server.clock.advance(HANDSHAKE_DEADLINE_MS);
             let result = client.receive().await;
@@ -1492,6 +1493,10 @@ fn overlapping_read_admissions_keep_subscriptions_and_socket_alive() {
     });
 }
 
-mod app_sessions;
+pub(crate) mod app_sessions;
 
 mod native;
+
+pub(crate) fn lease_counter(core: &Core) -> Arc<Semaphore> {
+    core.shared.slots.clone()
+}

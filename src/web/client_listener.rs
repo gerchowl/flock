@@ -55,25 +55,36 @@ where
         while clients.try_join_next().is_some() {}
         let (socket, peer) = accept_next(&mut accept, clock.as_ref(), &health).await?;
         let Ok(permit) = slots.clone().try_acquire_owned() else {
-            http(
-                socket,
-                Router::new().fallback(|| async {
-                    super::local_admission::refusal(
-                        crate::api::error_code::ErrorCode::PreauthCapacity,
-                    )
-                }),
-            )
-            .await;
+            // Refuse without reading another header outside the incomplete-HTTP cap.
+            let response =
+                super::local_admission::refusal(crate::api::error_code::ErrorCode::PreauthCapacity);
+            if let Ok(body) = axum::body::to_bytes(response.into_body(), 512).await {
+                use tokio::io::AsyncWriteExt;
+                let mut socket = socket;
+                let header = format!("HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nCache-Control: no-store\r\nConnection: close\r\nContent-Length: {}\r\n\r\n", body.len());
+                let write = async {
+                    socket.write_all(header.as_bytes()).await?;
+                    socket.write_all(&body).await?;
+                    socket.shutdown().await?;
+                    // Drain after half-close so unread request bytes cannot reset the reply.
+                    tokio::io::copy(&mut socket, &mut tokio::io::sink()).await
+                };
+                tokio::select! { biased;
+                    _ = clock.until(clock.now() + HTTP_ADMISSION_DEADLINE) => (),
+                    _ = write => (),
+                }
+            }
             continue;
         };
         let service = router.clone().layer(Extension(ConnectInfo(peer)));
+        let clock = clock.clone();
         clients.spawn(async move {
             let _permit = permit;
-            http(socket, service).await;
+            http(socket, service, clock).await;
         });
     }
 }
-async fn http<S>(socket: S, service: Router)
+async fn http<S>(socket: S, service: Router, clock: Arc<dyn Clock>)
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
@@ -82,13 +93,10 @@ where
         .half_close(true)
         .header_read_timeout(HTTP_ADMISSION_DEADLINE)
         .timer(TokioTimer::new());
-    let _ = tokio::time::timeout(
-        HTTP_ADMISSION_DEADLINE,
-        builder
-            .serve_connection(TokioIo::new(socket), TowerToHyperService::new(service))
-            .with_upgrades(),
-    )
-    .await;
+    tokio::select! { biased;
+        _ = clock.until(clock.now() + HTTP_ADMISSION_DEADLINE) => (),
+        _ = builder.serve_connection(TokioIo::new(socket), TowerToHyperService::new(service)).with_upgrades() => (),
+    }
 }
 /// Prepared before handoff ready; only run activates acceptance, after commit.
 pub(crate) struct Listener {

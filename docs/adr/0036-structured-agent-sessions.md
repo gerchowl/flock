@@ -4121,8 +4121,16 @@ socket shares the API's mode `0600` constant and the ownership protocol above.
 `owner`, `SocketOwner::duplicate` and `SocketOwner::take` retain the same locked
 open description through descriptor transfer, rebind and rollback. `unlink`
 and destruction compare the recorded inode, so an old exporter cannot unlink
-an importer's replacement socket. This slice adds no production call to these
-listener methods and changes neither reachable endpoints nor TCP authentication.
-The following activation slice owns the server handoff manifest extension,
-LocalOperator admission, independent pre-auth pools and the atomic TCP
-app-session refusal.
+an importer's replacement socket. `HeadlessServer::prepare_client_wire` activates the foundation together with
+`Core::local_router` owner admission and TCP app-session refusal. The bounded
+`local_admission::Owner::service` obtains a sealed proof from the application
+owner. `Store::admit_peer` and the final registration check hold the existing
+revocation fence through insertion; `Lease::drop` prevents a cancelled waiter
+from leaving a registration behind. HTTP and hello permits are separate per
+transport; upgraded and per-credential caps belong to the single shared core.
+`client_listener::Listener::shutdown` cancels HTTP acceptance and drains the
+upgraded sessions through `Core::shutdown`; the HTTP task set alone does not
+own upgraded futures. Internal handoff manifest version 4 appends the native
+ownership descriptor after the API and terminal owners; import adopts it before
+preparation and rollback retains the same guard. No mesh or JSON wire version
+changes.

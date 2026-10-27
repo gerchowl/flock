@@ -507,3 +507,7 @@ async fn native_listener_is_prepared_when_tcp_is_disabled() {
     assert!(super::super::local_listener::socket_path(&root.path().join("flock.sock")).exists());
     listener.shutdown().await.unwrap();
 }
+
+mod budgets;
+
+mod shutdown;

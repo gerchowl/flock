@@ -444,7 +444,15 @@ async fn connection(
         let token = token.clone();
         super::store_io::shared().run(move || {
             shared.store.admit_peer(&token, peer.as_ref(), |session| {
-                let mut clients = shared.clients.lock().map_err(|_| TokenError::Busy)?;
+                let mut clients = shared
+                    .clients
+                    .lock()
+                    .map_err(|_| PeerAdmissionError::from(TokenError::Busy))?;
+                if let Some(peer) = &peer {
+                    if peer.process().exited().map_err(TokenError::from)? {
+                        return Err(PeerAdmissionError::PeerProcessChanged);
+                    }
+                }
                 if !live.load(Ordering::Acquire)
                     || *shared.stop.borrow()
                     || shared.clock.now() >= end
@@ -454,7 +462,7 @@ async fn connection(
                         .count()
                         >= CREDENTIAL_CONNECTIONS
                 {
-                    return Err(TokenError::Busy);
+                    return Err(TokenError::Busy.into());
                 }
                 clients.insert(
                     id,
@@ -472,14 +480,19 @@ async fn connection(
     let session = match before(shared.clock.as_ref(), end, registration)
         .await
         .flatten()
+        .map(|result| result.and_then(|registered| registered))
     {
-        Some(Ok(Ok(session))) => session,
+        Some(Ok(session)) => session,
         failure => {
             let changed = matches!(failure, Some(Err(PeerAdmissionError::PeerProcessChanged)));
             let code = match failure {
-                Some(Err(PeerAdmissionError::Token(error))) => HandshakeFailure::from(error)
-                    .hello_code()
-                    .unwrap_or(GOING_AWAY_CLOSE),
+                // The first verification succeeded: a later credential refusal is revocation.
+                Some(Err(PeerAdmissionError::Token(error))) => {
+                    match HandshakeFailure::from(error) {
+                        HandshakeFailure::Refused => AUTH_REVOKED_CLOSE,
+                        _ => GOING_AWAY_CLOSE,
+                    }
+                }
                 _ if changed => AUTH_REFUSED_CLOSE,
                 _ => GOING_AWAY_CLOSE,
             };
