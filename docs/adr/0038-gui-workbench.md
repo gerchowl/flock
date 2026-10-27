@@ -369,6 +369,14 @@ wire ev ─▶ reducer(kind) ─▶ store (normalised) ─▶ selector(tile) ─
   - A `structured` agent's tile reads ADR-0036's session stream. Its events are the canonical entries ADR-0012 §1 asked for, with stable ids and an unknown-event fallback.
   - A `pty` agent's tile uses the terminal view (ADR-0011 §7) until ADR-0012's canonical entries and derived index are built for its harness. Then the same `TranscriptVM` renders them, and the client doesn't care which producer made them.
   - ADR-0012 §6's rule, that reads are authorization-scoped, is applied by the server per stream through the token's scopes (ADR-0036 §5).
+- **Permission presentation (#2559).** One prompt has one transcript entry:
+  the canonical `flk_permission_request` presents it. A native `control_request`
+  with the same nonempty `request_id` in that session stream is transport detail
+  and does not render a second prompt, even if the canonical fact arrives later.
+  Native requests without a known canonical twin remain visible; unknown facts
+  retain their JSON fallback. Canonical closed records remain visible too.
+  This is presentation grouping (§3), not permission-state inference: raw facts,
+  stream cursors and event counts are unchanged. Reset clears the correlation.
 - **Streaming text.**
   - `agent/<id>/live` deltas append to an in-flight block keyed by `(message uuid, block index)`.
   - When the complete `assistant` event arrives on `agent/<id>`, it replaces the in-flight block (ADR-0036 §4: deltas are not persisted).
