@@ -537,7 +537,7 @@ async fn native_owner_refuses_agent_and_mesh_peers_before_upgrade() {
 #[tokio::test]
 async fn ready_child_exit_refuses_hello_while_notification_consumer_is_gated() {
     let mut f = Native::new().await;
-    let (mut child, token, mut sockets) = child_sockets(&mut f, true).await;
+    let (child, token, mut sockets) = child_sockets(&mut f, true).await;
     let session = f.server.core.shared.store.authenticate(&token).unwrap();
     let app = session.app().unwrap().clone();
     let notification = app.revoked.clone();
@@ -550,21 +550,38 @@ async fn ready_child_exit_refuses_hello_while_notification_consumer_is_gated() {
         held.await.unwrap();
         store.retire(&session).unwrap();
     });
-    child.exit_unreaped();
-    within(observed).await.unwrap();
-    // No registered connection owns a lifetime consumer; the sole consumer is held above.
-    assert!(
-        !*notification.borrow(),
-        "the exit consumer must still be held"
-    );
-    assert!(matches!(
-        f.server.core.shared.store.authenticate(&token),
-        Err(TokenError::Revoked)
-    ));
+    use crate::structured::permissions::auth::tokens::server::PeerStage;
+    let child = Arc::new(Mutex::new(child));
+    let exiting = child.clone();
+    let crossed = Arc::new(AtomicBool::new(false));
+    let checked = crossed.clone();
+    f.server
+        .core
+        .shared
+        .store
+        .on_peer_stage(PeerStage::Checked, move || {
+            checked.store(true, Ordering::SeqCst);
+        });
+    f.server
+        .core
+        .shared
+        .store
+        .on_peer_stage(PeerStage::Authenticated, move || {
+            exiting.lock().unwrap().exit_unreaped();
+            assert!(
+                !*notification.borrow(),
+                "the exit consumer is held before retirement"
+            );
+        });
     for socket in &mut sockets {
         socket.send(json!({"t":"hello","protocol":WIRE_JSON_VERSION,"client":{"name":"fixture","version":"1"},"token":token.0})).await;
         assert_eq!(close_detail(socket).await.0, AUTH_REFUSED_CLOSE);
     }
+    within(observed).await.unwrap();
+    assert!(
+        !crossed.load(Ordering::SeqCst),
+        "ready exit crossed the registration fence"
+    );
     assert!(f.server.core.shared.clients.lock().unwrap().is_empty());
     release.send(()).unwrap();
     within(consumer).await.unwrap();
@@ -573,20 +590,9 @@ async fn ready_child_exit_refuses_hello_while_notification_consumer_is_gated() {
 
 #[tokio::test]
 async fn child_exit_races_both_sides_of_fenced_registration() {
+    use crate::structured::permissions::auth::tokens::server::PeerStage;
     for registered in [false, true] {
-        let action = Arc::new(Mutex::new(None));
-        let state = Arc::new(AtomicU64::new(0));
-        let calls = state.clone();
-        let gate = action.clone();
-        let mut f = Native::using(None, move |clock| {
-            Arc::new(RegistrationClock {
-                clock,
-                calls,
-                action: gate,
-                at: if registered { 2 } else { 1 },
-            })
-        })
-        .await;
+        let mut f = Native::new().await;
         let (child, token, mut sockets) = child_sockets(&mut f, true).await;
         // Keep both sockets pending: an already-welcomed socket would retire the
         // credential on exit and race the registration fence with an exclusive lock.
@@ -596,15 +602,21 @@ async fn child_exit_races_both_sides_of_fenced_registration() {
         let shared = f.server.core.shared.clone();
         let fired = Arc::new(AtomicBool::new(false));
         let observed = fired.clone();
-        *action.lock().unwrap() = Some(Box::new(move || {
-            assert_eq!(
-                shared.clients.lock().unwrap().len(),
-                usize::from(registered)
-            );
-            exiting.lock().unwrap().exit_unreaped();
-            observed.store(true, Ordering::SeqCst);
-        }) as Box<dyn FnOnce() + Send>);
-        state.store(0, Ordering::SeqCst);
+        f.server.core.shared.store.on_peer_stage(
+            if registered {
+                PeerStage::Registered
+            } else {
+                PeerStage::Authenticated
+            },
+            move || {
+                assert_eq!(
+                    shared.clients.lock().unwrap().len(),
+                    usize::from(registered)
+                );
+                exiting.lock().unwrap().exit_unreaped();
+                observed.store(true, Ordering::SeqCst);
+            },
+        );
         let mut racing = sockets.remove(0);
         racing.send(json!({"t":"hello","protocol":WIRE_JSON_VERSION,"client":{"name":"fixture","version":"1"},"token":token.0})).await;
         assert_eq!(
@@ -618,36 +630,5 @@ async fn child_exit_races_both_sides_of_fenced_registration() {
         assert!(fired.load(Ordering::SeqCst));
         drop(child);
         f.finish().await;
-    }
-}
-struct RegistrationClock {
-    clock: TestClock,
-    calls: Arc<AtomicU64>,
-    action: super::Revocation,
-    at: u64,
-}
-impl Clock for RegistrationClock {
-    fn now(&self) -> Instant {
-        self.clock.now()
-    }
-    fn until(&self, end: Instant) -> futures_util::future::BoxFuture<'_, ()> {
-        let handshake = end == self.clock.now() + Duration::from_millis(HANDSHAKE_DEADLINE_MS);
-        let calls = self.calls.clone();
-        let action = self.action.clone();
-        let at = self.at;
-        // Count completed phases, including a read whose future predates the gate.
-        let gate = super::OnVerified(Some(Box::new(move || {
-            if handshake && calls.fetch_add(1, Ordering::SeqCst) == at {
-                let action = action.lock().unwrap().take();
-                if let Some(action) = action {
-                    action();
-                }
-            }
-        })));
-        let wait = self.clock.until(end);
-        Box::pin(async move {
-            let _gate = gate;
-            wait.await
-        })
     }
 }

@@ -54,10 +54,25 @@ impl std::fmt::Display for PeerAdmissionError {
     }
 }
 impl std::error::Error for PeerAdmissionError {}
+/// Explicit fixture boundaries around the fenced authentication and insertion.
+#[cfg(all(test, feature = "web"))]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PeerStage {
+    /// The lookup succeeded, before inspecting the accepted peer readiness.
+    Authenticated,
+    /// Peer checks passed, before invoking the registration callback.
+    Checked,
+    /// The registration callback returned, before releasing admission ownership.
+    Registered,
+}
+#[cfg(all(test, feature = "web"))]
+type PeerHook = (PeerStage, Box<dyn FnOnce() + Send>);
 /// One memory domain shared by socket minting and every transport admission.
 pub(crate) struct Store {
     files: Arc<TokenStore>,
     apps: app_sessions::Store,
+    #[cfg(all(test, feature = "web"))]
+    peer_hooks: Mutex<Vec<PeerHook>>,
 }
 impl Store {
     /// Bind both sources to the same filesystem admission and revocation fence.
@@ -72,6 +87,8 @@ impl Store {
         Self {
             apps: app_sessions::Store::new(files.clone(), clock),
             files,
+            #[cfg(all(test, feature = "web"))]
+            peer_hooks: Mutex::default(),
         }
     }
     /// Fixed-scope issuance, requiring the minting socket's LocalOperator proof.
@@ -111,6 +128,8 @@ impl Store {
     ) -> Result<T, PeerAdmissionError> {
         let _guard = self.files.lock_with(LockFile::try_lock_shared)?;
         let session = self.authenticate(token)?;
+        #[cfg(all(test, feature = "web"))]
+        self.peer_stage(PeerStage::Authenticated);
         let peer_exited = match peer {
             Some(peer) => peer.process().exited().map_err(TokenError::from)?,
             None => false,
@@ -124,7 +143,34 @@ impl Store {
         {
             return Err(PeerAdmissionError::PeerProcessChanged);
         }
-        Ok(register(session))
+        #[cfg(all(test, feature = "web"))]
+        self.peer_stage(PeerStage::Checked);
+        let result = register(session);
+        #[cfg(all(test, feature = "web"))]
+        self.peer_stage(PeerStage::Registered);
+        Ok(result)
+    }
+
+    /// Install a one-shot fixture gate at an explicit admission boundary.
+    #[cfg(all(test, feature = "web"))]
+    pub(crate) fn on_peer_stage(&self, stage: PeerStage, action: impl FnOnce() + Send + 'static) {
+        self.peer_hooks
+            .lock()
+            .unwrap()
+            .push((stage, Box::new(action)));
+    }
+    #[cfg(all(test, feature = "web"))]
+    fn peer_stage(&self, stage: PeerStage) {
+        let action = {
+            let mut hooks = self.peer_hooks.lock().unwrap();
+            hooks
+                .iter()
+                .position(|(at, _)| *at == stage)
+                .map(|index| hooks.remove(index).1)
+        };
+        if let Some(action) = action {
+            action();
+        }
     }
 
     /// Recheck the original source under its shared fence through bounded dispatch.

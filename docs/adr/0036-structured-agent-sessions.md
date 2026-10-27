@@ -4140,6 +4140,7 @@ changes.
 PR3b refusal delivery uses four independent writer/drain tasks per listener.
 They do not consume normal HTTP reservations or block acceptance. Each retains
 the same absolute five-second deadline; when that separate budget is exhausted,
-additional over-cap connections are closed without allocating another task.
+additional over-cap connections are closed without a 503 response or another task.
+This trades a typed overload response for bounded memory and continued acceptance.
 A refused hello closes 4401 before registration; an exit after registration
 closes 4403 and includes every socket already admitted under the fence.
