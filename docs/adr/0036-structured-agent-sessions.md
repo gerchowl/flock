@@ -4219,3 +4219,10 @@ cursor; only a producer end or generation retirement ends the subscription. A
 terminal queue refusal remains a typed failure on subsequent polls rather than
 becoming a successful end. Retirement clears old presentation state and leaves
 composer admission refused as `agent_not_found`; it does not grant a new target.
+
+Queue subscribers wake waiters after releasing the book on every result.
+Failed try-locks never self-notify. Ended sources need this wake because their
+publisher has stopped. Capture capacity has a separate notification, armed
+before capture, so a full channel cannot self-wake a retry loop.
+A terminal queue refusal also stops history and live retirement. Canonical
+generation refresh still precedes presentation and can retire the failed view.
