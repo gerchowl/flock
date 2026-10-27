@@ -97,6 +97,14 @@ impl Store {
         })
     }
 
+    /// Await the app credential's enforcing clock, independently of transport heartbeats.
+    #[cfg(feature = "web")]
+    pub(crate) async fn app_expired(&self, session: &Session) -> io::Result<()> {
+        match session.app() {
+            Some(app) => self.apps.expired(app).await,
+            None => std::future::pending().await,
+        }
+    }
     /// Authenticate and register under one admission/revocation fence. A local
     /// transport supplies its sealed origin proof; TCP supplies None. App credentials
     /// require the minting PID and birth, while file credentials retain their grants.
