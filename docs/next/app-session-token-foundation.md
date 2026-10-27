@@ -41,6 +41,10 @@ live. Issuance first reclaims expired/exited entries; capacity
 or admission contention refuses with `session_busy`. No failed mint discloses
 a credential. Storage/entropy failures return `internal_error`.
 
+Hello lookup returns a snapshot without taking the management lock. Registration
+waits for shared ownership and pending revocation within the original five-second
+hello deadline; an expired waiter cannot register later.
+
 Admission rechecks its original source under the shared filesystem lock, held
 through bounded dispatch. Revocation and shutdown publish the existing intent
 before waiting for exclusive ownership, preserving file-token admission rules

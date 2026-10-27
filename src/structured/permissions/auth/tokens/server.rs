@@ -60,6 +60,8 @@ impl std::error::Error for PeerAdmissionError {}
 pub(crate) enum PeerStage {
     /// The lookup succeeded, before inspecting the accepted peer readiness.
     Authenticated,
+    /// A kernel lock helper is waiting for management or a revocation intent.
+    Waiting,
     /// Peer checks passed, before invoking the registration callback.
     Checked,
     /// The registration callback returned, before releasing admission ownership.
@@ -118,15 +120,20 @@ impl Store {
     /// transport supplies its sealed origin proof; TCP supplies None. App credentials
     /// require the minting PID and birth, while file credentials retain their grants.
     /// The callback must stay bounded and must not acquire an exclusive store lock.
+    /// `budget` is the remaining original hello deadline, including all lock waits.
     // Native registration is optional; non-web binaries still compile the store tests.
     #[cfg_attr(not(feature = "web"), allow(dead_code))]
     pub(crate) fn admit_peer<T>(
         &self,
         token: &Bearer,
         peer: Option<&crate::app::LocalPeer>,
+        budget: Duration,
         register: impl FnOnce(Session) -> T,
     ) -> Result<T, PeerAdmissionError> {
-        let _guard = self.files.lock_with(LockFile::try_lock_shared)?;
+        let _guard = self.files.hello_lock(budget, || {
+            #[cfg(all(test, feature = "web"))]
+            self.peer_stage(PeerStage::Waiting);
+        })?;
         let session = self.authenticate(token)?;
         #[cfg(all(test, feature = "web"))]
         self.peer_stage(PeerStage::Authenticated);

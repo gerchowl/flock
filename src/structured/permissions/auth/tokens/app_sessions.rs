@@ -191,9 +191,9 @@ impl Store {
             .map_err(|_| TokenError::Unsafe)?
             .contains_key(&digest))
     }
-    /// Lookup only in this private memory domain; file-token authentication is unchanged.
+    /// Lookup returns a snapshot; registration and dispatch separately fence its use.
+    /// Like file-token lookup, it does not wait for token-management ownership.
     pub(crate) fn authenticate(&self, token: &Bearer) -> Result<Session, TokenError> {
-        let _guard = self.files.lock_with(LockFile::try_lock_shared)?;
         if !valid_hex(&token.0, 64) {
             return Err(TokenError::Unauthorized);
         }

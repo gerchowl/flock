@@ -1933,7 +1933,16 @@ the recheck and bounded callback, with exclusive locks for token mutation.
 Revocation intent fences new admissions before waiting for existing callbacks;
 readers check it again after shared acquisition. Revoke cannot return while an
 admitted callback remains in flight. This preserves S6 decision fencing and is
-the same shared/exclusive split recorded in ADR-0038 §6. A subscription's typed
+the same shared/exclusive split recorded in ADR-0038 §6. Hello lookup returns a snapshot and does not acquire the management lock.
+Registration still holds shared file ownership through insertion, but waits for
+management and any published revocation intent within the remaining original
+five-second handshake deadline. Its descriptor-only shared-lock helper is owned
+and reaped by the bounded store job; abandoned async waiters retain their store
+reservation until that job ends. The deadline also bounds welcome, and cancelled
+or expired waiters cannot insert a late registration. Command and subscription
+dispatch retain fail-fast admission with the existing retry class.
+
+A subscription's typed
 `session_busy` is retryable `later`, not a transport failure; unsafe storage and
 I/O failures retain their connection-close behavior.
 

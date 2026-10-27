@@ -5200,6 +5200,24 @@ pub(crate) fn selection_content_unavailable(pane_closed: bool) {
     );
 }
 
+/// Close metadata only: no bearer, frame payload or client-provided reason.
+#[cfg(feature = "web")]
+pub(crate) fn client_wire_closing(code: u16, source: &'static str, line: u32) {
+    let source = source.rsplit('/').next().unwrap_or("wire");
+    tracing::debug!(
+        event = "client.wire.closing",
+        close_code = code,
+        source,
+        line,
+        "structured transport closing"
+    );
+}
+/// Internal cause and I/O class, without paths or raw parser errors.
+#[cfg(feature = "web")]
+pub(crate) fn client_wire_unavailable(cause: &'static str, kind: Option<io::ErrorKind>) {
+    tracing::debug!(event = "client.wire.unavailable", cause, kind = ?kind, "structured transport unavailable");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

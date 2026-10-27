@@ -321,7 +321,10 @@ pub(super) async fn replay(
         (e.kind() == io::ErrorKind::InvalidInput).then_some(SubfailCode::CursorAhead)
     })?;
     loop {
-        let frame = cut.next(id).await.map_err(|_| None)?;
+        let frame = cut.next(id).await.map_err(|error| {
+            crate::logging::client_wire_unavailable("fleet_replay", Some(error.kind()));
+            None
+        })?;
         let ended = matches!(frame, ServerFrame::Lagged { .. });
         if !deliver(data, live, frame).await || ended {
             return Ok(());

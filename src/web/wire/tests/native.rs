@@ -632,3 +632,90 @@ async fn child_exit_races_both_sides_of_fenced_registration() {
         f.finish().await;
     }
 }
+
+fn browser_file(f: &Native) -> Bearer {
+    let token = Bearer("a".repeat(64));
+    let path = f.server._root.path().join("client-tokens/browser.token");
+    fs::write(
+        &path,
+        json!({"token":token.0,"principal":"b".repeat(32),"scopes":["read"]}).to_string(),
+    )
+    .unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+    token
+}
+fn management_lock(f: &Native) -> std::fs::File {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(f.server._root.path().join("client-tokens/.lock"))
+        .unwrap();
+    file.lock().unwrap();
+    file
+}
+#[tokio::test]
+async fn native_browser_hello_waits_for_management_without_a_transport_failure() {
+    use crate::structured::permissions::auth::tokens::server::PeerStage;
+    let mut f = Native::new().await;
+    let token = browser_file(&f);
+    let lock = management_lock(&f);
+    let waited = Arc::new(AtomicBool::new(false));
+    let observed = waited.clone();
+    f.server
+        .core
+        .shared
+        .store
+        .on_peer_stage(PeerStage::Waiting, move || {
+            observed.store(true, Ordering::SeqCst);
+            drop(lock);
+        });
+    let mut socket = f.open().await;
+    assert_eq!(
+        socket.hello(WIRE_JSON_VERSION, &token.0).await["t"],
+        "welcome"
+    );
+    assert!(waited.load(Ordering::SeqCst));
+    f.finish().await;
+}
+#[tokio::test]
+async fn management_wait_keeps_the_original_hello_deadline_and_cannot_register_late() {
+    use crate::structured::permissions::auth::tokens::server::PeerStage;
+    let mut f = Native::new().await;
+    let token = browser_file(&f);
+    let lock = management_lock(&f);
+    let clock = f.server.clock.clone();
+    let waited = Arc::new(AtomicBool::new(false));
+    let observed = waited.clone();
+    f.server
+        .core
+        .shared
+        .store
+        .on_peer_stage(PeerStage::Waiting, move || {
+            observed.store(true, Ordering::SeqCst);
+            clock.advance(HANDSHAKE_DEADLINE_MS);
+        });
+    let (completed, producer) = tokio::sync::oneshot::channel();
+    f.server
+        .core
+        .shared
+        .store
+        .on_peer_stage(PeerStage::Registered, move || {
+            completed.send(()).unwrap();
+        });
+    let mut socket = f.open().await;
+    socket.send(json!({"t":"hello","protocol":WIRE_JSON_VERSION,"client":{"name":"fixture","version":"1"},"token":token.0})).await;
+    assert!(matches!(
+        socket.receive().await,
+        Received::Close(GOING_AWAY_CLOSE)
+    ));
+    assert!(waited.load(Ordering::SeqCst));
+    assert!(f.server.core.shared.clients.lock().unwrap().is_empty());
+    drop(lock);
+    within(producer).await.unwrap();
+    assert!(f.server.core.shared.clients.lock().unwrap().is_empty());
+    f.finish().await;
+}

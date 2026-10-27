@@ -891,19 +891,12 @@ fn held_management_lock_does_not_block_valid_or_junk_hello_verification() {
             .open(server._root.path().join("client-tokens/.lock"))
             .unwrap();
         lock.lock().unwrap();
-        let mut valid = Socket::open(&server).await;
-        // Lookup stays lock-free; registering must respect the admission/revocation fence.
         assert!(server
             .core
             .shared
             .store
             .authenticate(&Bearer("a".repeat(64)))
             .is_ok());
-        valid.send(json!({"t":"hello","protocol":1,"client":{"name":"fixture","version":"1"},"token":"a".repeat(64)})).await;
-        assert!(matches!(
-            valid.receive().await,
-            Received::Close(GOING_AWAY_CLOSE)
-        ));
         let mut junk = Socket::open(&server).await;
         junk.send(
             json!({"t":"hello","protocol":1,"client":{"name":"f","version":"1"},"token":"invalid"}),
@@ -913,9 +906,18 @@ fn held_management_lock_does_not_block_valid_or_junk_hello_verification() {
             junk.receive().await,
             Received::Close(AUTH_REFUSED_CLOSE)
         ));
-        drop(lock);
-        let mut available = Socket::open(&server).await;
-        assert_eq!(available.hello(1, &"a".repeat(64)).await["t"], "welcome");
+        let waited = Arc::new(AtomicBool::new(false));
+        let observed = waited.clone();
+        server.core.shared.store.on_peer_stage(
+            crate::structured::permissions::auth::tokens::server::PeerStage::Waiting,
+            move || {
+                observed.store(true, Ordering::SeqCst);
+                drop(lock);
+            },
+        );
+        let mut valid = Socket::open(&server).await;
+        assert_eq!(valid.hello(1, &"a".repeat(64)).await["t"], "welcome");
+        assert!(waited.load(Ordering::SeqCst));
         server.finish().await;
     });
 }

@@ -306,11 +306,18 @@ async fn before<T>(
 ) -> Option<T> {
     tokio::select! { biased; _ = clock.until(deadline) => None, out = work => Some(out) }
 }
+#[track_caller]
 fn close(code: u16) -> Message {
+    let source = std::panic::Location::caller();
+    crate::logging::client_wire_closing(code, source.file(), source.line());
     Message::Close(Some(CloseFrame {
         code,
         reason: "client transport ended".into(),
     }))
+}
+fn unavailable(cause: &'static str) -> u16 {
+    crate::logging::client_wire_unavailable(cause, None);
+    GOING_AWAY_CLOSE
 }
 async fn authenticate(
     socket: &mut WebSocket,
@@ -448,38 +455,41 @@ async fn connection(
         let shared = shared.clone();
         let token = token.clone();
         super::store_io::shared().run(move || {
-            shared.store.admit_peer(&token, peer.as_ref(), |session| {
-                let mut clients = shared
-                    .clients
-                    .lock()
-                    .map_err(|_| PeerAdmissionError::from(TokenError::Busy))?;
-                if let Some(peer) = &peer {
-                    if peer.process().exited().map_err(TokenError::from)? {
-                        return Err(PeerAdmissionError::PeerProcessChanged);
+            let budget = end.saturating_duration_since(shared.clock.now());
+            shared
+                .store
+                .admit_peer(&token, peer.as_ref(), budget, |session| {
+                    let mut clients = shared
+                        .clients
+                        .lock()
+                        .map_err(|_| PeerAdmissionError::from(TokenError::Busy))?;
+                    if let Some(peer) = &peer {
+                        if peer.process().exited().map_err(TokenError::from)? {
+                            return Err(PeerAdmissionError::PeerProcessChanged);
+                        }
                     }
-                }
-                if !live.load(Ordering::Acquire)
-                    || *shared.stop.borrow()
-                    || shared.clock.now() >= end
-                    || clients
-                        .values()
-                        .filter(|c| c.session.same_credential(&session))
-                        .count()
-                        >= CREDENTIAL_CONNECTIONS
-                {
-                    return Err(TokenError::Busy.into());
-                }
-                clients.insert(
-                    id,
-                    Client {
-                        session: session.clone(),
-                        read_only,
-                        data,
-                        revoke,
-                    },
-                );
-                Ok(session)
-            })
+                    if !live.load(Ordering::Acquire)
+                        || *shared.stop.borrow()
+                        || shared.clock.now() >= end
+                        || clients
+                            .values()
+                            .filter(|c| c.session.same_credential(&session))
+                            .count()
+                            >= CREDENTIAL_CONNECTIONS
+                    {
+                        return Err(TokenError::Busy.into());
+                    }
+                    clients.insert(
+                        id,
+                        Client {
+                            session: session.clone(),
+                            read_only,
+                            data,
+                            revoke,
+                        },
+                    );
+                    Ok(session)
+                })
         })
     };
     let session = match before(shared.clock.as_ref(), end, registration)
@@ -596,19 +606,19 @@ async fn connection(
             _ = revoked.changed() => break AUTH_REVOKED_CLOSE,
             _ = &mut writer => return,
             result = running.join_next(), if !running.is_empty() => {
-                if !matches!(result, Some(Ok(Ok(())))) { break GOING_AWAY_CLOSE; }
+                if !matches!(result, Some(Ok(Ok(())))) { break unavailable("command_worker"); }
             },
-            _ = shared.clock.until(heartbeat.expires()) => break GOING_AWAY_CLOSE,
+            _ = shared.clock.until(heartbeat.expires()) => break unavailable("heartbeat_expired"),
             _ = shared.clock.until(heartbeat.next_ping) => {
-                let Some(nonce) = heartbeat.ping(shared.clock.now(), &format!("{}/{id}", shared.epoch)) else { break GOING_AWAY_CLOSE };
-                let Some(frame) = output::encode(ServerFrame::Ping { nonce }) else { break GOING_AWAY_CLOSE };
-                if priority.try_send(frame).is_err() { break GOING_AWAY_CLOSE; }
+                let Some(nonce) = heartbeat.ping(shared.clock.now(), &format!("{}/{id}", shared.epoch)) else { break unavailable("heartbeat_budget") };
+                let Some(frame) = output::encode(ServerFrame::Ping { nonce }) else { break unavailable("ping_encoding") };
+                if priority.try_send(frame).is_err() { break unavailable("control_capacity"); }
             }
             frame = stream.next() => match frame {
                 Some(Ok(Message::Text(text))) => match serde_json::from_str(&text) {
                     Ok(ClientFrame::Pong { nonce }) => heartbeat.pong(&nonce, shared.clock.now()),
                     Ok(ClientFrame::Sub { sub_id, stream, after }) => {
-                        if !subscriptions.subscribe(sub_id, stream, after) { break GOING_AWAY_CLOSE }
+                        if !subscriptions.subscribe(sub_id, stream, after) { break unavailable("subscription_capacity") }
                     }
                     Ok(ClientFrame::Unsub { sub_id }) => subscriptions.unsubscribe(&sub_id),
                     Ok(ClientFrame::Cmd { cmd_id, verb, args, resume_only }) => {
@@ -620,12 +630,12 @@ async fn connection(
                             Some(crate::api::error_code::ErrorCode::SessionBusy)
                         } else { None };
                         if let Some(code) = refusal {
-                            let Some(ack) = output::encode(commands::ack(cmd_id, Err(code))) else { break GOING_AWAY_CLOSE };
+                            let Some(ack) = output::encode(commands::ack(cmd_id, Err(code))) else { break unavailable("ack_encoding") };
                             tokio::select! { biased;
                                 _ = stop.changed() => return,
                                 _ = revoked.changed() => break AUTH_REVOKED_CLOSE,
                                 _ = &mut writer => return,
-                                _ = shared.clock.until(heartbeat.expires()) => break GOING_AWAY_CLOSE,
+                                _ = shared.clock.until(heartbeat.expires()) => break unavailable("heartbeat_expired"),
                                 sent = priority.send(ack) => if sent.is_err() { return },
                             }
                             continue;
@@ -636,7 +646,9 @@ async fn connection(
                 },
                 Some(Ok(Message::Binary(_))) => break POLICY_VIOLATION_CLOSE,
                 Some(Ok(Message::Ping(_) | Message::Pong(_))) => (),
-                _ => break GOING_AWAY_CLOSE,
+                Some(Ok(Message::Close(_))) => break unavailable("peer_close"),
+                Some(Err(_)) => break unavailable("peer_transport"),
+                None => break unavailable("peer_eof"),
             }
         }
     };

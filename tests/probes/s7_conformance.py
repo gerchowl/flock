@@ -63,18 +63,31 @@ def main():
         result = subprocess.run(["bun", str(repo / "web/client/tests/wire/dogfood-server.ts"), endpoint, token, reader, agent, binary, args.disable or "none"],
                                 cwd=root, env=env, capture_output=True, text=True, timeout=30)
         if result.returncode != 0:
-            artifacts = repo / ".local" / "1833-r2-server-evidence"
-            artifacts.mkdir(parents=True, exist_ok=True)
-            for index, path in enumerate(root.rglob("*.log")):
-                (artifacts / f"{index}-{path.name}").write_bytes(path.read_bytes())
-        if result.returncode != 0:
             sys.stderr.write(result.stderr)
             raise AssertionError("real-client wire proof failed")
         proof = json.loads(result.stdout)
         assert proof["status"] == "passed", proof
         print(json.dumps(proof), flush=True)
 
-    proof = public.run(binary, "capacity", wire=wire)
+    def diagnostics(root):
+        # The owned server has exited, so its logging worker has flushed.
+        artifacts = repo / ".local" / "1833-r2-server-evidence"
+        artifacts.mkdir(parents=True, exist_ok=True)
+        diagnostics = []
+        for index, path in enumerate(root.rglob("*.log")):
+            (artifacts / f"{index}-{path.name}").write_bytes(path.read_bytes())
+            for line in path.read_text(errors="replace").splitlines():
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(event, dict) and event.get("event") in ("client.wire.closing", "client.wire.unavailable"):
+                    diagnostics.append({key: event[key] for key in
+                        ("event", "close_code", "cause", "kind", "source", "line") if key in event})
+        # Preserve evidence in JUnit without credentials or raw frames.
+        sys.stderr.write("wire diagnostics: " + json.dumps(diagnostics[-32:]) + "\n")
+
+    proof = public.run(binary, "capacity", wire=wire, on_failure=diagnostics)
     assert proof["status"] == "passed", proof
 
 

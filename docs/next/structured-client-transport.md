@@ -24,6 +24,11 @@ The core opens the store once off the async executor, then verifies current
 private token storage using S2a's bounded blocking-I/O budget. Unproven hellos
 never take the exclusive management/cleanup lock. An absolute five-second
 deadline covers receipt, verification and the successful `welcome` write.
+Hello lookup stays independent of token-management ownership. Registration
+waits for concurrent management and revocation intents within that same deadline,
+rather than dropping an otherwise valid browser hello immediately. The shared
+registration lock still fences insertion against revocation; cancelled waiters
+cannot register later.
 Missing, malformed, removed or incorrect credentials and explicit
 authentication-scope refusals fail closed with 4401. If the first `hello` never
 arrives before the five-second deadline, the server closes 1001 and the client
