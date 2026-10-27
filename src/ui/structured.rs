@@ -1,0 +1,5 @@
+//! S10c pure components (ADR-0036 §11); composed and wired by S10c2/S10d (#1430).
+// Components are reviewed independently before their pane and input consumers land.
+#![allow(dead_code)]
+mod markdown;
+pub(crate) mod transcript;
