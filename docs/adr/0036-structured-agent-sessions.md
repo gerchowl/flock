@@ -4157,3 +4157,21 @@ cursor. Ordinals are deterministic for a given record and projection parser
 version; sibling cards never share a fold key. `ObservedToolUse` retains the
 original id, name, typed input and raw source event, independently of the stdio
 permission `ToolRequest`. Neither observed cards nor their ids grant authority.
+
+The native projection retains at most `history::LIVE_RECORDS` (16) source
+cursors and 16 permission observations. Earlier records remain available through
+the history cursor; window eviction never rewinds the applied cursor or claims a
+storage gap. Live partials are keyed by message identity and block index (source
+cursor when no message id exists), with at most 16 active blocks and at most
+`transport::MAX_LINE_BYTES` (2 MiB) of text per block. Capacity or text overflow
+clears transient cards and marks replay lagged at the observed durable floor;
+further deltas at that floor are suppressed until durable progress. No synthetic
+cursor is allocated. Known live deltas retain only current partial state, rather
+than an additional raw card for every delta. Malformed or unsupported content
+remains inspectable as raw JSON with its original classifier provenance.
+Durable ordinals are raw event at zero, then content-block position plus one.
+Live cards use a disjoint provisional ordinal range, assigned in observation
+order within a source cursor; matching durable messages replace them. A final
+message clears its own partials, and older cursor-only partials, while preserving
+partials explicitly identified as a different message. Fold state is per-card:
+only thinking and unprojected JSON start folded, not known sibling cards.

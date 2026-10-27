@@ -3,6 +3,7 @@ use crate::structured::{
     registry::Registry,
     workers::{tests::Case, Workers},
 };
+use serde_json::json;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
@@ -66,7 +67,7 @@ fn provenance_usage_tool_correlation_and_owned_facts() {
     assert_eq!(m.snapshot.transcript.len(), 1, "unknown never reclassified");
     m.history(history::Item::Record(record(2, r#"{"type":"assistant","usage":{"input_tokens":7},"message":{"content":[{"type":"tool_use","id":"t","name":"Bash","input":{}}]}}"#, true))).unwrap();
     m.history(history::Item::Record(record(3, r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t","content":"ok"}]}}"#, true))).unwrap();
-    assert!(contents(&m).any(|c| matches!(c, Content::ToolRequest(t) if t.tool_use_id == "t")));
+    assert!(contents(&m).any(|c| matches!(c, Content::ToolUse(t) if t.id == "t")));
     assert!(contents(&m)
         .any(|c| matches!(c, Content::ToolResult { tool_use_id, .. } if tool_use_id == "t")));
     let usage = m.snapshot.usage.as_ref().unwrap();
@@ -100,7 +101,11 @@ fn provenance_usage_tool_correlation_and_owned_facts() {
 }
 #[tokio::test]
 async fn real_fake_partials_reconcile_and_burst_resync() {
-    for mode in ["s10b-live-exit", "s10b-live-burst-exit"] {
+    for mode in [
+        "s10b-live-exit",
+        "s10b-live-burst-exit",
+        "s10b-live-interleaved-exit",
+    ] {
         let notify = Arc::new(Notify::new());
         let (mut registry, mut workers) = (Registry::default(), Workers::new(notify.clone()));
         let (mut case, mut launch, factory) = Case::prepare(&mut registry, 920, "unused", vec![]);
@@ -147,6 +152,9 @@ async fn real_fake_partials_reconcile_and_burst_resync() {
                 m.snapshot.transcript.is_empty(),
                 "seq-1 burst tail predates Gap through 3"
             );
+        } else if mode.contains("interleaved") {
+            assert!(contents(&m).any(|c| matches!(c, Content::Markdown(s) if s == "partial")));
+            assert!(contents(&m).any(|c| matches!(c, Content::Markdown(s) if s == "later")));
         } else {
             assert!(contents(&m).any(|c| matches!(c, Content::Markdown(s) if s == "partial")));
             assert!(contents(&m).any(|c| matches!(c, Content::Thinking(s) if s == "thinking")));
@@ -178,7 +186,17 @@ async fn real_fake_partials_reconcile_and_burst_resync() {
                 .count(),
             1
         );
-        assert!(m.snapshot.transcript.iter().all(|c| !c.streaming));
+        if mode.contains("interleaved") {
+            assert!(
+                m.snapshot
+                    .transcript
+                    .iter()
+                    .any(|c| c.streaming
+                        && matches!(&c.content, Content::Markdown(s) if s == "later"))
+            );
+        } else {
+            assert!(m.snapshot.transcript.iter().all(|c| !c.streaming));
+        }
         assert!(contents(&m).any(|c| matches!(c, Content::ToolResult { tool_use_id, .. } if tool_use_id == "fixture-tool")));
         assert!(m.snapshot.reported_model.is_some());
         assert_eq!(m.snapshot.reported_permissions.as_deref(), Some("default"));
@@ -204,5 +222,152 @@ fn thinking_fold_does_not_hide_sibling_text() {
     assert!(
         !m.snapshot.collapsed.contains(&text.id),
         "folding thinking must leave sibling text visible"
+    );
+}
+fn message_delta(seq: u64, id: &str, text: &str) -> live::Item {
+    let r = record(seq, &json!({"type":"stream_event","api_message_id":id,"event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":text}}}).to_string(), true);
+    live::Item::Delta {
+        event: Arc::new(crate::structured::claude::SessionEvent::parse(
+            &r.raw, "2.1.296",
+        )),
+        record: r,
+    }
+}
+#[test]
+fn interleaved_messages_do_not_share_block_zero() {
+    let mut m = model();
+    m.live(message_delta(1, "first", "partial"));
+    m.snapshot.scroll_anchor = Some(1);
+    m.live(message_delta(1, "first", "!"));
+    assert!(m.snapshot.new_output);
+    m.live(message_delta(2, "second", "later"));
+    assert_eq!(
+        contents(&m)
+            .filter(|c| matches!(c,Content::Markdown(s) if s=="partial!"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        contents(&m)
+            .filter(|c| matches!(c,Content::Markdown(s) if s=="later"))
+            .count(),
+        1
+    );
+}
+#[test]
+fn history_reconciles_only_its_message_and_preserves_later_partial() {
+    let mut m = model();
+    m.live(message_delta(0, "first", "partial"));
+    m.live(message_delta(1, "second", "later"));
+    m.history(history::Item::Record(record(1,r#"{"type":"assistant","message":{"id":"first","content":[{"type":"text","text":"partial"}]}}"#,true))).unwrap();
+    assert!(m
+        .snapshot
+        .transcript
+        .iter()
+        .any(|c| c.streaming && matches!(&c.content,Content::Markdown(s) if s=="later")));
+    assert_eq!(
+        contents(&m)
+            .filter(|c| matches!(c,Content::Markdown(s) if s=="partial"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        m.snapshot
+            .transcript
+            .iter()
+            .map(|c| c.id)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        m.snapshot.transcript.len()
+    );
+}
+#[test]
+fn long_stream_retains_only_a_bounded_history_window_and_current_partial() {
+    let mut m = model();
+    for seq in 1..=64 {
+        m.history(history::Item::Record(record(
+            seq,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"partial"}]}}"#,
+            true,
+        )))
+        .unwrap();
+    }
+    assert_eq!(m.snapshot.applied_cursor, 64);
+    assert_eq!(
+        m.snapshot
+            .transcript
+            .iter()
+            .filter(|c| matches!(c.content, Content::Markdown(_)))
+            .count(),
+        history::LIVE_RECORDS
+    );
+    assert!(m.snapshot.transcript.iter().all(|c| c.seq >= 49));
+    for _ in 0..1000 {
+        m.live(message_delta(64, "current", "x"));
+    }
+    assert_eq!(
+        m.snapshot.transcript.iter().filter(|c| c.streaming).count(),
+        1,
+        "one current partial, no raw card per delta"
+    );
+    assert!(contents(&m).any(|c| matches!(c,Content::Markdown(s) if s.len()==1000)));
+}
+#[test]
+fn live_capacity_and_text_overflow_require_replay_without_inventing_a_cursor() {
+    for text_overflow in [false, true] {
+        let mut m = model();
+        if text_overflow {
+            m.live(message_delta(
+                0,
+                "one",
+                &"x".repeat(crate::structured::transport::MAX_LINE_BYTES),
+            ));
+            m.live(message_delta(0, "one", "x"));
+        } else {
+            for n in 0..=history::LIVE_RECORDS {
+                m.live(message_delta(0, &format!("message-{n}"), "partial"));
+            }
+        }
+        assert!(m.snapshot.transcript.is_empty());
+        assert!(matches!(m.snapshot.replay, Replay::Lagged { through: 0 }));
+        assert_eq!(m.snapshot.applied_cursor, 0);
+        m.live(message_delta(0, "ignored", "tail"));
+        assert!(m.snapshot.transcript.is_empty());
+        m.history(history::Item::Record(record(1, "{}", true)))
+            .unwrap();
+        m.live(message_delta(1, "new", "accepted"));
+        assert!(contents(&m).any(|c| matches!(c,Content::Markdown(s) if s=="accepted")));
+    }
+}
+#[test]
+fn malformed_blocks_and_observed_tools_keep_exact_source_without_permission_authority() {
+    let mut m = model();
+    let raw = r#"{ "type":"assistant", "message":{"content":[{"type":"tool_use","id":"t","name":"Bash","input":{"x":1.00},"future":true},{"type":"text","text":12}]} }"#;
+    m.history(history::Item::Record(record(1, raw, true)))
+        .unwrap();
+    assert!(contents(&m).any(|c| matches!(c,Content::ToolUse(t) if t.id=="t" && t.raw.as_ref()==raw && t.name=="Bash" && t.input.contains_key("x"))));
+    assert!(!contents(&m).any(|c| matches!(c, Content::ToolRequest(_))));
+    assert!(
+        m.snapshot
+            .collapsed
+            .contains(&CardId { seq: 1, ordinal: 0 }),
+        "malformed block is inspectable as raw JSON"
+    );
+    assert!(
+        matches!(&m.snapshot.transcript[0].content,Content::RawJson {raw:r,known:Some(true),..} if r==raw)
+    );
+    let ids: Vec<_> = m.snapshot.transcript.iter().map(|c| c.id).collect();
+    let mut replay = model();
+    replay
+        .history(history::Item::Record(record(1, raw, true)))
+        .unwrap();
+    assert_eq!(
+        ids,
+        replay
+            .snapshot
+            .transcript
+            .iter()
+            .map(|c| c.id)
+            .collect::<Vec<_>>()
     );
 }
