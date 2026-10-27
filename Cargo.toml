@@ -84,6 +84,8 @@ toml_edit = "0.25.15"
 
 # Wipe node-key seeds and serialized private-key buffers after use.
 zeroize = { version = "1.9", features = ["serde"] }
+# Pin the reviewed streaming and entity-decoding behavior used by the display boundary.
+pulldown-cmark = { version = "=0.13.5", default-features = false }
 
 [dev-dependencies]
 # Await fixture FIFO reports and bound scripted CLI subprocess lifetimes.

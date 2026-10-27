@@ -27,6 +27,7 @@ pub(crate) mod sheep;
 mod sidebar;
 pub(crate) mod state_signal;
 pub(crate) mod status;
+pub(crate) mod structured;
 mod tabs;
 mod widgets;
 pub(crate) mod window_title;
