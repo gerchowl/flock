@@ -35,7 +35,7 @@
  *   message is {@link ShellTokens.notice}, and the reactive path takes over
  *   when the server ends the token. Without `expiresInMs` there is no timer.
  * - One call at a time: a request while one is in flight, or waiting, is
- *   the same request. A request skipped for the call in flight (a re-mint
+ *   the same request. A request skipped for the wait or call in flight (a re-mint
  *   after an end, or a bridged reconnect's session) is owed: when the call
  *   settles and the state still needs it, a value counts as that call, and a
  *   failure issues it at once, on its own streak delay.
@@ -180,7 +180,7 @@ function driveShell<T>(connection: WireConnection, source: Source<T>, clock: Clo
   let due: number | null = null;
   /** The current bearer's renewal was asked for: it is not asked again, even when a reconnect reports its lifetime. */
   let spent = false;
-  /** A request skipped for the call in flight, with its delay. */
+  /** A request skipped for a backoff wait or call in flight, with its delay. */
   let owed: { readonly kind: "mint" | "reconnect"; readonly delay: number } | null = null;
   let error: string | null = null;
   let notice: string | null = null;
@@ -284,8 +284,9 @@ function driveShell<T>(connection: WireConnection, source: Source<T>, clock: Clo
   /** Whether the state still needs a skipped request: a reconnect waiting for its session, or a re-mint in NeedsToken. */
   const stillNeeded = (kind: "mint" | "reconnect"): boolean => (kind === "reconnect" ? connection.awaitingSession : connection.state === "NeedsToken" && error === null);
   const request = (delay: number, kind: "mint" | "reconnect"): void => {
-    if (disposed || waiting !== null) return;
-    if (inFlight) {
+    if (disposed) return;
+    // A renewal can run before a waiting mint; it must inherit this request too.
+    if (inFlight || waiting !== null) {
       owed = { kind, delay };
       return;
     }

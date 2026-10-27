@@ -18,7 +18,7 @@ import { App, SHELL_OWNS_TOKENS } from "../src/App";
 import { BRIDGE_ALONE, readShellConfig, type BridgeSocket, type OpenBridge, type ShellToken, type TokenProvider } from "../src/config";
 import type { ServerFrame } from "../src/gen/ServerFrame";
 import { OUTBOX_KEY } from "../src/wire/outbox";
-import { WireConnection } from "../src/wire/connection";
+import { DEADLINES, WireConnection } from "../src/wire/connection";
 import { MAX_REMINTS, MAX_TIMER_DELAY, REMINTS_SPENT, RENEW_AT, driveBridge, driveTokenProvider } from "../src/wire/provider";
 import { RUN_CLIENT_OPEN, type SessionLike } from "../src/wire/token";
 import { FIXTURE_TOKEN, Harness, WELCOME, live, sentFrames, step, type FakeNetwork, type FakeSocket } from "./wire/harness";
@@ -818,6 +818,34 @@ describe("the bridge transport", () => {
     });
   }
 
+  test("a bridge-made 1013 preauth_capacity close is Socket lost: later under capped backoff, outside the re-mint streak", async () => {
+    const shell = provider("bridge", "t1", "t2");
+    const { h, root } = mount(shell);
+    await tick();
+    // ADR-0038 §6: the native bridge makes this close before a welcome.
+    // §3's Socket lost retries later, never as an auth end, even past the mint cap.
+    for (let attempt = 0; attempt <= MAX_REMINTS + 1; attempt++) {
+      h.step(step({ step: "close", code: 1013, reason: "preauth_capacity" }));
+      expect(status(root)).toBe("Reconnecting · Connection lost: the socket closed (1013: preauth_capacity).");
+      const opened = shell.renews.length;
+      const later = Math.min(30_000, 500 * 2 ** attempt) / 2;
+      h.clock.advanceTo(h.clock.now() + later - 1);
+      await tick();
+      expect(shell.renews.length).toBe(opened);
+      h.clock.advanceTo(h.clock.now() + 1);
+      await tick();
+      expect([shell.calls, shell.renews.length]).toEqual([1, opened + 1]);
+      expect(shell.renews.every((renew) => !renew)).toBe(true);
+    }
+    // The first actual auth refusal must still get its first, immediate re-mint.
+    h.step(step({ step: "token_refused", code: 4401 }));
+    await tick();
+    expect(shell.calls).toBe(2);
+    expect(shell.openedAt.at(-1)).toBe(h.clock.now());
+    welcome(h, 0);
+    expect(status(root)).toBe("Live");
+  });
+
   test("a 1006 is an ordinary reconnect: Reconnecting on §3's backoff, then one openBridge that mints nothing, and the streak is untouched", async () => {
     const shell = provider("bridge", "t1");
     const { h, root } = mount(shell);
@@ -1120,6 +1148,45 @@ describe("a bridged connection", () => {
     shell.net = h.net;
     return { h, shell, open: (token: string) => shell.open(token) };
   }
+
+  test("a reconnect requested during re-mint backoff is owed when a renewal overlaps it, without a connect deadline", async () => {
+    const h = new Harness();
+    h.conn = new WireConnection({ bridged: true, client: { name: "fixture", version: "1" }, clock: h.clock, random: () => 0, store: h.store });
+    const shell = provider("bridge", "t1", "t2", { token: "t3", expiresInMs: 533 }, "deferred");
+    shell.net = h.net;
+    const config = shell.config as { readonly openBridge: OpenBridge };
+    const driver = driveBridge(h.connection, config.openBridge, h.clock, () => 0, () => undefined);
+    dispose = () => { driver.dispose(); h.connection.disconnect(); };
+    h.connection.connect();
+    await tick();
+    send(h, WELCOME);
+    h.step(step({ step: "token_refused", code: 4403 }));
+    await tick();
+    send(h, WELCOME);
+    h.step(step({ step: "token_refused", code: 4403 }));
+    h.clock.advanceTo(250);
+    await tick();
+    send(h, WELCOME);
+    h.step(step({ step: "token_refused", code: 4403 }));
+    // Deliberate session-handoff injection: an already-open session arrives while
+    // the 500 ms re-mint waits, then drops. This overlaps all three driver timers.
+    h.connection.setSocket(shell.open("t3"));
+    h.step(step({ step: "drop" }));
+    h.clock.advanceTo(500);
+    await tick();
+    expect(h.connection.awaitingSession).toBe(true);
+    // t3's renewal is due at 250 + floor(533 * 3/4), before the re-mint at 750.
+    h.clock.advanceTo(649);
+    await tick();
+    expect(shell.renews).toEqual([false, false, false, true]);
+    h.clock.advanceTo(750);
+    shell.reject(PANE);
+    await tick();
+    const servedAt = shell.openedAt.at(-1);
+    if (h.connection.state === "Hello") send(h, WELCOME);
+    h.clock.advanceTo(500 + DEADLINES.connect);
+    expect([servedAt, h.connection.state, h.connection.error, shell.renews]).toEqual([750, "Live", null, [false, false, false, true, false]]);
+  });
 
   test("a held session replaced by another is closed", () => {
     const { h, open } = bridged();
