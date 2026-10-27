@@ -29,7 +29,8 @@
  *   it, by one timer, and the connection switches to the new token through
  *   §3's resume path. The timer is armed in steps of at most
  *   {@link MAX_TIMER_DELAY} until the renewal time, so no lifetime is too long.
- *   It is cleared on Disconnect, and it renews only a running session: in
+ *   It is cleared on Disconnect. A late result's deadline waits without a timer
+ *   until Connect resumes it. It renews only a running session: in
  *   NeedsToken (a spent cap included) the reactive path owns the provider.
  *   A failed renewal is not retried; the session stays Live, the shell's
  *   message is {@link ShellTokens.notice}, and the reactive path takes over
@@ -50,7 +51,7 @@
  * - **Bounded re-mints.** Consecutive re-mints back off on §3's reconnect
  *   backoff: the first is immediate, the next ones wait `backoffDelay(0…)`.
  *   After {@link MAX_REMINTS} in a row, pending waits and owed work are cleared:
- *   the provider is not asked again until the person asks. A session that stayed
+ *   unresolved results are discarded until the person asks. A session that stayed
  *   Live for §3's healthy period (the one that resets its backoff), or an
  *   `ack`ed command since the streak began, ends the streak.
  *
@@ -267,8 +268,10 @@ function driveShell<T>(connection: WireConnection, source: Source<T>, clock: Clo
       inFlight = false;
       const skipped = owed;
       owed = null;
-      if (disposed) {
+      // The cap cancels an unresolved call's authority to hand over its result.
+      if (disposed || error === REMINTS_SPENT) {
         if (token !== null) source.discard(token.value);
+        if (!disposed) changed();
         return;
       }
       if (renewing && failure !== null) notice = failure;
@@ -336,6 +339,9 @@ function driveShell<T>(connection: WireConnection, source: Source<T>, clock: Clo
   };
 
   const stop = connection.onTransition((state) => {
+    // A late result keeps an absolute deadline without owning a timer while
+    // Disconnected. Connect resumes it, immediately if it is already overdue.
+    if (previous === "Disconnected" && running() && due !== null && !spent && renewal === null) renewAt(due);
     if (state === "Live") liveSince = clock.now();
     else if (liveSince !== null) {
       if (clock.now() - liveSince >= DEADLINES.healthy) streak = 0;

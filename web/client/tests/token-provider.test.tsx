@@ -1108,6 +1108,80 @@ for (const mode of MODES) {
     expect(tokens.calls).toBe(2);
   });
 
+  for (const connectAt of [20, 115]) {
+    test(`Connect at ${connectAt} resumes the late renewal's absolute due time`, async () => {
+      const { h, tokens, driver } = driven({ token: "t2", expiresInMs: 20 }, "deferred", "t4");
+      dispose = () => { driver.dispose(); h.connection.disconnect(); };
+      h.step(step({ step: "token_refused", code: 4403 }));
+      await tick();
+      h.step(step({ step: "open" }));
+      send(h, WELCOME);
+      h.clock.advanceTo(15);
+      await tick();
+      h.connection.disconnect();
+      tokens.resolve("late", 40);
+      await tick();
+      expect([h.connection.state, h.clock.pendingTimers]).toEqual(["Disconnected", 0]);
+      h.clock.advanceTo(connectAt);
+      expect(h.clock.pendingTimers).toBe(0);
+      h.connection.connect();
+      await tick();
+      h.step(step({ step: "open" }));
+      send(h, WELCOME);
+      expect(frames(h, "hello").at(-1)?.["token"]).toBe("late");
+      const due = Math.max(connectAt, 45); // Late result at 15 + floor(40 * 3/4).
+      if (connectAt < due) {
+        h.clock.advanceTo(due - 1);
+        await tick();
+        expect(tokens.calls).toBe(2);
+      }
+      h.clock.advanceTo(due);
+      await tick();
+      expect(tokens.calls).toBe(3);
+      h.step(step({ step: "open" }));
+      send(h, WELCOME);
+      expect([h.connection.state, frames(h, "hello").at(-1)?.["token"]]).toEqual(["Live", "t4"]);
+      driver.dispose();
+      h.connection.disconnect();
+      expect(h.clock.pendingTimers).toBe(0);
+    });
+  }
+
+  for (const pending of ["mint", "renewal"] as const) {
+    test(`the re-mint cap discards an in-flight ${pending} success`, async () => {
+      const { h, tokens, driver } = pending === "mint"
+        ? driven("deferred")
+        : driven({ token: "t2", expiresInMs: 20 }, "deferred");
+      dispose = () => { driver.dispose(); h.connection.disconnect(); };
+      h.step(step({ step: "token_refused", code: 4403 }));
+      await tick();
+      if (pending === "renewal") {
+        h.step(step({ step: "open" }));
+        send(h, WELCOME);
+        h.clock.advanceTo(15);
+        await tick();
+        h.step(step({ step: "token_refused", code: 4403 }));
+      }
+      // Deliberate external handoffs reach the cap while the original call
+      // stays unresolved, rather than waiting for a new mint on each end.
+      for (let revoked = pending === "mint" ? 2 : 3; revoked <= MAX_REMINTS + 1; revoked++) {
+        if (mode === "bridge") h.connection.setSocket(tokens.open("handoff"));
+        else h.connection.setToken("handoff");
+        h.step(step({ step: "open" }));
+        send(h, WELCOME);
+        h.step(step({ step: "token_refused", code: 4403 }));
+      }
+      expect(driver.error).toBe(REMINTS_SPENT);
+      const hellos = frames(h, "hello").length;
+      const closes = h.net.closes.length;
+      tokens.resolve("late", 40);
+      await tick();
+      expect([h.connection.state, driver.error, driver.asking, h.clock.pendingTimers]).toEqual(["NeedsToken", REMINTS_SPENT, false, 0]);
+      expect(frames(h, "hello")).toHaveLength(hellos);
+      if (mode === "bridge") expect(h.net.closes.slice(closes)).toEqual([{ code: 1000, reason: "disposed", at: h.clock.now(), consumed: false }]);
+    });
+  }
+
   test("the re-mint cap cancels a pending wait and keeps its error", async () => {
     const { h, tokens, driver } = driven("t2", "unexpected");
     dispose = () => { driver.dispose(); h.connection.disconnect(); };
