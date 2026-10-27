@@ -30,10 +30,13 @@ pub(crate) struct Fixture {
 }
 impl Fixture {
     pub(crate) fn new(records: Vec<StreamRecord>) -> Self {
+        Self::named("fixture-agent", records)
+    }
+    pub(crate) fn named(agent: &str, records: Vec<StreamRecord>) -> Self {
         let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
         let sessions = root.path().join("sessions");
         crate::platform::structured::ensure_private_dir(&sessions).unwrap();
-        let directory = sessions.join("fixture-agent");
+        let directory = sessions.join(agent);
         crate::platform::structured::ensure_private_dir(&directory).unwrap();
         let path = directory.join("history.jsonl");
         drop(crate::platform::structured::create_private_file(&path).unwrap());
@@ -43,7 +46,7 @@ impl Fixture {
         }
         file.sync_all().unwrap();
         let source = History::default();
-        source.bind("fixture-agent", "history");
+        source.bind(agent, "history");
         source
             .initialize(
                 &file,

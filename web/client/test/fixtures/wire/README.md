@@ -174,3 +174,29 @@ grants (ADR-0036 S6/#1429 and #2461; corrected rulings #2579/#2580). No scope
 change occurs mid-script. Separate real-client negative cases pin typed `scope`
 without `answer`, and `not_authorized` for send or decide without `operate`.
 Whether send alone should suffice is pending owner decision in #2585.
+
+## Actual-endpoint trace infrastructure (#2467)
+
+`tests/wire/endpoint-runner.ts` selects by `covers` containing `s7-min`, including
+multi-label headers. It freezes authored inputs and requires one ordered checked
+receipt per step. Missing handlers, unchecked results, failed assertions and
+silent asynchronous ports fail at their original step. A separate five-second
+failure guard never advances protocol time. Server observations and intentionally
+injected client faults have distinct provenance in the execution ledger.
+
+The recorded-agent port in `tests/wire/endpoint-client.ts` uses the real
+WireConnection and actual endpoint. Rust's `web::wire::tests::trace_endpoint`
+currently drives the complete `clean` and `agent-gap` traces (25 total steps),
+including the original client assertions and quiet periods. Retained history is
+independent provider input; actual server frames are never injected. Welcome
+comparison checks protocol, exact granted capabilities and idempotency window;
+server version, epoch and principal are opaque identities. Other authored
+values are checked exactly, permitting additive object fields. Credential names
+resolve through the scenario's provider before network transmission.
+
+This recorded port is not the full selected-script adapter. Commands, permission
+producers, heartbeat/auth/fault paths and producer-backed fleet integration remain
+tracked by #2467. Unimplemented handlers fail; no selected script is silently
+allowlisted away. `S7_TRACE_DROP_STEP=observe` is a test-only fail-first control:
+the normal `clean` endpoint test must fail at its unhandled observe step (exit
+100), then pass with the variable absent. No production hook is involved.

@@ -19,21 +19,24 @@ fn record(seq: u64) -> StreamRecord {
         raw: json!({"type":"assistant","message":{"content":[]}}).to_string(),
     }
 }
-struct Case {
-    server: Server,
+pub(super) struct Case {
+    pub(super) server: Server,
     registry: Registry,
     workers: Workers,
     stored: Stored,
 }
 impl Case {
     async fn new(records: Vec<StreamRecord>) -> Self {
+        Self::named("fixture-agent", records).await
+    }
+    pub(super) async fn named(agent: &str, records: Vec<StreamRecord>) -> Self {
         let server = Server::new().await;
-        let stored = Stored::new(records);
+        let stored = Stored::named(agent, records);
         let mut registry = Registry::default();
         let generation = registry
             .register(Record {
                 runtime: StructuredRuntime::Structured,
-                agent_id: "fixture-agent".into(),
+                agent_id: agent.into(),
                 session_id: "history".into(),
                 name: None,
                 harness: "claude".into(),
@@ -43,12 +46,7 @@ impl Case {
             .unwrap();
         let mut workers = Workers::new(server.wake.clone());
         workers
-            .install_retained(
-                &registry,
-                "fixture-agent",
-                generation,
-                stored.source.clone(),
-            )
+            .install_retained(&registry, agent, generation, stored.source.clone())
             .unwrap();
         Self {
             server,
@@ -56,6 +54,13 @@ impl Case {
             workers,
             stored,
         }
+    }
+    pub(super) fn service(&mut self) {
+        Arc::get_mut(&mut self.server.core).unwrap().service(
+            &self.registry,
+            &mut self.workers,
+            self.server._root.path(),
+        );
     }
     async fn open(&self) -> Socket {
         let mut socket = Socket::open(&self.server).await;
