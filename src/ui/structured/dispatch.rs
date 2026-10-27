@@ -91,8 +91,10 @@ pub(crate) fn render_native(app: &AppState, frame: &mut Frame, info: &PaneInfo) 
             pane.render(frame);
             if let Some((target, index)) = &app.native_control {
                 if view.target() == Some(target) && info.is_focused {
-                    if let Some(&(x, y)) = pane.positions().get(*index) {
-                        frame.buffer_mut()[(x, y)].set_style(Style::default().reversed());
+                    if let Some(rect) = pane.control_rect(*index) {
+                        frame
+                            .buffer_mut()
+                            .set_style(rect, Style::default().reversed());
                     }
                 }
             }
