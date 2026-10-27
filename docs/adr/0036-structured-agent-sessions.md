@@ -4257,3 +4257,8 @@ App and render share Arcs and never borrow Model. Unshared mutation reuses the
 allocation. A watch channel's retained last frame is itself a shared owner, so
 it can require a copy even when App has not separately retained that frame.
 No snapshot fields or intent shapes change.
+
+Initial queue admission also belongs to the continuation: opening a view does
+not acquire the publication book or capture channel. Its first poll arms the
+source readiness notification before trying admission, preserving the same
+pending state through contention and cancellation as a lagged resubscribe.

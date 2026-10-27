@@ -1,5 +1,6 @@
 use super::*;
 use crate::app::App;
+use crate::structured::publication::Provider;
 use crate::structured::{
     registry::Registry,
     view::Target,
@@ -182,6 +183,7 @@ async fn lag_recovery(busy: bool, replacement: bool) {
     owner.append(1);
     s.source = owner.source.clone();
     s.queue = Some(s.source.subscribe(None).unwrap());
+    s.queue_started = true;
     s.queue_wake = s.queue.as_ref().unwrap().waker();
     s.ended = [true, true, false];
     owner.capture();
@@ -267,6 +269,7 @@ async fn queue_refusal_stays_a_refusal() {
     let mut owner = Fixture::new();
     owner.finish(true);
     s.queue = Some(owner.source.subscribe(None).unwrap());
+    s.queue_started = true;
     s.queue_wake = s.queue.as_ref().unwrap().waker();
     for _ in 0..2 {
         let error = s.next().await.unwrap_err();
@@ -284,6 +287,7 @@ async fn ended_queue_resumes_after_a_real_competing_subscriber() {
     let mut owner = Fixture::new();
     s.source = owner.source.clone();
     s.queue = Some(s.source.subscribe(None).unwrap());
+    s.queue_started = true;
     s.queue_wake = s.queue.as_ref().unwrap().waker();
     s.ended = [true, true, false];
     owner.capture();
@@ -428,6 +432,7 @@ async fn cancellation_of_busy_resubscribe_preserves_its_cursor() {
     let mut owner = Fixture::new();
     s.source = owner.source.clone();
     s.queue = Some(s.source.subscribe(None).unwrap());
+    s.queue_started = true;
     s.queue_wake = s.queue.as_ref().unwrap().waker();
     s.ended = [true, true, false];
     owner.capture();
@@ -506,4 +511,23 @@ async fn cancelled_pending_page_cannot_hide_a_publication() {
     drain(&mut s).await;
     assert_eq!(s.model.snapshot.applied_cursor, 1);
     assert_eq!(s.model.snapshot.transcript.len(), 1);
+}
+#[tokio::test]
+async fn opening_during_book_contention_defers_admission_until_polling() {
+    let (_app, _case, s) = fixture("s10b-live-lifecycle-exit").await;
+    let mut owner = Fixture::new();
+    owner.finish(false);
+    let mut opened = None;
+    owner.competing_subscriber(|| {
+        let mut view = Stream::new(s.model, s.history, s.live, owner.source.clone())
+            .expect("opening a view must defer transient book contention");
+        view.ended = [true, true, false];
+        let mut step = Box::pin(view.next());
+        assert!(poll(step.as_mut()).is_pending());
+        drop(step);
+        opened = Some(view);
+    });
+    let mut view = opened.unwrap();
+    drain(&mut view).await;
+    assert!(view.ended[2]);
 }

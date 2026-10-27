@@ -201,6 +201,10 @@ pub(crate) enum SubscribeError {
 }
 type SubscribeResult = Result<Reader, SubscribeError>;
 impl Source {
+    /// Book readiness, including competing subscriber releases on an ended source.
+    pub(in crate::structured) fn waker(&self) -> Arc<Notify> {
+        self.2.clone()
+    }
     pub(in crate::structured) fn capture_waker(&self) -> Arc<Notify> {
         self.4.clone()
     }
