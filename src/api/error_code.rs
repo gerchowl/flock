@@ -327,6 +327,17 @@ error_codes! {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn compatibility_note_belongs_to_the_unsupported_permission_decision() {
+        let lines: Vec<_> = include_str!("error_code.rs").lines().collect();
+        assert!(lines.windows(2).any(|pair| {
+            pair[0].trim()
+                == "// Retained for compatibility with runtimes predating session grants."
+                && pair[1]
+                    .trim()
+                    .starts_with("PermissionDecisionUnsupported =")
+        }));
+    }
     use super::ErrorCode;
 
     #[test]
