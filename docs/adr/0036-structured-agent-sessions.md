@@ -4275,3 +4275,12 @@ Closing a placement aborts only its reader task; the worker continues. Reopening
 replays from canonical warm sources. Cold sources retain their typed refusal;
 source refusals remain visible instead of appearing as successful frozen frames.
 An ended stream still accepts canonical metadata updates until placement closes.
+
+### Amendment: S10d1b warm-history opening
+
+A canonical warm history handle can precede producer file initialization.
+`Stream::next` waits on that source's readiness for this opening state, retaining
+it across cancellation. This is not cold recovery: no second writer or loader is
+created. Producer failure and actual page I/O errors stay explicit errors. As with
+a cancelled Pending page, resuming an older opening yields one recheck step so
+an initialization preceding the new wait cannot be missed.

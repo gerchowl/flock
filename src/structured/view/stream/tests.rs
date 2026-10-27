@@ -587,3 +587,96 @@ async fn driver_preserves_a_terminal_source_refusal() {
     })
     .await;
 }
+
+async fn warm_opening(failed: bool) {
+    let (_app, _case, mut s) = fixture("s10b-live-lifecycle-exit").await;
+    let pending = History::default();
+    s.history = pending.clone();
+    s.ended = [false, true, true];
+    let (waiting, entered) = tokio::sync::oneshot::channel();
+    s.waiting = Some(waiting);
+    let mut step = Box::pin(s.next());
+    tokio::time::timeout(WITHIN, async {
+        tokio::select! {
+            result = &mut step => panic!("warm opening must wait for readiness: {result:?}"),
+            result = entered => result.unwrap(),
+        }
+    })
+    .await
+    .expect("warm opening never reached its readiness wait");
+    drop(step);
+    if failed {
+        pending.finish(true);
+        let error = tokio::time::timeout(WITHIN, s.next())
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+    } else {
+        let source =
+            history::tests::Fixture::new(vec![crate::structured::transport::StreamRecord {
+                seq: 1,
+                known: Some(false),
+                shape: None,
+                received_at_ms: 1,
+                origin: crate::structured::transport::RecordOrigin::Claude,
+                result_subtype: None,
+                permission_grant_request_id: None,
+                permission_request_seq: None,
+                raw: "{\"future_field\":\"ready\"}".into(),
+            }]);
+        pending
+            .initialize(&source.file, 1, source.file.metadata().unwrap().len())
+            .unwrap();
+        pending.finish(false);
+        drain(&mut s).await;
+        assert_eq!(s.model.snapshot.applied_cursor, 1);
+        assert_eq!(
+            s.model
+                .snapshot
+                .transcript
+                .iter()
+                .filter(|c| c.seq == 1)
+                .count(),
+            1
+        );
+    }
+}
+#[tokio::test]
+async fn warm_history_opening_survives_cancellation_and_initialization() {
+    warm_opening(false).await;
+}
+#[tokio::test]
+async fn warm_history_opening_reports_a_producer_failure() {
+    warm_opening(true).await;
+}
+
+#[tokio::test]
+async fn cancelled_opening_cannot_hide_initialization_before_its_next_poll() {
+    let (_app, _case, mut s) = fixture("s10b-live-lifecycle-exit").await;
+    let history = History::default();
+    s.history = history.clone();
+    s.ended = [false, true, true];
+    let source = history::tests::Fixture::new(vec![]);
+    let (entered, mut stages) = tokio::sync::mpsc::unbounded_channel();
+    let (release, gate) = std::sync::mpsc::channel();
+    s.gate = Some(CancelGate {
+        entered,
+        release: gate,
+    });
+    let mut step = Box::pin(s.next());
+    tokio::time::timeout(WITHIN, async {
+        tokio::select! {
+            result = &mut step => panic!("opening terminated before the gate: {result:?}"),
+            stage = stages.recv() => assert_eq!(stage, Some(2)),
+        }
+    })
+    .await
+    .unwrap();
+    drop(step);
+    history.initialize(&source.file, 0, 0).unwrap();
+    history.finish(false);
+    release.send(()).unwrap();
+    drain(&mut s).await;
+    assert_eq!(s.ended, [true; 3]);
+}
