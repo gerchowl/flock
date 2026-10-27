@@ -1504,3 +1504,5 @@ mod app_sessions;
 mod trace_auth;
 
 mod trace_protocol;
+
+mod trace_ping;

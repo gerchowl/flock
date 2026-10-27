@@ -508,9 +508,9 @@ export const fixtureExamples = {
 {"not_before_ms":0,"step":"expect_connect","v":1,"within_ms":1},
 {"step":"open","v":1},
 {"absent":[],"fields":["protocol","token"],"frame":{"client":{"name":"fixture","version":"1"},"protocol":1,"t":"hello","token":"fixture-token"},"step":"expect","v":1},
-{"frame":{"capabilities":["read","send"],"idempotency_window_ms":86400000,"principal":"fixture-principal","protocol":1,"server_epoch":"fixture-epoch","server_version":"fixture","t":"welcome"},"step":"send","v":1},
-{"frame":{"nonce":"minimal-ping","t":"ping"},"step":"send","v":1},
-{"absent":[],"fields":["nonce"],"frame":{"nonce":"minimal-ping","t":"pong"},"step":"expect","v":1},
+{"frame":{"capabilities":["read","send"],"idempotency_window_ms":86400000,"principal":"0123456789abcdef0123456789abcdef","protocol":1,"server_epoch":"00000000000000000000000000000001","server_version":{"$dynamic":"server_version","source":"build"},"t":"welcome"},"step":"send","v":1},
+{"frame":{"nonce":"00000000000000000000000000000001/1/1","t":"ping"},"step":"send","v":1},
+{"absent":[],"fields":["nonce"],"frame":{"nonce":"00000000000000000000000000000001/1/1","t":"pong"},"step":"expect","v":1},
 {"ceiling_ms":1000,"step":"quiet","v":1},
 ],
 "protocol-refusal": [
