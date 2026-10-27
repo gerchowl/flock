@@ -1,20 +1,13 @@
 //! Source-anchored transcript compute/paint; no subscriptions, file reads or authority.
-use super::markdown::{lines, safe};
+use super::markdown::{lines, safe, wrap, DisplayLine};
 use crate::structured::view::contracts::{Action, Card, Content};
-use ratatui::{
-    layout::Rect,
-    style::Style,
-    text::{Line, Span},
-    widgets::Paragraph,
-    Frame,
-};
+use ratatui::{layout::Rect, text::Line, widgets::Paragraph, Frame};
 use std::collections::BTreeSet;
-use unicode_width::UnicodeWidthStr;
 
 /// Visible physical rows and exact button rectangles, computed together before painting.
 pub(crate) struct Transcript {
     area: Rect,
-    rows: Vec<Line<'static>>,
+    rows: Vec<DisplayLine>,
     hits: Vec<(Rect, Action)>,
 }
 impl Transcript {
@@ -27,35 +20,16 @@ impl Transcript {
     }
     /// Paint only the prepared rows. The source snapshot and computed geometry stay immutable.
     pub fn render(&self, frame: &mut Frame) {
-        frame.render_widget(Paragraph::new(self.rows.clone()), self.area);
+        // Per-frame row cloning is tracked in #2590.
+        let rows = self
+            .rows
+            .iter()
+            .map(|r| r.line().clone())
+            .collect::<Vec<_>>();
+        frame.render_widget(Paragraph::new(rows), self.area);
     }
 }
-fn wrap(lines: Vec<Line<'static>>, width: u16) -> Vec<Line<'static>> {
-    let mut rows = vec![];
-    if width == 0 {
-        return rows;
-    }
-    for line in lines {
-        let mut row = Line::default();
-        let mut used = 0;
-        for g in line.styled_graphemes(Style::default()) {
-            let (symbol, w) = if g.symbol.width() > usize::from(width) {
-                ("�", 1)
-            } else {
-                (g.symbol, g.symbol.width())
-            };
-            if used + w > usize::from(width) {
-                rows.push(row);
-                row = Line::default();
-                used = 0;
-            }
-            row.spans.push(Span::styled(symbol.to_owned(), g.style));
-            used += w;
-        }
-        rows.push(row);
-    }
-    rows
-}
+
 fn content(card: &Card) -> (String, Vec<Line<'static>>) {
     let (title, body) = match &card.content {
         Content::Markdown(t) => return ("Assistant".into(), lines(t)),
@@ -127,7 +101,10 @@ pub(crate) fn compute(
                 x += width + 1;
             }
         }
-        rows.push(Line::from(controls));
+        rows.extend(wrap(
+            vec![Line::from(controls.trim_end().to_owned())],
+            area.width,
+        ));
         if !folded {
             rows.extend(wrap(body, area.width));
         }

@@ -127,5 +127,105 @@ fn unicode_tail_and_narrow_clipping_use_physical_rows() {
     let b = draw(&t);
     assert_eq!(b[(2, 0)].symbol(), "e\u{301}");
     assert!(t.hits.is_empty());
-    assert!(t.rows.iter().all(|r| r.width() <= 6));
+    assert!(t.rows.iter().all(|r| r.line().width() <= 6));
+}
+
+fn escaped_card(content: Content, raw: &str, escaped: &str) {
+    let b = draw(&compute(
+        &[card(1, content)],
+        &BTreeSet::new(),
+        Some(1),
+        Rect::new(0, 0, 100, 20),
+    ));
+    let rendered = text(&b);
+    assert!(rendered.contains(escaped), "missing {escaped:?} in {b:?}");
+    for c in raw.chars() {
+        assert!(!rendered.contains(c), "raw display control {c:?}");
+    }
+}
+macro_rules! entity_case {
+    ($name:ident, $input:expr, $raw:expr, $escaped:expr) => {
+        #[test]
+        fn $name() {
+            escaped_card(Content::Markdown($input.into()), $raw, $escaped);
+        }
+    };
+}
+entity_case!(entity_esc, "&#27;[2J", "\u{1b}", "\\u{1b}[2J");
+entity_case!(entity_csi, "&#x9b;2J", "\u{9b}", "\\u{9b}2J");
+entity_case!(entity_c1, "&#x85;", "\u{85}", "\\u{85}");
+entity_case!(entity_rlo, "&#x202e;ABC", "\u{202e}", "\\u{202e}ABC");
+fn raw_format_controls(make: impl Fn(String) -> Content) {
+    for c in [
+        '\u{202a}',
+        '\u{202b}',
+        '\u{202c}',
+        '\u{202d}',
+        '\u{202e}',
+        '\u{2066}',
+        '\u{2067}',
+        '\u{2068}',
+        '\u{2069}',
+        '\u{200e}',
+        '\u{200f}',
+        '\u{61c}',
+        '\u{ad}',
+        '\u{200b}',
+        '\u{200c}',
+        '\u{200d}',
+        '\u{2060}',
+        '\u{feff}',
+        '\u{1343f}',
+        '\u{e0001}',
+        '\u{e0061}',
+        '\u{2028}',
+        '\u{2029}',
+    ] {
+        let raw = c.to_string();
+        let escaped = c.escape_unicode().to_string();
+        escaped_card(make(raw.clone()), &raw, &escaped);
+    }
+}
+macro_rules! raw_case {
+    ($name:ident, $make:expr) => {
+        #[test]
+        fn $name() {
+            raw_format_controls($make);
+        }
+    };
+}
+raw_case!(raw_thinking_controls, Content::Thinking);
+raw_case!(raw_json_controls, |raw| Content::RawJson {
+    known: None,
+    shape: None,
+    raw
+});
+raw_case!(raw_tool_controls, |text| Content::ToolResult {
+    tool_use_id: "use-1".into(),
+    text,
+    is_error: false
+});
+raw_case!(raw_title_controls, |raw| {
+    Content::ToolRequest(serde_json::from_value(serde_json::json!({"tool_name": raw, "input": {}, "tool_use_id": "use-1", "subtype": "can_use_tool"})).unwrap())
+});
+#[test]
+fn ordered_and_nested_lists_preserve_numbering_and_indentation() {
+    let b = draw(&compute(
+        &[card(
+            1,
+            Content::Markdown("3. parent\n   - child\n     7. nested\n   - next\n4. end".into()),
+        )],
+        &BTreeSet::new(),
+        Some(1),
+        Rect::new(0, 0, 60, 20),
+    ));
+    for expected in [
+        "3. parent",
+        "  • child",
+        "    7. nested",
+        "  • next",
+        "4. end",
+    ] {
+        assert!(text(&b).contains(expected), "missing {expected:?} in {b:?}");
+    }
 }
