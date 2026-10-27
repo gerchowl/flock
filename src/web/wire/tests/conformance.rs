@@ -45,13 +45,10 @@ fn selected_welcome_capabilities_match_the_actual_endpoint() {
     runtime(async {
         for (name, lines) in selected() {
             let Some(expected) = lines.iter().find_map(|line| match &line.step {
-                FixtureStep::Send {
-                    frame:
-                        crate::structured_wire::fixture::FixtureServerFrame::Literal(
-                            frame @ ServerFrame::Welcome { .. },
-                        ),
-                    ..
-                } => Some(serde_json::to_value(frame).unwrap()),
+                FixtureStep::Send { frame, .. } => {
+                    let value = serde_json::to_value(frame).unwrap();
+                    (value["t"] == "welcome").then_some(value)
+                }
                 _ => None,
             }) else {
                 continue;

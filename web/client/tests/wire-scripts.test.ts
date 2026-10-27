@@ -111,7 +111,9 @@ describe("S7a scripts", () => {
     for (const [jitter, random] of Object.entries(JITTER)) {
       test(`${name} (${jitter} jitter)`, async () => {
         const steps = await load(name);
-        if (steps.some((line) => line.step === "send" && line.frame.t === "ev" && typeof line.frame.ts_ms !== "number")) {
+        if (steps.some((line) => line.step === "send" && line.frame.t === "welcome" && typeof line.frame.server_version !== "string")) {
+          expect(() => new Harness(random).run(steps)).toThrow("dynamic build version requires compiled metadata oracle");
+        } else if (steps.some((line) => line.step === "send" && line.frame.t === "ev" && typeof line.frame.ts_ms !== "number")) {
           expect(() => new Harness(random).run(steps)).toThrow("dynamic timestamp requires persisted and wall-window oracles");
         } else new Harness(random).run(steps);
       });
@@ -191,4 +193,15 @@ test("permission script assigns one valid principal per scripted token", async (
   expect(observations).toBe(2);
   expect([...identities].map(([token, principals]) => [token, [...principals]]))
     .toEqual([["fixture-token", ["0123456789abcdef0123456789abcdef"]]]);
+});
+
+// The real endpoint must issue this exact principal; no received-frame normalization.
+test("protocol trace uses a valid literal principal and exact ClientOpen grants", async () => {
+  const welcome = (await load("unknown-subscription")).find(
+    (line) => line.step === "send" && line.frame.t === "welcome",
+  );
+  if (welcome?.step !== "send" || welcome.frame.t !== "welcome") throw new Error("missing welcome");
+  expect(welcome.frame.principal).toBe("0123456789abcdef0123456789abcdef");
+  expect(welcome.frame.server_epoch).toBe("00000000000000000000000000000001");
+  expect(welcome.frame.capabilities).toEqual(["read", "send", "answer", "operate"]);
 });

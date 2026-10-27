@@ -1502,3 +1502,5 @@ fn overlapping_read_admissions_keep_subscriptions_and_socket_alive() {
 mod app_sessions;
 
 mod trace_auth;
+
+mod trace_protocol;

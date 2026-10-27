@@ -25,10 +25,10 @@ export const PENDING_PART_2B = {
   "agent-gap": "pending part 2b", "agent-send": "pending part 2b",
   "clean": "pending part 2b", "heartbeat-missed": "pending part 2b",
   "ping-pong": "pending part 2b",
-  "token-revoked": "pending part 2b", "unknown-subscription": "pending part 2b",
+  "token-revoked": "pending part 2b",
 } satisfies Partial<Record<keyof typeof fixtureExamples, "pending part 2b">>;
 
-export const WIRED_SCRIPTS = ["token-refused", "permission-decision"] as const;
+export const WIRED_SCRIPTS = ["token-refused", "permission-decision", "unknown-subscription"] as const;
 
 /** Every selected script belongs exactly once to a real provider or the pending set. */
 export function assertInventory(scripts: readonly TraceScript[], wired: readonly string[]): void {

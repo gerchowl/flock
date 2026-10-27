@@ -39,7 +39,7 @@ fn every_script_parses_and_round_trips_all_frame_kinds() {
                 FixtureStep::Send { frame, .. } => {
                     server.insert(value["frame"]["t"].as_str().unwrap().to_owned());
                     let encoded = serde_json::to_string(&frame).unwrap();
-                    if matches!(frame, fixture::FixtureServerFrame::Dynamic(_)) {
+                    if !matches!(frame, fixture::FixtureServerFrame::Literal(_)) {
                         assert!(serde_json::from_str::<ServerFrame>(&encoded).is_err());
                         continue;
                     }
@@ -752,4 +752,25 @@ fn permission_fixture_principal_is_a_literal_valid_token_identity() {
         close["frame"]["ev"]["principal"],
         "0123456789abcdef0123456789abcdef"
     );
+}
+
+#[test]
+fn build_version_matcher_is_typed_and_restricted_to_welcome() {
+    let line = json!({"v":1,"step":"send","frame":{"t":"welcome","protocol":1,"server_version":{"$dynamic":"server_version","source":"build"},"capabilities":["read"],"principal":"fixture","server_epoch":"fixture","idempotency_window_ms":1}});
+    assert!(FixtureLine::parse(&line.to_string()).is_ok());
+    for (field, value) in [
+        (
+            "server_version",
+            json!({"$dynamic":"server_version","source":"socket"}),
+        ),
+        (
+            "server_version",
+            json!({"$dynamic":"server_version","source":"build","extra":true}),
+        ),
+        ("server_epoch", line["frame"]["server_version"].clone()),
+    ] {
+        let mut invalid = line.clone();
+        invalid["frame"][field] = value;
+        assert!(FixtureLine::parse(&invalid.to_string()).is_err());
+    }
 }
