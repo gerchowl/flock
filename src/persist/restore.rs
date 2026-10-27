@@ -34,6 +34,8 @@ struct PaneRestoreStartup<'a> {
 }
 
 struct RestoreRuntimeContext<'a> {
+    registry: &'a crate::structured::registry::Registry,
+    native_seen: &'a std::cell::RefCell<HashSet<String>>,
     scrollback_limit_bytes: usize,
     shell_config: crate::pane::PaneShellConfig<'a>,
     resume_agents_on_restore: bool,
@@ -293,8 +295,11 @@ fn restore_with_imports_and_failures(
     let mut terminal_runtimes = HashMap::new();
     let mut resumed_agent_sessions = HashSet::new();
     let mut failed_imports = 0;
+    let native_seen = std::cell::RefCell::new(HashSet::new());
     for (idx, ws_snap) in snapshot.workspaces.iter().enumerate() {
         let runtime_context = RestoreRuntimeContext {
+            registry: &snapshot.structured_agents,
+            native_seen: &native_seen,
             scrollback_limit_bytes,
             shell_config,
             resume_agents_on_restore,
@@ -472,11 +477,22 @@ fn restore_tab(
     let pane_ids = collect_pane_ids(&node);
 
     let mut panes = HashMap::new();
+    let mut native_views = HashMap::new();
     let mut terminals = Vec::new();
     let mut terminal_runtimes = HashMap::new();
     let mut failed_imports = 0;
     for id in &pane_ids {
         let old_id = reverse_id_map.get(id);
+        if let Some(saved) = old_id.and_then(|id| snap.native_views.get(id)) {
+            native_views.insert(
+                *id,
+                saved.restore(
+                    runtime_context.registry,
+                    &mut runtime_context.native_seen.borrow_mut(),
+                ),
+            );
+            continue;
+        }
         let saved_pane = old_id.and_then(|old_id| snap.panes.get(old_id));
         let saved_cwd = saved_pane
             .map(|p| p.cwd.clone())
@@ -720,12 +736,12 @@ fn restore_tab(
         }
     }
 
-    if panes.is_empty() {
+    if panes.is_empty() && native_views.is_empty() {
         crate::logging::session_restore_tab_no_panes(&format!("{:?}", snap.custom_name));
         return (None, failed_imports);
     }
 
-    let surviving: HashSet<PaneId> = panes.keys().copied().collect();
+    let surviving: HashSet<PaneId> = panes.keys().chain(native_views.keys()).copied().collect();
     let Some(node) = prune_restored_node(node, &surviving) else {
         crate::logging::session_restore_tab_pruned_empty(&format!("{:?}", snap.custom_name));
         return (None, failed_imports);
@@ -748,7 +764,7 @@ fn restore_tab(
                 root_pane,
                 layout,
                 panes,
-                native_views: HashMap::new(),
+                native_views,
                 #[cfg(test)]
                 runtimes: HashMap::new(),
                 zoomed: snap.zoomed,
@@ -1192,6 +1208,7 @@ mod tests {
                 public_tab_numbers: Vec::new(),
                 next_public_tab_number: 0,
                 tabs: vec![TabSnapshot {
+                    native_views: HashMap::new(),
                     custom_name: None,
                     layout: LayoutSnapshot::Pane(0),
                     panes: HashMap::from([(
@@ -1288,6 +1305,7 @@ mod tests {
                 public_tab_numbers: Vec::new(),
                 next_public_tab_number: 0,
                 tabs: vec![TabSnapshot {
+                    native_views: HashMap::new(),
                     custom_name: None,
                     layout: LayoutSnapshot::Pane(0),
                     panes: HashMap::from([(
@@ -1770,6 +1788,7 @@ mod tests {
                 public_tab_numbers: Vec::new(),
                 next_public_tab_number: 0,
                 tabs: vec![TabSnapshot {
+                    native_views: HashMap::new(),
                     custom_name: None,
                     layout: LayoutSnapshot::Pane(0),
                     panes,
@@ -1823,5 +1842,78 @@ mod tests {
         assert_eq!(aliases.get(&old_pane.raw()), Some(&new_pane));
         // The ancient gen1 id still resolves: 5 -> gen2 -> gen3.
         assert_eq!(aliases.get(&5), Some(&new_pane));
+    }
+}
+
+#[cfg(test)]
+mod native_tests {
+    use super::*;
+    use crate::app::state::PendingUiEvent::PaneClosed;
+    use crate::structured::view::{
+        placement::{UnavailableReason::*, View},
+        tests::fixture,
+    };
+
+    #[test]
+    fn native_roundtrip_unavailable_survives_and_close_removes() {
+        for (kind, schema, agent, reason) in [
+            ("structured", "1", "fixture-agent", None),
+            ("future", " 1", "x", Some(UnknownKind)),
+            ("structured", "2", "x", Some(UnsupportedSchema)),
+            ("structured", "1", "x", Some(MissingAgent)),
+            ("structured", "false", "x", Some(InvalidRecord)),
+        ] {
+            let (mut state, target) = fixture();
+            let raw = format!(r#"{{"kind":"{kind}","schema":{schema},"agent_id":"{agent}"}}"#);
+            let json = format!(
+                r#"{{"workspaces":[{{"identity_cwd":".","tabs":[{{"layout":{{"Pane":7}},"panes":{{}},"native_views":{{"7":{raw}}},"zoomed":false}}]}}]}}"#
+            );
+            let mut snap = super::super::snapshot::parse_snapshot(&json).unwrap();
+            snap.structured_agents = state.structured_agents.snapshot();
+            let (events, _) = mpsc::channel(8);
+            let (workspaces, terminals, runtimes) = restore(
+                &snap,
+                None,
+                24,
+                80,
+                0,
+                "/bin/sh",
+                crate::config::ShellModeConfig::NonLogin,
+                true,
+                events,
+                Arc::new(Notify::new()),
+                Arc::new(AtomicBool::new(false)),
+            );
+            assert_eq!(workspaces.len(), 1);
+            assert!(terminals.is_empty() && runtimes.is_empty());
+            let tab = &workspaces[0].tabs[0];
+            assert!(tab.membership_valid());
+            let id = tab.root_pane;
+            let view = &tab.native_views[&id];
+            assert_eq!(view.target(), reason.is_none().then_some(&target));
+            if let Some(reason) = reason {
+                assert!(
+                    matches!(view, View::Unavailable { reason: actual, .. } if *actual == reason)
+                );
+                let mut terminal =
+                    ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 4)).unwrap();
+                terminal
+                    .draw(|f| {
+                        assert!(view.render_unavailable(f, f.area()));
+                    })
+                    .unwrap();
+                let cells = terminal.backend().buffer().content();
+                let screen: String = cells.iter().map(|c| c.symbol()).collect();
+                assert!(screen.contains(&format!("Unavailable native view: {reason:?}")));
+            }
+            let saved = super::super::snapshot::capture_tab(tab, &terminals, &runtimes.into());
+            let record = &saved.native_views[&id.raw()];
+            assert_eq!(serde_json::to_string(record).unwrap(), raw.trim());
+            state.workspaces = workspaces;
+            state.active = Some(0);
+            state.close_pane();
+            assert!(state.workspaces.is_empty());
+            assert!(matches!(state.pending_ui_events[0], PaneClosed { .. }));
+        }
     }
 }
