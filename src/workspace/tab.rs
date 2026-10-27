@@ -11,7 +11,25 @@ use crate::layout::{Node, PaneId, TileLayout};
 use crate::pane::PaneState;
 use crate::terminal::{TerminalId, TerminalRuntime, TerminalRuntimeRegistry, TerminalState};
 
-pub(crate) type DetachedPane = (PaneId, TerminalId);
+/// Detached content never fabricates a terminal identity for a native view.
+// Payloads are retained for the upcoming native-view lifecycle consumers.
+#[allow(dead_code)]
+pub(crate) enum DetachedPane {
+    Terminal(PaneId, TerminalId),
+    Native(PaneId, crate::structured::view::Target),
+}
+impl DetachedPane {
+    pub fn pane_id(&self) -> PaneId {
+        match self {
+            Self::Terminal(id, _) | Self::Native(id, _) => *id,
+        }
+    }
+}
+/// Exhaustive content classification after checking layout membership.
+pub(crate) enum Content<'a> {
+    Terminal(&'a PaneState),
+    Native(&'a crate::structured::view::Target),
+}
 
 /// A pane removed from its tab for relocation. Carries the live `PaneState`
 /// (including its `attached_terminal_id`) so the PTY/runtime registered under
@@ -47,6 +65,7 @@ pub struct Tab {
     pub layout: TileLayout,
     /// Pane viewport state — always present, testable without PTYs.
     pub panes: HashMap<PaneId, PaneState>,
+    pub(crate) native_views: HashMap<PaneId, crate::structured::view::Target>,
     #[cfg(test)]
     pub runtimes: HashMap<PaneId, TerminalRuntime>,
     pub zoomed: bool,
@@ -56,6 +75,28 @@ pub struct Tab {
 }
 
 impl Tab {
+    pub(crate) fn content(
+        &self,
+        id: PaneId,
+    ) -> Result<Content<'_>, crate::structured::view::PlacementError> {
+        use crate::structured::view::PlacementError::Membership;
+        if !self.layout.pane_ids().contains(&id) {
+            return Err(Membership);
+        }
+        match (self.panes.get(&id), self.native_views.get(&id)) {
+            (Some(pane), None) => Ok(Content::Terminal(pane)),
+            (None, Some(view)) => Ok(Content::Native(view)),
+            _ => Err(Membership),
+        }
+    }
+    pub(crate) fn membership_valid(&self) -> bool {
+        let ids = self.layout.pane_ids();
+        ids.len() == self.panes.len() + self.native_views.len()
+            && ids.iter().all(|id| self.content(*id).is_ok())
+            && ids.contains(&self.root_pane)
+            && ids.contains(&self.layout.focused())
+    }
+
     pub fn new(
         number: usize,
         initial_cwd: PathBuf,
@@ -172,6 +213,7 @@ impl Tab {
                 root_pane: root_id,
                 layout,
                 panes,
+                native_views: HashMap::new(),
                 #[cfg(test)]
                 runtimes: HashMap::new(),
                 zoomed: false,
@@ -380,6 +422,7 @@ impl Tab {
             root_pane: pane_id,
             layout: TileLayout::from_saved(Node::Pane(pane_id), pane_id),
             panes,
+            native_views: HashMap::new(),
             #[cfg(test)]
             runtimes: HashMap::new(),
             zoomed: false,
@@ -395,7 +438,7 @@ impl Tab {
     /// expected to drop the tab itself; we still return the pane_state so the
     /// pane survives the tab removal.
     pub(crate) fn take_pane_for_move(&mut self, pane_id: PaneId) -> Option<MovedPane> {
-        if !self.panes.contains_key(&pane_id) {
+        if !matches!(self.content(pane_id), Ok(Content::Terminal(_))) {
             return None;
         }
 
@@ -463,6 +506,12 @@ impl Tab {
             return None;
         }
 
+        let detached = match self.content(pane_id).ok()? {
+            Content::Terminal(pane) => {
+                DetachedPane::Terminal(pane_id, pane.attached_terminal_id.clone())
+            }
+            Content::Native(view) => DetachedPane::Native(pane_id, view.clone()),
+        };
         let next_root = self.promoted_root_if_needed(pane_id);
 
         if self.layout.focused() == pane_id {
@@ -474,13 +523,13 @@ impl Tab {
             self.layout.focus_pane(prev_focus);
         }
 
-        let pane = self.panes.remove(&pane_id)?;
-        let terminal_id = pane.attached_terminal_id;
+        self.panes.remove(&pane_id);
+        self.native_views.remove(&pane_id);
         self.zoomed = false;
         if let Some(next_root) = next_root {
             self.root_pane = next_root;
         }
-        Some((pane_id, terminal_id))
+        Some(detached)
     }
 
     fn promoted_root_if_needed(&self, closing: PaneId) -> Option<PaneId> {
