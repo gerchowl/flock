@@ -4247,3 +4247,12 @@ predates the new wait cannot leave the continuation asleep. Retirement alone
 discards a dead generation's page. Its blocking work retains the I/O permit
 until completion, even if the Stream is dropped. No timeout, sleep or mutation
 retry substitutes for source readiness.
+
+### Amendment: admitted launch with failed placement (#2655)
+
+If placement fails after launch admission, return the typed
+`structured_agent_started_unplaced` result with the admitted ID, generation
+and registered placement cause. Keep the registry/worker under normal ownership
+so it remains inspectable and stoppable. CLI/MCP expose the result with exit 1;
+this is not a clean start refusal and must not trigger a fresh start blindly.
+Duplicate placement and invalid membership remain typed preflight refusals.
