@@ -735,3 +735,28 @@ fn endpoint_warning_has_a_closed_path_free_reason() {
         assert!(log["fields"].get("path").is_none());
     }
 }
+
+#[tokio::test]
+async fn directory_change_is_emitted_once_for_a_real_structured_launch() {
+    let _guard = crate::config::test_config_env_guard();
+    let mut fixture = AdmissionFixture::new("s4-accepted-silent", 5000);
+    fixture.start().await;
+    let changes = |app: &App| {
+        app.event_hub
+            .ring_snapshot_after(0)
+            .into_iter()
+            .filter(|(_, event)| {
+                serde_json::to_value(event).unwrap()["event"] == "directory_changed"
+            })
+            .count()
+    };
+    assert_eq!(
+        changes(&fixture.app),
+        1,
+        "the launch must invalidate discovery"
+    );
+    for _ in 0..2 {
+        fixture.request(Method::AgentList(Default::default())).await;
+        assert_eq!(changes(&fixture.app), 1, "unchanged reads must not emit");
+    }
+}

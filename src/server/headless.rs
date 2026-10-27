@@ -987,6 +987,8 @@ impl HeadlessServer {
                 }
             }
 
+            self.app.sync_directory_events();
+
             // 7. Render virtually and stream frames.
             if needs_render && self.app.can_render_now(now) {
                 crate::render_prof::event("render.attempt");
@@ -5474,6 +5476,41 @@ mod tests {
         .await
         .expect("headless loop did not finish after explicit owned shutdown");
         result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn headless_loop_publishes_directory_removal_without_an_api_request() {
+        use crate::app::directory::loop_tests::{changes, prepare, wait};
+        let mut server = test_headless_server();
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        server.app.api_rx = api_rx;
+        let (hub, after) = prepare(&mut server.app);
+        let observer_hub = hub.clone();
+        let quit = server.should_quit.clone();
+        let wake = server.server_event_tx.clone();
+        let exercise = async move {
+            let found = tokio::task::spawn_blocking(move || wait(observer_hub, after)).await;
+            // Always stop the owned loop, including when the mutant stayed silent.
+            quit.store(true, Ordering::Release);
+            wake.send(ServerEvent::QuitSignal).await.unwrap();
+            found.expect("directory observer panicked")
+        };
+        let (result, observed) = tokio::time::timeout(Duration::from_secs(8), async {
+            tokio::join!(server.run(), exercise)
+        })
+        .await
+        .expect("owned headless loop or observer stalled");
+        result.unwrap();
+        assert!(
+            server.app.state.workspaces.is_empty(),
+            "the loop must process pane death"
+        );
+        assert_eq!(
+            observed.len(),
+            1,
+            "headless loop did not publish the removal"
+        );
+        assert_eq!(changes(&hub, after).len(), 1);
     }
 
     fn test_headless_server() -> HeadlessServer {

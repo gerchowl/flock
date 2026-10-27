@@ -13,6 +13,97 @@
 
 use crate::app::App;
 
+/// Last published directory identity/location projection, excluding volatile state.
+#[derive(Default)]
+pub(super) struct DirectorySnapshot(std::collections::BTreeMap<String, DirectoryEntry>);
+
+#[derive(PartialEq, Eq)]
+struct DirectoryEntry {
+    host: String,
+    pane_id: Option<String>,
+    local: bool,
+    route: Option<String>,
+    agent: Option<String>,
+    name: Option<String>,
+    runtime: Option<crate::api::schema::AgentRuntime>,
+}
+
+impl App {
+    /// ADR-0028 §3: invalidate discovery only after accepted state changes.
+    /// The EventHub's durable sequence is the version; no second cursor exists.
+    pub(crate) fn sync_directory_events(&mut self) {
+        let mut entries: std::collections::BTreeMap<_, _> = self
+            .collect_fleet_agents(&[])
+            .into_iter()
+            .map(|row| {
+                (
+                    row.agent_id,
+                    DirectoryEntry {
+                        host: row.host,
+                        pane_id: row.pane_id,
+                        local: row.local,
+                        route: row.route,
+                        agent: row.agent,
+                        name: row.name,
+                        runtime: row.runtime,
+                    },
+                )
+            })
+            .collect();
+        let host = crate::app::short_host_name();
+        // Match agent.list's membership gate without reading screens, cwd or status.
+        for (ws_idx, ws) in self.state.workspaces.iter().enumerate() {
+            for tab in &ws.tabs {
+                for pane_id in tab.layout.pane_ids() {
+                    let Some(terminal) = ws
+                        .pane_state(pane_id)
+                        .and_then(|pane| self.state.terminals.get(&pane.attached_terminal_id))
+                        .filter(|terminal| terminal.is_agent_terminal())
+                    else {
+                        continue;
+                    };
+                    let Some(pane_id) = self.state.public_pane_id(ws_idx, pane_id) else {
+                        continue;
+                    };
+                    entries.insert(
+                        terminal.agent_id.to_string(),
+                        DirectoryEntry {
+                            host: host.clone(),
+                            pane_id: Some(pane_id),
+                            local: true,
+                            route: None,
+                            agent: terminal.effective_agent_label().map(str::to_owned),
+                            name: terminal.agent_name().map(str::to_owned),
+                            runtime: None,
+                        },
+                    );
+                }
+            }
+        }
+        for record in self.state.structured_agents.records() {
+            entries.insert(
+                record.agent_id.clone(),
+                DirectoryEntry {
+                    host: host.clone(),
+                    pane_id: None,
+                    local: true,
+                    route: None,
+                    agent: Some(record.harness.clone()),
+                    name: record.name.clone(),
+                    runtime: Some(crate::api::schema::AgentRuntime::Structured),
+                },
+            );
+        }
+        if self.directory_snapshot.0 != entries {
+            self.directory_snapshot.0 = entries;
+            self.emit_event(crate::api::schema::EventEnvelope {
+                event: crate::api::schema::EventKind::DirectoryChanged,
+                data: crate::api::schema::EventData::DirectoryChanged {},
+            });
+        }
+    }
+}
+
 /// Where an agent is, at the moment of asking.
 ///
 /// Every field except the id is expected to change. Callers that persist any
@@ -364,6 +455,9 @@ impl App {
 }
 
 #[cfg(test)]
+pub(crate) mod loop_tests;
+
+#[cfg(test)]
 mod tests {
     use crate::api::schema::{AgentStatus, PeerAgentSummary, PeerWorkspaceSummary};
     use crate::app::App;
@@ -377,6 +471,54 @@ mod tests {
             api_rx,
             crate::api::EventHub::default(),
         )
+    }
+
+    #[tokio::test]
+    async fn directory_change_tracks_accepted_remote_summaries_not_refresh_times() {
+        let mut config = crate::config::Config::default();
+        config.peers.push(crate::config::PeerConfig {
+            name: "remote.invalid".into(),
+            ..Default::default()
+        });
+        let (_, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(&config, true, None, rx, crate::api::EventHub::default());
+        let mut payload = crate::peers::PeerSummaryPayload {
+            node_id: None,
+            outbound_pending: false,
+            host: "remote.invalid".into(),
+            version: None,
+            protocol: None,
+            icon: None,
+            system: None,
+            structured_agents: Vec::new(),
+            workspaces: peer_with_agent("remote.invalid", "remote.invalid", "remote-agent")
+                .workspaces,
+            latency_ms: 1,
+            relayed_fleet: Vec::new(),
+        };
+        let changes = |app: &App| {
+            app.event_hub
+                .ring_snapshot_after(0)
+                .into_iter()
+                .filter(|(_, event)| {
+                    serde_json::to_value(event).unwrap()["event"] == "directory_changed"
+                })
+                .count()
+        };
+        for expected in [1, 1, 2] {
+            app.handle_internal_event(crate::events::AppEvent::PeerSummaryFetched(
+                crate::peers::PeerSummaryFetch {
+                    peer: "remote.invalid".into(),
+                    stream_error: None,
+                    result: Ok(payload.clone()),
+                },
+            ));
+            assert_eq!(changes(&app), expected);
+            if payload.latency_ms == 2 {
+                payload.workspaces.clear();
+            }
+            payload.latency_ms += 1;
+        }
     }
 
     fn peer_with_agent(peer: &str, host: &str, agent_id: &str) -> crate::peers::PeerSummaryState {
@@ -572,6 +714,93 @@ mod tests {
         let terminal = app.state.terminals.get_mut(&terminal_id).expect("terminal");
         terminal.set_agent_name(name.to_string()).unwrap();
         terminal.agent_id.to_string()
+    }
+
+    #[test]
+    fn directory_change_tracks_local_membership_without_turn_noise() {
+        let mut app = test_app();
+        name_local_agent(&mut app, "local-fixture");
+        let read = |app: &mut App| {
+            app.handle_api_request(crate::api::schema::Request {
+                id: "directory-fixture".into(),
+                method: crate::api::schema::Method::AgentList(Default::default()),
+            });
+            app.event_hub
+                .ring_snapshot_after(0)
+                .into_iter()
+                .filter(|(_, e)| serde_json::to_value(e).unwrap()["event"] == "directory_changed")
+                .count()
+        };
+        assert_eq!(read(&mut app), 1);
+        for terminal in app.state.terminals.values_mut() {
+            terminal.fallback_state = crate::detect::AgentState::Working;
+        }
+        assert_eq!(read(&mut app), 1);
+        app.state.workspaces.clear();
+        assert_eq!(read(&mut app), 2);
+        assert_eq!(read(&mut app), 2);
+    }
+
+    #[test]
+    fn directory_change_detects_only_a_pane_id_change_once() {
+        let mut app = test_app();
+        app.state.peer_summaries = vec![peer_with_agent(
+            "remote.invalid",
+            "remote.invalid",
+            "remote-agent",
+        )];
+        let read = |app: &mut App| {
+            app.handle_api_request(crate::api::schema::Request {
+                id: "directory-pane".into(),
+                method: crate::api::schema::Method::AgentList(Default::default()),
+            });
+            super::loop_tests::changes(&app.event_hub, 0).len()
+        };
+        assert_eq!(read(&mut app), 1);
+        let mut expected = app.collect_fleet_agents(&[]);
+        app.state.peer_summaries[0].workspaces[0].agents[0].pane_id = "moved-pane".into();
+        expected[0].pane_id = Some("moved-pane".into());
+        assert_eq!(
+            app.collect_fleet_agents(&[]),
+            expected,
+            "only the public pane changed"
+        );
+        assert_eq!(read(&mut app), 2);
+        assert_eq!(read(&mut app), 2);
+    }
+
+    #[test]
+    fn directory_change_detects_an_agent_rename_once() {
+        let mut app = test_app();
+        let id = name_local_agent(&mut app, "original-name");
+        let read = |app: &mut App| {
+            app.handle_api_request(crate::api::schema::Request {
+                id: "directory-name".into(),
+                method: crate::api::schema::Method::AgentList(Default::default()),
+            });
+            super::loop_tests::changes(&app.event_hub, 0).len()
+        };
+        assert_eq!(read(&mut app), 1);
+        let before = app.collect_fleet_agents(&app.collect_agent_infos());
+        app.state
+            .terminals
+            .values_mut()
+            .find(|t| t.agent_id.to_string() == id)
+            .unwrap()
+            .set_agent_name("renamed-agent".into())
+            .unwrap();
+        let after = app.collect_fleet_agents(&app.collect_agent_infos());
+        assert_eq!(before[0].agent_id, after[0].agent_id);
+        assert_eq!(before[0].pane_id, after[0].pane_id);
+        assert_eq!(before[0].host, after[0].host);
+        assert_eq!(before[0].route, after[0].route);
+        assert_eq!(before[0].runtime, after[0].runtime);
+        assert_eq!(before[0].agent, after[0].agent);
+        assert_eq!(before[0].local, after[0].local);
+        assert_eq!(before[0].name.as_deref(), Some("original-name"));
+        assert_eq!(after[0].name.as_deref(), Some("renamed-agent"));
+        assert_eq!(read(&mut app), 2);
+        assert_eq!(read(&mut app), 2);
     }
 
     #[test]
