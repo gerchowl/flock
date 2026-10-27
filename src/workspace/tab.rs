@@ -75,6 +75,10 @@ pub struct Tab {
 }
 
 impl Tab {
+    /// Classify one layout member without inferring native content from a
+    /// missing terminal. Reject absent layout membership, missing content or
+    /// content present in both maps with `PlacementError::Membership`.
+    /// Use `membership_valid` when the whole tab must be checked.
     pub(crate) fn content(
         &self,
         id: PaneId,
@@ -89,6 +93,9 @@ impl Tab {
             _ => Err(Membership),
         }
     }
+    /// Check that terminal and native maps exhaustively and disjointly cover
+    /// the layout, including its root and focus. Intended for mutation guards,
+    /// not the per-event indexed workspace lookup.
     pub(crate) fn membership_valid(&self) -> bool {
         let ids = self.layout.pane_ids();
         ids.len() == self.panes.len() + self.native_views.len()

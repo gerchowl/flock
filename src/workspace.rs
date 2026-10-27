@@ -1176,10 +1176,14 @@ impl Workspace {
         self::git::git_status_snapshot_for_cwd(resolved_identity_cwd, cached)
     }
 
+    /// Locate terminal or native storage with two hash lookups per tab.
+    /// The content maps are the index, so mutations cannot leave a second
+    /// lookup cache stale. This deliberately preserves corrupt stored rows:
+    /// `Tab::content` must report their membership error before an operation.
     pub fn find_tab_index_for_pane(&self, pane_id: PaneId) -> Option<usize> {
-        self.tabs
-            .iter()
-            .position(|tab| tab.content(pane_id).is_ok())
+        self.tabs.iter().position(|tab| {
+            tab.panes.contains_key(&pane_id) || tab.native_views.contains_key(&pane_id)
+        })
     }
 
     pub fn pane_state(&self, pane_id: PaneId) -> Option<&PaneState> {
@@ -1375,6 +1379,111 @@ impl Workspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn placement_lookup_keeps_invalid_stored_content_addressable_for_validation() {
+        use crate::structured::view::{PlacementError, Target};
+        let mut ws = Workspace::test_new("placement-lookup");
+        let root = ws.tabs[0].root_pane;
+        let view = Target {
+            agent_id: "fixture-agent".into(),
+            generation: 1,
+        };
+        assert_eq!(ws.find_tab_index_for_pane(root), Some(0));
+        let native = ws.tabs[0].layout.split_focused(Direction::Horizontal);
+        ws.tabs[0].native_views.insert(native, view.clone());
+        assert_eq!(ws.find_tab_index_for_pane(native), Some(0));
+        assert!(ws.tabs[0].membership_valid());
+        assert_eq!(ws.find_tab_index_for_pane(PaneId::alloc()), None);
+
+        // The storage maps themselves are the index, including corrupt rows.
+        ws.tabs[0].native_views.insert(root, view.clone());
+        assert_eq!(ws.find_tab_index_for_pane(root), Some(0));
+        assert!(matches!(
+            ws.take_pane_for_move(root),
+            Err(PlacementError::Membership)
+        ));
+        ws.tabs[0].native_views.remove(&root);
+        let orphan = PaneId::alloc();
+        ws.tabs[0].native_views.insert(orphan, view);
+        assert_eq!(ws.find_tab_index_for_pane(orphan), Some(0));
+        assert!(matches!(
+            ws.take_pane_for_move(orphan),
+            Err(PlacementError::Membership)
+        ));
+        ws.tabs[0].native_views.remove(&orphan);
+        ws.tabs[0]
+            .panes
+            .insert(orphan, PaneState::new(TerminalId::alloc()));
+        assert_eq!(ws.find_tab_index_for_pane(orphan), Some(0));
+        assert!(matches!(
+            ws.take_pane_for_move(orphan),
+            Err(PlacementError::Membership)
+        ));
+    }
+
+    #[test]
+    fn placement_lookup_does_not_materialize_tab_content_or_layout() {
+        // A source pin prevents a per-event lookup from walking all pane trees.
+        let source = include_str!("workspace.rs");
+        let body = source
+            .split("pub fn find_tab_index_for_pane(")
+            .nth(1)
+            .unwrap()
+            .split("pub fn pane_state(")
+            .next()
+            .unwrap();
+        assert!(
+            !body.contains(".content("),
+            "lookup must use stored content indices"
+        );
+        assert!(
+            !body.contains(".pane_ids("),
+            "lookup must not allocate a pane list"
+        );
+    }
+
+    #[test]
+    fn native_split_clears_zoom_on_the_destination_tab() {
+        use crate::structured::{
+            registry::{Record, StructuredRuntime},
+            view::Target,
+        };
+        let mut state = crate::app::AppState::test_new();
+        state.workspaces.push(Workspace::test_new("native-zoom"));
+        let generation = state
+            .structured_agents
+            .register(Record {
+                runtime: StructuredRuntime::Structured,
+                agent_id: "fixture-agent".into(),
+                name: None,
+                harness: "claude".into(),
+                session_id: "fixture-session".into(),
+                cwd: std::env::temp_dir(),
+                model: None,
+            })
+            .unwrap();
+        state.workspaces[0].tabs[0].zoomed = true;
+        let id = state
+            .attach_native_view(
+                Target {
+                    agent_id: "fixture-agent".into(),
+                    generation,
+                },
+                0,
+                0,
+                Direction::Horizontal,
+            )
+            .unwrap();
+        let tab = &state.workspaces[0].tabs[0];
+        assert!(
+            !tab.zoomed,
+            "a successful split must expose both placements"
+        );
+        assert_eq!(tab.layout.focused(), id);
+        assert_eq!(tab.layout.pane_count(), 2);
+        assert!(tab.membership_valid());
+    }
 
     fn linked_membership(checkout_path: &str) -> WorktreeSpaceMembership {
         WorktreeSpaceMembership {
