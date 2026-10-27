@@ -18,16 +18,19 @@ use std::{
 
 use futures_util::{SinkExt, StreamExt};
 use serde::{de, Deserialize, Serialize};
-use tokio::sync::mpsc;
+use tokio::{
+    sync::{mpsc, watch},
+    time::Instant,
+};
 use tokio_tungstenite::{
     tungstenite::{self, protocol::CloseFrame, Message},
     WebSocketStream,
 };
 
-use crate::mint::{Minted, Token, DEADLINE, REMOTE};
+use crate::mint::{Minted, Token, DEADLINE, NO_ANSWER, REMOTE};
 
-/// One blocking mint over `flock.sock` (`mint::mint`).
-pub type Mint = Arc<dyn Fn() -> Result<Minted, String> + Send + Sync>;
+/// One blocking mint over `flock.sock` (`mint::mint`), answered by the instant given.
+pub type Mint = Arc<dyn Fn(std::time::Instant) -> Result<Minted, String> + Send + Sync>;
 /// Milliseconds on a clock that counts suspended time, as the server's TTL does.
 pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
 /// One session's channel to the webview; `false` when it could not deliver,
@@ -72,6 +75,9 @@ impl Bearer {
     }
 }
 
+/// A mint's outcome, the same for every open waiting on it.
+type Flight = Option<Result<Arc<Bearer>, String>>;
+
 /// The one current bearer ("When the native side mints").
 #[derive(Default)]
 struct Current {
@@ -79,6 +85,8 @@ struct Current {
     /// The last bearer ended with a 4401 or 4403 the webview saw, so the
     /// client caused the next mint and it is not `fresh`.
     ended_in_view: bool,
+    /// The one mint in flight: every open that needs a bearer meanwhile waits on it.
+    minting: Option<watch::Sender<Flight>>,
 }
 
 /// The webview's side of a session, queued for its task.
@@ -92,8 +100,9 @@ enum Out {
 }
 
 struct Session {
-    /// The label of the webview that opened it.
+    /// The label of the webview that opened it, and that webview's page.
     owner: String,
+    page: u64,
     bearer: Arc<Bearer>,
     hello_sent: bool,
     out: mpsc::UnboundedSender<Out>,
@@ -110,20 +119,34 @@ struct Inner {
     mint: Mint,
     now: Clock,
     current: Mutex<Current>,
-    sessions: Mutex<HashMap<u64, Session>>,
+    table: Mutex<Table>,
     next: AtomicU64,
+}
+
+#[derive(Default)]
+struct Table {
+    sessions: HashMap<u64, Session>,
+    /// Each webview's page, counted up each time its page goes away.
+    pages: HashMap<String, u64>,
+}
+
+impl Table {
+    fn page(&self, owner: &str) -> u64 {
+        self.pages.get(owner).copied().unwrap_or_default()
+    }
 }
 
 impl fmt::Debug for Bridge {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Bridge")
             .field("ws", &self.0.ws)
-            .field("sessions", &self.sessions().len())
+            .field("sessions", &self.table().sessions.len())
             .finish_non_exhaustive()
     }
 }
 
 const ENDED: &str = "this bridged session has ended";
+const MINT_FAILED: &str = "The mint task failed.";
 const GONE: &str = "the page that opened this session went away";
 
 /// The one place a rejection's message is made: why, then the remote path
@@ -140,7 +163,7 @@ impl Bridge {
             mint,
             now,
             current: Default::default(),
-            sessions: Default::default(),
+            table: Default::default(),
             next: AtomicU64::new(1),
         }))
     }
@@ -148,13 +171,22 @@ impl Bridge {
     /// One session for the webview `owner` (the contract's `openBridge`).
     /// It rejects only for a refusal, saying why and offering the remote
     /// path; an unreachable or silent socket resolves and `sink` gets 1006.
+    /// The mint, its retry and the upgrade share one [`DEADLINE`].
     pub async fn open(&self, owner: &str, renew: bool, sink: Sink) -> Result<Opened, String> {
-        let opened = self.start(owner, renew, sink).await;
+        let deadline = Instant::now() + DEADLINE;
+        let opened = self.start(owner, renew, sink, deadline).await;
         opened.map_err(|why| rejection(&why))
     }
 
-    async fn start(&self, owner: &str, renew: bool, sink: Sink) -> Result<Opened, String> {
-        let (bearer, fresh) = self.bearer(renew).await?;
+    async fn start(
+        &self,
+        owner: &str,
+        renew: bool,
+        sink: Sink,
+        deadline: Instant,
+    ) -> Result<Opened, String> {
+        let page = self.table().page(owner);
+        let (bearer, fresh) = self.bearer(renew, deadline).await?;
         let id = self.0.next.fetch_add(1, Ordering::Relaxed);
         let opened = Opened {
             id,
@@ -164,7 +196,7 @@ impl Bridge {
         let scrubbed = |text: String| scrub(text, &bearer.token);
         let mut retried = false;
         let ws = loop {
-            let attempt = tokio::time::timeout(DEADLINE, upgrade(&self.0.ws)).await;
+            let attempt = tokio::time::timeout_at(deadline, upgrade(&self.0.ws)).await;
             match attempt.unwrap_or(Upgrade::Unreachable) {
                 Upgrade::Open(ws) => break *ws,
                 Upgrade::Unreachable => return Ok(closed(opened, &sink, 1006, "")),
@@ -198,12 +230,22 @@ impl Bridge {
         let abandoned = Arc::new(AtomicBool::new(false));
         let session = Session {
             owner: owner.to_owned(),
+            page,
             bearer: bearer.clone(),
             hello_sent: false,
             out,
             abandoned: abandoned.clone(),
         };
-        self.sessions().insert(id, session);
+        let mut table = self.table();
+        if table.page(owner) != page {
+            // The page that asked went away meanwhile; a new page shares its
+            // label, so the session never joins the table and nobody hears of it.
+            drop(table);
+            tokio::spawn(self.clone().gone(id, ws));
+            return Ok(opened);
+        }
+        table.sessions.insert(id, session);
+        drop(table);
         tokio::spawn(self.clone().run(id, ws, rx, sink, bearer, abandoned));
         Ok(opened)
     }
@@ -211,8 +253,8 @@ impl Bridge {
     /// A frame from the webview. The first must be a `hello` without a
     /// token; it gets the bearer. Every later one passes unchanged.
     pub fn send(&self, id: u64, text: String) -> Result<(), String> {
-        let mut sessions = self.sessions();
-        let session = sessions.get_mut(&id).ok_or(ENDED)?;
+        let mut table = self.table();
+        let session = table.sessions.get_mut(&id).ok_or(ENDED)?;
         let out = if session.hello_sent {
             Out::Frame(text)
         } else {
@@ -224,8 +266,8 @@ impl Bridge {
 
     /// The webview closes its socket; the server's close still comes back.
     pub fn close(&self, id: u64, code: Option<u16>, reason: Option<String>) -> Result<(), String> {
-        let sessions = self.sessions();
-        let session = sessions.get(&id).ok_or(ENDED)?;
+        let table = self.table();
+        let session = table.sessions.get(&id).ok_or(ENDED)?;
         session.abandoned.store(true, Ordering::Relaxed);
         let frame = code.map(|code| CloseFrame {
             code: code.into(),
@@ -237,24 +279,29 @@ impl Bridge {
             .map_err(|_| ENDED.into())
     }
 
-    /// The webview `owner` reloaded, navigated or closed: its sessions end
-    /// with 1001 at the server, and leave the table now.
+    /// The webview `owner` reloaded, navigated or closed: its page is over,
+    /// so the sessions of its older pages end with 1001 at the server and
+    /// leave the table now, and an open still in flight never joins it.
     pub fn webview_gone(&self, owner: &str) {
-        let mut sessions = self.sessions();
-        let ids: Vec<u64> = sessions
+        let mut table = self.table();
+        let page = table.pages.entry(owner.to_owned()).or_default();
+        *page += 1;
+        let page = *page;
+        let ids: Vec<u64> = table
+            .sessions
             .iter()
-            .filter(|(_, session)| session.owner == owner)
+            .filter(|(_, session)| session.owner == owner && session.page < page)
             .map(|(id, _)| *id)
             .collect();
-        for session in ids.iter().filter_map(|id| sessions.remove(id)) {
+        for session in ids.iter().filter_map(|id| table.sessions.remove(id)) {
             session.abandoned.store(true, Ordering::Relaxed);
             drop(session.out.send(Out::Gone));
         }
     }
 
-    fn sessions(&self) -> MutexGuard<'_, HashMap<u64, Session>> {
-        let sessions = self.0.sessions.lock();
-        sessions.unwrap_or_else(|poisoned| poisoned.into_inner())
+    fn table(&self) -> MutexGuard<'_, Table> {
+        let table = self.0.table.lock();
+        table.unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn current(&self) -> MutexGuard<'_, Current> {
@@ -264,13 +311,12 @@ impl Bridge {
 
     /// The current bearer, or a new one when there is none, it has run out,
     /// or the open renews. `true` when the client did not cause the mint.
-    /// The mint runs with no lock held, so a hung server delays this open
-    /// only, up to the mint's deadline; two opens racing may both mint, and
-    /// the bearer replaced is unused until it expires or the app exits (§6).
-    async fn bearer(&self, renew: bool) -> Result<(Arc<Bearer>, bool), String> {
+    /// At most one mint is in flight: an open that needs a bearer meanwhile,
+    /// renewing or not, waits for that mint's bearer or its refusal.
+    async fn bearer(&self, renew: bool, deadline: Instant) -> Result<(Arc<Bearer>, bool), String> {
         let now = (self.0.now)();
-        let fresh = {
-            let current = self.current();
+        let (mut flight, fresh) = {
+            let mut current = self.current();
             let kept = current
                 .bearer
                 .as_ref()
@@ -278,26 +324,54 @@ impl Bridge {
             if let (false, Some(bearer)) = (renew, kept) {
                 return Ok((bearer.clone(), false));
             }
-            !renew && !current.ended_in_view
+            let fresh = !renew && !current.ended_in_view;
+            let minting = current
+                .minting
+                .get_or_insert_with(|| self.fly(deadline, now));
+            (minting.subscribe(), fresh)
         };
-        let mint = self.0.mint.clone();
-        let minted = tokio::task::spawn_blocking(move || mint())
-            .await
-            .map_err(|error| format!("The mint task failed: {error}."))?;
-        let minted = minted.map_err(|message| match &self.current().bearer {
-            Some(bearer) => scrub(message, &bearer.token),
-            None => message,
-        })?;
-        let bearer = Arc::new(Bearer {
-            token: minted.token,
-            expires_in_ms: minted.expires_in_ms,
-            minted_at: now,
-        });
-        *self.current() = Current {
-            bearer: Some(bearer.clone()),
-            ended_in_view: false,
-        };
+        let outcome = flight.wait_for(Option::is_some).await;
+        let outcome = outcome.map_err(|_| MINT_FAILED.to_owned())?.clone();
+        let bearer = outcome.unwrap_or_else(|| Err(MINT_FAILED.into()))?;
         Ok((bearer, fresh))
+    }
+
+    /// Starts the one mint, which must answer by `deadline`. No lock is held
+    /// while it runs; its outcome becomes the current bearer, or the refusal
+    /// every waiter rejects with. A late answer is dropped unused.
+    fn fly(&self, deadline: Instant, minted_at: u64) -> watch::Sender<Flight> {
+        let (done, _) = watch::channel(None);
+        let mint = self.0.mint.clone();
+        let until = std::time::Instant::now() + deadline.saturating_duration_since(Instant::now());
+        let minting = tokio::task::spawn_blocking(move || mint(until));
+        let (bridge, publish) = (self.clone(), done.clone());
+        tokio::spawn(async move {
+            let minted = match tokio::time::timeout_at(deadline, minting).await {
+                Ok(Ok(minted)) => minted,
+                Ok(Err(_)) => Err(MINT_FAILED.into()),
+                Err(_) => Err(NO_ANSWER.into()),
+            };
+            let mut current = bridge.current();
+            current.minting = None;
+            let outcome = match minted {
+                Ok(minted) => {
+                    let bearer = Arc::new(Bearer {
+                        token: minted.token,
+                        expires_in_ms: minted.expires_in_ms,
+                        minted_at,
+                    });
+                    current.bearer = Some(bearer.clone());
+                    current.ended_in_view = false;
+                    Ok(bearer)
+                }
+                Err(message) => Err(match &current.bearer {
+                    Some(bearer) => scrub(message, &bearer.token),
+                    None => message,
+                }),
+            };
+            publish.send_replace(Some(outcome));
+        });
+        done
     }
 
     /// The server refused or ended `bearer` (4401, 4403): never offer it
@@ -309,10 +383,8 @@ impl Bridge {
             .as_ref()
             .is_some_and(|c| Arc::ptr_eq(c, bearer))
         {
-            *current = Current {
-                bearer: None,
-                ended_in_view: seen,
-            };
+            current.bearer = None;
+            current.ended_in_view = seen;
         }
     }
 
@@ -328,21 +400,10 @@ impl Bridge {
         abandoned: Arc<AtomicBool>,
     ) {
         let (code, reason) = loop {
+            // What the server has sent goes first: a 4401 or 4403 it sent
+            // before the page went away still ends the bearer.
             tokio::select! {
-                out = rx.recv() => match out {
-                    Some(Out::Frame(text)) => {
-                        if ws.send(Message::Text(text.into())).await.is_err() {
-                            break (1006, String::new());
-                        }
-                    }
-                    Some(Out::Close(frame)) => drop(ws.close(frame).await),
-                    Some(Out::Refuse(reason)) => {
-                        let frame = CloseFrame { code: 1008.into(), reason: reason.into() };
-                        drop(ws.close(Some(frame)).await);
-                        break (1008, reason.to_owned());
-                    }
-                    Some(Out::Gone) | None => return self.gone(id, ws).await,
-                },
+                biased;
                 frame = ws.next() => match frame {
                     Some(Ok(Message::Text(text))) => {
                         let data = scrub(text.as_str().to_owned(), &bearer.token);
@@ -370,17 +431,31 @@ impl Bridge {
                     Some(Ok(_)) => {}
                     Some(Err(_)) | None => break (1006, String::new()),
                 },
+                out = rx.recv() => match out {
+                    Some(Out::Frame(text)) => {
+                        if ws.send(Message::Text(text.into())).await.is_err() {
+                            break (1006, String::new());
+                        }
+                    }
+                    Some(Out::Close(frame)) => drop(ws.close(frame).await),
+                    Some(Out::Refuse(reason)) => {
+                        let frame = CloseFrame { code: 1008.into(), reason: reason.into() };
+                        drop(ws.close(Some(frame)).await);
+                        break (1008, reason.to_owned());
+                    }
+                    Some(Out::Gone) | None => return self.gone(id, ws).await,
+                },
             }
         };
-        self.sessions().remove(&id);
+        self.table().sessions.remove(&id);
         let reason = scrub(reason, &bearer.token);
         sink(Event::Close { code, reason });
     }
 
     /// The session's page is gone: out of the table, and a 1001 to the
     /// server, whose close reply ends it, awaited for at most the deadline.
-    async fn gone(&self, id: u64, mut ws: WebSocketStream<Stream>) {
-        self.sessions().remove(&id);
+    async fn gone(self, id: u64, mut ws: WebSocketStream<Stream>) {
+        self.table().sessions.remove(&id);
         let frame = CloseFrame {
             code: 1001.into(),
             reason: GONE.into(),
@@ -400,7 +475,14 @@ impl Bridge {
     /// The sessions in the table, for tests.
     #[cfg(test)]
     fn live(&self) -> usize {
-        self.sessions().len()
+        self.table().sessions.len()
+    }
+
+    /// The opens waiting on the mint in flight, for tests.
+    #[cfg(test)]
+    fn joined(&self) -> usize {
+        let current = self.current();
+        current.minting.as_ref().map_or(0, |m| m.receiver_count())
     }
 }
 

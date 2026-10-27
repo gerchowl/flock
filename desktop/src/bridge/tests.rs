@@ -7,6 +7,7 @@ use std::{
         atomic::{AtomicU64, AtomicUsize},
         mpsc::{Receiver, SyncSender},
     },
+    time::Duration,
 };
 
 use serde_json::{json, Value};
@@ -18,7 +19,7 @@ use tokio::{
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 
 use super::*;
-use crate::mint::parse_reply;
+use crate::mint::{parse_reply, NO_ANSWER};
 
 type Server = WebSocketStream<UnixStream>;
 
@@ -119,11 +120,11 @@ impl Harness {
         let (mints, refuse_mint) = (Arc::new(AtomicUsize::new(0)), Arc::new(Mutex::new(None)));
         let hold_mint: MintGate = Default::default();
         let (count, refuse, hold) = (mints.clone(), refuse_mint.clone(), hold_mint.clone());
-        let mint: Mint = Arc::new(move || {
+        let mint: Mint = Arc::new(move |_| {
             let held = hold.lock().unwrap().take();
             if let Some((entered, release)) = held {
-                entered.send(()).unwrap();
-                release.recv().unwrap();
+                let _ = entered.send(());
+                let _ = release.recv();
             }
             if let Some(message) = refuse.lock().unwrap().clone() {
                 return Err(message);
@@ -171,6 +172,64 @@ impl Harness {
     fn mints(&self) -> usize {
         self.mints.load(Ordering::Relaxed)
     }
+
+    /// Holds the next mint: `entered` hears when it starts, and it answers
+    /// once `release` sends.
+    fn hold(&self) -> (Receiver<()>, SyncSender<()>) {
+        let (entered_tx, entered) = std::sync::mpsc::sync_channel(1);
+        let (release, release_rx) = std::sync::mpsc::sync_channel(1);
+        *self.hold_mint.lock().unwrap() = Some((entered_tx, release_rx));
+        (entered, release)
+    }
+
+    /// An open on its own task, for opens that overlap.
+    fn spawn_open(
+        &self,
+        renew: bool,
+    ) -> (
+        tokio::task::JoinHandle<Result<Opened, String>>,
+        UnboundedReceiver<Event>,
+    ) {
+        let (tx, events) = mpsc::unbounded_channel();
+        let sink: Sink = Arc::new(move |event| tx.send(event).is_ok());
+        let bridge = self.bridge.clone();
+        let open = tokio::spawn(async move { bridge.open(OWNER, renew, sink).await });
+        (open, events)
+    }
+}
+
+/// Until a held mint has started.
+async fn wait_entered(entered: Receiver<()>) {
+    let started = tokio::task::spawn_blocking(move || entered.recv());
+    settled(started).await.unwrap().unwrap();
+}
+
+/// Yields until `done`, for a state the test cannot await.
+async fn until(done: impl Fn() -> bool) {
+    settled(async {
+        while !done() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+}
+
+/// The bearer each of the sessions `ids` sent, sorted: one connection each.
+async fn bearers(h: &mut Harness, ids: &[u64]) -> Vec<String> {
+    let mut servers = Vec::new();
+    for _ in ids {
+        servers.push(h.fake.accept().await);
+    }
+    for id in ids {
+        h.bridge.send(*id, HELLO.into()).unwrap();
+    }
+    let mut tokens = Vec::new();
+    for server in &mut servers {
+        let hello: Value = serde_json::from_str(&text(server).await).unwrap();
+        tokens.push(hello["token"].as_str().unwrap().to_owned());
+    }
+    tokens.sort();
+    tokens
 }
 
 const HELLO: &str = r#"{"t":"hello","protocol":1,"client":{"name":"flock-gui"}}"#;
@@ -592,12 +651,18 @@ async fn every_rejection_says_why_and_offers_the_remote_path_never_the_bearer() 
         .into_iter()
         .map(|mut replies| {
             replies.reverse();
-            crate::mint::mint_with(|| replies.pop().unwrap(), || Ok(())).unwrap_err()
+            let left = || DEADLINE;
+            crate::mint::mint_with(|_| replies.pop().unwrap(), || Ok(()), left).unwrap_err()
         })
         .collect();
     let mut no_start = vec![Err(crate::mint::Failure::NoServer)];
     whys.push(
-        crate::mint::mint_with(|| no_start.pop().unwrap(), || Err(echo.clone())).unwrap_err(),
+        crate::mint::mint_with(
+            |_| no_start.pop().unwrap(),
+            || Err(echo.clone()),
+            || DEADLINE,
+        )
+        .unwrap_err(),
     );
     whys.push(crate::mint::ptrace_guard(|| Ok("0".into())).unwrap_err());
     let mut messages = Vec::new();
@@ -657,25 +722,195 @@ async fn a_server_that_never_answers_the_upgrade_is_an_outage_within_the_deadlin
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_hung_mint_does_not_block_another_open() {
+async fn two_concurrent_opens_share_one_mint_and_its_bearer() {
     let mut h = Harness::new(None, true);
+    let (entered, release) = h.hold();
+    let (first, _first_events) = h.spawn_open(false);
+    wait_entered(entered).await;
+    // The first open's mint is in flight: this one joins it, minting nothing.
+    let (second, _second_events) = h.spawn_open(false);
+    until(|| first.is_finished() || second.is_finished() || h.bridge.joined() == 2).await;
+    release.send(()).unwrap();
+    let first = settled(first).await.unwrap().unwrap();
+    let second = settled(second).await.unwrap().unwrap();
+    assert!(first.fresh && second.fresh);
+    let tokens = bearers(&mut h, &[first.id, second.id]).await;
+    assert_eq!(tokens, ["bearer-1", "bearer-1"]);
+    assert_eq!(h.mints(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_mint_that_never_answers_rejects_every_waiter_at_the_deadline() {
+    let h = Harness::new(None, true);
+    let (_entered, release) = h.hold();
+    let started = tokio::time::Instant::now();
+    let (first, _) = h.spawn_open(false);
+    let (second, _) = h.spawn_open(true);
+    until(|| first.is_finished() || second.is_finished() || h.bridge.joined() == 2).await;
+    // The held mint keeps the paused clock still; the test moves it.
+    tokio::time::advance(DEADLINE - Duration::from_millis(1)).await;
+    assert!(!first.is_finished() && !second.is_finished());
+    tokio::time::advance(Duration::from_millis(1)).await;
+    // No timer can fire for the test while the mint holds the clock: yield.
+    for _ in 0..1000 {
+        if first.is_finished() && second.is_finished() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        first.is_finished() && second.is_finished(),
+        "a waiter outlived the deadline"
+    );
+    for open in [first, second] {
+        assert_eq!(open.await.unwrap(), Err(rejection(NO_ANSWER)));
+    }
+    assert_eq!(started.elapsed(), DEADLINE);
+    release.send(()).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_renewal_joins_the_mint_in_flight_and_never_holds_up_the_current_bearer() {
+    let mut h = Harness::new(None, true);
+    let (_, _, _, first) = h.session(false).await;
+    let (entered, release) = h.hold();
+    let (renewing, _renewing_events) = h.spawn_open(true);
+    wait_entered(entered).await;
+    // An open on the current bearer does not wait for the renewal.
+    let (_, _, _, kept) = settled(h.session(false)).await;
+    assert_eq!(kept, first);
+    let (joining, _joining_events) = h.spawn_open(true);
+    until(|| renewing.is_finished() || joining.is_finished() || h.bridge.joined() == 2).await;
+    release.send(()).unwrap();
+    let renewed = settled(renewing).await.unwrap().unwrap();
+    let joined = settled(joining).await.unwrap().unwrap();
+    assert!(!renewed.fresh && !joined.fresh);
+    let tokens = bearers(&mut h, &[renewed.id, joined.id]).await;
+    assert_eq!(tokens, ["bearer-2", "bearer-2"]);
+    assert_eq!(h.mints(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_open_in_flight_when_its_page_goes_never_enters_the_table() {
+    let mut h = Harness::new(None, true);
+    let (entered, release) = h.hold();
+    let (open, mut events) = h.spawn_open(false);
+    wait_entered(entered).await;
+    h.bridge.webview_gone(OWNER);
+    release.send(()).unwrap();
+    assert!(settled(open).await.unwrap().is_ok());
+    let mut server = h.fake.accept().await;
+    match settled(server.next()).await {
+        Some(Ok(Message::Close(Some(frame)))) => assert_eq!(u16::from(frame.code), 1001),
+        other => panic!("the server never saw the close: {other:?}"),
+    }
+    assert_eq!(h.bridge.live(), 0);
+    no_events(&mut events);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_open_from_the_new_page_survives_the_old_pages_end() {
+    let mut h = Harness::new(None, true);
+    let (entered, release) = h.hold();
+    let (old, _old_events) = h.spawn_open(false);
+    wait_entered(entered).await;
+    h.bridge.webview_gone(OWNER);
+    // The reloaded page opens while the old page's open is still minting.
+    let (new, _new_events) = h.spawn_open(false);
+    until(|| old.is_finished() || new.is_finished() || h.bridge.joined() == 2).await;
+    release.send(()).unwrap();
+    settled(old).await.unwrap().unwrap();
+    let new = settled(new).await.unwrap().unwrap();
+    let mut servers = [h.fake.accept().await, h.fake.accept().await];
+    h.bridge.send(new.id, HELLO.into()).unwrap();
+    let mut firsts = Vec::new();
+    for server in &mut servers {
+        firsts.push(match settled(server.next()).await {
+            Some(Ok(Message::Close(Some(frame)))) => format!("close {}", u16::from(frame.code)),
+            Some(Ok(Message::Text(text))) => serde_json::from_str::<Value>(&text).unwrap()["t"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+            other => panic!("{other:?}"),
+        });
+    }
+    firsts.sort();
+    assert_eq!(firsts, ["close 1001", "hello"]);
+    assert_eq!(h.bridge.live(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn one_budget_covers_the_mint_its_retry_and_the_upgrade() {
+    let h = Harness::new(None, true);
+    let (entered, release) = h.hold();
+    h.fake.refuse(403, "peer_process_changed", "changed");
+    h.fake.script(Script::Hang);
+    let started = tokio::time::Instant::now();
+    let (open, mut events) = h.spawn_open(false);
+    wait_entered(entered).await;
+    // The mint takes 6 s of the 10; the retried upgrade then hangs.
+    tokio::time::advance(Duration::from_secs(6)).await;
+    release.send(()).unwrap();
+    let opened = tokio::time::timeout(DEADLINE * 2, open).await;
+    assert!(opened
+        .expect("the open hung past its budget")
+        .unwrap()
+        .is_ok());
+    assert_eq!(
+        events.try_recv(),
+        Ok(Event::Close {
+            code: 1006,
+            reason: String::new()
+        })
+    );
+    assert_eq!(started.elapsed(), DEADLINE, "one budget, not one per step");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_gone_page_waits_for_the_servers_close_reply_up_to_the_deadline() {
+    let mut h = Harness::new(None, true);
+    let (_, _events, mut server, _) = h.session(false).await;
+    h.bridge.webview_gone(OWNER);
+    // Read, not yet answered: tungstenite replies on the server's next read.
+    match settled(server.next()).await {
+        Some(Ok(Message::Close(Some(frame)))) => assert_eq!(u16::from(frame.code), 1001),
+        other => panic!("the server never saw the close: {other:?}"),
+    }
+    let started = tokio::time::Instant::now();
+    // The bridge keeps its end open for the reply, then lets go at the deadline.
+    let ended = tokio::time::timeout(DEADLINE * 2, server.get_ref().readable()).await;
+    ended.expect("the bridge never let go").unwrap();
+    assert_eq!(started.elapsed(), DEADLINE);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_4403_that_races_a_reload_is_one_the_page_never_saw() {
+    let mut h = Harness::new(None, true);
+    // The page's channel holds the session's task on its first frame.
     let (entered_tx, entered) = std::sync::mpsc::sync_channel(1);
     let (release, release_rx) = std::sync::mpsc::sync_channel(1);
-    *h.hold_mint.lock().unwrap() = Some((entered_tx, release_rx));
-    let bridge = h.bridge.clone();
-    let (tx, _first_events) = mpsc::unbounded_channel();
-    let sink: Sink = Arc::new(move |event| tx.send(event).is_ok());
-    let first = tokio::spawn(async move { bridge.open(OWNER, false, sink).await });
-    tokio::task::spawn_blocking(move || entered.recv().unwrap())
-        .await
-        .unwrap();
-    // The first open's mint is stuck; this one mints and connects regardless.
-    let (opened, _, _, token) = settled(h.session(false)).await;
-    assert_eq!(token, "bearer-1");
-    assert!(opened.fresh);
+    let gate = Mutex::new(Some((entered_tx, release_rx)));
+    let sink: Sink = Arc::new(move |_| {
+        if let Some((entered, release)) = gate.lock().unwrap().take() {
+            entered.send(()).unwrap();
+            release.recv().unwrap();
+        }
+        true
+    });
+    let opened = h.bridge.open(OWNER, false, sink).await.unwrap();
+    let mut server = h.fake.accept().await;
+    h.bridge.send(opened.id, HELLO.into()).unwrap();
+    text(&mut server).await;
+    // A frame and the 4403 in one write, so the bridge has read both.
+    server.feed(Message::Text("{}".into())).await.unwrap();
+    close_from_server(&mut server, 4403, "revoked").await;
+    wait_entered(entered).await;
+    // The page reloads while the task holds the 4403 it has read.
+    h.bridge.webview_gone(OWNER);
     release.send(()).unwrap();
-    assert!(settled(first).await.unwrap().is_ok());
-    assert_eq!(h.mints(), 2);
+    finish_close(&mut server).await;
+    let (opened, _, _, token) = h.session(false).await;
+    assert_eq!((opened.fresh, token.as_str()), (true, "bearer-2"));
 }
 
 #[tokio::test]

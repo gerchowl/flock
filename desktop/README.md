@@ -41,18 +41,28 @@ server on the same machine"). The init script sets the bundle's
 - **A session belongs to its page.** A reload, a navigation or the window
   closing ends the old page's sessions with 1001 at the server
   (`on_page_load`, `WindowEvent::Destroyed`), and so does a channel the page
-  can no longer receive on; nothing lives on until the token's TTL. A channel
-  that ends without a close tells the page 1006.
-- **Deadlines.** The mint exchange and the upgrade each have 10 s, ADR-0038
-  §3's connect deadline. A mint that runs out rejects; an upgrade that runs
-  out resolves and closes with 1006, an outage. No lock is held across either,
-  so one hung attempt never stalls another open.
-- **One current bearer.** The native side mints when it has none, when the
-  open renews (`renew: true`, at ¾ of `expiresInMs`), when the bearer has run
-  out on a clock that counts sleep, and after the server ends a session on it
-  with 4401 or 4403. A refused bearer is never offered again. Any other close,
-  such as 1006 or 1001, keeps it, so a reconnect mints nothing. `fresh: true`
-  says the open minted without the client causing it.
+  can no longer receive on. Each of these starts a new page generation for
+  the webview's label, so an open the old page began that completes later is
+  closed with 1001 as soon as it connects and never joins the table; the new
+  page's opens are unaffected. Nothing lives on until the token's TTL. A
+  channel that ends without a close tells the page 1006.
+- **One budget per open.** The mint, its one retry and the upgrade, with its
+  one retry, share 10 s, ADR-0038 §3's connect deadline (`mint::DEADLINE`,
+  started in `Bridge::open`). Starting a server waits up to 5 s, `flk`'s own
+  daemon timeout (`src/server/autodetect.rs`), inside that budget: the mint
+  after it gets what is left. An open that runs out during the mint rejects;
+  one that runs out during the upgrade resolves and closes with 1006, an
+  outage. No lock is held across any of it, so a hung server stalls only the
+  opens that need it.
+- **One current bearer, one mint at a time.** The native side mints when it
+  has none, when the open renews (`renew: true`, at ¾ of `expiresInMs`), when
+  the bearer has run out on a clock that counts sleep, and after the server
+  ends a session on it with 4401 or 4403. While a mint is in flight, every
+  open that needs a bearer, renewing or not, waits for that mint and gets its
+  bearer, or its refusal; an open that can use the current bearer does not
+  wait. A refused bearer is never offered again. Any other close, such as
+  1006 or 1001, keeps it, so a reconnect mints nothing. `fresh: true` says the
+  open minted without the client causing it.
 
 **Why no token reaches the webview.** The bearer is the operator's identity
 while the app runs. It stays in the native process: no command returns it, the
@@ -95,7 +105,8 @@ and ends by offering the remote path (#2293), added in one place
 - **"…could not mint a token (code: message)"**: any other mint refusal.
 - **"…refused this app's connection with HTTP <status> (<code>)…"**: an
   upgrade refusal the contract does not name. A defect: report it.
-- **"…did not answer the mint within 10 s"**: the server accepted but hung.
+- **"…did not answer within 10 s"**: the server accepted but did not answer
+  the mint within the open's budget.
 - **"No flk server is running, and starting one failed: …"**: why `flk server`
   could not start, or that it did not listen within 5 s.
 - **Linux, "…ptrace_scope is 0"**: any process of yours could read the token

@@ -1,5 +1,5 @@
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
     collections::HashMap,
     io,
     path::{Path, PathBuf},
@@ -26,7 +26,7 @@ fn mint_scripted(
     let calls = Cell::new(0);
     let started = Cell::new(false);
     let outcome = mint_with(
-        || {
+        |_| {
             calls.set(calls.get() + 1);
             replies.pop().expect("an unscripted request")
         },
@@ -34,6 +34,7 @@ fn mint_scripted(
             started.set(true);
             start
         },
+        || DEADLINE,
     );
     (outcome, calls.get(), started.get())
 }
@@ -106,6 +107,46 @@ fn no_server_starts_one_then_mints() {
     let (outcome, _, _) =
         mint_scripted(vec![Err(Failure::NoServer), Err(Failure::NoServer)], Ok(()));
     assert!(outcome.unwrap_err().contains("did not answer"));
+}
+
+#[test]
+fn the_retry_and_a_server_start_share_the_opens_one_budget() {
+    // An injected clock: each request and the start spend scripted time.
+    let spent = Cell::new(Duration::ZERO);
+    let given = RefCell::new(Vec::new());
+    let left = || DEADLINE.saturating_sub(spent.get());
+    let secs = Duration::from_secs;
+    let mut replies = vec![
+        (secs(0), token()),
+        (secs(4), Err(refused("peer_process_changed"))),
+        (secs(0), Err(Failure::NoServer)),
+    ];
+    let request = |left| {
+        given.borrow_mut().push(left);
+        let (cost, reply) = replies.pop().expect("an unscripted request");
+        spent.set(spent.get() + cost);
+        reply
+    };
+    // `flk`'s own 5 s wait for its server comes out of the same budget.
+    let start = || {
+        spent.set(spent.get() + secs(5));
+        Ok(())
+    };
+    assert!(mint_with(request, start, left).is_ok());
+    assert_eq!(*given.borrow(), [secs(10), secs(5), secs(1)]);
+    // A start that spends the rest leaves no time for a request.
+    spent.set(Duration::ZERO);
+    given.borrow_mut().clear();
+    let request = |left| {
+        given.borrow_mut().push(left);
+        Err(Failure::NoServer)
+    };
+    let start = || {
+        spent.set(DEADLINE);
+        Ok(())
+    };
+    assert_eq!(mint_with(request, start, left).unwrap_err(), NO_ANSWER);
+    assert_eq!(*given.borrow(), [secs(10)]);
 }
 
 #[test]
@@ -261,14 +302,13 @@ fn a_server_that_never_answers_times_the_mint_out() {
     let asked = path.clone();
     std::thread::spawn(move || tx.send(unix::request(&asked, deadline)));
     // A guard on the test, so a request with no deadline fails it, not hangs it.
-    let outcome = rx.recv_timeout(DEADLINE).expect("the request has no deadline");
+    let outcome = rx
+        .recv_timeout(DEADLINE)
+        .expect("the request has no deadline");
     assert!(matches!(outcome, Err(Failure::Timeout)), "{outcome:?}");
     assert!(started.elapsed() >= deadline);
     let (outcome, _, _) = mint_scripted(vec![Err(Failure::Timeout)], Ok(()));
-    assert_eq!(
-        outcome.unwrap_err(),
-        "The flk server did not answer the mint within 10 s."
-    );
+    assert_eq!(outcome.unwrap_err(), NO_ANSWER);
     drop(held.join());
     std::fs::remove_dir_all(dir).unwrap();
 }

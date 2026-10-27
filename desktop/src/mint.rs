@@ -14,9 +14,13 @@ use std::{
 /// The remote path every refusal offers instead (#2293).
 pub const REMOTE: &str = "Connect to it with a one-time code instead (the remote path, #2293).";
 
-/// How long one exchange with the server may take: the mint, or the
-/// `/v1/ws` upgrade. ADR-0038 §3's connect deadline, 10 s per attempt.
+/// How long one open may take, all of it: the mint, its one retry and the
+/// `/v1/ws` upgrade. ADR-0038 §3's connect deadline, 10 s. `bridge::Bridge::open`
+/// is the one place it starts.
 pub const DEADLINE: Duration = Duration::from_secs(10);
+
+/// Why an open ran out of [`DEADLINE`] before the server answered the mint.
+pub const NO_ANSWER: &str = "The flk server did not answer within 10 s.";
 
 /// An app-session token: a bearer secret with operator authority while the app
 /// runs. It has no `Display`, and its `Debug` shows nothing of it.
@@ -48,7 +52,7 @@ impl fmt::Debug for Token {
 pub enum Failure {
     /// No socket, or nobody listening on it.
     NoServer,
-    /// The server accepted but did not answer within [`DEADLINE`].
+    /// The server did not answer within what was left of [`DEADLINE`].
     Timeout,
     Io(String),
     Refused {
@@ -133,24 +137,31 @@ pub fn refusal_message(code: &str, message: &str) -> String {
 }
 
 /// Mints through `request`, retrying `peer_process_changed` once on a fresh
-/// connection and starting a server through `start` when none runs.
+/// connection and starting a server through `start` when none runs. Each
+/// request gets what `left` says remains of the open's one budget, and none
+/// runs once it is spent.
 pub fn mint_with(
-    mut request: impl FnMut() -> Result<Minted, Failure>,
+    mut request: impl FnMut(Duration) -> Result<Minted, Failure>,
     start: impl FnOnce() -> Result<(), String>,
+    left: impl Fn() -> Duration,
 ) -> Result<Minted, String> {
-    let mut reply = request();
+    let mut ask = || match left() {
+        spent if spent.is_zero() => Err(Failure::Timeout),
+        left => request(left),
+    };
+    let mut reply = ask();
     if matches!(reply, Err(Failure::NoServer)) {
         start().map_err(|reason| {
             format!("No flk server is running, and starting one failed: {reason}")
         })?;
-        reply = request();
+        reply = ask();
     }
     if matches!(&reply, Err(Failure::Refused { code, .. }) if code == "peer_process_changed") {
-        reply = request();
+        reply = ask();
     }
     reply.map_err(|failure| match failure {
         Failure::NoServer => "No flk server is running, and the one started did not answer.".into(),
-        Failure::Timeout => "The flk server did not answer the mint within 10 s.".into(),
+        Failure::Timeout => NO_ANSWER.into(),
         Failure::Io(reason) => format!("Talking to the flk server failed: {reason}"),
         Failure::Refused { code, message } => refusal_message(&code, &message),
     })
@@ -197,19 +208,21 @@ mod unix {
         time::{Duration, Instant},
     };
 
-    use super::{Failure, Minted, DEADLINE};
+    use super::{Failure, Minted};
 
     /// `src/server/autodetect.rs`: how long `flk` waits for its daemon, and how often it looks.
     const SERVER_READY_TIMEOUT: Duration = Duration::from_secs(5);
     const SOCKET_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
-    /// One mint from this process, starting a server when none runs.
-    pub fn mint() -> Result<Minted, String> {
+    /// One mint from this process, answered by `until` (the open's
+    /// budget), starting a server when none runs.
+    pub fn mint(until: Instant) -> Result<Minted, String> {
         if cfg!(target_os = "linux") {
             super::ptrace_guard(|| std::fs::read_to_string("/proc/sys/kernel/yama/ptrace_scope"))?;
         }
         let path = super::socket_path(|key| std::env::var(key).ok());
-        super::mint_with(|| request(&path, DEADLINE), || start_server(&path))
+        let left = || until.saturating_duration_since(Instant::now());
+        super::mint_with(|left| request(&path, left), || start_server(&path), left)
     }
 
     /// A fresh connection, one `client.app.mint` line and its reply line,
@@ -263,7 +276,7 @@ mod unix {
 }
 
 #[cfg(not(unix))]
-pub fn mint() -> Result<Minted, String> {
+pub fn mint(_until: std::time::Instant) -> Result<Minted, String> {
     Err("This platform has no flock.sock.".into())
 }
 

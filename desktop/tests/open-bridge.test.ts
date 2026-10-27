@@ -107,9 +107,10 @@ test("a channel that ends without a close closes once with 1006", async () => {
   const socket = session.socket as Socket;
   socket.onmessage = (text) => seen.push(["message", text]);
   socket.onclose = (code, reason) => seen.push(["close", code, reason]);
-  // The end arrives before the one message sent ahead of it.
+  // The end arrives before the one message sent ahead of it, and again.
   fake.endChannel(1);
   fake.deliver(0, { kind: "message", data: "{}" });
+  fake.endChannel(1);
   await settle();
   expect(seen).toEqual([
     ["message", "{}"],
@@ -118,7 +119,7 @@ test("a channel that ends without a close closes once with 1006", async () => {
   expect(fake.callbacks.size).toBe(0);
 });
 
-test("an end after a close adds nothing", async () => {
+test("nothing after a close reaches the socket", async () => {
   const fake = fakeIpc(() => Promise.resolve({ id: 6 }));
   const session = await fake.openBridge({ renew: false });
   const seen: unknown[] = [];
@@ -126,7 +127,8 @@ test("an end after a close adds nothing", async () => {
   socket.onmessage = () => seen.push("message");
   socket.onclose = (code) => seen.push(code);
   fake.deliver(0, { kind: "close", code: 1000, reason: "bye" });
-  fake.endChannel(1);
+  fake.deliver(1, { kind: "message", data: "late" });
+  fake.endChannel(2);
   await settle();
   expect(seen).toEqual([1000]);
 });
