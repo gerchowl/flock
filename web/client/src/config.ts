@@ -16,8 +16,10 @@
  *   here relies on either. The token comes from the one-time code exchange
  *   (`src/wire/token.ts`).
  * - **Tauri v2 shell** (#1601): an initialization script assigns it before
- *   the page loads, with a {@link TokenProvider} that mints a token over
- *   `flock.sock` (zero-touch, ADR-0038 §6).
+ *   the page loads. On the same machine it is a {@link BridgeShellConfig}: the
+ *   native side carries `/v1/ws` over the server's unix socket and keeps the
+ *   bearer it mints over `flock.sock` (zero-touch, ADR-0038 §6, #2500). For a
+ *   remote server it is a wire config with a {@link TokenProvider} (#2293).
  * - **Fixture build** (`vite build --mode fixture`, `just client-preview`):
  *   `src/fixture-shell.ts` runs first and assigns a fixture configuration
  *   with the recorded session bundled in, so the page needs no server.
@@ -66,6 +68,49 @@ export type WireShellConfig = {
   readonly tokenProvider?: TokenProvider;
 };
 
+/**
+ * One bridged session's socket (ADR-0038 §6): the WebSocket subset the
+ * client uses, carrying `/v1/ws`'s JSON text frames and close codes
+ * verbatim. It is open when `openBridge` resolves it, so it has no `onopen`.
+ * The client assigns the three handlers once, at once: `onmessage` receives
+ * each text frame, `onclose` the close code and reason.
+ */
+export type BridgeSocket = {
+  send(text: string): void;
+  close(code?: number, reason?: string): void;
+  onmessage: ((text: string) => void) | null;
+  onclose: ((code: number, reason: string) => void) | null;
+  onerror: (() => void) | null;
+};
+
+/**
+ * A bridged session, and the remaining lifetime of the bearer the native
+ * side used for it (the server's `expires_in_ms`), when it reported one.
+ * `fresh: true` says the native side minted a new bearer for this open, so
+ * the renewal is timed from it; absent or false, the bearer was kept.
+ */
+export type BridgeSession = { readonly socket: BridgeSocket; readonly expiresInMs?: number; readonly fresh?: boolean };
+
+/**
+ * The shell's source of bridged sessions, pull-only: each call is one
+ * session. The client calls it at connect, on the person's Connect, on
+ * every reconnect and, with `expiresInMs`, at ¾ of it, the one call with
+ * `renew: true`. A rejection is a refusal (the native side could not obtain
+ * a bearer), shown with its message and not retried; an unreachable server
+ * resolves a socket that closes with 1006 (`src/wire/provider.ts`).
+ */
+export type OpenBridge = (request: { readonly renew: boolean }) => Promise<BridgeSession>;
+
+/**
+ * Bridge mode: the shell's native side carries `/v1/ws` itself, so the
+ * bearer never enters the webview (#2500). Never beside `serverUrl`, `token`
+ * or `tokenProvider`.
+ */
+export type BridgeShellConfig = {
+  readonly transport: "bridge";
+  readonly openBridge: OpenBridge;
+};
+
 /** Fixture mode: replay a recorded session; no server is contacted. */
 export type FixtureShellConfig = {
   readonly transport: "fixture";
@@ -76,7 +121,7 @@ export type FixtureShellConfig = {
 };
 
 /** What a shell may inject. */
-export type ShellConfig = WireShellConfig | FixtureShellConfig;
+export type ShellConfig = WireShellConfig | BridgeShellConfig | FixtureShellConfig;
 
 /**
  * Injected instead of a {@link ShellConfig} when the shell has none to give:
@@ -97,6 +142,9 @@ export type ConfigResult =
   | { readonly ok: false; readonly error: ConfigError };
 
 const ABSOLUTE_SCHEMES = new Set(["ws:", "wss:", "http:", "https:"]);
+
+/** Why a bridge config with a server or token is refused: the bridge carries both. */
+export const BRIDGE_ALONE = "openBridge carries the session and its bearer itself, so it is never beside serverUrl, token or tokenProvider.";
 
 function refuse(message: string): ConfigResult {
   return { ok: false, error: { message } };
@@ -151,7 +199,8 @@ export function readShellConfig(scope: object): ConfigResult {
   }
   switch (raw["transport"]) {
     case "wire": {
-      const { serverUrl, token, tokenProvider } = raw;
+      const { serverUrl, token, tokenProvider, openBridge } = raw;
+      if (openBridge !== undefined) return refuse(BRIDGE_ALONE);
       if (typeof serverUrl !== "string" || !URL.canParse(serverUrl)) {
         return refuse("serverUrl must be an absolute URL.");
       }
@@ -166,6 +215,12 @@ export function readShellConfig(scope: object): ConfigResult {
       }
       const provider = tokenProvider as TokenProvider | undefined;
       return { ok: true, config: { transport: "wire", serverUrl, ...(token === undefined ? {} : { token }), ...(provider === undefined ? {} : { tokenProvider: provider }) } };
+    }
+    case "bridge": {
+      const { openBridge, serverUrl, token, tokenProvider } = raw;
+      if (serverUrl !== undefined || token !== undefined || tokenProvider !== undefined) return refuse(BRIDGE_ALONE);
+      if (typeof openBridge !== "function") return refuse("A bridge configuration needs an openBridge function.");
+      return { ok: true, config: { transport: "bridge", openBridge: openBridge as OpenBridge } };
     }
     case "fixture": {
       const { fixtureJsonl, source } = raw;
