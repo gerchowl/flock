@@ -96,7 +96,7 @@ export function inputSummary(tool: string, input: JsonValue | undefined): string
   return known === null ? boundText(`(no summary for ${tool})`, TITLE_MAX) : boundText(known, SUMMARY_MAX);
 }
 
-/** A turn retains sparse slots until at least half have been retired. */
+/** Retired tails disappear immediately; interior slots compact when at least half are retired. */
 type FoldTurn = { key: number; entries: (SessionEntry | null)[]; first: number; removed: number };
 /** Numeric locations survive Solid reconciliation without cross-store object aliases. */
 type PermissionLocation = { turn: number; slot: number };
@@ -136,8 +136,8 @@ function permission(entry: SessionEntry): { key: string; canonical: boolean } | 
 
 /**
  * Retire an indexed native twin. Scanning/compaction costs are charged to
- * retired slots: each leading hole is crossed once, and a compaction scans
- * at most twice the number of holes it removes. No later row is shifted.
+ * retired slots: each leading/tail hole is crossed once, and compaction
+ * scans at most twice the holes it removes. No later row is shifted.
  */
 function retireNative(fold: TurnFold, seq: number): void {
   const location = fold.permissionLocations[seq];
@@ -147,6 +147,10 @@ function retireNative(fold: TurnFold, seq: number): void {
   turn.entries[location.slot] = null;
   delete fold.permissionLocations[seq];
   turn.removed++;
+  while (turn.entries.at(-1) === null) {
+    turn.entries.pop();
+    turn.removed--;
+  }
   while (turn.entries[turn.first] === null) turn.first++;
   const first = turn.entries[turn.first];
   if (first == null) {
