@@ -17,6 +17,7 @@ use crate::terminal::{TerminalId, TerminalRuntime, TerminalRuntimeRegistry, Term
 mod aggregate;
 pub(crate) mod git;
 mod tab;
+pub(crate) use tab::Content;
 
 pub(crate) use self::aggregate::{pane_attention_priority, PaneDetail, PaneSignal};
 #[cfg(test)]

@@ -16,7 +16,7 @@ use crate::terminal::{TerminalId, TerminalRuntime, TerminalRuntimeRegistry, Term
 #[allow(dead_code)]
 pub(crate) enum DetachedPane {
     Terminal(PaneId, TerminalId),
-    Native(PaneId, crate::structured::view::Target),
+    Native(PaneId, crate::structured::view::placement::View),
 }
 impl DetachedPane {
     pub fn pane_id(&self) -> PaneId {
@@ -28,7 +28,7 @@ impl DetachedPane {
 /// Exhaustive content classification after checking layout membership.
 pub(crate) enum Content<'a> {
     Terminal(&'a PaneState),
-    Native(&'a crate::structured::view::Target),
+    Native(&'a crate::structured::view::placement::View),
 }
 
 /// A pane removed from its tab for relocation. Carries the live `PaneState`
@@ -65,7 +65,7 @@ pub struct Tab {
     pub layout: TileLayout,
     /// Pane viewport state — always present, testable without PTYs.
     pub panes: HashMap<PaneId, PaneState>,
-    pub(crate) native_views: HashMap<PaneId, crate::structured::view::Target>,
+    pub(crate) native_views: HashMap<PaneId, crate::structured::view::placement::View>,
     #[cfg(test)]
     pub runtimes: HashMap<PaneId, TerminalRuntime>,
     pub zoomed: bool,
