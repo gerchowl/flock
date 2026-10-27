@@ -55,6 +55,7 @@ pub(crate) mod queue_events;
 mod runtime;
 mod session;
 pub mod state;
+mod structured_controller;
 mod structured_placement;
 pub(crate) mod structured_view;
 mod terminal_targets;
@@ -397,6 +398,7 @@ pub struct App {
     pub(crate) input_writes: input_writes::InputWrites,
     directory_snapshot: directory::DirectorySnapshot,
     pub(crate) structured_workers: crate::structured::workers::Workers,
+    structured_views: HashMap<String, crate::structured::view::driver::Driver>,
     queue_events: queue_events::QueueEvents,
     pub(crate) structured_sends: api::structured_queue::Sends,
     pub render_notify: Arc<Notify>,
@@ -780,6 +782,7 @@ impl App {
 
         let mut state = AppState {
             structured_agents,
+            native_frames: HashMap::new(),
             issue_drop: None,
             issue_repo_cache: None,
             terminals: std::collections::HashMap::new(),
@@ -1157,6 +1160,7 @@ impl App {
             input_writes: input_writes::InputWrites::default(),
             directory_snapshot: directory::DirectorySnapshot::default(),
             structured_workers: crate::structured::workers::Workers::new(render_notify.clone()),
+            structured_views: HashMap::new(),
             queue_events: queue_events::QueueEvents::default(),
             structured_sends: api::structured_queue::Sends::default(),
             render_notify,
@@ -1651,6 +1655,7 @@ impl App {
             self.sync_host_mouse_capture(&mut host_mouse_capture_active)?;
 
             if needs_render && self.can_render_now(now) {
+                self.sync_structured_views();
                 self.render_dirty.swap(false, Ordering::AcqRel);
                 let _sync_output = SyncOutputGuard::begin()?;
                 let kitty_graphics_enabled = self.state.kitty_graphics_enabled;
@@ -1745,6 +1750,7 @@ impl App {
                     self.input_rx = None;
                 }
                 LoopEvent::RenderRequested => {
+                    needs_render |= self.sync_structured_views();
                     if self.render_dirty.load(Ordering::Acquire) {
                         needs_render = true;
                     }

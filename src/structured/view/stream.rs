@@ -156,10 +156,10 @@ impl Stream {
                 Page::Record(v) => {
                     let r: queue::Record = serde_json::from_value(v)?;
                     if r.seq > self.queue_cursor {
-                        let items = self
-                            .replacement
-                            .as_mut()
-                            .map_or(&mut self.model.snapshot.queue, |(_, items)| items);
+                        let items = match &mut self.replacement {
+                            Some((_, items)) => items,
+                            None => &mut self.model.snapshot.queue,
+                        };
                         r.change.apply(items)?;
                         self.queue_cursor = r.seq;
                     }
