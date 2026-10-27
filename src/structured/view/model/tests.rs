@@ -102,9 +102,9 @@ fn provenance_usage_tool_correlation_and_owned_facts() {
 #[tokio::test]
 async fn real_fake_partials_reconcile_and_burst_resync() {
     for mode in [
-        "s10b-live-exit",
-        "s10b-live-burst-exit",
-        "s10b-live-interleaved-exit",
+        "s10b-live-lifecycle-exit",
+        "s10b-live-lifecycle-burst-exit",
+        "s10b-live-lifecycle-interleaved-exit",
     ] {
         let notify = Arc::new(Notify::new());
         let (mut registry, mut workers) = (Registry::default(), Workers::new(notify.clone()));
@@ -370,4 +370,228 @@ fn malformed_blocks_and_observed_tools_keep_exact_source_without_permission_auth
             .map(|c| c.id)
             .collect::<Vec<_>>()
     );
+}
+
+#[test]
+fn typed_thinking_has_no_unfolded_raw_source() {
+    let mut m = model();
+    m.history(history::Item::Record(record(1,r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"private thought"}]}}"#,true))).unwrap();
+    assert!(m
+        .snapshot
+        .transcript
+        .iter()
+        .any(|c| matches!(c.content, Content::Thinking(_))));
+    assert!(
+        m.snapshot
+            .transcript
+            .iter()
+            .filter(|c| matches!(c.content, Content::RawJson { .. }))
+            .all(|c| m.snapshot.collapsed.contains(&c.id)),
+        "raw source must not bypass the thinking fold"
+    );
+}
+fn live_value(seq: u64, v: Value) -> live::Item {
+    let r = record(seq, &v.to_string(), true);
+    live::Item::Delta {
+        event: Arc::new(crate::structured::claude::SessionEvent::parse(
+            &r.raw, "2.1.296",
+        )),
+        record: r,
+    }
+}
+#[test]
+fn block_lifecycle_preserves_partial_text() {
+    let mut m = model();
+    let start = json!({"type":"stream_event","api_message_id":"first","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}});
+    m.live(live_value(0, start.clone()));
+    m.live(message_delta(0, "first", "partial"));
+    m.live(live_value(0, start));
+    m.live(live_value(0,json!({"type":"stream_event","api_message_id":"first","event":{"type":"content_block_stop","index":0}})));
+    assert_eq!(m.snapshot.transcript.len(), 1);
+    assert!(contents(&m).any(|c| matches!(c,Content::Markdown(s) if s=="partial")));
+    assert_eq!(m.snapshot.applied_cursor, 0);
+}
+fn permission_record(seq: u64, request_seq: u64, closed: bool) -> history::Item {
+    let mut v = json!({"type":"flk_permission_request","request_id":format!("request-{request_seq}"),"request_seq":request_seq});
+    if closed {
+        v["state"] = json!("closed");
+        v["reason"] = json!("session_ended");
+    } else {
+        v["state"] = json!("open");
+        v["request"] = json!({"subtype":"can_use_tool","tool_name":"Bash","tool_use_id":format!("tool-{request_seq}"),"input":{}});
+    }
+    let mut r = (*record(seq, &v.to_string(), true)).clone();
+    r.origin = RecordOrigin::Flk;
+    history::Item::Record(Arc::new(r))
+}
+#[test]
+fn pending_permissions_survive_the_transcript_window_until_their_own_close() {
+    use crate::structured_wire::PermissionState;
+    let mut m = model();
+    for seq in 1..=20 {
+        m.history(permission_record(seq, seq, false)).unwrap();
+    }
+    assert_eq!(m.snapshot.permissions.len(), 20);
+    assert!(m
+        .snapshot
+        .permissions
+        .iter()
+        .all(|p| matches!(p.state, PermissionState::Open { .. })));
+    let mut orphan = (*record(21, &json!({"type":"flk_permission_request","request_id":"request-1","request_seq":999,"state":"closed","reason":"session_ended"}).to_string(),true)).clone();
+    orphan.origin = RecordOrigin::Flk;
+    m.history(history::Item::Record(Arc::new(orphan))).unwrap();
+    assert_eq!(
+        m.snapshot
+            .permissions
+            .iter()
+            .filter(|p| matches!(p.state, PermissionState::Open { .. }))
+            .count(),
+        20,
+        "a close with another request_seq cannot retire an open"
+    );
+    for seq in 22..=41 {
+        m.history(permission_record(seq, seq - 21, true)).unwrap();
+        assert_eq!(
+            m.snapshot
+                .permissions
+                .iter()
+                .filter(|p| matches!(p.state, PermissionState::Open { .. }))
+                .count(),
+            (41 - seq) as usize
+        );
+    }
+    assert_eq!(m.snapshot.permissions.len(), history::LIVE_RECORDS);
+    assert!(m
+        .snapshot
+        .permissions
+        .iter()
+        .all(|p| matches!(p.state, PermissionState::Closed { .. })));
+    assert_eq!(m.snapshot.permissions[0].request_seq, 5);
+}
+#[test]
+fn live_fold_choice_survives_finalization_and_gap_resync() {
+    for resync in [true, false] {
+        for thinking in [false, true] {
+            for folded in [false, true] {
+                let mut m = model();
+                let delta = if thinking {
+                    json!({"type":"thinking_delta","thinking":"partial"})
+                } else {
+                    json!({"type":"text_delta","text":"partial"})
+                };
+                m.live(live_value(0,json!({"type":"stream_event","api_message_id":"first","event":{"type":"content_block_delta","index":0,"delta":delta}})));
+                let id = m.snapshot.transcript[0].id;
+                if folded {
+                    m.snapshot.collapsed.insert(id);
+                } else {
+                    m.snapshot.collapsed.remove(&id);
+                }
+                if resync {
+                    m.live(live::Item::Gap { through: 1 });
+                    m.live(live_value(1, json!({"type":"stream_event","api_message_id":"first","event":{"type":"content_block_delta","index":0,"delta":delta}})));
+                    let id = m.snapshot.transcript[0].id;
+                    assert_eq!(m.snapshot.collapsed.contains(&id), folded);
+                    m.live(live::Item::Gap { through: 1 });
+                }
+                let block = if thinking {
+                    json!({"type":"thinking","thinking":"partial"})
+                } else {
+                    json!({"type":"text","text":"partial"})
+                };
+                m.history(history::Item::Record(record(
+                    1,
+                    &json!({"type":"assistant","message":{"id":"first","content":[block]}})
+                        .to_string(),
+                    true,
+                )))
+                .unwrap();
+                assert_eq!(
+                    m.snapshot
+                        .collapsed
+                        .contains(&CardId { seq: 1, ordinal: 1 }),
+                    folded,
+                    "resync={resync}, thinking={thinking}"
+                );
+            }
+        }
+    }
+}
+#[test]
+fn window_eviction_reports_earlier_history_without_cursor_progress() {
+    let mut m = model();
+    assert_eq!(m.snapshot.earlier_history, None);
+    for seq in 1..=17 {
+        m.history(history::Item::Record(record(seq, "{}", true)))
+            .unwrap();
+    }
+    assert_eq!(m.snapshot.earlier_history, Some(2));
+    assert_eq!(m.snapshot.applied_cursor, 17);
+    assert!(contents(&m).all(|c| !matches!(c, Content::Gap { .. })));
+}
+#[test]
+fn anonymous_partial_at_final_cursor_belongs_to_the_later_message() {
+    for resync in [false, true] {
+        let mut m = model();
+        m.live(live_value(1,json!({"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"later"}}})));
+        let id = m.snapshot.transcript[0].id;
+        m.snapshot.collapsed.insert(id);
+        if resync {
+            m.live(live::Item::Gap { through: 1 });
+        }
+        m.history(history::Item::Record(record(
+            1,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"first"}]}}"#,
+            true,
+        )))
+        .unwrap();
+        assert!(
+            !m.snapshot
+                .collapsed
+                .contains(&CardId { seq: 1, ordinal: 1 }),
+            "a later block's fold must not apply to the earlier final"
+        );
+        if !resync {
+            assert!(m
+                .snapshot
+                .transcript
+                .iter()
+                .any(|c| c.streaming && matches!(&c.content,Content::Markdown(s) if s=="later")));
+        }
+        m.history(history::Item::Record(record(
+            2,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"later"}]}}"#,
+            true,
+        )))
+        .unwrap();
+        assert!(m
+            .snapshot
+            .collapsed
+            .contains(&CardId { seq: 2, ordinal: 1 }));
+    }
+}
+#[test]
+fn unmatched_or_missing_anonymous_blocks_do_not_unfold_another_message() {
+    for missing in [false, true] {
+        let mut m = model();
+        m.live(live_value(0,json!({"type":"stream_event","event":{"type":"content_block_delta","index":1,"delta":{"type":"thinking_delta","thinking":"earlier"}}})));
+        m.snapshot.collapsed.clear();
+        if missing {
+            m.live(live::Item::Gap { through: 1 });
+            m.history(history::Item::Gap {
+                from: 1,
+                to: 1,
+                reason: history::GapReason::RetainedPrefix,
+            })
+            .unwrap();
+        } else {
+            m.history(history::Item::Record(record(1,r#"{"type":"assistant","message":{"id":"first","content":[{"type":"text","text":"first"}]}}"#,true))).unwrap();
+        }
+        m.history(history::Item::Record(record(2,r#"{"type":"assistant","message":{"id":"second","content":[{"type":"text","text":"second"},{"type":"thinking","thinking":"new thought"}]}}"#,true))).unwrap();
+        assert!(
+            m.snapshot
+                .collapsed
+                .contains(&CardId { seq: 2, ordinal: 2 }),
+            "missing={missing}: an unmatched old preference must not bypass the new thinking fold"
+        );
+    }
 }

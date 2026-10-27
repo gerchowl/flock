@@ -23,6 +23,9 @@ pub(crate) struct Snapshot {
     pub reported_permissions: Option<String>,
     /// Cards in original stream order, retaining stable source identities on updates.
     pub transcript: Vec<Card>,
+    /// Earlier projected history exists before this eviction watermark. Request
+    /// it separately; this is neither a storage gap nor applied cursor progress.
+    pub earlier_history: Option<u64>,
     /// Highest contiguous original cursor actually applied, including explicit gaps.
     /// Resume after this cursor, never after a received or advertised head.
     pub applied_cursor: u64,
@@ -30,8 +33,9 @@ pub(crate) struct Snapshot {
     pub replay: Replay,
     /// Observed counters only, without estimates or fabricated zeroes.
     pub usage: Option<Usage>,
-    /// Permission-book records in durable publication order, never map order.
-    /// A close may lack an earlier open. Displaying a record grants no authority.
+    /// Latest lifecycle observation per permission handle, in publication order.
+    /// Pending opens remain until a matching close; only closed observations are
+    /// windowed. A close may lack an open. Displaying records grants no authority.
     pub permissions: Vec<PermissionRecord>,
     /// Owner FIFO order and lifecycle, never inferred from transcript text.
     /// Admission does not imply delivery, start, or completion.
