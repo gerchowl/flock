@@ -166,3 +166,29 @@ test("permission principal is a literal deterministic token identity", async () 
   expect(close !== null && typeof close === "object" && "principal" in close && close.principal)
     .toBe("0123456789abcdef0123456789abcdef");
 });
+
+test("permission script assigns one valid principal per scripted token", async () => {
+  const identities = new Map<string, Set<string>>();
+  let token: string | undefined;
+  let observations = 0;
+  for (const line of await load("permission-decision")) {
+    if (line.step === "expect" && line.frame.t === "hello") token = line.frame.token ?? undefined;
+    if (line.step !== "send") continue;
+    const frame = line.frame;
+    const principal = frame.t === "welcome" ? frame.principal
+      : frame.t === "ev" && frame.ev !== null && typeof frame.ev === "object" && "principal" in frame.ev
+        ? frame.ev.principal : undefined;
+    if (principal === undefined) continue;
+    expect(token).toBeDefined();
+    expect(typeof principal).toBe("string");
+    expect(principal).toMatch(/^[0-9a-f]{32}$/);
+    if (token === undefined || typeof principal !== "string") throw new Error("unbound principal");
+    const seen = identities.get(token) ?? new Set<string>();
+    seen.add(principal);
+    identities.set(token, seen);
+    observations++;
+  }
+  expect(observations).toBe(2);
+  expect([...identities].map(([token, principals]) => [token, [...principals]]))
+    .toEqual([["fixture-token", ["0123456789abcdef0123456789abcdef"]]]);
+});
