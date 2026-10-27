@@ -152,6 +152,45 @@ impl<R: parking_lot::lock_api::RawMutex> Book<R> {
         });
     }
 }
+/// Notify only after the owning book guard has released, including on unwind.
+struct NotifyOnDrop<'a>(&'a Notify, Option<&'a Notify>);
+impl Drop for NotifyOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.notify_waiters();
+        if let Some(capacity) = self.1 {
+            capacity.notify_waiters();
+        }
+    }
+}
+/// Fields drop in declaration order: unlock the book before waking waiters.
+/// Bundling both fields keeps this order independent of local variable scopes.
+struct PublicationBook<'a, R: parking_lot::lock_api::RawMutex = parking_lot::RawMutex> {
+    book: parking_lot::lock_api::MutexGuard<'a, R, Book>,
+    _wake: NotifyOnDrop<'a>,
+}
+impl<'a, R: parking_lot::lock_api::RawMutex> PublicationBook<'a, R> {
+    fn new(
+        book: parking_lot::lock_api::MutexGuard<'a, R, Book>,
+        ready: &'a Notify,
+        capacity: Option<&'a Notify>,
+    ) -> Self {
+        Self {
+            book,
+            _wake: NotifyOnDrop(ready, capacity),
+        }
+    }
+}
+impl<R: parking_lot::lock_api::RawMutex> std::ops::Deref for PublicationBook<'_, R> {
+    type Target = Book;
+    fn deref(&self) -> &Book {
+        &self.book
+    }
+}
+impl<R: parking_lot::lock_api::RawMutex> std::ops::DerefMut for PublicationBook<'_, R> {
+    fn deref_mut(&mut self) -> &mut Book {
+        &mut self.book
+    }
+}
 struct Capture(Option<u64>, Arc<Mutex<Live>>);
 /// Retained generation source. Cold opening belongs exclusively on an I/O worker.
 #[derive(Clone)]
@@ -201,43 +240,44 @@ pub(crate) enum SubscribeError {
 }
 type SubscribeResult = Result<Reader, SubscribeError>;
 impl Source {
+    fn lock_book(&self) -> PublicationBook<'_> {
+        PublicationBook::new(self.1.lock(), &self.2, Some(&self.4))
+    }
     pub(in crate::structured) fn capture_waker(&self) -> Arc<Notify> {
         self.4.clone()
     }
     pub(in crate::structured) fn subscribe_ready(&self, after: Option<u64>) -> SubscribeResult {
         let live = Arc::new(Mutex::new(Live::default()));
-        let mut book = self
-            .1
-            .try_lock()
-            .ok_or(SubscribeError::Code(ErrorCode::SessionBusy))?;
+        let mut book = PublicationBook::new(
+            self.1
+                .try_lock()
+                .ok_or(SubscribeError::Code(ErrorCode::SessionBusy))?,
+            &self.2,
+            None,
+        );
         #[cfg(test)]
         view_test::pause_subscription();
         // Every lock-owning outcome wakes after release, including refusals.
         // A failed try_lock must not notify itself and turn busy into a spin.
-        let result = (|| {
-            if after.is_some_and(|n| n > book.retained.through) {
-                return Err(SubscribeError::Code(ErrorCode::CursorAhead));
-            }
-            if book.ended {
-                book.register(after, live.clone())
-                    .map_err(SubscribeError::Code)?;
-            } else {
-                self.0
-                    .try_send(Capture(after, live.clone()))
-                    .map_err(|_| SubscribeError::CaptureBusy)?;
-            }
-            Ok(Reader {
-                source: self.clone(),
-                live,
-                current: None,
-                index: 0,
-                stage: 0,
-                closed: false,
-            })
-        })();
-        drop(book);
-        self.2.notify_waiters();
-        result
+        if after.is_some_and(|n| n > book.retained.through) {
+            return Err(SubscribeError::Code(ErrorCode::CursorAhead));
+        }
+        if book.ended {
+            book.register(after, live.clone())
+                .map_err(SubscribeError::Code)?;
+        } else {
+            self.0
+                .try_send(Capture(after, live.clone()))
+                .map_err(|_| SubscribeError::CaptureBusy)?;
+        }
+        Ok(Reader {
+            source: self.clone(),
+            live,
+            current: None,
+            index: 0,
+            stage: 0,
+            closed: false,
+        })
     }
 }
 impl Provider for Source {
@@ -357,9 +397,13 @@ impl Publisher {
         let Ok(Capture(after, live)) = self.1.try_recv() else {
             return false;
         };
-        capture_locked(&self.0 .1, Capture(after, live), snapshot, status);
-        self.0 .2.notify_waiters();
-        self.0 .4.notify_waiters();
+        capture_locked(
+            &self.0 .1,
+            Capture(after, live),
+            snapshot,
+            status,
+            (&self.0 .2, &self.0 .4),
+        );
         true
     }
     pub fn finish(
@@ -367,7 +411,7 @@ impl Publisher {
         snapshot: impl FnOnce() -> Result<Cut, Failure>,
         status: Option<Pending>,
     ) {
-        let mut book = self.0 .1.lock();
+        let mut book = self.0.lock_book();
         match snapshot() {
             Ok(cut) => {
                 if cut.through != book.retained.through || cut.gap != book.retained.gap {
@@ -378,19 +422,16 @@ impl Publisher {
             Err(error) => book.refusal = Some(error.code),
         }
         book.close();
-        drop(book);
-        self.0 .2.notify_waiters();
-        self.0 .4.notify_waiters();
     }
     pub fn publish(&mut self, update: &Update) {
         if let Some(cut) = &update.cut {
-            self.0 .1.lock().publish(
+            self.0.lock_book().publish(
                 cut.clone(),
                 update.pending.clone(),
                 update.offer.as_ref().err().map(|e| e.code),
             );
         } else {
-            let mut book = self.0 .1.lock();
+            let mut book = self.0.lock_book();
             book.refusal = Some(
                 update
                     .offer
@@ -400,13 +441,11 @@ impl Publisher {
             );
             book.close();
         }
-        self.0 .2.notify_waiters();
-        self.0 .4.notify_waiters();
     }
 }
 impl Drop for Publisher {
     fn drop(&mut self) {
-        let mut book = self.0 .1.lock();
+        let mut book = self.0.lock_book();
         if !book.ended {
             book.refusal = Some(ErrorCode::InternalError);
         }
@@ -416,9 +455,6 @@ impl Drop for Publisher {
                 live.lock().refusal = Some(code);
             }
         }
-        drop(book);
-        self.0 .2.notify_waiters();
-        self.0 .4.notify_waiters();
     }
 }
 
@@ -429,8 +465,9 @@ fn capture_locked<R: parking_lot::lock_api::RawMutex>(
     Capture(after, live): Capture,
     snapshot: impl FnOnce() -> Result<Cut, Failure>,
     status: Option<Pending>,
+    notifications: (&Notify, &Notify),
 ) {
-    let mut book = owner.lock();
+    let mut book = PublicationBook::new(owner.lock(), notifications.0, Some(notifications.1));
     if !book.bootstrapped && book.refusal.is_none() {
         match snapshot() {
             Ok(cut) => {
@@ -446,7 +483,6 @@ fn capture_locked<R: parking_lot::lock_api::RawMutex>(
     if let Err(error) = book.register(after, live.clone()) {
         live.lock().refusal = Some(error);
     }
-    drop(book);
 }
 
 #[cfg(test)]
