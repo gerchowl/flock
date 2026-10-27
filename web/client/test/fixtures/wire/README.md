@@ -224,7 +224,7 @@ checks open at 4, close at 5, and permission handle 3. Its driver acknowledges
 stdin over IPC rather than injecting a fixture-only session echo. The open bound
 is `after_ack` (owner's durable-open receipt); close uses `record_delivery` (the
 WebSocket callback). Missing/unknown bounds fail (ADR-0036 #2224, slice-3 ruling).
-Epoch and principal remain exact. Both actual-endpoint welcomes declare
+Epoch and principal remain exact. Actual-endpoint welcomes declare
 `server_version:{"$dynamic":"server_version","source":"build"}`. The Rust driver
 supplies `CARGO_PKG_VERSION` independently of the socket. Missing evidence or a
 mismatch fails; package bumps require no fixture edit. The pure virtual harness
