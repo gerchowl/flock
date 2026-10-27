@@ -126,11 +126,11 @@ mod tests {
         assert!(ws.tabs[0].runtimes.is_empty());
         assert_eq!(ws.tabs[0].panes.len(), 1);
         assert!(ws.tabs[0].membership_valid());
-        assert!(!ws.close_pane(root));
+        assert_eq!(ws.close_pane(root), Ok(false));
         assert_eq!(ws.tabs[0].root_pane, id);
         assert!(ws.tabs[0].membership_valid());
         ws.test_split(Direction::Horizontal);
-        assert!(!ws.close_pane(id));
+        assert_eq!(ws.close_pane(id), Ok(false));
         assert!(ws.tabs[0].native_views.is_empty());
         assert!(ws.tabs[0].membership_valid());
         assert!(state.structured_agents.get(&target.agent_id).is_some());
@@ -143,7 +143,7 @@ mod tests {
             .attach_native_view(target, 0, 0, Direction::Horizontal)
             .unwrap();
         let ws = &mut state.workspaces[0];
-        ws.close_pane(root);
+        ws.close_pane(root).unwrap();
         assert!(matches!(
             ws.take_pane_for_move(id),
             Err(PlacementError::RelocationUnsupported)
