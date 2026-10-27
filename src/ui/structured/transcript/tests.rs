@@ -56,7 +56,7 @@ fn streaming_commonmark_and_controls_survive_fragment_boundaries() {
         .any(|c| c.modifier.contains(Modifier::ITALIC)));
     assert!(b.content.iter().any(|c| c.fg == Color::Cyan));
     assert!(!text(&b).contains('\u{1b}'));
-    assert!(text(&b).contains("\\u{1b}[2J\\r\\t"));
+    assert!(text(&b).contains("\\u{1b}[2J"));
 }
 #[test]
 fn folds_inspection_and_paused_anchor_share_the_drawn_geometry() {
@@ -229,3 +229,78 @@ fn ordered_and_nested_lists_preserve_numbering_and_indentation() {
         assert!(text(&b).contains(expected), "missing {expected:?} in {b:?}");
     }
 }
+
+#[test]
+fn entity_controls_in_each_markdown_context_are_display_safe() {
+    for (entity, raw, escaped) in [
+        ("&#27;", '\u{1b}', "\\u{1b}"),
+        ("&#x9b;", '\u{9b}', "\\u{9b}"),
+        ("&#x85;", '\u{85}', "\\u{85}"),
+        ("&#x202e;", '\u{202e}', "\\u{202e}"),
+    ] {
+        for source in [
+            format!("# {entity}heading"),
+            format!("[{entity}link](https://example.com)"),
+            format!("![{entity}image](https://example.com/image)"),
+            format!("| cell |\n| --- |\n| {entity}value |"),
+        ] {
+            escaped_card(Content::Markdown(source), &raw.to_string(), escaped);
+        }
+        // CommonMark raw HTML preserves references literally, without entity decoding.
+        for source in [
+            format!("<div>{entity}html</div>\n"),
+            format!("inline <span title=\"{entity}\">html</span>"),
+        ] {
+            escaped_card(Content::Markdown(source), &raw.to_string(), entity);
+        }
+    }
+}
+raw_case!(raw_markdown_controls, Content::Markdown);
+raw_case!(raw_text_controls, Content::Text);
+raw_case!(raw_request_input_controls, |raw| {
+    Content::ToolRequest(serde_json::from_value(serde_json::json!({"tool_name": "Bash", "input": {"command": raw}, "tool_use_id": "use-1", "subtype": "can_use_tool"})).unwrap())
+});
+raw_case!(raw_result_title_controls, |raw| Content::ToolResult {
+    tool_use_id: raw,
+    text: "result".into(),
+    is_error: false
+});
+#[test]
+fn crlf_markdown_preserves_paragraphs_without_literal_carriage_returns() {
+    let b = draw(&compute(
+        &[card(
+            1,
+            Content::Markdown("# Heading\r\n\r\nparagraph\r\nnext".into()),
+        )],
+        &BTreeSet::new(),
+        Some(1),
+        Rect::new(0, 0, 60, 10),
+    ));
+    assert!(text(&b).contains("Heading"));
+    assert!(text(&b).contains("paragraph"));
+    assert!(!text(&b).contains("\\r"));
+    assert!(!text(&b).contains('\r'));
+}
+#[test]
+fn tab_indented_code_and_tab_list_markers_keep_markdown_structure() {
+    let b = draw(&compute(
+        &[card(
+            1,
+            Content::Markdown("\tlet value = 1;\n\n-\titem".into()),
+        )],
+        &BTreeSet::new(),
+        Some(1),
+        Rect::new(0, 0, 60, 10),
+    ));
+    assert!(text(&b).contains("let value = 1;"));
+    assert!(b.content.iter().any(|c| c.fg == Color::Cyan));
+    assert!(text(&b).contains("• item"));
+    assert!(!text(&b).contains("\\t"));
+}
+
+raw_case!(raw_html_controls, |raw| Content::Markdown(format!(
+    "<div>{raw}</div>\n"
+)));
+raw_case!(raw_inline_html_controls, |raw| Content::Markdown(format!(
+    "inline <span title=\"{raw}\">html</span>"
+)));
