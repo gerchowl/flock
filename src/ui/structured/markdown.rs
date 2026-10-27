@@ -7,8 +7,8 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 /// Escape Cc except LF, Unicode 17 Cf, and line/paragraph separators.
-/// Joiners, soft hyphens, bidi controls and tags deliberately display as escapes;
-/// ordinary combining marks retain their glyph behavior.
+/// Joiners, soft hyphens, bidi controls and tags deliberately display as escapes.
+/// Ordinary combining marks retain their glyph behavior.
 /// Cf ranges follow the [Unicode category data](https://www.unicode.org/Public/17.0.0/ucd/extracted/DerivedGeneralCategory.txt).
 pub(super) fn safe(text: &str) -> String {
     text.chars()
