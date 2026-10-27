@@ -1414,8 +1414,10 @@ The credential lives only in server memory, is not listed among file tokens,
 and grants exactly `read`, `send`, `answer`, `operate` for a fixed 12 hours.
 `issued.info.expires_in_ms` is the server-computed remaining lifetime at
 issuance, as an unsigned integer number of milliseconds. It uses the same
-clock and deadline as the store enforces (currently monotonic; #2489 owns
-the clock-policy decision), so wall-clock skew does not affect this value.
+clock and deadline as the store enforces: suspend-inclusive elapsed time
+(`CLOCK_BOOTTIME` on Linux, `mach_continuous_time` on macOS, per #2489).
+Machine sleep counts toward the TTL; changes to the wall clock cannot extend
+it. Absolute timers use that same clock, including for idle socket expiry.
 Use it to renew before expiry instead of hard-coding the TTL. This optional
 additive field is absent for persistent file tokens and may be absent from
 older servers. It is an issuance snapshot, not a sliding lifetime.

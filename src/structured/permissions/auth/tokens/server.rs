@@ -65,6 +65,14 @@ impl Store {
         })
     }
 
+    /// Await the app credential's enforcing clock, independently of transport heartbeats.
+    #[cfg(feature = "web")]
+    pub(crate) async fn app_expired(&self, session: &Session) -> io::Result<()> {
+        match session.app() {
+            Some(app) => self.apps.expired(app).await,
+            None => std::future::pending().await,
+        }
+    }
     /// Recheck the original source under its shared fence through bounded dispatch.
     pub(crate) fn admit<T>(
         &self,

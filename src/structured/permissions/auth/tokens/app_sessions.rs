@@ -2,22 +2,40 @@
 //! The server owner shares this source with socket minting and transport admission.
 use super::*;
 use crate::platform::process_exit::ExitWatch;
-use std::{collections::HashMap, sync::Arc, time::Instant};
+use std::{collections::HashMap, sync::Arc};
 use tokio::sync::watch;
 
 const CAPACITY: usize = 128;
 /// Fixed lifetime; renewal always issues a different bearer and principal.
 pub(crate) const TTL: Duration = Duration::from_secs(12 * 60 * 60);
-/// Monotonic time supplied by the owning server, never serialized or wall-clock based.
+/// Fallible clock wait, owned by the caller's async reactor rather than a blocking worker.
+#[cfg(any(feature = "web", test))]
+pub(crate) type Wait<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<()>> + Send + 'a>>;
+/// Supplied non-settable elapsed clock, including suspend, in one deadline domain.
 pub(crate) trait Clock: Send + Sync {
-    /// Read the current monotonic instant without blocking.
-    fn now(&self) -> Instant;
+    /// Read elapsed time; unavailable clock evidence withholds authorization.
+    fn now(&self) -> io::Result<Duration>;
+    /// Await the same clock's absolute deadline without polling.
+    #[cfg(any(feature = "web", test))]
+    fn until(&self, deadline: Duration) -> Wait<'_>;
 }
-/// Production monotonic clock; tests supply the same explicit time domain.
-pub(crate) struct SystemClock;
-impl Clock for SystemClock {
-    fn now(&self) -> Instant {
-        Instant::now()
+/// Production suspend-inclusive clock: CLOCK_BOOTTIME or mach_continuous_time.
+#[derive(Default)]
+pub(crate) struct SystemClock<R = crate::platform::suspend_clock::Kernel>(pub(crate) R);
+impl SystemClock {
+    /// Use the production kernel reader.
+    pub(crate) fn new() -> Self {
+        Self(crate::platform::suspend_clock::Kernel)
+    }
+}
+impl<R: crate::platform::suspend_clock::Read> Clock for SystemClock<R> {
+    fn now(&self) -> io::Result<Duration> {
+        crate::platform::suspend_clock::now(&self.0)
+    }
+    #[cfg(any(feature = "web", test))]
+    fn until(&self, deadline: Duration) -> Wait<'_> {
+        Box::pin(crate::platform::suspend_clock::until(deadline))
     }
 }
 /// Peer evidence failures stay distinct from entropy, storage and admission failures.
@@ -46,7 +64,7 @@ pub(crate) struct Session {
     /// Server-issued identity and fixed operator scopes.
     pub(crate) info: TokenInfo,
     /// Fixed expiry in the supplied clock domain, never extended by lookup.
-    pub(crate) expires: Instant,
+    pub(crate) expires: Duration,
     /// Retained kernel evidence for readiness-driven owner scheduling.
     pub(crate) process: Arc<ExitWatch>,
     /// Changes after fenced removal; owner drop closes the sender.
@@ -127,7 +145,7 @@ impl Store {
         let process = Arc::new(watch);
         let _guard = self.files.lock()?;
         let mut entries = self.entries.lock().map_err(|_| TokenError::Unsafe)?;
-        Self::sweep_entries(&mut entries, self.clock.now())?;
+        Self::sweep_entries(&mut entries, self.clock.now().map_err(TokenError::from)?)?;
         if entries.len() == CAPACITY {
             return Err(TokenError::Busy.into());
         }
@@ -137,15 +155,20 @@ impl Store {
             return Err(TokenError::Unsafe.into());
         }
         let principal = self.files.random::<16>()?;
-        let issued_at = self.clock.now();
-        let expires = issued_at + TTL;
+        let issued_at = self.clock.now().map_err(TokenError::from)?;
+        let expires = issued_at.checked_add(TTL).ok_or(TokenError::Unsafe)?;
         let info = TokenInfo {
             name: format!("app:{principal}"),
             principal,
             scopes: operator_scopes(),
             expires_in_ms: Some(
-                u64::try_from(expires.duration_since(issued_at).as_millis())
-                    .map_err(|_| TokenError::Unsafe)?,
+                u64::try_from(
+                    expires
+                        .checked_sub(issued_at)
+                        .ok_or(TokenError::Unsafe)?
+                        .as_millis(),
+                )
+                .map_err(|_| TokenError::Unsafe)?,
             ),
         };
         let (revoke, revoked) = watch::channel(false);
@@ -164,10 +187,15 @@ impl Store {
         );
         Ok(Issued { info, token })
     }
+    /// Await expiry in the exact clock domain used for issuance and admission.
+    #[cfg(feature = "web")]
+    pub(crate) async fn expired(&self, session: &Session) -> io::Result<()> {
+        self.clock.until(session.expires).await
+    }
     fn current(&self, digest: &[u8; 32]) -> Result<Session, TokenError> {
         let entries = self.entries.lock().map_err(|_| TokenError::Unsafe)?;
         let entry = entries.get(digest).ok_or(TokenError::Revoked)?;
-        if self.clock.now() >= entry.session.expires || entry.session.process.exited()? {
+        if self.clock.now()? >= entry.session.expires || entry.session.process.exited()? {
             return Err(TokenError::Revoked);
         }
         Ok(entry.session.clone())
@@ -222,7 +250,7 @@ impl Store {
             Ok(())
         })
     }
-    fn sweep_entries(entries: &mut Entries, now: Instant) -> Result<(), TokenError> {
+    fn sweep_entries(entries: &mut Entries, now: Duration) -> Result<(), TokenError> {
         let mut ended = Vec::new();
         for (digest, entry) in entries.iter() {
             if now >= entry.session.expires || entry.session.process.exited()? {
@@ -239,7 +267,7 @@ impl Store {
     #[cfg_attr(not(test), allow(dead_code))] // Automatic per-session retirement uses revoke; bulk sweep remains tested.
     pub(crate) fn sweep(&self) -> Result<(), TokenError> {
         self.mutation()?
-            .finish(|entries| Self::sweep_entries(entries, self.clock.now()))
+            .finish(|entries| Self::sweep_entries(entries, self.clock.now()?))
     }
 }
 #[cfg(test)]

@@ -50,7 +50,7 @@ impl App {
                 .get(
                     &crate::session::data_dir(),
                     std::sync::Arc::new(
-                        crate::structured::permissions::auth::tokens::app_sessions::SystemClock,
+                        crate::structured::permissions::auth::tokens::app_sessions::SystemClock::new(),
                     ),
                 )
                 .map_err(
