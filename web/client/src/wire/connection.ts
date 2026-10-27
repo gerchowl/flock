@@ -29,8 +29,17 @@
  * **The outbox:** see `outbox.ts`. Commands go out only in Live.
  *
  * Every timer runs on the injected {@link Clock}; every socket comes from the
- * injected {@link SocketFactory}. The connection is synchronous: each socket
- * or timer callback runs to completion, with no microtasks of its own.
+ * injected {@link SocketFactory}, or, bridged, from the shell. The connection
+ * is synchronous: each socket or timer callback runs to completion, with no
+ * microtasks of its own.
+ *
+ * **Bridged** (ADR-0038 §6, #2500): the shell's native side carries `/v1/ws`
+ * and holds the bearer, so `hello` carries no token, and each attempt runs on
+ * a session the shell opened: {@link WireConnection.setSocket} hands one over,
+ * open, and an attempt without one waits for it in Connecting under the
+ * connect deadline ({@link WireConnection.awaitingSession}). Everything after
+ * the socket is the same code: a 1006 or 1008 close is Socket lost, and 4401
+ * or 4403 is NeedsToken.
  *
  * Reading of S7a's scripts where ADR-0038 §3 is silent: a `sub` that has
  * not yet settled on this connection takes a Live connection back to
@@ -55,8 +64,9 @@ import type { WireClient } from "../gen/WireClient";
 import type { WireError } from "../gen/WireError";
 import type { WireEvent } from "../gen/WireEvent";
 import type { JsonValue } from "../gen/serde_json/JsonValue";
+import type { BridgeSocket } from "../config";
 import { decodeServerFrame } from "./decode";
-import { backoffDelay, uuidv7, type Clock, type KeyValueStore, type SocketFactory, type SocketLike, type TimerHandle } from "./env";
+import { backoffDelay, bridgeSocket, uuidv7, type Clock, type KeyValueStore, type SocketFactory, type SocketLike, type TimerHandle } from "./env";
 import { Outbox, type OutboxEntry } from "./outbox";
 
 /**
@@ -137,14 +147,21 @@ export interface StreamHandler {
 /** One subscription, as {@link WireConnection.streams} reports it. */
 export type StreamStatus = { readonly stream: string; readonly state: StreamState; readonly cursor: number | null };
 
+/** Where each attempt's socket comes from. */
+export type Endpoint =
+  | {
+      readonly url: string;
+      /** The token for `hello`; null connects straight into NeedsToken. */
+      readonly token: string | null;
+      readonly sockets: SocketFactory;
+    }
+  /** The shell's bridge: sessions arrive through {@link WireConnection.setSocket}, and `hello` has no token. */
+  | { readonly bridged: true };
+
 /** What the connection was created with. */
-export type ConnectionOptions = {
-  readonly url: string;
-  /** The token for `hello`; null connects straight into NeedsToken. */
-  readonly token: string | null;
+export type ConnectionOptions = Endpoint & {
   readonly client: WireClient;
   readonly clock: Clock;
-  readonly sockets: SocketFactory;
   readonly random: () => number;
   readonly store: KeyValueStore;
   /** Applied cursors by stream, to resume from (in memory only, see above). */
@@ -197,6 +214,10 @@ export class WireConnection {
   #state: ConnectionState = "Disconnected";
   #token: string | null;
   #socket: SocketLike | null = null;
+  /** Bridged: a session the shell opened for the next attempt. */
+  #pending: SocketLike | null = null;
+  /** Bridged: the attempt in Connecting waits for the shell's session. */
+  #awaiting = false;
   #generation = 0;
   #attempt = 0;
   #acks = 0;
@@ -216,7 +237,7 @@ export class WireConnection {
 
   constructor(options: ConnectionOptions) {
     this.#options = options;
-    this.#token = options.token;
+    this.#token = "bridged" in options ? null : options.token;
     this.#cursors = new Map(Object.entries(options.cursors ?? {}));
     this.#outbox = new Outbox(options.store, () => this.#changed());
   }
@@ -224,6 +245,11 @@ export class WireConnection {
   /** The connection state. */
   get state(): ConnectionState {
     return this.#state;
+  }
+
+  /** Bridged: an attempt waits in Connecting for the shell to open a session. */
+  get awaitingSession(): boolean {
+    return this.#awaiting;
   }
 
   /** The latest failure, shown while reconnecting or stopped; never a token. */
@@ -286,6 +312,8 @@ export class WireConnection {
   /** The user's `disconnect`: closes any socket, cancels retries, holds the outbox. */
   disconnect(): void {
     this.#abandon(NORMAL, "disconnect");
+    this.#pending?.close(NORMAL, "disconnect");
+    this.#pending = null;
     this.#clear("backoff");
     this.#enter("Disconnected");
   }
@@ -297,6 +325,33 @@ export class WireConnection {
   setToken(token: string): void {
     this.#token = token;
     if (this.#state === "NeedsToken") this.#attemptNow();
+  }
+
+  /**
+   * Bridged: a session the shell opened, for the attempt waiting on one or,
+   * from NeedsToken, the attempt it starts. Otherwise it is held for the
+   * next attempt, until it closes or a Disconnect closes it.
+   */
+  setSocket(socket: BridgeSocket): void {
+    const held = bridgeSocket(socket);
+    held.onclose = () => {
+      if (this.#pending === held) this.#pending = null;
+    };
+    this.#pending?.close(NORMAL, "replaced");
+    this.#pending = held;
+    if (this.#awaiting || this.#state === "NeedsToken") this.#attemptNow();
+  }
+
+  /**
+   * Bridged: the shell could not open a session (a refusal, never an
+   * outage): NeedsToken, until {@link setSocket}. A session the person
+   * stopped, or one already in NeedsToken, stays as it is.
+   */
+  sessionRefused(): void {
+    if (!("bridged" in this.#options) || this.#state === "Disconnected" || this.#state === "NeedsToken") return;
+    this.#abandon(NORMAL, "the shell refused the session");
+    this.#clear("backoff");
+    this.#enter("NeedsToken");
   }
 
   /** A network change: ends a backoff wait with one immediate attempt. */
@@ -430,20 +485,36 @@ export class WireConnection {
 
   #attemptNow(): void {
     this.#clear("backoff");
+    const endpoint = this.#options;
+    if ("bridged" in endpoint) {
+      // The shell opened it already: the attempt starts on it, open, or waits for one.
+      const session = this.#pending;
+      this.#pending = null;
+      this.#begin(() => session, session === null);
+      if (session !== null) this.#opened();
+      return;
+    }
     if (this.#token === null) {
       this.#enter("NeedsToken");
       return;
     }
+    this.#begin(() => endpoint.sockets(endpoint.url), false);
+  }
+
+  /** Enters Connecting under the connect deadline, on the socket `open` gives, or `awaiting` the shell's session. */
+  #begin(open: () => SocketLike | null, awaiting: boolean): void {
     const generation = ++this.#generation;
+    this.#awaiting = awaiting;
     this.#enter("Connecting");
-    const socket = this.#options.sockets(this.#options.url);
+    const socket = open();
+    this.#arm("connect", DEADLINES.connect, () => this.#lost(NORMAL, "the connect deadline (10 s) elapsed"));
+    if (socket === null) return;
     this.#socket = socket;
     const current = (): boolean => generation === this.#generation;
     socket.onopen = () => current() && this.#opened();
     socket.onmessage = (event) => current() && this.#frame(event.data);
     socket.onclose = (event) => current() && this.#closed(event.code, event.reason);
     socket.onerror = () => undefined;
-    this.#arm("connect", DEADLINES.connect, () => this.#lost(NORMAL, "the connect deadline (10 s) elapsed"));
   }
 
   #opened(): void {
@@ -484,6 +555,7 @@ export class WireConnection {
   /** Leaves the current socket: its later callbacks are discarded. */
   #abandon(closeCode: number | null, reason: string): void {
     this.#generation++;
+    this.#awaiting = false;
     for (const timer of ["connect", "handshake", "liveness"] as const) this.#clear(timer);
     for (const sub of this.#subs.values()) this.#stopProgress(sub);
     this.#outbox.socketLost();
