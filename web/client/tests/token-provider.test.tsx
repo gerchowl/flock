@@ -3,17 +3,25 @@
  * asked at connect, after a 4403 and on the person's Connect; kept in memory
  * only; never a token prompt; bounded re-mints. All time and sockets are
  * virtual (ADR-0037).
+ *
+ * The suite runs twice: against a token provider, and against a shell's
+ * `openBridge` (#2500), whose fake plays the native side. Each of its
+ * sessions is a scripted socket that adds the session's bearer to the
+ * client's `hello`, so a reply's token names the bearer that `hello` went
+ * out with, in both modes. A bridge is also asked on every reconnect, where
+ * a provider's token is reused; the few tests with a reconnect say so.
  */
 import { afterEach, describe, expect, test } from "bun:test";
 import { render } from "solid-js/web";
 
 import { App, SHELL_OWNS_TOKENS } from "../src/App";
-import { readShellConfig, type ShellToken, type TokenProvider } from "../src/config";
+import { BRIDGE_ALONE, readShellConfig, type BridgeSocket, type OpenBridge, type ShellToken, type TokenProvider } from "../src/config";
 import type { ServerFrame } from "../src/gen/ServerFrame";
 import { OUTBOX_KEY } from "../src/wire/outbox";
-import { MAX_REMINTS, MAX_TIMER_DELAY, REMINTS_SPENT, RENEW_AT, driveTokenProvider } from "../src/wire/provider";
+import { WireConnection } from "../src/wire/connection";
+import { MAX_REMINTS, MAX_TIMER_DELAY, REMINTS_SPENT, RENEW_AT, driveBridge, driveTokenProvider } from "../src/wire/provider";
 import { RUN_CLIENT_OPEN, type SessionLike } from "../src/wire/token";
-import { Harness, WELCOME, live, sentFrames, step } from "./wire/harness";
+import { FIXTURE_TOKEN, Harness, WELCOME, live, sentFrames, step, type FakeNetwork, type FakeSocket } from "./wire/harness";
 
 let dispose: (() => void) | undefined;
 afterEach(() => {
@@ -28,26 +36,130 @@ const PENDING = { cmd_id: "c0", verb: "agent.send", args: { target: "a", text: "
 const CODE = "a".repeat(64);
 const PANE = "The flk server refused the mint: this app was started from inside a flk pane.";
 
-type Reply = string | ShellToken | { reject: unknown } | { throws: unknown } | { value: unknown } | "deferred";
+type Mode = "provider" | "bridge";
+const MODES: readonly Mode[] = ["provider", "bridge"];
 
-/** A provider that answers `replies` in order (a string is `{ token }`) and counts its calls; "deferred" waits for `resolve`. */
-function provider(...replies: Reply[]) {
-  let release: ((token: ShellToken) => void) | undefined;
-  const ask = Object.assign(
-    (): Promise<ShellToken> => {
-      const reply = replies[ask.calls++];
-      if (reply === undefined) throw new Error("an unscripted provider call");
-      if (reply === "deferred") return new Promise((resolve) => (release = resolve));
-      if (typeof reply === "string") return Promise.resolve({ token: reply });
-      if ("token" in reply) return Promise.resolve(reply);
-      if ("throws" in reply) throw reply.throws;
-      if ("value" in reply) return reply.value as Promise<ShellToken>;
-      return Promise.reject(reply.reject);
+/**
+ * A shell's value: `token` is the bearer; `expiresInMs` is passed on as
+ * given, valid or not. A bridge marks every mint `fresh` unless `fresh`
+ * says otherwise, as an older native side would.
+ */
+type Issued = { readonly token: string; readonly expiresInMs?: unknown; readonly fresh?: unknown };
+type Reply = string | Issued | { reject: unknown } | { throws: unknown } | { value: unknown } | "deferred";
+
+/** The native side's current bearer: when it was minted, and whether the server refused or ended it. */
+type Bearer = Issued & { readonly mintedAt: number; refused: boolean };
+
+/**
+ * A bridged session as the native side opens it on `bearer`: a scripted
+ * socket on `net` that adds the bearer to the client's first frame, the
+ * `hello`, which it records as the client sent it. A 4401 or 4403 marks the
+ * bearer refused, so the next open mints.
+ */
+function bridgedSession(net: FakeNetwork, bearer: Bearer, hellos: Record<string, unknown>[]): BridgeSocket {
+  const fake = net.factory("bridge:") as FakeSocket;
+  let first = true;
+  const socket: BridgeSocket = {
+    send: (text) => {
+      if (!first) return fake.send(text);
+      first = false;
+      const hello = JSON.parse(text) as Record<string, unknown>;
+      hellos.push(hello);
+      fake.send(JSON.stringify({ ...hello, token: bearer.token }));
     },
-    { calls: 0, resolve: (token: string) => release?.({ token }) },
-  );
-  return ask;
+    close: (code = 1000, reason = "") => fake.close(code, reason),
+    onmessage: null,
+    onclose: null,
+    onerror: null,
+  };
+  // Open already: the harness's `open` step finds no handler and does nothing.
+  fake.onmessage = (event) => socket.onmessage?.(event.data as string);
+  fake.onclose = (event) => {
+    if (event.code === 4401 || event.code === 4403) bearer.refused = true;
+    socket.onclose?.(event.code, event.reason);
+  };
+  fake.onerror = () => socket.onerror?.();
+  return socket;
 }
+
+/**
+ * A shell for `mode` that answers `replies` in order (a string is
+ * `{ token }`) and counts its calls; "deferred" waits for `resolve`.
+ *
+ * A bridge plays the native side (ADR-0038 §6, "When the native side
+ * mints"): it keeps one bearer, and only a mint takes the next reply, so
+ * `calls` counts mints, as a provider's calls do. It mints when it has no
+ * bearer, on `renew: true`, and after the server refused or ended the
+ * current one; any other open reuses it, with its remaining lifetime. It
+ * records every open's `renew`, every `hello` its client sent, and when each
+ * session with a lifetime was opened.
+ */
+function provider(mode: Mode, ...replies: Reply[]) {
+  let release: ((issued: Issued) => void) | undefined;
+  let refuse: ((failure: unknown) => void) | undefined;
+  let bearer: Bearer | null = null;
+  const shell = {
+    mode,
+    calls: 0,
+    renews: [] as boolean[],
+    /** When each open was called, beside {@link renews}. */
+    openedAt: [] as number[],
+    hellos: [] as Record<string, unknown>[],
+    lifetimes: [] as { readonly at: number; readonly expiresInMs: number }[],
+    net: null as FakeNetwork | null,
+    resolve: (token: string) => release?.({ token }),
+    /** Rejects the deferred call with `failure`. */
+    reject: (failure: unknown) => refuse?.(failure),
+    /** The native side loses its bearer, so its next open mints one the client did not cause. */
+    forget: () => void (bearer = null),
+    /** A bridge session on a bearer minted outside the script, as before a driver is attached. */
+    open: (token: string): BridgeSocket => session((bearer = { token, mintedAt: network().clock.now(), refused: false })),
+    config: {} as { readonly tokenProvider: TokenProvider } | { readonly openBridge: OpenBridge },
+  };
+  const network = (): FakeNetwork => shell.net ?? (() => { throw new Error("the shell has no network yet"); })();
+  const session = (on: Bearer, expiresInMs?: unknown): BridgeSocket => {
+    if (typeof expiresInMs === "number" && expiresInMs > 0) shell.lifetimes.push({ at: network().clock.now(), expiresInMs });
+    return bridgedSession(network(), on, shell.hellos);
+  };
+  const value = (issued: Issued): unknown => {
+    if (mode === "provider") {
+      if (typeof issued.expiresInMs === "number" && issued.expiresInMs > 0) shell.lifetimes.push({ at: network().clock.now(), expiresInMs: issued.expiresInMs });
+      return issued;
+    }
+    bearer = { ...issued, mintedAt: network().clock.now(), refused: false };
+    const socket = session(bearer, issued.expiresInMs);
+    const fresh = "fresh" in issued ? issued.fresh : true;
+    return { socket, ...("expiresInMs" in issued ? { expiresInMs: issued.expiresInMs } : {}), ...(fresh === false ? {} : { fresh }) };
+  };
+  const answer = (): Promise<unknown> => {
+    const reply = replies[shell.calls++];
+    if (reply === undefined) throw new Error("an unscripted shell call");
+    if (reply === "deferred") return new Promise<Issued>((resolve, reject) => ((release = resolve), (refuse = reject))).then(value);
+    if (typeof reply === "string") return Promise.resolve(value({ token: reply }));
+    if ("token" in reply) return Promise.resolve(value(reply));
+    if ("throws" in reply) throw reply.throws;
+    if ("value" in reply) return reply.value as Promise<unknown>;
+    return Promise.reject(reply.reject);
+  };
+  /** The current bearer again, with what is left of its lifetime. */
+  const reuse = (current: Bearer): Promise<unknown> => {
+    const left = typeof current.expiresInMs === "number" ? current.expiresInMs - (network().clock.now() - current.mintedAt) : undefined;
+    const socket = session(current, left);
+    return Promise.resolve(left !== undefined && left > 0 ? { socket, expiresInMs: left } : { socket });
+  };
+  shell.config =
+    mode === "provider"
+      ? { tokenProvider: () => answer() as Promise<ShellToken> }
+      : {
+          openBridge: ({ renew }) => {
+            shell.renews.push(renew);
+            shell.openedAt.push(network().clock.now());
+            return (!renew && bearer !== null && !bearer.refused ? reuse(bearer) : answer()) as ReturnType<OpenBridge>;
+          },
+        };
+  return shell;
+}
+type Shell = ReturnType<typeof provider>;
 
 /** A page whose fragment the test changes the way pasting a link does. */
 function page(hash = "") {
@@ -66,16 +178,17 @@ function page(hash = "") {
   };
 }
 
-function mount(tokenProvider: TokenProvider | undefined, options: { outbox?: readonly (typeof PENDING)[]; stored?: unknown; code?: string; at?: ReturnType<typeof page> } = {}) {
+function mount(shell: Shell | undefined, options: { outbox?: readonly (typeof PENDING)[]; stored?: unknown; code?: string; at?: ReturnType<typeof page> } = {}) {
   const h = new Harness();
   h.step(step({ step: "given", cursors: {}, outbox: [...(options.outbox ?? [])] }));
+  if (shell !== undefined) shell.net = h.net;
   if (options.stored !== undefined) h.store.setItem(OUTBOX_KEY, JSON.stringify(options.stored));
   const entries = new Map<string, string>();
   const session: SessionLike = { getItem: (key) => entries.get(key) ?? null, setItem: (key, value) => void entries.set(key, value), removeItem: (key) => void entries.delete(key) };
   const requests: string[] = [];
   const root = document.createElement("div");
   document.body.append(root);
-  const config = { ok: true, config: { transport: "wire", serverUrl: "https://flk.invalid", ...(tokenProvider === undefined ? {} : { tokenProvider }) } } as const;
+  const config = { ok: true, config: shell?.mode === "bridge" ? { transport: "bridge", ...shell.config } : { transport: "wire", serverUrl: "https://flk.invalid", ...shell?.config } } as Parameters<typeof App>[0]["config"];
   const request = async (url: string) => {
     requests.push(url);
     return { status: 500, json: async () => null };
@@ -90,6 +203,8 @@ const prompt = (root: HTMLElement): Element | null => root.querySelector('input[
 const click = (root: HTMLElement, selector: string): void => (root.querySelector(selector) as HTMLButtonElement).click();
 const frames = (h: Harness, t: string): Record<string, unknown>[] => sentFrames(h).filter((frame) => (frame as { t: string }).t === t) as Record<string, unknown>[];
 const send = (h: Harness, frame: unknown): void => h.step(step({ step: "send", frame: frame as ServerFrame }));
+/** Sessions the client started: a provider's sockets, or the bridged sessions a `hello` went out on. */
+const started = (h: Harness, mode: Mode): number => (mode === "bridge" ? frames(h, "hello").length : h.net.attempts.length);
 const fleetSubs = (h: Harness): Record<string, unknown>[] => frames(h, "sub").filter((frame) => frame["stream"] === "fleet");
 
 /** Opens the current socket, welcomes it as `principal` and syncs the fleet stream at `seq`: Live. */
@@ -101,20 +216,24 @@ function welcome(h: Harness, seq: number, principal = WELCOME.t === "welcome" ? 
   send(h, { t: "synced", sub_id: fleet, seq });
 }
 
-describe("with a token provider", () => {
+for (const mode of MODES) {
+  describe(`with a shell ${mode}`, () => {
   test("the client connects with its token and shows no token prompt; a reload asks again, nothing is stored", async () => {
-    const first = provider("t1");
+    const first = provider(mode, "t1");
     const { h, root, entries } = mount(first);
-    expect(status(root)).toBe("Signing in…");
+    // A bridged attempt waits for its session in Connecting; a provider's token is asked for in NeedsToken.
+    expect(status(root)).toBe(mode === "bridge" ? "Connecting" : "Signing in…");
     expect(prompt(root)).toBeNull();
     await tick();
-    expect([first.calls, h.net.attempts.length]).toEqual([1, 1]);
+    expect([first.calls, started(h, mode)]).toEqual([1, 1]);
     welcome(h, 0);
     expect(frames(h, "hello").map((frame) => frame["token"])).toEqual(["t1"]);
+    // The client's own `hello` on a bridge carries no token key at all: the native side adds its bearer.
+    expect(first.hellos.map((frame) => "token" in frame)).toEqual(mode === "bridge" ? [false] : []);
     expect(status(root)).toBe("Live");
     expect(entries.size).toBe(0);
     dispose?.();
-    const reloaded = provider("t2");
+    const reloaded = provider(mode, "t2");
     const again = mount(reloaded);
     await tick();
     again.h.step(step({ step: "open" }));
@@ -123,7 +242,7 @@ describe("with a token provider", () => {
   });
 
   test("a 4403 re-mint welcomed as the same principal keeps cursors and the outbox: the queued command goes out with its cmd_id", async () => {
-    const tokens = provider("t1", "t2");
+    const tokens = provider(mode, "t1", "t2");
     const { h, root } = mount(tokens, { outbox: [PENDING] });
     await tick();
     // The first socket applies the fleet up to 7 and is revoked before it is Live, so c0 is still queued.
@@ -133,7 +252,7 @@ describe("with a token provider", () => {
     h.step(step({ step: "token_refused", code: 4403 }));
     expect(prompt(root)).toBeNull();
     await tick();
-    expect([tokens.calls, h.net.attempts.length]).toEqual([2, 2]);
+    expect([tokens.calls, started(h, mode)]).toEqual([2, 2]);
     // The app-session principal is stable across re-mints (ADR-0036's app-session principal).
     h.step(step({ step: "open" }));
     send(h, WELCOME);
@@ -146,7 +265,7 @@ describe("with a token provider", () => {
   });
 
   test("a re-minted token welcomed as another principal drops the outbox and says so, beside the restore problem, until dismissed", async () => {
-    const tokens = provider("t1", "t2");
+    const tokens = provider(mode, "t1", "t2");
     const stored = { principal: "fixture-principal", commands: [PENDING, "junk"] };
     const { h, root } = mount(tokens, { stored });
     await tick();
@@ -171,26 +290,26 @@ describe("with a token provider", () => {
     ["a synchronous throw", { throws: new Error(PANE) }],
   ] as const) {
     test(`a provider failure (${name}) shows its message in NeedsToken, and is not retried`, async () => {
-      const tokens = provider(reply);
+      const tokens = provider(mode, reply);
       const { h, root } = mount(tokens);
       await tick();
       expect(status(root)).toBe(`NeedsToken · ${PANE}`);
       expect(prompt(root)).toBeNull();
       h.clock.advanceTo(h.clock.now() + 120_000);
       await tick();
-      expect([tokens.calls, h.net.attempts.length]).toEqual([1, 0]);
+      expect([tokens.calls, started(h, mode)]).toEqual([1, 0]);
     });
   }
 
   test("a provider that returns no promise lands in NeedsToken, never a crash", async () => {
-    const { h, root } = mount(provider({ value: undefined }));
+    const { h, root } = mount(provider(mode, { value: undefined }));
     await tick();
-    expect(status(root)).toBe("NeedsToken · The shell gave no token.");
-    expect(h.net.attempts).toHaveLength(0);
+    expect(status(root)).toBe(`NeedsToken · ${mode === "bridge" ? "The shell gave no bridge session." : "The shell gave no token."}`);
+    expect(started(h, mode)).toBe(0);
   });
 
   test("after a failure, Connect asks the provider again", async () => {
-    const tokens = provider({ reject: PANE }, "t2");
+    const tokens = provider(mode, { reject: PANE }, "t2");
     const { h, root } = mount(tokens);
     await tick();
     click(root, '[data-testid="shell-connect"]');
@@ -201,7 +320,7 @@ describe("with a token provider", () => {
   });
 
   test("after a server restart, the welcomed token refused at hello (4401) is one re-mint: Live as the same principal, the outbox kept", async () => {
-    const tokens = provider("t1", "t2");
+    const tokens = provider(mode, "t1", "t2");
     const { h, root } = mount(tokens, { outbox: [PENDING] });
     await tick();
     // Welcomed, then the server goes away; c0 is still queued (the fleet never synced).
@@ -209,6 +328,8 @@ describe("with a token provider", () => {
     send(h, WELCOME);
     h.step(step({ step: "drop" }));
     h.clock.advanceTo(h.clock.now() + 30_000);
+    // A bridge's reconnect opens a session on the same bearer: the native side mints nothing for a 1006.
+    await tick();
     // The restarted server no longer knows t1.
     h.step(step({ step: "open" }));
     h.step(step({ step: "token_refused", code: 4401 }));
@@ -221,7 +342,7 @@ describe("with a token provider", () => {
   });
 
   test("a never-welcomed token refused at hello counts toward the streak: re-minted on the backoff, and the cap holds", async () => {
-    const tokens = provider(...Array.from({ length: MAX_REMINTS + 1 }, (_, index) => `t${index}`));
+    const tokens = provider(mode, ...Array.from({ length: MAX_REMINTS + 1 }, (_, index) => `t${index}`));
     const { h, root } = mount(tokens);
     await tick();
     for (let refused = 1; refused <= MAX_REMINTS + 1; refused++) {
@@ -236,7 +357,7 @@ describe("with a token provider", () => {
   });
 
   test(`a server that revokes every token at once is asked ${MAX_REMINTS} times on §3's backoff, then NeedsToken says why`, async () => {
-    const tokens = provider(...Array.from({ length: MAX_REMINTS + 2 }, (_, index) => `t${index}`));
+    const tokens = provider(mode, ...Array.from({ length: MAX_REMINTS + 2 }, (_, index) => `t${index}`));
     const { h, root } = mount(tokens);
     await tick();
     for (let remint = 1; remint <= MAX_REMINTS + 1; remint++) {
@@ -264,7 +385,7 @@ describe("with a token provider", () => {
   });
 
   test("an acked command ends the re-mint streak: the next 4403 re-mints at once again", async () => {
-    const tokens = provider("t1", "t2", "t3", "t4");
+    const tokens = provider(mode, "t1", "t2", "t3", "t4");
     const { h } = mount(tokens, { outbox: [PENDING] });
     await tick();
     // Revoked before Live: c0 stays queued; the first re-mint is immediate.
@@ -287,7 +408,7 @@ describe("with a token provider", () => {
   });
 
   test("a session Live for §3's healthy period ends the streak: every revocation re-mints at once, and the cap never trips", async () => {
-    const tokens = provider(...Array.from({ length: MAX_REMINTS + 3 }, (_, index) => `t${index}`));
+    const tokens = provider(mode, ...Array.from({ length: MAX_REMINTS + 3 }, (_, index) => `t${index}`));
     const { h, root } = mount(tokens);
     await tick();
     for (let revoked = 1; revoked <= MAX_REMINTS + 2; revoked++) {
@@ -304,7 +425,7 @@ describe("with a token provider", () => {
   });
 
   test("Connect during a backoff wait asks at once and cancels the wait", async () => {
-    const tokens = provider("t1", "t2", "deferred", "t4");
+    const tokens = provider(mode, "t1", "t2", "deferred", "t4");
     const { h, root } = mount(tokens);
     await tick();
     welcome(h, 0);
@@ -323,11 +444,11 @@ describe("with a token provider", () => {
     expect(tokens.calls).toBe(3);
     tokens.resolve("t3");
     await tick();
-    expect(h.net.attempts).toHaveLength(3);
+    expect(started(h, mode)).toBe(3);
   });
 
   test("with expiresInMs, the token is renewed at RENEW_AT of it, through the resume path: same principal, the outbox kept", async () => {
-    const tokens = provider({ token: "t1", expiresInMs: 20_000 }, "t2");
+    const tokens = provider(mode, { token: "t1", expiresInMs: 20_000 }, "t2");
     const { h, root } = mount(tokens, { outbox: [PENDING] });
     await tick();
     h.step(step({ step: "open" }));
@@ -339,7 +460,7 @@ describe("with a token provider", () => {
     h.clock.advanceTo(start + 20_000 * RENEW_AT);
     await tick();
     expect(tokens.calls).toBe(2);
-    expect(h.net.attempts).toHaveLength(2);
+    expect(started(h, mode)).toBe(2);
     welcome(h, 0);
     expect(frames(h, "hello").map((frame) => frame["token"])).toEqual(["t1", "t2"]);
     expect(status(root)).toBe("Live");
@@ -351,7 +472,7 @@ describe("with a token provider", () => {
   });
 
   test("a failed renewal is a dismissible notice while Live, is not retried, and the reactive path takes over at the next revocation", async () => {
-    const tokens = provider({ token: "t1", expiresInMs: 20_000 }, { reject: PANE }, "t3");
+    const tokens = provider(mode, { token: "t1", expiresInMs: 20_000 }, { reject: PANE }, "t3");
     const { h, root } = mount(tokens);
     await tick();
     welcome(h, 0);
@@ -375,7 +496,7 @@ describe("with a token provider", () => {
 
   test("a Disconnect clears the renewal: it calls nothing while disconnected, nor once the person connects again", async () => {
     for (const reconnectFirst of [false, true]) {
-      const tokens = provider({ token: "t1", expiresInMs: 20_000 });
+      const tokens = provider(mode, { token: "t1", expiresInMs: 20_000 });
       const { h, root } = mount(tokens);
       await tick();
       welcome(h, 0);
@@ -383,17 +504,19 @@ describe("with a token provider", () => {
       click(root, ".connection-bar__toggle");
       if (reconnectFirst) {
         click(root, ".connection-bar__toggle");
+        await tick();
         welcome(h, 0);
       }
       h.clock.advanceTo(start + 20_000 * RENEW_AT);
       await tick();
-      expect(tokens.calls).toBe(1);
+      // The Disconnect forgot the due time; on a bridge the session after Connect reports its bearer's remaining lifetime, which sets it again.
+      expect([tokens.calls, tokens.renews]).toEqual(mode === "bridge" && reconnectFirst ? [2, [false, false, true]] : [1, mode === "bridge" ? [false] : []]);
       dispose?.();
     }
   });
 
   test("a renewal due after the re-mint cap is spent calls nothing and keeps the cap's message", async () => {
-    const tokens = provider(...Array.from({ length: MAX_REMINTS + 1 }, () => ({ token: "t", expiresInMs: 600_000 })));
+    const tokens = provider(mode, ...Array.from({ length: MAX_REMINTS + 1 }, () => ({ token: "t", expiresInMs: 600_000 })));
     const { h, root } = mount(tokens);
     await tick();
     for (let revoked = 1; revoked <= MAX_REMINTS + 1; revoked++) {
@@ -418,15 +541,15 @@ describe("with a token provider", () => {
     ["a string", "5000"],
   ] as const) {
     test(`an expiresInMs of ${name} is refused: NeedsToken says why, and nothing connects`, async () => {
-      const { h, root } = mount(provider({ value: Promise.resolve({ token: "t1", expiresInMs }) }));
+      const { h, root } = mount(provider(mode, { token: "t1", expiresInMs }));
       await tick();
-      expect(status(root)).toBe("NeedsToken · The shell's token has an invalid expiresInMs: it must be a positive, finite number of milliseconds.");
-      expect(h.net.attempts).toHaveLength(0);
+      expect(status(root)).toBe(`NeedsToken · The shell's ${mode === "bridge" ? "bridge session" : "token"} has an invalid expiresInMs: it must be a positive, finite number of milliseconds.`);
+      expect(started(h, mode)).toBe(0);
     });
   }
 
   test("a Disconnect while the provider is asked: its token does not reconnect, and the next Connect uses it", async () => {
-    const tokens = provider("deferred");
+    const tokens = provider(mode, "deferred");
     const { h, root } = mount(tokens);
     await tick();
     expect(tokens.calls).toBe(1);
@@ -434,7 +557,7 @@ describe("with a token provider", () => {
     expect(status(root)).toBe("Disconnected");
     tokens.resolve("late");
     await tick();
-    expect(h.net.attempts).toHaveLength(0);
+    expect(started(h, mode)).toBe(0);
     expect(status(root)).toBe("Disconnected");
     click(root, ".connection-bar__toggle");
     h.step(step({ step: "open" }));
@@ -443,7 +566,7 @@ describe("with a token provider", () => {
   });
 
   test("a provider resolving after the app is gone opens nothing", async () => {
-    const tokens = provider("deferred");
+    const tokens = provider(mode, "deferred");
     const { h } = mount(tokens);
     await tick();
     expect(tokens.calls).toBe(1);
@@ -451,11 +574,11 @@ describe("with a token provider", () => {
     dispose = undefined;
     tokens.resolve("late");
     await tick();
-    expect(h.net.attempts).toHaveLength(0);
+    expect(started(h, mode)).toBe(0);
   });
 
   test("Connect pressed again while the provider is asked makes no second call", async () => {
-    const tokens = provider({ reject: PANE }, "deferred");
+    const tokens = provider(mode, { reject: PANE }, "deferred");
     const { root } = mount(tokens);
     await tick();
     click(root, '[data-testid="shell-connect"]');
@@ -464,8 +587,52 @@ describe("with a token provider", () => {
     expect(tokens.calls).toBe(2);
   });
 
+  for (const [end, code] of [
+    ["a 4403", 4403],
+    ["a 4401", 4401],
+  ] as const) {
+    test(`a renewal in flight when ${end} ends the token, then rejected, is followed at once by exactly one re-mint`, async () => {
+      const tokens = provider(mode, { token: "t1", expiresInMs: 40_000 }, "deferred", "t3");
+      const { h } = mount(tokens);
+      await tick();
+      welcome(h, 0);
+      h.clock.advanceTo(h.clock.now() + 30_000);
+      await tick();
+      expect(tokens.calls).toBe(2);
+      // The re-mint the end asks for meets the renewal still in flight.
+      h.step(step({ step: "token_refused", code }));
+      await tick();
+      expect(tokens.calls).toBe(2);
+      tokens.reject(PANE);
+      await tick();
+      expect(tokens.calls).toBe(3);
+      h.step(step({ step: "open" }));
+      expect(frames(h, "hello").map((frame) => frame["token"])).toEqual(["t1", "t3"]);
+      h.clock.advanceTo(h.clock.now() + 120_000);
+      await tick();
+      expect(tokens.calls).toBe(3);
+    });
+  }
+
+  test("a renewal that resolves after a 4403 ended the token is that re-mint: Live on it, with no second call", async () => {
+    const tokens = provider(mode, { token: "t1", expiresInMs: 40_000 }, "deferred");
+    const { h, root } = mount(tokens);
+    await tick();
+    welcome(h, 0);
+    h.clock.advanceTo(h.clock.now() + 30_000);
+    await tick();
+    h.step(step({ step: "token_refused", code: 4403 }));
+    await tick();
+    tokens.resolve("t2");
+    await tick();
+    welcome(h, 0);
+    expect(status(root)).toBe("Live");
+    expect(frames(h, "hello").map((frame) => frame["token"])).toEqual(["t1", "t2"]);
+    expect(tokens.calls).toBe(2);
+  });
+
   test("an auth_revoked ack before the 4403 is one provider call", async () => {
-    const tokens = provider("t1", "t2");
+    const tokens = provider(mode, "t1", "t2");
     const { h } = mount(tokens, { outbox: [PENDING] });
     await tick();
     welcome(h, 0);
@@ -479,7 +646,7 @@ describe("with a token provider", () => {
 
   test("a link's code is refused with a notice: never exchanged, never stored", async () => {
     const at = page();
-    const tokens = provider("t1");
+    const tokens = provider(mode, "t1");
     const { h, root, entries, requests } = mount(tokens, { code: CODE, at });
     await tick();
     expect(root.querySelector('[data-testid="exchange-notice"]')?.textContent).toContain(SHELL_OWNS_TOKENS);
@@ -491,6 +658,7 @@ describe("with a token provider", () => {
     expect([requests, [...entries.keys()], tokens.calls]).toEqual([[], [], 1]);
   });
 });
+}
 
 test("without a provider, NeedsToken still prompts for a token and names flk client open", () => {
   const { h, root } = mount(undefined);
@@ -509,17 +677,381 @@ test("the contract: a provider is a function, and never beside a fixed token", (
   }
 });
 
-describe("the provider driver on a bare connection", () => {
+test("the contract: openBridge is a function, and never beside serverUrl, token or tokenProvider", () => {
+  const scope = (config: object) => ({ __FLOCK_SHELL_CONFIG__: config });
+  const openBridge: OpenBridge = async () => Promise.reject(new Error("unused"));
+  const tokenProvider: TokenProvider = async () => ({ token: "t" });
+  expect(readShellConfig(scope({ transport: "bridge", openBridge }))).toEqual({ ok: true, config: { transport: "bridge", openBridge } });
+  for (const beside of [{ serverUrl: "ws://127.0.0.1:1" }, { token: "t" }, { tokenProvider }]) {
+    expect(readShellConfig(scope({ transport: "bridge", openBridge, ...beside }))).toEqual({ ok: false, error: { message: BRIDGE_ALONE } });
+  }
+  expect(readShellConfig(scope({ transport: "wire", serverUrl: "ws://127.0.0.1:1", openBridge }))).toEqual({ ok: false, error: { message: BRIDGE_ALONE } });
+  expect(readShellConfig(scope({ transport: "bridge", openBridge: "shell" }))).toEqual({ ok: false, error: { message: "A bridge configuration needs an openBridge function." } });
+});
+
+describe("the bridge transport", () => {
+  /**
+   * Keeps the current session Live for `ms` with a server ping every 30 s,
+   * inside the 45 s liveness window. It stops at each of `stops` too, and
+   * lets the shell's calls run at every stop, so an open is recorded at the
+   * instant it was made.
+   */
+  const alive = async (h: Harness, ms: number, stops: readonly number[] = []): Promise<void> => {
+    const until = h.clock.now() + ms;
+    const pings = Array.from({ length: Math.ceil(ms / 30_000) }, (_, index) => h.clock.now() + (index + 1) * 30_000).filter((at) => at < until);
+    for (const at of [...new Set([...pings, ...stops.filter((stop) => stop > h.clock.now() && stop < until), until])].sort((a, b) => a - b)) {
+      h.clock.advanceTo(at);
+      await tick();
+      if (pings.includes(at)) send(h, { t: "ping", nonce: `n${at}` });
+    }
+  };
+  const MINUTE = 60_000;
+
+  test("the renewal's due time belongs to the bearer: a drop every 10 min still renews a 12 h bearer at ¾ of its life", async () => {
+    const lifetime = 12 * 60 * MINUTE;
+    const shell = provider("bridge", { token: "t1", expiresInMs: lifetime }, "t2");
+    const { h } = mount(shell);
+    await tick();
+    const start = h.clock.now();
+    while (!shell.renews.includes(true) && h.clock.now() < start + lifetime) {
+      welcome(h, 0);
+      await alive(h, 10 * MINUTE, [start + lifetime * RENEW_AT]);
+      if (shell.renews.includes(true)) break;
+      // An ordinary drop keeps the bearer; the reconnect's session reports what is left of it.
+      h.step(step({ step: "drop" }));
+      h.clock.advanceTo(h.clock.now() + 250);
+      await tick();
+    }
+    const renewedAt = shell.openedAt[shell.renews.indexOf(true)] ?? Number.POSITIVE_INFINITY;
+    expect(shell.renews.filter((renew) => !renew).length).toBeGreaterThan(40);
+    expect(renewedAt - start).toBeLessThanOrEqual(lifetime * RENEW_AT);
+  });
+
+  test("a new bearer replaces the due time: after a 4403 the re-minted bearer renews at ¾ of its own life, not the old one's", async () => {
+    const shell = provider("bridge", { token: "t1", expiresInMs: 40_000 }, { token: "t2", expiresInMs: 100_000 }, "t3");
+    const { h } = mount(shell);
+    await tick();
+    welcome(h, 0);
+    h.clock.advanceTo(h.clock.now() + 1_000);
+    h.step(step({ step: "token_refused", code: 4403 }));
+    await tick();
+    const reminted = h.clock.now();
+    welcome(h, 0);
+    // t1's renewal would have been due at 30 s.
+    await alive(h, 75_000 - 1);
+    expect(shell.renews).toEqual([false, false]);
+    h.clock.advanceTo(reminted + 75_000);
+    await tick();
+    expect(shell.renews).toEqual([false, false, true]);
+  });
+
+  test("a renewal that fails while a reconnect waits for its session is followed at once by the reconnect's own open", async () => {
+    const shell = provider("bridge", { token: "t1", expiresInMs: 40_000 }, "deferred");
+    const { h, root } = mount(shell);
+    await tick();
+    welcome(h, 0);
+    h.clock.advanceTo(h.clock.now() + 30_000);
+    await tick();
+    expect(shell.renews).toEqual([false, true]);
+    // The socket drops while the renewal is in flight: the reconnect waits for a session, and its own open waits for the call.
+    h.step(step({ step: "drop" }));
+    h.clock.advanceTo(h.clock.now() + 250);
+    await tick();
+    expect(shell.renews).toEqual([false, true]);
+    shell.reject(PANE);
+    await tick();
+    expect(shell.renews).toEqual([false, true, false]);
+    expect(shell.openedAt.at(-1)).toBe(h.clock.now());
+    welcome(h, 0);
+    expect(status(root)).toBe("Live");
+    expect(root.querySelector('[data-testid="renewal-notice"]')?.textContent).toContain(PANE);
+  });
+
+  test("openBridge passes renew: false at connect and on every reconnect, and renew: true only from the renewal timer", async () => {
+    const shell = provider("bridge", { token: "t1", expiresInMs: 40_000 }, "t2");
+    const { h, root } = mount(shell);
+    await tick();
+    welcome(h, 0);
+    // An ordinary drop: the reconnect opens a session on the same bearer, with what is left of its lifetime.
+    h.step(step({ step: "drop" }));
+    expect(status(root)).toContain("Reconnecting");
+    h.clock.advanceTo(h.clock.now() + 1_000);
+    await tick();
+    welcome(h, 0);
+    expect([shell.renews, shell.calls]).toEqual([[false, false], 1]);
+    // That session reported 39 s left, which would be due later than the bearer's own ¾ mark: the bearer's stands.
+    h.clock.advanceTo(40_000 * RENEW_AT - 1);
+    await tick();
+    expect(shell.renews).toEqual([false, false]);
+    h.clock.advanceTo(40_000 * RENEW_AT);
+    await tick();
+    expect([shell.renews, shell.calls]).toEqual([[false, false, true], 2]);
+    welcome(h, 0);
+    expect(frames(h, "hello").map((frame) => frame["token"])).toEqual(["t1", "t1", "t2"]);
+    expect(shell.hellos.some((frame) => "token" in frame)).toBe(false);
+    expect(status(root)).toBe("Live");
+  });
+
+  for (const [end, code, welcomed] of [
+    ["a 4403", 4403, true],
+    ["a 4401 after a welcome", 4401, true],
+    ["a 4401 before one", 4401, false],
+  ] as const) {
+    test(`${end} leads to one new openBridge call, which mints, within the streak`, async () => {
+      const shell = provider("bridge", "t1", "t2", "t3");
+      const { h, root } = mount(shell);
+      await tick();
+      if (welcomed) welcome(h, 0);
+      h.step(step({ step: "token_refused", code }));
+      await tick();
+      expect([shell.renews, shell.calls]).toEqual([[false, false], 2]);
+      // The second end in a row waits for the backoff: the streak counts it.
+      if (welcomed) welcome(h, 0);
+      h.step(step({ step: "token_refused", code }));
+      await tick();
+      expect([shell.calls, status(root)]).toEqual([2, "Signing in…"]);
+      h.clock.advanceTo(h.clock.now() + 250);
+      await tick();
+      // The re-mint after the backoff is no renewal either.
+      expect([shell.renews, shell.calls]).toEqual([[false, false, false], 3]);
+      expect(frames(h, "hello").map((frame) => frame["token"])).toEqual(["t1", "t2", "t3"]);
+    });
+  }
+
+  test("a 1006 is an ordinary reconnect: Reconnecting on §3's backoff, then one openBridge that mints nothing, and the streak is untouched", async () => {
+    const shell = provider("bridge", "t1");
+    const { h, root } = mount(shell);
+    await tick();
+    welcome(h, 0);
+    h.step(step({ step: "drop" }));
+    expect(status(root)).toBe("Reconnecting · Connection lost: the socket closed (1006).");
+    // Attempt 0's backoff is [250, 500] ms; random 0 takes 250.
+    h.clock.advanceTo(h.clock.now() + 249);
+    await tick();
+    expect(shell.renews).toEqual([false]);
+    h.clock.advanceTo(h.clock.now() + 1);
+    await tick();
+    expect([shell.renews, shell.calls, started(h, "bridge")]).toEqual([[false, false], 1, 2]);
+    welcome(h, 0);
+    expect(status(root)).toBe("Live");
+  });
+
+  test("a 1008 is a protocol close: the diagnosis is shown and the connection goes to Reconnecting, never NeedsToken", async () => {
+    const shell = provider("bridge", "t1");
+    const { h, root } = mount(shell);
+    await tick();
+    h.step(step({ step: "close", code: 1008, reason: "the first frame was not a token-free hello" }));
+    expect(status(root)).toBe("Reconnecting · Connection lost: the socket closed (1008: the first frame was not a token-free hello).");
+    h.clock.advanceTo(h.clock.now() + 250);
+    await tick();
+    expect([shell.renews, shell.calls, started(h, "bridge")]).toEqual([[false, false], 1, 2]);
+  });
+
+  test("a refusal on a reconnect is NeedsToken with the shell's message, is not retried, and Connect asks again", async () => {
+    const shell = provider("bridge", "t1", { reject: PANE }, "t3");
+    const { h, root } = mount(shell);
+    await tick();
+    welcome(h, 0);
+    // The server ended t1, so the reconnect's open must mint, and the shell refuses.
+    h.step(step({ step: "token_refused", code: 4403 }));
+    await tick();
+    expect(status(root)).toBe(`NeedsToken · The token was revoked. ${PANE}`);
+    h.clock.advanceTo(h.clock.now() + 600_000);
+    await tick();
+    expect([shell.renews, shell.calls]).toEqual([[false, false], 2]);
+    click(root, '[data-testid="shell-connect"]');
+    await tick();
+    expect([shell.renews, shell.calls]).toEqual([[false, false, false], 3]);
+    welcome(h, 0);
+    expect(status(root)).toBe("Live");
+  });
+
+  test("a bearer's renewal is asked once: after it fails, reconnects on the same bearer never ask again, and the notice stands", async () => {
+    const shell = provider("bridge", { token: "t1", expiresInMs: 40_000 }, { reject: PANE });
+    const { h, root } = mount(shell);
+    await tick();
+    welcome(h, 0);
+    h.clock.advanceTo(h.clock.now() + 30_000);
+    await tick();
+    expect(shell.renews).toEqual([false, true]);
+    for (let drop = 0; drop < 2; drop++) {
+      h.step(step({ step: "drop" }));
+      h.clock.advanceTo(h.clock.now() + 1_000);
+      await tick();
+      welcome(h, 0);
+      h.clock.advanceTo(h.clock.now() + 1_000);
+      await tick();
+    }
+    expect(shell.renews).toEqual([false, true, false, false]);
+    expect(root.querySelector('[data-testid="renewal-notice"]')?.textContent).toContain(PANE);
+  });
+
+  test("a Disconnect clears the due time: after Connect the renewal is at ¾ of the new session's lifetime, not the old due time", async () => {
+    const shell = provider("bridge", { token: "t1", expiresInMs: 40_000 }, "t2");
+    const { h, root } = mount(shell);
+    await tick();
+    welcome(h, 0);
+    h.clock.advanceTo(20_000);
+    click(root, ".connection-bar__toggle");
+    click(root, ".connection-bar__toggle");
+    await tick();
+    welcome(h, 0);
+    // The session on t1 reports 20 s left: due at 20 + 15 s, where the forgotten due time was 30 s.
+    h.clock.advanceTo(35_000 - 1);
+    await tick();
+    expect(shell.renews).toEqual([false, false]);
+    h.clock.advanceTo(35_000);
+    await tick();
+    expect(shell.renews).toEqual([false, false, true]);
+  });
+
+  test("a reconnect on a bearer the native side minted silently (fresh) renews at ¾ of the new lifetime, even after a failed renewal", async () => {
+    const shell = provider("bridge", { token: "t1", expiresInMs: 40_000 }, { reject: PANE }, { token: "t2", expiresInMs: 100_000 }, "t3");
+    const { h } = mount(shell);
+    await tick();
+    welcome(h, 0);
+    h.clock.advanceTo(30_000);
+    await tick();
+    expect(shell.renews).toEqual([false, true]);
+    // The native side lost t1: the reconnect's open mints t2, which the client did not cause.
+    shell.forget();
+    h.step(step({ step: "drop" }));
+    h.clock.advanceTo(h.clock.now() + 250);
+    await tick();
+    const reconnected = h.clock.now();
+    welcome(h, 0);
+    h.clock.advanceTo(reconnected + 30_000);
+    send(h, { t: "ping", nonce: "p1" });
+    h.clock.advanceTo(reconnected + 60_000);
+    send(h, { t: "ping", nonce: "p2" });
+    h.clock.advanceTo(reconnected + 75_000 - 1);
+    await tick();
+    expect(shell.renews).toEqual([false, true, false]);
+    h.clock.advanceTo(reconnected + 75_000);
+    await tick();
+    expect(shell.renews).toEqual([false, true, false, true]);
+  });
+
+  test("a fresh that is not a boolean is refused: NeedsToken says why, and its socket is closed", async () => {
+    const { h, root } = mount(provider("bridge", { token: "t1", fresh: "yes" }));
+    await tick();
+    expect(status(root)).toBe("NeedsToken · The shell's bridge session has an invalid fresh: it must be a boolean.");
+    expect([frames(h, "hello").length, h.net.closes.map((close) => close.code)]).toEqual([0, [1000]]);
+  });
+
+  test("a silent mint without fresh, from an older native side, keeps the earlier due time", async () => {
+    const shell = provider("bridge", { token: "t1", expiresInMs: 40_000 }, { token: "t2", expiresInMs: 100_000, fresh: false }, "t3");
+    const { h } = mount(shell);
+    await tick();
+    welcome(h, 0);
+    h.clock.advanceTo(1_000);
+    shell.forget();
+    h.step(step({ step: "drop" }));
+    h.clock.advanceTo(h.clock.now() + 250);
+    await tick();
+    welcome(h, 0);
+    // t1's due time (30 s) stands: min(30 s, 1.25 s + 75 s).
+    h.clock.advanceTo(30_000 - 1);
+    await tick();
+    expect(shell.renews).toEqual([false, false]);
+    h.clock.advanceTo(30_000);
+    await tick();
+    expect(shell.renews).toEqual([false, false, true]);
+  });
+
+  test("Connect from Disconnected starts a fresh streak: the next end re-mints at once, with no backoff", async () => {
+    const shell = provider("bridge", "t1", "t2", "t3", "t4");
+    const { h, root } = mount(shell);
+    await tick();
+    // Two ends in a row: the second re-mint waits for the backoff.
+    welcome(h, 0);
+    h.step(step({ step: "token_refused", code: 4403 }));
+    await tick();
+    welcome(h, 0);
+    h.step(step({ step: "token_refused", code: 4403 }));
+    await tick();
+    expect(shell.calls).toBe(2);
+    click(root, ".connection-bar__toggle");
+    click(root, ".connection-bar__toggle");
+    await tick();
+    expect([shell.renews, shell.calls]).toEqual([[false, false, false], 3]);
+    welcome(h, 0);
+    h.step(step({ step: "token_refused", code: 4403 }));
+    await tick();
+    expect(shell.calls).toBe(4);
+  });
+
+  test("a session held after a Disconnect is closed when the app goes away", async () => {
+    const shell = provider("bridge", "deferred");
+    const { h, root } = mount(shell);
+    await tick();
+    click(root, ".connection-bar__toggle");
+    shell.resolve("late");
+    await tick();
+    expect(h.net.closes).toEqual([]);
+    dispose?.();
+    dispose = undefined;
+    expect(h.net.closes.map((close) => [close.code, close.reason])).toEqual([[1000, "disconnect"]]);
+  });
+
+  test("a session held after a Disconnect that closes before Connect is dropped: Connect opens another on the same bearer", async () => {
+    const shell = provider("bridge", "deferred");
+    const { h, root } = mount(shell);
+    await tick();
+    click(root, ".connection-bar__toggle");
+    shell.resolve("late");
+    await tick();
+    // The native side's socket to the server went away while nobody used it.
+    h.net.current().drop();
+    click(root, ".connection-bar__toggle");
+    expect(status(root)).toBe("Connecting");
+    await tick();
+    expect([shell.renews, shell.calls]).toEqual([[false, false], 1]);
+    welcome(h, 0);
+    expect(frames(h, "hello").map((frame) => frame["token"])).toEqual(["late"]);
+    expect(status(root)).toBe("Live");
+  });
+
+  test("a session that resolves after the app is gone is closed, and one with an invalid lifetime is closed too", async () => {
+    const late = provider("bridge", "deferred");
+    const first = mount(late);
+    await tick();
+    dispose?.();
+    dispose = undefined;
+    late.resolve("late");
+    await tick();
+    expect(first.h.net.closes.map((close) => close.code)).toEqual([1000]);
+    const invalid = mount(provider("bridge", { token: "t1", expiresInMs: 0 }));
+    await tick();
+    expect(invalid.h.net.closes.map((close) => close.code)).toEqual([1000]);
+    expect(frames(invalid.h, "hello")).toEqual([]);
+  });
+});
+
+for (const mode of MODES) {
+  describe(`the ${mode} driver on a bare connection`, () => {
   /** A Live connection (given → hello → welcome), a driver on it, and every delay it armed. */
   function driven(...replies: Reply[]) {
     const h = new Harness();
-    live(h);
+    const tokens = provider(mode, ...replies);
+    if (mode === "provider") live(h);
+    else {
+      // A session on the native side's first bearer, then hello → welcome: Live before the driver is attached.
+      h.conn = new WireConnection({ bridged: true, client: { name: "fixture", version: "1" }, clock: h.clock, random: () => 0, store: h.store });
+      tokens.net = h.net;
+      h.connection.setSocket(tokens.open(FIXTURE_TOKEN));
+      h.connection.connect();
+      send(h, WELCOME);
+    }
+    // The provider's `given` replaced the harness's network.
+    tokens.net = h.net;
     const delays: number[] = [];
     // Like a browser, a delay above 2^31 - 1 ms fires at once.
     const browserDelay = (ms: number): number => (ms > 2 ** 31 - 1 ? 0 : ms);
     const clock = { ...h.clock, now: () => h.clock.now(), wallNow: () => h.clock.wallNow(), clearTimeout: (handle: Parameters<typeof h.clock.clearTimeout>[0]) => h.clock.clearTimeout(handle), setTimeout: (callback: () => void, ms: number) => (delays.push(ms), h.clock.setTimeout(callback, browserDelay(ms))) };
-    const tokens = provider(...replies);
-    driveTokenProvider(h.connection, tokens, clock, () => 0, () => undefined);
+    const config = tokens.config;
+    if ("openBridge" in config) driveBridge(h.connection, config.openBridge, clock, () => 0, () => undefined);
+    else driveTokenProvider(h.connection, config.tokenProvider, clock, () => 0, () => undefined);
     return { h, tokens, delays };
   }
 
@@ -549,10 +1081,13 @@ describe("the provider driver on a bare connection", () => {
       }
       expect(tokens.calls).toBe(1);
       expect(delays.every((ms) => ms <= MAX_TIMER_DELAY)).toBe(true);
+      // Nothing keeps this socket alive, so a bridge reconnects all along on the same bearer, whose due time stands.
+      if (mode === "bridge") expect(tokens.lifetimes.length).toBeGreaterThan(1);
       if (due - h.clock.now() <= 20 * MAX_TIMER_DELAY) {
         h.clock.advanceTo(due);
         await tick();
         expect(tokens.calls).toBe(2);
+        if (mode === "bridge") expect(tokens.renews.at(-1)).toBe(true);
       }
     });
   }
@@ -572,6 +1107,58 @@ describe("the provider driver on a bare connection", () => {
     h.step(step({ step: "token_refused", code: 4403 }));
     await tick();
     expect(tokens.calls).toBe(2);
+  });
+});
+}
+
+describe("a bridged connection", () => {
+  /** A bridged connection on a fresh harness, and a session factory on its network. */
+  function bridged() {
+    const h = new Harness();
+    h.conn = new WireConnection({ bridged: true, client: { name: "fixture", version: "1" }, clock: h.clock, random: () => 0, store: h.store });
+    const shell = provider("bridge");
+    shell.net = h.net;
+    return { h, shell, open: (token: string) => shell.open(token) };
+  }
+
+  test("a held session replaced by another is closed", () => {
+    const { h, open } = bridged();
+    h.connection.setSocket(open("t1"));
+    h.connection.setSocket(open("t2"));
+    expect(h.net.closes.map((close) => [close.code, close.reason])).toEqual([[1000, "replaced"]]);
+    h.connection.connect();
+    expect(frames(h, "hello").map((frame) => frame["token"])).toEqual(["t2"]);
+  });
+
+  test("a late close from an abandoned session is ignored: the session that replaced it stays Live", () => {
+    const { h, open } = bridged();
+    h.connection.setSocket(open("t1"));
+    h.connection.connect();
+    send(h, WELCOME);
+    h.connection.disconnect();
+    h.connection.setSocket(open("t2"));
+    h.connection.connect();
+    send(h, WELCOME);
+    expect(h.connection.state).toBe("Live");
+    h.net.previous().serverClose(4403, "");
+    h.net.previous().drop();
+    expect(h.connection.state).toBe("Live");
+  });
+
+  test("a reconnect's session goes to the waiting attempt directly: the connection never passes through Disconnected", async () => {
+    const { h, shell, open } = bridged();
+    h.connection.setSocket(open("t1"));
+    h.connection.connect();
+    send(h, WELCOME);
+    const states: string[] = [];
+    h.connection.onTransition((state) => states.push(state));
+    const config = shell.config as { readonly openBridge: OpenBridge };
+    driveBridge(h.connection, config.openBridge, h.clock, () => 0, () => undefined);
+    h.step(step({ step: "drop" }));
+    h.clock.advanceTo(h.clock.now() + 250);
+    await tick();
+    expect(shell.renews).toEqual([false]);
+    expect(states).toEqual(["Reconnecting", "Connecting", "Hello"]);
   });
 });
 
