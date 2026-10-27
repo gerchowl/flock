@@ -1150,7 +1150,7 @@ describe("a bridged connection", () => {
   }
 
   /** A deferred renewal at 649 ms overlaps a re-mint scheduled for 750 ms. */
-  async function renewalDuringRemint() {
+  async function renewalDuringRemint(reconnect = true) {
     const h = new Harness();
     h.conn = new WireConnection({ bridged: true, client: { name: "fixture", version: "1" }, clock: h.clock, random: () => 0, store: h.store });
     const shell = provider("bridge", "t1", "t2", { token: "t3", expiresInMs: 533 }, "deferred", "deferred");
@@ -1172,16 +1172,30 @@ describe("a bridged connection", () => {
     // Deliberate session-handoff injection: an already-open session arrives while
     // the 500 ms re-mint waits, then drops. This overlaps all three driver timers.
     h.connection.setSocket(shell.open("t3"));
-    h.step(step({ step: "drop" }));
+    if (reconnect) h.step(step({ step: "drop" }));
+    else send(h, WELCOME);
     h.clock.advanceTo(500);
     await tick();
-    expect(h.connection.awaitingSession).toBe(true);
+    expect(h.connection.awaitingSession).toBe(reconnect);
     // t3's renewal is due at 250 + floor(533 * 3/4), before the re-mint at 750.
     h.clock.advanceTo(649);
     await tick();
     expect(shell.renews).toEqual([false, false, false, true]);
     return { h, shell, driver };
   }
+
+  test("renewal cancels an obsolete mint while Live, without manufacturing owed work", async () => {
+    const { h, shell, driver } = await renewalDuringRemint(false);
+    h.clock.advanceTo(660);
+    shell.reject(PANE);
+    await tick();
+    h.clock.advanceTo(750);
+    await tick();
+    expect([h.connection.state, shell.openedAt, driver.asking]).toEqual(["Live", [0, 0, 250, 649], false]);
+    driver.dispose();
+    h.connection.disconnect();
+    expect(h.clock.pendingTimers).toBe(0);
+  });
 
   test("a reconnect requested during re-mint backoff is owed when a renewal overlaps it, without a connect deadline", async () => {
     const { h, shell, driver } = await renewalDuringRemint();
