@@ -78,7 +78,9 @@ async fn aggregate_shutdown_ends_native_and_tcp_upgrades_and_retires_app_bearers
     let store = owner
         .get(
             server._root.path(),
-            Arc::new(crate::structured::permissions::auth::tokens::app_sessions::SystemClock),
+            Arc::new(
+                crate::structured::permissions::auth::tokens::app_sessions::SystemClock::new(),
+            ),
         )
         .unwrap();
     assert!(store.authenticate(&token).is_err());
