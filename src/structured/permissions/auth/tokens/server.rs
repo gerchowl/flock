@@ -227,7 +227,42 @@ impl Store {
             Source::File(s) => self.files.admit(s, required, dispatch),
         }
     }
+    /// Observe a retirement entering its real contended kernel wait.
+    #[cfg(all(test, feature = "web"))]
+    pub(crate) fn on_mutation_waiting(&self, ready: tokio::sync::oneshot::Sender<()>) {
+        self.apps.on_waiting(ready);
+    }
+    /// Publish revocation intent before waiting outside the store-I/O pool.
+    #[cfg(feature = "web")]
+    pub(crate) fn begin_mutation(&self) -> Result<app_sessions::PendingMutation, TokenError> {
+        self.apps.begin_mutation()
+    }
+    /// Await exclusive ownership on the separate bounded retirement worker.
+    #[cfg(feature = "web")]
+    pub(crate) fn wait_mutation(
+        &self,
+        pending: app_sessions::PendingMutation,
+    ) -> Result<app_sessions::MutationFence, TokenError> {
+        pending.wait(|| {
+            #[cfg(test)]
+            self.apps.notify_waiting();
+        })
+    }
+    /// Commit the exact app retirement, retaining the fence through notification.
+    #[cfg(feature = "web")]
+    pub(crate) fn finish_mutation(
+        &self,
+        fence: app_sessions::MutationFence,
+        session: Option<&Session>,
+    ) -> Result<(), TokenError> {
+        let app = match session {
+            Some(session) => Some(session.app().ok_or(TokenError::Unsafe)?),
+            None => None,
+        };
+        self.apps.finish_mutation(fence, app)
+    }
     /// Retire the exact ephemeral credential under the existing exclusive fence.
+    #[cfg(test)]
     pub(crate) fn retire(&self, session: &Session) -> Result<(), TokenError> {
         match session.app() {
             Some(s) => self.apps.revoke(s),
@@ -235,6 +270,7 @@ impl Store {
         }
     }
     /// Revoke all ephemeral credentials before server shutdown or handoff.
+    #[cfg(test)]
     pub(crate) fn shutdown(&self) -> Result<(), TokenError> {
         self.apps.revoke_all()
     }

@@ -1,13 +1,14 @@
 //! Cross-process revocation intent, separate from the admission lock.
 use super::*;
 /// The locked entry is published before waiting for admission; a crash unlocks it.
-pub(super) struct Intent<'a> {
-    namespace: &'a Namespace,
+/// Synchronous management borrows the namespace; worker handoffs retain its Arc.
+pub(super) struct Intent<N: std::ops::Deref<Target = Namespace>> {
+    namespace: N,
     name: String,
     file: LockFile,
 }
-impl<'a> Intent<'a> {
-    pub(super) fn begin(namespace: &'a Namespace, nonce: String) -> Result<Self, TokenError> {
+impl<N: std::ops::Deref<Target = Namespace>> Intent<N> {
+    pub(super) fn begin(namespace: N, nonce: String) -> Result<Self, TokenError> {
         let staged = format!(".intent-{nonce}");
         let file = LockFile::new(namespace.file(&staged, true)?);
         let mut intent = Self {
@@ -17,13 +18,13 @@ impl<'a> Intent<'a> {
         };
         intent.file.try_lock().map_err(|_| TokenError::Busy)?;
         let published = format!(".revoke-{nonce}");
-        namespace.publish(&intent.name, &published, false)?;
-        namespace.remove(&intent.name)?;
+        intent.namespace.publish(&intent.name, &published, false)?;
+        intent.namespace.remove(&intent.name)?;
         intent.name = published;
         Ok(intent)
     }
 }
-impl Drop for Intent<'_> {
+impl<N: std::ops::Deref<Target = Namespace>> Drop for Intent<N> {
     fn drop(&mut self) {
         if self.namespace.remove(&self.name).is_err() {
             crate::logging::client_token_entry_unsafe(&hex(self.name.as_bytes()));

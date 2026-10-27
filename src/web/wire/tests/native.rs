@@ -817,3 +817,103 @@ async fn waiting_hellos_do_not_starve_established_subscriptions() {
         f.finish().await;
     }
 }
+
+#[tokio::test]
+async fn waiting_retirements_do_not_starve_established_subscriptions() {
+    let mut f = Native::new().await;
+    let token = browser_file(&f);
+    let mut live = Socket::open(&f.server).await;
+    live.hello(1, &token.0).await;
+    live.send(json!({"t":"sub","sub_id":"live","stream":"fleet"}))
+        .await;
+    assert_eq!(f.drive(live.text()).await["t"], "gap");
+    assert_eq!(f.drive(live.text()).await["t"], "synced");
+    let mut sockets = Vec::new();
+    let mut tokens = Vec::new();
+    for _ in 0..4 {
+        let token = f.mint().await;
+        let mut socket = f.open().await;
+        socket.hello(1, &token.0).await;
+        sockets.push(socket);
+        tokens.push(token);
+    }
+    f.server.clock.deadline_count(12 * 60 * 60 * 1000, 4).await;
+    let lock = management_lock(&f);
+    // Each close targets a distinct credential, so all four retirements must wait.
+    for token in &tokens {
+        let (ready, waiting) = tokio::sync::oneshot::channel();
+        f.server.core.shared.store.on_mutation_waiting(ready);
+        let session = f.server.core.shared.store.authenticate(token).unwrap();
+        f.server.core.shared.revoke(&session);
+        within(waiting)
+            .await
+            .expect("retirement never reached its contended lock wait");
+    }
+    f.app
+        .state
+        .structured_agents
+        .register(crate::structured::registry::Record {
+            runtime: crate::structured::registry::StructuredRuntime::Structured,
+            agent_id: "fixture-retire-event".into(),
+            name: None,
+            harness: "claude".into(),
+            session_id: "fixture-retire-session".into(),
+            cwd: f.server._root.path().to_owned(),
+            model: None,
+        })
+        .unwrap();
+    Arc::get_mut(&mut f.server.core).unwrap().service(
+        &f.app.state.structured_agents,
+        &mut f.app.structured_workers,
+        f.server._root.path(),
+    );
+    let event = f.drive(live.text()).await;
+    assert_eq!(event["ev"]["type"], "fleet.upsert");
+    // Force authorization on this established socket while retirements still wait.
+    live.send(json!({"t":"sub","sub_id":"contended","stream":"fleet"}))
+        .await;
+    let refusal = f.drive(live.text()).await;
+    assert_eq!(refusal["t"], "subfail");
+    assert_eq!(refusal["code"], "session_busy");
+    for (socket, token) in sockets.iter().zip(&tokens) {
+        assert!(f.server.core.shared.store.authenticate(token).is_ok());
+        assert_eq!(
+            socket.0.try_read(&mut [0]).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+    }
+    drop(lock);
+    for (socket, token) in sockets.iter_mut().zip(&tokens) {
+        assert_eq!(close_detail(socket).await.0, AUTH_REVOKED_CLOSE);
+        assert!(f.server.core.shared.store.authenticate(token).is_err());
+    }
+    f.finish().await;
+}
+
+#[tokio::test]
+async fn shutdown_waits_outside_the_store_io_pool() {
+    let mut f = Native::new().await;
+    let token = f.mint().await;
+    let mut socket = f.open().await;
+    socket.hello(1, &token.0).await;
+    let lock = management_lock(&f);
+    let (ready, waiting) = tokio::sync::oneshot::channel();
+    f.server.core.shared.store.on_mutation_waiting(ready);
+    {
+        let shutdown = f.server.core.shutdown();
+        tokio::pin!(shutdown);
+        tokio::select! {
+            ready = within(waiting) => ready.expect("shutdown lock producer disappeared"),
+            result = &mut shutdown => panic!("shutdown returned before its held lock was released: {result:?}"),
+        }
+        let capacity = super::super::super::store_io::shared().available();
+        drop(lock);
+        within(&mut shutdown).await.unwrap();
+        assert_eq!(
+            capacity, 4,
+            "shutdown reserved store I/O while waiting for its lock"
+        );
+        assert_eq!(close_detail(&mut socket).await.0, AUTH_REVOKED_CLOSE);
+    }
+    f.finish().await;
+}

@@ -76,7 +76,7 @@ pub(crate) struct Session {
     digest: [u8; 32],
 }
 /// Store handles share a stable filesystem admission lock, including across processes.
-pub(crate) struct TokenStore(Namespace, Mutex<Box<dyn Entropy>>, PathBuf);
+pub(crate) struct TokenStore(std::sync::Arc<Namespace>, Mutex<Box<dyn Entropy>>, PathBuf);
 /// Injectable randomness; production uses the operating system, fixtures use a sequence.
 pub(crate) trait Entropy: Send {
     /// Fill the whole buffer or fail without issuing a credential.
@@ -94,7 +94,7 @@ struct PendingRevoke<'a> {
     store: &'a TokenStore,
     entry: String,
     guard: PendingLock,
-    _intent: priority::Intent<'a>,
+    _intent: priority::Intent<&'a Namespace>,
 }
 impl PendingRevoke<'_> {
     fn finish(self) -> Result<(), TokenError> {
@@ -141,7 +141,7 @@ impl TokenStore {
         entropy: impl Entropy + 'static,
     ) -> Result<Self, TokenError> {
         let store = Self(
-            Namespace::open(data)?,
+            std::sync::Arc::new(Namespace::open(data)?),
             Mutex::new(Box::new(entropy)),
             std::env::current_exe()?,
         );
@@ -229,7 +229,7 @@ impl TokenStore {
         }
     }
     fn begin_revoke_entry(&self, entry: String) -> Result<PendingRevoke<'_>, TokenError> {
-        let intent = priority::Intent::begin(&self.0, self.random::<16>()?)?;
+        let intent = priority::Intent::begin(&*self.0, self.random::<16>()?)?;
         let guard = PendingLock::begin(self.lock_file()?, &self.2)?;
         Ok(PendingRevoke {
             store: self,
