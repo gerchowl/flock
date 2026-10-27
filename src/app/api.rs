@@ -618,6 +618,7 @@ impl App {
             // Only meaningful now that carried freshness decays.
             self.note_mesh_owners();
             self.state.evict_expired_relayed_entries();
+            self.sync_directory_events();
             self.render_dirty.store(true, Ordering::Release);
             self.render_notify.notify_one();
             return;
@@ -1429,6 +1430,7 @@ impl App {
         // ADR-0005) before the response goes out, so a socket caller sees its
         // own event on the stream.
         self.drain_pending_ui_events();
+        self.sync_directory_events();
         response
     }
 

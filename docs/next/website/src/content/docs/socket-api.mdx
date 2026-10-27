@@ -1012,6 +1012,25 @@ Workspace event subscriptions include `workspace.created`, `workspace.updated`, 
 
 Use `events.wait` when you want one matching event and then a response.
 
+### Directory discovery
+
+`directory_changed` is a durable, payload-free event. Its `seq` versions changes
+in merged local PTY, local structured and accepted remote agent directory rows:
+identity, name, harness, membership and location/route. Repeated summaries with
+only latency, freshness or status changes do not emit it. The event reports
+accepted local state; it does not bypass the existing peer refresh cadence.
+
+Capture `next_after` from `events.read` before reading `agent.list`, then wait
+with `events.read {after, kinds: ["directory_changed"], wait_ms}` and no
+`subjects` filter (the event carries no row IDs). On a matching
+event or `gap`, re-read the listing and resume from `next_after`. This ordering
+avoids missing a change between listing and waiting. Apply a bounded deadline
+and handle producer failure; a timeout does not prove discovery succeeded.
+
+CLI/MCP raw JSON clients preserve unknown kinds. Persisted-log readers skip
+unknown kinds; strict Rust response enums do not, so typed clients must filter
+to known kinds or upgrade. No mesh protocol change is required.
+
 ### Supervisor events
 
 The server derives four durable kinds from each local agent's `state` (the one `agent.get` reports), so a supervisor reads facts instead of re-deriving them from `pane_agent_status_changed` (ADR-0028 §2):

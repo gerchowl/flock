@@ -393,6 +393,7 @@ pub struct App {
     pub(crate) suppressed_repeat_keys:
         HashSet<(crossterm::event::KeyCode, crossterm::event::KeyModifiers)>,
     pub(crate) input_writes: input_writes::InputWrites,
+    directory_snapshot: directory::DirectorySnapshot,
     pub(crate) structured_workers: crate::structured::workers::Workers,
     queue_events: queue_events::QueueEvents,
     pub(crate) structured_sends: api::structured_queue::Sends,
@@ -1152,6 +1153,7 @@ impl App {
             input_rx: None,
             last_terminal_size: terminal::size().ok(),
             input_writes: input_writes::InputWrites::default(),
+            directory_snapshot: directory::DirectorySnapshot::default(),
             structured_workers: crate::structured::workers::Workers::new(render_notify.clone()),
             queue_events: queue_events::QueueEvents::default(),
             structured_sends: api::structured_queue::Sends::default(),
@@ -1531,6 +1533,8 @@ impl App {
             if self.handle_scheduled_tasks(now, needs_render) {
                 needs_render = true;
             }
+
+            self.sync_directory_events();
 
             // #361: advertise flock's state to the host terminal. Monolithic
             // mode owns the terminal itself, so the write happens right here.
