@@ -174,3 +174,26 @@ grants (ADR-0036 S6/#1429 and #2461; corrected rulings #2579/#2580). No scope
 change occurs mid-script. Separate real-client negative cases pin typed `scope`
 without `answer`, and `not_authorized` for send or decide without `operate`.
 Whether send alone should suffice is pending owner decision in #2585.
+
+## Runtime timestamp matchers
+
+A genuinely runtime `ev.ts_ms` may be authored as
+`{"$dynamic":"ts_ms","source":"persisted"}` (#2467 timestamp ruling).
+The fixture schema permits this marker only at that wall-clock field. The
+actual-endpoint interpreter must verify equality with the corresponding persisted
+record (sequence and event payload included), and membership in its independently
+observed `[before_action, after_ack]` wall-clock window. Missing evidence, an
+unsupported source, or a marker elsewhere fails. Literal timestamps and all other
+literal fields stay exact. Receipt wall times are not promised monotonic by
+ADR-0036; event ordering remains sequence-based.
+
+The pure virtual harness has no persistence/window oracle and explicitly rejects
+such traces. Its client-script tests pin that rejection rather than fabricate a
+timestamp; actual-endpoint execution owns their complete coverage. Rust parsing
+and the TypeScript fixture generator validate the marker's schema. This changes
+fixture authoring only, with no product clock injection.
+
+`permission-decision` authors token principal
+`0123456789abcdef0123456789abcdef`, a deterministic valid 32-hex identity.
+Its scenario token must be minted with exactly that literal; the principal is
+not a digest of the bearer, a runtime substitution, or a dynamic matcher.
