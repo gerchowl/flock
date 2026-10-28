@@ -226,7 +226,7 @@ fn revocation_intent_fences_both_sources_and_waits_for_existing_callbacks() {
         }
     });
     ready.recv_timeout(Duration::from_secs(5)).unwrap();
-    let mut pending = store.mutation().unwrap();
+    let mut pending = store.begin_mutation().unwrap();
     assert!(priority::pending(&files.0).unwrap());
     let app_refused = matches!(
         store.admit(&session, Scope::Read, |_| ()),
@@ -241,10 +241,14 @@ fn revocation_intent_fences_both_sources_and_waits_for_existing_callbacks() {
         let (done, finished) = mpsc::channel();
         pending.pending.notify_waiting(waiting);
         let digest = session.digest;
-        let revoke = scope.spawn(move || {
-            done.send(pending.finish(|entries| Store::remove(entries, &digest)))
+        let store = store.clone();
+        let revoke =
+            scope.spawn(move || {
+                done.send(pending.wait(|| {}).and_then(|fence| {
+                    store.mutate(fence, |entries| Store::remove(entries, &digest))
+                }))
                 .unwrap();
-        });
+            });
         started.recv_timeout(Duration::from_secs(5)).unwrap();
         let still_waiting = matches!(finished.try_recv(), Err(mpsc::TryRecvError::Empty));
         release.send(()).unwrap();
