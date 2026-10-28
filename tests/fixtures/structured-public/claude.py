@@ -81,6 +81,95 @@ profile = Path(os.environ["CLAUDE_CONFIG_DIR"])
 (profile / "sessions").mkdir(exist_ok=True, mode=0o700)
 (profile / "sessions" / f"{os.getpid()}.json").write_text("{}")
 print(json.dumps({"type": "system", "subtype": "hook_started", "hook_id": "fixture", "hook_name": "fixture", "hook_event": "SessionStart"}), flush=True)
+if model == "s10f-mvp":
+    # Deliberately gated turn: the public TUI must queue until this producer idles.
+    import signal
+    tool = subprocess.Popen([server["command"], *server["args"]],
+                            env=dict(os.environ, **server["env"]),
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    tool.stdin.write(b'{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n')
+    tool.stdin.flush()
+    assert select.select([tool.stdout], [], [], 10)[0], "MCP initialization missing"
+    assert json.loads(tool.stdout.readline())["id"] == 1
+    def emit(value):
+        print(json.dumps(dict(value, session_id=session)), flush=True)
+    def finish():
+        emit({"type": "result", "subtype": "success", "is_error": False, "result": "turn complete"})
+    def begin():
+        emit({"type": "command_lifecycle", "command_uuid": "00000000-0000-4000-8000-000000002495", "state": "started"})
+        emit({"type": "stream_event", "api_message_id": "live-turn", "event": {
+            "type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}})
+        emit({"type": "stream_event", "api_message_id": "live-turn", "event": {
+            "type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "streaming-marker"}}})
+    def terminate(_signal, _frame):
+        raise SystemExit(0)
+    signal.signal(signal.SIGTERM, terminate)
+    listener = socket.socket(socket.AF_UNIX)
+    listener.bind(str(root / "control"))
+    listener.listen(1)
+    init = json.loads((root / "init.json").read_text())
+    init["session_id"] = session
+    print(json.dumps(init), flush=True)
+    emit({"type": "assistant", "message": {"role": "assistant", "content": [
+        {"type": "text", "text": "native-transcript"},
+        {"type": "tool_use", "id": "fixture-tool", "name": "Bash", "input": {"command": "printf tool-card"}}]}})
+    emit({"type": "user", "message": {"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "fixture-tool", "content": "tool-card-result"}]}})
+    with open(root / "ready", "wb", buffering=0) as ready:
+        ready.write(b"R")
+    inputs = []
+    try:
+        listener.settimeout(15)
+        control, _ = listener.accept()
+        control.settimeout(15)
+        with control, control.makefile("rb", buffering=0) as commands:
+            control.sendall((json.dumps({"pid": os.getpid(), "mcp_pid": tool.pid,
+                "stdin_tty": os.isatty(0), "stdout_tty": os.isatty(1),
+                "temporary": str(config_path.parent), "profile": str(profile)}) + "\n").encode())
+            while True:
+                readable, _, _ = select.select([sys.stdin, commands], [], [], 15)
+                assert readable, "acceptance driver stopped servicing the fake"
+                if commands in readable:
+                    line = commands.readline()
+                    if not line:
+                        break
+                    command = json.loads(line)
+                    if command == "finish":
+                        finish()
+                    elif command == "begin":
+                        begin()
+                    elif command in ("permission-deny", "permission-allow"):
+                        emit({"type": "control_request", "request_id": command, "request": {
+                            "subtype": "can_use_tool", "tool_name": "Bash", "tool_use_id": "fixture-tool",
+                            "input": {"command": "true"}, "requires_user_interaction": True,
+                            "permission_suggestions": []}})
+                    else:
+                        assert command == "inspect", command
+                    control.sendall((json.dumps(inputs) + "\n").encode())
+                if sys.stdin in readable:
+                    line = sys.stdin.readline()
+                    if not line:
+                        break
+                    value = json.loads(line)
+                    inputs.append(value)
+                    if value["type"] == "user":
+                        text = "".join(b.get("text", "") for b in value["message"]["content"])
+                        answer = "composer-answer" if "composer-message" in text else "shell-answer"
+                        emit({"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": answer}]}})
+                        finish()
+                    else:
+                        assert value["type"] == "control_response", value
+                        emit({"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": value["response"]["request_id"] + "-answer"}]}})
+                        finish()
+    finally:
+        listener.close()
+        tool.stdin.close()
+        mcp_exit = tool.wait(timeout=10)
+        tool.stdout.close()
+        error = sys.exc_info()[1]
+        model_exit = error.code if isinstance(error, SystemExit) else (0 if error is None else 1)
+        (root / "stopped.json").write_text(json.dumps({"model_exit": model_exit, "mcp_exit": mcp_exit}))
+    sys.exit(0)
 if model == "dogfood-parent":
     env = dict(os.environ, **server["env"])
     tool = subprocess.Popen([server["command"], *server["args"]], env=env,
