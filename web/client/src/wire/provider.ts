@@ -63,7 +63,7 @@
  * @module
  */
 import type { BridgeSession, BridgeSocket, OpenBridge, ShellToken, TokenProvider } from "../config";
-import { DEADLINES, type WireConnection } from "./connection";
+import { DEADLINES, replaceProviderSession, type WireConnection } from "./connection";
 import { backoffDelay, type Clock, type TimerHandle } from "./env";
 
 /**
@@ -240,7 +240,7 @@ function driveShell<T>(connection: WireConnection, source: Source<T>, clock: Clo
   const adopt = ({ value, expiresInMs }: { readonly value: T; readonly expiresInMs?: number; readonly fresh?: boolean }, kept: boolean): void => {
     const before = kept ? { due, spent } : { due: null, spent: false };
     const reconnect = running() && !connection.awaitingSession;
-    if (reconnect) connection.replaceSession(() => source.hand(value));
+    if (reconnect) replaceProviderSession(connection, () => source.hand(value));
     else source.hand(value);
     renewal = cancel(renewal);
     ({ due, spent } = before);
@@ -371,7 +371,7 @@ function driveShell<T>(connection: WireConnection, source: Source<T>, clock: Clo
       forget();
       if (armed) changed();
     }
-    // A bridged attempt with no session asks for one: the person's Connect starts a fresh streak.
+    // This transition only requests a session; onUserConnect or ask resets the streak.
     if (state === "Connecting" && connection.awaitingSession) {
       request(0, "reconnect");
     }
