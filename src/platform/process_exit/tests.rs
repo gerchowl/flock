@@ -6,6 +6,8 @@ use std::{
     time::Duration,
 };
 
+mod identity;
+
 pub(crate) fn readable(fd: RawFd, timeout: Duration) -> bool {
     let mut p = libc::pollfd {
         fd,
@@ -237,23 +239,6 @@ fn async_kernel_exit_wait_is_observable_by_exited() {
             assert!(watch.exited().unwrap());
             assert!(watch.exited().unwrap());
         });
-}
-
-#[test]
-fn exit_after_kernel_arm_before_identity_check_is_refused() {
-    let mut peer = Peer::spawn();
-    let accepted = peer.credentials;
-    let witness = ExitWatch::arm(accepted).unwrap();
-    let result = ExitWatch::checked(accepted, |_| {
-        peer.exit();
-        assert!(readable(witness.as_raw_fd(), Duration::from_secs(5)));
-        assert!(peer.child.wait().unwrap().success());
-        accepted.birth
-    });
-    assert!(
-        result.is_err(),
-        "cached birth must not authorize an exited peer"
-    );
 }
 
 #[test]

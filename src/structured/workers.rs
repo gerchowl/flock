@@ -30,6 +30,9 @@ use std::{
 };
 use tokio::sync::Notify;
 pub(crate) mod queue;
+// Consumed by the following S10b projection slice (#1430).
+#[allow(dead_code)]
+pub(crate) mod live;
 const BATCH: usize = 4;
 mod admission;
 pub(crate) use admission::Admission;
@@ -74,6 +77,7 @@ enum Message {
     End(Report),
 }
 struct Worker {
+    live: live::Source,
     generation: u64,
     messages: mpsc::Receiver<Message>,
     runtime: Option<Runtime>,
@@ -346,6 +350,7 @@ impl Workers {
         self.entries.insert(
             agent_id,
             Worker {
+                live: live::Source::default(),
                 generation,
                 messages,
                 runtime: None,
@@ -375,6 +380,13 @@ impl Workers {
         let (generation, source) = self.history.get(id)?;
         let (_, _, current) = registry.get(id)?;
         (*generation == current).then_some(source)
+    }
+    /// Subscribe without runtime or permission authority; old generations cannot attach.
+    #[allow(dead_code)] // S10b (#1430) adds the native consumer.
+    pub(crate) fn live(&self, registry: &Registry, id: &str) -> Option<live::Subscription> {
+        let worker = self.entries.get(id)?;
+        let (_, _, generation) = registry.get(id)?;
+        (generation == worker.generation).then(|| worker.live.subscribe())
     }
     /// Cold recovery requires a joined producer without retained cleanup authority.
     /// Existing canonical history remains readable while a worker is active.
@@ -512,6 +524,7 @@ impl Workers {
                 .get(id)
                 .is_none_or(|(_, _, g)| g != worker.generation)
             {
+                worker.live.finish(live::End::Retired);
                 worker.stop();
             }
             for _ in 0..3 {
@@ -571,6 +584,12 @@ impl Workers {
                                 received.record.received_at_ms.min(u128::from(u64::MAX)) as u64,
                             );
                         }
+                        if registry
+                            .get(id)
+                            .is_some_and(|(_, _, g)| g == worker.generation)
+                        {
+                            worker.live.observe(&received);
+                        }
                         if index + 1 == BATCH {
                             self.notify.notify_one();
                         }
@@ -626,6 +645,7 @@ impl Workers {
                     self.notify.notify_one();
                     continue;
                 }
+                worker.live.finish(live::End::ProducerEnded);
                 worker.finished = true;
                 // Retain bounded terminal cuts until the consumer drains or relaunches.
                 // Runtime authority is already closed; runtime() refuses finished entries.
