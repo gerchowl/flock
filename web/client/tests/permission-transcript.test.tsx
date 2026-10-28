@@ -7,6 +7,7 @@ import { permissionLifecycle } from "../src/gen/FixtureExamples";
 import type { SessionEntry, Transport } from "../src/transport";
 import { classifyStoredLine } from "../src/transport/fixture";
 import { Transcript } from "../src/views/Transcript";
+import { emptyFold, foldEntry, groupTurns, keptEntries } from "../src/views/turns";
 
 const open = (id: string, requestSeq = 1) => ({ ...permissionLifecycle[0], request_id: id, request_seq: requestSeq });
 const native = (id: string): CanUseTool => ({ type: "control_request", request_id: id, request: { ...permissionLifecycle[0].request } });
@@ -124,4 +125,108 @@ test("native-first permission replay visits entries a bounded number of times", 
   expect(root.querySelectorAll(".event--control_request")).toHaveLength(0);
   expect(root.querySelectorAll(".event--flk_permission_request")).toHaveLength(prompts);
   expect(visits / (prompts * 2)).toBeLessThan(20);
+});
+
+for (const shape of ["same-turn gap", "turn boundary", "repeated native"] as const) {
+  test(`${shape} permission pairing visits entries a bounded number of times`, () => {
+    const { root, deliver, synced } = transcript();
+    const prompts = 200;
+    let visits = 0;
+    let entries = 0;
+    const send = (event: object) => {
+      const entry = classifyStoredLine(++entries, JSON.stringify(event));
+      const kind = entry.kind;
+      Object.defineProperty(entry, "kind", { get: () => { visits++; return kind; }, enumerable: true });
+      deliver(entry);
+    };
+    for (let n = 0; n < prompts; n++) {
+      send({ type: "user", message: { role: "user", content: `turn ${n}` } });
+      send(native(`request-${n}`));
+      if (shape === "repeated native") {
+        send(native(`request-${n}`));
+        expect(root.querySelectorAll(".event--control_request")).toHaveLength(2);
+      } else {
+        send({ type: shape === "turn boundary" ? "user" : "assistant", message: { role: shape === "turn boundary" ? "user" : "assistant", content: "between twins" } });
+      }
+      send(open(`request-${n}`, entries + 1));
+    }
+    synced();
+    root.querySelector<HTMLButtonElement>('[data-testid="earlier-turns"]')?.click();
+    expect(root.querySelectorAll(".event--control_request")).toHaveLength(0);
+    expect(root.querySelectorAll(".event--flk_permission_request")).toHaveLength(prompts);
+    expect(root.querySelector('[data-testid="transcript-synced"]')?.textContent).toBe(`End of recording · ${entries} events`);
+    expect(visits / entries).toBeLessThan(20);
+  });
+}
+
+/** Every ordering, including twins which precede the first user turn. */
+function* orderings<T>(items: readonly T[]): Generator<T[]> {
+  if (items.length === 0) { yield []; return; }
+  for (const [index, item] of items.entries()) {
+    for (const rest of orderings(items.filter((_, i) => i !== index))) yield [item, ...rest];
+  }
+}
+
+test("indexed permission slots match replay through opening-turn removal and compaction", () => {
+  const events = [native("__proto__"), native("__proto__"), open("__proto__"), native("constructor"), open("constructor"), { type: "user", message: { role: "user", content: "next turn" } }];
+  for (const ordering of orderings(events)) {
+    const fold = emptyFold();
+    const applied: SessionEntry[] = [];
+    for (const event of ordering) {
+      const entry = classifyStoredLine(applied.length + 1, JSON.stringify(event));
+      applied.push(entry);
+      expect(foldEntry(fold, entry)).toBe(true);
+      const expected = groupTurns(applied).turns.map((turn) => ({ key: turn.key, entries: turn.entries.map((entry) => entry.seq) }));
+      expect(fold.turns.map((turn) => ({ key: turn.key, entries: keptEntries(turn).map((entry) => entry.seq) }))).toEqual(expected);
+    }
+  }
+});
+
+test("batch retirement and compaction have bounded slot-array visits", () => {
+  const fold = emptyFold();
+  let entries = 0;
+  const send = (event: object) => expect(foldEntry(fold, classifyStoredLine(++entries, JSON.stringify(event)))).toBe(true);
+  send({ type: "user", message: { role: "user", content: "one long turn" } });
+  const prompts = 400;
+  for (let n = 0; n < prompts; n++) for (let copy = 0; copy < 3; copy++) send(native(`request-${n}`));
+  const turn = fold.turns[0];
+  if (turn === undefined) throw new Error("missing fixture turn");
+  let visits = 0;
+  let arrays = 0;
+  const counted = new WeakSet<object>();
+  for (let n = 0; n < prompts; n++) {
+    if (!counted.has(turn.entries)) {
+      const slots = new Proxy(turn.entries, {
+        get(target, key, receiver) {
+          if (typeof key === "string" && /^\d+$/.test(key)) visits++;
+          return Reflect.get(target, key, receiver);
+        },
+      });
+      counted.add(slots);
+      turn.entries = slots;
+      arrays++;
+    }
+    send(open(`request-${n}`, entries + 1));
+  }
+  expect(arrays).toBeGreaterThan(1);
+  expect(visits / entries).toBeLessThan(20);
+  expect(keptEntries(turn)).toHaveLength(prompts + 1);
+});
+
+
+test("a late tool-result regroup keeps pending permission locations attached to the rendered slots", () => {
+  const { root, send } = transcript();
+  send({ type: "user", message: { role: "user", content: "start" } });
+  const result = (content: string) => ({ type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "late-tool", content }] } });
+  send(result("first"));
+  send(native("pending"));
+  send({ type: "assistant", message: { role: "assistant", content: [{ type: "tool_use", id: "late-tool", name: "Bash", input: { command: "pwd" } }] } });
+  send(result("second"));
+  expect(root.querySelectorAll(".event--control_request")).toHaveLength(1);
+  send(open("pending"));
+  expect(root.querySelectorAll(".event--control_request")).toHaveLength(0);
+  expect(root.querySelectorAll(".event--flk_permission_request")).toHaveLength(1);
+  expect(root.querySelectorAll('[data-testid="tool-run"]')).toHaveLength(1);
+  expect(root.textContent).toContain("pwd");
+  expect(root.textContent).toContain("second");
 });
