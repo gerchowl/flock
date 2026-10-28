@@ -138,6 +138,16 @@ kernel-lock waits have a separate eight-worker budget; only credential I/O and
 registration reserve one of the four shared store-I/O workers. Reconnecting
 hellos cannot consume the workers used by established subscriptions.
 
+App-session retirement and shutdown also wait outside the shared store-I/O
+pool. They publish revocation intent before acquiring exclusive ownership,
+then retain that ownership through removal and notification (ADR-0036 §5a).
+The separate retirement-wait budget allows one worker per live socket plus
+shutdown (seventeen workers); cancellation retains its worker until the helper
+is reaped. The existing two-second lock ceiling is unchanged. Only intent
+publication and the fenced mutation reserve store-I/O capacity. A successful
+retirement still precedes the credential's 4403 close; acquisition or resource
+failure closes fail-closed with 1001 instead of claiming successful revocation.
+
 The enforcing clock is Linux `CLOCK_BOOTTIME` or macOS `mach_continuous_time`
 (#2489), so sleep counts without trusting a settable wall clock. Absolute
 kernel timers use the same domain; expiry is ready on resume without polling,

@@ -31,7 +31,7 @@ use tokio::sync::{mpsc, watch, OwnedSemaphorePermit, Semaphore};
 /// Maximum encoded, received or reassembled message bytes.
 const MAX_MESSAGE: usize = 65_536;
 /// Upgraded socket cap, including pending hellos.
-const CONNECTIONS: u32 = 16;
+pub(super) const CONNECTIONS: u32 = 16;
 /// Pending unauthenticated sockets; leave capacity for authenticated sessions.
 const PENDING_HELLOS: usize = 4;
 /// Registered sockets per authenticated bearer digest, including pending welcome.
@@ -221,8 +221,7 @@ impl Core {
     /// Return the revocation failure after bounded cleanup, logging it first.
     pub(crate) async fn shutdown(&self) -> io::Result<()> {
         let store = self.shared.store.clone();
-        let revocation = super::store_io::shared()
-            .run(move || store.shutdown())
+        let revocation = mutate_apps(store, None)
             .await
             .ok_or_else(|| io::Error::other("app revocation worker unavailable"))
             .and_then(|out| out.map_err(io::Error::other));
@@ -711,9 +710,7 @@ async fn connection(
         let store = shared.store.clone();
         let session = session.clone();
         if !matches!(
-            super::store_io::shared()
-                .run(move || store.retire(&session))
-                .await,
+            mutate_apps(store, Some(session)).await,
             Some(Ok(()) | Err(TokenError::Revoked))
         ) {
             code = GOING_AWAY_CLOSE;
@@ -725,3 +722,30 @@ async fn connection(
 }
 #[cfg(test)]
 pub(crate) mod tests;
+
+/// Publish intent, wait outside store I/O, then commit under the acquired fence.
+/// Overload fails closed; abandoned waits retain their bounded worker until reaped.
+async fn mutate_apps(
+    store: Arc<Store>,
+    session: Option<Session>,
+) -> Option<Result<(), TokenError>> {
+    let begin = store.clone();
+    let pending = match super::store_io::shared()
+        .run(move || begin.begin_mutation())
+        .await?
+    {
+        Ok(pending) => pending,
+        Err(error) => return Some(Err(error)),
+    };
+    let waiter = store.clone();
+    let fence = match super::store_io::retirement_waits()
+        .run(move || waiter.wait_mutation(pending))
+        .await?
+    {
+        Ok(fence) => fence,
+        Err(error) => return Some(Err(error)),
+    };
+    super::store_io::shared()
+        .run(move || store.finish_mutation(fence, session.as_ref()))
+        .await
+}
