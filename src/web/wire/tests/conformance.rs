@@ -54,10 +54,24 @@ fn selected_welcome_capabilities_match_the_actual_endpoint() {
                 continue;
             };
             let server = Server::new().await;
-            // ADR-0036 #2461: mint exactly the scopes authored by this scenario.
+            // Command scenarios use ClientOpen's actual grants, independently of
+            // the fixture. Other scenarios intentionally use narrower credentials.
+            let scopes = if ["agent-send", "permission-decision", "token-revoked"]
+                .contains(&name.as_str())
+            {
+                let grants =
+                    serde_json::to_value(crate::api::client_tokens::operator_scopes()).unwrap();
+                assert_eq!(
+                    expected["capabilities"], grants,
+                    "{name}: ClientOpen grants"
+                );
+                grants
+            } else {
+                expected["capabilities"].clone()
+            };
             let path = server._root.path().join("client-tokens/one.token");
             let mut token: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-            token["scopes"] = expected["capabilities"].clone();
+            token["scopes"] = scopes.clone();
             fs::write(path, serde_json::to_vec(&token).unwrap()).unwrap();
             let protocol = lines
                 .iter()
@@ -73,7 +87,11 @@ fn selected_welcome_capabilities_match_the_actual_endpoint() {
             let actual = client.hello(protocol, &"a".repeat(64)).await;
             server.finish().await;
             // Opaque server identities differ; operation capabilities are semantic.
-            for field in ["protocol", "capabilities", "idempotency_window_ms"] {
+            assert_eq!(
+                actual["capabilities"], scopes,
+                "{name}: granted welcome capabilities"
+            );
+            for field in ["protocol", "idempotency_window_ms"] {
                 assert_eq!(actual[field], expected[field], "{name}: welcome.{field}");
             }
         }

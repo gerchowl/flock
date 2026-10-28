@@ -64,10 +64,9 @@ def main():
         reader = cli("client", "token", "add", "dogfood-reader", "--scopes", "read", "--show-token")["result"]["issued"]["token"]
         endpoint = api("client.open", {})["result"]["url"].split("#", 1)[0]
         endpoint = endpoint.replace("http://", "ws://").rstrip("/") + "/v1/ws"
-        if args.verify_scopes:
-            # The owned local operator creates the real permission request.
-            api("agent.send", {"target": agent, "text": "fixture message", "submit": True})
-        result = subprocess.run(["bun", str(repo / "web/client/tests/wire/dogfood-server.ts"), endpoint, token, reader, agent, binary, "without-operate" if args.verify_scopes else args.disable or "none"],
+        journals = list((root / "x").glob(f"**/sessions/{agent}/queue.jsonl"))
+        assert len(journals) == 1, "one owned queue journal"
+        result = subprocess.run(["bun", str(repo / "web/client/tests/wire/dogfood-server.ts"), endpoint, token, reader, agent, binary, "without-operate" if args.verify_scopes else args.disable or "none", str(journals[0])],
                                 cwd=root, env=env, capture_output=True, text=True, timeout=30)
         if result.returncode != 0:
             artifacts = repo / ".local" / "1833-r2-server-evidence"
