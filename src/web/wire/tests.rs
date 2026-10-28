@@ -793,7 +793,9 @@ fn covers_selected_fixture_handshake_vectors_run_against_the_core() {
                     matches!(
                         line.step,
                         FixtureStep::Send {
-                            frame: ServerFrame::Ping { .. },
+                            frame: crate::structured_wire::fixture::FixtureServerFrame::Literal(
+                                ServerFrame::Ping { .. }
+                            ),
                             ..
                         }
                     )
