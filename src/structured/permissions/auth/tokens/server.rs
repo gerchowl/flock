@@ -227,10 +227,10 @@ impl Store {
             Source::File(s) => self.files.admit(s, required, dispatch),
         }
     }
-    /// Observe a retirement entering its real contended kernel wait.
+    /// Gate a contended retirement before its deadline-bounded IPC read.
     #[cfg(all(test, feature = "web"))]
-    pub(crate) fn on_mutation_waiting(&self, ready: tokio::sync::oneshot::Sender<()>) {
-        self.apps.on_waiting(ready);
+    pub(crate) fn on_mutation_waiting(&self, action: impl FnOnce() + Send + 'static) {
+        self.apps.on_waiting(action);
     }
     /// Publish revocation intent before waiting outside the store-I/O pool.
     #[cfg(feature = "web")]

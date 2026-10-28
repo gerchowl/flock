@@ -48,7 +48,9 @@ pub(crate) fn hello_waits() -> &'static StoreIo {
 }
 
 /// Bound retirement lock waits independently of live subscription I/O.
-/// One slot per live socket plus shutdown; cancellation retains the helper's slot.
+/// Shared capacity is the socket cap plus one, not a reserved shutdown slot.
+/// Abandoned waits retain slots until their helpers are reaped, so replacement
+/// sockets can exhaust the pool; shutdown then fails closed without waiting.
 pub(crate) fn retirement_waits() -> &'static StoreIo {
     static POOL: OnceLock<StoreIo> = OnceLock::new();
     POOL.get_or_init(|| {
