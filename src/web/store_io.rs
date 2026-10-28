@@ -10,13 +10,21 @@ impl StoreIo {
         &self,
         operation: impl FnOnce() -> T + Send + 'static,
     ) -> Option<T> {
-        let permit = self.0.clone().try_acquire_owned().ok()?;
+        let permit = self
+            .0
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| {
+                crate::logging::client_wire_unavailable("store_capacity", None);
+            })
+            .ok()?;
         tokio::task::spawn_blocking(move || {
             let result = operation();
             drop(permit);
             result
         })
         .await
+        .map_err(|_| crate::logging::client_wire_unavailable("store_worker", None))
         .ok()
     }
 }

@@ -9,6 +9,8 @@ use std::time::Duration;
 
 /// Internal worker argument; the worker receives no path or credential.
 pub(crate) const WORKER_ARG: &str = "--client-token-lock";
+/// Shared admission worker, with the same descriptor-only ownership checks.
+pub(crate) const SHARED_WORKER_ARG: &str = "--client-token-lock-shared";
 /// Owned advisory-lock description whose scope ends independently of child fds.
 ///
 /// Close alone waits for every fork/dup reference to disappear. Explicit unlock
@@ -53,8 +55,20 @@ pub(crate) struct PendingLock {
 impl PendingLock {
     /// Start without blocking the caller. Only a contended lock needs a helper.
     pub(crate) fn begin(file: File, executable: &Path) -> io::Result<Self> {
+        Self::begin_with(file, executable, false)
+    }
+    /// Wait for shared admission without changing exclusive mutation ownership.
+    pub(crate) fn begin_shared(file: File, executable: &Path) -> io::Result<Self> {
+        Self::begin_with(file, executable, true)
+    }
+    fn begin_with(file: File, executable: &Path, shared: bool) -> io::Result<Self> {
         let file = LockFile::new(file);
-        let contended = match file.try_lock() {
+        let attempt = if shared {
+            file.try_lock_shared()
+        } else {
+            file.try_lock()
+        };
+        let contended = match attempt {
             Ok(()) => false,
             Err(TryLockError::WouldBlock) => true,
             Err(TryLockError::Error(error)) => return Err(error),
@@ -65,7 +79,11 @@ impl PendingLock {
             #[allow(clippy::disallowed_methods)]
             let mut command = std::process::Command::new(executable);
             command
-                .arg(WORKER_ARG)
+                .arg(if shared {
+                    SHARED_WORKER_ARG
+                } else {
+                    WORKER_ARG
+                })
                 .stdin(Stdio::null())
                 .stdout(Stdio::from(OwnedFd::from(child)))
                 .stderr(Stdio::null());
@@ -100,8 +118,18 @@ impl PendingLock {
         self.waiting = Some(ready);
     }
     /// Wait at most the supplied lock deadline; cleanup also runs when abandoned.
-    pub(crate) fn finish(mut self, deadline: Duration) -> io::Result<LockFile> {
+    pub(crate) fn finish(self, deadline: Duration) -> io::Result<LockFile> {
+        self.finish_notifying(deadline, || {})
+    }
+    /// Observe a real contended wait before reading its bounded helper acknowledgement.
+    /// The callback must not wait for the helper or manage the guarded token store.
+    pub(crate) fn finish_notifying(
+        mut self,
+        deadline: Duration,
+        on_wait: impl FnOnce(),
+    ) -> io::Result<LockFile> {
         if let Some((_, stream)) = &mut self.helper {
+            on_wait();
             stream.set_read_timeout(Some(deadline))?;
             let mut ack = [0];
             #[cfg(test)]
@@ -173,7 +201,14 @@ pub(crate) fn worker() -> io::Result<()> {
             let _ = monitor.read(&mut [0]);
             std::process::exit(crate::cli::exit::SUCCESS);
         })?;
-    file.lock()?;
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == SHARED_WORKER_ARG)
+    {
+        file.lock_shared()?;
+    } else {
+        file.lock()?;
+    }
     // The parent retains this same description through the operation. Unlocking
     // here would break the transfer; the parent guard releases it after admission.
     std::io::stdout().write_all(b"L")
