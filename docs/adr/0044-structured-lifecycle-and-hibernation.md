@@ -1,4 +1,4 @@
-# ADR-0042: Durable structured lifecycle and idle hibernation
+# ADR-0044: Durable structured lifecycle and idle hibernation
 
 - Status: Proposed
 - Date: 2026-10-29
