@@ -204,3 +204,7 @@ not a digest of the bearer, a runtime substitution, or a dynamic matcher.
 `endpoint-auth.ts` runs all eight `token-refused` steps through a real endpoint
 and client. Its typed pending-part-2b set is tested against the other eight
 selected scripts; later providers must shrink it. Gaps and overlap fail.
+
+The endpoint uses close code 4401 for missing, malformed and unknown tokens.
+The `token-refused` trace proves the refusal path, not which token the endpoint
+saw. Unexpected server frames fail the trace even after refusal has settled.
