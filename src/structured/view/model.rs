@@ -127,6 +127,15 @@ impl Model {
             {
                 self.record(&record, true)
             }
+            live::Item::Delta { record, .. } if record.known == Some(true) => {
+                // Completion can retire old cards after history catches up, but
+                // stale data must never recreate a provisional card.
+                if let Ok(v) = serde_json::from_str::<Value>(&record.raw) {
+                    if v["type"] == "stream_event" && v["event"]["type"] == "message_stop" {
+                        self.partial(&record, &v);
+                    }
+                }
+            }
             live::Item::Gap { through } => self.gap(through),
             live::Item::End(_) => self.snapshot.replay = Replay::Ended,
             _ => {}
@@ -139,11 +148,30 @@ impl Model {
     }
     fn clear_partials(&mut self) {
         for (key, id) in &self.partials {
-            self.folds
-                .remember(key, self.snapshot.collapsed.contains(id));
+            if let Some(card) = self.snapshot.transcript.iter().find(|card| card.id == *id) {
+                self.folds
+                    .remember(key, self.snapshot.collapsed.contains(id), &card.content);
+            }
         }
         self.snapshot.transcript.retain(|card| !card.streaming);
         self.partials.clear();
+        self.prune();
+    }
+    /// Retire selected provisional cards, retaining only bounded fold correlation hints.
+    fn retire_partials(&mut self, ends: impl Fn(&BlockKey, &Card) -> bool) {
+        let mut removed = std::collections::BTreeSet::new();
+        for (key, id) in &self.partials {
+            if let Some(card) = self.snapshot.transcript.iter().find(|c| c.id == *id) {
+                if ends(key, card) {
+                    removed.insert(*id);
+                    self.folds
+                        .remember(key, self.snapshot.collapsed.contains(id), &card.content);
+                }
+            }
+        }
+        self.snapshot
+            .transcript
+            .retain(|c| !removed.contains(&c.id));
         self.prune();
     }
     fn prune(&mut self) {
@@ -151,6 +179,17 @@ impl Model {
             self.snapshot.transcript.iter().map(|c| c.seq).collect();
         if let Some(&first) = cursors.iter().rev().nth(history::LIVE_RECORDS - 1) {
             let before = self.snapshot.transcript.len();
+            for (key, id) in &self.partials {
+                if let Some(card) = self
+                    .snapshot
+                    .transcript
+                    .iter()
+                    .find(|c| c.id == *id && c.seq < first)
+                {
+                    self.folds
+                        .remember(key, self.snapshot.collapsed.contains(id), &card.content);
+                }
+            }
             self.snapshot.transcript.retain(|c| c.seq >= first);
             if self.snapshot.transcript.len() != before {
                 self.snapshot.earlier_history = Some(first);
@@ -191,6 +230,18 @@ impl Model {
         }
     }
     fn partial(&mut self, r: &StreamRecord, v: &Value) {
+        if v["event"]["type"] == "message_stop" {
+            let message = Self::message(v, r.seq);
+            self.retire_partials(|key, card| {
+                card.seq <= r.seq
+                    && match (&key.0, &message) {
+                        (Message::Named(_), Message::Named(_)) => key.0 == message,
+                        (Message::Cursor(start), Message::Cursor(end)) => start <= end,
+                        _ => false,
+                    }
+            });
+            return;
+        }
         if matches!(
             v["event"]["type"].as_str(),
             Some("content_block_start" | "content_block_stop")
@@ -316,22 +367,21 @@ impl Model {
         };
         let message = Self::message(&v, r.seq);
         if v["type"] == "assistant" {
-            let removed: std::collections::BTreeSet<_> = self
-                .partials
-                .iter()
-                .filter(|((m, _), _)| m.finalized_by(&message, r.seq))
-                .map(|(_, id)| *id)
-                .collect();
-            for (key, id) in &self.partials {
-                if removed.contains(id) {
-                    self.folds
-                        .remember(key, self.snapshot.collapsed.contains(id));
-                }
-            }
-            self.snapshot
-                .transcript
-                .retain(|c| !removed.contains(&c.id));
-            self.prune();
+            self.retire_partials(|key, card| {
+                key.0.finalized_by(&message, r.seq)
+                    && (matches!(key.0, Message::Cursor(_))
+                        || matches!(card.content, Content::RawJson { .. })
+                        || v.pointer("/message/content")
+                            .and_then(Value::as_array)
+                            .is_some_and(|blocks| {
+                                blocks.iter().any(|b| folds::same_content(&card.content, b))
+                            }))
+            });
+        }
+        if v["type"] == "result" && v["parent_tool_use_id"].is_null() {
+            // Later-turn live output may already be queued ahead of history replay.
+            self.retire_partials(|_, card| card.seq < r.seq);
+            self.folds.finish(r.seq);
         }
         if v["type"] == "system" && v["subtype"] == "init" {
             self.snapshot.reported_model = v["model"].as_str().map(str::to_owned);
@@ -392,7 +442,7 @@ impl Model {
                         let default = matches!(content, Content::Thinking(_));
                         let fold = if v["type"] == "assistant" {
                             self.folds
-                                .take(&message, index as u64, r.seq)
+                                .take(&message, index as u64, r.seq, &content, blocks.len() == 1)
                                 .unwrap_or(default)
                         } else {
                             default
@@ -417,7 +467,7 @@ impl Model {
             }
         }
         if v["type"] == "assistant" {
-            self.folds.finish(&message, r.seq);
+            self.folds.finish(r.seq);
         }
     }
 }

@@ -686,21 +686,32 @@ impl HeadlessServer {
     async fn prepare_client_wire(
         &mut self,
         inherited: Option<std::net::TcpListener>,
+        local_owner: Option<crate::ipc::SocketOwner>,
     ) -> io::Result<()> {
-        self.client_wire = crate::web::client_listener::Listener::prepare(
-            self.app.state.config.client.bind,
-            self.app.client_codes.clone(),
-            crate::session::data_dir(),
-            inherited,
-            self.client_wire_health.clone(),
+        let data = crate::session::data_dir();
+        let core = crate::web::wire::Core::new_shared(
+            data.clone(),
             self.app.render_notify.clone(),
             self.app.client_auth.clone(),
         )
         .await?;
-        if let Some(wire) = &self.client_wire {
+        self.client_wire = crate::web::client_listener::Listener::prepare(
+            self.app.state.config.client.bind,
+            self.app.client_codes.clone(),
+            data,
+            inherited,
+            (
+                crate::web::local_listener::socket_path(&api::socket_path()),
+                local_owner,
+            ),
+            self.client_wire_health.clone(),
+            core,
+        )
+        .await?;
+        if let Some(socket) = self.client_wire.as_ref().and_then(|w| w.socket.as_ref()) {
             self.app
                 .client_codes
-                .set_endpoint(wire.socket.local_addr()?)
+                .set_endpoint(socket.local_addr()?)
                 .map_err(io::Error::other)?;
         }
         Ok(())
@@ -1441,15 +1452,19 @@ impl HeadlessServer {
         {
             manifest.store_generation = store_generation.saturating_add(1);
         }
-        #[cfg(feature = "web")]
-        {
-            manifest.client_listener = self.client_wire.is_some();
-            if manifest.client_listener {
-                manifest.version = crate::server::handoff::CLIENT_LISTENER_HANDOFF_VERSION;
-            }
-        }
         manifest.socket_owners = true;
         manifest.version = crate::server::handoff::SOCKET_OWNER_HANDOFF_VERSION;
+        #[cfg(feature = "web")]
+        {
+            manifest.client_listener = self
+                .client_wire
+                .as_ref()
+                .is_some_and(|w| w.socket.is_some());
+            manifest.local_ws_owner = self.client_wire.is_some();
+            if manifest.local_ws_owner {
+                manifest.version = crate::server::handoff::LOCAL_WS_HANDOFF_VERSION;
+            }
+        }
         let mut import_child = match crate::server::handoff::spawn_handoff_import(
             import_exe.as_deref(),
             &socket_path,
@@ -1473,9 +1488,9 @@ impl HeadlessServer {
                 fds.push(runtime.duplicate_handoff_fd()?);
             }
             #[cfg(feature = "web")]
-            if let Some(wire) = &self.client_wire {
+            if let Some(socket) = self.client_wire.as_ref().and_then(|w| w.socket.as_ref()) {
                 use std::os::fd::IntoRawFd;
-                fds.push(crate::platform::client_listener::duplicate(&wire.socket)?.into_raw_fd());
+                fds.push(crate::platform::client_listener::duplicate(socket)?.into_raw_fd());
             }
             use std::os::fd::IntoRawFd;
             let api_owner = &self
@@ -1485,6 +1500,10 @@ impl HeadlessServer {
                 .socket_owner;
             fds.push(api_owner.duplicate()?.into_raw_fd());
             fds.push(self.client_socket_owner.duplicate()?.into_raw_fd());
+            #[cfg(feature = "web")]
+            if let Some(wire) = &self.client_wire {
+                fds.push(wire.local_owner().duplicate()?.into_raw_fd());
+            }
             Ok::<(), io::Error>(())
         })();
         if let Err(err) = duplicate_result {
@@ -1533,7 +1552,14 @@ impl HeadlessServer {
             let _ = api_server.remove_socket_file_if_owned();
         }
         let _ = remove_socket_file_if_owned(&self.client_socket_path, self.client_socket_identity);
-        if let Err(err) = crate::server::handoff::wait_ready(&mut stream) {
+        #[cfg(feature = "web")]
+        let unlinked = self
+            .client_wire
+            .as_ref()
+            .map_or(Ok(()), |wire| wire.unlink_local());
+        #[cfg(not(feature = "web"))]
+        let unlinked: io::Result<()> = Ok(());
+        if let Err(err) = unlinked.and_then(|()| crate::server::handoff::wait_ready(&mut stream)) {
             crate::server::handoff::cleanup_failed_import_child(&mut import_child);
             match self.wait_then_restore_public_sockets_after_failed_handoff() {
                 Ok(()) => {
@@ -1641,6 +1667,10 @@ impl HeadlessServer {
         self.client_listener = listener;
         self.client_socket_path = client_path;
         self.client_socket_identity = client_socket_identity;
+        #[cfg(feature = "web")]
+        if let Some(wire) = &mut self.client_wire {
+            wire.restore_local(crate::web::local_listener::socket_path(&api::socket_path()))?;
+        }
         Ok(())
     }
 
@@ -4347,7 +4377,7 @@ pub fn run_server(args: &[String], handoff_socket: Option<PathBuf>) -> io::Resul
         };
 
         #[cfg(feature = "web")]
-        server.prepare_client_wire(None).await?;
+        server.prepare_client_wire(None, None).await?;
         crate::logging::server_started(&api::socket_path(), &client_socket_path());
         print_ready_message(&api::socket_path(), &client_socket_path());
 
@@ -4366,6 +4396,15 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
     init_logging();
     let loaded_config = config::Config::load();
     let mut received = crate::server::handoff::receive(socket_path, token)?;
+    #[cfg(feature = "web")]
+    let local_ws_owner = if received.manifest.local_ws_owner {
+        Some(crate::ipc::SocketOwner::take(
+            &crate::web::local_listener::socket_path(&api::socket_path()),
+            &mut received.fds,
+        )?)
+    } else {
+        None
+    };
     let (api_owner, client_owner) = if received.manifest.socket_owners {
         let client = crate::ipc::SocketOwner::take(&client_socket_path(), &mut received.fds)?;
         let api = crate::ipc::SocketOwner::take(&api::socket_path(), &mut received.fds)?;
@@ -4468,7 +4507,10 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
             client_owner,
         )?;
         #[cfg(feature = "web")]
-        if let Err(err) = server.prepare_client_wire(wire_listener).await {
+        if let Err(err) = server
+            .prepare_client_wire(wire_listener, local_ws_owner)
+            .await
+        {
             crate::server::handoff::report_import_refusal(&mut received.stream, &err.to_string())?;
             return Err(err);
         }
@@ -4524,18 +4566,45 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
 
 #[cfg(unix)]
 fn wait_for_old_public_sockets_to_close(timeout: Duration) -> io::Result<()> {
-    use std::os::unix::net::UnixStream;
+    wait_for_old_public_sockets_at(api::socket_path(), client_socket_path(), timeout, || {
+        std::thread::sleep(Duration::from_millis(50));
+    })
+}
 
+#[cfg(unix)]
+fn wait_for_old_public_sockets_at(
+    api_socket: PathBuf,
+    client_socket: PathBuf,
+    timeout: Duration,
+    mut wait: impl FnMut(),
+) -> io::Result<()> {
+    let paths = [api_socket, client_socket];
+    #[cfg(feature = "web")]
+    let paths = [
+        paths[0].clone(),
+        paths[1].clone(),
+        crate::web::local_listener::socket_path(&paths[0]),
+    ];
     let deadline = Instant::now() + timeout;
-    let api_socket = api::socket_path();
-    let client_socket = client_socket_path();
     while Instant::now() < deadline {
-        let api_open = api_socket.exists() && UnixStream::connect(&api_socket).is_ok();
-        let client_open = client_socket.exists() && UnixStream::connect(&client_socket).is_ok();
-        if !api_open && !client_open {
+        if !paths.iter().any(|path| {
+            path.exists()
+                && match crate::platform::socket::probe_listener(path) {
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
+                        ) =>
+                    {
+                        false
+                    }
+                    // Full backlogs and uncertain probes are still busy, never proof of unlink.
+                    _ => true,
+                }
+        }) {
             return Ok(());
         }
-        std::thread::sleep(Duration::from_millis(50));
+        wait();
     }
     Err(io::Error::new(
         io::ErrorKind::TimedOut,
@@ -10082,3 +10151,6 @@ next_tab = ""
         );
     }
 }
+
+#[cfg(all(test, feature = "web"))]
+mod native_handoff_tests;
