@@ -1,4 +1,4 @@
-# ADR 0042 — Multi-node GUI access through a TLS home server and the mesh
+# ADR 0043 — Multi-node GUI access through a TLS home server and the mesh
 
 - Status: Proposed
 - Date: 2026-10-29
@@ -23,7 +23,7 @@ independently of mesh VERSION. They do not authorize a mesh bump.
 ```typescript
 type FleetNodeRow = {
   node_id: string;                  // pinned NodeId; key, never hostname
-  name: string;                     // bounded display label
+  name: string;                     // bounded policy-projected display alias
   health: PeerSystemSummary | null;
   latency_ms: number | null;
   last_ok: number | null;
@@ -39,6 +39,25 @@ type FleetNodeRow = {
 };
 ```
 
+**Identity before the first successful poll — owner choice.**
+`PeerSummaryState.node_id` is optional and starts as None; PeerConfig has no
+NodeId pin. A configured name or SSH destination cannot establish that identity.
+
+| Option | Key and behavior | Cost |
+| --- | --- | --- |
+| No provisional node row (Recommended) | Emit FleetNodeRow only when an authenticated mesh identity/route or a previously verified binding supplies NodeId. Key it by that NodeId for its entire life. A configured peer with no such identity emits no node row. | A never-reached, unbound configured peer is absent from the GUI node tree. Its configured-name failure remains in the home's existing peer/config diagnostics, not a fake fleet node. |
+| Provisional row | Add a tagged configured-peer key scoped by home NodeId and configured peer name, separate from NodeId; later add an atomic, typed bind/merge delta to replace it with the authenticated NodeId, merging any already present row. | Another wire identity variant, alias/rename collisions, persistence migration and atomic reducer cases. A plain string name cannot safely stand in for NodeId. This alternative is not selected here. |
+
+Thus **online=false before first summary success** is represented only if the
+identity is already authenticated independently, for example from RouteTable or
+a retained verified binding: emit that NodeId with online false, last_ok/health/
+latency/version/counts null until known, and a classified pending/failure reason.
+If no NodeId is known, there is no FleetNodeRow and no online field to serialize.
+First authenticated discovery adds a normal upsert, not a rename from a synthetic
+key. Never correlate unbound summaries to routes by matching names; retain only
+observations actually bound to the same NodeId. A changed peer identity cannot
+inherit the previous identity's last success, health, counts or command authority.
+
 Every top-level field is present; nullable fields serialize as `null` when
 unknown. Legacy/future readers use ADR-0028 §3a's leniency, not strict whole-list
 loading. Nonnegative integers must fit JavaScript's safe-integer range. Unknown
@@ -47,15 +66,36 @@ The GUI never treats null as zero, an empty inventory, healthy or online.
 
 | Field | Units, provenance and render contract |
 | --- | --- |
-| `node_id`, `name` | Merge PeerSummaryState with RouteTable by authenticated NodeId. A name/alias or two diamond routes cannot create a second row. Unbound labels never become routing authority. |
+| `node_id`, `name` | Merge PeerSummaryState with RouteTable only by authenticated NodeId, under the identity choice above. A name/alias or two diamond routes cannot create a second row. Project names through the exposure policy in §2; unbound labels never become routing authority. |
 | `health` | Reuse PeerSystemSummary: cpu_percent/gpu_percent are integer percent 0–100; mem_used, mem_total and disk_free are bytes; thermal uses ADR-0013's declared severity 0–3 and component. Missing individual measurements remain absent/unknown under that existing type. Load never implies thermal health. The node tile renders only supplied measurements. |
 | `latency_ms` | Unsigned integer milliseconds of the last successful summary request, including its round trip and service time. This is PeerSummaryState.latency_ms, not ICMP or pure network RTT. Retained on failure and visibly stale when offline. Only a request measured by the serving home to this owner can populate this scalar. A relayed leg with a different or unknown observer yields null; it cannot be represented as home-to-owner latency. Per-hop/provenance-rich latency is later #2293 work. The home has null, not fabricated 0. |
 | `last_ok` | Unix epoch milliseconds in the home server's clock domain for the last successful owner observation. Project the existing monotonic last_ok/relayed age against home wall time at capture; do not serialize Instant. Null means never observed or age unprovable. Presentation only: GUI can display an age using the envelope ts_ms and its own monotonic dwell, but must never derive online from wall clocks. |
 | `version` | Last owner-reported software version string, or null. Show stale retained version as such. It is not capability evidence. Mesh/client protocol incompatibility is a typed error, not a guessed version comparison. |
-| `error` | Latest classified failure or null after success. Bounded, content-free code/message such as unavailable, stale, peer_incompatible or refused; no raw SSH stderr, tokens, payloads or private paths. Preserve specific authorization/version causes. Unknown code renders a generic failure with its safe message. |
-| `online` | Server classification: true only for a current local server, or a compatible remote with a live route, a successful observation no older than the effective stale threshold and no current failure. It is false before first success, on failure/withdrawal/incompatibility, and after staleness. It describes reachability, never command permission or agent liveness. |
-| `route` | Existing Route {node, name, next_hop, hops}; node equals row.node_id, next_hop is the actual enrolled next hop and hops is an integer edge count. Home/local or unavailable path uses null. Null plus online distinguishes local from unavailable; the serving home NodeId is known from enrollment. Never fill a route from labels or point a remote row through itself. |
-| `counts` | Last complete owner inventory, deduped by AgentId, or null if unavailable. total counts those agents; by_phase is a disjoint partition using shared AgentState phase, including unknown, and sums to total. waiting_on_human counts distinct agents with one or more open non-automatic permission requests, not request IDs; null if that source is unavailable. Hibernated/offline agents remain in total. A confirmed empty inventory is total 0 with empty phase counts and waiting 0. Counts stay stale with their row; route loss never means zero agents. |
+| `error` | For SSH failures use SshFailureReason::classify and its stable as_str token (src/peers.rs), with a bounded safe message, not raw PeerSummaryState.error or SSH stderr. Use separately typed pending/stale/route/peer_incompatible reasons for non-SSH states; null after success. No tokens, payloads or private paths. Preserve specific authorization/version causes. Unknown code renders a generic failure with its safe message. |
+| `online` | Server classification: true only for a current local server, or a compatible remote with a live route, a successful observation no older than the effective stale threshold and no current failure. For an already authenticated identity it is false before first success, on failure/withdrawal/incompatibility, and after staleness; an unbound peer has no node row. It describes reachability, never command permission or agent liveness. |
+| `route` | Existing Route {node, name, next_hop, hops}; node equals row.node_id, next_hop is the actual enrolled next hop and hops is an integer edge count; route.name follows the same exposure policy as row.name. Home/local or unavailable path uses null. Null plus online distinguishes local from unavailable; the serving home NodeId is known from enrollment. Never fill a route from labels or point a remote row through itself. |
+| `counts` | Last complete owner inventory, deduped by AgentId, or null if unavailable. total counts those agents; by_phase is a disjoint partition using shared AgentState phase (or the explicit legacy mapping below), including unknown, and sums to total. waiting_on_human counts distinct agents with one or more open non-automatic permission requests, not request IDs; null if that source is unavailable. Hibernated/offline agents remain in total. A confirmed empty inventory is total 0 with empty phase counts; local waiting is 0 when its book confirms it, while remote waiting remains null today. Counts stay stale with their row; route loss never means zero agents. |
+
+**Remote status/count projection available today.**
+PeerStructuredAgentSummary.status is AgentStatus, not the full S4 AgentState.
+For each deduped remote agent map its reported value as follows; do not invent
+S4 axes or a permission-book observation:
+
+| AgentStatus | by_phase bucket |
+| --- | --- |
+| Idle | unknown (idle alone does not distinguish finished, settling or waiting) |
+| Working | working |
+| Blocked | blocked |
+| Done | finished |
+| Hibernated | hibernated |
+| Offline | offline |
+| Unknown or a future value | unknown |
+
+Local structured agents use their actual S4 phase instead. **Remote
+waiting_on_human is null today**, even for an otherwise complete inventory:
+PeerStructuredAgentSummary carries no open non-automatic request IDs. Blocked
+status is not a permission-book observation. #2721 must preserve that null;
+#2293's later authorized owner-stream integration can supply the real book.
 
 **Cadence and staleness.** Observe on completed peer summaries, local registry/S4/
 permission-book changes, route-table generation changes and connection failures.
@@ -80,12 +120,14 @@ G4 renders the authoritative online/error state and a stale marker for retained
 facts. A healthy client↔home ping cannot freshen an owner or its counts.
 
 **Immediate fail-first acceptance for #2721.** Drive the public fleet subscription:
-merge two routes to one NodeId; update only latency/version/health; fail a poll;
+start with an unbound never-reached peer (no node row), authenticate its NodeId
+without a successful summary (offline row), then succeed; merge two routes to
+one NodeId; update only latency/version/health; fail a poll;
 advance the supplied clock across the exact stale boundary with no API request;
 withdraw/restore a route; change agent phases/permissions; finish an empty
 snapshot. Assert row shape/units, actual route, retained offline counts, explicit
-nulls and completion-only removal. A live home plus silent remote stays visibly
-stale. Existing VERSION 5 summaries with missing fields remain readable.
+nulls and completion-only removal. Assert every AgentStatus mapping and null remote waiting count. A live home
+plus silent remote stays visibly stale. Existing VERSION 5 summaries with missing fields remain readable.
 
 ## 1. Context and settled owner decisions
 
@@ -151,10 +193,18 @@ Remaining **owner choices**, proposed rather than accepted:
 
 | Choice | (Recommended) option and cost | Alternative and cost |
 | --- | --- | --- |
+| Host-like names at read scope | Alias raw row.name and route.name (Recommended), following the pre-wire exposure note on #1380. Default aliases are opaque NodeId-derived labels, extending the displayed digest on collision; an operator can choose a deliberately public alias. Apply projection before encoding snapshots/live frames or persistence of client-visible cuts, never only in a component. Cost: less recognizable machines and an alias policy to maintain. | Allow configured/mesh host-like names to read-scoped tokens: easier recognition, but discloses private hostnames and topology labels. This needs explicit owner acceptance; no raw-name default. |
 | Remote exposure | Enable TLS only on explicitly selected home nodes. Any other node can be enabled later. Cost: maintain certificate and firewall configuration for those homes. | TLS enabled on every node by default: more certificate work and attack surface, without improving an existing mesh route. |
 | Client admission | Existing per-home scoped bearer plus an explicit per-destination gateway grant (§4). Cost: bearer theft is still meaningful and each destination needs enrollment. | Mandatory mTLS/device keys as well: stronger device binding, but browser provisioning, recovery and rotation become a second credential lifecycle. Track that option in #2293; it is not silently promised by TLS. |
 | Certificates | Operator-supplied certificate chain and private-key files, renewed by the deployment's certificate manager, with validated atomic reload. Cost: operator owns issuance and renewal. | Embedded ACME automation: easier setup for public DNS but adds account keys, challenges and private-network DNS policy; subsequent work remains #2293. No self-signed bypass button. |
 | Home failure | Explicitly switch to a separately enrolled home, with separate credentials and cursor namespace (§7). Cost: no automatic cross-home command replay. | Replicate gateway journals and credentials for transparent active-active failover: a new distributed authority/store problem; not required or authorized here, tracked in #2293. |
+
+The name policy covers row.name and every route.name regardless of which mesh
+hop supplied it. Read scope still exposes NodeId, actual next_hop and hop count;
+aliasing hides labels, not topology. An alias is display-only, never dialing or
+authorization input. The same safe alias must be used for a node wherever it
+appears on one home, including agent routes. The [#1380 pre-wire note](https://github.com/gerchowl/flock/issues/1380)
+records why this choice must be settled before remote projection is enabled.
 
 ## 3. TLS ingress, enrollment and limits
 
@@ -218,10 +268,30 @@ Each destination's local operator explicitly grants an enrolled home a maximum
 set of client principals, verbs, scopes and agent/workspace targets. Default is
 no new gateway client access, including owner streams and commands. Existing
 authorized peer summaries remain governed by their current mesh policy; #2721
-projects those already admitted observations without requiring a new gateway grant. Node enrollment, SSH uid and agent mail
+projects those already admitted observations without requiring a new gateway
+grant. Node enrollment, SSH uid and agent mail
 `allow_from` are not operator grants. A home with `operate` does not implicitly
 get `operate` on another node. Effective authority is the intersection of the
 current home token scopes, the destination grant and the verb's local checks.
+The remote verb→scope mapping follows ADR-0036 and the
+[#2585 ruling](https://github.com/gerchowl/flock/issues/2585#issuecomment-6471599727):
+read authorizes permitted reads; send authorizes structured sends attributed to
+the token's own principal, not the operator; answer covers its documented answer
+verbs, not agent.decide. Permission decisions (agent.decide) and lifecycle/operator
+verbs require operate. A destination grant may narrow this map, never promote
+send into operate. #2585's attributed-principal implementation is a dependency
+for send-only remote structured sends; until it lands the stricter current
+backend refusal remains visible, without silently granting operator identity.
+
+**Config gateway gate.** Every remote config.* verb, including config writes,
+is refused with typed `unsupported` before forwarding, claiming or dispatch,
+even for an operate token. There is no local-write fallback, arbitrary target
+path or raw-secret export. This gate remains until target routing/authorization
+(#2366 and #2367 → ADR-0042, #2724) is accepted and implemented with the explicit
+destination scope and revision-checked writer. Local config authorization is
+unchanged. A gateway's operator scope alone cannot select another node's write
+target; ordinary agent-command support in #1380 does not open this gate.
+
 The destination remains the only server that changes its agents, queues,
 permissions and transcripts. Stable permission request IDs/seqs are preserved.
 
@@ -380,6 +450,8 @@ at destinations. Neither hostnames nor source IPs are authorization.
 
 ## 9. Implementation slices and release gates
 
+N1 (#2721) is the **first implementation slice**, ahead of TLS and gateway
+work; it uses existing VERSION 5 observations and is not gated by #1380.
 All work below is tracked by #2293 unless #1380 is named. These are proposed
 slice boundaries, not implementation authorization. Each PR must stay at or
 below **400 own production lines, Rust plus TypeScript combined**; tests and
@@ -390,16 +462,16 @@ clocks; no sleeps, retries or timing slack to turn red into green.
 
 | Slice | Own production budget | Dependencies | Fail-first acceptance |
 | --- | --- | --- | --- |
+| N1 node schema/projection (#2721) | 300 | NODE STATUS contract, existing directory/samplers | Never-reached unbound peers emit no row; authenticated identities before first success emit offline rows. Pin AgentStatus buckets, null remote waiting, SshFailureReason codes, name projection, NodeId dedupe and generated types. |
 | T1 certificate/config boundary | 250 | Owner acceptance of §2/§3; ADR-0041 | Missing key, wrong chain, expired cert and non-TLS wildcard exposure refuse; valid explicit config works; logs contain no key. |
 | T2 TLS listener and origins | 350 | T1, existing S7 endpoint | Real isolated TLS/browser connects; wrong name/Origin/Host, insecure redirect and early application data refuse; current Unix admission remains covered. |
 | T3 reload and admission limits | 300 | T2 | Rotate a valid pair, then an invalid pair and expiry; no plaintext fallback. Flood pending handshakes while one admitted reader progresses; cap reservations release on cancellation. |
-| A1 destination gateway grants | 300 | Accepted §4, existing token management | Valid home token without a destination grant refuses; wrong principal/home, read scope and operate escalation refuse before claim; revocation fences a racing admission. |
+| A1 destination gateway grants | 300 | Accepted §4, existing token management | Valid home token without a destination grant refuses; wrong principal/home, read scope and send→operate escalation refuse before claim; remote config.* refuses unsupported; revocation fences a racing admission. |
 | M1 command envelope/version | 300 | A1; #1380; coordinated upgrade decision | VERSION 5/6 mismatch yields peer_incompatible with no dispatch; origin/target/payload substitution fails; no credential occurs in serialized frames. This is the only slice authorized to bump VERSION. |
 | M2 destination journal dispatch | 350 | M1, S7 command journal | Lose ack, restart at claim/effect/result, then resume: exactly one effect or explicit uncertainty; same id/different target refuses. |
 | M3 home return binding | 300 | M2 | Crash home across forwarding/ack; replay preserves destination key and result, never returns custody as command success or creates another command. |
 | R1 owner read cut | 350 | A1, M1, S7 replay core | Mutate during capture/replay and withdraw route: no missing/duplicate owner event or sequence rewrite; wrong read grant and late old generation refuse. |
 | R2 home subscription relay | 350 | R1 | One lagged reader or stopped owner does not lag siblings; fresh IDs recover on a diamond route; blob access does not bypass grants. |
-| N1 node schema/projection (#2721) | 300 | NODE STATUS contract, existing directory/samplers | Missing metrics stay unknown, old source epochs cannot freshen rows, duplicate routes yield one NodeId, versions and RTT provenance remain distinct; generated types drift-check. |
 | N2 fleet node/project persistence (#2721) | 350 | N1, fleet-lite cut machinery; R2 only for new remote reads | Concurrent mutation and replay, empty completion and absent-row removal, restart/ahead cursor, two readers plus a third snapshot: no lost delta, false removal or resnapshot storm. |
 | G1 node tree/tile | 350 | N2, ADR-0038 client store | Real endpoint fixture drives health, versions, latency and agents; stale remote plus live home renders distinct states, unknown remains visible, no per-node frontend socket appears. |
 | G2 enrollment/failover UX | 300 | T3, M3, G1, existing shell provider | Browser and shell connect to one enrolled TLS home; switch home after lost ack and show old outbox as uncertain without replay; stolen origin cannot access keychain credential. |
