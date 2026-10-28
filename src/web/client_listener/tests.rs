@@ -100,11 +100,18 @@ pub(crate) async fn failed_listener() -> (crate::test_support::TempDir, Listener
         }
     })
     .await;
+    let local = super::super::local_listener::Listener::prepare(
+        data.path().join("native.sock"),
+        None,
+        core.local_router(),
+    )
+    .unwrap();
     (
         data,
         Listener {
             health,
-            socket,
+            socket: Some(socket),
+            local,
             core,
             prepared: None,
             task: Some(task),
@@ -202,9 +209,11 @@ async fn refuse_wildcard(inherit_as_loopback: bool) {
         Codes::default(),
         root.path().to_owned(),
         Some(socket),
+        (root.path().join("native.sock"), None),
         Health::default(),
-        Arc::new(tokio::sync::Notify::new()),
-        Default::default(),
+        Core::new(root.path().to_owned(), Arc::new(tokio::sync::Notify::new()))
+            .await
+            .unwrap(),
     )
     .await
     .err()
@@ -237,9 +246,11 @@ async fn assert_preparation_refusal(
         Codes::default(),
         root.path().into(),
         socket,
+        (root.path().join("native.sock"), None),
         Health::default(),
-        Arc::new(tokio::sync::Notify::new()),
-        Default::default(),
+        Core::new(root.path().to_owned(), Arc::new(tokio::sync::Notify::new()))
+            .await
+            .unwrap(),
     )
     .await
     .err()
@@ -476,19 +487,27 @@ async fn non_document_responses_carry_the_resource_policy_and_documents_keep_the
 }
 
 #[tokio::test]
-async fn disabled_public_listener_does_not_create_a_native_endpoint() {
+async fn native_listener_is_prepared_when_tcp_is_disabled() {
     let root = crate::test_support::TempDir::socket();
     let listener = Listener::prepare(
         None,
         Codes::default(),
         root.path().into(),
         None,
+        (root.path().join("flock-ws.sock"), None),
         Health::default(),
-        Arc::new(tokio::sync::Notify::new()),
-        Default::default(),
+        Core::new(root.path().to_owned(), Arc::new(tokio::sync::Notify::new()))
+            .await
+            .unwrap(),
     )
     .await
     .unwrap();
-    assert!(listener.is_none());
-    assert!(!super::super::local_listener::socket_path(&root.path().join("flock.sock")).exists());
+    let listener = listener.expect("native listener exists independently of TCP");
+    assert!(listener.socket.is_none());
+    assert!(super::super::local_listener::socket_path(&root.path().join("flock.sock")).exists());
+    listener.shutdown().await.unwrap();
 }
+
+mod budgets;
+
+mod shutdown;

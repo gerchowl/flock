@@ -17,7 +17,7 @@ import tempfile
 import time
 
 
-def run(binary, scenario, wire=None):
+def run(binary, scenario, wire=None, on_failure=None):
     repo = Path(__file__).resolve().parents[2]
     with tempfile.TemporaryDirectory(prefix="fc", dir="/tmp") as temporary:
         root = Path(temporary).resolve()
@@ -44,6 +44,7 @@ def run(binary, scenario, wire=None):
         env["FLOCK_SOCKET_PATH"] = str(root / "a")
         env["FLOCK_CLIENT_SOCKET_PATH"] = str(root / "c")
         if wire is not None:
+            env["FLOCK_LOG"] = "debug"
             tailscale = root / "bin" / "tailscale"
             tailscale.write_text("#!/bin/sh\nprintf '{}\\n'\n")
             tailscale.chmod(0o700)
@@ -232,6 +233,7 @@ max_spawn_fanout = {fanout}
                     "scoped_identity":True,"framed_opening_turn":True,"isolated_home":True,
                     "operator_resume_with_opening":True,"operator_resume_without_opening":True}
         finally:
+            failed = sys.exc_info()[0] is not None
             if channel is not None:
                 channel.close()
             if server.poll() is None:
@@ -245,6 +247,8 @@ max_spawn_fanout = {fanout}
             os.close(ready)
             os.close(turn_ready)
             os.close(resume_ready)
+            if failed and on_failure is not None:
+                on_failure(root)
 
 
 if __name__ == "__main__":

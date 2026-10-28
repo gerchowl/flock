@@ -1,5 +1,5 @@
 //! Connection-bound TUI capabilities, ADR-0036 S10e and ADR-0038 §6.
-use super::{App, LocalPeer};
+use super::{local_operator::LocalPeerRefusal, App, LocalPeer};
 use crate::{
     api::error_code::ErrorCode,
     raw_input::RawInputEvent,
@@ -55,7 +55,13 @@ impl App {
         credentials: crate::platform::peer::Credentials,
     ) {
         let issued: Result<ClientSession, ErrorCode> = (|| {
-            let peer = self.admit_local_peer(credentials)?;
+            let peer = self
+                .admit_local_peer(credentials)
+                .map_err(|refusal| match refusal {
+                    LocalPeerRefusal::OperatorOnly | LocalPeerRefusal::PeerProcessChanged => {
+                        ErrorCode::NotAuthorized
+                    }
+                })?;
             let store = self
                 .client_auth
                 .get(
@@ -71,8 +77,13 @@ impl App {
                     }
                     app_sessions::IssueError::Store(error) => token_code(error),
                 })?;
+            let fence = store
+                .wait_peer(std::time::Duration::from_millis(
+                    server::HANDSHAKE_DEADLINE_MS,
+                ))
+                .map_err(token_code)?;
             let session = store
-                .admit_peer(&issued.token, Some(&peer), |session| session)
+                .register_peer(fence, &issued.token, Some(&peer), |session| session)
                 .map_err(|error| match error {
                     server::PeerAdmissionError::PeerProcessChanged => ErrorCode::PeerProcessChanged,
                     server::PeerAdmissionError::Token(error) => token_code(error),
@@ -95,7 +106,16 @@ impl App {
     /// Detach removes the input capability before fenced retirement can fail or wait.
     pub(crate) fn detach_native_client(&mut self, client: u64) {
         if let Some(Ok(authority)) = self.native_clients.remove(&client) {
-            if let Err(error) = authority.store.retire(&authority.session) {
+            let retired = authority
+                .store
+                .begin_mutation()
+                .and_then(|pending| authority.store.wait_mutation(pending))
+                .and_then(|fence| {
+                    authority
+                        .store
+                        .finish_mutation(fence, Some(&authority.session))
+                });
+            if let Err(error) = retired {
                 tracing::warn!(
                     client,
                     code = token_code(error).as_str(),

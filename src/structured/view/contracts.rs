@@ -38,7 +38,10 @@ pub(crate) struct Snapshot {
     pub usage: Option<Usage>,
     /// Latest lifecycle observation per permission handle, in publication order.
     /// Pending opens remain until a matching close; only closed observations are
-    /// windowed. A close may lack an open. Displaying records grants no authority.
+    /// windowed. The producer bounds live opens with
+    /// [`crate::structured::permissions::MAX_OPEN_PERMISSION_REQUESTS`]; recovery
+    /// closes orphaned handles via [`crate::structured::permissions::Orphaned::into_closes`].
+    /// A close may lack an open. Displaying records grants no authority.
     pub permissions: Vec<PermissionRecord>,
     /// Owner FIFO order and lifecycle, never inferred from transcript text.
     /// Admission does not imply delivery, start, or completion.

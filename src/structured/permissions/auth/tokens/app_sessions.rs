@@ -91,20 +91,33 @@ pub(crate) struct Store {
     files: Arc<TokenStore>,
     entries: Mutex<Entries>,
     clock: Arc<dyn Clock>,
+    #[cfg(all(test, feature = "web"))]
+    waiting: Mutex<Vec<Box<dyn FnOnce() + Send>>>,
 }
-struct Mutation<'a> {
-    store: &'a Store,
+/// Published revocation intent and owned helper, transferable outside store I/O.
+pub(crate) struct PendingMutation {
+    files: Arc<TokenStore>,
     pending: PendingLock,
-    _intent: priority::Intent<'a>,
+    intent: priority::Intent<Arc<Namespace>>,
 }
-impl Mutation<'_> {
-    fn finish<T>(
-        self,
-        change: impl FnOnce(&mut Entries) -> Result<T, TokenError>,
-    ) -> Result<T, TokenError> {
-        let _guard = self.pending.finish(Duration::from_secs(2))?;
-        let mut entries = self.store.entries.lock().map_err(|_| TokenError::Unsafe)?;
-        change(&mut entries)
+/// Exclusive ownership retained through the memory mutation and notification.
+pub(crate) struct MutationFence {
+    files: Arc<TokenStore>,
+    _guard: LockFile,
+    _intent: priority::Intent<Arc<Namespace>>,
+}
+impl PendingMutation {
+    /// The existing two-second mutation ceiling includes the helper acknowledgement.
+    /// Call only on the separately bounded retirement-wait worker.
+    pub(crate) fn wait(self, on_wait: impl FnOnce()) -> Result<MutationFence, TokenError> {
+        let guard = self
+            .pending
+            .finish_notifying(Duration::from_secs(2), on_wait)?;
+        Ok(MutationFence {
+            files: self.files,
+            _guard: guard,
+            _intent: self.intent,
+        })
     }
 }
 impl Store {
@@ -114,15 +127,69 @@ impl Store {
             files,
             entries: Mutex::new(HashMap::new()),
             clock,
+            #[cfg(all(test, feature = "web"))]
+            waiting: Mutex::default(),
         }
     }
-    fn mutation(&self) -> Result<Mutation<'_>, TokenError> {
-        let intent = priority::Intent::begin(&self.files.0, self.files.random::<16>()?)?;
+    /// Install a fixture gate before the contended IPC read starts.
+    #[cfg(all(test, feature = "web"))]
+    pub(crate) fn on_waiting(&self, action: impl FnOnce() + Send + 'static) {
+        self.waiting.lock().unwrap().push(Box::new(action));
+    }
+    /// Signal only after the helper has entered the contended acquisition path.
+    #[cfg(all(test, feature = "web"))]
+    pub(crate) fn notify_waiting(&self) {
+        let action = self.waiting.lock().unwrap().pop();
+        // Release the hook mutex before a gate pauses this worker.
+        if let Some(action) = action {
+            action();
+        }
+    }
+    /// Publish intent and start acquisition without waiting on the store worker.
+    pub(crate) fn begin_mutation(&self) -> Result<PendingMutation, TokenError> {
+        let intent = priority::Intent::begin(self.files.0.clone(), self.files.random::<16>()?)?;
         let pending = PendingLock::begin(self.files.lock_file()?, &self.files.2)?;
-        Ok(Mutation {
-            store: self,
+        Ok(PendingMutation {
+            files: self.files.clone(),
             pending,
-            _intent: intent,
+            intent,
+        })
+    }
+    fn mutate<T>(
+        &self,
+        fence: MutationFence,
+        change: impl FnOnce(&mut Entries) -> Result<T, TokenError>,
+    ) -> Result<T, TokenError> {
+        if !Arc::ptr_eq(&self.files, &fence.files) {
+            return Err(TokenError::Unsafe);
+        }
+        let mut entries = self.entries.lock().map_err(|_| TokenError::Unsafe)?;
+        // Keep the intent and exclusive fence alive until notification is published.
+        let result = change(&mut entries);
+        drop(entries);
+        drop(fence);
+        result
+    }
+    fn mutation(&self) -> Result<MutationFence, TokenError> {
+        self.begin_mutation()?.wait(|| {
+            #[cfg(all(test, feature = "web"))]
+            self.notify_waiting();
+        })
+    }
+    /// Finish a previously fenced retirement; None retires the entire owner domain.
+    pub(crate) fn finish_mutation(
+        &self,
+        fence: MutationFence,
+        session: Option<&Session>,
+    ) -> Result<(), TokenError> {
+        self.mutate(fence, |entries| match session {
+            Some(session) => Self::remove(entries, &session.digest),
+            None => {
+                for (_, entry) in entries.drain() {
+                    entry.revoke.send_replace(true);
+                }
+                Ok(())
+            }
         })
     }
     /// Arm the attested process before reading its identity or generating a bearer.
@@ -219,9 +286,9 @@ impl Store {
             .map_err(|_| TokenError::Unsafe)?
             .contains_key(&digest))
     }
-    /// Lookup only in this private memory domain; file-token authentication is unchanged.
+    /// Lookup returns a snapshot; registration and dispatch separately fence its use.
+    /// Like file-token lookup, it does not wait for token-management ownership.
     pub(crate) fn authenticate(&self, token: &Bearer) -> Result<Session, TokenError> {
-        let _guard = self.files.lock_with(LockFile::try_lock_shared)?;
         if !valid_hex(&token.0, 64) {
             return Err(TokenError::Unauthorized);
         }
@@ -247,18 +314,14 @@ impl Store {
         Ok(())
     }
     /// Publish intent before waiting; after return, admitted callbacks have drained.
+    #[cfg(test)]
     pub(crate) fn revoke(&self, session: &Session) -> Result<(), TokenError> {
-        self.mutation()?
-            .finish(|entries| Self::remove(entries, &session.digest))
+        self.finish_mutation(self.mutation()?, Some(session))
     }
     /// Quiescence fence for restart/handoff; no session state belongs in their snapshots.
+    #[cfg_attr(not(test), allow(dead_code))] // Async transport shutdown uses the split mutation phases.
     pub(crate) fn revoke_all(&self) -> Result<(), TokenError> {
-        self.mutation()?.finish(|entries| {
-            for (_, entry) in entries.drain() {
-                entry.revoke.send_replace(true);
-            }
-            Ok(())
-        })
+        self.finish_mutation(self.mutation()?, None)
     }
     fn sweep_entries(entries: &mut Entries, now: Duration) -> Result<(), TokenError> {
         let mut ended = Vec::new();
@@ -276,8 +339,9 @@ impl Store {
     /// Watch I/O errors fail closed; no uncertain observation is silently discarded.
     #[cfg_attr(not(test), allow(dead_code))] // Automatic per-session retirement uses revoke; bulk sweep remains tested.
     pub(crate) fn sweep(&self) -> Result<(), TokenError> {
-        self.mutation()?
-            .finish(|entries| Self::sweep_entries(entries, self.clock.now()?))
+        self.mutate(self.mutation()?, |entries| {
+            Self::sweep_entries(entries, self.clock.now()?)
+        })
     }
 }
 #[cfg(test)]
