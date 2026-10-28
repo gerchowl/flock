@@ -2,11 +2,26 @@
 
 - Status: Proposed
 - Date: 2026-10-29
-- Issues: [#2718](https://github.com/gerchowl/flock/issues/2718), informed by [#819](https://github.com/gerchowl/flock/issues/819), [#663](https://github.com/gerchowl/flock/issues/663), [#1044](https://github.com/gerchowl/flock/issues/1044), [#965](https://github.com/gerchowl/flock/issues/965), [#1600](https://github.com/gerchowl/flock/issues/1600) and [#1603](https://github.com/gerchowl/flock/issues/1603).
-- Decision owner: repository owner; the choices below require explicit acceptance.
-- Builds on: ADR-0027/0028 (delegation, observation and waits), ADR-0029 (agent-facing contracts), ADR-0030/0031 (goals and storage), ADR-0034/0035 (authority and resident owners), ADR-0036 (structured sessions), ADR-0037 (bounded tests), ADR-0038 §8 (work projection and records).
-- Coordination: Proposed [ADR-0042](https://github.com/gerchowl/flock/pull/2724) (`0f234e23`), [ADR-0044](https://github.com/gerchowl/flock/pull/2728) (`1ba1c7c9`) and the [S6e answer-wake amendment](https://github.com/gerchowl/flock/pull/2731) (`0d301649`), inspected for this round; their pending choices are not accepted here.
-- Implemented: none of this proposal. The baseline below describes inspected code at `b2519c2c49b08498d75ac427a182ac2298ab49c2`.
+- Issues: [#2718](https://github.com/gerchowl/flock/issues/2718), informed by
+  [#819](https://github.com/gerchowl/flock/issues/819),
+  [#663](https://github.com/gerchowl/flock/issues/663),
+  [#1044](https://github.com/gerchowl/flock/issues/1044),
+  [#965](https://github.com/gerchowl/flock/issues/965),
+  [#1600](https://github.com/gerchowl/flock/issues/1600) and
+  [#1603](https://github.com/gerchowl/flock/issues/1603).
+- Decision owner: repository owner; the choices below require explicit
+  acceptance.
+- Builds on: ADR-0027/0028 (delegation, observation and waits), ADR-0029
+  (agent-facing contracts), ADR-0030/0031 (goals and storage), ADR-0034/0035
+  (authority and resident owners), ADR-0036 (structured sessions), ADR-0037
+  (bounded tests), ADR-0038 §8 (work projection and records).
+- Coordination: Proposed [ADR-0042](https://github.com/gerchowl/flock/pull/2724)
+  (`0f234e23`), [ADR-0044](https://github.com/gerchowl/flock/pull/2728)
+  (`1ba1c7c9`) and the [S6e answer-wake
+  amendment](https://github.com/gerchowl/flock/pull/2731) (`0d301649`),
+  inspected for this round; their pending choices are not accepted here.
+- Implemented: none of this proposal. The baseline below describes inspected
+  code at `b2519c2c49b08498d75ac427a182ac2298ab49c2`.
 
 ## Context and placement
 
@@ -57,7 +72,7 @@ must not imply approval of the others.
 | **D1: work identity and storage** | **(Recommended)** Stable `WorkId` records folded from the existing log, with bounded record-carrying checkpoints and an explicit compatibility link to the one-goal-per-agent API. Cost: an acknowledged writer, rotation fencing, migration and retention work before any liveness claim. Alternative: a transactional database as the authoritative store. Cost: a second storage/migration/backup contract and an amendment to ADR-0031; potentially simpler transactions at larger scale. Do not build both. |
 | **D2: who can declare completion** | **(Recommended)** An assigned agent records progress and proposes completion; its supervisor/operator approves the frozen check revision and evidence. Root completion remains operator-approved. Cost: an explicit review acknowledgement, and blocked progress when no authorised reviewer is available. Alternative: agents self-close after check success. Cost: an agent can declare its own success without independent review; changes ADR-0030's done gate. |
 | **D3: delivery semantics** | **(Recommended)** Durable outbox, at-least-once processing, stable wake IDs, deduped queue admission and an explicit handled acknowledgement. Cost: retained dedupe state and extra durable writes; actions outside flk still need idempotency keys or review. Alternative: mark handled when queued/started. Cost: a crash during the turn silently loses the supervisor action. “Exactly once” for arbitrary agent tool effects is not an offered guarantee. |
-| **D4: heartbeat policy** | **(Recommended)** Per-loop progress deadlines, ordinary at-idle delivery, the D8 escalation chain with reminders ON by default, and finite pauses (default 30 minutes). Never clear an operator composer or bypass permission. Cost: notification traffic and resumed-agent compute; busy, frozen or permission-blocked agents may need human intervention. Alternative: explicitly authorised destructive hard-send as proposed in #1044. Cost: draft loss, harness-specific submission verification and a separate safety design; it is not enabled by accepting the recommended policy. |
+| **D4: heartbeat policy** | **(Recommended)** Per-loop progress and handling deadlines, bounded healthy-source waits, ordinary at-idle delivery, the D8 escalation chain with reminders ON by default, and finite pauses (default 30 minutes). Never clear an operator composer or bypass permission. Cost: notification traffic and resumed-agent compute; busy, frozen or permission-blocked agents may need human intervention. Alternative: explicitly authorised destructive hard-send as proposed in #1044. Cost: draft loss, harness-specific submission verification and a separate safety design; it is not enabled by accepting the recommended policy. |
 | **D5: restart and host handoff** | **(Recommended)** One active authority, fenced by an ownership epoch; restart/refold and cooperative break-before-make host transfer. Cost: an unreachable old authority blocks transfer until it can be fenced; no automatic partition failover. Alternative: replicated leases/consensus and automatic failover. Cost: a distributed authority service, partition policy and a separate design before rollout. A local file lock alone cannot fence two hosts. |
 | **D6: trigger ingestion** | **(Recommended)** Typed observations from shared server producers, typed receipt submission first, and a bounded operator-configured receipt-file compatibility adapter. Cost: source-specific health/reconciliation and filesystem admission rules. Alternative: run arbitrary watch scripts per loop. Cost: recreate the original unsupervised process, credential and restart failure modes. Neither option grants instructions embedded in an event authority. |
 | **D7: work projection and migration** | **(Recommended)** Deliver #1600's read-only projection first, then enable #1603's record phase explicitly; one work stream and goal-tree tile, with old goal commands as a compatibility view. Cost: a versioned projection-to-record transition and adapters for existing tooling. Alternative: new independent goal/task GUI and stores. Cost: divergent status and duplicate ownership; conflicts with ADR-0038 §8. |
@@ -93,8 +108,8 @@ loops to be installed.
 Statuses are `planned`, `active`, `waiting`, `blocked`, `review_pending`, `done`
 and `cancelled`. Pause is a separate supervision control. Every change carries
 the server-attested actor and expected revision. Assigned agents can update
-progress, attach evidence and enter `review_pending` within their assignment; only
-the authorised supervisor/operator changes acceptance, reassigns ownership,
+progress, attach evidence and enter `review_pending` within their assignment;
+only the authorised supervisor/operator changes acceptance, reassigns ownership,
 pauses/stops a loop or approves completion. Preserve the existing goal API's
 self-pause/self-stop refusal. An unresolved or peer-claimed identity gains no
 local authority; do not mistake the existing cooperative ancestry check for a
@@ -126,8 +141,8 @@ evidence blocks it.
 Proposed events retain ADR-0038's `work.created`, `work.updated`,
 `work.edge_added`, `work.edge_removed` and `work.closed`, with typed
 `work.loop_changed`, `work.wake_changed` and record-carrying `work.checkpoint`
-payloads. Each mutation carries its actor, operation ID, revision and work ID; the
-occurrence variant carries both its cursor advance and wake intent.
+payloads. Each mutation carries its actor, operation ID, revision and work ID;
+the occurrence variant carries both its cursor advance and wake intent.
 Checkpoint copies are not new semantic changes. These are proposed schema
 additions, not existing persisted kinds.
 
@@ -174,8 +189,8 @@ name inherits no authority.
 
 A loop definition contains its work/agent IDs, predicate, source cursors,
 occurrence policy (once or recurring), progress/deadline policy, escalation
-recipient and ownership epoch. Held CLI/MCP reads remain connection-scoped; ending
-a read does not cancel a durable loop. Extend the wait service instead of
+recipient and ownership epoch. Held CLI/MCP reads remain connection-scoped;
+ending a read does not cancel a durable loop. Extend the wait service instead of
 building a second independent predicate/wake engine. Existing `wait.park`
 compatibility and persistence are tracked by #1240; missing predicate evaluation
 must be implemented, not inferred from registration.
@@ -206,8 +221,8 @@ registered -> occurrence recorded + wake pending -> queue committed
 3. An owned I/O worker appends/syncs before publishing a committed transition or
    answering success. Introduce a fallible acknowledged write path; the current
    best-effort `EventHub::push` cannot be the commit acknowledgement. On write
-   uncertainty, expose a typed unresolved outcome and reconcile by operation ID; never
-   answer “registered”, advance a cursor or announce handled prematurely.
+   uncertainty, expose a typed unresolved outcome and reconcile by operation ID;
+   never answer “registered”, advance a cursor or announce handled prematurely.
    Keep filesystem work and fsync off the server deadline dispatcher.
 4. Admit a `Kind::Wake` at normal priority/at idle through the existing queue
    worker. Its internal producer is authenticated server context. The wake ID
@@ -327,30 +342,93 @@ bound delegation or queue effect) or explicit operator progress confirmation. A
 wake acknowledgement, status-text edit or empty revision bump alone is not
 meaningful progress; rich PR/check verification is added in its later slices.
 
-Registration arms the progress deadline even when no external event is pending.
-If it expires with no existing wake, commit one timer occurrence keyed by loop
-ID and progress-boundary revision through the same occurrence/outbox path.
-Silence cannot turn the timer off or require a shell waiter to re-arm it.
+Registration arms the progress deadline even when no external event is pending,
+unless the loop enters the verified healthy-source wait below. If it expires
+with no existing wake, commit one timer occurrence keyed by loop ID and
+progress-boundary revision through the same occurrence/outbox path. Silence
+cannot turn the timer off or require a shell waiter to re-arm it.
+
+### Bounded healthy-source waiting
+
+Persist a typed `waiting_healthy_source` state, bound to the armed LoopId,
+source kind, exact subject ID/revision, assignment and predicate revision. Entry
+requires a completed authorised poll covering that subject within
+`work.loops.source_stale_after_ms`, with the awaited object explicitly still
+open/pending. A scheduled request, another repository's successful poll, an
+unchanged cursor or absence of a receipt is not health evidence. Store the
+observation and last successful coverage time, original wait start, resolved
+policy revision and hard expiry in the checkpoint.
+
+While these conditions hold and the hard expiry has not arrived, suppress the
+ordinary inactivity occurrence and its escalation/reminders for this wait.
+Waiting calmly on a healthy long batch must not page the operator every fifteen
+minutes or consume the one-hour action lease. This is an observable typed state,
+not an assertion that polling or a status edit is meaningful work progress. It
+cannot mask an outstanding actionable wake, unrelated escalation or overdue
+handling obligation. Entering it does not clear an existing incident.
+
+The first source error, staleness boundary, terminal observation or hard expiry
+ends the state immediately, without waiting for another agent turn. Persist a
+typed exit reason (`source_error`, `source_stale`, `subject_terminal` or
+`wait_limit`) with the observation. Terminal observations use the ordinary
+occurrence/cursor/outbox transition; stale/error/limit exits create one keyed
+attention occurrence and expose degraded coverage. Retain wake custody through
+capacity/commit uncertainty. Never restart an already overdue inactivity timer
+as if the agent had just progressed, or page for that obsolete boundary while
+the resulting wake has a fresh handling window.
+
+Each supported source kind has a finite hard maximum in the ADR-0042 registry:
+GitHub PR/CI/landing-batch subjects default to 24 hours, receipt subjects and
+agent-phase subjects to one hour. Receipt waiting requires a typed pending
+producer object and fresh producer coverage, not merely a successful directory
+scan; agent waiting requires a freshly observed pending assigned work object,
+not an idle process alone. Disk thresholds have no open/pending object and do
+not support this state. Unsupported kinds refuse it. Repeated polls, re-entry
+for the same awaited object, acknowledgements, restart and handoff never renew
+the original maximum; poll revisions and CI reruns are not new wait generations.
+A new wait after expiry requires verified progress or an explicit authorised
+operator decision recorded as a new wait generation. Policy shrinkage may expire
+it immediately; reload cannot extend its persisted hard boundary. Revoked read
+authority ends observation under the existing suspension/scrubbing rules, never
+preserving a claim of healthy coverage.
+
+### Fresh handling boundary after delivery
+
+`work.loops.handling_timeout_ms` is separate from the inactivity/progress key.
+The first committed queue `DELIVERED` fact for each wake ItemId (the harness
+reported it started, not merely admission or a stdin write) starts a fresh
+handling deadline, default fifteen minutes. It does not inherit an overdue
+progress deadline. Duplicate delivery observations and replay reconstruct that
+same boundary; they cannot renew it. Prior to delivery, retain the owed wake and
+its visible queue/lifecycle/delivery escalation policy. Delivery cannot rewind
+an escalation already opened for an independently failed obligation. An
+unanswered delivered wake cannot enter healthy waiting to escape its handling
+deadline. A verified handling acknowledgement may establish a new healthy wait
+only with the exact source/subject evidence above; a bare acknowledgement
+cannot.
 
 ### Escalation must leave the sleeping supervisor's context (D8)
 
-At the progress/handling deadline, open one durable escalation keyed by the wake
-and work revision. Its chain starts at the assigned agent's attested supervisor,
-then that supervisor's supervisor, and ends at the operator. Allow five minutes
-per agent hop; at most eight agent hops, with a visited-ID set to reject cycles.
-A missing, retired, Stopped, Crashed or unauthorised recipient is skipped
-immediately, recording a typed recipient-unavailable reason, never waiting on a
-name that may now identify someone else. A confirmed Hibernated recipient can
-wake only under D9. A permission-blocked or unresponsive recipient still owes
-progress; expiry advances the chain without answering its permission prompt. A
-root supervisor with no parent advances directly to the operator. If no safe
-ancestor path exists, go directly to the validated operator binding.
+At an unsuppressed progress deadline or an expired handling deadline, open one
+durable escalation keyed by the wake and work revision. Its chain starts at the
+assigned agent's attested supervisor, then that supervisor's supervisor, and
+ends at the operator. Allow five minutes per agent hop; at most eight agent
+hops, with a visited-ID set to reject cycles. A missing, retired, Stopped,
+Crashed or unauthorised recipient is skipped immediately, recording a typed
+recipient-unavailable reason, never waiting on a name that may now identify
+someone else. A confirmed Hibernated recipient can wake only under D9. A
+permission-blocked or unresponsive recipient still owes progress; expiry
+advances the chain without answering its permission prompt. A root supervisor
+with no parent advances directly to the operator. If no safe ancestor path
+exists, go directly to the validated operator binding.
 
 With healthy sources and delivery, the proposed defaults reach the operator
-within the 15-minute progress interval plus at most eight five-minute hops (55
-minutes), plus observation latency (normally up to two minutes for polling) and
-scheduling/transport overhead. This is a policy budget, not a hard real-time or
-human-response guarantee; vanished ancestors shorten the route immediately.
+within the applicable 15-minute progress or fresh handling interval plus at most
+eight five-minute hops (55 minutes), plus observation latency (normally up to
+two minutes for polling) and scheduling/transport overhead. A verified healthy
+wait delays this budget until its exit condition; the finite per-kind maximum
+still applies. This is a policy budget, not a hard real-time or human-response
+guarantee; vanished ancestors shorten the route immediately.
 
 At operator stage, file an attention record and post to the configured #1005
 Telegram bridge binding. Use a narrowly scoped outbound credential reference and
@@ -378,8 +456,8 @@ suppress reminders.
 Protected-loop arming refuses when the operator binding is absent, lacks the
 required source-read grant or cannot pass its delivery-health check. If it goes
 away later, retain the escalation and a typed delivery-degraded state, file the
-local attention/OS fallback and continue bounded health checks and reminders; never
-mark the incident delivered/handled or present the fallback as equally
+local attention/OS fallback and continue bounded health checks and reminders;
+never mark the incident delivered/handled or present the fallback as equally
 observable. External channel delivery needs a stable escalation/delivery ID and
 an uncertain outcome on a lost response, not a newly minted duplicate action.
 Once a recipient has legitimately received data, revocation cannot retract that
@@ -494,6 +572,10 @@ path, not an arbitrary duration smuggled in a subscription payload.
 | Proposed registry key | Default / allowed range | Scope / consumer and reload |
 | --- | --- | --- |
 | `work.loops.progress_timeout_ms` | 900000; 60000–86400000 | G/N/A; progress dispatcher, recompute from the last verified progress boundary |
+| `work.loops.handling_timeout_ms` | 900000; 60000–86400000 | G/N/A; handling dispatcher from first committed DELIVERED per wake ItemId; replay never renews it |
+| `work.loops.wait.github_max_ms` | 86400000; 60000–604800000 | G/N/A; PR/CI/landing-batch healthy-wait maximum from original entry; reload may shorten, never extend that wait |
+| `work.loops.wait.receipt_max_ms` | 3600000; 60000–86400000 | G/N/A; typed pending receipt subject with fresh producer coverage; original-entry maximum |
+| `work.loops.wait.agent_phase_max_ms` | 3600000; 60000–86400000 | G/N/A; pending assigned work with fresh phase coverage; original-entry maximum |
 | `work.loops.max_progress_lease_ms` | 3600000; 60000–86400000 | G/N/A; reject/shorten newly requested leases beyond the bound; shrinking cannot erase an already raised escalation |
 | `work.loops.pause_timeout_ms` | 1800000; 60000–86400000; no null/0/infinite | G/N/A; pause dispatcher, expiry from original pause boundary; an authorised request may shorten it |
 | `work.loops.escalation.hop_timeout_ms` | 300000; 60000–900000 | G/N/A; agent-hop deadline from hop entry, never waiting on a missing recipient |
@@ -542,7 +624,7 @@ configuration in a worker.
 
 Proposed socket verbs are `work.create/get/list/update/link/unlink`,
 `work.evidence.attach`, `work.complete.propose/approve`, `work.archive`,
-`work.loop.register/get/pause/resume/cancel`, `work.wake.ack`,
+`work.loop.register/get/wait/pause/resume/cancel`, `work.wake.ack`,
 `work.wake.progress` and the recipient-bound `work.escalation.ack`. Mutation
 inputs carry an idempotency ID and expected revision, never an actor supplied by
 the body. Add `flk work` and generated `flock_work_*` MCP adapters over the same
@@ -560,12 +642,12 @@ derives view IDs from existing authority/agent/delegation keys without new
 records. Those keys can be reused on legacy re-arm: they are not durable WorkIds
 or mutation targets. Entering phase 2 requires a complete snapshot reset and
 committed migration mapping, so clients cannot confuse two goal lifetimes.
-Generate Rust/TS shapes from one source. Add a goal-tree tile and sidebar tree; show
-assignment, status, acceptance revision, evidence head, pending wake age,
-source health and overdue acknowledgement without turning every progress sample
-into agent context. Render untrusted labels safely; frame external evidence as
-data with unforgeable per-item delimiters when it reaches a model. Neither the
-GUI nor MCP owns timers.
+Generate Rust/TS shapes from one source. Add a goal-tree tile and sidebar tree;
+show assignment, status, acceptance revision, evidence head, pending wake age,
+source health, healthy-wait subject/expiry and overdue acknowledgement without
+turning every progress sample into agent context. Render untrusted labels
+safely; frame external evidence as data with unforgeable per-item delimiters
+when it reaches a model. Neither the GUI nor MCP owns timers.
 
 New verbs/streams must use the existing version/skew gates; an older server
 returns a typed unsupported/version refusal, never apparent success with a loop
@@ -592,6 +674,7 @@ Assume the owner again discovers a red batch sixteen hours late. Work backwards:
 | Event arrived during subscription setup, or restart seeded it as historical | Capture/replay cut plus current-condition reconciliation. Initial terminal facts still create an occurrence; source seeding cannot suppress an armed rule. |
 | Disk full, append failure, worker panic or an unacknowledged fsync | Never return committed success or advance cursor from memory alone. Retain pending/unknown state, typed storage degradation and operator-visible recovery. A memory-only notification cannot clear it. |
 | Crash after queue commit but before outbox acknowledgement | Replay the same wake/item identity and compare payload, dedupe or return uncertainty; retain enough queue evidence to reconcile after compaction. |
+| Healthy long batch caused repeated false alarms | Subject-specific successful coverage and open/pending evidence suppress inactivity escalation only until the per-kind hard maximum. Stale/error/terminal/limit exits end the wait and retain one wake; unrelated obligations remain protected. |
 | Agent started a turn but never acted, or acknowledged someone else's wake | Require handled acknowledgement from the assigned identity/revision; progress deadline escalates. Started/done observations do not close the occurrence. |
 | PR rerun failed at the same SHA, checks never started or the shared poller stopped | Track run/attempt and source health; reconcile current PR/head/check state, expose missing checks and observation gaps. No viewer must not disable an armed source. |
 | Permission pending, agent removed, provider limited, queue held or turn end unknown | Keep the pending reason and escalate; no permission bypass, auto-reassignment by name, background process kill or fabricated success. |
@@ -620,16 +703,15 @@ opening its implementation PR. The listed order is the dependency order; no
 record-writing or autonomous wake feature is enabled before its prerequisites.
 
 Every test starts at the real socket/CLI/MCP/wire ingress and ends at its public
-status/stream or at the input observed by
-[`tests/fixtures/structured-public/claude.py`](../../tests/fixtures/structured-public/claude.py).
-Use only that fake model, isolated server instances, private temporary
-HOME/data, short socket paths and no inherited live-server selectors or
-credentials. Source feeds and clocks are controlled test adapters, never real
-GitHub, disks filled on the host, judges or user panes. Fault seams must be
-added without changing behaviour first if needed; show an actual failing
-assertion against the old behaviour, never a compile failure for a missing API.
-Raw JSON calls can exercise an as-yet unsupported verb before its
-implementation.
+status/stream or at the input observed by [the public fake
+model](../../tests/fixtures/structured-public/claude.py). Use only that fake
+model, isolated server instances, private temporary HOME/data, short socket
+paths and no inherited live-server selectors or credentials. Source feeds and
+clocks are controlled test adapters, never real GitHub, disks filled on the
+host, judges or user panes. Fault seams must be added without changing behaviour
+first if needed; show an actual failing assertion against the old behaviour,
+never a compile failure for a missing API. Raw JSON calls can exercise an as-yet
+unsupported verb before its implementation.
 
 | Order / estimate | Slice and tracked scope | Fail-first public-path acceptance |
 | --- | --- | --- |
@@ -642,10 +724,10 @@ implementation.
 | 6 / 340 | Stable queue admission and retained wake dedupe (#2718) | Submit the same wake twice across compaction/recovery: one active ItemId and one fake input. Different body/same ID refuses; queue-commit crash reconciles by that ID. |
 | 7 / 300 | Outbox worker and actual idle delivery (#2718) | Gate the permission book and release with no later model event; fake receives the original wake. No started/handled claim precedes the appropriate durable/harness fact. |
 | 8 / 320 | Receipt-bound Hibernated wake (#2728 Q2/Q5/Q6, #2731, D9 gate) | Let the fake enter confirmed Hibernated; one committed LoopWakeReceipt resumes once for the original ItemId with no new start/send/operate right. Pre-/post-freeze arrivals cancel hibernation or retain wake owed until cleanup. Reads, uncommitted events, Stopped/Crashed/replaced/uncertain identities never spawn; pending custody blocks quiesce. Restart can run only the owed committed receipt, not all saved sessions. |
-| 9 / 300 | Ack/progress deadlines and finite pause (#1044) | Start/end a fake turn without progress and emit no external events; advance supplied clock while I/O is held and observe one timer occurrence and overdue state. Default pause expires after its persisted finite deadline, including restart; resume/ack without progress cannot disable protection indefinitely. |
+| 9 / 380 | Ack/progress/handling deadlines, healthy waits and finite pause (#1044) | Start/end a fake turn without progress and emit no external events; advance supplied clock while I/O is held and observe one timer occurrence and overdue state. A late DELIVERED wake gets the full fresh handling interval, unchanged by replay. Register a healthy pending subject, advance beyond the ordinary progress/lease intervals with successful polls and assert no escalation or reminder intents; separately inject stale/error/terminal/maximum exits and assert immediate wait exit, one occurrence and the fresh handling boundary after delivery. Repeat across restart without renewing the maximum. Default pause expires after its persisted finite deadline, including restart; resume/ack without progress cannot disable protection indefinitely. |
 | 10 / 320 | Attested supervisor chain and durable attention (#1044, D8) | Fake supervisor does not act: advance each hop and reach operator. Retire a parent, create a cycle or use an unreadable recipient: skip/refuse safely and keep escalation owed; source data never reaches an unauthorised notice. |
 | 11 / 340 | Concrete operator notification outbox / enrolled bridge (#1005 contract, D8) | Controlled bridge receives the operator escalation and default reminders with one escalation ID while GUI is absent. Missing/unhealthy binding refuses arming; later bridge loss keeps degraded/unresolved state. Acknowledge grants only the finite lease; no progress reactivates reminders. Fake inputs remain unduplicated. |
-| 12 / 320 | GitHub credential/read check/quota producer (#663, D10) | Fake source reports same-SHA rerun failure, already-merged PR and rate exhaustion: public loop fires/degrades correctly without viewer/per-loop poller. App access with no subscriber repo-read grant refuses and emits no private event. Provider reset/request timeout do not become success. |
+| 12 / 320 | CI/landing-batch RED adapter, GitHub credential/read check/quota producer (#663, D10) | Fake source reports same-SHA rerun failure, already-merged PR and rate exhaustion: public loop fires/degrades correctly without viewer/per-loop poller. App access with no subscriber repo-read grant refuses and emits no private event. Provider reset/request timeout do not become success. |
 | 13 / 240 | Typed receipt ingress (#2718) | Same receipt twice yields one verified event; wrong task/head/hash refuses and cannot inject model instructions. |
 | 14 / 320 | Receipt-file compatibility (#2718) | Atomic rename/restart fires once; partial/symlink/oversized records and overflow trigger bounded errors/reconciliation without silently skipping a source cursor. |
 | 15 / 220 | Full phase/attention and disk health adapters (#663, #1044) | Drive fake phase/permission/background signals plus injected disk low/recovered/low; public transitions differ from sample count. Failed sampler is unhealthy, never healthy-by-absence. |
@@ -666,17 +748,22 @@ Slices 1–11 form the **minimal durable wake and visible escalation** chain,
 using a built-in authorised phase source; record writes cannot be enabled before
 checkpoint/authority prerequisites. Evidence, checks, source-specific ingestion,
 CLI/MCP adapters and GUI come after it. PR/CI protection is advertised only once
-slice 12 also passes, and hibernated protection only after the joint lifecycle
-slice 8 dependencies are accepted/implemented. The concrete operator bridge in
-slice 11 is core delivery infrastructure, not an optional GUI adapter. It
-requires #1005's scoped binding/delivery contract; until that dependency is
-implemented and the binding is healthy, protected-loop arming refuses instead of
-falling back silently to a GUI badge. Projection slice 24 may ship independently
-under #1600's own gates, but must not delay or claim to complete the minimal
-wake chain. For each implementation PR record the red command/assertion and exit
-code, restore the fix, and run focused nextest/client checks. Fake-clock
-advancement drives conditions; no test sleeps, timed retries or wider ceilings
-may manufacture ordering (ADR-0037).
+slice 12 also passes (including both healthy-wait and exit paths against its
+real adapter), and hibernated protection only after the joint lifecycle slice 8
+dependencies are accepted/implemented. The concrete operator bridge in slice 11
+is core delivery infrastructure, not an optional GUI adapter. It requires
+#1005's scoped binding/delivery contract; until that dependency is implemented
+and the binding is healthy, protected-loop arming refuses instead of falling
+back silently to a GUI badge. Slice 12 follows the minimal chain immediately
+because CI/landing-batch RED is the exact incident source; it takes priority
+over receipt adapters, evidence, checks and user interfaces. Slice 9 proves the
+wait fold with a controlled source; slice 12 proves the same transitions through
+the CI adapter. Projection slice 24 may ship independently under #1600's own
+gates, but must not delay or claim to complete the minimal wake chain. For each
+implementation PR record the red command/assertion and exit code, restore the
+fix, and run focused nextest/client checks. Fake-clock advancement drives
+conditions; no test sleeps, timed retries or wider ceilings may manufacture
+ordering (ADR-0037).
 
 ## Boundaries and tracked follow-up
 
