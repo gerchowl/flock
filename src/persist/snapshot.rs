@@ -131,6 +131,8 @@ pub struct TabSnapshot {
     pub custom_name: Option<String>,
     pub layout: LayoutSnapshot,
     pub panes: HashMap<u32, PaneSnapshot>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub(crate) native_views: HashMap<u32, crate::structured::view::placement::Saved>,
     pub zoomed: bool,
     #[serde(default)]
     pub focused: Option<u32>,
@@ -304,6 +306,7 @@ impl From<LegacyWorkspaceSnapshot> for WorkspaceSnapshot {
     fn from(snap: LegacyWorkspaceSnapshot) -> Self {
         let identity_cwd = legacy_identity_cwd(&snap);
         let tab = TabSnapshot {
+            native_views: HashMap::new(),
             custom_name: None,
             layout: snap.layout,
             panes: snap.panes,
@@ -332,7 +335,7 @@ struct RawSessionSnapshot {
     #[serde(default)]
     version: u32,
     #[serde(default)]
-    workspaces: Vec<serde_json::Value>,
+    workspaces: Vec<Box<serde_json::value::RawValue>>,
     #[serde(default)]
     structured_agents: crate::structured::registry::Registry,
     #[serde(default)]
@@ -368,7 +371,7 @@ fn migrate_snapshot(raw: RawSessionSnapshot) -> Result<SessionSnapshot, String> 
         workspaces: raw
             .workspaces
             .into_iter()
-            .map(migrate_workspace)
+            .map(|raw| migrate_workspace(&raw))
             .collect::<Result<Vec<_>, _>>()?,
         active: raw.active,
         selected: raw.selected,
@@ -382,14 +385,15 @@ fn migrate_snapshot(raw: RawSessionSnapshot) -> Result<SessionSnapshot, String> 
     })
 }
 
-fn migrate_workspace(raw: serde_json::Value) -> Result<WorkspaceSnapshot, String> {
-    if raw.get("identity_cwd").is_some() {
-        return serde_json::from_value(raw).map_err(|e| e.to_string());
+fn migrate_workspace(raw: &serde_json::value::RawValue) -> Result<WorkspaceSnapshot, String> {
+    let shape: serde_json::Value = serde_json::from_str(raw.get()).map_err(|e| e.to_string())?;
+    if shape.get("identity_cwd").is_some() {
+        return serde_json::from_str(raw.get()).map_err(|e| e.to_string());
     }
 
-    if raw.get("layout").is_some() {
-        let legacy =
-            serde_json::from_value::<LegacyWorkspaceSnapshot>(raw).map_err(|e| e.to_string())?;
+    if shape.get("layout").is_some() {
+        let legacy = serde_json::from_str::<LegacyWorkspaceSnapshot>(raw.get())
+            .map_err(|e| e.to_string())?;
         return Ok(legacy.into());
     }
 
@@ -512,7 +516,7 @@ fn capture_workspace(
     }
 }
 
-fn capture_tab(
+pub(super) fn capture_tab(
     tab: &crate::workspace::Tab,
     terminals: &std::collections::HashMap<
         crate::terminal::TerminalId,
@@ -626,6 +630,11 @@ fn capture_tab(
         custom_name: tab.custom_name.clone(),
         layout: capture_node(tab.layout.root()),
         panes,
+        native_views: tab
+            .native_views
+            .iter()
+            .map(|(id, view)| (id.raw(), view.saved()))
+            .collect(),
         zoomed: tab.zoomed,
         focused: Some(tab.layout.focused().raw()),
         root_pane: Some(tab.root_pane.raw()),
@@ -1383,6 +1392,7 @@ mod tests {
                 public_tab_numbers: Vec::new(),
                 next_public_tab_number: 0,
                 tabs: vec![TabSnapshot {
+                    native_views: HashMap::new(),
                     custom_name: Some("api".to_string()),
                     layout: LayoutSnapshot::Split {
                         direction: DirectionSnapshot::Horizontal,
@@ -1664,6 +1674,7 @@ mod tests {
                 public_tab_numbers: Vec::new(),
                 next_public_tab_number: 0,
                 tabs: vec![TabSnapshot {
+                    native_views: HashMap::new(),
                     custom_name: None,
                     layout: LayoutSnapshot::Pane(0),
                     panes: HashMap::new(),
@@ -2096,6 +2107,7 @@ mod tests {
                 public_tab_numbers: Vec::new(),
                 next_public_tab_number: 0,
                 tabs: vec![TabSnapshot {
+                    native_views: HashMap::new(),
                     custom_name: None,
                     layout: LayoutSnapshot::Split {
                         direction: DirectionSnapshot::Horizontal,

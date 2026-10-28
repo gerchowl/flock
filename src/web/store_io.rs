@@ -2,28 +2,62 @@
 use std::sync::{Arc, OnceLock};
 use tokio::sync::Semaphore;
 
-/// Four active or queued blocking jobs, including abandoned async waiters.
+/// Bounded active or queued blocking jobs, including abandoned async waiters.
 pub(crate) struct StoreIo(Arc<Semaphore>);
 impl StoreIo {
+    #[cfg(test)]
+    pub(crate) fn available(&self) -> usize {
+        self.0.available_permits()
+    }
+
     /// Return None on overload or worker failure; no unbounded waiting queue.
     pub(crate) async fn run<T: Send + 'static>(
         &self,
         operation: impl FnOnce() -> T + Send + 'static,
     ) -> Option<T> {
-        let permit = self.0.clone().try_acquire_owned().ok()?;
+        let permit = self
+            .0
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| {
+                crate::logging::client_wire_unavailable("store_capacity", None);
+            })
+            .ok()?;
         tokio::task::spawn_blocking(move || {
             let result = operation();
             drop(permit);
             result
         })
         .await
+        .map_err(|_| crate::logging::client_wire_unavailable("store_worker", None))
         .ok()
     }
 }
-/// Share the fixed budget across all token verification routes.
+/// Share four I/O slots across all token verification routes.
 pub(crate) fn shared() -> &'static StoreIo {
     static POOL: OnceLock<StoreIo> = OnceLock::new();
     POOL.get_or_init(|| StoreIo(Arc::new(Semaphore::new(4))))
+}
+
+/// At most eight kernel-lock waits, matching both listeners' four pending hellos.
+/// Separate from store I/O: waiting reconnects cannot evict live subscriptions.
+/// Cancellation retains a slot until its deadline-bounded helper has been reaped.
+pub(crate) fn hello_waits() -> &'static StoreIo {
+    static POOL: OnceLock<StoreIo> = OnceLock::new();
+    POOL.get_or_init(|| StoreIo(Arc::new(Semaphore::new(8))))
+}
+
+/// Bound retirement lock waits independently of live subscription I/O.
+/// Shared capacity is the socket cap plus one, not a reserved shutdown slot.
+/// Abandoned waits retain slots until their helpers are reaped, so replacement
+/// sockets can exhaust the pool; shutdown then fails closed without waiting.
+pub(crate) fn retirement_waits() -> &'static StoreIo {
+    static POOL: OnceLock<StoreIo> = OnceLock::new();
+    POOL.get_or_init(|| {
+        StoreIo(Arc::new(Semaphore::new(
+            super::wire::CONNECTIONS as usize + 1,
+        )))
+    })
 }
 
 #[cfg(test)]
