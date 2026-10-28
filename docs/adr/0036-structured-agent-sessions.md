@@ -4178,3 +4178,15 @@ Closing detaches placement without stopping the runtime. Native cross-tab or
 workspace relocation is unsupported and refuses before any layout mutation,
 including removal of a single-pane tab. Public start/render wiring is S10d.
 
+### Amendment: S10a2 frozen view and persistence contracts
+
+`structured::view::contracts` freezes the S10b/S10c snapshot and fenced intent boundary.
+`Snapshot.agent.model` is requested; reported values and absent usage stay distinct.
+`TabSnapshot.native_views`: layout ID → `{kind:"structured",schema:1,agent_id}`.
+Restore uses cold registry generations, never credentials, PIDs or auto-restart.
+Unsupported records remain visible unavailable tiles without attach authority.
+Raw record bytes survive migration/save; native-only tabs survive until explicit close.
+Snapshot format version 3 is deliberately unchanged. Older builds ignore this
+additive field and spawn shells in native tile slots; their next save permanently
+drops `native_views`. This placement loss is preferable to a version bump, which
+would make older builds ignore the entire session, including its terminal tabs.
