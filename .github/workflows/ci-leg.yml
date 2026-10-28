@@ -23,7 +23,7 @@ on:
         required: true
         type: string
       run-tests:
-        description: Run test shards; ordinary macOS PRs build and lint only
+        description: Run full test shards; macOS PR builds also run native suspend timers
         type: boolean
         default: true
     outputs:
@@ -126,6 +126,11 @@ jobs:
       - name: Build test archive and verify the shard partition
         id: archive
         run: just ci-archive '${{ inputs.leg }}' nextest-archive.tar.zst
+
+      # Exercise native continuous-time timers even when PR policy skips the full matrix.
+      - name: Check native macOS suspend timers
+        if: inputs.leg == 'macos-15'
+        run: cargo nextest run --archive-file nextest-archive.tar.zst -E 'binary(=flk) & test(platform::suspend_clock::tests::)' --retries 0
 
       # Reuse the build toolchain and cache for both GUI feature variants.
       # The required Linux leg includes this result; macOS PR policy is unchanged.
