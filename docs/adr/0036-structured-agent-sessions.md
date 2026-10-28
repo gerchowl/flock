@@ -4199,3 +4199,52 @@ Snapshot format version 3 is deliberately unchanged. Older builds ignore this
 additive field and spawn shells in native tile slots; their next save permanently
 drops `native_views`. This placement loss is preferable to a version bump, which
 would make older builds ignore the entire session, including its terminal tabs.
+
+### Amendment: native card identity and observed tool use
+
+`CardId { seq, ordinal }` separates fold/inspection identity from a shared source
+cursor. Ordinals are deterministic for a given record and projection parser
+version; sibling cards never share a fold key. `ObservedToolUse` retains the
+original id, name, typed input and raw source event, independently of the stdio
+permission `ToolRequest`. Neither observed cards nor their ids grant authority.
+
+The native projection retains at most `history::LIVE_RECORDS` (16) source
+cursors. `Snapshot.earlier_history` explicitly marks the eviction watermark so
+older history can be requested. Window eviction never rewinds the applied cursor
+or claims a storage gap. Live partials are keyed by message identity and block index (source
+cursor when no message id exists), with at most 16 active blocks and at most
+`transport::MAX_LINE_BYTES` (2 MiB) of text per block. Capacity or text overflow
+clears transient cards and marks replay lagged at the observed durable floor;
+further deltas at that floor are suppressed until durable progress. No synthetic
+cursor is allocated. Known live deltas retain only current partial state, rather
+than an additional raw card for every delta. Malformed or unsupported content
+remains inspectable as raw JSON with its original classifier provenance.
+Durable ordinals are raw event at zero, then content-block position plus one.
+Live cards use a disjoint provisional ordinal range, assigned in observation
+order within a source cursor; matching durable messages replace them. A final
+message clears its own partials, and older cursor-only partials, while preserving
+partials explicitly identified as a different message. Fold state is per-card:
+thinking, unprojected JSON and raw source beside typed cards start folded,
+independently of sibling text/tool cards. Raw inspection remains an explicit
+choice, so raw source cannot bypass a thinking fold by default.
+
+This amendment also specifies `ObservedToolUse.raw: Arc<str>` to share exact
+source events between tool cards, and a disjoint provisional live ordinal range
+beginning at `1 << 31`, as described above. `content_block_start` and
+`content_block_stop` are lifecycle signals ignored by the text projection;
+neither replaces accumulated text. Durable assistant records finalize cards.
+Fold choices for the 16 most recently retired live blocks survive gap recovery
+and transfer to the final card for the same message/block. Preferences outside
+that bounded live window may return to their defaults on later reconstruction.
+Unused hints retire with their final message. Anonymous hints whose possible
+final record lies inside an actual missing history range are discarded rather
+than assigned to another message. Anonymous partials at the final record's own
+cursor belong to later output and are preserved.
+
+Permission snapshots retain the latest lifecycle observation per
+`(request_id, request_seq)`, in publication order. Pending opens have no local
+projection count limit or clock-based expiry: only a matching real close retires
+them, including host cancellation or session-end closes. Unmatched opens in
+older data remain visible until such a close is observed. Only closed
+observations are bounded to the latest 16; older closed records remain in
+History. Displayed requests never substitute for S6 decision revalidation.
