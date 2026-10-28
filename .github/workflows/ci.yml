@@ -176,7 +176,7 @@ jobs:
     with:
       leg: macos-15
       # Policy (#1613, docs/next/ci-platform-policy.md): ordinary PRs run macOS
-      # build + lint only; the full macOS test matrix runs for `land/` batch
+      # build + lint and targeted native suspend-timer tests; the full matrix runs for `land/` batch
       # PRs, merge_group and pushes. check-macos below asserts this expectation.
       # Batch PRs use head_ref; ref is refs/pull/<number>/merge on PR events.
       run-tests: ${{ github.event_name != 'pull_request' || startsWith(github.head_ref, 'land/') }}
