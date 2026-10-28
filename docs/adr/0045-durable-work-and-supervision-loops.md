@@ -322,7 +322,15 @@ is not automatically progress. Persist meaningful progress against a work
 revision or a finite declared long-running-job lease. The proposed default
 progress deadline is 15 minutes and the maximum declared lease is one hour. All
 policy timings resolve through the ADR-0042 entries below, not local timers with
-hidden defaults.
+hidden defaults. Core progress needs an attested action receipt (for example a
+bound delegation or queue effect) or explicit operator progress confirmation. A
+wake acknowledgement, status-text edit or empty revision bump alone is not
+meaningful progress; rich PR/check verification is added in its later slices.
+
+Registration arms the progress deadline even when no external event is pending.
+If it expires with no existing wake, commit one timer occurrence keyed by loop
+ID and progress-boundary revision through the same occurrence/outbox path.
+Silence cannot turn the timer off or require a shell waiter to re-arm it.
 
 ### Escalation must leave the sleeping supervisor's context (D8)
 
@@ -410,7 +418,12 @@ permission grant. Always-grant lifetime remains ADR-0044 Q4's gated choice; the
 receipt itself restores no permission authority. Read/list/subscribe, an
 uncommitted event and an unregistered predicate cannot mint it.
 Stopped/Crashed/replaced/unknown targets retain explicit-start/recovery
-requirements and trigger the escalation chain.
+requirements and trigger the escalation chain. On restart, a restored Hibernated
+record alone never spawns. Replaying an unhandled, committed receipt after
+ownership recovery proposes only that narrow exception to ADR-0044 Q6's
+cold-start rule, alongside #2731's owed-answer wake. It requires joint Q6
+acceptance; completed receipts and checkpoints are not new wake triggers and
+cannot resume every saved session.
 
 A committed pending wake or unresolved admission blocks ADR-0044 Q2's idle
 quiesce. An idle loop with no occurrence does not. Before the generation-scoped
@@ -420,9 +433,10 @@ under ADR-0044's one-per-agent and node limits. Preserve the original ItemId,
 rotate generated MCP credentials and use ADR-0044 Q9's original-input bootstrap.
 A possible stdin write remains held/uncertain, not automatically replayed.
 Lifecycle wake target/readiness/grace policy remains owned by ADR-0044 and its
-pending registry entries below. Both D9 and the companion Q2/Q5 and S6e choices
-must be accepted and implemented before advertising automatic hibernated-loop
-wake; no lifecycle authority is inferred from #2585's send/answer scopes.
+pending registry entries below. Both D9 and the companion Q2/Q5/Q6 and S6e
+choices must be accepted and implemented before advertising automatic
+hibernated-loop wake; no lifecycle authority is inferred from #2585's
+send/answer scopes.
 
 Evaluate deadlines on a dispatcher reachable while any I/O/check/observation
 worker is in flight. Use a supplied monotonic clock during uptime; persist wall
@@ -627,8 +641,8 @@ implementation.
 | 5 / 320 | Occurrence/cursor/outbox atomic transition (#2718) | Fire between registration cut and commit, replay twice and get one pending occurrence. Fill the outbox, refuse the next event without cursor movement, release capacity and observe the same event admitted once without a timer retry. |
 | 6 / 340 | Stable queue admission and retained wake dedupe (#2718) | Submit the same wake twice across compaction/recovery: one active ItemId and one fake input. Different body/same ID refuses; queue-commit crash reconciles by that ID. |
 | 7 / 300 | Outbox worker and actual idle delivery (#2718) | Gate the permission book and release with no later model event; fake receives the original wake. No started/handled claim precedes the appropriate durable/harness fact. |
-| 8 / 320 | Receipt-bound Hibernated wake (#2728 Q2/Q5, #2731, D9 gate) | Let the fake enter confirmed Hibernated; one committed LoopWakeReceipt resumes once for the original ItemId with no new start/send/operate right. Pre-/post-freeze arrivals cancel hibernation or retain wake owed until cleanup. Reads, uncommitted events, Stopped/Crashed/replaced/uncertain identities never spawn; pending custody blocks quiesce. |
-| 9 / 300 | Ack/progress deadlines and finite pause (#1044) | Start/end a fake turn without progress; advance supplied clock while I/O is held and observe overdue state. Default pause expires after its persisted finite deadline, including restart; resume/ack without progress cannot disable protection indefinitely. |
+| 8 / 320 | Receipt-bound Hibernated wake (#2728 Q2/Q5/Q6, #2731, D9 gate) | Let the fake enter confirmed Hibernated; one committed LoopWakeReceipt resumes once for the original ItemId with no new start/send/operate right. Pre-/post-freeze arrivals cancel hibernation or retain wake owed until cleanup. Reads, uncommitted events, Stopped/Crashed/replaced/uncertain identities never spawn; pending custody blocks quiesce. Restart can run only the owed committed receipt, not all saved sessions. |
+| 9 / 300 | Ack/progress deadlines and finite pause (#1044) | Start/end a fake turn without progress and emit no external events; advance supplied clock while I/O is held and observe one timer occurrence and overdue state. Default pause expires after its persisted finite deadline, including restart; resume/ack without progress cannot disable protection indefinitely. |
 | 10 / 320 | Attested supervisor chain and durable attention (#1044, D8) | Fake supervisor does not act: advance each hop and reach operator. Retire a parent, create a cycle or use an unreadable recipient: skip/refuse safely and keep escalation owed; source data never reaches an unauthorised notice. |
 | 11 / 340 | Concrete operator notification outbox / enrolled bridge (#1005 contract, D8) | Controlled bridge receives the operator escalation and default reminders with one escalation ID while GUI is absent. Missing/unhealthy binding refuses arming; later bridge loss keeps degraded/unresolved state. Acknowledge grants only the finite lease; no progress reactivates reminders. Fake inputs remain unduplicated. |
 | 12 / 320 | GitHub credential/read check/quota producer (#663, D10) | Fake source reports same-SHA rerun failure, already-merged PR and rate exhaustion: public loop fires/degrades correctly without viewer/per-loop poller. App access with no subscriber repo-read grant refuses and emits no private event. Provider reset/request timeout do not become success. |
