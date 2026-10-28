@@ -9,21 +9,15 @@ use crate::structured::permissions::auth::tokens::TokenStore;
 use crate::{
     api::client_tokens::{Bearer, Scope},
     structured::permissions::auth::tokens::{
-        server::{Owner, Session, Store},
+        server::{Owner, PeerAdmissionError, Session, Store},
         TokenError,
     },
     structured_wire::*,
 };
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
-use axum::{
-    extract::State,
-    http::StatusCode,
-    response::{IntoResponse, Response},
-    routing::get,
-    Router,
-};
+use axum::{extract::State, response::Response, routing::get, Extension, Router};
 use futures_util::{FutureExt, Sink, SinkExt, StreamExt};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::{
     collections::HashMap,
     future::Future,
@@ -37,7 +31,7 @@ use tokio::sync::{mpsc, watch, OwnedSemaphorePermit, Semaphore};
 /// Maximum encoded, received or reassembled message bytes.
 const MAX_MESSAGE: usize = 65_536;
 /// Upgraded socket cap, including pending hellos.
-const CONNECTIONS: u32 = 16;
+pub(super) const CONNECTIONS: u32 = 16;
 /// Pending unauthenticated sockets; leave capacity for authenticated sessions.
 const PENDING_HELLOS: usize = 4;
 /// Registered sockets per authenticated bearer digest, including pending welcome.
@@ -73,7 +67,8 @@ struct Shared {
     epoch: String,
     clock: Arc<dyn Clock>,
     slots: Arc<Semaphore>,
-    hellos: Arc<Semaphore>,
+    hellos: [Arc<Semaphore>; 2],
+    admission: super::local_admission::Client,
     clients: Mutex<HashMap<u64, Client>>,
     next: AtomicU64,
     stop: watch::Sender<bool>,
@@ -92,13 +87,18 @@ impl Shared {
 struct Lease {
     shared: Arc<Shared>,
     id: u64,
+    live: Arc<AtomicBool>,
     _permit: OwnedSemaphorePermit,
 }
 impl Drop for Lease {
     fn drop(&mut self) {
-        if let Ok(mut clients) = self.shared.clients.lock() {
-            clients.remove(&self.id);
-        }
+        let mut clients = self
+            .shared
+            .clients
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        self.live.store(false, Ordering::Release);
+        clients.remove(&self.id);
     }
 }
 /// Unmounted protocol core. The listener slice owns HTTP hosting guards and binding.
@@ -106,6 +106,7 @@ impl Drop for Lease {
 pub(crate) struct Core {
     owner: crate::structured::history::owner::Owner,
     command_owner: commands::Owner,
+    admission: super::local_admission::Owner,
     shared: Arc<Shared>,
 }
 impl Drop for Core {
@@ -161,10 +162,12 @@ impl Core {
         let (stop, _) = watch::channel(false);
         let fleet = fleet::Client::new(wake.clone(), stop.subscribe());
         let (commands, command_owner) = commands::channel(wake.clone());
+        let (admission, admission_owner) = super::local_admission::channel(wake.clone());
         let (histories, owner) = crate::structured::history::owner::channel(wake);
         Ok(Self {
             owner,
             command_owner,
+            admission: admission_owner,
             shared: Arc::new(Shared {
                 histories,
                 commands,
@@ -173,7 +176,8 @@ impl Core {
                 epoch,
                 clock,
                 slots: Arc::new(Semaphore::new(CONNECTIONS as usize)),
-                hellos: Arc::new(Semaphore::new(PENDING_HELLOS)),
+                hellos: std::array::from_fn(|_| Arc::new(Semaphore::new(PENDING_HELLOS))),
+                admission,
                 clients: Mutex::new(HashMap::new()),
                 next: AtomicU64::new(1),
                 stop,
@@ -192,18 +196,32 @@ impl Core {
     }
     /// Mount only behind S2b-mount's loopback, Host/Origin and funnel guards.
     pub(crate) fn router(&self) -> Router {
-        Router::new().route("/v1/ws", get(upgrade).with_state(self.shared.clone()))
+        self.endpoint(false)
+    }
+    /// Same protocol and global caps, with a separate native pre-auth pool and kernel proof.
+    pub(crate) fn local_router(&self) -> Router {
+        self.endpoint(true)
+            .layer(axum::middleware::from_fn_with_state(
+                self.shared.admission.clone(),
+                super::local_listener::admit,
+            ))
+    }
+    fn endpoint(&self, local: bool) -> Router {
+        Router::new().route(
+            "/v1/ws",
+            get(upgrade).with_state((self.shared.clone(), local)),
+        )
     }
     /// Admit commands on the same owner that services structured workers.
     pub(crate) fn service_commands(&mut self, app: &mut crate::app::App) {
+        self.admission.service(app);
         self.command_owner.service(app);
     }
     /// Stop and drain every transport lease even when app revocation fails.
     /// Return the revocation failure after bounded cleanup, logging it first.
     pub(crate) async fn shutdown(&self) -> io::Result<()> {
         let store = self.shared.store.clone();
-        let revocation = super::store_io::shared()
-            .run(move || store.shutdown())
+        let revocation = mutate_apps(store, None)
             .await
             .ok_or_else(|| io::Error::other("app revocation worker unavailable"))
             .and_then(|out| out.map_err(io::Error::other));
@@ -282,21 +300,33 @@ async fn app_lifetime(shared: &Shared, session: &Session) -> u16 {
         },
     }
 }
-async fn upgrade(ws: WebSocketUpgrade, State(shared): State<Arc<Shared>>) -> Response {
+async fn upgrade(
+    ws: WebSocketUpgrade,
+    State((shared, local)): State<(Arc<Shared>, bool)>,
+    peer: Option<Extension<crate::app::LocalPeer>>,
+) -> Response {
+    if local && peer.is_none() {
+        return super::local_admission::refusal(super::local_admission::Refusal::Identity(
+            crate::app::LocalPeerRefusal::OperatorOnly,
+        ));
+    }
     if *shared.stop.borrow() {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        return super::local_admission::refusal(super::local_admission::Refusal::Capacity);
     }
     let Ok(permit) = shared.slots.clone().try_acquire_owned() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        return super::local_admission::refusal(super::local_admission::Refusal::Capacity);
     };
-    let Ok(hello) = shared.hellos.clone().try_acquire_owned() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    let Ok(hello) = shared.hellos[usize::from(local)]
+        .clone()
+        .try_acquire_owned()
+    else {
+        return super::local_admission::refusal(super::local_admission::Refusal::Capacity);
     };
     ws.max_frame_size(MAX_MESSAGE)
         .max_message_size(MAX_MESSAGE)
         .write_buffer_size(0)
         .max_write_buffer_size(WRITE_BUFFER_BYTES)
-        .on_upgrade(move |socket| connection(socket, shared, permit, hello))
+        .on_upgrade(move |socket| connection(socket, shared, permit, hello, peer.map(|p| p.0)))
 }
 async fn before<T>(
     clock: &dyn Clock,
@@ -305,11 +335,18 @@ async fn before<T>(
 ) -> Option<T> {
     tokio::select! { biased; _ = clock.until(deadline) => None, out = work => Some(out) }
 }
+#[track_caller]
 fn close(code: u16) -> Message {
+    let source = std::panic::Location::caller();
+    crate::logging::client_wire_closing(code, source.file(), source.line());
     Message::Close(Some(CloseFrame {
         code,
         reason: "client transport ended".into(),
     }))
+}
+fn unavailable(cause: &'static str) -> u16 {
+    crate::logging::client_wire_unavailable(cause, None);
+    GOING_AWAY_CLOSE
 }
 async fn authenticate(
     socket: &mut WebSocket,
@@ -409,6 +446,7 @@ async fn connection(
     shared: Arc<Shared>,
     permit: OwnedSemaphorePermit,
     hello: OwnedSemaphorePermit,
+    peer: Option<crate::app::LocalPeer>,
 ) {
     let Ok(id) = shared
         .next
@@ -416,9 +454,11 @@ async fn connection(
     else {
         return;
     };
+    let live = Arc::new(AtomicBool::new(true));
     let _lease = Lease {
         shared: shared.clone(),
         id,
+        live: live.clone(),
         _permit: permit,
     };
     let mut stop = shared.stop.subscribe();
@@ -427,13 +467,94 @@ async fn connection(
     }
     let end = shared.clock.now() + Duration::from_millis(HANDSHAKE_DEADLINE_MS);
     let session = tokio::select! { biased; _ = stop.changed() => return, session = authenticate(&mut socket, &shared, end) => session };
-    let (session, read_only, token) = match session {
+    let (_session, read_only, token) = match session {
         Ok(session) => session,
         Err(failure) => {
             let Some(code) = failure.hello_code() else {
                 return;
             };
             let _ = socket.send(close(code)).now_or_never();
+            return;
+        }
+    };
+    let (priority, priority_rx) = mpsc::channel(PRIORITY_CAPACITY);
+    let (data, data_rx) = mpsc::channel(DATA_CAPACITY);
+    let (revoke, mut revoked) = watch::channel(false);
+    let registration = async {
+        let store = shared.store.clone();
+        let clock = shared.clock.clone();
+        let fence = match super::store_io::hello_waits()
+            .run(move || store.wait_peer(end.saturating_duration_since(clock.now())))
+            .await?
+        {
+            Ok(fence) => fence,
+            Err(error) => return Some(Err(error.into())),
+        };
+        let shared = shared.clone();
+        let token = token.clone();
+        super::store_io::shared()
+            .run(move || {
+                shared
+                    .store
+                    .register_peer(fence, &token, peer.as_ref(), |session| {
+                        let mut clients = shared
+                            .clients
+                            .lock()
+                            .map_err(|_| PeerAdmissionError::from(TokenError::Busy))?;
+                        if let Some(peer) = &peer {
+                            if peer.process().exited().map_err(TokenError::from)? {
+                                return Err(PeerAdmissionError::PeerProcessChanged);
+                            }
+                        }
+                        if !live.load(Ordering::Acquire)
+                            || *shared.stop.borrow()
+                            || shared.clock.now() >= end
+                            || clients
+                                .values()
+                                .filter(|c| c.session.same_credential(&session))
+                                .count()
+                                >= CREDENTIAL_CONNECTIONS
+                        {
+                            return Err(TokenError::Busy.into());
+                        }
+                        clients.insert(
+                            id,
+                            Client {
+                                session: session.clone(),
+                                read_only,
+                                data,
+                                revoke,
+                            },
+                        );
+                        Ok(session)
+                    })
+            })
+            .await
+    };
+    let session = match before(shared.clock.as_ref(), end, registration)
+        .await
+        .flatten()
+        .map(|result| result.and_then(|registered| registered))
+    {
+        Some(Ok(session)) => session,
+        failure => {
+            let changed = matches!(failure, Some(Err(PeerAdmissionError::PeerProcessChanged)));
+            let code = match failure {
+                // Nothing has registered yet: a credential refusal is a refused hello.
+                Some(Err(PeerAdmissionError::Token(error))) => HandshakeFailure::from(error)
+                    .hello_code()
+                    .unwrap_or(GOING_AWAY_CLOSE),
+                _ if changed => AUTH_REFUSED_CLOSE,
+                _ => GOING_AWAY_CLOSE,
+            };
+            let mut frame = close(code);
+            if changed {
+                frame = Message::Close(Some(CloseFrame {
+                    code,
+                    reason: "peer_process_changed".into(),
+                }));
+            }
+            let _ = socket.send(frame).now_or_never();
             return;
         }
     };
@@ -454,31 +575,6 @@ async fn connection(
         })
         .collect();
     let principal = session.info.principal.clone();
-    let (priority, priority_rx) = mpsc::channel(PRIORITY_CAPACITY);
-    let (data, data_rx) = mpsc::channel(DATA_CAPACITY);
-    let (revoke, mut revoked) = watch::channel(false);
-    if let Ok(mut clients) = shared.clients.lock() {
-        if clients
-            .values()
-            .filter(|c| c.session.same_credential(&session))
-            .count()
-            >= CREDENTIAL_CONNECTIONS
-        {
-            let _ = socket.send(close(GOING_AWAY_CLOSE)).now_or_never();
-            return;
-        }
-        clients.insert(
-            id,
-            Client {
-                session: session.clone(),
-                read_only,
-                data,
-                revoke,
-            },
-        );
-    } else {
-        return;
-    }
     let welcome = ServerFrame::Welcome {
         protocol: WIRE_JSON_VERSION,
         server_version: crate::build_info::version(),
@@ -549,19 +645,19 @@ async fn connection(
             _ = revoked.changed() => break AUTH_REVOKED_CLOSE,
             _ = &mut writer => return,
             result = running.join_next(), if !running.is_empty() => {
-                if !matches!(result, Some(Ok(Ok(())))) { break GOING_AWAY_CLOSE; }
+                if !matches!(result, Some(Ok(Ok(())))) { break unavailable("command_worker"); }
             },
-            _ = shared.clock.until(heartbeat.expires()) => break GOING_AWAY_CLOSE,
+            _ = shared.clock.until(heartbeat.expires()) => break unavailable("heartbeat_expired"),
             _ = shared.clock.until(heartbeat.next_ping) => {
-                let Some(nonce) = heartbeat.ping(shared.clock.now(), &format!("{}/{id}", shared.epoch)) else { break GOING_AWAY_CLOSE };
-                let Some(frame) = output::encode(ServerFrame::Ping { nonce }) else { break GOING_AWAY_CLOSE };
-                if priority.try_send(frame).is_err() { break GOING_AWAY_CLOSE; }
+                let Some(nonce) = heartbeat.ping(shared.clock.now(), &format!("{}/{id}", shared.epoch)) else { break unavailable("heartbeat_budget") };
+                let Some(frame) = output::encode(ServerFrame::Ping { nonce }) else { break unavailable("ping_encoding") };
+                if priority.try_send(frame).is_err() { break unavailable("control_capacity"); }
             }
             frame = stream.next() => match frame {
                 Some(Ok(Message::Text(text))) => match serde_json::from_str(&text) {
                     Ok(ClientFrame::Pong { nonce }) => heartbeat.pong(&nonce, shared.clock.now()),
                     Ok(ClientFrame::Sub { sub_id, stream, after }) => {
-                        if !subscriptions.subscribe(sub_id, stream, after) { break GOING_AWAY_CLOSE }
+                        if !subscriptions.subscribe(sub_id, stream, after) { break unavailable("subscription_capacity") }
                     }
                     Ok(ClientFrame::Unsub { sub_id }) => subscriptions.unsubscribe(&sub_id),
                     Ok(ClientFrame::Cmd { cmd_id, verb, args, resume_only }) => {
@@ -573,12 +669,12 @@ async fn connection(
                             Some(crate::api::error_code::ErrorCode::SessionBusy)
                         } else { None };
                         if let Some(code) = refusal {
-                            let Some(ack) = output::encode(commands::ack(cmd_id, Err(code))) else { break GOING_AWAY_CLOSE };
+                            let Some(ack) = output::encode(commands::ack(cmd_id, Err(code))) else { break unavailable("ack_encoding") };
                             tokio::select! { biased;
                                 _ = stop.changed() => return,
                                 _ = revoked.changed() => break AUTH_REVOKED_CLOSE,
                                 _ = &mut writer => return,
-                                _ = shared.clock.until(heartbeat.expires()) => break GOING_AWAY_CLOSE,
+                                _ = shared.clock.until(heartbeat.expires()) => break unavailable("heartbeat_expired"),
                                 sent = priority.send(ack) => if sent.is_err() { return },
                             }
                             continue;
@@ -589,7 +685,9 @@ async fn connection(
                 },
                 Some(Ok(Message::Binary(_))) => break POLICY_VIOLATION_CLOSE,
                 Some(Ok(Message::Ping(_) | Message::Pong(_))) => (),
-                _ => break GOING_AWAY_CLOSE,
+                Some(Ok(Message::Close(_))) => break unavailable("peer_close"),
+                Some(Err(_)) => break unavailable("peer_transport"),
+                None => break unavailable("peer_eof"),
             }
         }
     };
@@ -612,9 +710,7 @@ async fn connection(
         let store = shared.store.clone();
         let session = session.clone();
         if !matches!(
-            super::store_io::shared()
-                .run(move || store.retire(&session))
-                .await,
+            mutate_apps(store, Some(session)).await,
             Some(Ok(()) | Err(TokenError::Revoked))
         ) {
             code = GOING_AWAY_CLOSE;
@@ -626,3 +722,32 @@ async fn connection(
 }
 #[cfg(test)]
 pub(crate) mod tests;
+
+/// Publish intent, wait outside store I/O, then commit under the acquired fence.
+/// Each phase independently reserves capacity. Finish-step overload drops the
+/// fence without removing the app credential; retirement maps this to close 1001.
+/// Abandoned waits retain their bounded worker until reaped.
+async fn mutate_apps(
+    store: Arc<Store>,
+    session: Option<Session>,
+) -> Option<Result<(), TokenError>> {
+    let begin = store.clone();
+    let pending = match super::store_io::shared()
+        .run(move || begin.begin_mutation())
+        .await?
+    {
+        Ok(pending) => pending,
+        Err(error) => return Some(Err(error)),
+    };
+    let waiter = store.clone();
+    let fence = match super::store_io::retirement_waits()
+        .run(move || waiter.wait_mutation(pending))
+        .await?
+    {
+        Ok(fence) => fence,
+        Err(error) => return Some(Err(error)),
+    };
+    super::store_io::shared()
+        .run(move || store.finish_mutation(fence, session.as_ref()))
+        .await
+}

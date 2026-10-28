@@ -230,3 +230,56 @@ test("a late tool-result regroup keeps pending permission locations attached to 
   expect(root.textContent).toContain("pwd");
   expect(root.textContent).toContain("second");
 });
+
+
+test("only the opening permission-only turn disappears; later user anchors survive", () => {
+  const fold = emptyFold();
+  let seq = 0;
+  const send = (event: object) => foldEntry(fold, classifyStoredLine(++seq, JSON.stringify(event)));
+  send(native("opening"));
+  send({ type: "user", message: { role: "user", content: "first user" } });
+  send(native("later"));
+  send({ type: "user", message: { role: "user", content: "second user" } });
+  send(open("opening"));
+  expect(fold.turns.map((turn) => turn.key)).toEqual([2, 4]);
+  expect(fold.permissionLocations[3]).toEqual({ turn: 0, slot: 1 });
+  send(open("later"));
+  expect(fold.turns.map((turn) => keptEntries(turn).map((entry) => entry.seq))).toEqual([[2], [4, 5, 6]]);
+});
+
+test("an empty non-opening permission turn is rejected as a broken invariant", () => {
+  const fold = emptyFold();
+  let seq = 0;
+  const send = (event: object) => foldEntry(fold, classifyStoredLine(++seq, JSON.stringify(event)));
+  send({ type: "user", message: { role: "user", content: "first user" } });
+  send({ type: "user", message: { role: "user", content: "second user" } });
+  send(native("broken"));
+  const turn = fold.turns[1];
+  const location = fold.permissionLocations[3];
+  if (turn === undefined || location === undefined) throw new Error("missing indexed fixture turn");
+  // Deliberate corruption: remove the user anchor, which place always supplies
+  // to every non-opening turn. The guard must reject this impossible state.
+  turn.entries.shift();
+  location.slot = 0;
+  expect(() => send(open("broken"))).toThrow("empty non-opening permission turn");
+});
+
+test("the opening turn's cursor crosses each retired leading slot only once", () => {
+  const fold = emptyFold();
+  let seq = 0;
+  const send = (event: object) => foldEntry(fold, classifyStoredLine(++seq, JSON.stringify(event)));
+  const prompts = 400;
+  for (let n = 0; n < prompts; n++) send(native(`leading-${n}`));
+  const turn = fold.turns[0];
+  if (turn === undefined) throw new Error("missing opening fixture turn");
+  let visits = 0;
+  turn.entries = new Proxy(turn.entries, {
+    get(target, key, receiver) {
+      if (typeof key === "string" && /^\d+$/.test(key)) visits++;
+      return Reflect.get(target, key, receiver);
+    },
+  });
+  for (let n = 0; n < prompts; n++) send(open(`leading-${n}`, seq + 1));
+  expect(keptEntries(turn)).toHaveLength(prompts);
+  expect(visits / seq).toBeLessThan(20);
+});
