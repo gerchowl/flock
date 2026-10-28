@@ -254,12 +254,13 @@ export class Harness {
         this.#lastServerFrameAt = this.clock.now();
         return this.net.current().open();
       case "send":
+        if (step.frame.t === "ev" && typeof step.frame.ts_ms !== "number") fail("dynamic timestamp requires persisted and wall-window oracles");
         if ((step.socket ?? "current") === "current") {
           this.#lastServerFrameAt = this.clock.now();
           if ("sub_id" in step.frame) this.#origins.set(`sub:${step.frame.sub_id}`, this.clock.now());
-          return this.net.current().deliver(step.frame);
+          return this.net.current().deliver(step.frame as ServerFrame);
         }
-        return this.net.previous().deliver(step.frame);
+        return this.net.previous().deliver(step.frame as ServerFrame);
       case "expect":
         return this.#expect(step.frame, step.fields, step.absent ?? []);
       case "expect_close":

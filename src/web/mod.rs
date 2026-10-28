@@ -23,6 +23,7 @@ pub(crate) mod client_exchange;
 pub(crate) mod client_listener;
 pub(crate) mod gui;
 pub(crate) mod listener_foundation;
+mod local_admission;
 pub(crate) mod local_listener;
 pub(crate) mod store_io;
 pub(crate) mod wire;
@@ -160,20 +161,29 @@ pub fn run_web_command(args: &[String]) -> std::io::Result<i32> {
         }
     }
 
-    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Layer};
-    let filter =
-        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
-    let _ = tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::fmt::layer()
-                .with_filter(crate::logging::credential_safe_filter(filter)),
-        )
-        .try_init();
+    use tracing_subscriber::util::SubscriberInitExt;
+    let _ = log_subscriber(std::io::stdout).try_init();
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
     rt.block_on(serve(cfg))
+}
+
+/// Build the web command's console subscriber, shared with real-wire tests.
+/// Preserve its stdout destination and RUST_LOG selection independently of file logging.
+pub(crate) fn log_subscriber<W>(writer: W) -> impl tracing::Subscriber + Send + Sync
+where
+    W: for<'a> tracing_subscriber::fmt::writer::MakeWriter<'a> + Send + Sync + 'static,
+{
+    use tracing_subscriber::{layer::SubscriberExt, Layer};
+    let filter =
+        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
+    tracing_subscriber::registry().with(
+        tracing_subscriber::fmt::layer()
+            .with_writer(writer)
+            .with_filter(crate::logging::credential_safe_filter(filter)),
+    )
 }
 
 async fn serve(cfg: WebConfig) -> std::io::Result<i32> {

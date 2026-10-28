@@ -54,10 +54,33 @@ impl std::fmt::Display for PeerAdmissionError {
     }
 }
 impl std::error::Error for PeerAdmissionError {}
+/// Explicit fixture boundaries around the fenced authentication and insertion.
+#[cfg(all(test, feature = "web"))]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PeerStage {
+    /// The lookup succeeded, before inspecting the accepted peer readiness.
+    Authenticated,
+    /// A kernel lock helper is waiting for management or a revocation intent.
+    Waiting,
+    /// The shared management fence was acquired, before queued store I/O.
+    LockAcquired,
+    /// Peer checks passed, before invoking the registration callback.
+    Checked,
+    /// The registration callback returned, before releasing admission ownership.
+    Registered,
+}
+#[cfg(all(test, feature = "web"))]
+type PeerHook = (PeerStage, Box<dyn FnOnce() + Send>);
+/// Owned hello fence, acquired outside the shared store-I/O pool and held through insertion.
+/// Only this store module can construct it; callers cannot substitute an unlocked file.
+#[cfg_attr(not(feature = "web"), allow(dead_code))]
+pub(crate) struct PeerFence(Arc<TokenStore>, LockFile);
 /// One memory domain shared by socket minting and every transport admission.
 pub(crate) struct Store {
     files: Arc<TokenStore>,
     apps: app_sessions::Store,
+    #[cfg(all(test, feature = "web"))]
+    peer_hooks: Mutex<Vec<PeerHook>>,
 }
 impl Store {
     /// Bind both sources to the same filesystem admission and revocation fence.
@@ -72,6 +95,8 @@ impl Store {
         Self {
             apps: app_sessions::Store::new(files.clone(), clock),
             files,
+            #[cfg(all(test, feature = "web"))]
+            peer_hooks: Mutex::default(),
         }
     }
     /// Fixed-scope issuance, requiring the minting socket's LocalOperator proof.
@@ -105,20 +130,48 @@ impl Store {
             None => std::future::pending().await,
         }
     }
-    /// Authenticate and register under one admission/revocation fence. A local
-    /// transport supplies its sealed origin proof; TCP supplies None. App credentials
-    /// require the minting PID and birth, while file credentials retain their grants.
-    /// The callback must stay bounded and must not acquire an exclusive store lock.
-    // Staged for the approved #2500 PR3 listener/core integration; tests exercise the primitive now.
-    #[allow(dead_code)]
+    /// Await management and revocation ownership under the remaining hello deadline.
+    /// Run on the separately bounded hello-wait worker, never the store-I/O pool.
+    // Native registration is compiled but unused without the web transport.
+    #[cfg_attr(not(feature = "web"), allow(dead_code))]
+    pub(crate) fn wait_peer(&self, budget: Duration) -> Result<PeerFence, TokenError> {
+        let guard = self.files.hello_lock(budget, || {
+            #[cfg(all(test, feature = "web"))]
+            self.peer_stage(PeerStage::Waiting);
+        })?;
+        #[cfg(all(test, feature = "web"))]
+        self.peer_stage(PeerStage::LockAcquired);
+        Ok(PeerFence(self.files.clone(), guard))
+    }
+    /// Synchronous fixture entry retains the same fence and callback ordering.
+    #[cfg(test)]
     pub(crate) fn admit_peer<T>(
         &self,
         token: &Bearer,
         peer: Option<&crate::app::LocalPeer>,
+        budget: Duration,
         register: impl FnOnce(Session) -> T,
     ) -> Result<T, PeerAdmissionError> {
-        let _guard = self.files.lock_with(LockFile::try_lock_shared)?;
+        self.register_peer(self.wait_peer(budget)?, token, peer, register)
+    }
+    /// Recheck identity and register while retaining the previously acquired fence.
+    /// The callback must stay bounded and must not acquire an exclusive store lock.
+    // Native registration is compiled but unused without the web transport.
+    #[cfg_attr(not(feature = "web"), allow(dead_code))]
+    pub(crate) fn register_peer<T>(
+        &self,
+        fence: PeerFence,
+        token: &Bearer,
+        peer: Option<&crate::app::LocalPeer>,
+        register: impl FnOnce(Session) -> T,
+    ) -> Result<T, PeerAdmissionError> {
+        if !Arc::ptr_eq(&self.files, &fence.0) {
+            return Err(TokenError::Unsafe.into());
+        }
+        let _guard = fence.1;
         let session = self.authenticate(token)?;
+        #[cfg(all(test, feature = "web"))]
+        self.peer_stage(PeerStage::Authenticated);
         let peer_exited = match peer {
             Some(peer) => peer.process().exited().map_err(TokenError::from)?,
             None => false,
@@ -132,7 +185,34 @@ impl Store {
         {
             return Err(PeerAdmissionError::PeerProcessChanged);
         }
-        Ok(register(session))
+        #[cfg(all(test, feature = "web"))]
+        self.peer_stage(PeerStage::Checked);
+        let result = register(session);
+        #[cfg(all(test, feature = "web"))]
+        self.peer_stage(PeerStage::Registered);
+        Ok(result)
+    }
+
+    /// Install a one-shot fixture gate at an explicit admission boundary.
+    #[cfg(all(test, feature = "web"))]
+    pub(crate) fn on_peer_stage(&self, stage: PeerStage, action: impl FnOnce() + Send + 'static) {
+        self.peer_hooks
+            .lock()
+            .unwrap()
+            .push((stage, Box::new(action)));
+    }
+    #[cfg(all(test, feature = "web"))]
+    fn peer_stage(&self, stage: PeerStage) {
+        let action = {
+            let mut hooks = self.peer_hooks.lock().unwrap();
+            hooks
+                .iter()
+                .position(|(at, _)| *at == stage)
+                .map(|index| hooks.remove(index).1)
+        };
+        if let Some(action) = action {
+            action();
+        }
     }
 
     /// Recheck the original source under its shared fence through bounded dispatch.
@@ -147,7 +227,42 @@ impl Store {
             Source::File(s) => self.files.admit(s, required, dispatch),
         }
     }
+    /// Gate a contended retirement before its deadline-bounded IPC read.
+    #[cfg(all(test, feature = "web"))]
+    pub(crate) fn on_mutation_waiting(&self, action: impl FnOnce() + Send + 'static) {
+        self.apps.on_waiting(action);
+    }
+    /// Publish revocation intent before waiting outside the store-I/O pool.
+    #[cfg(feature = "web")]
+    pub(crate) fn begin_mutation(&self) -> Result<app_sessions::PendingMutation, TokenError> {
+        self.apps.begin_mutation()
+    }
+    /// Await exclusive ownership on the separate bounded retirement worker.
+    #[cfg(feature = "web")]
+    pub(crate) fn wait_mutation(
+        &self,
+        pending: app_sessions::PendingMutation,
+    ) -> Result<app_sessions::MutationFence, TokenError> {
+        pending.wait(|| {
+            #[cfg(test)]
+            self.apps.notify_waiting();
+        })
+    }
+    /// Commit the exact app retirement, retaining the fence through notification.
+    #[cfg(feature = "web")]
+    pub(crate) fn finish_mutation(
+        &self,
+        fence: app_sessions::MutationFence,
+        session: Option<&Session>,
+    ) -> Result<(), TokenError> {
+        let app = match session {
+            Some(session) => Some(session.app().ok_or(TokenError::Unsafe)?),
+            None => None,
+        };
+        self.apps.finish_mutation(fence, app)
+    }
     /// Retire the exact ephemeral credential under the existing exclusive fence.
+    #[cfg(test)]
     pub(crate) fn retire(&self, session: &Session) -> Result<(), TokenError> {
         match session.app() {
             Some(s) => self.apps.revoke(s),
@@ -155,6 +270,7 @@ impl Store {
         }
     }
     /// Revoke all ephemeral credentials before server shutdown or handoff.
+    #[cfg(test)]
     pub(crate) fn shutdown(&self) -> Result<(), TokenError> {
         self.apps.revoke_all()
     }
