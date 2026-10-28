@@ -639,7 +639,7 @@ fn revocation_intent_blocks_new_admissions_across_handles_without_starvation() {
     let (_root, store, mut app) = setup();
     let issued = issue(&store, &mut app, "browser", &[Scope::Send]);
     let session = store.authenticate(&issued.token).unwrap();
-    let intent = priority::Intent::begin(&store.0, store.random::<16>().unwrap()).unwrap();
+    let intent = priority::Intent::begin(&*store.0, store.random::<16>().unwrap()).unwrap();
     // The primary lock is free, so Busy proves intent priority rather than contention.
     assert!(store.lock_file().unwrap().try_lock().is_ok());
     for _ in 0..4096 {
@@ -760,7 +760,7 @@ fn priority_process_fixture() {
 #[test]
 fn intent_is_observed_by_an_independent_process_with_no_primary_lock_held() {
     let (root, store, _app) = setup();
-    let intent = priority::Intent::begin(&store.0, store.random::<16>().unwrap()).unwrap();
+    let intent = priority::Intent::begin(&*store.0, store.random::<16>().unwrap()).unwrap();
     let mut command = crate::process::TracedCommand::new(std::env::current_exe().unwrap(), "test");
     command.args([
         "--exact",
@@ -998,7 +998,7 @@ fn startup_sweeps_stale_intents_but_preserves_live_revokers() {
     drop(store.0.file(&name, true).unwrap());
     TokenStore::open(root.path()).unwrap();
     assert!(matches!(store.0.file(&name, false), Err(e) if e.kind() == io::ErrorKind::NotFound));
-    let intent = priority::Intent::begin(&store.0, "b".repeat(32)).unwrap();
+    let intent = priority::Intent::begin(&*store.0, "b".repeat(32)).unwrap();
     let guard = LockFile::new(store.lock_file().unwrap());
     guard.try_lock().unwrap();
     priority::sweep(&store.0).unwrap();

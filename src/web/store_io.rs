@@ -5,6 +5,11 @@ use tokio::sync::Semaphore;
 /// Bounded active or queued blocking jobs, including abandoned async waiters.
 pub(crate) struct StoreIo(Arc<Semaphore>);
 impl StoreIo {
+    #[cfg(test)]
+    pub(crate) fn available(&self) -> usize {
+        self.0.available_permits()
+    }
+
     /// Return None on overload or worker failure; no unbounded waiting queue.
     pub(crate) async fn run<T: Send + 'static>(
         &self,
@@ -40,6 +45,17 @@ pub(crate) fn shared() -> &'static StoreIo {
 pub(crate) fn hello_waits() -> &'static StoreIo {
     static POOL: OnceLock<StoreIo> = OnceLock::new();
     POOL.get_or_init(|| StoreIo(Arc::new(Semaphore::new(8))))
+}
+
+/// Bound retirement lock waits independently of live subscription I/O.
+/// One slot per live socket plus shutdown; cancellation retains the helper's slot.
+pub(crate) fn retirement_waits() -> &'static StoreIo {
+    static POOL: OnceLock<StoreIo> = OnceLock::new();
+    POOL.get_or_init(|| {
+        StoreIo(Arc::new(Semaphore::new(
+            super::wire::CONNECTIONS as usize + 1,
+        )))
+    })
 }
 
 #[cfg(test)]
