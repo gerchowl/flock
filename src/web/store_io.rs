@@ -2,7 +2,7 @@
 use std::sync::{Arc, OnceLock};
 use tokio::sync::Semaphore;
 
-/// Four active or queued blocking jobs, including abandoned async waiters.
+/// Bounded active or queued blocking jobs, including abandoned async waiters.
 pub(crate) struct StoreIo(Arc<Semaphore>);
 impl StoreIo {
     /// Return None on overload or worker failure; no unbounded waiting queue.
@@ -28,10 +28,18 @@ impl StoreIo {
         .ok()
     }
 }
-/// Share the fixed budget across all token verification routes.
+/// Share four I/O slots across all token verification routes.
 pub(crate) fn shared() -> &'static StoreIo {
     static POOL: OnceLock<StoreIo> = OnceLock::new();
     POOL.get_or_init(|| StoreIo(Arc::new(Semaphore::new(4))))
+}
+
+/// At most eight kernel-lock waits, matching both listeners' four pending hellos.
+/// Separate from store I/O: waiting reconnects cannot evict live subscriptions.
+/// Cancellation retains a slot until its deadline-bounded helper has been reaped.
+pub(crate) fn hello_waits() -> &'static StoreIo {
+    static POOL: OnceLock<StoreIo> = OnceLock::new();
+    POOL.get_or_init(|| StoreIo(Arc::new(Semaphore::new(8))))
 }
 
 #[cfg(test)]
