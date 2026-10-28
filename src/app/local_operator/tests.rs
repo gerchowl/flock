@@ -17,7 +17,10 @@ fn app() -> App {
     app
 }
 fn refuses(app: &mut App, peer: Credentials, code: ErrorCode) {
-    assert_eq!(app.admit_local_peer(peer).err(), Some(code));
+    assert_eq!(
+        app.admit_local_peer(peer).err().map(LocalPeerRefusal::code),
+        Some(code)
+    );
 }
 #[test]
 fn kernel_peer_admission_is_independent_of_the_current_api_request() {
@@ -138,7 +141,10 @@ fn exit_during_ancestry_refuses_the_unreaped_peer() {
         exited,
         "the real peer must exit after its kernel watch was armed"
     );
-    assert_eq!(result.err(), Some(ErrorCode::PeerProcessChanged));
+    assert_eq!(
+        result.err().map(LocalPeerRefusal::code),
+        Some(ErrorCode::PeerProcessChanged)
+    );
 }
 
 #[test]
@@ -151,5 +157,8 @@ fn incomplete_ancestry_refuses_an_otherwise_live_peer() {
         None
     });
     assert!(read, "admission must request ancestry evidence");
-    assert_eq!(result.err(), Some(ErrorCode::OperatorOnly));
+    assert_eq!(
+        result.err().map(LocalPeerRefusal::code),
+        Some(ErrorCode::OperatorOnly)
+    );
 }
