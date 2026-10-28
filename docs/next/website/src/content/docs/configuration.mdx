@@ -1046,6 +1046,8 @@ Common log files:
 
 Logs rotate automatically. Include the current log and rotated siblings when reporting issues.
 
+`FLOCK_LOG` controls file logging; the `flk web` console subscriber uses `RUST_LOG`. WebSocket dependency targets `tungstenite` and `tokio_tungstenite` are always capped at DEBUG because TRACE dumps raw frames, including bearer credentials in `hello`. The `tungstenite::protocol` target is capped at INFO because its DEBUG events include arbitrary close reasons. These subscriber caps also apply to explicit module or span directives and cannot be lifted by either environment variable. Flock TRACE events remain available when selected.
+
 ## System One advice
 
 Delegate round endings and readiness expiry can query System One, a model that answers typed questions with probabilities. With no configured URLs, it is disabled.
