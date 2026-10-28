@@ -17,16 +17,30 @@ if "--model" in sys.argv and sys.argv[sys.argv.index("--model") + 1].startswith(
     mode = sys.argv[sys.argv.index("--model") + 1]
     def emit_live(value):
         print(json.dumps(value), flush=True)
+    def emit_block(index, kind, field, text, identity=None):
+        envelope = {"type": "stream_event"}
+        if identity is not None:
+            envelope["api_message_id"] = identity
+        if "lifecycle" in mode:
+            emit_live(dict(envelope, event={"type": "content_block_start", "index": index,
+                      "content_block": {"type": "thinking" if field == "thinking" else "text", field: ""}}))
+        emit_live(dict(envelope, event={"type": "content_block_delta", "index": index,
+                  "delta": {"type": kind, field: text}}))
+        if "lifecycle" in mode:
+            emit_live(dict(envelope, event={"type": "content_block_stop", "index": index}))
     init = json.loads((root / "restricted-init.json").read_text())
     init["session_id"] = sys.argv[sys.argv.index("--session-id") + 1]
     emit_live(init)
-    for index in range(40 if mode.endswith("burst") else 3):
-        kind, field, text = [("text_delta", "text", "partial"),
-                             ("thinking_delta", "thinking", "thinking"),
-                             ("text_delta", "text", "tool-result")][index % 3]
-        emit_live({"type": "stream_event", "event": {"type": "content_block_delta",
-                  "index": index, "delta": {"type": kind, field: text}}})
-    emit_live({"type": "assistant", "message": {"role": "assistant", "content": [
+    if "interleaved" in mode:
+        for identity, text in [("first", "partial"), ("second", "later")]:
+            emit_block(0, "text_delta", "text", text, identity)
+    else:
+        for index in range(40 if "burst" in mode else 3):
+            kind, field, text = [("text_delta", "text", "partial"),
+                                 ("thinking_delta", "thinking", "thinking"),
+                                 ("text_delta", "text", "tool-result")][index % 3]
+            emit_block(index, kind, field, text)
+    emit_live({"type": "assistant", "message": {"id": "first", "role": "assistant", "content": [
         {"type": "text", "text": "partial"}, {"type": "thinking", "thinking": "thinking"}]}})
     emit_live({"type": "user", "message": {"role": "user", "content": [
         {"type": "tool_result", "tool_use_id": "fixture-tool", "content": "tool-result"}]}})
