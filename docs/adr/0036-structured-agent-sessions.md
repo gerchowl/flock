@@ -1942,7 +1942,16 @@ the recheck and bounded callback, with exclusive locks for token mutation.
 Revocation intent fences new admissions before waiting for existing callbacks;
 readers check it again after shared acquisition. Revoke cannot return while an
 admitted callback remains in flight. This preserves S6 decision fencing and is
-the same shared/exclusive split recorded in ADR-0038 §6. A subscription's typed
+the same shared/exclusive split recorded in ADR-0038 §6. Hello lookup returns a snapshot and does not acquire the management lock.
+Registration still holds shared file ownership through insertion, but waits for
+management and any published revocation intent within the remaining original
+five-second handshake deadline. Its descriptor-only shared-lock helper is owned
+and reaped by the bounded store job; abandoned async waiters retain their store
+reservation until that job ends. The deadline also bounds welcome, and cancelled
+or expired waiters cannot insert a late registration. Command and subscription
+dispatch retain fail-fast admission with the existing retry class.
+
+A subscription's typed
 `session_busy` is retryable `later`, not a transport failure; unsafe storage and
 I/O failures retain their connection-close behavior.
 
@@ -4113,10 +4122,11 @@ are refused rather than followed or removed.
 
 The lock follows the **open file description**, including across SCM_RIGHTS.
 `perform_live_handoff` sends the API and terminal ownership descriptors after
-PTYs and the optional TCP listener, under handoff manifest version 3. Older
-importers refuse that version before transfer. `run_handoff_import_server`
-adopts both descriptors before acknowledging restoration or rebinding the
-public paths; the exporter retains its descriptors for rollback. Public Unix
+PTYs and the optional TCP listener. Internal handoff manifest version 4 also
+appends the native WebSocket ownership descriptor; builds without that extension
+retain version 3. Older importers refuse unsupported versions before transfer.
+`run_handoff_import_server` adopts these ownership descriptors before
+acknowledging restoration or rebinding the public paths; the exporter retains its descriptors for rollback. Public Unix
 listeners are rebound under those same locks; TCP retains its listening fd.
 `restore_public_sockets_after_failed_handoff` also reuses the retained locks.
 There is no unlocked interval during either transition. This changes only the
@@ -4140,11 +4150,28 @@ socket shares the API's mode `0600` constant and the ownership protocol above.
 `owner`, `SocketOwner::duplicate` and `SocketOwner::take` retain the same locked
 open description through descriptor transfer, rebind and rollback. `unlink`
 and destruction compare the recorded inode, so an old exporter cannot unlink
-an importer's replacement socket. This slice adds no production call to these
-listener methods and changes neither reachable endpoints nor TCP authentication.
-The following activation slice owns the server handoff manifest extension,
-LocalOperator admission, independent pre-auth pools and the atomic TCP
-app-session refusal.
+an importer's replacement socket. `HeadlessServer::prepare_client_wire` activates the foundation together with
+`Core::local_router` owner admission and TCP app-session refusal. The bounded
+`local_admission::Owner::service` obtains a sealed proof from the application
+owner. `Store::admit_peer` and the final registration check hold the existing
+revocation fence through insertion; `Lease::drop` prevents a cancelled waiter
+from leaving a registration behind. HTTP and hello permits are separate per
+transport; upgraded and per-credential caps belong to the single shared core.
+`client_listener::Listener::shutdown` cancels HTTP acceptance and drains the
+upgraded sessions through `Core::shutdown`; the HTTP task set alone does not
+own upgraded futures. Internal handoff manifest version 4 appends the native
+ownership descriptor after the API and terminal owners; import adopts it before
+preparation and rollback retains the same guard. No mesh or JSON wire version
+changes.
+
+
+PR3b refusal delivery uses four independent writer/drain tasks per listener.
+They do not consume normal HTTP reservations or block acceptance. Each retains
+the same absolute five-second deadline; when that separate budget is exhausted,
+additional over-cap connections are closed without a 503 response or another task.
+This trades a typed overload response for bounded memory and continued acceptance.
+A refused hello closes 4401 before registration; an exit after registration
+closes 4403 and includes every socket already admitted under the fence.
 
 ### Amendment: S10a1 native placement
 

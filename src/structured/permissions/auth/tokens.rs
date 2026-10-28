@@ -201,6 +201,31 @@ impl TokenStore {
         }
         Ok(file)
     }
+    /// Hello alone waits for management ownership under its remaining handshake budget.
+    /// Dispatch still uses fail-fast shared admission and the existing retry class.
+    fn hello_lock(
+        &self,
+        budget: Duration,
+        mut on_wait: impl FnMut(),
+    ) -> Result<LockFile, TokenError> {
+        let deadline = std::time::Instant::now() + budget;
+        let remaining = || {
+            deadline
+                .checked_duration_since(std::time::Instant::now())
+                .filter(|left| !left.is_zero())
+                .ok_or_else(|| TokenError::Io(io::ErrorKind::TimedOut.into()))
+        };
+        loop {
+            priority::wait(&self.0, &self.2, deadline, &mut on_wait)?;
+            let guard = PendingLock::begin_shared(self.lock_file()?, &self.2)?
+                .finish_notifying(remaining()?, &mut on_wait)?;
+            if !priority::pending(&self.0)? {
+                return Ok(guard);
+            }
+            // A newly published revoker wins before this hello enters its callback.
+            drop(guard);
+        }
+    }
     fn begin_revoke_entry(&self, entry: String) -> Result<PendingRevoke<'_>, TokenError> {
         let intent = priority::Intent::begin(&self.0, self.random::<16>()?)?;
         let guard = PendingLock::begin(self.lock_file()?, &self.2)?;

@@ -723,6 +723,13 @@ fn orphan_intent_and_invalid_dash_names_cannot_deny_or_issue() {
             |_| ()
         )
         .is_ok());
+    let invalid = root
+        .path()
+        .join("client-tokens")
+        .join(format!(".revoke-{}", "b".repeat(32)));
+    fs::write(&invalid, b"untrusted marker").unwrap();
+    fs::set_permissions(&invalid, fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(store.hello_lock(Duration::from_secs(5), || {}).is_ok());
     for name in ["--show-token", "-browser"] {
         assert!(matches!(
             store.issue(
@@ -1006,4 +1013,35 @@ fn startup_sweeps_stale_intents_but_preserves_live_revokers() {
         .file(&format!(".revoke-{}", "b".repeat(32)), false)
         .is_ok());
     drop(intent);
+}
+
+#[test]
+fn hello_waits_for_revocation_intent_then_admits_an_unrelated_file_token() {
+    let (_root, mut store, mut app) = setup();
+    store.2 = helper_binary();
+    let authority = app.client_token_authority().unwrap();
+    store
+        .issue(&authority, "removed", [Scope::Read].into())
+        .unwrap();
+    let keep = store
+        .issue(&authority, "kept", [Scope::Read].into())
+        .unwrap();
+    let pending = store.begin_revoke("removed").unwrap();
+    std::thread::scope(|scope| {
+        let (ready, waiting) = std::sync::mpsc::channel();
+        let reader = scope.spawn(|| {
+            let mut ready = Some(ready);
+            let _guard = store
+                .hello_lock(Duration::from_secs(5), || {
+                    if let Some(ready) = ready.take() {
+                        ready.send(()).unwrap();
+                    }
+                })
+                .unwrap();
+            store.authenticate(&keep.token).unwrap().info
+        });
+        waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+        pending.finish().unwrap();
+        assert_eq!(reader.join().unwrap(), keep.info);
+    });
 }
