@@ -23,6 +23,9 @@ const HANDOFF_VERSION: u32 = 1;
 /// Two locked open descriptions follow the optional TCP listener and PTYs.
 #[cfg(unix)]
 pub(crate) const SOCKET_OWNER_HANDOFF_VERSION: u32 = 3;
+/// A local WebSocket ownership description follows the API and terminal owners.
+#[cfg(unix)]
+pub(crate) const LOCAL_WS_HANDOFF_VERSION: u32 = 4;
 /// Descriptor extension: old receivers must refuse before ready, even with zero PTYs.
 #[cfg(unix)]
 pub(crate) const CLIENT_LISTENER_HANDOFF_VERSION: u32 = 2;
@@ -80,6 +83,9 @@ pub(crate) struct HandoffManifest {
     /// API then terminal socket ownership; retained through public socket rebind.
     #[serde(default)]
     pub socket_owners: bool,
+    /// Local WebSocket ownership is adopted before preparing either client transport.
+    #[serde(default)]
+    pub local_ws_owner: bool,
     /// Operator drafts kept in panes' stashes (#850), so a handoff does not
     /// drop them. Absent from an older server's manifest.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
@@ -475,11 +481,13 @@ fn receive_after_token(stream: &mut UnixStream) -> io::Result<(HandoffManifest, 
         HANDOFF_VERSION,
         CLIENT_LISTENER_HANDOFF_VERSION,
         SOCKET_OWNER_HANDOFF_VERSION,
+        LOCAL_WS_HANDOFF_VERSION,
     ]
     .contains(&manifest.version)
-        || (manifest.version != SOCKET_OWNER_HANDOFF_VERSION
+        || (manifest.version < SOCKET_OWNER_HANDOFF_VERSION
             && manifest.client_listener != (manifest.version == CLIENT_LISTENER_HANDOFF_VERSION))
-        || manifest.socket_owners != (manifest.version == SOCKET_OWNER_HANDOFF_VERSION)
+        || manifest.socket_owners != (manifest.version >= SOCKET_OWNER_HANDOFF_VERSION)
+        || manifest.local_ws_owner != (manifest.version == LOCAL_WS_HANDOFF_VERSION)
     {
         return Err(io::Error::other(format!(
             "unsupported handoff version {}",
@@ -507,7 +515,7 @@ fn receive_after_token(stream: &mut UnixStream) -> io::Result<(HandoffManifest, 
             crate::build_info::version()
         )));
     }
-    if manifest.client_listener && !cfg!(feature = "web") {
+    if (manifest.client_listener || manifest.local_ws_owner) && !cfg!(feature = "web") {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "handoff listener requires a web-enabled replacement",
@@ -530,7 +538,8 @@ fn receive_after_token(stream: &mut UnixStream) -> io::Result<(HandoffManifest, 
         stream,
         manifest.panes.len()
             + usize::from(manifest.client_listener)
-            + 2 * usize::from(manifest.socket_owners),
+            + 2 * usize::from(manifest.socket_owners)
+            + usize::from(manifest.local_ws_owner),
     )?;
     Ok((manifest, fds))
 }
@@ -583,6 +592,7 @@ pub(crate) fn manifest_for(
         kept_drafts: Default::default(),
         client_listener: false,
         socket_owners: false,
+        local_ws_owner: false,
     }
 }
 

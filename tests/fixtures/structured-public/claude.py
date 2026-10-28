@@ -12,6 +12,54 @@ root = Path(os.environ["HOME"])
 if sys.argv[1:] == ["--version"]:
     print("2.1.296 (Claude Code)")
     sys.exit(0)
+# Explicit test-only model selects partial streaming; ordinary launches bypass this.
+if "--model" in sys.argv and sys.argv[sys.argv.index("--model") + 1].startswith("s10b-live"):
+    mode = sys.argv[sys.argv.index("--model") + 1]
+    def emit_live(value):
+        print(json.dumps(value), flush=True)
+    def emit_block(index, kind, field, text, identity=None):
+        envelope = {"type": "stream_event"}
+        if identity is not None:
+            envelope["api_message_id"] = identity
+        if "lifecycle" in mode:
+            emit_live(dict(envelope, event={"type": "content_block_start", "index": index,
+                      "content_block": {"type": "thinking" if field == "thinking" else "text", field: ""}}))
+        emit_live(dict(envelope, event={"type": "content_block_delta", "index": index,
+                  "delta": {"type": kind, field: text}}))
+        if "lifecycle" in mode:
+            emit_live(dict(envelope, event={"type": "content_block_stop", "index": index}))
+    init = json.loads((root / "restricted-init.json").read_text())
+    init["session_id"] = sys.argv[sys.argv.index("--session-id") + 1]
+    emit_live(init)
+    if "rewritten" in mode:
+        emit_block(0, "text_delta", "text", "partial", "first")
+        emit_live({"type": "assistant", "message": {"id": "first", "role": "assistant",
+                   "content": [{"type": "text", "text": "rewritten"}]}})
+        if "message-end" in mode:
+            emit_live({"type": "stream_event", "api_message_id": "first",
+                       "event": {"type": "message_stop"}})
+        else:
+            emit_live({"type": "result", "subtype": "success", "is_error": False,
+                       "result": "rewritten"})
+        sys.exit(0)
+    if "interleaved" in mode:
+        for identity, text in [("first", "partial"), ("second", "later")]:
+            emit_block(0, "text_delta", "text", text, identity)
+    else:
+        for index in range(40 if "burst" in mode else 2 if "per-block" in mode else 3):
+            kind, field, text = [("text_delta", "text", "partial"),
+                                 ("thinking_delta", "thinking", "thinking"),
+                                 ("text_delta", "text", "tool-result")][index % 3]
+            emit_block(index, kind, field, text, "first" if "per-block" in mode else None)
+    blocks = [{"type": "text", "text": "partial"}, {"type": "thinking", "thinking": "thinking"}]
+    for content in [[block] for block in blocks] if "per-block" in mode else [blocks]:
+        emit_live({"type": "assistant", "message": {"id": "first", "role": "assistant", "content": content}})
+    emit_live({"type": "user", "message": {"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "fixture-tool", "content": "tool-result"}]}})
+    if mode.endswith("exit"):
+        sys.exit(0)
+    sys.stdin.read()
+    sys.exit(0)
 assert Path.cwd() == root / "project", "launch cwd was not preserved"
 allowed = {"PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "TMPDIR",
            "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN"}

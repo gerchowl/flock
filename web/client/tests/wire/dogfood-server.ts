@@ -7,7 +7,7 @@ import type { WireEvent } from "../../src/gen/WireEvent";
 import { WireConnection } from "../../src/wire/connection";
 import { browserClock, memoryStore, type SocketLike } from "../../src/wire/env";
 
-const [url, token, readerToken, agent, binary, disabled] = process.argv.slice(2);
+const [url, token, readerToken, agent, binary, disabled, journal] = process.argv.slice(2);
 assert(url && token && readerToken && agent && binary);
 const events: WireEvent[] = [];
 const rows = new Map<string, { waiting_on_human: string[]; activity?: string }>();
@@ -99,26 +99,44 @@ try {
   reader.command("agent.send", { target: agent, text: "must not arrive", submit: true }, "scope-denied");
   await until(() => frames.some((f) => f.t === "ack" && f.cmd_id === "scope-denied"), "scope refusal");
   assert(frames.some((f) => f.t === "ack" && f.cmd_id === "scope-denied" && !f.ok && f.error?.code === "scope"));
-  const sent = await command("agent.send", { target: agent, text: "fixture message", submit: true });
-  assert(sent.result, "ack identifies durable queue admission");
-  await until(() => records().some((e) => e.type === "flk_permission_request" && e.state === "open") && rows.get(agent)?.waiting_on_human.includes("typed-request") === true, "real permission stream and fleet handle");
-  assert(records().some((e) => e.type === "command_lifecycle" && e.state === "started"), "harness lifecycle reached the agent stream");
-  const prompt = records().find((e) => e.type === "flk_permission_request" && e.state === "open")!;
-  assert.equal(prompt.request_id, "typed-request");
-  const args = { agent, request_id: String(prompt.request_id), request_seq: Number(prompt.request_seq), decision: "deny", message: "operator reason" };
-  await command("agent.decide", { ...args, request_seq: Number(prompt.request_seq) + 1 }, "permission_request_unknown");
-  await command("agent.decide", { ...args, agent: "missing-fixture-agent" }, "agent_not_found");
-  await command("agent.send", { target: agent, text: "must not arrive", submit: true, raw: true }, "invalid_params");
-  await command("agent.decide", args);
-  await until(() => records().some((e) => e.type === "flk_permission_request" && e.state === "closed") && records().some((e) => e.type === "result" && e.result === "wire-complete") && rows.get(agent)?.waiting_on_human.length === 0, "decision close, harness result and fleet clear");
-  await command("agent.decide", args, "permission_request_closed");
-  // Revocation is performed by the isolated local operator; the browser never owns that authority.
-  if (disabled !== "revocation") {
-  const revoke = Bun.spawn([binary, "--json", "client", "token", "rm", "dogfood-wire"], { stdout: "pipe", stderr: "pipe" });
-  assert.equal(await revoke.exited, 0, await new Response(revoke.stderr).text());
+  if (disabled === "without-operate") {
+    // #2585 tracks whether send alone should suffice; pin the current S6 policy.
+    assert(journal, "scope proof receives its owned queue journal");
+    const before = await Bun.file(journal).bytes();
+    await command("agent.send", { target: agent, text: "must not arrive", submit: true }, "not_authorized");
+    assert.deepEqual(await Bun.file(journal).bytes(), before, "send without operate journaled nothing");
+    // Seed the permission only after the byte-for-byte refusal check, so its
+    // legitimate queue writes cannot race the negative assertion.
+    const seed = Bun.spawn([binary, "--json", "agent", "send", agent, "fixture message"], { stdout: "pipe", stderr: "pipe" });
+    assert.equal(await seed.exited, 0, await new Response(seed.stderr).text());
+    await until(() => records().some((e) => e.type === "flk_permission_request" && e.state === "open"), "operator-created permission request");
+    const prompt = records().find((e) => e.type === "flk_permission_request" && e.state === "open")!;
+    await until(() => rows.get(agent)?.waiting_on_human.includes(String(prompt.request_id)) === true, "operator-created permission fleet handle");
+    await command("agent.decide", { agent, request_id: String(prompt.request_id), request_seq: Number(prompt.request_seq), decision: "deny" }, "not_authorized");
+    assert(rows.get(agent)?.waiting_on_human.includes(String(prompt.request_id)), "refused decision kept its real permission handle");
+    console.log(JSON.stringify({ status: "passed", without_operate: { send: "not_authorized", journal_unchanged: true, decide: "not_authorized" } }));
+  } else {
+    const sent = await command("agent.send", { target: agent, text: "fixture message", submit: true });
+    assert(sent.result, "ack identifies durable queue admission");
+    await until(() => records().some((e) => e.type === "flk_permission_request" && e.state === "open") && rows.get(agent)?.waiting_on_human.includes("typed-request") === true, "real permission stream and fleet handle");
+    assert(records().some((e) => e.type === "command_lifecycle" && e.state === "started"), "harness lifecycle reached the agent stream");
+    const prompt = records().find((e) => e.type === "flk_permission_request" && e.state === "open")!;
+    assert.equal(prompt.request_id, "typed-request");
+    const args = { agent, request_id: String(prompt.request_id), request_seq: Number(prompt.request_seq), decision: "deny", message: "operator reason" };
+    await command("agent.decide", { ...args, request_seq: Number(prompt.request_seq) + 1 }, "permission_request_unknown");
+    await command("agent.decide", { ...args, agent: "missing-fixture-agent" }, "agent_not_found");
+    await command("agent.send", { target: agent, text: "must not arrive", submit: true, raw: true }, "invalid_params");
+    await command("agent.decide", args);
+    await until(() => records().some((e) => e.type === "flk_permission_request" && e.state === "closed") && records().some((e) => e.type === "result" && e.result === "wire-complete") && rows.get(agent)?.waiting_on_human.length === 0, "decision close, harness result and fleet clear");
+    await command("agent.decide", args, "permission_request_closed");
+    // Revocation is performed by the isolated local operator; the browser never owns that authority.
+    if (disabled !== "revocation") {
+    const revoke = Bun.spawn([binary, "--json", "client", "token", "rm", "dogfood-wire"], { stdout: "pipe", stderr: "pipe" });
+    assert.equal(await revoke.exited, 0, await new Response(revoke.stderr).text());
+    }
+    connection.command("agent.send", { target: agent, text: "must not arrive", submit: true }, "revoked");
+    await until(() => connection.state === "NeedsToken", "revocation close");
+    assert(frames.some((f) => f.t === "ack" && f.cmd_id === "revoked" && !f.ok && f.error?.code === "auth_revoked"));
+    console.log(JSON.stringify({ status: "passed", start_stream_send_permission_decide_result_fleet: true, exact_handle: true, revoked: true }));
   }
-  connection.command("agent.send", { target: agent, text: "must not arrive", submit: true }, "revoked");
-  await until(() => connection.state === "NeedsToken", "revocation close");
-  assert(frames.some((f) => f.t === "ack" && f.cmd_id === "revoked" && !f.ok && f.error?.code === "auth_revoked"));
-  console.log(JSON.stringify({ status: "passed", start_stream_send_permission_decide_result_fleet: true, exact_handle: true, revoked: true }));
 } finally { connection.disconnect(); reader.disconnect(); invalid.disconnect(); }

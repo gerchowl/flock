@@ -46,7 +46,10 @@ fn selected_welcome_capabilities_match_the_actual_endpoint() {
         for (name, lines) in selected() {
             let Some(expected) = lines.iter().find_map(|line| match &line.step {
                 FixtureStep::Send {
-                    frame: frame @ ServerFrame::Welcome { .. },
+                    frame:
+                        crate::structured_wire::fixture::FixtureServerFrame::Literal(
+                            frame @ ServerFrame::Welcome { .. },
+                        ),
                     ..
                 } => Some(serde_json::to_value(frame).unwrap()),
                 _ => None,
@@ -54,10 +57,24 @@ fn selected_welcome_capabilities_match_the_actual_endpoint() {
                 continue;
             };
             let server = Server::new().await;
-            // These scripts describe a read+send credential, not the all-scopes seed.
+            // Command scenarios use ClientOpen's actual grants, independently of
+            // the fixture. Other scenarios intentionally use narrower credentials.
+            let scopes = if ["agent-send", "permission-decision", "token-revoked"]
+                .contains(&name.as_str())
+            {
+                let grants =
+                    serde_json::to_value(crate::api::client_tokens::operator_scopes()).unwrap();
+                assert_eq!(
+                    expected["capabilities"], grants,
+                    "{name}: ClientOpen grants"
+                );
+                grants
+            } else {
+                expected["capabilities"].clone()
+            };
             let path = server._root.path().join("client-tokens/one.token");
             let mut token: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-            token["scopes"] = json!(["read", "send"]);
+            token["scopes"] = scopes.clone();
             fs::write(path, serde_json::to_vec(&token).unwrap()).unwrap();
             let protocol = lines
                 .iter()
@@ -73,9 +90,60 @@ fn selected_welcome_capabilities_match_the_actual_endpoint() {
             let actual = client.hello(protocol, &"a".repeat(64)).await;
             server.finish().await;
             // Opaque server identities differ; operation capabilities are semantic.
-            for field in ["protocol", "capabilities", "idempotency_window_ms"] {
+            assert_eq!(
+                actual["capabilities"], scopes,
+                "{name}: granted welcome capabilities"
+            );
+            for field in ["protocol", "idempotency_window_ms"] {
                 assert_eq!(actual[field], expected[field], "{name}: welcome.{field}");
             }
         }
+    });
+}
+
+#[test]
+fn replay_credential_without_answer_gets_typed_scope_refusal() {
+    runtime(async {
+        let mut server = Server::new().await;
+        let path = server._root.path().join("client-tokens/one.token");
+        let mut token: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        token["scopes"] = json!(["read", "send"]);
+        fs::write(path, token.to_string()).unwrap();
+        let (_, rx) = mpsc::unbounded_channel();
+        let mut app = crate::app::App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            rx,
+            crate::api::EventHub::default(),
+        );
+        let mut socket = Socket::open(&server).await;
+        assert_eq!(
+            socket.hello(1, &"a".repeat(64)).await["capabilities"],
+            json!(["read", "send"])
+        );
+        // Scope admission precedes target lookup; no agent or permission book is needed.
+        socket.send(json!({"t":"cmd","cmd_id":"missing-answer","verb":"agent.decide","args":{},"resume_only":false})).await;
+        let wake = server.wake.clone();
+        let actual = within(async {
+            loop {
+                let notified = wake.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                Arc::get_mut(&mut server.core)
+                    .unwrap()
+                    .service_commands(&mut app);
+                tokio::select! { biased;
+                    frame = socket.text() => break frame,
+                    _ = &mut notified => (),
+                }
+            }
+        })
+        .await;
+        server.finish().await;
+        assert_eq!(actual["cmd_id"], "missing-answer");
+        assert_eq!(actual["ok"], false);
+        assert_eq!(actual["error"]["code"], "scope");
+        assert_eq!(actual["error"]["retry"], "never");
     });
 }
