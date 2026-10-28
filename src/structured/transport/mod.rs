@@ -596,6 +596,10 @@ impl InputHandle {
 
     /// Admit from the queue worker, waiting through book contention at this
     /// second acquisition too. Operator-facing admission remains nonblocking.
+    /// Like `try_submit`, this passes a no-op acceptance observer. If acceptance
+    /// cannot reach the pump, submission sets I/O cancellation and returns
+    /// `BrokenPipe` without directly calling `stop.request()` via that observer.
+    /// The queue pump separately handles the returned `InputWriteFailed` offer.
     pub(super) fn queue_submit(&self, user: &Value) -> io::Result<()> {
         self.submit(user, || {}, true)
     }
