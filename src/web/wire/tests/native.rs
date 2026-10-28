@@ -720,6 +720,52 @@ async fn management_wait_keeps_the_original_hello_deadline_and_cannot_register_l
     f.finish().await;
 }
 
+/// Model the timer notification being unpolled while a blocking callback reads now.
+struct DeferredTimer(TestClock);
+impl Clock for DeferredTimer {
+    fn now(&self) -> Instant {
+        self.0.now()
+    }
+    fn until(&self, _end: Instant) -> BoxFuture<'_, ()> {
+        Box::pin(std::future::pending())
+    }
+}
+
+#[tokio::test]
+async fn registration_rechecks_the_elapsed_deadline_before_insertion() {
+    use crate::structured::permissions::auth::tokens::server::PeerStage;
+    let mut f = Native::using(None, |clock| Arc::new(DeferredTimer(clock))).await;
+    let token = browser_file(&f);
+    let clock = f.server.clock.clone();
+    f.server
+        .core
+        .shared
+        .store
+        .on_peer_stage(PeerStage::Checked, move || {
+            clock.advance(HANDSHAKE_DEADLINE_MS);
+        });
+    let clients = f.server.core.shared.clone();
+    let (checked, observed) = tokio::sync::oneshot::channel();
+    f.server
+        .core
+        .shared
+        .store
+        .on_peer_stage(PeerStage::Registered, move || {
+            checked
+                .send(clients.clients.lock().unwrap().is_empty())
+                .unwrap();
+        });
+    let mut socket = f.open().await;
+    socket.send(json!({"t":"hello","protocol":WIRE_JSON_VERSION,"client":{"name":"fixture","version":"1"},"token":token.0})).await;
+    assert!(
+        within(observed).await.unwrap(),
+        "expired callback inserted a client"
+    );
+    assert_eq!(close_detail(&mut socket).await.0, GOING_AWAY_CLOSE);
+    assert!(f.server.core.shared.clients.lock().unwrap().is_empty());
+    f.finish().await;
+}
+
 #[tokio::test]
 async fn waiting_hellos_do_not_starve_established_subscriptions() {
     use crate::structured::permissions::auth::tokens::server::PeerStage;
@@ -748,15 +794,32 @@ async fn waiting_hellos_do_not_starve_established_subscriptions() {
         assert_eq!(f.drive(native.text()).await["t"], "gap");
         assert_eq!(f.drive(native.text()).await["t"], "synced");
         let lock = management_lock(&f);
+        let origin = Instant::now();
+        let events = Arc::new(Mutex::new(Vec::new()));
         let mut tcp_waiters = Vec::new();
         let mut unix_waiters = Vec::new();
         for _ in 0..4 {
             let (started, waiting) = tokio::sync::oneshot::channel();
+            let trace = events.clone();
+            for (stage, label) in [
+                (PeerStage::LockAcquired, "LockAcquired"),
+                (PeerStage::Checked, "Checked"),
+                (PeerStage::Registered, "Registered"),
+            ] {
+                let trace = events.clone();
+                f.server.core.shared.store.on_peer_stage(stage, move || {
+                    trace.lock().unwrap().push((label.into(), origin.elapsed()));
+                });
+            }
             f.server
                 .core
                 .shared
                 .store
                 .on_peer_stage(PeerStage::Waiting, move || {
+                    trace
+                        .lock()
+                        .unwrap()
+                        .push(("Waiting".into(), origin.elapsed()));
                     let _ = started.send(());
                 });
             let hello = json!({"t":"hello","protocol":1,"client":{"name":"fixture","version":"1"},"token":"d".repeat(64)});
@@ -802,6 +865,20 @@ async fn waiting_hellos_do_not_starve_established_subscriptions() {
             .await;
         let native_refusal = f.drive(native.text()).await;
         drop(lock);
+        let probe = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(f.server._root.path().join("client-tokens/.lock"))
+            .unwrap();
+        let released = probe.try_lock_shared();
+        let release_probe = format!("{released:?}");
+        if released.is_ok() {
+            probe.unlock().unwrap();
+        }
+        events
+            .lock()
+            .unwrap()
+            .push((format!("released; probe={release_probe}"), origin.elapsed()));
         assert_eq!(tcp_event["ev"]["type"], "fleet.upsert");
         assert_eq!(native_event["ev"]["type"], "fleet.upsert");
         for refusal in [tcp_refusal, native_refusal] {
@@ -809,10 +886,20 @@ async fn waiting_hellos_do_not_starve_established_subscriptions() {
             assert_eq!(refusal["code"], "session_busy");
         }
         for socket in &mut tcp_waiters {
-            assert_eq!(socket.text().await["t"], "welcome");
+            let reply = socket.receive().await;
+            assert!(
+                matches!(reply, Received::Text(ref value) if value["t"] == "welcome"),
+                "hello={reply:?}; events={:?}",
+                events.lock().unwrap()
+            );
         }
         for socket in &mut unix_waiters {
-            assert_eq!(socket.text().await["t"], "welcome");
+            let reply = socket.receive().await;
+            assert!(
+                matches!(reply, Received::Text(ref value) if value["t"] == "welcome"),
+                "hello={reply:?}; events={:?}",
+                events.lock().unwrap()
+            );
         }
         f.finish().await;
     }
