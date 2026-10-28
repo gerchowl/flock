@@ -1946,13 +1946,17 @@ the same shared/exclusive split recorded in ADR-0038 §6. Hello lookup returns a
 Registration still holds shared file ownership through insertion, but waits for
 management and any published revocation intent within the remaining original
 five-second handshake deadline. Its descriptor-only shared-lock helper is owned
-and reaped by the bounded store job; abandoned async waiters retain their store
-reservation until that job ends. The deadline also bounds welcome, and cancelled
+and reaped by a separate eight-slot hello-wait pool (four pending hellos per
+listener); abandoned async waiters retain that reservation until the bounded
+helper returns. No kernel-lock wait holds one of the four shared store-I/O
+permits. Only after acquiring the fence does registration acquire a store-I/O
+permit for credential recheck and insertion; the same fence stays owned across
+that transfer. Thus reconnects waiting on management cannot exhaust the store
+pool used by established subscriptions. The deadline also bounds welcome, and cancelled
 or expired waiters cannot insert a late registration. Command and subscription
 dispatch retain fail-fast admission with the existing retry class.
 
-A subscription's typed
-`session_busy` is retryable `later`, not a transport failure; unsafe storage and
+A subscription's typed `session_busy` is retryable `later`, not a transport failure; unsafe storage and
 I/O failures retain their connection-close behavior.
 
 ### 6. One schema, generated TypeScript

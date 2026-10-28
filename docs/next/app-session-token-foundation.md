@@ -132,8 +132,11 @@ A hello refused before registration, including a minter exit after the
 first verification, closes 4401 without welcome. An exit after registration
 closes 4403 and reaches all sockets of that credential. File-token verification
 remains lock-free; registration must acquire its shared admission fence. An
-exclusive management fence therefore yields retryable 1001 at registration,
-without treating a valid token as an authentication failure.
+exclusive management fence makes hello wait within its original five-second
+deadline, without treating a valid token as an authentication failure. These
+kernel-lock waits have a separate eight-worker budget; only credential I/O and
+registration reserve one of the four shared store-I/O workers. Reconnecting
+hellos cannot consume the workers used by established subscriptions.
 
 The enforcing clock is Linux `CLOCK_BOOTTIME` or macOS `mach_continuous_time`
 (#2489), so sleep counts without trusting a settable wall clock. Absolute

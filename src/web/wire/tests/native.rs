@@ -703,7 +703,7 @@ async fn management_wait_keeps_the_original_hello_deadline_and_cannot_register_l
         .core
         .shared
         .store
-        .on_peer_stage(PeerStage::Registered, move || {
+        .on_peer_stage(PeerStage::LockAcquired, move || {
             completed.send(()).unwrap();
         });
     let mut socket = f.open().await;
@@ -718,4 +718,102 @@ async fn management_wait_keeps_the_original_hello_deadline_and_cannot_register_l
     within(producer).await.unwrap();
     assert!(f.server.core.shared.clients.lock().unwrap().is_empty());
     f.finish().await;
+}
+
+#[tokio::test]
+async fn waiting_hellos_do_not_starve_established_subscriptions() {
+    use crate::structured::permissions::auth::tokens::server::PeerStage;
+    for native_waiters in [false, true] {
+        let mut f = Native::new().await;
+        let token = browser_file(&f);
+        let path = f.server._root.path().join("client-tokens/waiter.token");
+        fs::write(
+            &path,
+            json!({"token":"d".repeat(64),"principal":"e".repeat(32),"scopes":["read"]})
+                .to_string(),
+        )
+        .unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+        let mut tcp = Socket::open(&f.server).await;
+        tcp.hello(1, &token.0).await;
+        let mut native = f.open().await;
+        native.hello(1, &token.0).await;
+        tcp.send(json!({"t":"sub","sub_id":"live","stream":"fleet"}))
+            .await;
+        assert_eq!(f.drive(tcp.text()).await["t"], "gap");
+        assert_eq!(f.drive(tcp.text()).await["t"], "synced");
+        native
+            .send(json!({"t":"sub","sub_id":"live","stream":"fleet"}))
+            .await;
+        assert_eq!(f.drive(native.text()).await["t"], "gap");
+        assert_eq!(f.drive(native.text()).await["t"], "synced");
+        let lock = management_lock(&f);
+        let mut tcp_waiters = Vec::new();
+        let mut unix_waiters = Vec::new();
+        for _ in 0..4 {
+            let (started, waiting) = tokio::sync::oneshot::channel();
+            f.server
+                .core
+                .shared
+                .store
+                .on_peer_stage(PeerStage::Waiting, move || {
+                    let _ = started.send(());
+                });
+            let hello = json!({"t":"hello","protocol":1,"client":{"name":"fixture","version":"1"},"token":"d".repeat(64)});
+            if native_waiters {
+                let mut socket = f.open().await;
+                socket.send(hello).await;
+                unix_waiters.push(socket);
+            } else {
+                let mut socket = Socket::open(&f.server).await;
+                socket.send(hello).await;
+                tcp_waiters.push(socket);
+            }
+            within(waiting)
+                .await
+                .expect("hello never reached its contended kernel wait");
+        }
+        f.app
+            .state
+            .structured_agents
+            .register(crate::structured::registry::Record {
+                runtime: crate::structured::registry::StructuredRuntime::Structured,
+                agent_id: "fixture-event".into(),
+                name: None,
+                harness: "claude".into(),
+                session_id: "fixture-session".into(),
+                cwd: f.server._root.path().to_owned(),
+                model: None,
+            })
+            .unwrap();
+        Arc::get_mut(&mut f.server.core).unwrap().service(
+            &f.app.state.structured_agents,
+            &mut f.app.structured_workers,
+            f.server._root.path(),
+        );
+        let tcp_event = f.drive(tcp.text()).await;
+        let native_event = f.drive(native.text()).await;
+        // A new cut forces a fresh authorization check while all four hellos wait.
+        tcp.send(json!({"t":"sub","sub_id":"contended","stream":"fleet"}))
+            .await;
+        let tcp_refusal = f.drive(tcp.text()).await;
+        native
+            .send(json!({"t":"sub","sub_id":"contended","stream":"fleet"}))
+            .await;
+        let native_refusal = f.drive(native.text()).await;
+        drop(lock);
+        assert_eq!(tcp_event["ev"]["type"], "fleet.upsert");
+        assert_eq!(native_event["ev"]["type"], "fleet.upsert");
+        for refusal in [tcp_refusal, native_refusal] {
+            assert_eq!(refusal["t"], "subfail");
+            assert_eq!(refusal["code"], "session_busy");
+        }
+        for socket in &mut tcp_waiters {
+            assert_eq!(socket.text().await["t"], "welcome");
+        }
+        for socket in &mut unix_waiters {
+            assert_eq!(socket.text().await["t"], "welcome");
+        }
+        f.finish().await;
+    }
 }

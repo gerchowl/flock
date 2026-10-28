@@ -148,7 +148,10 @@ sockets across both transports, including pending welcome. Renewed app mints
 have independent budgets even when they share an operator principal. Pending
 overload refuses upgrade with typed 503; per-credential overload after upgrade
 closes 1001. Existing authenticated connections retain capacity when slow hellos
-fill the probation slots. These bounds do not promise per-process fairness.
+fill the probation slots. Management-lock waits use a separate eight-worker budget and retain their
+original hello deadline. They do not reserve the four shared credential-I/O
+workers needed by established subscriptions. These bounds do not promise
+per-process fairness.
 Each connection has an eight-message data queue and a four-message priority queue.
 The writer checks priority between data writes. Frames and reassembled messages
 are capped at 64 KiB, and outgoing serialization stops at that cap rather than

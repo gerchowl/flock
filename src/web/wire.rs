@@ -481,46 +481,56 @@ async fn connection(
     let (priority, priority_rx) = mpsc::channel(PRIORITY_CAPACITY);
     let (data, data_rx) = mpsc::channel(DATA_CAPACITY);
     let (revoke, mut revoked) = watch::channel(false);
-    let registration = {
+    let registration = async {
+        let store = shared.store.clone();
+        let clock = shared.clock.clone();
+        let fence = match super::store_io::hello_waits()
+            .run(move || store.wait_peer(end.saturating_duration_since(clock.now())))
+            .await?
+        {
+            Ok(fence) => fence,
+            Err(error) => return Some(Err(error.into())),
+        };
         let shared = shared.clone();
         let token = token.clone();
-        super::store_io::shared().run(move || {
-            let budget = end.saturating_duration_since(shared.clock.now());
-            shared
-                .store
-                .admit_peer(&token, peer.as_ref(), budget, |session| {
-                    let mut clients = shared
-                        .clients
-                        .lock()
-                        .map_err(|_| PeerAdmissionError::from(TokenError::Busy))?;
-                    if let Some(peer) = &peer {
-                        if peer.process().exited().map_err(TokenError::from)? {
-                            return Err(PeerAdmissionError::PeerProcessChanged);
+        super::store_io::shared()
+            .run(move || {
+                shared
+                    .store
+                    .register_peer(fence, &token, peer.as_ref(), |session| {
+                        let mut clients = shared
+                            .clients
+                            .lock()
+                            .map_err(|_| PeerAdmissionError::from(TokenError::Busy))?;
+                        if let Some(peer) = &peer {
+                            if peer.process().exited().map_err(TokenError::from)? {
+                                return Err(PeerAdmissionError::PeerProcessChanged);
+                            }
                         }
-                    }
-                    if !live.load(Ordering::Acquire)
-                        || *shared.stop.borrow()
-                        || shared.clock.now() >= end
-                        || clients
-                            .values()
-                            .filter(|c| c.session.same_credential(&session))
-                            .count()
-                            >= CREDENTIAL_CONNECTIONS
-                    {
-                        return Err(TokenError::Busy.into());
-                    }
-                    clients.insert(
-                        id,
-                        Client {
-                            session: session.clone(),
-                            read_only,
-                            data,
-                            revoke,
-                        },
-                    );
-                    Ok(session)
-                })
-        })
+                        if !live.load(Ordering::Acquire)
+                            || *shared.stop.borrow()
+                            || shared.clock.now() >= end
+                            || clients
+                                .values()
+                                .filter(|c| c.session.same_credential(&session))
+                                .count()
+                                >= CREDENTIAL_CONNECTIONS
+                        {
+                            return Err(TokenError::Busy.into());
+                        }
+                        clients.insert(
+                            id,
+                            Client {
+                                session: session.clone(),
+                                read_only,
+                                data,
+                                revoke,
+                            },
+                        );
+                        Ok(session)
+                    })
+            })
+            .await
     };
     let session = match before(shared.clock.as_ref(), end, registration)
         .await
