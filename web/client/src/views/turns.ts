@@ -97,7 +97,13 @@ export function inputSummary(tool: string, input: JsonValue | undefined): string
 }
 
 /** Retired tails disappear immediately; interior slots compact when at least half are retired. */
-type FoldTurn = { key: number; entries: (SessionEntry | null)[]; first: number; removed: number };
+type FoldTurn = {
+  key: number;
+  entries: (SessionEntry | null)[];
+  /** Monotonic leading-slot cursor between compactions: restarting at zero would rescan retired prefixes on every twin. */
+  first: number;
+  removed: number;
+};
 /** Numeric locations survive Solid reconciliation without cross-store object aliases. */
 type PermissionLocation = { turn: number; slot: number };
 
@@ -113,7 +119,14 @@ export type TurnFold = {
   readonly absorbed: Record<string, true>;
   /** Result ids a kept entry shows because no call preceded them. */
   readonly unpaired: Record<string, true>;
-  /** Pending native slots or canonical presence, never permission state; scoped to this fold. */
+  /**
+   * Pending native slots or canonical presence, never permission state.
+   * One canonical marker per distinct request id for this transcript's lifetime:
+   * late native twins have no correlation deadline, so evicting a marker would
+   * display them twice. Space is O(distinct ids), bounded by retained input entries,
+   * with no fixed session-wide cap, just like Transcript's replay buffer. A reset
+   * replaces the fold; unmount releases it. Closing a permission does not evict it.
+   */
   readonly permissionFacts: Record<string, number[] | "canonical">;
   /** Pending native locations by stream seq; no entries or turn objects are aliased. */
   readonly permissionLocations: Record<number, PermissionLocation>;

@@ -4,10 +4,10 @@ import type { ClientAction } from "./ClientAction";
 import type { ClientFrame } from "./ClientFrame";
 import type { DeadlineStage } from "./DeadlineStage";
 import type { FixtureCoverage } from "./FixtureCoverage";
+import type { FixtureServerFrame } from "./FixtureServerFrame";
 import type { OutboxStatus } from "./OutboxStatus";
 import type { QueuedCommand } from "./QueuedCommand";
 import type { ResyncMarker } from "./ResyncMarker";
-import type { ServerFrame } from "./ServerFrame";
 import type { SocketTarget } from "./SocketTarget";
 import type { StreamObservation } from "./StreamObservation";
 
@@ -95,7 +95,7 @@ socket?: SocketTarget,
 /**
  * Frame to inject; previous-socket callbacks must be ignored.
  */
-frame: ServerFrame, } | { "step": "expect",
+frame: FixtureServerFrame, } | { "step": "expect",
 /**
  * Typed example; unselected fields are ignored by the matcher.
  */

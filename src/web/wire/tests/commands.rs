@@ -17,7 +17,7 @@ fn script(name: &str) -> Vec<Value> {
     };
     let typed: Vec<FixtureLine> = text
         .lines()
-        .map(|line| serde_json::from_str(line).unwrap())
+        .map(|line| FixtureLine::parse(line).unwrap())
         .collect();
     assert!(
         matches!(&typed[0].step, FixtureStep::Given { covers, .. } if covers.contains(&FixtureCoverage::S7Min))
@@ -64,8 +64,13 @@ impl Case {
                 Instant::now(),
             )
             .await;
+        let server = Server::new().await;
+        let path = server._root.path().join("client-tokens/one.token");
+        let mut token: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        token["principal"] = json!("0123456789abcdef0123456789abcdef");
+        fs::write(path, token.to_string()).unwrap();
         Self {
-            server: Server::new().await,
+            server,
             app,
             worker,
             notify,
@@ -75,7 +80,8 @@ impl Case {
     }
     async fn open(&self) -> Socket {
         let mut socket = Socket::open(&self.server).await;
-        socket.hello(1, &"a".repeat(64)).await;
+        let welcome = socket.hello(1, &"a".repeat(64)).await;
+        assert_eq!(welcome["principal"], "0123456789abcdef0123456789abcdef");
         socket
     }
     fn service(&mut self) {
