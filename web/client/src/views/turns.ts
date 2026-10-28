@@ -26,8 +26,8 @@ type Block = { readonly [key: string]: JsonValue };
 export type ToolRun = { readonly id: string; readonly name: string; readonly command: string; readonly result: Block | null };
 
 /**
- * A turn's entries, in seq order. `key` is its first entry's seq: appends
- * never change it, so a view keyed by it keeps each turn mounted.
+ * A turn's entries, in seq order. `key` is its first kept entry's seq:
+ * it changes only when correlation retires that opening entry.
  */
 export type TurnGroup = { readonly key: number; readonly entries: readonly SessionEntry[] };
 
@@ -96,24 +96,45 @@ export function inputSummary(tool: string, input: JsonValue | undefined): string
   return known === null ? boundText(`(no summary for ${tool})`, TITLE_MAX) : boundText(known, SUMMARY_MAX);
 }
 
+/** Retired tails disappear immediately; interior slots compact when at least half are retired. */
+type FoldTurn = {
+  key: number;
+  entries: (SessionEntry | null)[];
+  /** Monotonic leading-slot cursor between compactions: restarting at zero would rescan retired prefixes on every twin. */
+  first: number;
+  removed: number;
+};
+/** Numeric locations survive Solid reconciliation without cross-store object aliases. */
+type PermissionLocation = { turn: number; slot: number };
+
 /**
  * The turns of a transcript in a form that grows in place, so a view can
- * keep it in a store and fold each new entry in at O(1) (#1782). Records
+ * keep it in a store and fold permission twins in O(1) amortised per entry
+ * (#1782, #2575). Records
  * have no prototype, so an id such as `constructor` is an ordinary key.
  */
 export type TurnFold = {
-  readonly turns: { readonly key: number; readonly entries: SessionEntry[] }[];
+  readonly turns: FoldTurn[];
   readonly runs: Record<string, ToolRun>;
   readonly absorbed: Record<string, true>;
   /** Result ids a kept entry shows because no call preceded them. */
   readonly unpaired: Record<string, true>;
-  /** Seen request ids: native occurrence count or canonical presence, never permission state. */
-  readonly permissionFacts: Record<string, number | "canonical">;
+  /**
+   * Pending native slots or canonical presence, never permission state.
+   * One canonical marker per distinct request id for this transcript's lifetime:
+   * late native twins have no correlation deadline, so evicting a marker would
+   * display them twice. Space is O(distinct ids), bounded by retained input entries,
+   * with no fixed session-wide cap, just like Transcript's replay buffer. A reset
+   * replaces the fold; unmount releases it. Closing a permission does not evict it.
+   */
+  readonly permissionFacts: Record<string, number[] | "canonical">;
+  /** Pending native locations by stream seq; no entries or turn objects are aliased. */
+  readonly permissionLocations: Record<number, PermissionLocation>;
 };
 
 /** A fold of no entries. */
 export function emptyFold(): TurnFold {
-  return { turns: [], runs: Object.create(null), absorbed: Object.create(null), unpaired: Object.create(null), permissionFacts: Object.create(null) };
+  return { turns: [], runs: Object.create(null), absorbed: Object.create(null), unpaired: Object.create(null), permissionFacts: Object.create(null), permissionLocations: Object.create(null) };
 }
 
 /** Only known permission facts with nonempty shared ids can correlate. */
@@ -126,27 +147,56 @@ function permission(entry: SessionEntry): { key: string; canonical: boolean } | 
   return { key: `request:${event.request_id}`, canonical: event.type === "flk_permission_request" };
 }
 
-/** Indexes related facts; true when an earlier kept entry can now fold away. */
+/**
+ * Retire an indexed native twin. Scanning/compaction costs are charged to
+ * retired slots: each leading/tail hole is crossed once, and compaction
+ * scans at most twice the holes it removes. No later row is shifted.
+ */
+function retireNative(fold: TurnFold, seq: number): void {
+  const location = fold.permissionLocations[seq];
+  if (location === undefined) throw new Error("missing native permission location");
+  const turn = fold.turns[location.turn];
+  if (turn === undefined) throw new Error("missing native permission turn");
+  turn.entries[location.slot] = null;
+  delete fold.permissionLocations[seq];
+  turn.removed++;
+  while (turn.entries.at(-1) === null) {
+    turn.entries.pop();
+    turn.removed--;
+  }
+  while (turn.entries[turn.first] === null) turn.first++;
+  const first = turn.entries[turn.first];
+  if (first == null) {
+    // Only the opening turn can lack a user message. Removing it can shift
+    // later turns once per transcript, amortised over their earlier appends.
+    if (location.turn !== 0) throw new Error("empty non-opening permission turn");
+    fold.turns.shift();
+    for (const pending of Object.values(fold.permissionLocations)) pending.turn--;
+    return;
+  }
+  turn.key = first.seq;
+  if (turn.removed * 2 >= turn.entries.length) {
+    const kept: SessionEntry[] = [];
+    for (const entry of turn.entries) {
+      if (entry === null) continue;
+      const pending = fold.permissionLocations[entry.seq];
+      if (pending !== undefined) pending.slot = kept.length;
+      kept.push(entry);
+    }
+    turn.entries = kept;
+    turn.first = 0;
+    turn.removed = 0;
+  }
+}
+
+/** Index related facts; only late tool results can require a full regroup. */
 function pair(fold: TurnFold, entry: SessionEntry): boolean {
   let regroup = false;
   const fact = permission(entry);
-  const seen = fact === null ? undefined : fold.permissionFacts[fact.key];
   if (fact?.canonical === true) {
-    if (typeof seen === "number") {
-      const last = fold.turns.at(-1);
-      const previous = last?.entries.at(-1);
-      const twin = previous === undefined ? null : permission(previous);
-      // The producer stores native then canonical adjacently. Replace that tail in O(1).
-      if (seen === 1 && twin?.canonical === false && twin.key === fact.key && last !== undefined) {
-        last.entries.pop();
-        if (last.entries.length === 0) fold.turns.pop();
-      } else {
-        regroup = true;
-      }
-    }
+    const pending = fold.permissionFacts[fact.key];
+    if (Array.isArray(pending)) for (const seq of pending) retireNative(fold, seq);
     fold.permissionFacts[fact.key] = "canonical";
-  } else if (fact !== null && seen !== "canonical") {
-    fold.permissionFacts[fact.key] = (seen ?? 0) + 1;
   }
   for (const block of blocks(entry)) {
     const id = block["type"] === "tool_use" ? block["id"] : block["tool_use_id"];
@@ -172,17 +222,25 @@ function place(fold: TurnFold, entry: SessionEntry): void {
     const id = String(block["tool_use_id"]);
     if (block["type"] === "tool_result" && fold.absorbed[id] !== true) fold.unpaired[id] = true;
   }
-  const last = fold.turns.at(-1);
-  if (last === undefined || (startsTurn(entry) && last.entries.length > 0)) fold.turns.push({ key: entry.seq, entries: [entry] });
-  else last.entries.push(entry);
+  let turn = fold.turns.at(-1);
+  if (turn === undefined || startsTurn(entry)) {
+    turn = { key: entry.seq, entries: [entry], first: 0, removed: 0 };
+    fold.turns.push(turn);
+  } else turn.entries.push(entry);
+  if (fact?.canonical === false) {
+    const pending = fold.permissionFacts[fact.key];
+    fold.permissionLocations[entry.seq] = { turn: fold.turns.length - 1, slot: turn.entries.length - 1 };
+    if (Array.isArray(pending)) pending.push(entry.seq);
+    else fold.permissionFacts[fact.key] = [entry.seq];
+  }
 }
 
 /**
- * Folds `entry`, the transcript's next one, into `fold` in place, reading
- * only `entry`, identity indexes and the fold's last turn. Returns false
- * when an earlier kept entry can now fold away: a late paired tool result,
- * or a nonadjacent canonical permission twin. Adjacent native/canonical
- * pairs replace the tail in O(1); other reordering uses {@link foldAll}.
+ * Folds `entry`, the transcript's next one, into `fold` in place using
+ * identity indexes and stable presentation slots. Returns false
+ * when a late paired tool result needs regrouping. Permission twins use
+ * indexed slots in any order: each native slot is retired once, and
+ * compaction is O(1) amortised per entry, including repeated native ids.
  */
 export function foldEntry(fold: TurnFold, entry: SessionEntry): boolean {
   const regroup = pair(fold, entry);
@@ -201,10 +259,15 @@ export function foldAll(entries: readonly SessionEntry[]): TurnFold {
   return fold;
 }
 
+/** Materialise kept entries for a snapshot; incremental rendering reads slots directly. */
+export function keptEntries(turn: FoldTurn): SessionEntry[] {
+  return turn.entries.filter((entry): entry is SessionEntry => entry !== null);
+}
+
 /** Groups `entries` into turns and pairs tool calls with their results. */
 export function groupTurns(entries: readonly SessionEntry[]): Turns {
   const fold = foldAll(entries);
-  const groups = fold.turns.map((turn) => ({ key: turn.key, entries: turn.entries }));
+  const groups = fold.turns.map((turn) => ({ key: turn.key, entries: keptEntries(turn) }));
   return {
     turns: groups,
     runs: new Map(Object.entries(fold.runs)),

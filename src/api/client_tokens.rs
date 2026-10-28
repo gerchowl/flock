@@ -16,6 +16,11 @@ pub enum Scope {
     /// Act as an operator for explicitly authorized verbs.
     Operate,
 }
+/// Exact server-chosen grants shared by ClientOpen and ephemeral app sessions.
+/// No caller or conformance fixture chooses this set (ADR-0036 §5, ADR-0038 §6).
+pub(crate) fn operator_scopes() -> BTreeSet<Scope> {
+    BTreeSet::from([Scope::Read, Scope::Send, Scope::Answer, Scope::Operate])
+}
 /// A wire bearer whose diagnostic form is always redacted.
 #[derive(Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]

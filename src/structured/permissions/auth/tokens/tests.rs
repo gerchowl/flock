@@ -639,7 +639,7 @@ fn revocation_intent_blocks_new_admissions_across_handles_without_starvation() {
     let (_root, store, mut app) = setup();
     let issued = issue(&store, &mut app, "browser", &[Scope::Send]);
     let session = store.authenticate(&issued.token).unwrap();
-    let intent = priority::Intent::begin(&store.0, store.random::<16>().unwrap()).unwrap();
+    let intent = priority::Intent::begin(&*store.0, store.random::<16>().unwrap()).unwrap();
     // The primary lock is free, so Busy proves intent priority rather than contention.
     assert!(store.lock_file().unwrap().try_lock().is_ok());
     for _ in 0..4096 {
@@ -723,6 +723,13 @@ fn orphan_intent_and_invalid_dash_names_cannot_deny_or_issue() {
             |_| ()
         )
         .is_ok());
+    let invalid = root
+        .path()
+        .join("client-tokens")
+        .join(format!(".revoke-{}", "b".repeat(32)));
+    fs::write(&invalid, b"untrusted marker").unwrap();
+    fs::set_permissions(&invalid, fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(store.hello_lock(Duration::from_secs(5), || {}).is_ok());
     for name in ["--show-token", "-browser"] {
         assert!(matches!(
             store.issue(
@@ -753,7 +760,7 @@ fn priority_process_fixture() {
 #[test]
 fn intent_is_observed_by_an_independent_process_with_no_primary_lock_held() {
     let (root, store, _app) = setup();
-    let intent = priority::Intent::begin(&store.0, store.random::<16>().unwrap()).unwrap();
+    let intent = priority::Intent::begin(&*store.0, store.random::<16>().unwrap()).unwrap();
     let mut command = crate::process::TracedCommand::new(std::env::current_exe().unwrap(), "test");
     command.args([
         "--exact",
@@ -991,7 +998,7 @@ fn startup_sweeps_stale_intents_but_preserves_live_revokers() {
     drop(store.0.file(&name, true).unwrap());
     TokenStore::open(root.path()).unwrap();
     assert!(matches!(store.0.file(&name, false), Err(e) if e.kind() == io::ErrorKind::NotFound));
-    let intent = priority::Intent::begin(&store.0, "b".repeat(32)).unwrap();
+    let intent = priority::Intent::begin(&*store.0, "b".repeat(32)).unwrap();
     let guard = LockFile::new(store.lock_file().unwrap());
     guard.try_lock().unwrap();
     priority::sweep(&store.0).unwrap();
@@ -1006,4 +1013,35 @@ fn startup_sweeps_stale_intents_but_preserves_live_revokers() {
         .file(&format!(".revoke-{}", "b".repeat(32)), false)
         .is_ok());
     drop(intent);
+}
+
+#[test]
+fn hello_waits_for_revocation_intent_then_admits_an_unrelated_file_token() {
+    let (_root, mut store, mut app) = setup();
+    store.2 = helper_binary();
+    let authority = app.client_token_authority().unwrap();
+    store
+        .issue(&authority, "removed", [Scope::Read].into())
+        .unwrap();
+    let keep = store
+        .issue(&authority, "kept", [Scope::Read].into())
+        .unwrap();
+    let pending = store.begin_revoke("removed").unwrap();
+    std::thread::scope(|scope| {
+        let (ready, waiting) = std::sync::mpsc::channel();
+        let reader = scope.spawn(|| {
+            let mut ready = Some(ready);
+            let _guard = store
+                .hello_lock(Duration::from_secs(5), || {
+                    if let Some(ready) = ready.take() {
+                        ready.send(()).unwrap();
+                    }
+                })
+                .unwrap();
+            store.authenticate(&keep.token).unwrap().info
+        });
+        waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+        pending.finish().unwrap();
+        assert_eq!(reader.join().unwrap(), keep.info);
+    });
 }
