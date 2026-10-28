@@ -4339,8 +4339,9 @@ idle delivery, rather than interpreting printable or pasted text as Send.
 ### Proposed amendment: S10d3 composer editing contract (#2696)
 
 This is the proposed extension for architect acceptance, not a claim that editing
-has shipped. It supplies MVP #1424 step 2 on top of S10d2c (#2685). The typed
-`Composer` gains a `revision: u64`; its cursor remains a UTF-8 byte offset, now
+has shipped. D3a alone supplies MVP #1424 step 2 on top of S10d2c (#2685);
+D3b–D3e below are issue-tracked post-MVP work. The typed `Composer` gains a
+`text_revision: u64`; its cursor remains a UTF-8 byte offset, now
 restricted to an extended-grapheme boundary. `Action` gains `EditComposer(Edit)`
 with typed focus, insertion, deletion and movement variants; existing `ComposerHistory`
 and `Send(Composer)` remain. Directions and units are enums, never JSON commands.
@@ -4352,19 +4353,24 @@ The existing App mode and binding dispatcher runs first: overlays, visible float
 direct configured actions/commands and the prefix own their existing inputs. Only
 otherwise-unclaimed input in `Mode::Terminal`, focused on a valid native target,
 can edit its composer. A PTY pane keeps its terminal routing. Non-terminal modes
-never edit or submit a hidden composer. Key release does nothing; key repeat may
-repeat movement/deletion/printable insertion, but explicit Repeat events never
-Submit or activate a control. Legacy input cannot distinguish repeated Press events
-from independent presses; pending admission and exact clear still fence duplicates.
+never edit or submit a hidden composer. Key release does nothing. The runtime
+currently forwards Repeat events to `handle_key` (`src/app/runtime.rs`): D3a must
+consume repeated Enter before either Submit or painted-control activation, even
+when a nonempty draft has no pending ticket. A repeated Enter never submits.
+Repeat may repeat movement/deletion/printable insertion. Legacy input cannot
+distinguish repeated Press events from independent presses; pending admission
+and text-revision-fenced clear still protect those paths without timing guesses.
 
 An accepted composer operation selects the composer, leaving painted-control
 selection; subsequent Enter submits the draft rather than activating an old
 control. A left click inside the painted composer emits typed `Edit::Focus`,
-selecting it without moving the cursor; mouse caret placement is outside this MVP.
+selecting it without moving the cursor; mouse caret placement is post-MVP #2699.
 A rejected operation preserves both draft and selection. Tab/Shift-Tab
 continue selecting painted controls, and Enter on a selected control activates
 its original generation-fenced intent. Esc acquires no new native binding.
-Default editor bindings below apply only after the existing App bindings:
+The full target keymap below applies only after the existing App bindings. D3a
+implements its minimal typing keys; remaining movement/newline bindings are
+post-MVP D3b (#2702), and history is post-MVP D3e (#2704):
 
 | Input | Composer operation |
 | --- | --- |
@@ -4378,16 +4384,20 @@ Default editor bindings below apply only after the existing App bindings:
 | Up / Down | Previous / next logical line, preserving a preferred display-cell column |
 | Ctrl-P / Ctrl-N | Older / newer local committed composer history |
 | Ctrl-J, or distinguishable Shift-Enter | Insert LF; never submit |
-| Plain Enter | Submit the current accepted revision, unless a painted control is selected |
+| Plain Enter | Submit the current accepted text revision, unless a painted control is selected |
 | PageUp / PageDown / End | Existing transcript scroll / follow-tail actions |
 | Ctrl-W | Existing detach action, not word deletion |
 
 The raw parser already distinguishes CR (Enter) from LF (Ctrl-J). A terminal that
-encodes Shift-Enter as ordinary CR cannot communicate the distinction: the UI
-advertises Ctrl-J for newline, and never guesses from timing. Other modified keys
+encodes Shift-Enter as ordinary CR cannot communicate the distinction: Ctrl-J is
+the newline binding when unclaimed, and the UI never guesses from timing. Other modified keys
 have no implicit insertion fallback. A configured App binding may shadow an editor
-binding; the App binding wins. Unbracketed CR retains Enter semantics, so a stream
-of ordinary key events is not promised paste safety.
+binding; the App binding wins. In particular, `keys.prefix = "ctrl+a"` makes Ctrl-A
+unavailable to the editor (Home remains an alternative). A direct Ctrl-J binding
+without the kitty protocol can leave no distinguishable newline key: Shift-Enter
+may arrive as ordinary CR. The UI must expose that binding gap, not steal Ctrl-J
+from the App or pretend Shift-Enter is distinct. Unbracketed CR retains Enter
+semantics, so a stream of ordinary key events is not promised paste safety.
 
 #### Graphemes, words and bounds
 
@@ -4415,6 +4425,15 @@ the control/UTF-8 validator below; only paste normalizes CR. Existing queue/tran
 bounds still apply independently when sending; the editor bound grants no admission.
 
 #### Bracketed paste and the byte boundary
+
+Until post-MVP native paste insertion lands (D3d, #2703), D3a handles a delivered
+paste event targeting a native pane with an `invalid_params` refusal toast and no
+draft or queue mutation. It never silently drops the event. Float/PTY owners keep
+their existing routing. The shared `raw_input` decoder currently buffers paste
+without a bound and stalls on invalid UTF-8; that existing PTY-affecting bug is
+#2701, not a native-only feature deferral. It can prevent a paste event reaching
+the App. D3c (#2705) builds on the #2701 fix, or fixes #2701 in its first child,
+before claiming the bounded end-to-end behavior below.
 
 `COMPOSER_MAX_PASTE_BYTES = 64 * 1024` bounds the original paste payload as bytes;
 the resulting draft must also satisfy `COMPOSER_MAX_BYTES`. Valid UTF-8 is required.
@@ -4457,47 +4476,58 @@ Keep one pure `EditorState` per App-owned driver lifetime, keyed by the exact
 runtime task. The App serializes accepted input into this authority; it never
 reads back its own painted payload as proof of freshness and never borrows Model.
 The driver task still owns Stream and Model. It receives an immutable typed
-`EditorCut` containing composer/revision, admission state and receipt identity,
+`EditorCut` containing composer/text revision, admission state and receipt identity,
 and projects that coherent cut through its existing copy-on-write snapshot.
 Latest-wins publication may skip frames, not accepted edits. Queue/history/live
 projection cannot overwrite the editor with an older composer cut.
 
-The first editor for a `Target` starts at revision zero. A pure App-owned
-per-Target clock survives detach while that registry generation exists; recreating
-an editor reserves the next revision before accepting input. This prevents a stale
-payload or receipt from matching a new driver at the same generation. Each
-non-noop accepted text, cursor or history edit, and each successful clear, advances
-the clock exactly once with checked addition. A no-op, refusal, focus-only change
-or admission-status update does not advance it.
-At revision exhaustion, edits and new Submit refuse as `invalid_params`. An
-already-in-flight receipt still reports its actual outcome, but a clear that would
-overflow retains the draft; revision never wraps or reuses a value. The cursor is
-always in bounds at a grapheme boundary in the same cut.
+A single App-wide monotonically increasing `u64` counter supplies every editor's
+initial `text_revision` and each subsequent actual text change. Creating another
+driver takes a fresh value, so detach/reattach cannot reuse an old driver's
+revision. Intervening edits to another editor can consume values; an editor must
+not assume consecutive values.
 
-Keyboard Submit captures the authoritative editor revision and exact text/cursor,
-even when paint has not caught up. Painted Send retains its captured revision;
-the dispatcher compares that revision to `EditorState` before admission. A stale
-payload refuses atomically with `invalid_params`. The revision is not inferred by
-comparing a frame with a payload copied from that same frame. The existing target
-and principal checks remain mandatory. Each accepted edit commits locally before
-its projection is published, so rapid typing followed by Enter cannot omit the
-unpainted suffix or spuriously reject it as a stale frame.
+Within an editor, only a change to the exact UTF-8 text allocates a new text
+revision: insertion, deletion, paste, history recall that changes text, or clear.
+Cursor/word/line movement, history-index movement or recall of identical text,
+focus, refusal and admission-status updates leave it unchanged. Cursor-only changes
+still publish a new coherent `EditorCut`; text revision is not a frame version.
+The cursor remains in bounds at a grapheme boundary in the same cut.
+
+Keyboard Submit captures the authoritative editor text revision and body, even
+when paint has not caught up. Painted Send retains its captured text revision;
+the dispatcher compares that value to `EditorState` before admission. Cursor
+movement alone does not stale Send: the body is text-only. A matching revision
+admits the authoritative editor text, not a body inferred from a copied frame;
+a stale text revision refuses atomically with `invalid_params`. This replaces the
+circular stale-draft comparison noted in #2655. Existing target and principal
+checks remain mandatory. Each accepted edit commits locally before projection,
+so rapid typing followed by Enter cannot omit the unpainted suffix or spuriously
+reject it as a stale frame.
 
 One outstanding admission ticket per driver still fences Submit (`session_busy`).
 Editing may continue while that ticket is pending. Its completion carries the
-original target, lifecycle ID and captured revision. Clear applies only if the
-current generation and revision still match, then advances revision and publishes
-one cut. Editing away and back to identical bytes/cursor (ABA) does not permit the
-old clear. A different revision keeps its draft while the receipt still reports
-the older item's outcome. Completion must match the outstanding lifecycle ID; stale
-or already-settled completions cannot clear or append history twice. Deduplication
+original target, lifecycle ID and captured text revision. Clear applies only if
+the current generation and text revision still match; it empties the text, resets
+the cursor to zero, assigns a new text revision and publishes one cut. Enter
+"hello", Left, then acknowledgement must clear "hello": retaining it would make
+the next Enter resend an already admitted message. This intentionally supersedes
+S10d2c's cursor-mismatch retention. Editing text away and back to identical bytes
+(ABA) changes its text revision and prevents the old clear. A different text
+revision keeps its draft while the receipt still reports the older item's outcome.
+Completion must match the outstanding lifecycle ID; stale or already-settled
+completions cannot clear or append history twice. Deduplication
 does not require an unbounded set of historical IDs.
 
 Refusal preserves the editor. `input_write_unknown` preserves both draft and
 lifecycle identity and stays latched across edits; another Enter still refuses.
-No edit, cursor movement or fresh revision authorizes automatic resubmission.
-The explicit uncertain-admission reconciliation UX remains tracked in #2655;
-this extension does not silently clear that latch or invent a new queue owner.
+No edit, cursor movement or fresh text revision authorizes automatic resubmission.
+This latch lasts only while its driver/ticket lives: existing detach/reattach drops
+the ticket and therefore clears the unknown-admission latch, even if the item may
+have committed. That is current behavior, not proof that retry is safe. Explicit
+reconciliation and the fix for silent latch loss belong to #2700; D3a does not
+claim that UX or invent a new queue owner.
+
 The composer receipt displays its lifecycle ID and owner-confirmed admission or
 typed refused/unknown outcome, independently of the newer draft revision. A
 committed receipt means admission, never start, delivery or completion. Delivery
@@ -4524,16 +4554,17 @@ includes that saved scratch draft; evict oldest entries as needed before saving 
 The authoritative current draft has its separate 64-KiB bound. An empty history or
 a boundary move is a no-op.
 
-Draft, revision, history and pending/uncertain presentation survive repaint, focus
-changes, workspace/tab switches and source replay while that driver lives. They
+Draft, text revision, history and pending/uncertain presentation survive repaint,
+focus changes, workspace/tab switches and source replay while that driver lives. They
 are local to that App/controller: attached clients showing the same driver share
 them, while another App/server has an independent editor. Explicit detach drops
 that driver and its unsent draft/history; reattach creates a fresh empty editor
-at a strictly newer revision from the retained App clock, with no inherited
-outstanding ticket. Only that clock survives detach. A generation change or App
-restart starts fresh at revision zero; the retired generation or old App cannot
-supply an outstanding editor receipt to the new one. This slice adds no
-placement/session persistence for editor state. An already committed queue item
+with a fresh text revision from the App-wide counter and no inherited outstanding
+ticket. This also clears the unknown-admission latch under current behavior
+(#2700). The single App-wide counter continues for the App lifetime. Generation
+changes get fresh values from that counter. An App restart has a new counter/empty
+editor state and no outstanding editor receipts from the old App. This slice adds
+no placement/session persistence for editor state. An already committed queue item
 survives detach/restart under the existing journal; dropping its view or ticket
 never cancels or resends it. A new driver must not auto-send or reconstruct an
 uncertain draft from a queued item. Inspect the canonical queue before manually
@@ -4544,7 +4575,8 @@ repeating a possibly admitted message after reopening.
 | Production failure | Required prevention and evidence |
 | --- | --- |
 | Fast typing outruns the published frame; Enter sends a prefix | App editor authority precedes paint; public test types and submits without yielding to a frame |
-| An old receipt clears a newly edited draft that happens to look identical | Revision-fenced clear; hold acknowledgement, type/delete back to the same bytes/cursor, then release it |
+| An old receipt clears a newly edited draft that happens to look identical | Text-revision-fenced clear; hold acknowledgement, type/delete back to the same bytes/cursor, then release it |
+| Cursor movement keeps already admitted text and the next Enter duplicates it | Cursor movement leaves text revision unchanged; Enter, Left, release acknowledgement must clear the draft |
 | Delete corrupts an emoji or caret lands inside a combining cluster | Grapheme segmentation and boundary assertions; real key path covers combining/ZWJ/flag cases and cell rendering |
 | A large, binary or split paste leaks a newline as Submit, or exhausts memory | Bounded byte framing, one typed refusal and drain-to-terminator; test chunks, exact limits and disconnect |
 | A modal/float or another pane receives the wrong draft/paste | Existing routing precedence and captured paste focus/generation; public mode/focus change tests assert zero edit/admission |
@@ -4558,45 +4590,64 @@ order after architect acceptance of this amendment. Every slice uses the existin
 isolated socket-start fake fixture; no real model or operator session is involved.
 Pure reducer/segmentation tests supplement, never replace, the public path.
 
-1. **D3a — editor authority, minimal typing and revision-fenced submission.** Add
-   typed revision/editor/cut contracts, insert/backspace and left/right grapheme
-   edits, coherent publication, and revision-based Send/clear. Public acceptance:
-   start through the socket, type Unicode using the actual key path and Enter
-   without waiting for paint; assert one exact queue body. Hold the real ticket
-   completion, edit/delete back to the old text/cursor, release it, and assert the
-   newer revision survives. A captured stale painted Send refuses without mutation.
-   Detach/reattach while the old acknowledgement is held, then release it: it must
-   not clear or settle a new editor that has the same text and canonical generation.
-2. **D3b — remaining editor keys and caret rendering.** Add forward/word deletion,
-   word/line/draft/vertical movement and newline routing. Public acceptance: fake
-   start, edit combining/flag/ZWJ text through actual key events, inspect the painted
-   caret and admitted body. Ctrl-J/distinct Shift-Enter adds LF without admission;
-   plain Enter submits once. App binding, prefix, modal, float, control selection
-   and key-release/repeat cases prove the correct owner; clicking the composer
-   leaves control selection. End still follows tail as regression coverage.
-3. **D3c — bounded byte-paste framing.** Capture App destination policy/context
-   at paste-begin, then stream existing input-byte frames with per-connection
-   incremental framing and typed internal completion/refusal. Native insertion
-   remains disabled until the next slice. Public
-   acceptance feeds the real client/server raw-input entry with chunk splits inside
-   UTF-8 and delimiters: exact-limit paste arrives once, overflow/invalid UTF-8
-   refuses once with bounded retained bytes, and tail/newline is never dispatched.
-   Terminate or disconnect the producer and prove the next independent input works;
+1. **D3a — MVP: editor authority, minimal typing and text-revision-fenced
+   submission (#2696; MVP #1424 step 2).** Add typed editor/cut contracts, the
+   App-wide revision allocator, insert/backspace and left/right grapheme edits,
+   coherent publication, and text-revision-based Send/clear. Guard repeated Enter
+   here, not in D3b; handle native paste with a typed unsupported-paste refusal toast
+   until D3d lands. Public acceptance uses the actual raw-event/key path on the
+   socket-started fake fixture:
+   - Type Unicode and Enter without waiting for paint; assert one exact queue body.
+   - Type "hello", hold its acknowledgement, press Enter, move Left, then release it:
+     assert an empty draft and cursor zero; another Enter cannot resend "hello".
+   - Hold a real ticket's completion, edit/delete back to the original text/cursor,
+     then release it; the newer text revision survives. A cursor move leaves a
+     painted Send valid, but a captured stale text revision refuses without mutation.
+   - Deliver Repeat Enter to `handle_raw_input_event` with nonempty text and no
+     pending ticket: zero submissions. Press Enter submits once; repeated Enter
+     still never submits, including after a fresh draft replaces the cleared one.
+   - Deliver a native paste event: a typed refusal toast, unchanged editor and zero
+     queue items. Preserve float/PTY ownership as regression coverage. #2701 covers
+     malformed raw pastes that currently fail before event delivery.
+   - Detach/reattach while the old acknowledgement is held, then release it: it must
+     not clear or settle a new editor with the same text and canonical generation.
+2. **D3b — post-MVP: remaining editor keys and caret rendering (#2702).** Add
+   forward/word deletion, word/line/draft/vertical movement and newline routing.
+   Public acceptance edits combining/flag/ZWJ text through actual key events,
+   inspecting the painted caret and admitted body. Ctrl-J/distinct Shift-Enter adds
+   LF without admission; plain Enter submits once. Prefix Ctrl-A and direct Ctrl-J
+   bindings demonstrate the documented gaps without stealing App ownership. Test
+   App bindings, prefix, modal, float and control focus. Clicking the composer leaves
+   control selection; mouse caret placement is separate #2699. End still follows
+   tail as regression coverage. Repeat-Enter acceptance belongs to D3a.
+3. **D3c — post-MVP: bounded byte-paste framing integration (#2705).** Shared
+   parser hardening #2701 is a prerequisite, or is fixed in the first child here.
+   Capture App destination policy/context at paste-begin, then stream existing
+   input-byte frames with per-connection incremental framing and typed internal
+   completion/refusal. Native insertion remains disabled with D3a's refusal toast.
+   Public acceptance feeds the real client/server raw-input entry with chunk splits
+   inside UTF-8 and delimiters: exact-limit paste arrives once, overflow/invalid
+   UTF-8 refuses once with bounded retained bytes, and tail/newline is never
+   dispatched. Termination/disconnect leaves the next independent input processable;
    producer death or silence must fail a bounded test, never hang it.
-4. **D3d — atomic native paste routing.** Revalidate the captured App target/focus,
-   normalize/validate and apply one insertion/revision. Public acceptance uses the
-   same raw-input path on a fake-started native pane: 64-KiB boundaries, combined
-   draft overflow, NUL/ESC/C1, CRLF/TAB, focus/mode and generation changes. Assert
-   exact text/cursor/revision, unchanged state on refusal and zero queue items until
-   explicit Enter. PTY and float forwarding remain covered by their real paths.
-5. **D3e — bounded local history and lifecycle/receipt integration.** Add history
-   recall/scratch restoration, lifecycle-ID-bearing admission receipt rendering and
-   editor cleanup. Public acceptance commits real fake-worker turns, recalls/edits/submits, covers
-   both history caps, then detaches/reattaches and retires a generation. Assert fresh
-   editor state at a newer revision and the same durable queue item. A held-busy/then-idle fake worker
-   proves one admission receipt before delivery, one delivery only at idle, and
-   retained drafts on refusal/unknown with no automatic retry. No new delivery
-   policy or persisted history format is introduced.
+4. **D3d — post-MVP: atomic native paste routing (#2703).** Revalidate captured
+   App target/focus, normalize/validate and apply one insertion/text revision.
+   Public acceptance uses the same raw-input path on a fake-started native pane:
+   64-KiB boundaries, combined draft overflow, NUL/ESC/C1, CRLF/TAB, and focus/mode/
+   generation changes. Assert exact text/cursor/text revision, unchanged state on
+   refusal and zero queue items until explicit Enter. PTY/float forwarding retains
+   regression coverage through its real paths.
+5. **D3e — post-MVP: bounded history and lifecycle/receipt integration (#2704).**
+   Add history recall/scratch restoration, lifecycle-ID-bearing admission receipt
+   rendering and editor cleanup. Public acceptance commits real fake-worker turns,
+   recalls/edits/submits, covers both history caps, then detaches/reattaches and
+   retires a generation. Recalling equal text does not change text revision;
+   recalling different text does. Assert a fresh editor/text revision and the same
+   durable queue item. A held-busy/then-idle fake worker proves one admission receipt
+   before delivery and one delivery only at idle, as regression coverage. Refusal/
+   unknown retains drafts without automatic retry while the ticket lives; existing
+   detach latch loss is documented, with reconciliation/fix owned by #2700. No new
+   delivery policy or persisted history format is introduced.
 
 For every slice, run its new public acceptance tests against its parent once and
 record the command, behavioral failures and exit code, then record the passing
