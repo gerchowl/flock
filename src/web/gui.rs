@@ -50,7 +50,7 @@ fn router_for<A: RustEmbed + 'static>(bind: SocketAddr) -> io::Result<Router> {
         .with_state((bind.to_string(), document_policy(bind))))
 }
 
-fn refusal(status: StatusCode, code: ErrorCode, message: &'static str) -> Response {
+pub(super) fn refusal(status: StatusCode, code: ErrorCode, message: &'static str) -> Response {
     (
         status,
         [(header::CACHE_CONTROL, "no-store")],
