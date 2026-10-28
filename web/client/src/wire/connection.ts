@@ -72,7 +72,7 @@ import { Outbox, type OutboxEntry } from "./outbox";
 // Only this module can name the connection's internal handoff method.
 const providerSessionHandoff = Symbol("provider session handoff");
 
-/** Provider-only capability; the source-boundary test rejects UI imports and calls. */
+/** Public handoff helper; CI's source scan restricts its use to provider.ts. */
 export function replaceProviderSession(connection: WireConnection, install: () => void): void {
   connection[providerSessionHandoff](install);
 }

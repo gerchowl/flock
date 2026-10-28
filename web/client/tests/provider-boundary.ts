@@ -1,3 +1,4 @@
+// TypeScript checks direct method/symbol access; CI's source scan governs public helper imports.
 // @ts-expect-error The internal handoff symbol is not exported to UI modules.
 import { providerSessionHandoff } from "../src/wire/connection";
 import type { WireConnection } from "../src/wire/connection";
