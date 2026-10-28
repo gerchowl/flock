@@ -232,6 +232,7 @@ export class WireConnection {
   #error: string | null = null;
   #listeners = new Set<() => void>();
   #transitions = new Set<(state: ConnectionState) => void>();
+  #userConnects = new Set<() => void>();
   readonly #options: ConnectionOptions;
   readonly #outbox: Outbox;
 
@@ -304,9 +305,28 @@ export class WireConnection {
     return () => this.#transitions.delete(listener);
   }
 
+  /** User Connect actions before their attempt; internal session replacement never emits this. */
+  onUserConnect(listener: () => void): () => void {
+    this.#userConnects.add(listener);
+    return () => this.#userConnects.delete(listener);
+  }
+
   /** The user's `connect`: from Disconnected only. */
   connect(): void {
-    if (this.#state === "Disconnected") this.#attemptNow();
+    if (this.#state !== "Disconnected") return;
+    for (const listener of this.#userConnects) listener();
+    this.#attemptNow();
+  }
+
+  /**
+   * Install a replacement credential/session while Disconnected, then resume.
+   * This internal handoff preserves the provider's auth budget: it is not a
+   * user Connect. If installation throws, the connection stays Disconnected.
+   */
+  replaceSession(install: () => void): void {
+    this.disconnect();
+    install();
+    this.#attemptNow();
   }
 
   /** The user's `disconnect`: closes any socket, cancels retries, holds the outbox. */
