@@ -2573,10 +2573,12 @@ one authoritative append before acknowledging acceptance. The question stream
 cannot atomically append to a second queue file: recovery reconciles that
 obligation with the queue owner's durable idempotency key, rather than assuming
 two writes are a transaction. Admit one authenticated `reply` producer through
-§3's gate, `delivery: at_idle`, under that same key on recovery. Only this slice
-may enable the currently reserved Reply kind (#2364); a raw client naming Reply
-still has no authority to create one. Recipient answering authority authorizes
-this specific reply, not general sends to the asker.
+§3's gate, `delivery: at_idle`, under that same key on recovery. Reply is already
+admitted by the queue (`validate_kind` in `src/structured/queue/admission.rs`;
+#2364 is closed). S6e-8 must bind every question Reply to an existing, committed
+AnswerReceipt, checking its asker, question identity and delivery ItemId at the
+mutation fence. Naming Reply or supplying an anchor is not that proof. Recipient
+answering authority authorizes this specific reply, not general sends to the asker.
 
 Repeated client commands replay their original receipt. A competing *new* answer
 gets `question_closed`. The delivery receipt appears separately from Answered:
@@ -2597,6 +2599,44 @@ an uncertain stdin write or exactly-once external side effects. Preserve §3's
 explicit recovery, never reissue a fresh reply identity to resolve uncertainty.
 A replaced asker fails the obligation visibly. A stopped asker keeps it pending
 for the same identity's restart; closing the question does not erase delivery.
+
+**Hibernated asker — owner choice (Recommended): a committed answer is a wake
+trigger, limited to its asker.** This extends Proposed ADR-0044 Q5 in
+[PR #2728](https://github.com/gerchowl/flock/pull/2728), inspected at
+`1ba1c7c9`:
+accepting the answer mints a server-internal wake obligation bound to
+`(AnswerId, asker identity, ItemId)`. It authorizes only resuming that same,
+confirmed Hibernated asker to consume that reply. It grants no general send,
+focus, start, operate or permission authority to the responder; an answer-only
+client or the admitted architect need not acquire those scopes. Validate the
+committed receipt and current asker identity, ownership and absence proofs at
+wake admission, not caller-provided wake fields. Subscription, progress reads,
+proposals and uncommitted answers grant no wake. Stopped, Crashed, replaced or
+uncertain askers retain their existing explicit-start/recovery requirements.
+Coalesce with other admitted wakes under ADR-0044's per-agent/per-node limits,
+retain the original ItemId, use its guarded resume bootstrap and record wake owed
+across restart. Never silently create a fresh conversation.
+
+**Alternative:** record the reply but wait for a separate authorized send or
+operator resume. This needs no Q5 extension and saves a wake, but an unattended
+hibernated asker may never receive its answer. **Recommended cost:** extra
+resume compute/latency and one narrowly typed wake obligation; it must wait for
+owner acceptance alongside ADR-0044 Q5, not treat read or answer scope as generic
+lifecycle authority.
+
+**Outstanding answer custody blocks hibernation.** Extend ADR-0044 Q2's “no
+unresolved batch or admission” eligibility rule and its quiesce protocol step 2
+to include the question owner's unfulfilled answer obligations, even before they
+reach the queue: PendingAdmission, queue-full and unresolved commit/admission
+proof all refuse the freeze. An eligible queued reply already blocks through
+Q2's “no eligible queued item” rule. A Pending non-blocking question alone is not
+a live prompt for Q2; a held blocking question remains a prompt and prevents
+hibernation. Check this under the shared lifecycle/input freeze fence, not an
+eventually consistent EventHub count. An answer committed
+before freeze invalidates eligibility; one committed after the hibernation intent
+records wake owed, finishes confirmed cleanup and then resumes, per ADR-0044's
+quiesce protocol step 4. Never launch alongside a still-exiting process. This is
+a prerequisite of S6e's wake integration, including the pristine focus-only exit.
 
 Render replies with §3's per-item random nonce frame. Put attested responder,
 question ID and optional fork ID in the header, outside untrusted answer text.
@@ -2644,8 +2684,9 @@ single Rust schema, scoped resolver, provenance and audited writer must own:
 | --- | --- | --- |
 | `questions.routing.rules` | Ordered RouteRule list: registered asker/project selectors, admitted recipient selector, escalation target | New asks; explicit reroute for pending records |
 | `questions.routing.escalate_after_ms` | Optional duration, proposed 1 second–30 days; null disables automatic escalation | Snapshot into RouteReceipt |
-| `questions.routing.max_hops` | Positive integer, proposed maximum 32 | New asks; existing chains keep their recorded budget |
+| `questions.routing.max_hops` | Positive integer, proposed default 8 and maximum 32 | New asks; existing chains keep their recorded budget |
 | `questions.expire_after_ms` | Optional duration, proposed 1 second–30 days; null means no automatic expiry | Persist one absolute deadline at ask |
+| `questions.max_pending_per_asker` | Positive integer, proposed default 32 and maximum 256; named schema constants | Admission checks the durable Pending count per stable asker identity |
 
 No routing map in env strings, CLI or GUI bypasses schema validation. Use
 ADR-0042's defaults < file < env < explicit flags < runtime resolution, with
@@ -2661,15 +2702,29 @@ Pending route/deadline; an explicit audited reroute uses the new revision.
 
 | Choice | (Recommended) | Alternative and cost |
 | --- | --- | --- |
-| Escalation timing | Disabled by default; explicit policy may escalate after 5 minutes, along admitted architect edges, max 8 hops. Orphans follow the existing operator route immediately. | Automatic owner paging on every timeout reduces unattended waits but increases interruptions and may disclose an agent-only question to the owner without an admitted route. |
+| Escalation timing | Disabled by default; explicit policy may escalate after 5 minutes, along admitted architect edges, default max_hops 8 (hard cap 32). Orphans follow the existing operator route immediately. | Automatic owner paging on every timeout reduces unattended waits but increases interruptions and may disclose an agent-only question to the owner without an admitted route. |
 | Expiry | No implicit expiry; an explicit admitted deadline expires without answering. Check persisted wall-clock deadlines on restart; a runtime deadline also bounds each wait. | Default 24-hour expiry bounds inbox growth but can discard a slow, still relevant decision. |
 | Other-agent routing | Explicit operator-managed edges only, local node initially. | Arbitrary peer or cross-node routing needs mesh identity, delegated scopes and custody proof; defer that implementation to ADR-0034's mesh follow-up. |
 | Input bounds | Prompt/answer 16 KiB each, context 32 KiB, up to 16 options (label 256 bytes, description 2 KiB), 32 typed refs (path 1 KiB), 4 live threads and 8 live proposals per question, total serialized record 128 KiB. Named schema constants validate trimmed UTF-8 and prompt control bytes; blocking reason keeps its already-decided 512-byte bound. | Reusing an entire prompt/blob allowance simplifies validation but makes question cards and replay substantially larger. |
+| Pending flood guard | At most 32 Pending questions per asker by default, configurable 1–256. Re-asks reuse their slot; terminal commit releases it. Refuse overflow with `session_busy` and typed pending-question-limit detail before any write, without evicting existing questions. | No count cap avoids admission refusals but permits unbounded inbox/replay growth; a global-only cap lets one asker exhaust everyone else. |
 
 Timeout never applies a default choice. It reroutes or expires only as configured,
 including for blocking asks. Expiry ends a held call with a typed expired result,
 not a fabricated user answer. A timer is durable scheduling metadata, not a sleep
 loop. Manual answers, timeout, restart and reassign race through the same reducer.
+
+Expiry or supersession also commits a typed terminal-notice obligation to the
+original asker: question ID, terminal revision and reason, with no fabricated
+answer. Deliver it at idle through the queue's existing typed Message path,
+framed as server metadata plus untrusted question text. One stable notice ItemId
+per terminal transition prevents duplicates across restart; queue-full retains
+the obligation. Identity replacement never delivers into the successor: retain
+a visible failed notice for the old identity. A still-live blocking call receives
+its terminal result once instead of an additional notice. Notices alone do not
+grant the proposed AnswerReceipt wake capability: a hibernated asker reads them
+on its next independently authorized wake. Unresolved notice admission is also
+covered by Q2's unresolved-admission freeze gate; a live eligible queued notice
+blocks hibernation like other input.
 
 #### Authorization and proposals
 
@@ -2683,7 +2738,8 @@ preserves ADR-0034 §3's architect answers. It agrees with ADR-0038 §5b:
 | Answer an agent question | Its attested current recipient via CLI/MCP or authenticated reply capability; never a self-asserted label |
 | Create/resolve a thread proposal | Attested fork bound to that question; it may propose, never answer for the operator |
 | Start a thread fork | `operate`/local operator, or existing admitted architect lifecycle authority for its delegate; cost preview still checks visibility |
-| Permission `agent.decide`, lifecycle or tier widening | `operate` or the existing specific operator authority, unchanged |
+| Receipt-bound wake of a Hibernated asker | Proposed S6e/ADR-0044 Q5 capability from an accepted AnswerReceipt, for that asker and ItemId only; owner acceptance required |
+| Permission `agent.decide`, generic lifecycle or tier widening | `operate` or the existing specific operator authority, unchanged |
 
 `answer` is sufficient for a question reply and insufficient for a permission
 prompt. `send` alone answers neither, starts no fork, and cannot act as the
@@ -2729,10 +2785,20 @@ labelled self-reported step; latest-wins coalescing under the existing stream
 budgets, never coalescing terminal/custody records. Alternative: a progress tool
 alone costs model cooperation and can go silent; derivation alone cannot know
 intended next steps. The fork and parent viewers must independently pass read
-visibility; inheritance of lineage grants no transcript access. Parent progress
-is a subscription, not repeated prompt injection, and cannot apply a proposal.
-Detailed progress schema/rate tuning belongs to #2726; it must not gate answer
-custody or non-blocking questions.
+visibility; inheritance of lineage grants no transcript access. A parent AGENT
+reads through existing bounded `flk events read` + `flk events wait` / MCP `flock_events_read`
+cursor-and-wait surface, filtered to its admitted fork identities; #2726 adds a
+generated typed progress projection there, backed by the same owner stream the
+GUI subscribes to. An authenticated parent may read a bounded snapshot and wait
+from its cursor, with gap/replay handling, rather than scraping a tile or
+injecting every progress event into its own prompt. Registration survives an
+agent compaction through #2718's server-owned durable goal/task subscriptions:
+progress links the fork to its owning goal/task, and a terminal or blocked fact
+can wake that goal's admitted supervision loop. Neither task ownership nor a
+lineage edge bypasses read or wake authority; these loops do not acquire the
+AnswerReceipt capability. Progress cannot apply a proposal. Detailed progress
+schema/rate tuning belongs to #2726 and durable goal/task loop delivery to #2718;
+neither gates answer custody or non-blocking questions.
 
 #### GUI, TUI and CLI contracts
 
@@ -2758,6 +2824,8 @@ Expose `fork_points` absence with its typed reason rather than a dead action.
 | Failure | Prevention and observable result |
 | --- | --- |
 | Agent idles behind its ask | Non-blocking tool completes immediately after durable receipt; fake harness continues independent work before any answer. No S6d hold. |
+| Hibernated asker never sees its answer, or reply races freeze | Owner-approved receipt-bound wake only for that asker; PendingAdmission/queue-full obligations block Q2 eligibility; post-freeze answer records wake owed until cleanup. |
+| One asker floods the shared inbox | Per-asker Pending cap, enforced before append; re-ask dedupe, bounded proposals/threads and typed overflow without eviction. |
 | Two answers, or crash between log and queue | Serialized question transition, durable obligation, same queue key; exactly one item/started receipt, uncertainty held visibly. |
 | An agent impersonates the owner | Lease/pane origin and recipient-specific auth; answer scope cannot approve tools; proposals require separate recipient apply. |
 | Escalation loops or leaks a question | Admitted edges, route revisions, bounded visited set, read checks and no timeout auto-answer. |
@@ -2780,19 +2848,21 @@ slice; a parent compilation error is build evidence, not a behavioral failure.
 
 | Slice | Scope / production budget | Fail-first public-path acceptance |
 | --- | --- | --- |
-| S6e-1 | Typed records, bounds, generated DTOs and replay, ≤300 | Replay a stored ask/terminal pair through classifier; known shapes remain typed, unknown-kind line is preserved/skipped, invalid/overbound input leaves log unchanged. |
+| S6e-1 | Typed records, bounds, generated DTOs and public read/replay adapter, ≤300 | Launch isolated server with retained fake-produced ask/terminal log; CLI/socket read replays the pair through the real classifier as known typed records. An unknown-kind line is preserved/skipped. Public adapter rejects invalid bounds; no seeded reducer state. |
 | S6e-2 | Lease/pane origin and one ask adapter, ≤350 | Fake asks, emits independent work before answer; absent blocking returns Pending; forged origin refuses; true blocking without valid reason refuses. |
 | S6e-3 | Launch profile, MCP/stdio and recap convergence, ≤300 | Stray AskUserQuestion gets the exact deny-carried deferral and continues; duplicate source observation opens one question; permissions still block. |
 | S6e-4 | Reducer persistence and lifecycle, ≤300 | Restart preserves Pending; replacement supersedes; held exit becomes deferred; racing expiry/answer has one winner, no half-written checkpoint. |
-| S6e-5 | Recipient routing and config schema, ≤350 | Auto routes delegate to architect and root to operator; authorized other-agent edge works; forbidden widening refuses. Config round-trip/provenance through ADR-0042. |
-| S6e-6 | Reroute, escalation and deadlines, ≤300 | Inject clock, reassign/orphan/timeout; old recipient refuses, cycle stops at bound, disabled timeout never answers or expires. |
-| S6e-7 | Answer admission/auth and durable obligation, ≤350 | Answer-only token answers question but refuses agent.decide; send-only and wrong recipient refuse; concurrent answers retain one immutable receipt. |
-| S6e-8 | Reply producer and queue recovery, ≤350 | Answer while busy delivers only at result; crash after answer append/before queue ack recovers same ItemId; unknown write holds, no duplicate started receipt. Fake sees one reply. |
+| S6e-5 | Recipient routing and config schema, ≤350; depends on accepted ADR-0042/config registry slices (#2724) | Auto routes delegate to architect and root to operator; authorized other-agent edge works; forbidden widening refuses. Config round-trip/provenance through ADR-0042. |
+| S6e-6 | Reroute, escalation and deadlines, ≤300 | Inject clock, reassign/orphan/timeout; old recipient refuses, cycle stops at bound, disabled timeout never answers or expires; terminal notice reaches the original fake once at idle after expiry/supersession. |
+| S6e-7 | Answer admission/auth and durable obligation, ≤350 | Answer-only token answers question but refuses agent.decide; send-only and wrong recipient refuse; concurrent answers retain one immutable receipt; Pending cap refuses the next ask without a write and releases one slot only on terminal commit. |
+| S6e-8 | AnswerReceipt-bound Reply admission and queue recovery, ≤350 | Answer while busy delivers only at result; crash after answer append/before queue ack recovers same ItemId; unknown write holds, no duplicate started receipt. Fake sees one reply; a forged Reply/receipt binding refuses before mutation. |
 | S6e-9 | Question fork adapter / availability, ≤300, after #2365/S19 | Dry-run advertises warm/cold path; compaction updates cost; missing prefix refuses; PTY latest only; read-only fork cannot widen tools. |
 | S6e-10 | Generic proposals and reviewed apply, ≤300 | Bound fork resolves proposal, original keeps working; recipient edit/apply logs both texts; stale/replaced/wrong-question proposal refuses. |
 | S6e-11 | Thread stop recovery and progress link, ≤250 | Crash after apply/before stop then restart stops once; lineage/transcript retained; unauthorized progress subscriber gets no details (#2726). |
 | S6e-12 | G5 projection / review controls, ≤350, after S6e-8/10 | GUI fixture and real-server adapter agree on revisions and delivery; duplicate tap shows current state; multiple-choice edits retain typed option IDs. |
 | S6e-13 | TUI/CLI projection and generated help, ≤350 | Same pending/answered data as GUI; fork proposal cannot be applied by another agent; late idle reply reaches fake with its question and fork attribution. |
+| S6e-14 | Answer wake and hibernation eligibility, ≤300; after S6e-8 and ADR-0044 Q2/Q5 acceptance/lifecycle owner | Fake asks, becomes confirmed Hibernated, then an answer-only client answers: exactly one resume and original reply ItemId, no general start permission. Gate queue admission full/PendingAdmission and prove hibernate refuses; answer on either side of freeze yields cancellation or one wake owed after cleanup. Stopped/replaced targets and reads/proposals never wake. Restart retains the same obligation, never a second input. |
+| S6e-15 | Coordinated rollout gate, ≤200; after core custody/auth/routing, public projections and S6e-14 when hibernation is enabled | Start isolated server with gate off, observe truthful legacy capabilities and launch profile; flip through the admitted config API and launch a new fake: MCP shared-channel profile and typed capability appear together, stray stdio converts. Gate-on with a missing dependency refuses without changing profile; existing generations retain their recorded contract. |
 
 ## Failure modes and known limits
 
