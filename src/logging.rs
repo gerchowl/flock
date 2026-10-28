@@ -257,30 +257,35 @@ where
 /// DEBUG events also dump peer-controlled close reasons, so that module uses INFO.
 /// An AND filter, rather than overridable EnvFilter directives, enforces the caps
 /// even for more specific module/span directives from FLOCK_LOG or RUST_LOG.
-/// File and web stderr subscribers share this boundary; flk TRACE is unaffected.
+/// File and web console subscribers share this boundary; flk TRACE is unaffected.
+/// The cap advertises TRACE (its highest permitted level) so AND preserves the
+/// user's lower max-level hint and default INFO callsites retain their fast path.
 pub(crate) fn credential_safe_filter<S>(
     directives: EnvFilter,
 ) -> impl tracing_subscriber::layer::Filter<S>
 where
     S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
 {
-    directives.and(tracing_subscriber::filter::filter_fn(|metadata| {
-        let target = metadata.target();
-        let module = |name: &str| {
-            target == name
-                || target
-                    .strip_prefix(name)
-                    .is_some_and(|tail| tail.starts_with("::"))
-        };
-        let cap = if module("tungstenite::protocol") {
-            tracing::Level::INFO
-        } else if module("tungstenite") || module("tokio_tungstenite") {
-            tracing::Level::DEBUG
-        } else {
-            tracing::Level::TRACE
-        };
-        *metadata.level() <= cap
-    }))
+    directives.and(
+        tracing_subscriber::filter::filter_fn(|metadata| {
+            let target = metadata.target();
+            let module = |name: &str| {
+                target == name
+                    || target
+                        .strip_prefix(name)
+                        .is_some_and(|tail| tail.starts_with("::"))
+            };
+            let cap = if module("tungstenite::protocol") {
+                tracing::Level::INFO
+            } else if module("tungstenite") || module("tokio_tungstenite") {
+                tracing::Level::DEBUG
+            } else {
+                tracing::Level::TRACE
+            };
+            *metadata.level() <= cap
+        })
+        .with_max_level_hint(tracing_subscriber::filter::LevelFilter::TRACE),
+    )
 }
 
 /// Bridge typed input metadata into stable tracing's scalar-only field API.
@@ -5240,6 +5245,24 @@ pub(crate) fn selection_content_unavailable(pane_closed: bool) {
         },
         "selected content is no longer available"
     );
+}
+
+/// Close metadata only: no bearer, frame payload or client-provided reason.
+#[cfg(feature = "web")]
+pub(crate) fn client_wire_closing(code: u16, source: &'static str, line: u32) {
+    let source = source.rsplit('/').next().unwrap_or("wire");
+    tracing::debug!(
+        event = "client.wire.closing",
+        close_code = code,
+        source,
+        line,
+        "structured transport closing"
+    );
+}
+/// Internal cause and I/O class, without paths or raw parser errors.
+#[cfg(feature = "web")]
+pub(crate) fn client_wire_unavailable(cause: &'static str, kind: Option<io::ErrorKind>) {
+    tracing::debug!(event = "client.wire.unavailable", cause, kind = ?kind, "structured transport unavailable");
 }
 
 #[cfg(test)]

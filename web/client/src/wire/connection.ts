@@ -69,6 +69,14 @@ import { decodeServerFrame } from "./decode";
 import { backoffDelay, bridgeSocket, uuidv7, type Clock, type KeyValueStore, type SocketFactory, type SocketLike, type TimerHandle } from "./env";
 import { Outbox, type OutboxEntry } from "./outbox";
 
+// Only this module can name the connection's internal handoff method.
+const providerSessionHandoff = Symbol("provider session handoff");
+
+/** Public handoff helper; CI's source scan restricts its use to provider.ts. */
+export function replaceProviderSession(connection: WireConnection, install: () => void): void {
+  connection[providerSessionHandoff](install);
+}
+
 /**
  * The JSON wire version this client speaks: `WIRE_JSON_VERSION` in
  * `src/structured_wire/mod.rs`, which a test keeps in step.
@@ -232,6 +240,7 @@ export class WireConnection {
   #error: string | null = null;
   #listeners = new Set<() => void>();
   #transitions = new Set<(state: ConnectionState) => void>();
+  #userConnects = new Set<() => void>();
   readonly #options: ConnectionOptions;
   readonly #outbox: Outbox;
 
@@ -304,9 +313,28 @@ export class WireConnection {
     return () => this.#transitions.delete(listener);
   }
 
+  /** User Connect actions before their attempt; internal session replacement never emits this. */
+  onUserConnect(listener: () => void): () => void {
+    this.#userConnects.add(listener);
+    return () => this.#userConnects.delete(listener);
+  }
+
   /** The user's `connect`: from Disconnected only. */
   connect(): void {
-    if (this.#state === "Disconnected") this.#attemptNow();
+    if (this.#state !== "Disconnected") return;
+    for (const listener of this.#userConnects) listener();
+    this.#attemptNow();
+  }
+
+  /**
+   * Install a replacement credential/session while Disconnected, then resume.
+   * This internal handoff preserves the provider's auth budget: it is not a
+   * user Connect. If installation throws, the connection stays Disconnected.
+   */
+  [providerSessionHandoff](install: () => void): void {
+    this.disconnect();
+    install();
+    this.#attemptNow();
   }
 
   /** The user's `disconnect`: closes any socket, cancels retries, holds the outbox. */
