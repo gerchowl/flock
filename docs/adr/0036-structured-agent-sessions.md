@@ -4221,9 +4221,9 @@ than an additional raw card for every delta. Malformed or unsupported content
 remains inspectable as raw JSON with its original classifier provenance.
 Durable ordinals are raw event at zero, then content-block position plus one.
 Live cards use a disjoint provisional ordinal range, assigned in observation
-order within a source cursor; matching durable messages replace them. A final
-message clears its own partials, and older cursor-only partials, while preserving
-partials explicitly identified as a different message. Fold state is per-card:
+order within a source cursor; durable assistant records replace matching completed
+blocks and older cursor-only partials, while preserving unmatched named blocks.
+A block's public envelope is not a whole-message completion signal. Fold state is per-card:
 thinking, unprojected JSON and raw source beside typed cards start folded,
 independently of sibling text/tool cards. Raw inspection remains an explicit
 choice, so raw source cannot bypass a thinking fold by default.
@@ -4236,7 +4236,16 @@ neither replaces accumulated text. Durable assistant records finalize cards.
 Fold choices for the 16 most recently retired live blocks survive gap recovery
 and transfer to the final card for the same message/block. Preferences outside
 that bounded live window may return to their defaults on later reconstruction.
-Unused hints retire with their final message. Anonymous hints whose possible
+Claude Code 2.1.296 emits one assistant envelope per completed content block
+(E1, A.13). Its public envelope omits the internal API block index. Named
+text/thinking hints therefore transfer only when message identity, content kind
+and exact completed content select a unique retained hint (a bounded SHA-256 fingerprint
+retains no text). Single-block envelopes do not imply block zero. Bundled
+multi-block records additionally match their content positions. Unmatched named
+siblings remain within the same 16-hint cache; unrelated or ambiguous content
+uses default folding. Finalizing one block preserves unmatched named live blocks.
+Evicting a partial saves its fold before removing its card. Anonymous hints retire
+with their final message. Anonymous hints whose possible
 final record lies inside an actual missing history range are discarded rather
 than assigned to another message. Anonymous partials at the final record's own
 cursor belong to later output and are preserved.
@@ -4244,7 +4253,10 @@ cursor belong to later output and are preserved.
 Permission snapshots retain the latest lifecycle observation per
 `(request_id, request_seq)`, in publication order. Pending opens have no local
 projection count limit or clock-based expiry: only a matching real close retires
-them, including host cancellation or session-end closes. Unmatched opens in
-older data remain visible until such a close is observed. Only closed
+them, including host cancellation or session-end closes. The production producer
+bounds live opens with `permissions::MAX_OPEN_PERMISSION_REQUESTS` (16), and
+`permissions::Orphaned::into_closes` emits `SessionEnded` closes on recovery.
+These upstream bounds do not authorize the projection to drop an unmatched open;
+unmatched opens in older data remain visible until a matching close is observed. Only closed
 observations are bounded to the latest 16; older closed records remain in
 History. Displayed requests never substitute for S6 decision revalidation.

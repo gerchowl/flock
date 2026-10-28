@@ -105,6 +105,7 @@ async fn real_fake_partials_reconcile_and_burst_resync() {
         "s10b-live-lifecycle-exit",
         "s10b-live-lifecycle-burst-exit",
         "s10b-live-lifecycle-interleaved-exit",
+        "s10b-live-lifecycle-per-block-exit",
     ] {
         let notify = Arc::new(Notify::new());
         let (mut registry, mut workers) = (Registry::default(), Workers::new(notify.clone()));
@@ -166,6 +167,24 @@ async fn real_fake_partials_reconcile_and_burst_resync() {
                 .collapsed
                 .contains(&c.id)));
         }
+        if mode.contains("per-block") {
+            let text = m
+                .snapshot
+                .transcript
+                .iter()
+                .find(|c| matches!(c.content, Content::Markdown(_)))
+                .unwrap()
+                .id;
+            let thinking = m
+                .snapshot
+                .transcript
+                .iter()
+                .find(|c| matches!(c.content, Content::Thinking(_)))
+                .unwrap()
+                .id;
+            m.snapshot.collapsed.insert(text);
+            m.snapshot.collapsed.remove(&thinking);
+        }
         let mut cut = workers
             .history(&registry, &case.id)
             .unwrap()
@@ -179,7 +198,20 @@ async fn real_fake_partials_reconcile_and_burst_resync() {
                 break;
             }
         }
-        assert_eq!(m.snapshot.applied_cursor, 3);
+        assert_eq!(
+            m.snapshot.applied_cursor,
+            if mode.contains("per-block") { 4 } else { 3 }
+        );
+        if mode.contains("per-block") {
+            assert!(m
+                .snapshot
+                .collapsed
+                .contains(&CardId { seq: 2, ordinal: 1 }));
+            assert!(!m
+                .snapshot
+                .collapsed
+                .contains(&CardId { seq: 3, ordinal: 1 }));
+        }
         assert_eq!(
             contents(&m)
                 .filter(|c| matches!(c, Content::Markdown(s) if s == "partial"))
@@ -592,6 +624,177 @@ fn unmatched_or_missing_anonymous_blocks_do_not_unfold_another_message() {
                 .collapsed
                 .contains(&CardId { seq: 2, ordinal: 2 }),
             "missing={missing}: an unmatched old preference must not bypass the new thinking fold"
+        );
+    }
+}
+
+#[test]
+fn per_block_assistant_records_preserve_sibling_fold_preferences() {
+    for resync in [false, true] {
+        let mut m = model();
+        for (index, delta) in [
+            (0, json!({"type":"text_delta","text":"first"})),
+            (1, json!({"type":"thinking_delta","thinking":"second"})),
+        ] {
+            m.live(live_value(0, json!({"type":"stream_event","api_message_id":"shared","event":{"type":"content_block_delta","index":index,"delta":delta}})));
+        }
+        let text = m.snapshot.transcript[0].id;
+        let thinking = m.snapshot.transcript[1].id;
+        m.snapshot.collapsed.insert(text);
+        m.snapshot.collapsed.remove(&thinking);
+        if resync {
+            m.live(live::Item::Gap { through: 1 });
+        }
+        // Claude Code emits a separate assistant envelope at each block stop.
+        for (seq, block, folded) in [
+            (1, json!({"type":"text","text":"first"}), true),
+            (2, json!({"type":"thinking","thinking":"second"}), false),
+        ] {
+            m.history(history::Item::Record(record(
+                seq,
+                &json!({"type":"assistant","message":{"id":"shared","content":[block]}})
+                    .to_string(),
+                true,
+            )))
+            .unwrap();
+            assert_eq!(
+                m.snapshot.collapsed.contains(&CardId { seq, ordinal: 1 }),
+                folded,
+                "seq={seq}, resync={resync}"
+            );
+            if seq == 1 && !resync {
+                assert!(
+                    m.snapshot
+                        .transcript
+                        .iter()
+                        .any(|c| c.id == thinking && c.streaming),
+                    "the other block is still live"
+                );
+            }
+        }
+        assert!(m.snapshot.transcript.iter().all(|c| !c.streaming));
+    }
+}
+
+#[test]
+fn evicted_partial_saves_fold_before_pruning_its_card() {
+    for thinking in [false, true] {
+        let mut m = model();
+        let delta = if thinking {
+            json!({"type":"thinking_delta","thinking":"retired"})
+        } else {
+            json!({"type":"text_delta","text":"retired"})
+        };
+        m.live(live_value(0,json!({"type":"stream_event","api_message_id":"retired","event":{"type":"content_block_delta","index":0,"delta":delta}})));
+        let id = m.snapshot.transcript[0].id;
+        if thinking {
+            m.snapshot.collapsed.remove(&id);
+        } else {
+            m.snapshot.collapsed.insert(id);
+        }
+        for seq in 1..=history::LIVE_RECORDS as u64 {
+            m.history(history::Item::Record(record(seq, "{}", true)))
+                .unwrap();
+        }
+        assert!(!m.snapshot.transcript.iter().any(|c| c.id == id));
+        let seq = history::LIVE_RECORDS as u64 + 1;
+        let block = if thinking {
+            json!({"type":"thinking","thinking":"retired"})
+        } else {
+            json!({"type":"text","text":"retired"})
+        };
+        m.history(history::Item::Record(record(
+            seq,
+            &json!({"type":"assistant","message":{"id":"retired","content":[block]}}).to_string(),
+            true,
+        )))
+        .unwrap();
+        assert_eq!(
+            m.snapshot.collapsed.contains(&CardId { seq, ordinal: 1 }),
+            !thinking
+        );
+    }
+}
+
+#[test]
+fn unobserved_earlier_block_does_not_consume_a_later_fold() {
+    let mut m = model();
+    m.live(live_value(0, json!({"type":"stream_event","api_message_id":"shared","event":{"type":"content_block_delta","index":2,"delta":{"type":"text_delta","text":"later"}}})));
+    let id = m.snapshot.transcript[0].id;
+    m.snapshot.collapsed.insert(id);
+    for (seq, text, folded) in [(1, "unseen", false), (2, "later", true)] {
+        m.history(history::Item::Record(record(seq,&json!({"type":"assistant","message":{"id":"shared","content":[{"type":"text","text":text}]}}).to_string(),true))).unwrap();
+        assert_eq!(
+            m.snapshot.collapsed.contains(&CardId { seq, ordinal: 1 }),
+            folded
+        );
+    }
+}
+
+#[test]
+fn ambiguous_identical_blocks_use_defaults_but_bundled_positions_are_exact() {
+    for bundled in [false, true] {
+        let mut m = model();
+        for index in [0, 1] {
+            m.live(live_value(0,json!({"type":"stream_event","api_message_id":"shared","event":{"type":"content_block_delta","index":index,"delta":{"type":"thinking_delta","thinking":"identical"}}})));
+        }
+        // An absent wire block index must never guess which thinking card was unfolded.
+        m.snapshot.collapsed.clear();
+        if bundled {
+            m.snapshot.collapsed.insert(m.snapshot.transcript[1].id);
+        }
+        let block = json!({"type":"thinking","thinking":"identical"});
+        let blocks = if bundled {
+            vec![block.clone(), block]
+        } else {
+            vec![block]
+        };
+        m.history(history::Item::Record(record(
+            1,
+            &json!({"type":"assistant","message":{"id":"shared","content":blocks}}).to_string(),
+            true,
+        )))
+        .unwrap();
+        assert_eq!(
+            m.snapshot
+                .collapsed
+                .contains(&CardId { seq: 1, ordinal: 1 }),
+            !bundled
+        );
+        if bundled {
+            assert!(m
+                .snapshot
+                .collapsed
+                .contains(&CardId { seq: 1, ordinal: 2 }));
+        }
+    }
+}
+
+#[test]
+fn text_and_thinking_with_identical_bytes_keep_distinct_fold_hints() {
+    let mut m = model();
+    for (index, delta) in [
+        (0, json!({"type":"text_delta","text":"same"})),
+        (1, json!({"type":"thinking_delta","thinking":"same"})),
+    ] {
+        m.live(live_value(0,json!({"type":"stream_event","api_message_id":"shared","event":{"type":"content_block_delta","index":index,"delta":delta}})));
+    }
+    m.snapshot.collapsed.clear();
+    m.snapshot.collapsed.insert(m.snapshot.transcript[0].id);
+    m.live(live::Item::Gap { through: 1 });
+    for (seq, block, folded) in [
+        (1, json!({"type":"text","text":"same"}), true),
+        (2, json!({"type":"thinking","thinking":"same"}), false),
+    ] {
+        m.history(history::Item::Record(record(
+            seq,
+            &json!({"type":"assistant","message":{"id":"shared","content":[block]}}).to_string(),
+            true,
+        )))
+        .unwrap();
+        assert_eq!(
+            m.snapshot.collapsed.contains(&CardId { seq, ordinal: 1 }),
+            folded
         );
     }
 }
