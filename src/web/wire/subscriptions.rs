@@ -206,7 +206,10 @@ pub(super) async fn replay(
         .await
         .map_err(|_| None)?;
         cut = next;
-        let item = item.map_err(|_| None)?;
+        let item = item.map_err(|error| {
+            crate::logging::client_wire_unavailable("agent_replay_page", Some(error.kind()));
+            None
+        })?;
         let frame = match item {
             Item::Record(record) => {
                 cursor = record.seq;
