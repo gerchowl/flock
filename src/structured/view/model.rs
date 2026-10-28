@@ -139,8 +139,10 @@ impl Model {
     }
     fn clear_partials(&mut self) {
         for (key, id) in &self.partials {
-            self.folds
-                .remember(key, self.snapshot.collapsed.contains(id));
+            if let Some(card) = self.snapshot.transcript.iter().find(|card| card.id == *id) {
+                self.folds
+                    .remember(key, self.snapshot.collapsed.contains(id), &card.content);
+            }
         }
         self.snapshot.transcript.retain(|card| !card.streaming);
         self.partials.clear();
@@ -151,6 +153,17 @@ impl Model {
             self.snapshot.transcript.iter().map(|c| c.seq).collect();
         if let Some(&first) = cursors.iter().rev().nth(history::LIVE_RECORDS - 1) {
             let before = self.snapshot.transcript.len();
+            for (key, id) in &self.partials {
+                if let Some(card) = self
+                    .snapshot
+                    .transcript
+                    .iter()
+                    .find(|c| c.id == *id && c.seq < first)
+                {
+                    self.folds
+                        .remember(key, self.snapshot.collapsed.contains(id), &card.content);
+                }
+            }
             self.snapshot.transcript.retain(|c| c.seq >= first);
             if self.snapshot.transcript.len() != before {
                 self.snapshot.earlier_history = Some(first);
@@ -316,16 +329,25 @@ impl Model {
         };
         let message = Self::message(&v, r.seq);
         if v["type"] == "assistant" {
-            let removed: std::collections::BTreeSet<_> = self
-                .partials
-                .iter()
-                .filter(|((m, _), _)| m.finalized_by(&message, r.seq))
-                .map(|(_, id)| *id)
-                .collect();
+            let mut removed = std::collections::BTreeSet::new();
             for (key, id) in &self.partials {
-                if removed.contains(id) {
+                if !key.0.finalized_by(&message, r.seq) {
+                    continue;
+                }
+                let Some(card) = self.snapshot.transcript.iter().find(|c| c.id == *id) else {
+                    continue;
+                };
+                let matches = matches!(key.0, Message::Cursor(_))
+                    || matches!(card.content, Content::RawJson { .. })
+                    || v.pointer("/message/content")
+                        .and_then(Value::as_array)
+                        .is_some_and(|blocks| {
+                            blocks.iter().any(|b| folds::same_content(&card.content, b))
+                        });
+                if matches {
+                    removed.insert(*id);
                     self.folds
-                        .remember(key, self.snapshot.collapsed.contains(id));
+                        .remember(key, self.snapshot.collapsed.contains(id), &card.content);
                 }
             }
             self.snapshot
@@ -392,7 +414,7 @@ impl Model {
                         let default = matches!(content, Content::Thinking(_));
                         let fold = if v["type"] == "assistant" {
                             self.folds
-                                .take(&message, index as u64, r.seq)
+                                .take(&message, index as u64, r.seq, &content, blocks.len() == 1)
                                 .unwrap_or(default)
                         } else {
                             default
@@ -417,7 +439,7 @@ impl Model {
             }
         }
         if v["type"] == "assistant" {
-            self.folds.finish(&message, r.seq);
+            self.folds.finish(r.seq);
         }
     }
 }
