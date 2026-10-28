@@ -7,7 +7,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use tracing_subscriber::fmt::writer::MakeWriter;
+use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{filter::FilterExt, layer::SubscriberExt, Layer};
 
 const DEFAULT_MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
 // Keep previous generations on rotation: retained=0 DELETED the log at the
@@ -212,6 +214,14 @@ pub(crate) fn init_file_logging(file_name: &str) {
         return;
     };
 
+    let _ = file_log_subscriber(make_writer).try_init();
+}
+
+/// Build the disk subscriber, shared with real-wire secret regression tests.
+fn file_log_subscriber<W>(make_writer: W) -> impl tracing::Subscriber + Send + Sync
+where
+    W: for<'a> MakeWriter<'a> + Send + Sync + 'static,
+{
     // Default filter covers both the crate's module_path (`flk`, the [[bin]]
     // name from Cargo.toml; see ADR-0003) AND the explicit brand-namespaced
     // `target: "flock::..."` events (e.g. `flock::attach`, `flock::peers`)
@@ -228,17 +238,49 @@ pub(crate) fn init_file_logging(file_name: &str) {
     // Spans are off: nothing #[instrument]s yet, and the default timestamp
     // precision matches the old text layer, preserving merge_log_records'
     // lexicographic-sort contract across mixed-format tails.
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(make_writer)
-        .with_ansi(false)
-        .with_target(true)
-        .json()
-        .flatten_event(true)
-        .with_current_span(false)
-        .with_span_list(false)
-        .event_format(InputJsonFormat::default())
-        .try_init();
+    tracing_subscriber::registry().with(
+        tracing_subscriber::fmt::layer()
+            .with_writer(make_writer)
+            .with_ansi(false)
+            .with_target(true)
+            .json()
+            .flatten_event(true)
+            .with_current_span(false)
+            .with_span_list(false)
+            .event_format(InputJsonFormat::default())
+            .with_filter(credential_safe_filter(filter)),
+    )
+}
+
+/// Apply an immutable credential boundary alongside the user's filter (ADR-0036 §5,
+/// ADR-0038 §6). WebSocket TRACE events dump raw hello/frame payloads. Protocol
+/// DEBUG events also dump peer-controlled close reasons, so that module uses INFO.
+/// An AND filter, rather than overridable EnvFilter directives, enforces the caps
+/// even for more specific module/span directives from FLOCK_LOG or RUST_LOG.
+/// File and web stderr subscribers share this boundary; flk TRACE is unaffected.
+pub(crate) fn credential_safe_filter<S>(
+    directives: EnvFilter,
+) -> impl tracing_subscriber::layer::Filter<S>
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    directives.and(tracing_subscriber::filter::filter_fn(|metadata| {
+        let target = metadata.target();
+        let module = |name: &str| {
+            target == name
+                || target
+                    .strip_prefix(name)
+                    .is_some_and(|tail| tail.starts_with("::"))
+        };
+        let cap = if module("tungstenite::protocol") {
+            tracing::Level::INFO
+        } else if module("tungstenite") || module("tokio_tungstenite") {
+            tracing::Level::DEBUG
+        } else {
+            tracing::Level::TRACE
+        };
+        *metadata.level() <= cap
+    }))
 }
 
 /// Bridge typed input metadata into stable tracing's scalar-only field API.
@@ -7358,3 +7400,6 @@ mod tests {
         assert!(out.contains("INFO"), "{out}");
     }
 }
+
+#[cfg(all(test, feature = "web"))]
+mod secret_tests;
