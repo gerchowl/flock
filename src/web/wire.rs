@@ -724,7 +724,9 @@ async fn connection(
 pub(crate) mod tests;
 
 /// Publish intent, wait outside store I/O, then commit under the acquired fence.
-/// Overload fails closed; abandoned waits retain their bounded worker until reaped.
+/// Each phase independently reserves capacity. Finish-step overload drops the
+/// fence without removing the app credential; retirement maps this to close 1001.
+/// Abandoned waits retain their bounded worker until reaped.
 async fn mutate_apps(
     store: Arc<Store>,
     session: Option<Session>,
