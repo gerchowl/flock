@@ -75,6 +75,8 @@ struct Harness {
     refuse_mint: Arc<Mutex<Option<String>>>,
     hold_mint: MintGate,
     clock: Arc<AtomicU64>,
+    /// What was left of its deadline when each mint began.
+    budgets: Arc<Mutex<Vec<Duration>>>,
 }
 
 /// When set, the next mint signals the sender, then waits on the receiver.
@@ -119,8 +121,12 @@ impl Harness {
         }
         let (mints, refuse_mint) = (Arc::new(AtomicUsize::new(0)), Arc::new(Mutex::new(None)));
         let hold_mint: MintGate = Default::default();
+        let budgets: Arc<Mutex<Vec<Duration>>> = Default::default();
         let (count, refuse, hold) = (mints.clone(), refuse_mint.clone(), hold_mint.clone());
-        let mint: Mint = Arc::new(move |_| {
+        let left = budgets.clone();
+        let mint: Mint = Arc::new(move |until| {
+            let budget = until.saturating_duration_since(std::time::Instant::now());
+            left.lock().unwrap().push(budget);
             let held = hold.lock().unwrap().take();
             if let Some((entered, release)) = held {
                 let _ = entered.send(());
@@ -149,6 +155,7 @@ impl Harness {
             refuse_mint,
             hold_mint,
             clock,
+            budgets,
         }
     }
 
@@ -282,6 +289,23 @@ async fn text(server: &mut Server) -> String {
 /// The server's side of a close the bridge began: its reply, then the end.
 async fn finish_close(server: &mut Server) {
     while let Some(Ok(_)) = settled(server.next()).await {}
+}
+
+/// Until the bridge has let go of the connection, after all it does with it;
+/// whatever it sent before that is left unread.
+async fn dropped(server: &Server) {
+    settled(async {
+        loop {
+            server.get_ref().readable().await.unwrap();
+            match server.get_ref().try_read(&mut [0; 64]) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => panic!("{e}"),
+            }
+        }
+    })
+    .await;
 }
 
 async fn close_from_server(server: &mut Server, code: u16, reason: &str) {
@@ -883,19 +907,21 @@ async fn a_gone_page_waits_for_the_servers_close_reply_up_to_the_deadline() {
     assert_eq!(started.elapsed(), DEADLINE);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_4403_that_races_a_reload_is_one_the_page_never_saw() {
+/// The server's 4403 is in the bridge's hands before the page goes away:
+/// the session's task holds on the frame before it until the reload.
+async fn a_4403_then_a_reload() -> (Option<Event>, Opened, String) {
     let mut h = Harness::new(None, true);
-    // The page's channel holds the session's task on its first frame.
     let (entered_tx, entered) = std::sync::mpsc::sync_channel(1);
     let (release, release_rx) = std::sync::mpsc::sync_channel(1);
     let gate = Mutex::new(Some((entered_tx, release_rx)));
-    let sink: Sink = Arc::new(move |_| {
+    let (tx, mut events) = mpsc::unbounded_channel();
+    let sink: Sink = Arc::new(move |event| {
         if let Some((entered, release)) = gate.lock().unwrap().take() {
             entered.send(()).unwrap();
             release.recv().unwrap();
+            return true;
         }
-        true
+        tx.send(event).is_ok()
     });
     let opened = h.bridge.open(OWNER, false, sink).await.unwrap();
     let mut server = h.fake.accept().await;
@@ -905,12 +931,80 @@ async fn a_4403_that_races_a_reload_is_one_the_page_never_saw() {
     server.feed(Message::Text("{}".into())).await.unwrap();
     close_from_server(&mut server, 4403, "revoked").await;
     wait_entered(entered).await;
-    // The page reloads while the task holds the 4403 it has read.
+    // The page reloads while the task holds the 4403 it has read: both are
+    // ready when it next looks.
     h.bridge.webview_gone(OWNER);
     release.send(()).unwrap();
-    finish_close(&mut server).await;
+    let end = settled(events.recv()).await;
+    dropped(&server).await;
     let (opened, _, _, token) = h.session(false).await;
-    assert_eq!((opened.fresh, token.as_str()), (true, "bearer-2"));
+    (end, opened, token)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_4403_read_before_a_reload_is_the_sessions_end_and_one_the_page_never_saw() {
+    // Each run is one race between the two; an unordered read loses half.
+    for _ in 0..32 {
+        let (end, opened, token) = a_4403_then_a_reload().await;
+        let revoked = Event::Close {
+            code: 4403,
+            reason: "revoked".into(),
+        };
+        assert_eq!(end, Some(revoked), "the server's close came first");
+        assert_eq!((opened.fresh, token.as_str()), (true, "bearer-2"));
+    }
+}
+
+#[tokio::test]
+async fn a_4403_while_a_gone_page_waits_for_the_close_reply_ends_the_bearer() {
+    let mut h = Harness::new(None, true);
+    let (_, _events, mut server, first) = h.session(false).await;
+    h.bridge.webview_gone(OWNER);
+    // The bridge's 1001 is at the server, unread, when the server revokes.
+    settled(server.get_ref().readable()).await.unwrap();
+    close_from_server(&mut server, 4403, "revoked").await;
+    dropped(&server).await;
+    let (opened, _, _, next) = h.session(false).await;
+    assert_eq!(first, "bearer-1");
+    assert_eq!(
+        (opened.fresh, next.as_str()),
+        (true, "bearer-2"),
+        "a refused bearer was offered again"
+    );
+    assert_eq!(h.mints(), 2);
+}
+
+#[tokio::test]
+async fn the_mint_gets_what_is_left_of_the_opens_budget() {
+    let h = Harness::new(None, true);
+    let (opened, _) = h.open(false).await;
+    opened.unwrap();
+    // An open that has spent 7 s of its 10 before it needs a bearer.
+    let (tx, _events) = mpsc::unbounded_channel();
+    let sink: Sink = Arc::new(move |event| tx.send(event).is_ok());
+    let deadline = Instant::now() + Duration::from_secs(3);
+    h.bridge.start(OWNER, true, sink, deadline).await.unwrap();
+    let budgets = h.budgets.lock().unwrap().clone();
+    let within =
+        |left: Duration, budget: Duration| left <= budget && left > budget - Duration::from_secs(1);
+    assert_eq!(budgets.len(), 2);
+    assert!(within(budgets[0], DEADLINE), "{budgets:?}");
+    assert!(within(budgets[1], Duration::from_secs(3)), "{budgets:?}");
+}
+
+#[tokio::test]
+async fn a_mint_after_a_seen_refusal_leaves_the_next_lost_bearer_fresh() {
+    let mut h = Harness::new(Some(1_000), true);
+    let (_, mut events, mut server, _) = h.session(false).await;
+    close_from_server(&mut server, 4403, "revoked").await;
+    assert_eq!(closed(&mut events).await.0, 4403);
+    let (opened, _) = h.open(false).await;
+    assert!(!opened.unwrap().fresh, "the client saw the 4403");
+    // That mint settled the 4403; the bearer it made now runs out.
+    h.clock.fetch_add(1_000, Ordering::Relaxed);
+    let (opened, _) = h.open(false).await;
+    assert!(opened.unwrap().fresh, "the client did not cause this mint");
+    assert_eq!(h.mints(), 3);
 }
 
 #[tokio::test]

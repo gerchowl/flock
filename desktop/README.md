@@ -60,7 +60,9 @@ server on the same machine"). The init script sets the bundle's
   ends a session on it with 4401 or 4403. While a mint is in flight, every
   open that needs a bearer, renewing or not, waits for that mint and gets its
   bearer, or its refusal; an open that can use the current bearer does not
-  wait. A refused bearer is never offered again. Any other close, such as
+  wait. A refused bearer is never offered again, whichever way the 4401 or
+  4403 arrives: on a live session, or while a gone page's session waits for
+  the server's close reply. Any other close, such as
   1006 or 1001, keeps it, so a reconnect mints nothing. `fresh: true` says the
   open minted without the client causing it.
 

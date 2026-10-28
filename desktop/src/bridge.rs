@@ -241,7 +241,7 @@ impl Bridge {
             // The page that asked went away meanwhile; a new page shares its
             // label, so the session never joins the table and nobody hears of it.
             drop(table);
-            tokio::spawn(self.clone().gone(id, ws));
+            tokio::spawn(self.clone().gone(id, ws, bearer));
             return Ok(opened);
         }
         table.sessions.insert(id, session);
@@ -374,18 +374,31 @@ impl Bridge {
         done
     }
 
-    /// The server refused or ended `bearer` (4401, 4403): never offer it
-    /// again. An end on an older bearer leaves the current one.
-    fn ended(&self, bearer: &Arc<Bearer>, seen: bool) {
+    /// A close the server sent on a session that ran on `bearer`, as its
+    /// code and reason. Every path that reads one comes here, so the mint
+    /// rule always applies: a 4401 or 4403 ends `bearer`, never offered
+    /// again, and `seen` says whether the page heard of it. An end on an
+    /// older bearer leaves the current one.
+    fn server_closed(
+        &self,
+        bearer: &Arc<Bearer>,
+        frame: Option<CloseFrame>,
+        seen: bool,
+    ) -> (u16, String) {
+        let (code, reason) = frame.map_or((1005, String::new()), |f| {
+            (f.code.into(), f.reason.as_str().to_owned())
+        });
         let mut current = self.current();
-        if current
-            .bearer
-            .as_ref()
-            .is_some_and(|c| Arc::ptr_eq(c, bearer))
+        if matches!(code, 4401 | 4403)
+            && current
+                .bearer
+                .as_ref()
+                .is_some_and(|c| Arc::ptr_eq(c, bearer))
         {
             current.bearer = None;
             current.ended_in_view = seen;
         }
+        (code, reason)
     }
 
     /// One session's task: frames both ways until either side closes, or
@@ -400,25 +413,19 @@ impl Bridge {
         abandoned: Arc<AtomicBool>,
     ) {
         let (code, reason) = loop {
-            // What the server has sent goes first: a 4401 or 4403 it sent
-            // before the page went away still ends the bearer.
+            // What the server has sent goes first: a close it sent before
+            // the page went away is the session's end, as the server made it.
             tokio::select! {
                 biased;
                 frame = ws.next() => match frame {
                     Some(Ok(Message::Text(text))) => {
                         let data = scrub(text.as_str().to_owned(), &bearer.token);
                         if !sink(Event::Message { data }) {
-                            return self.gone(id, ws).await;
+                            return self.gone(id, ws, bearer).await;
                         }
                     }
                     Some(Ok(Message::Close(frame))) => {
-                        let (code, reason) = frame.map_or((1005, String::new()), |f| {
-                            (f.code.into(), f.reason.as_str().to_owned())
-                        });
-                        if matches!(code, 4401 | 4403) {
-                            self.ended(&bearer, !abandoned.load(Ordering::Relaxed));
-                        }
-                        break (code, reason);
+                        break self.server_closed(&bearer, frame, !abandoned.load(Ordering::Relaxed));
                     }
                     // `/v1/ws` carries JSON text frames only (§6), so a binary
                     // frame is RFC 6455's 1003, unsupported data, never text.
@@ -443,7 +450,7 @@ impl Bridge {
                         drop(ws.close(Some(frame)).await);
                         break (1008, reason.to_owned());
                     }
-                    Some(Out::Gone) | None => return self.gone(id, ws).await,
+                    Some(Out::Gone) | None => return self.gone(id, ws, bearer).await,
                 },
             }
         };
@@ -454,7 +461,8 @@ impl Bridge {
 
     /// The session's page is gone: out of the table, and a 1001 to the
     /// server, whose close reply ends it, awaited for at most the deadline.
-    async fn gone(self, id: u64, mut ws: WebSocketStream<Stream>) {
+    /// A 4401 or 4403 the server sent meanwhile still ends `bearer`.
+    async fn gone(self, id: u64, mut ws: WebSocketStream<Stream>, bearer: Arc<Bearer>) {
         self.table().sessions.remove(&id);
         let frame = CloseFrame {
             code: 1001.into(),
@@ -463,7 +471,9 @@ impl Bridge {
         if ws.close(Some(frame)).await.is_ok() {
             let reply = async {
                 while let Some(Ok(frame)) = ws.next().await {
-                    if frame.is_close() {
+                    if let Message::Close(frame) = frame {
+                        // Nobody is left to tell: the page never sees this end.
+                        self.server_closed(&bearer, frame, false);
                         break;
                     }
                 }
