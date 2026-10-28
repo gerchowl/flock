@@ -4,7 +4,7 @@ use crate::{
     api::error_code::ErrorCode,
     layout::PaneId,
     structured::view::{
-        contracts::{Action, Composer, Intent},
+        contracts::{Action, Intent},
         Target,
     },
 };
@@ -105,13 +105,9 @@ impl App {
                 KeyCode::Enter if selection.is_none() => {
                     let draft = self
                         .state
-                        .native_frames
+                        .native_editors
                         .get(&target.agent_id)
-                        .and_then(|f| f.as_ref().ok())
-                        .map(|f| Composer {
-                            text: f.composer.text.clone(),
-                            cursor: f.composer.cursor,
-                        });
+                        .map(|e| e.cut.composer.clone());
                     let result = draft.ok_or(ErrorCode::SessionBusy).and_then(|draft| {
                         self.dispatch_native_intent(
                             id,

@@ -786,6 +786,8 @@ impl App {
         let mut state = AppState {
             structured_agents,
             native_control: None,
+            native_editors: HashMap::new(),
+            native_text_revision: 0,
             native_frames: HashMap::new(),
             issue_drop: None,
             issue_repo_cache: None,

@@ -47,6 +47,8 @@ pub(crate) struct Snapshot {
     pub admission: Admission,
     /// Controller-owned structured-send draft, never terminal input.
     pub composer: Composer,
+    /// Lifecycle identity of the latest admission, independent of current text.
+    pub admission_receipt: Option<String>,
     /// Source cursor anchoring paused scroll despite new output. `None` follows tail.
     pub scroll_anchor: Option<u64>,
     /// Unseen-output indicator while paused, without moving the anchor.
@@ -187,6 +189,8 @@ pub(crate) struct Composer {
     pub text: String,
     /// UTF-8 byte boundary at most `text.len()`, maintained by the input controller.
     pub cursor: usize,
+    /// App-wide text identity. Cursor-only edits preserve it.
+    pub text_revision: u64,
 }
 /// Data-only controller intent. The dispatcher derives authenticated authority
 /// and revalidates the target generation before any effect.
@@ -206,6 +210,8 @@ pub(crate) enum Action {
     Resume,
     /// Submit the draft durably, retaining it on refusal or uncertainty.
     Send(Composer),
+    /// Commit an editor operation before projecting its immutable cut.
+    EditComposer(super::editor::Edit),
     /// Toggle folding for a source card identity.
     ToggleFold(CardId),
     /// Inspect a source card without changing runtime state.

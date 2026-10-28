@@ -76,6 +76,7 @@ toml = "1"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 unicode-width = "0.2"
+unicode-segmentation = "1.13.3"
 # Reuse termwiz's locked Unicode 17 categories for identity-format validation.
 finl_unicode = "1.4"
 sysinfo = "0.39.3"

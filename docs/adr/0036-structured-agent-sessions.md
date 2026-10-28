@@ -4590,6 +4590,12 @@ order after architect acceptance of this amendment. Every slice uses the existin
 isolated socket-start fake fixture; no real model or operator session is involved.
 Pure reducer/segmentation tests supplement, never replace, the public path.
 
+Implementation staging: D3a1 supplies the typed App editor authority, shared text
+revision allocator, coherent driver cuts, driver-lifetime cleanup and revision-fenced
+admission/clear. It does not yet bind raw text input. D3a2 adds the raw keyboard,
+composer-focus and paste-refusal routing and the public fake-fixture acceptance
+coverage below. Each child carries its own fail-first tests.
+
 1. **D3a — MVP: editor authority, minimal typing and text-revision-fenced
    submission (#2696; MVP #1424 step 2).** Add typed editor/cut contracts, the
    App-wide revision allocator, insert/backspace and left/right grapheme edits,

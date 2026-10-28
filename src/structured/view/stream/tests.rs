@@ -721,6 +721,7 @@ async fn driver_whitelist_and_full_channel_fail_closed() {
         Action::Send(Composer {
             text: "never input".into(),
             cursor: 0,
+            text_revision: 0,
         }),
     ] {
         assert_eq!(driver.control(action), Err(ErrorCode::RuntimeUnsupported));

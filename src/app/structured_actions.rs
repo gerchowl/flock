@@ -18,6 +18,7 @@ impl App {
         let target = intent.target;
         match intent.action {
             Action::Send(draft) => self.submit_native(target, draft),
+            Action::EditComposer(edit) => self.edit_native(&target, edit),
             Action::Close => {
                 let workspace = self.state.active.ok_or(ErrorCode::AgentNotFound)?;
                 self.state.focus_pane_in_workspace(workspace, pane);

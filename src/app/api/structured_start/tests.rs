@@ -1032,35 +1032,12 @@ async fn public_native_keyboard_close_detaches_without_stopping() {
 
 #[tokio::test]
 async fn public_native_enter_submits_current_draft_once_without_terminal_bytes() {
-    use crate::structured::{
-        launch::PermissionMode,
-        view::{contracts::Composer, driver::Driver, Target},
-    };
     use crossterm::event::{KeyCode, KeyModifiers};
     let _guard = crate::config::test_config_env_guard();
     let mut fixture = AdmissionFixture::new("init-socket-null", 5000);
     let (id, generation) = fixture.start().await;
     let text = "MVP 中文 e\u{301}\nnext";
-    // S10d3 owns editing. Seed only the draft, preserving real public-start sources.
-    let mut stream = fixture
-        .app
-        .open_structured_view(
-            Target {
-                agent_id: id.clone(),
-                generation,
-            },
-            PermissionMode::Default,
-        )
-        .unwrap();
-    stream.model.snapshot.composer = Composer {
-        text: text.into(),
-        cursor: text.len(),
-    };
-    fixture.app.structured_views.insert(
-        id.clone(),
-        Driver::new(stream, fixture.app.render_notify.clone()),
-    );
-    fixture.app.sync_structured_views();
+    seed_native_draft(&mut fixture, &id, generation, text, text.len(), false);
     fixture.app.state.mode = crate::app::Mode::Terminal;
     crate::ui::compute_view_with_runtime_registry(
         &mut fixture.app.state,
@@ -1197,46 +1174,40 @@ async fn regression_public_native_mouse_uses_painted_fold_and_rejects_stale_hits
         .contains_key(&pane_id));
 }
 
-// S10d3 owns editing. Replace only the draft/frame while retaining the real
-// socket-started agent, canonical generation and publication sources.
+// Apply typed operations to the real App authority without raw-key routing (D3a2).
 fn seed_native_draft(
     fixture: &mut AdmissionFixture,
     id: &str,
     generation: u64,
     text: &str,
     cursor: usize,
-    pending: bool,
+    _pending: bool,
 ) {
-    use crate::structured::{
-        launch::PermissionMode,
-        view::{
-            contracts::{Admission, Composer},
-            driver::Driver,
-            Target,
-        },
-    };
-    let mut stream = fixture
-        .app
-        .open_structured_view(
-            Target {
-                agent_id: id.into(),
-                generation,
-            },
-            PermissionMode::Default,
-        )
-        .unwrap();
-    stream.model.snapshot.composer = Composer {
-        text: text.into(),
-        cursor,
-    };
-    if pending {
-        stream.model.snapshot.admission = Admission::Pending;
-    }
-    fixture.app.structured_views.insert(
-        id.into(),
-        Driver::new(stream, fixture.app.render_notify.clone()),
-    );
+    use crate::structured::view::{editor::Edit, Target};
     fixture.app.sync_structured_views();
+    let target = Target {
+        agent_id: id.into(),
+        generation,
+    };
+    let count = fixture.app.state.native_editors[id]
+        .cut
+        .composer
+        .text
+        .chars()
+        .count();
+    fixture.app.edit_native(&target, Edit::Right).unwrap();
+    for _ in 0..count {
+        fixture.app.edit_native(&target, Edit::Right).unwrap();
+    }
+    for _ in 0..count {
+        fixture.app.edit_native(&target, Edit::Backspace).unwrap();
+    }
+    for c in text.chars() {
+        fixture.app.edit_native(&target, Edit::Insert(c)).unwrap();
+    }
+    while fixture.app.state.native_editors[id].cut.composer.cursor > cursor {
+        fixture.app.edit_native(&target, Edit::Left).unwrap();
+    }
     fixture.app.state.mode = crate::app::Mode::Terminal;
 }
 fn native_enter(fixture: &mut AdmissionFixture) {
@@ -1334,6 +1305,141 @@ async fn public_native_changed_text_is_not_cleared_after_admission() {
     public_native_changed_draft_survives_clear(true).await;
 }
 #[tokio::test]
-async fn public_native_changed_cursor_is_not_cleared_after_admission() {
+async fn public_native_aba_text_is_not_cleared_after_admission() {
     public_native_changed_draft_survives_clear(false).await;
+}
+
+#[tokio::test]
+async fn d3a1_cursor_preserves_revision_and_painted_send() {
+    use crate::structured::view::{editor::Edit, Target};
+    let _guard = crate::config::test_config_env_guard();
+    let mut fixture = AdmissionFixture::new("init-socket-null", 5000);
+    let (id, generation) = fixture.start().await;
+    seed_native_draft(&mut fixture, &id, generation, "hello", 5, false);
+    let target = Target {
+        agent_id: id.clone(),
+        generation,
+    };
+    let painted = fixture.app.state.native_editors[&id].cut.composer.clone();
+    fixture.app.edit_native(&target, Edit::Left).unwrap();
+    assert_eq!(
+        fixture.app.state.native_editors[&id]
+            .cut
+            .composer
+            .text_revision,
+        painted.text_revision
+    );
+    assert!(
+        fixture.app.submit_native(target, painted).is_ok(),
+        "cursor movement does not stale a painted Send"
+    );
+}
+
+#[tokio::test]
+async fn d3a1_ack_clears_after_cursor_move() {
+    use crate::structured::view::{editor::Edit, Target};
+    let _guard = crate::config::test_config_env_guard();
+    let mut fixture = AdmissionFixture::new("init-socket-null", 5000);
+    let (id, generation) = fixture.start().await;
+    seed_native_draft(&mut fixture, &id, generation, "hello", 5, false);
+    native_enter(&mut fixture);
+    // The App has not consumed the real journal owner's acknowledgement.
+    fixture
+        .app
+        .edit_native(
+            &Target {
+                agent_id: id.clone(),
+                generation,
+            },
+            Edit::Left,
+        )
+        .unwrap();
+    let wake = fixture.app.render_notify.clone();
+    crate::structured::workers::tests::wait(&wake, || {
+        fixture.app.service_structured_workers(Instant::now());
+        fixture.app.state.native_frames[&id]
+            .as_ref()
+            .is_ok_and(|f| f.composer.text.is_empty() && f.queue.iter().any(|q| q.body == "hello"))
+    })
+    .await;
+    assert_eq!(fixture.app.state.native_editors[&id].cut.composer.cursor, 0);
+    native_enter(&mut fixture);
+    assert_eq!(
+        fixture.app.state.toast.as_ref().unwrap().context,
+        "invalid_params"
+    );
+}
+
+#[tokio::test]
+async fn d3a1_aba_revision_survives_ack() {
+    use crate::structured::view::{editor::Edit, Target};
+    let _guard = crate::config::test_config_env_guard();
+    let mut fixture = AdmissionFixture::new("init-socket-null", 5000);
+    let (id, generation) = fixture.start().await;
+    seed_native_draft(&mut fixture, &id, generation, "hello", 5, false);
+    let before = fixture.app.state.native_editors[&id]
+        .cut
+        .composer
+        .text_revision;
+    native_enter(&mut fixture);
+    let target = Target {
+        agent_id: id.clone(),
+        generation,
+    };
+    fixture.app.edit_native(&target, Edit::Insert('!')).unwrap();
+    fixture.app.edit_native(&target, Edit::Backspace).unwrap();
+    let after = fixture.app.state.native_editors[&id]
+        .cut
+        .composer
+        .text_revision;
+    assert!(after > before);
+    let wake = fixture.app.render_notify.clone();
+    crate::structured::workers::tests::wait(&wake, || {
+        fixture.app.service_structured_workers(Instant::now());
+        fixture.app.state.native_frames[&id]
+            .as_ref()
+            .is_ok_and(|f| {
+                matches!(
+                    f.admission,
+                    crate::structured::view::contracts::Admission::Ready
+                ) && f.queue.iter().any(|q| q.body == "hello")
+            })
+    })
+    .await;
+    assert_eq!(
+        fixture.app.state.native_editors[&id].cut.composer.text,
+        "hello"
+    );
+    assert_eq!(
+        fixture.app.state.native_editors[&id]
+            .cut
+            .composer
+            .text_revision,
+        after
+    );
+}
+
+#[tokio::test]
+async fn d3a1_stale_painted_send_refuses_aba() {
+    use crate::structured::view::{editor::Edit, Target};
+    let _guard = crate::config::test_config_env_guard();
+    let mut fixture = AdmissionFixture::new("init-socket-null", 5000);
+    let (id, generation) = fixture.start().await;
+    seed_native_draft(&mut fixture, &id, generation, "hello", 5, false);
+    let old = fixture.app.state.native_editors[&id].cut.composer.clone();
+    let target = Target {
+        agent_id: id.clone(),
+        generation,
+    };
+    fixture.app.edit_native(&target, Edit::Insert('!')).unwrap();
+    fixture.app.edit_native(&target, Edit::Backspace).unwrap();
+    assert_eq!(
+        fixture.app.submit_native(target, old),
+        Err(crate::api::error_code::ErrorCode::InvalidParams)
+    );
+    assert!(fixture.app.native_submissions.is_empty());
+    assert_eq!(
+        fixture.app.state.native_editors[&id].cut.composer.text,
+        "hello"
+    );
 }
