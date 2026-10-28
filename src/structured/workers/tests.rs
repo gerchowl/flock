@@ -181,6 +181,7 @@ impl Case {
         workers.entries.insert(
             case.id.clone(),
             Worker {
+                live: live::Source::default(),
                 generation: case.generation,
                 messages,
                 runtime: None,
@@ -674,6 +675,7 @@ async fn missing_worker_completion_retains_uncertain_authority_and_refuses_resta
     workers.entries.insert(
         a.id.clone(),
         Worker {
+            live: live::Source::default(),
             generation: a.generation,
             messages,
             runtime: None,
@@ -1335,3 +1337,6 @@ mod recovery;
 pub(crate) mod global;
 
 mod send;
+
+#[path = "tests/live.rs"]
+mod live_feed;
