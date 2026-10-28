@@ -479,7 +479,10 @@ fn main() {
 
 fn run() -> io::Result<()> {
     let raw_args: Vec<_> = std::env::args_os().collect();
-    if raw_args.len() == 2 && raw_args[1] == platform::client_token_lock::WORKER_ARG {
+    if raw_args.len() == 2
+        && (raw_args[1] == platform::client_token_lock::WORKER_ARG
+            || raw_args[1] == platform::client_token_lock::SHARED_WORKER_ARG)
+    {
         return platform::client_token_lock::worker();
     }
     let args = match session::configure_from_args(&raw_args) {
