@@ -109,6 +109,8 @@ export const fixtureExamples = {
             .expect("fixture script")
             .lines()
         {
+            crate::structured_wire::fixture::FixtureLine::parse(line)
+                .expect("validated typed fixture");
             let value: serde_json::Value = serde_json::from_str(line).expect("fixture JSON");
             if name == "permission-decision" {
                 let frame = &value["frame"];
