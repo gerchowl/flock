@@ -857,8 +857,8 @@ When a hold ends, the artifact follows the persistent idle rule from that moment
 - If eviction cannot make room, the publish is refused with `artifact_quota_exceeded` (the agent's own quota) or `artifact_total_quota_exceeded` (the server total). These are two codes because the registry gives each code one retry class (§7e).
 
 **Pinning.**
-- A person pins or unpins through a client token with `answer` or `operate` scope, or through the local CLI. This is recorded as `artifact.pinned` / `artifact.unpinned`.
-- Attested agent/MCP authority alone cannot pin. The proposed [scope clarification](0038-gui/artifact-contract.md#6-visibility-scopes-and-blob-reads-q6), following #2585, permits an explicitly delegated `answer` or `operate` credential to perform that named action without inventing roles.
+- A person pins or unpins through a client token with `operate` scope, or through the local CLI. This is recorded as `artifact.pinned` / `artifact.unpinned`.
+- Attested agent/MCP authority alone cannot pin. The proposed [scope clarification](0038-gui/artifact-contract.md#6-visibility-scopes-and-blob-reads-q6), following #2585, requires `operate` for pin/unpin/lifetime; `answer` remains limited to answering scoped questions. It fixes quota attribution without inventing roles.
 - Only an explicit operator purge removes a pinned artifact.
 
 **Purge is a record, not a hole.**
@@ -1053,7 +1053,7 @@ A refused call is never retried automatically by the parent.
 
 ### 7g. Concrete artifact contract and implementation plan (#1598)
 
-The proposed [artifact amendment](0038-gui/artifact-contract.md) gives full schema-versioned records and commands (Q2), shared reference accounting and crash recovery (Q3), version-cap eligibility (Q4), bounded paging and retention (Q5), independent scope authority and blob reads (Q6), durable comment custody (Q7), origin-qualified ids with carriage deferred to #1602 (Q8), and G6/G7 ownership (Q9). It includes a pre-mortem and the updated ten-slice plan, each at most 400 production lines. One explicit owner acceptance of that annex and the named artifact sections resolves Q1; publishing this proposal does not resolve the gate.
+The proposed [artifact amendment](0038-gui/artifact-contract.md) gives full schema-versioned records and commands (Q2), shared reference accounting, the explicit #1712 GC decision and crash recovery (Q3), version-cap eligibility (Q4), bounded paging and retention (Q5), independent scope authority and blob reads (Q6), durable comment custody (Q7), origin-qualified ids with carriage deferred to #1602 (Q8), and G6/G7 ownership (Q9). It includes a pre-mortem and the updated twelve-PR plan (the original ten subjects with a split GC foundation and a new authenticated blob-route prerequisite), each at most 400 production lines. One explicit owner acceptance of that annex and the named artifact sections resolves Q1; publishing this proposal does not resolve the gate.
 
 ### 8. Goals and work
 
