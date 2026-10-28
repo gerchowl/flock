@@ -1790,6 +1790,7 @@ impl HeadlessServer {
     fn remove_client(&mut self, client_id: u64) -> bool {
         let was_foreground = self.foreground_client_id == Some(client_id);
         self.send_client_graphics_cleanup(client_id);
+        self.app.detach_native_client(client_id);
         let removed = self.clients.remove(&client_id);
         if let Some(removed) = removed {
             // Staged files are NOT deleted here (#286). The file was handed
@@ -2608,6 +2609,9 @@ impl HeadlessServer {
                     }
                     return false;
                 }
+                if !direct_attach_requested {
+                    self.app.attach_native_client(client_id, writer.peer);
+                }
                 let first_app_client = !direct_attach_requested && self.app_client_count() == 0;
                 info!(
                     client_id,
@@ -2764,8 +2768,11 @@ impl HeadlessServer {
                 // self-heals via the split-drag Resize a user does to widen
                 // a split, but a single-pane switch has no such trigger.
                 let focus_before = self.active_focus_snapshot();
-                self.app
-                    .route_client_events(events, self.foreground_client_id == Some(client_id));
+                self.app.route_native_client_events(
+                    client_id,
+                    events,
+                    self.foreground_client_id == Some(client_id),
+                );
                 if self.app.take_config_reloaded_from_disk() {
                     self.reload_server_config(false);
                 } else {
@@ -2777,6 +2784,7 @@ impl HeadlessServer {
                 if self.app.state.detach_requested {
                     self.app.state.detach_requested = false;
                     info!(client_id, "client detach requested via keybind");
+                    self.app.detach_native_client(client_id);
 
                     // Clear client-local host graphics before sending ServerShutdown
                     // so the outer terminal does not retain stale images.
@@ -5471,7 +5479,7 @@ mod tests {
         assert_eq!(changes(&hub, after).len(), 1);
     }
 
-    fn test_headless_server() -> HeadlessServer {
+    pub(super) fn test_headless_server() -> HeadlessServer {
         let config = crate::config::Config::default();
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = crate::app::App::new(&config, true, None, api_rx, api::EventHub::default());
@@ -5652,6 +5660,7 @@ mod tests {
         let (render_tx, render_rx) = std::sync::mpsc::sync_channel(1);
         (
             ClientWriter {
+                peer: Default::default(),
                 control: control_tx,
                 render: render_tx,
             },
@@ -10082,3 +10091,6 @@ next_tab = ""
         );
     }
 }
+
+#[cfg(test)]
+mod native_permissions;

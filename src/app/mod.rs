@@ -46,6 +46,7 @@ pub(crate) mod issue_drop;
 pub(crate) mod line_editor;
 pub(crate) mod mailboxes;
 pub(crate) mod message_relay;
+mod native_auth;
 mod native_submission;
 pub(crate) mod notification_panel;
 pub(crate) mod notifications;
@@ -215,6 +216,8 @@ pub struct App {
     pub(crate) runtime_config: AppRuntimeConfig,
     /// Shared, in-memory one-time browser handoffs, never persisted across restart.
     pub(crate) client_codes: crate::client_open::Codes,
+    native_clients: native_auth::Clients,
+    native_input_client: Option<u64>,
     pub(crate) client_auth: crate::structured::permissions::auth::tokens::server::Owner,
     pub state: AppState,
     pub(crate) terminal_runtimes: crate::terminal::TerminalRuntimeRegistry,
@@ -1144,6 +1147,8 @@ impl App {
             pending_agent_removals: Default::default(),
             client_codes: Default::default(),
             client_auth: Default::default(),
+            native_clients: Default::default(),
+            native_input_client: None,
             delegations: Default::default(),
             goals: Default::default(),
             owner_policies: Default::default(),

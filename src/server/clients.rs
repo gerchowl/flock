@@ -261,7 +261,11 @@ mod tests {
             None,
             0,
             RenderEncoding::SemanticFrame,
-            Some(ClientWriter { control, render }),
+            Some(ClientWriter {
+                peer: Default::default(),
+                control,
+                render,
+            }),
         )
     }
 

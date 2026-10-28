@@ -482,6 +482,15 @@ settled waits, return `runtime_unsupported` (retry `never`, exit 2). Use the
 structured state for observation instead. PTY records keep their existing fields.
 Start a structured session with `flk agent start NAME --runtime structured --model MODEL --cwd /absolute/checkout -- claude`.
 
+An attached local TUI can choose **Allow once** or **Deny** on a native permission
+card. The server authenticates the attaching process and uses a private app-session
+credential with the GUI app session's fixed scopes and 12-hour lifetime, including
+suspend time. It never takes a credential from terminal input. Detach, client exit
+or expiry removes decision authority; reconnect to obtain a fresh session. An
+expired or exited session reports `auth_revoked`; unverified attaches cannot approve.
+**Always (session)** currently refuses with `permission_decision_unsupported` until
+the confirmation flow in [#1430](https://github.com/gerchowl/flock/issues/1430) is available.
+
 In a native structured pane, printable Unicode edits the composer. Backspace deletes
 one extended grapheme; Left/Right move by grapheme. Drafts are limited to 64 KiB of
 UTF-8; overflow and invalid control characters refuse without truncation. App

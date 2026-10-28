@@ -4663,3 +4663,29 @@ scroll behavior are explicitly regression coverage; tests for them may pass on t
 parent and must not be claimed as fail-first evidence for the new feature.
 Framing/routing may be split into smaller children rather than merging a partially
 unbounded paste path as a completed native feature.
+
+
+### Amendment: S10e native TUI permission decisions (#1430, #1424)
+
+A full TUI attach over `flock.sock` captures kernel peer credentials before Hello.
+The existing LocalOperator admission seals that process instance and arms its exit
+watch before issuing an existing ADR-0038 §6 app-session token. Its fixed scopes
+are Read, Send, Answer and Operate, with the same suspend-inclusive 12-hour TTL.
+The bearer stays inside the server; neither Hello nor an input frame can supply
+or select one. Direct terminal attaches receive no permission capability.
+
+Each native decision uses only the input connection's session and sealed peer.
+Process identity, liveness, expiry and Answer scope are checked at the existing
+shared admission fence, through `Principal::Token`. Exact request id, request
+sequence and target generation remain mandatory. Allow once resumes the paused
+turn; Deny sends the harness its denial. UID-only or internal interactive calls
+continue to refuse with `not_authorized`; this does not widen send-only principals.
+
+Detach removes the input capability before retiring the credential under the
+existing revocation fence. Retirement errors are logged and the detached
+connection remains disabled. Owner exit and TTL expiry refuse queued decisions
+with `auth_revoked`, even before EOF or a cleanup notification is serviced.
+Reattach mints a new credential and reruns admission; a refused mint conveys its
+typed reason on a decision. No credential is persisted or transferred at handoff.
+This slice covers Allow once and Deny. Always (session) remains refused with
+`permission_decision_unsupported` pending the confirmation flow tracked in #1430.

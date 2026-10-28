@@ -17,7 +17,21 @@ if "--model" in sys.argv and sys.argv[sys.argv.index("--model") + 1] == "fixture
     init = json.loads((root / "restricted-init.json").read_text())
     init["session_id"] = sys.argv[sys.argv.index("--session-id") + 1]
     print(json.dumps(init), flush=True)
-    sys.stdin.read()
+    if (root / "native-permission-fixture").exists():
+        for line in sys.stdin:
+            value = json.loads(line)
+            if value.get("type") == "user":
+                print(json.dumps({"type": "control_request", "request_id": "native-request", "request": {
+                    "subtype": "can_use_tool", "tool_name": "Bash", "tool_use_id": "native-tool",
+                    "input": {"command": "fixture input"}}}), flush=True)
+            elif value.get("type") == "control_response":
+                response = value["response"]["response"]
+                print(json.dumps({"type": "assistant", "message": {"role": "assistant", "content": [
+                    {"type": "text", "text": "native-decision:" + response["behavior"]}]}}), flush=True)
+                print(json.dumps({"type": "result", "subtype": "success", "is_error": False,
+                                  "result": "native-complete"}), flush=True)
+    else:
+        sys.stdin.read()
     sys.exit(0)
 # Explicit test-only model selects partial streaming; ordinary launches bypass this.
 if "--model" in sys.argv and sys.argv[sys.argv.index("--model") + 1].startswith("s10b-live"):
