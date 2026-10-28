@@ -36,7 +36,7 @@ line offsets, identify the current paths:
 | `config::inventory`, `inventory::projection` | Reviewed core/imported declarations, defaults, sensitivity and reload ownership already exist under #2384, with drift checks and mandatory safe projection. `core.json` is reviewed metadata, not a public schema API. |
 | `app::config_io::{resolve_write_target, write_config_update}` | Regular base file or adjacent managed-file overlay; settings updates currently read/edit/directly write. This is not an atomic, audited, concurrent GUI transaction. |
 | `App::{apply_config_from_disk, apply_live_config}` | Valid sections copy into live consumers; invalid sections retain running values. Aggregate Applied/Partial/Failed and some restart diagnostics exist; per-key consumer outcomes are not yet universal. |
-| `web::parse_web_args`, `main`, `client::run_client_with_mode` | Particular commands add flags and web CSV env exceptions; attaching clients also load local config. A server setting is not proof that a client applied it. |
+| `web::{parse_args, parse_args_with_config}`, `main`, `client::run_client_with_mode` | Particular commands add flags and web CSV env exceptions; attaching clients also load local config. A server setting is not proof that a client applied it. |
 
 The drift comes from independent declaration/default walks, source codecs and
 consumer application paths. Adding one GUI serializer or more env exceptions
@@ -46,10 +46,14 @@ consumer ownership, including absent values, not reverse-engineer defaults.
 ## 3. One typed schema and one resolver
 
 **(Recommended) Owner decision D1:** Rust declarations plus reviewed field metadata
-form one schema registry, used by parsing, validation, source mapping, redaction,
-reload classification and generated reference docs. Cost: migrate metadata by
+form one coordinated schema registry, used by parsing, validation, source mapping,
+redaction, reload classification and generated reference docs. Cost: migrate metadata by
 section, audit imported/manual serde representations and maintain generator and
 negative drift tests. A derive/descriptor must not infer sensitivity from names.
+Alternative: keep the current Rust types plus independent GUI/docs catalogs.
+Reject that recommendation because additions can silently diverge across catalogs.
+“One schema” means Rust types + a reviewed metadata registry + enforced drift
+checks, not that Rust type declarations alone encode sensitivity or reload policy.
 
 Every registered field has a stable canonical path, typed shape, optionality,
 compiled default factory, constraints, aliases, admitted scopes, merge rule,
@@ -79,10 +83,13 @@ source identifiers and errors; neither values nor secret lengths/hashes leak.
 ### Scope and precedence
 
 **(Recommended) Owner decision D2:** resolve an explicit context
-`{ node_id, project_id?, agent_id? }`, not a caller's cwd or a display label.
+`{ node_id?, project_id?, agent_id? }`, normalized to an authenticated NodeId,
+not a caller's cwd or a display label.
 Cost: identity plumbing and tests at every consumer, rather than a global config
 object reused for all panes. Schema admission restricts where each key makes
 sense; a node listener cannot be configured at agent scope.
+Alternative: infer scope from cwd, pane selection or a display label. Reject it
+because reconnects, renamed panes and another client can silently change the target.
 
 | Scope | Identity, ownership and storage |
 | --- | --- |
@@ -91,14 +98,81 @@ sense; a node listener cannot be configured at agent scope.
 | Project | Stable registered repository identity, using ADR-0004's main-checkout/common-directory `.flk.toml` and `.flk.local.toml` policy sources. Only repo-domain keys are admitted. Repo content cannot supply commands or user preferences merely by naming a key. |
 | Agent | Registered local agent identity with generation checks, operator-owned overrides outside the checkout. Harness kind alone is not an agent identity or authority. Launch-affecting values apply to future launches, not a running process's environment. |
 
-No automatic fleet forwarding or global synchronization is introduced. The API
-addresses the serving node; another node requires its own authenticated endpoint
-and scope check. Project authority and admission are checked before evaluating
-that layer. A newly cloned repository cannot grant its own config write authority.
-Agent overrides end at retirement unless an explicit persistent launch profile is
+### Home gateway and missing identity
+
+The GUI talks to **one home server**, as directed by #2293 and specified in
+heron's [#2727 draft](https://github.com/gerchowl/flock/pull/2727), reviewed at
+`5c8662bf`. Config read/write requests for another NodeId go through that home
+and the existing mesh routing foundation; the GUI holds no per-node sockets or
+tokens. The destination owns its schema, config, revisions, audit and reload.
+The home returns destination results without relabeling them as home-node state.
+
+Effective remote authority is the intersection of the home token's current
+scopes, the destination's explicit gateway grant and the local verb/key/scope
+checks. A `read` grant is needed for remote reads and `operate` for remote writes;
+home `operate` alone grants nothing at a destination. Forward attested identity
+`(home_node_id, principal)` and stable mutation identity, never a client bearer or
+reusable destination credential. Revalidate grants at the destination; resume of
+an uncertain write uses the same mutation ID, not a fresh automatic dispatch.
+No automatic fleet-wide replication or fan-out is implied by global scope.
+
+Normalize `node_id` before scope lookup: an omitted request NodeId binds to the
+serving home's established identity, not whichever node a GUI row happens to show.
+If the serving identity is absent, config.get/set refuse with the registered
+`identity_unknown` (`ErrorCode::IdentityUnknown`), including for an explicitly
+named remote target. Do not mint an identity, substitute a hostname, interpret
+`None == None` as local, or fall back to a local file. Static local
+config.schema reads without a destination can still return the classified schema with `serving_node_id: null` and identity
+unavailable; they make no claim about an effective scoped value.
+
+This is a real startup state: `App.node_id` is optional.
+`App::local_structured_message` in `src/app/api/structured_messages.rs` refuses
+missing or mismatched node identity with `IdentityUnknown`; its
+`verified_queue_custody` path also checks that option. Older paths in
+`src/app/api/messages.rs` return “mesh node identity unavailable”; those strings
+are evidence of the state, not new config error codes.
+
+For an enabled routed read (and writes only after the gate below), a request
+NodeId different from the serving home with no route returns registered
+`server_unavailable` with the safe target NodeId and route-unavailable context.
+An incompatible peer keeps `peer_incompatible`; absent grant keeps
+`not_authorized`. Absence of a route, config-capable destination or identity
+never redirects the operation onto the home. Until the gateway config verb is
+implemented, return the version-gap/unsupported capability refusal rather than
+ask the GUI to connect directly. The dedicated adapter slice below gates activation.
+
+Remote config writes specifically stay **unsupported** until this config ADR's
+target-authorization design is accepted and implemented, in addition to the
+#2293/#1380 gateway foundation. Until then, the home refuses remote config.set
+with the existing `server_version_gap` unsupported-capability response (ADR-0029
+exit 78), before routing, admission or mutation. Do not reuse an agent-only
+refusal or treat a valid home operate token as sufficient. Missing serving
+identity is still `identity_unknown`; no home config file may be a fallback.
+
+**(Recommended) Owner decision D13 — destination config grants:** require a
+config-specific grant binding the enrolled home, namespaced operator principal,
+destination NodeId, read/set verbs, allowed configuration scopes/IDs, file/runtime
+layers and an explicit canonical-key set. New schema keys are denied until added
+to the grant. Cost: destination-side grant administration, revocation fencing and
+schema-aware admission tests. Alternative: reuse an agent/workspace grant or trust
+home operate alone. Reject it because neither authorizes node-global config or a
+new scope/key. This is a proposal, not a grant that exists today. Destination
+revocation fences new mutations and cached results; an already admitted write
+can remain outcome-unknown and is never undone by claiming revocation cancelled it.
+Remote read grants must also explicitly admit config reads and still expose only
+the safe projection. No remote config capability is advertised before these checks exist.
+
+Project authority and admission are checked before evaluating that layer. A
+newly cloned repository cannot grant its own config write authority. Agent
+overrides end at retirement unless an explicit persistent launch profile is
 selected; they must never attach to a later generation with a reused display name.
 
-For keys admitted at each scope, source layer wins first:
+**(Recommended) Owner decision D7 — source layer before scope:** for keys admitted
+at each scope, source layer wins first. Cost: a specific agent file cannot bypass
+a broader deployment env/flag value; the GUI must explain the shadowing.
+Alternative: resolve each scope completely, then let the most specific scope win.
+Reject that recommendation because an agent file could override deployment env,
+contradicting the intended 12-factor control at the target node.
 
 ```text
 defaults < file < env < explicit flags < runtime
@@ -111,6 +185,25 @@ choice. Not every scope exists for every key. Additive protected-branch floors
 and authorization remain constraints outside this preference ordering: no layer
 can disable them. This explicitly reconciles ADR-0004's file policy with the
 owner's accepted env-above-file order.
+
+Scope targeting within each source is explicit:
+
+| Source | Target and tie-breaking |
+| --- | --- |
+| File | Global < node < project < agent among admitted scopes; local overlay wins within each scope. |
+| Canonical/legacy env | Belongs to the serving process's node context, before any more-specific project/agent env entries. |
+| `FLOCK_CFG_OVERRIDES` | Node entries merge into that same node env tier; overlap with a canonical/legacy node key is rejected even if equal. Project and agent entries follow in specificity order, all still below every explicit flag. |
+| Explicit flags | Ordinary flags target the node. Proposed typed override flags carry explicit registered project/agent IDs to target those scopes; no cwd inference. Duplicate same-key/same-context flags refuse. Within flags, node < project < agent. |
+| Runtime | Each set/reset carries the normalized node plus explicit project/agent context and current agent generation when applicable. Node < project < agent within runtime; an omitted project/agent never edits whichever pane is focused. |
+
+Only flags supplied to the process owning the configuration contribute to its
+flag layer. Client/CLI invocation flags are not silently forwarded as startup
+flags for a server; an explicit config.set remains a file/runtime mutation.
+Only admitted keys can use those scopes. A GUI request aimed at a remote node is
+not a way to change the home's env/flags: only the destination's own startup
+sources participate. For example, node env beats agent file, a node flag beats
+agent env, and a node runtime value beats an agent flag under D7/D8. Source
+admission and immutable safety floors still apply before selecting a winner.
 
 Canonical project discovery, symlink/common-directory checks and write-target
 selection are shared loader/writer code. The request supplies registered IDs and
@@ -127,6 +220,17 @@ canonical segments use `[a-z][a-z0-9_]*`, with a generation-time collision check
 For example `ui.sound.enabled` maps to `FLOCK_CFG__UI__SOUND__ENABLED`.
 Cost: new codecs, blocklist replacement review, migration of legacy spellings and
 larger deployment environments. This changes no process environment remotely.
+Alternative: retain scalar-only env admission. Reject it as the complete design
+because absent options and collections would still require files. It remains a
+valid intermediate release under ADR-0041 until these adapters are accepted.
+
+**(Recommended) Owner decision D9 — canonical env namespace:** use the
+`FLOCK_CFG__` prefix and a `__` path separator described above. Forbid `__` inside
+a canonical segment, and forbid leading/trailing underscores, in addition to
+its alphabet constraint so splitting the separator round-trips unambiguously. Cost: another namespace to document and migrate. Alternative: extend
+`FLOCK_<PATH>` without a distinct separator. Reject it because segment underscores
+can collide with path separators; silently changing a legacy variable's meaning
+would be unsafe. Legacy names remain explicit generated aliases.
 
 Env scalars use the descriptor's strict codec: booleans `true`/`false`, bounded
 numbers, enum spellings and strings. Collections and optional non-string values
@@ -138,19 +242,31 @@ computed value is not a configurable key and must be labeled as such.
 
 Unset means inherit; empty is a real string only for types that admit it. Clearing
 an optional or collection is explicit typed input, never a parse fallback.
-Collection env/flag/runtime values replace that collection. Existing file-array
-append behavior stays until a separately advertised file-format migration; a
+
+**(Recommended) Owner decision D11 — collection merge semantics:** collection
+env/flag/runtime values replace that collection; existing file arrays append.
+Cost: source-specific behavior must be visible in schema/provenance and tested.
+Alternative: append in every layer. Reject it because an env deployment cannot
+fully specify or clear an ordinary collection. Alternative: replace file arrays
+too. Reject an implicit change because existing overlays rely on append. A
+future file-format migration needs its own acceptance under #2720. Until then, a
 collection editor must not pretend an empty overlay clears the inherited list.
 Removal deletes that layer's entry and reveals the lower value. For append-only
 file collections the editor must edit an authorized owning layer or refuse a
 replacement it cannot represent; never append duplicates to simulate replace.
 
-Environment values belong to the serving process's node context. Project/agent
-scoped env input may be supplied by an operator-owned, typed
-`FLOCK_CFG_OVERRIDES` JSON document containing registered context IDs and canonical
-key/value entries. Same-context duplicates or conflicts with a canonical env key
-are rejected, not resolved by enumeration order. Child/model environment is not
-an input source for the server. Unknown contexts produce a safe diagnostic without
+**(Recommended) Owner decision D10 — scoped env document:** environment values
+belong to the serving process's node context. Use an operator-owned, typed
+`FLOCK_CFG_OVERRIDES` JSON document for explicit node/project/agent entries with
+registered context IDs and canonical key/value entries. Its position within the
+env tier is specified in the source-targeting table above. Same-context duplicates
+and overlap with canonical/legacy node env keys refuse, never depend on iteration
+order. Cost: a structured deployment value plus context validation and tooling.
+Alternative: encode arbitrary context IDs into many env names. Reject it because
+escaping, ID churn and name collisions make it fragile. Alternative: permit only
+node env values. Reject that as the complete design because scoped env control
+would be unavailable. Child/model environment is not an input source for the
+server. Unknown contexts produce a safe diagnostic without
 allocating an agent or discovering a remote node. This document uses the same
 codecs and authority gates, not another config language.
 
@@ -172,9 +288,18 @@ config override flags without requiring one bespoke CLI option per key.
 
 **(Recommended) Owner decision D4:** an explicit `config.set` target distinguishes
 `file` from `runtime`; runtime overrides are process-lifetime operator state above
-flags. Cost: another visible provenance layer and explicit reset semantics. Never
-silently persist a runtime toggle or claim it survives restart. Runtime edits and
-resets are validated, audited and serialized with file edits. Reload retains them;
+flags. Cost: another visible provenance layer and explicit reset semantics.
+Alternative: write every edit into a file. Reject it because temporary experiments
+would become persistent and silently alter managed deployment intent.
+
+**(Recommended) Owner decision D8 — runtime above flags:** an authorized explicit
+runtime override wins over startup flags, for keys admitted to live runtime edits.
+Cost: deployment flags are no longer absolute for mutable preferences; show both
+sources and provide reset. Alternative: keep flags above runtime. Reject it because
+the operator could submit a valid temporary edit that can never take effect while
+the process runs. Bootstrap-only keys and security floors remain non-overridable;
+this recommendation does not make them mutable. Never silently persist a runtime
+toggle or claim it survives restart. Runtime edits and resets are validated, audited and serialized with file edits. Reload retains them;
 restart clears them. A reset reveals the lower layer and returns its outcome.
 Bootstrap/restart-only settings may be saved to a file, but cannot be claimed as
 running changes through runtime overrides. Existing TUI toggles remain persistent
@@ -201,7 +326,10 @@ string codes from this Proposed ADR. Clients branch on typed causes, not current
 reference selects an allowlisted existing credential resolver, with no raw-secret
 input or export route. Cost: migrate legacy arbitrary argv/env/URL strings that
 may embed credentials; references cannot be safely inferred from such strings.
-Even references are redacted when their locator reveals sensitive information.
+Alternative: accept raw secrets on writes but redact reads. Reject it because new
+secret-bearing config files, logs and GUI forms expand exposure. Existing literal
+legacy fields remain migration inputs only; the no-raw-export owner ruling is
+binding whichever input migration is chosen. Even references are redacted when their locator reveals sensitive information.
 Neither `config.get` nor `config.schema` dereferences them. Credential resolution
 happens only at the authorized consuming boundary, not while previewing a setting.
 Raw bearer issuance and token files remain in their existing private stores.
@@ -236,14 +364,20 @@ masked by env/flags/runtime reports saved-but-shadowed and its winning source.
 `config.schema` and `config.get` use read authorization on both socket and S7 WS.
 `config.set` requires the local operator identity or an authenticated operator
 principal with `operate`; a GUI that also reads needs `read` separately. Agent
-principals, `send` and `answer` do not gain config authority. Scopes are rechecked
+principals, `send` and `answer` do not gain config authority. This config rule is
+independent of [#2585](https://github.com/gerchowl/flock/issues/2585), the unresolved
+structured agent.send scope/queue-origin mismatch; do not weaken config authority
+or claim that send-only admission is settled by this ADR. Scopes are rechecked
 under the existing revocation discipline immediately before mutation; cached
 results require current authorization too. No transport-specific backdoor.
 
 **(Recommended) Owner decision D6:** optimistic revision checks and a single
 serialized writer per owning store, with a durable mutation audit. Cost: journal
-recovery, conflict UX and failure injection tests. Last-writer-wins is simpler but
-loses edits and cannot honestly distinguish an uncertain write from an applied one.
+recovery, conflict UX and failure injection tests. Alternative: last-writer-wins
+with best-effort logging. Reject it because it loses concurrent edits and can leave
+a durable mutation without a trustworthy audit outcome. Alternative: reject every
+external-edit race by claiming filesystem compare-and-swap. Reject that claim:
+uncooperative editors do not obey the writer lock, as documented below.
 
 A write supplies schema version, context, target layer, expected revision,
 mutation UUID and typed set/remove entries. Revisions are opaque tokens, not
@@ -283,8 +417,9 @@ superseding edits. It is never part of a config export or public audit. An ambig
 external edit remains explicitly unresolved; never replay an uncertain mutation
 blindly. The API exposes status by mutation ID to an authorized operator. Persisted
 unknown/newer records are skipped/logged/preserved raw per ADR-0028 §3a, not
-strictly deserialized as one list. Audit remains metadata-only and private: directories use mode `0700`, records
-mode `0600`, and no client-supplied path chooses their location.
+strictly deserialized as one list. Audit remains metadata-only and private:
+directories use mode `0700`, records mode `0600`, and no client-supplied path
+chooses their location.
 
 `config.set` never changes process env/flags, installs dependencies, starts a
 program or restarts a server. Restart is a separate explicit operator action.
@@ -301,30 +436,84 @@ Implement incrementally; no flag day or “schema present therefore editable” 
 2. Ship #2385/#2386 read/provenance APIs before writes or precedence change. Show
    current sources and a redacted old/new precedence comparison in the CLI as well
    as GUI. Never expose an unredacted debug/export mode.
-3. Ship #2387's admitted scalar writer first, with atomic/audit/revision foundations
-   split below. Preserve the existing TUI write target. Adopt that writer from
-   settings and config editing rather than leaving competing direct writers.
+3. Prepare #2387's scalar writer foundations, but activate no writer adapter until
+   affected per-consumer reload outcomes are wired and tested. ADR-0041 §5 and
+   #2387 explicitly depend on #2064 and #2066. Preserve the TUI write target and
+   migrate settings/config editing onto the shared writer only after this gate;
+   a valid parse or file save cannot substitute for consumer application.
 4. Release #2388's accepted env-above-file flip with explicit changed release notes,
    startup/reload/fallback tests and legacy CSV/alias policy. Audit inherited
    deployment env first. Do not silently flip precedence at connection time.
-5. After D2–D5 acceptance, add scope resolution, optional/collection codecs and
+5. After D2–D5 and D7–D12 acceptance, add scope resolution, optional/collection codecs and
    reference migrations (#2719/#2720). Existing file arrays still append. Do not
    rewrite user files automatically; provide validated, redacted migration plans.
-   An old binary cannot consume new scopes/references: declare minimum version,
-   detect the format before launch, and refuse downgrade rather than losing values.
+   Rollback follows the explicit compatibility-export plan below; do not claim
+   that already-shipped binaries can be taught to reject a new format.
 6. Add #2389's schema-driven GUI: explicit node/scope/layer, shadowing, revision
    conflicts, restart boundaries and unresolved write outcomes. Old servers refuse
    unsupported verbs with the existing version-gap contract; no GUI file fallback.
 
-No mesh config RPC or fleet fan-out is included. Remote forwarding remains tracked
-by #2366/#2367 and requires a separate accepted target-authorization design.
-Cross-node secrets synchronization is not a configuration export feature. This
-record changes no mesh VERSION or handshake field.
+### Reversible migration and its limits
+
+**(Recommended) Owner decision D12 — downgrade policy:** future schema-aware
+binaries and managed launchers refuse unsupported config versions before writing
+or starting consumers. Cost: a blocked launch/downgrade requires an explicit
+legacy restoration instead of silently losing configuration. Alternative: warn
+and ignore unsupported keys. Reject it for new binaries because the visible
+configuration would not describe the running behavior. Already-shipped binaries
+cannot be changed: permissive Config paths silently discard unknown keys from
+the parsed model, and a later rewrite may persist that loss. Strict sections may
+instead reject the new input. This recommendation cannot prevent someone launching such a binary directly.
+
+Ship a compatibility-tooling release before activating new scopes/reference
+formats (#2720). While files still use the old format, the operator runs the
+proposed `flk config export --legacy --target-version <version>` command and keeps
+an owner-controlled filesystem backup of the original legacy files plus deployment
+env/flags. An old installed binary without the exporter needs that tooling release
+first; no nonexistent old command is assumed. The export is always redacted for
+every caller. It provides only safe representable legacy settings and a loss
+manifest, with omitted/redacted/unsupported entries outside the TOML value map.
+Never write a redaction sentinel as a working setting or call a partial export a
+complete backup. File backups are operator-managed recovery of preexisting files,
+not a new API path returning raw secrets. Never log or attach them to a report.
+
+Before enabling the new format, verify the manifest and a restart with the target
+legacy version in an isolated instance. If required values cannot be represented
+without redaction or a newer reference resolver, automatic rollback is unavailable:
+retain the original private legacy files/credential setup or supply those values
+out of band through the legacy operator workflow. Do not add an unredacted export
+to make rollback appear automatic. Versioned migration must not overwrite the
+only private legacy copy. Concurrent edits require a new comparison/manifest.
+
+To roll back: stop managed consumers, restore the original legacy files and their
+env/flag deployment, remove new canonical/scoped override variables from that
+legacy launch, then start the target version. This is an operator procedure, not
+a restart performed by config.set. Explicitly lost on downgrade are new node/
+project/agent overrides, newly typed optional/collection/reference representations,
+runtime overrides (already process-lifetime), candidate/running provenance and new
+audit/recovery status. A target predating #2388 restores env-below-file ordering;
+a newer legacy target retains its own advertised order. The loss manifest must
+name the chosen version's precedence, not assume all legacy releases agree. Old
+binaries may drop unknown keys if pointed at migrated files. They must not overwrite new
+files or resolve pending new-format mutation intents; retain that state separately
+for a later supported restart. No downgrade promises an equivalent active config.
+
+### Gateway rollout boundary
+
+Remote config forwarding is part of the #2293/#1380 home-gateway design, tracked
+with #2366/#2367 and #2719; it is not a direct-GUI-socket alternative. Implement
+local config adapters first, then route the same typed verbs with explicit
+destination config grants under D13 and bounded replies before enabling remote config controls.
+Remote writes remain unsupported until D13 is accepted and implemented, regardless
+of generic agent-command routing being available. Config addressing and
+failure semantics are fixed above; mesh envelope changes belong to #1380's
+separately approved VERSION exception, not to this docs PR. Cross-node secrets
+synchronization is not a config export feature. This record changes no VERSION.
 
 ## 7. Ordered implementation slices and fail-first evidence
 
-Each row is a separate PR of at most approximately 400 production lines, tests
-excluded. The estimates are budgets, not permission to exceed the cap. Repeat
+Each row is a separate PR with a **hard cap of 400 production lines**, tests
+excluded. The smaller estimates are budgets, never permission to exceed 400. Repeat
 metadata conversion by section/imported family; if a row cannot fit, split it
 before implementation. Tests exercise a real loader, dispatch, consumer or file
 boundary where that is the behavior being claimed; no sleeps as synchronization.
@@ -337,18 +526,23 @@ boundary where that is the behavior being claimed; no sleeps as synchronization.
 | 4a | Typed scalar write preparation, revisions and managed target resolution (#2387) | 250–350 | Invalid/stale edit leaves files/runtime untouched; symlink base selects overlay without modifying its target. |
 | 4b | Atomic persistence and external-edit detection (#2387, #657) | 250–350 | Inject failures at fsync/rename; previous or new complete TOML survives, and uncertainty is reported honestly. |
 | 4c | Audit intent/completion and bounded recovery (#2387) | 250–350 | Crash after rename before completion leaves a queryable pending mutation; failed intent prevents the write; no secret in audit. |
-| 4d | Shared authorized writer adapters/TUI migration (#2387) | 250–350 | Actual operate/read/agent/revoked calls prove authority; concurrent clients get revision conflict, not lost updates. |
-| 5 | Per-consumer reload outcome adapters, one family per PR (#2043, #2064, #2066) | 200–350 | Real consumer retains startup-only value; repeated reload still reports restart; mixed consumers never all claim live apply. |
-| 6 | Accepted precedence flip and legacy aliases (#2388) | 150–300 | File+env fixture changes winner at startup/reload and invalid-overlay fallback; empty CSV never disables a gate. |
+| 4d | Per-consumer reload outcome adapters, one family per PR (#2043, #2064, #2066) — prerequisite to writer activation; ADR-0041 §5 | 200–350 | Real consumer retains startup-only value; repeated reload still reports restart; mixed consumers never all claim live apply. |
+| 4e | Shared authorized writer adapters/TUI migration, gated on 4d (#2387 depends on #2064) | 250–350 | Actual operate/read/agent/revoked calls prove authority; concurrent clients get revision conflict, not lost updates. |
+| 5 | Accepted precedence flip and legacy aliases (#2388) | 150–300 | File+env fixture changes winner at startup/reload and invalid-overlay fallback; empty CSV never disables a gate. |
+| 6a | Destination config grant model and revocation, only after D13 acceptance (#2719, #2367) | 200–350 | Home operate/agent grant alone cannot set remote config; key/scope/layer restrictions and revocation fence a racing mutation. |
+| 6b | Home-gateway config routing, after 6a and #2293/#1380 plus local adapters (#2719, #2367) | 200–350 | Actual home-to-owner dispatch preserves destination result; absent write capability is unsupported, no route is server_unavailable, missing identity is identity_unknown, and the home file never changes for a remote edit. |
 | 7a | Stable context IDs and scope admission (#2719, #127) | 200–300 | Wrong node/generation refuses; project file cannot change user preferences or weaken branch floors. |
 | 7b | Scoped file/source resolution (#2719) | 250–350 | Real files prove node env beats agent file, overlay ordering and common-directory project authority. |
 | 7c | Runtime set/reset lifetime (#2719) | 200–300 | Real API reload retains runtime winner; reset reveals lower layer; new process has no transient override. |
 | 8a | Optional/scalar canonical env codecs (#2720) | 200–300 | Absent optional defaults accept typed input; empty/null/unset differ; ambiguous aliases refuse. |
 | 8b | Collection mapping/admission (#2720) | 250–350 | Real loader replaces env collection but preserves file append; duplicate scoped entries and policy-weakening empties refuse. |
 | 8c | Secret-reference adapters, one consumer family per PR (#2720) | 200–350 | Literal secret input refuses; authorized consumer resolves reference; every read/export/audit stays redacted. |
+| 8d | Safe legacy export/loss manifest and managed downgrade gate, before new format activation (#2720) | 200–350 | Export never returns secrets or redaction sentinels as values; loss manifest names unsupported scopes; supported launcher refuses a newer format without writes; real legacy loader restores the retained legacy config. |
 | 9 | GUI read editor, then write/reload/conflict UX (#2389) | 250–350 per PR | Actual API-backed editor shows saved-but-shadowed/restart/unknown outcome; denied edit does not mutate. |
 
-No rows above assert APIs exist today. The audit/recovery and GUI rows are blocked
+Row 8d is a pre-activation gate for the new formats prepared in 8a–8c; preparatory
+code is not permission to migrate an operator's only config copy. No rows above
+assert APIs exist today. The audit/recovery and GUI rows are blocked
 on their corresponding writer/read foundations; no temporary parallel store or
 unbounded writer is authorized to get an earlier checkbox green.
 
@@ -368,6 +562,6 @@ unbounded writer is authorized to get an earlier checkbox green.
 Keeping only scalar env keys is the smaller accepted ADR-0041 increment, not the
 complete end state. A GUI-specific store, direct `Serialize<Config>` export,
 last-writer-wins updates and blanket env unblocking are rejected recommendations:
-they retain drift, leak risk or authority ambiguity. Implementing D1–D6 costs more
+they retain drift, leak risk or authority ambiguity. Implementing D1–D13 costs more
 review and more small PRs; the alternative would make those costs recurring user
 failures rather than explicit migration work.
