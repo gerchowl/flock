@@ -1,7 +1,4 @@
-//! Unix HTTP listener foundation for ADR-0036, not mounted by the server yet.
-//! PR3b of #2500 will atomically activate owner admission and TCP app-session refusal.
-// Staged implementation exercised by real sockets below, awaiting #2500 activation.
-#![allow(dead_code)]
+//! Owned native Unix HTTP listener for ADR-0036, with app-owner admission.
 use super::wire::timing::SystemClock;
 use crate::{
     ipc::{SocketFileIdentity, SocketOwner},
@@ -110,6 +107,22 @@ async fn accept(socket: &UnixListener) -> io::Result<(UnixStream, Credentials)> 
     let stream = stream.into_std()?;
     let peer = crate::platform::peer::credentials(&stream);
     Ok((UnixStream::from_std(stream)?, peer))
+}
+
+/// Headers never supply authority; the app owner receives only captured kernel facts.
+pub(super) async fn admit(
+    axum::extract::State(client): axum::extract::State<super::local_admission::Client>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<Credentials>,
+    mut request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    match client.admit(peer).await {
+        Ok(peer) => {
+            request.extensions_mut().insert(peer);
+            next.run(request).await
+        }
+        Err(code) => super::local_admission::refusal(code),
+    }
 }
 
 #[cfg(test)]
