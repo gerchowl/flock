@@ -182,6 +182,13 @@ before serving work status or dispatching wakes. Readers skip and preserve unkno
 kinds/fields per ADR-0028 §3a, and refuse unsafe rewrites with unknown state.
 Every implementation slice adding persisted kinds tests that reader contract.
 
+The 8 MiB checkpoint budget is aggregate, not one log line or wire frame.
+Encode pages of at most 64 KiB plus a final manifest naming their epoch, hashes
+and coverage cursor. Only a complete synced manifest replaces prior coverage;
+a crash midway retains the previous checkpoint and its subsequent events.
+Internal checkpoint pages are not work deltas. Public snapshots are paged under
+the existing frame limit, so checkpointing cannot create an undeliverable event.
+
 Terminal records are retained/re-issued until explicitly archived by an
 authorised actor. Archival warns that older history can rotate out and offers a
 bounded export; it is not an implicit response to a full store. Event history
@@ -351,7 +358,7 @@ an as-yet unsupported verb before its implementation.
 | 3 / 280 | Parent links and attested assignment (#965, #2718) | Publicly link/reassign tasks; cycles refuse; a same-named replacement agent cannot edit the old assignment. |
 | 4 / 320 | Evidence and completion proposal/approval (#2718) | Attach receipt/PR/check evidence, change acceptance/head, then attempt approval with stale evidence: refuse. Fake delegate self-approval cannot mark root done. |
 | 5 / 320 | Capability-bound check worker (#2718) | Invoke a configured checker through the work API using a check mode of the same fake fixture: nonzero exit, silence and worker death never produce green evidence; an unauthorised argv/cwd refuses before spawn and only owned children are cleaned up. |
-| 6 / 340 | Checkpoint capacity, rotation fencing and explicit archive (#2718) | Register quiet work, force rotations beyond retention, restart and read identical state; capacity refuses before loss. Archive requires the authorised actor and reports retention consequences. |
+| 6 / 340 | Checkpoint capacity, rotation fencing and explicit archive (#2718) | Register quiet work, interrupt checkpoint pages before the manifest, force rotations beyond retention, restart and read identical state; capacity refuses before loss. Archive requires the authorised actor and reports retention consequences. |
 | 7 / 300 | Persisted loop definitions and park compatibility (#1240, #2718) | Register, disconnect CLI, restart/live-handoff, inspect same loop/wait ID and remaining deadline; cancellation by a different agent refuses. |
 | 8 / 320 | Source cut, occurrence and cursor/outbox transition (#2718) | Gate an event between registration cut and commit, then replay it twice: one pending occurrence, including when the condition was already true. Crash before/after commit retains the correct cursor. |
 | 9 / 300 | PR/CI shared-source adapter (#663) | Feed a CI failure after a successful rerun at the same head and an already merged PR at registration; both fire correctly without a viewer or per-loop poll process. A feed outage exposes coverage loss. |
