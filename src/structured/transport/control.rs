@@ -180,10 +180,21 @@ impl<'a> Recorder<'a> {
                 answer,
                 refusal: None,
             }),
-            Err(ErrorCode::PermissionRequestLimit) => Ok(Admission {
-                refusal: Some(book.capacity_refusal(id).map_err(io::Error::other)?),
-                ..Admission::default()
-            }),
+            Err(ErrorCode::PermissionRequestLimit) => {
+                let refusal = book.capacity_refusal(id).map_err(io::Error::other)?;
+                let agent = book.agent().to_owned();
+                drop(book);
+                crate::logging::structured_permission_request_refused(
+                    &agent,
+                    id,
+                    refusal.request_seq,
+                    ErrorCode::PermissionRequestLimit.as_str(),
+                );
+                Ok(Admission {
+                    refusal: Some(refusal),
+                    ..Admission::default()
+                })
+            }
             Err(code) => Err(io::Error::other(code)),
         }
     }

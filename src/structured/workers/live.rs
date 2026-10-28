@@ -7,6 +7,10 @@ use std::sync::{
 use tokio::sync::broadcast;
 /// Maximum retained partials; each payload also has the transport's line bound.
 pub const CAPACITY: usize = 16;
+
+const STATE_OPEN: u8 = 0;
+const STATE_PRODUCER_ENDED: u8 = 1;
+const STATE_RETIRED: u8 = 2;
 /// Why this generation's feed terminated.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum End {
@@ -27,7 +31,10 @@ pub enum Item {
     },
     /// Partial blocks were lost: discard them without advancing the durable cursor.
     Gap {
-        /// Latest durable sequence observed by the single receiver.
+        /// Latest durable sequence observed by this generation's receiver.
+        /// Starts at zero until its first persisted record, so partials that
+        /// overflow earlier can produce `Gap { through: 0 }`. This is not
+        /// durable progress, including when history predates this generation.
         through: u64,
     },
     /// All queued partials were drained; no further data will arrive.
@@ -50,7 +57,7 @@ impl Default for Source {
         Self {
             tx: Some(broadcast::channel(CAPACITY).0),
             through: Arc::default(),
-            ended: Arc::default(),
+            ended: Arc::new(AtomicU8::new(STATE_OPEN)),
         }
     }
 }
@@ -71,16 +78,21 @@ impl Source {
         if received.persisted {
             self.through.store(received.record.seq, Ordering::Release);
         } else if let Some(tx) = &self.tx {
-            let _ = tx.send((
-                Arc::new(received.record.clone()),
-                Arc::new(received.event.clone()),
-            ));
+            if tx.receiver_count() > 0 {
+                let _ = tx.send((
+                    Arc::new(received.record.clone()),
+                    Arc::new(received.event.clone()),
+                ));
+            }
         }
     }
     pub(super) fn finish(&mut self, reason: End) {
         if self.tx.is_some() {
             self.ended.store(
-                if reason == End::Retired { 2 } else { 1 },
+                match reason {
+                    End::ProducerEnded => STATE_PRODUCER_ENDED,
+                    End::Retired => STATE_RETIRED,
+                },
                 Ordering::Release,
             );
             self.tx = None;
@@ -96,7 +108,7 @@ impl Subscription {
                 through: self.through.load(Ordering::Acquire),
             },
             Err(broadcast::error::RecvError::Closed) => {
-                Item::End(if self.ended.load(Ordering::Acquire) == 2 {
+                Item::End(if self.ended.load(Ordering::Acquire) == STATE_RETIRED {
                     End::Retired
                 } else {
                     End::ProducerEnded
