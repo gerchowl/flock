@@ -4675,11 +4675,14 @@ The bearer stays inside the server; neither Hello nor an input frame can supply
 or select one. Direct terminal attaches receive no permission capability.
 
 Each native decision uses only the input connection's session and sealed peer.
-Process identity, liveness, expiry and Answer scope are checked at the existing
+Process identity, liveness, expiry and Operate scope are checked at the existing
 shared admission fence, through `Principal::Token`. Exact request id, request
 sequence and target generation remain mandatory. Allow once resumes the paused
 turn; Deny sends the harness its denial. UID-only or internal interactive calls
 continue to refuse with `not_authorized`; this does not widen send-only principals.
+Per #2585, Answer alone cannot authorize `agent.decide`: missing Operate refuses
+with `not_authorized`. A direct attach without a capability entry also refuses
+with `not_authorized`.
 
 Detach removes the input capability before retiring the credential under the
 existing revocation fence. Retirement errors are logged and the detached

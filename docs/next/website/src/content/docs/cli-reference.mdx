@@ -488,6 +488,9 @@ credential with the GUI app session's fixed scopes and 12-hour lifetime, includi
 suspend time. It never takes a credential from terminal input. Detach, client exit
 or expiry removes decision authority; reconnect to obtain a fresh session. An
 expired or exited session reports `auth_revoked`; unverified attaches cannot approve.
+Decisions require Operate: Answer alone is insufficient and refuses with
+`not_authorized`. A direct terminal attach without a capability also reports
+`not_authorized`.
 **Always (session)** currently refuses with `permission_decision_unsupported` until
 the confirmation flow in [#1430](https://github.com/gerchowl/flock/issues/1430) is available.
 

@@ -185,4 +185,16 @@ impl Owner {
 }
 
 #[cfg(test)]
+impl Store {
+    /// Keep the test credential snapshot and enforcing app source at the same reduced grants.
+    pub(crate) fn answer_only_app_for_test(&self, session: &mut Session) {
+        let Source::App(app) = &mut session.source else {
+            panic!("app-session fixture required")
+        };
+        self.apps.answer_only_for_test(app);
+        session.info = app.info.clone();
+    }
+}
+
+#[cfg(test)]
 mod tests;

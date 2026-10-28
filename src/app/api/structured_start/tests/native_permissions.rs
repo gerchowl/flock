@@ -161,9 +161,16 @@ impl Fixture {
         }
     }
     async fn attach(&mut self) -> UnixStream {
+        self.attach_mode(protocol::ClientLaunchMode::App).await
+    }
+    async fn attach_mode(&mut self, mode: protocol::ClientLaunchMode) -> UnixStream {
         let mut stream = UnixStream::connect(self.server.native_test_socket()).unwrap();
         stream.set_read_timeout(Some(LIMIT)).unwrap();
-        protocol::write_message(&mut stream, &Self::hello()).unwrap();
+        let mut hello = Self::hello();
+        if let ClientMessage::Hello { launch_mode, .. } = &mut hello {
+            *launch_mode = mode;
+        }
+        protocol::write_message(&mut stream, &hello).unwrap();
         self.server.native_test_accept();
         self.server.native_test_event().await;
         assert!(matches!(
@@ -430,4 +437,24 @@ async fn s10e_public_native_another_process_cannot_use_the_credential() {
     )
     .await;
     f.refused("peer_process_changed");
+}
+
+#[tokio::test]
+async fn s10e_public_native_answer_only_session_cannot_decide() {
+    let _guard = crate::config::test_config_env_guard();
+    let mut f = Fixture::new().await;
+    let mut client = f.attach().await;
+    f.server.native_test_app().native_test_answer_only(1);
+    f.click(&mut client, PermissionDecision::Deny).await;
+    f.refused("not_authorized");
+}
+#[tokio::test]
+async fn s10e_public_native_direct_attach_without_capability_is_not_authorized() {
+    let _guard = crate::config::test_config_env_guard();
+    let mut f = Fixture::new().await;
+    let mut client = f
+        .attach_mode(protocol::ClientLaunchMode::TerminalAttach)
+        .await;
+    f.click(&mut client, PermissionDecision::AllowOnce).await;
+    f.refused("not_authorized");
 }

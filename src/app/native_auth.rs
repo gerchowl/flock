@@ -27,7 +27,7 @@ fn token_code(error: TokenError) -> ErrorCode {
     }
 }
 impl ClientSession {
-    /// Revalidate the connection identity and fixed Answer grant at mutation time.
+    /// Revalidate the connection identity and required Operate grant at mutation time.
     pub(super) fn decide(
         &self,
         dispatch: impl for<'a> FnOnce(VerifiedToken<'a>) -> Result<(), ErrorCode>,
@@ -40,8 +40,11 @@ impl ClientSession {
             return Err(ErrorCode::PeerProcessChanged);
         }
         self.store
-            .admit(&self.session, Scope::Answer, dispatch)
-            .map_err(token_code)?
+            .admit(&self.session, Scope::Operate, dispatch)
+            .map_err(|error| match error {
+                TokenError::Scope => ErrorCode::NotAuthorized,
+                error => token_code(error),
+            })?
     }
 }
 impl App {
@@ -116,7 +119,7 @@ impl App {
         let client = self.native_input_client.ok_or(ErrorCode::NotAuthorized)?;
         self.native_clients
             .get(&client)
-            .ok_or(ErrorCode::AuthRevoked)?
+            .ok_or(ErrorCode::NotAuthorized)?
             .clone()
     }
 }
@@ -139,5 +142,20 @@ impl App {
             .as_mut()
             .unwrap()
             .session = credential;
+    }
+}
+
+#[cfg(test)]
+impl App {
+    pub(crate) fn native_test_answer_only(&mut self, client: u64) {
+        let authority = self
+            .native_clients
+            .get_mut(&client)
+            .unwrap()
+            .as_mut()
+            .unwrap();
+        authority
+            .store
+            .answer_only_app_for_test(&mut authority.session);
     }
 }
