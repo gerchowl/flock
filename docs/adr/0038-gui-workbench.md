@@ -1,6 +1,6 @@
 # ADR-0038: The GUI is a tiled workbench over one wire: a client that holds only presentation state, artifacts in opaque-origin sandboxes with feedback through questions, and goals and work as records on the same log
 
-- Status: Proposed; the §11 owner decisions 1–11 were taken on 2026-10-16 and 2026-10-17 (recorded on #1591), 12–15 (§5b) on 2026-10-19 (recorded on #1717), 16–17 on 2026-10-25 (recorded on #1601 and #1598), and 18 on 2026-10-26 (recorded on #2500 and #2489)
+- Status: Proposed; the artifact contract and its exact defaults await the single owner decision in [the artifact amendment](0038-gui/artifact-contract.md#1-the-single-owner-decision-q1); the §11 owner decisions 1–11 were taken on 2026-10-16 and 2026-10-17 (recorded on #1591), 12–15 (§5b) on 2026-10-19 (recorded on #1717), 16–17 on 2026-10-25 (recorded on #1601 and #1598), and 18 on 2026-10-26 (recorded on #2500 and #2489)
 - Date: 2026-10-15, amended 2026-10-16 (#1606; then #1641: the client side of ADR-0036 §5a's transport recovery), 2026-10-18 (#1717: §5b, question threads), 2026-10-25 (#1601: §6 shell tokens and origins; #1598: §7a–§7f artifact lifecycle; #2443: §7 residuals), and 2026-10-26 (#2500: §6 the local shell bridges `/v1/ws` over the server's unix socket `flock-ws.sock`; #2489: the app-session TTL clock)
 - Issues: [#1307](https://github.com/gerchowl/flock/issues/1307) (ADR-0036 slices), [#1310](https://github.com/gerchowl/flock/issues/1310), [#1323](https://github.com/gerchowl/flock/issues/1323) (superseded by the vigil decision), [#1614](https://github.com/gerchowl/flock/issues/1614), [#1380](https://github.com/gerchowl/flock/issues/1380), [#1401](https://github.com/gerchowl/flock/issues/1401), [#1402](https://github.com/gerchowl/flock/issues/1402), [#1546](https://github.com/gerchowl/flock/issues/1546) (settled by ADR-0036 §5a), [#1641](https://github.com/gerchowl/flock/issues/1641), [#1076](https://github.com/gerchowl/flock/issues/1076), [#1717](https://github.com/gerchowl/flock/issues/1717) (question threads, §5b), [#1719](https://github.com/gerchowl/flock/issues/1719), [#1673](https://github.com/gerchowl/flock/issues/1673), [#2500](https://github.com/gerchowl/flock/issues/2500) (the local shell's unix-socket bridge), [#2489](https://github.com/gerchowl/flock/issues/2489) (the TTL clock)
 - Builds on: ADR-0036 §5–§8, §10a, §12 (wire contract, generated types, reference client, unknown events, collapsible turns, reserved extension points); ADR-0011 (conversation-first GUI, Accepted, not built); ADR-0012 (read model); ADR-0026 (mesh); ADR-0027 (delegate edges); ADR-0030 and ADR-0031 (goals); ADR-0034 (question routing); ADR-0035 (repo owner)
@@ -773,6 +773,8 @@ Siblings keep their IDs and cursors.
 
 ### 7. Artifacts, and the artifact MCP
 
+**Artifact amendment (Proposed, #1598).** [The artifact contract annex](0038-gui/artifact-contract.md) answers the storage, custody, visibility and bounded-read questions left by these sketches. On acceptance, its explicit contracts take precedence over the artifact sketches in §§5 and 7–7f. Its [single owner decision](0038-gui/artifact-contract.md#1-the-single-owner-decision-q1) lists every default. This does not mark any section Accepted.
+
 An **artifact** is agent-authored content that a person looks at and answers: an HTML report, a plot, a diagram or a rendered table. It is versioned and immutable per version. It is also untrusted (ADR-0011 §5).
 
 **Publishing (MCP).** These tools are in the flock MCP for `pty` and `structured` agents. They are pre-allowed in the structured launch profile beside `flock_question_ask` (ADR-0036 S6c).
@@ -856,14 +858,14 @@ When a hold ends, the artifact follows the persistent idle rule from that moment
 
 **Pinning.**
 - A person pins or unpins through a client token with `answer` or `operate` scope, or through the local CLI. This is recorded as `artifact.pinned` / `artifact.unpinned`.
-- Agents cannot pin.
+- Attested agent/MCP authority alone cannot pin. The proposed [scope clarification](0038-gui/artifact-contract.md#6-visibility-scopes-and-blob-reads-q6), following #2585, permits an explicitly delegated `answer` or `operate` credential to perform that named action without inventing roles.
 - Only an explicit operator purge removes a pinned artifact.
 
 **Purge is a record, not a hole.**
 - Every removal writes `artifact.purged { artifact_id, version?, reason: idle | session_end | quota | operator | blob_missing }`.
 - The records, comments and questions stay. The tile shows "content expired". An open question about a purged artifact stays open and answerable, and its card says the content expired.
 - **What an operator purge removes.**
-  - It also removes every anchor excerpt for the purged versions: the `quote.exact`, `prefix` and `suffix` of §7d are replaced by `[purged]`, so no text of the content survives.
+  - It also removes every anchor excerpt for the purged versions: the `quote.exact`, `prefix` and `suffix` of §7d are replaced by `[purged]`, so the server no longer serves those anchor excerpt fields. The proposed [annotation-sidecar and reader-fence protocol](0038-gui/artifact-contract.md#5-bounded-reads-retention-and-purge-privacy-q5) removes them without rewriting unrelated log history; separately copied comment prose, transcripts and client-held content are outside this targeted purge.
   - Automatic purges (idle, session_end, quota, blob_missing) keep the excerpts, as part of the comments.
 - **Purge versus deduplication.** A purge drops **this version's reference** to its blob. The bytes are removed only when no record references them (§7c). Identical content that a stream line also holds stays, as part of that line. A purge therefore removes the artifact, not every copy of its bytes; erasing those is S16's retention work.
 - **A §5b fork** that is asked about a purged artifact reads the `artifact.purged` record, not the content.
@@ -1048,6 +1050,10 @@ A refused call is never retried automatically by the parent.
 - **Quota pressure.** The 80 % and 100 % notices are emitted. The total quota evicts only the publisher's own versions, and then refuses with `later`.
 - **Migration.** A sweep during an in-progress migration skips that blob. A failed hash verification refuses the pin and leaves the blob whole.
 - **Viewing lease.** It lapses without a heartbeat and at 8 h, at most 8 are held per principal, and a held version's bytes still count against its publisher's quota. An operator lease renewed past 8 h of total viewing still holds the version, and the version is not evicted. A non-operator principal re-leasing past its 8 h budget on a version neither holds it nor resets its idle clock.
+
+### 7g. Concrete artifact contract and implementation plan (#1598)
+
+The proposed [artifact amendment](0038-gui/artifact-contract.md) gives full schema-versioned records and commands (Q2), shared reference accounting and crash recovery (Q3), version-cap eligibility (Q4), bounded paging and retention (Q5), independent scope authority and blob reads (Q6), durable comment custody (Q7), origin-qualified ids with carriage deferred to #1602 (Q8), and G6/G7 ownership (Q9). It includes a pre-mortem and the updated ten-slice plan, each at most 400 production lines. One explicit owner acceptance of that annex and the named artifact sections resolves Q1; publishing this proposal does not resolve the gate.
 
 ### 8. Goals and work
 
