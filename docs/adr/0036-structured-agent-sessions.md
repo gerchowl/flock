@@ -4320,8 +4320,9 @@ UID-only Operator context without reserving or closing the exact live request.
 ### Amendment: S10d2 current-draft submission
 
 Enter without a selected control submits the current composer; Tab/Shift-Tab and
-Enter continue to activate painted controls. Empty or whitespace-only drafts refuse
-with `invalid_params` before admission. A stale draft or generation refuses
+Enter continue to activate painted controls. S10d2 adds no native Escape binding;
+navigation continues through the existing App routing. Empty or whitespace-only
+drafts refuse with `invalid_params` before admission. A stale draft or generation refuses
 before admission. Send uses the existing durable queue owner as interactive Operator,
 never raw stdin. One in-flight ticket per view prevents duplicate clicks. Only the
 exact committed draft is cleared; refusal or uncertainty retains it, and unknown

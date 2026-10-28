@@ -1105,8 +1105,9 @@ async fn public_native_enter_submits_current_draft_once_without_terminal_bytes()
     assert!(fixture.app.native_submissions.is_empty());
 }
 
+// Regression coverage for S10d2b (#2683), already present before S10d2c.
 #[tokio::test]
-async fn public_native_mouse_uses_painted_fold_and_rejects_stale_hits() {
+async fn regression_public_native_mouse_uses_painted_fold_and_rejects_stale_hits() {
     use crate::structured::view::contracts::Action;
     use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     let _guard = crate::config::test_config_env_guard();
@@ -1194,4 +1195,145 @@ async fn public_native_mouse_uses_painted_fold_and_rejects_stale_hits() {
     assert!(fixture.app.state.workspaces[0].tabs[0]
         .native_views
         .contains_key(&pane_id));
+}
+
+// S10d3 owns editing. Replace only the draft/frame while retaining the real
+// socket-started agent, canonical generation and publication sources.
+fn seed_native_draft(
+    fixture: &mut AdmissionFixture,
+    id: &str,
+    generation: u64,
+    text: &str,
+    cursor: usize,
+    pending: bool,
+) {
+    use crate::structured::{
+        launch::PermissionMode,
+        view::{
+            contracts::{Admission, Composer},
+            driver::Driver,
+            Target,
+        },
+    };
+    let mut stream = fixture
+        .app
+        .open_structured_view(
+            Target {
+                agent_id: id.into(),
+                generation,
+            },
+            PermissionMode::Default,
+        )
+        .unwrap();
+    stream.model.snapshot.composer = Composer {
+        text: text.into(),
+        cursor,
+    };
+    if pending {
+        stream.model.snapshot.admission = Admission::Pending;
+    }
+    fixture.app.structured_views.insert(
+        id.into(),
+        Driver::new(stream, fixture.app.render_notify.clone()),
+    );
+    fixture.app.sync_structured_views();
+    fixture.app.state.mode = crate::app::Mode::Terminal;
+}
+fn native_enter(fixture: &mut AdmissionFixture) {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    fixture
+        .app
+        .handle_terminal_key_headless(crate::input::TerminalKey::new(
+            KeyCode::Enter,
+            KeyModifiers::empty(),
+        ));
+}
+
+#[tokio::test]
+async fn public_native_unknown_admission_keeps_draft_and_refuses_next_enter() {
+    use crate::{api::error_code::ErrorCode, structured::view::contracts::Admission};
+    let _guard = crate::config::test_config_env_guard();
+    let mut fixture = AdmissionFixture::new("init-socket-null", 5000);
+    let (id, generation) = fixture.start().await;
+    let text = "uncertain draft";
+    seed_native_draft(&mut fixture, &id, generation, text, text.len(), false);
+    native_enter(&mut fixture);
+    // Lose completion routing after enqueue, before the App consumes the owner
+    // acknowledgement. The ticket disconnects; durable work is not cancelled.
+    fixture.app.structured_sends = Default::default();
+    fixture.app.sync_structured_views();
+    native_enter(&mut fixture);
+    assert_eq!(
+        fixture.app.state.toast.as_ref().map(|t| t.context.as_str()),
+        Some(ErrorCode::InputWriteUnknown.as_str())
+    );
+    let wake = fixture.app.render_notify.clone();
+    crate::structured::workers::tests::wait(&wake, || {
+        fixture.app.service_structured_workers(Instant::now());
+        matches!(fixture.app.state.native_frames.get(&id), Some(Ok(f))
+            if matches!(f.admission, Admission::Refused(ErrorCode::InputWriteUnknown))
+                && f.queue.iter().any(|i| i.body == text))
+    })
+    .await;
+    native_enter(&mut fixture);
+    assert_eq!(
+        fixture.app.state.toast.as_ref().unwrap().context,
+        ErrorCode::InputWriteUnknown.as_str()
+    );
+    let frame = fixture.app.state.native_frames[&id].as_ref().unwrap();
+    assert_eq!(frame.composer.text, text);
+    assert_eq!(frame.composer.cursor, text.len());
+    assert_eq!(frame.queue.iter().filter(|i| i.body == text).count(), 1);
+    assert!(fixture.app.state.terminals.is_empty());
+}
+
+async fn public_native_changed_draft_survives_clear(text_changed: bool) {
+    use crate::structured::view::contracts::Admission;
+    let _guard = crate::config::test_config_env_guard();
+    let mut fixture = AdmissionFixture::new("init-socket-null", 5000);
+    let (id, generation) = fixture.start().await;
+    let original = "submitted draft";
+    seed_native_draft(
+        &mut fixture,
+        &id,
+        generation,
+        original,
+        original.len(),
+        false,
+    );
+    native_enter(&mut fixture);
+    native_enter(&mut fixture);
+    assert_eq!(
+        fixture.app.state.toast.as_ref().map(|t| t.context.as_str()),
+        Some(crate::api::error_code::ErrorCode::SessionBusy.as_str())
+    );
+    let (changed, cursor) = if text_changed {
+        ("newer draft", 11)
+    } else {
+        (original, 0)
+    };
+    // The operator's newer editor cut arrives while the durable ticket is pending.
+    // Preserve Pending so Ready proves the real ticket's completion was applied.
+    seed_native_draft(&mut fixture, &id, generation, changed, cursor, true);
+    let wake = fixture.app.render_notify.clone();
+    crate::structured::workers::tests::wait(&wake, || {
+        fixture.app.service_structured_workers(Instant::now());
+        matches!(fixture.app.state.native_frames.get(&id), Some(Ok(f))
+            if matches!(f.admission, Admission::Ready)
+                && f.queue.iter().any(|i| i.body == original))
+    })
+    .await;
+    let frame = fixture.app.state.native_frames[&id].as_ref().unwrap();
+    assert_eq!(frame.composer.text, changed);
+    assert_eq!(frame.composer.cursor, cursor);
+    assert_eq!(frame.queue.iter().filter(|i| i.body == original).count(), 1);
+    assert!(fixture.app.state.terminals.is_empty());
+}
+#[tokio::test]
+async fn public_native_changed_text_is_not_cleared_after_admission() {
+    public_native_changed_draft_survives_clear(true).await;
+}
+#[tokio::test]
+async fn public_native_changed_cursor_is_not_cleared_after_admission() {
+    public_native_changed_draft_survives_clear(false).await;
 }

@@ -125,7 +125,6 @@ impl App {
                         self.structured_error(code);
                     }
                 }
-                KeyCode::Esc => self.state.mode = Mode::Navigate,
                 KeyCode::Enter => {
                     if let Some(&(x, y)) = positions.get(selected) {
                         self.activate_native(id, x, y);
