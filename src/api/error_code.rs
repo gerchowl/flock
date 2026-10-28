@@ -9,16 +9,22 @@
 use crate::cli::exit::{self, Retry};
 
 macro_rules! error_codes {
-    ($($retry:ident: $($variant:ident = $code:literal),+;)*) => {
+    ($($retry:ident: $($(#[doc = $doc:literal])* $variant:ident = $code:literal),+;)*) => {
         #[derive(Clone, Copy, Debug, PartialEq, Eq)]
         #[cfg_attr(not(test), allow(dead_code))]
         pub(crate) enum ErrorCode {
-            $($($variant,)+)*
+            $($($(#[doc = $doc])* $variant,)+)*
         }
 
         #[cfg_attr(not(test), allow(dead_code))]
         impl ErrorCode {
             pub(crate) const ALL: &'static [ErrorCode] = &[$($(ErrorCode::$variant,)+)*];
+
+            // Generated beside the variants so documentation stays attached structurally.
+            #[cfg(test)]
+            const DOCUMENTATION: &'static [(ErrorCode, &'static [&'static str])] = &[
+                $($((ErrorCode::$variant, &[$($doc,)*]),)+)*
+            ];
 
             pub(crate) const fn as_str(self) -> &'static str {
                 match self {
@@ -176,7 +182,7 @@ error_codes! {
         PermissionRequestUnknown = "permission_request_unknown",
         PermissionRequestClosed = "permission_request_closed",
         PeerProcessChanged = "peer_process_changed",
-        // Retained for compatibility with runtimes predating session grants.
+        /// Retained for compatibility with runtimes predating session grants.
         PermissionDecisionUnsupported = "permission_decision_unsupported",
         OriginMismatch = "origin_mismatch",
         OwnerPolicyChanged = "owner_policy_changed",
@@ -327,18 +333,9 @@ error_codes! {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn compatibility_note_belongs_to_the_unsupported_permission_decision() {
-        let lines: Vec<_> = include_str!("error_code.rs").lines().collect();
-        assert!(lines.windows(2).any(|pair| {
-            pair[0].trim()
-                == "// Retained for compatibility with runtimes predating session grants."
-                && pair[1]
-                    .trim()
-                    .starts_with("PermissionDecisionUnsupported =")
-        }));
-    }
     use super::ErrorCode;
+
+    mod compatibility;
 
     #[test]
     fn unreachable_checkout_requires_recovery_not_force() {

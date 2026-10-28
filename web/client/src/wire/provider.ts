@@ -35,10 +35,13 @@
  *   message is {@link ShellTokens.notice}, and the reactive path takes over
  *   when the server ends the token. Without `expiresInMs` there is no timer.
  * - One call at a time: a request while one is in flight, or waiting, is
- *   the same request. A request skipped for the call in flight (a re-mint
+ *   the same request. A request skipped for the wait or call in flight (a re-mint
  *   after an end, or a bridged reconnect's session) is owed: when the call
  *   settles and the state still needs it, a value counts as that call, and a
- *   failure issues it at once, on its own streak delay.
+ *   failure issues it on its own streak delay. A request coalesced with a
+ *   wait keeps that wait's due time even if renewal cancels it. There is one
+ *   owed slot: the latest request kind wins, its due time is the maximum of
+ *   all coalesced waits, and `stillNeeded` decides whether it is served.
  * - Its token goes to the connection with `setToken`, which connects only
  *   from NeedsToken; after a Disconnect it is kept for the next Connect.
  * - A rejection, a synchronous throw or a value that is not a
@@ -174,14 +177,18 @@ export function driveBridge(connection: WireConnection, openBridge: OpenBridge, 
 
 function driveShell<T>(connection: WireConnection, source: Source<T>, clock: Clock, random: () => number, changed: () => void): ShellTokens {
   let inFlight = false;
-  let waiting: TimerHandle | null = null;
+  let waiting: { readonly timer: TimerHandle; readonly due: number } | null = null;
   let renewal: TimerHandle | null = null;
   /** The current bearer's renewal time on the monotonic clock, or null for none. */
   let due: number | null = null;
   /** The current bearer's renewal was asked for: it is not asked again, even when a reconnect reports its lifetime. */
   let spent = false;
-  /** A request skipped for the call in flight, with its delay. */
-  let owed: { readonly kind: "mint" | "reconnect"; readonly delay: number } | null = null;
+  /** One slot, merged by owe; stillNeeded decides at settlement. */
+  let owed: { readonly kind: "mint" | "reconnect"; readonly due: number } | null = null;
+  /** Latest kind wins; neither a newer request nor cancellation shortens a wait. */
+  const owe = (kind: "mint" | "reconnect", at: number): void => {
+    owed = { kind, due: Math.max(at, waiting?.due ?? at, owed?.due ?? at) };
+  };
   let error: string | null = null;
   let notice: string | null = null;
   let disposed = false;
@@ -194,6 +201,10 @@ function driveShell<T>(connection: WireConnection, source: Source<T>, clock: Clo
 
   const cancel = (timer: TimerHandle | null): null => {
     if (timer !== null) clock.clearTimeout(timer);
+    return null;
+  };
+  const cancelWaiting = (): null => {
+    if (waiting !== null) clock.clearTimeout(waiting.timer);
     return null;
   };
   const running = (): boolean => connection.state !== "NeedsToken" && connection.state !== "Disconnected";
@@ -241,7 +252,12 @@ function driveShell<T>(connection: WireConnection, source: Source<T>, clock: Clo
   const call = (kind: "renew" | "mint" | "reconnect"): void => {
     if (inFlight || disposed) return;
     const renewing = kind === "renew";
-    waiting = null;
+    if (waiting !== null) {
+      // Only renewal interrupts a wait: request queues competitors, timer callbacks
+      // clear waiting first. running excludes NeedsToken, so the old mint is obsolete.
+      // Any later demand enters owed through request, already keeping the max due.
+      waiting = cancelWaiting();
+    }
     inFlight = true;
     if (renewing) spent = true;
     else error = null;
@@ -267,7 +283,10 @@ function driveShell<T>(connection: WireConnection, source: Source<T>, clock: Clo
         // A failed renewal's notice stands until a new bearer: a reconnect's session runs on the same one.
         if (!kept) notice = null;
         adopt(token, kept);
-      } else if (renewing && skipped !== null && stillNeeded(skipped.kind)) request(skipped.delay, skipped.kind);
+      } else if (renewing && skipped !== null && stillNeeded(skipped.kind)) {
+        const delay = Math.max(0, skipped.due - clock.now());
+        request(delay, skipped.kind);
+      }
       changed();
     };
     Promise.resolve(renewing)
@@ -284,14 +303,20 @@ function driveShell<T>(connection: WireConnection, source: Source<T>, clock: Clo
   /** Whether the state still needs a skipped request: a reconnect waiting for its session, or a re-mint in NeedsToken. */
   const stillNeeded = (kind: "mint" | "reconnect"): boolean => (kind === "reconnect" ? connection.awaitingSession : connection.state === "NeedsToken" && error === null);
   const request = (delay: number, kind: "mint" | "reconnect"): void => {
-    if (disposed || waiting !== null) return;
-    if (inFlight) {
-      owed = { kind, delay };
+    if (disposed) return;
+    // A renewal can run before a waiting mint; it must inherit this request too.
+    if (inFlight || waiting !== null) {
+      owe(kind, clock.now() + delay);
       return;
     }
     if (delay === 0) call(kind);
     else {
-      waiting = clock.setTimeout(() => call(kind), delay);
+      const due = clock.now() + delay;
+      const timer = clock.setTimeout(() => {
+        waiting = null;
+        call(kind);
+      }, delay);
+      waiting = { timer, due };
       changed();
     }
   };
@@ -315,7 +340,8 @@ function driveShell<T>(connection: WireConnection, source: Source<T>, clock: Clo
     }
     if (state === "Disconnected") {
       const armed = waiting !== null || renewal !== null;
-      waiting = cancel(waiting);
+      waiting = cancelWaiting();
+      owed = null;
       forget();
       if (armed) changed();
     }
@@ -348,7 +374,7 @@ function driveShell<T>(connection: WireConnection, source: Source<T>, clock: Clo
       changed();
     },
     ask() {
-      waiting = cancel(waiting);
+      waiting = cancelWaiting();
       streak = 0;
       error = null;
       request(0, "mint");
@@ -357,7 +383,9 @@ function driveShell<T>(connection: WireConnection, source: Source<T>, clock: Clo
     dispose() {
       disposed = true;
       stop();
-      waiting = cancel(waiting);
+      waiting = cancelWaiting();
+      // Release the record; the disposed guard already makes this work unobservable.
+      owed = null;
       forget();
     },
   };
