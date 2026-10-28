@@ -190,6 +190,12 @@ pub(crate) fn permission(s: &Snapshot, area: Rect) -> Panel {
 pub(crate) fn composer(s: &Snapshot, area: Rect) -> Panel {
     let mut p = Panel::default();
     p.text(preview(area), format!("> {}", s.composer.text));
+    if area.height >= 4 && area.width > 0 {
+        p.hits.push((
+            preview(area),
+            Action::EditComposer(crate::structured::view::editor::Edit::Focus),
+        ));
+    }
     let status = match &s.admission {
         Admission::Ready => "ready".into(),
         Admission::Pending => "pending; retain draft".into(),

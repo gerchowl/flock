@@ -1,4 +1,4 @@
-//! S10d2: native controls never become terminal bytes. Text/paste edits are S10d3.
+//! Native controls and D3a text edits remain typed; no terminal-byte fallback.
 use super::*;
 use crate::{
     api::error_code::ErrorCode,
@@ -18,6 +18,23 @@ impl App {
             .get(&id)?
             .target()
             .cloned()
+    }
+    fn native_input_target(&self) -> Option<(PaneId, Target)> {
+        let id = self
+            .state
+            .active
+            .and_then(|i| self.state.workspaces.get(i))?
+            .focused_pane_id()?;
+        Some((id, self.native_target(id)?))
+    }
+    pub(super) fn refuse_structured_paste(&mut self) -> bool {
+        if self.state.visible_float_for_active_workspace().is_some()
+            || self.native_input_target().is_none()
+        {
+            return false;
+        }
+        self.structured_error(ErrorCode::InvalidParams);
+        true
     }
     fn structured_error(&mut self, code: ErrorCode) {
         self.state.toast = Some(crate::app::state::ToastNotification {
@@ -44,17 +61,15 @@ impl App {
     }
     /// Consume native input only after float, global command and prefix routing.
     pub(super) fn handle_structured_key(&mut self, key: TerminalKey) -> bool {
-        let Some(id) = self
-            .state
-            .active
-            .and_then(|i| self.state.workspaces.get(i))
-            .and_then(|w| w.focused_pane_id())
-        else {
+        let Some((id, target)) = self.native_input_target() else {
             return false;
         };
-        let Some(target) = self.native_target(id) else {
-            return false;
-        };
+        // Repeat Enter must stop before Submit AND painted-control activation.
+        if key.kind == crossterm::event::KeyEventKind::Release
+            || (key.code == KeyCode::Enter && key.kind == crossterm::event::KeyEventKind::Repeat)
+        {
+            return true;
+        }
         if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('w') {
             if let Err(code) = self.dispatch_native_intent(
                 id,
@@ -101,6 +116,24 @@ impl App {
                             0
                         },
                     ));
+                }
+                KeyCode::Char(_) | KeyCode::Backspace | KeyCode::Left | KeyCode::Right => {
+                    use crate::structured::view::editor::Edit;
+                    let edit = match key.code {
+                        KeyCode::Char(c) => Edit::Insert(c),
+                        KeyCode::Backspace => Edit::Backspace,
+                        KeyCode::Left => Edit::Left,
+                        _ => Edit::Right,
+                    };
+                    if let Err(code) = self.dispatch_native_intent(
+                        id,
+                        Intent {
+                            target,
+                            action: Action::EditComposer(edit),
+                        },
+                    ) {
+                        self.structured_error(code);
+                    }
                 }
                 KeyCode::Enter if selection.is_none() => {
                     let draft = self

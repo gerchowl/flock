@@ -12,6 +12,13 @@ root = Path(os.environ["HOME"])
 if sys.argv[1:] == ["--version"]:
     print("2.1.296 (Claude Code)")
     sys.exit(0)
+# Composer tests need a ready fake session; queue admission is observed separately.
+if "--model" in sys.argv and sys.argv[sys.argv.index("--model") + 1] == "fixture-worker-model":
+    init = json.loads((root / "restricted-init.json").read_text())
+    init["session_id"] = sys.argv[sys.argv.index("--session-id") + 1]
+    print(json.dumps(init), flush=True)
+    sys.stdin.read()
+    sys.exit(0)
 # Explicit test-only model selects partial streaming; ordinary launches bypass this.
 if "--model" in sys.argv and sys.argv[sys.argv.index("--model") + 1].startswith("s10b-live"):
     mode = sys.argv[sys.argv.index("--model") + 1]

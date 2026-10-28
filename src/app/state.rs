@@ -2255,7 +2255,9 @@ pub struct AppState {
     pub structured_agents: crate::structured::registry::Registry,
     /// Immutable presentation data only; subscriptions and tasks belong to App.
     pub(crate) native_control: Option<(crate::structured::view::Target, usize)>,
+    /// Pure draft authorities, each scoped to one App-owned driver lifetime.
     pub(crate) native_editors: HashMap<String, crate::structured::view::editor::EditorState>,
+    /// Checked App-wide counter shared by editor creation and actual text changes.
     pub(crate) native_text_revision: u64,
     pub(crate) native_frames: HashMap<String, crate::structured::view::driver::Published>,
     pub terminals:

@@ -109,8 +109,11 @@ impl App {
                     .get_mut(&target.agent_id)
                     .ok_or(ErrorCode::AgentNotFound)?;
                 editor.cut.receipt = Some(ticket.item_id.clone());
-                if let Err(code) =
-                    self.structured_views[&target.agent_id].editor(editor.cut.clone())
+                if let Err(code) = self
+                    .structured_views
+                    .get(&target.agent_id)
+                    .ok_or(ErrorCode::AgentNotFound)
+                    .and_then(|driver| driver.editor(editor.cut.clone()))
                 {
                     tracing::warn!(code = code.as_str(), "native admission view retired");
                 }
@@ -133,7 +136,14 @@ impl App {
                     .get_mut(&target.agent_id)
                     .ok_or(ErrorCode::AgentNotFound)?;
                 editor.cut.admission = Admission::Refused(code);
-                self.structured_views[&target.agent_id].editor(editor.cut.clone())?;
+                if let Err(projection) = self
+                    .structured_views
+                    .get(&target.agent_id)
+                    .ok_or(ErrorCode::AgentNotFound)
+                    .and_then(|driver| driver.editor(editor.cut.clone()))
+                {
+                    tracing::warn!(code = projection.as_str(), "native admission view retired");
+                }
                 Err(code)
             }
         }

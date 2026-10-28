@@ -1037,7 +1037,7 @@ async fn public_native_enter_submits_current_draft_once_without_terminal_bytes()
     let mut fixture = AdmissionFixture::new("init-socket-null", 5000);
     let (id, generation) = fixture.start().await;
     let text = "MVP 中文 e\u{301}\nnext";
-    seed_native_draft(&mut fixture, &id, generation, text, text.len(), false);
+    seed_native_draft(&mut fixture, &id, generation, text, text.len());
     fixture.app.state.mode = crate::app::Mode::Terminal;
     crate::ui::compute_view_with_runtime_registry(
         &mut fixture.app.state,
@@ -1181,7 +1181,6 @@ fn seed_native_draft(
     generation: u64,
     text: &str,
     cursor: usize,
-    _pending: bool,
 ) {
     use crate::structured::view::{editor::Edit, Target};
     fixture.app.sync_structured_views();
@@ -1227,7 +1226,7 @@ async fn public_native_unknown_admission_keeps_draft_and_refuses_next_enter() {
     let mut fixture = AdmissionFixture::new("init-socket-null", 5000);
     let (id, generation) = fixture.start().await;
     let text = "uncertain draft";
-    seed_native_draft(&mut fixture, &id, generation, text, text.len(), false);
+    seed_native_draft(&mut fixture, &id, generation, text, text.len());
     native_enter(&mut fixture);
     // Lose completion routing after enqueue, before the App consumes the owner
     // acknowledgement. The ticket disconnects; durable work is not cancelled.
@@ -1264,14 +1263,7 @@ async fn public_native_changed_draft_survives_clear(text_changed: bool) {
     let mut fixture = AdmissionFixture::new("init-socket-null", 5000);
     let (id, generation) = fixture.start().await;
     let original = "submitted draft";
-    seed_native_draft(
-        &mut fixture,
-        &id,
-        generation,
-        original,
-        original.len(),
-        false,
-    );
+    seed_native_draft(&mut fixture, &id, generation, original, original.len());
     native_enter(&mut fixture);
     native_enter(&mut fixture);
     assert_eq!(
@@ -1285,7 +1277,7 @@ async fn public_native_changed_draft_survives_clear(text_changed: bool) {
     };
     // The operator's newer editor cut arrives while the durable ticket is pending.
     // Preserve Pending so Ready proves the real ticket's completion was applied.
-    seed_native_draft(&mut fixture, &id, generation, changed, cursor, true);
+    seed_native_draft(&mut fixture, &id, generation, changed, cursor);
     let wake = fixture.app.render_notify.clone();
     crate::structured::workers::tests::wait(&wake, || {
         fixture.app.service_structured_workers(Instant::now());
@@ -1315,7 +1307,7 @@ async fn d3a1_cursor_preserves_revision_and_painted_send() {
     let _guard = crate::config::test_config_env_guard();
     let mut fixture = AdmissionFixture::new("init-socket-null", 5000);
     let (id, generation) = fixture.start().await;
-    seed_native_draft(&mut fixture, &id, generation, "hello", 5, false);
+    seed_native_draft(&mut fixture, &id, generation, "hello", 5);
     let target = Target {
         agent_id: id.clone(),
         generation,
@@ -1341,9 +1333,9 @@ async fn d3a1_ack_clears_after_cursor_move() {
     let _guard = crate::config::test_config_env_guard();
     let mut fixture = AdmissionFixture::new("init-socket-null", 5000);
     let (id, generation) = fixture.start().await;
-    seed_native_draft(&mut fixture, &id, generation, "hello", 5, false);
+    seed_native_draft(&mut fixture, &id, generation, "hello", 5);
     native_enter(&mut fixture);
-    // The App has not consumed the real journal owner's acknowledgement.
+    let (ack, release) = hold_native_ack(&mut fixture, &id, generation).await;
     fixture
         .app
         .edit_native(
@@ -1354,6 +1346,7 @@ async fn d3a1_ack_clears_after_cursor_move() {
             Edit::Left,
         )
         .unwrap();
+    release.send(ack).unwrap();
     let wake = fixture.app.render_notify.clone();
     crate::structured::workers::tests::wait(&wake, || {
         fixture.app.service_structured_workers(Instant::now());
@@ -1376,7 +1369,7 @@ async fn d3a1_aba_revision_survives_ack() {
     let _guard = crate::config::test_config_env_guard();
     let mut fixture = AdmissionFixture::new("init-socket-null", 5000);
     let (id, generation) = fixture.start().await;
-    seed_native_draft(&mut fixture, &id, generation, "hello", 5, false);
+    seed_native_draft(&mut fixture, &id, generation, "hello", 5);
     let before = fixture.app.state.native_editors[&id]
         .cut
         .composer
@@ -1425,8 +1418,47 @@ async fn d3a1_stale_painted_send_refuses_aba() {
     let _guard = crate::config::test_config_env_guard();
     let mut fixture = AdmissionFixture::new("init-socket-null", 5000);
     let (id, generation) = fixture.start().await;
-    seed_native_draft(&mut fixture, &id, generation, "hello", 5, false);
-    let old = fixture.app.state.native_editors[&id].cut.composer.clone();
+    seed_native_draft(&mut fixture, &id, generation, "hello", 5);
+    let wake = fixture.app.render_notify.clone();
+    crate::structured::workers::tests::wait(&wake, || {
+        fixture.app.service_structured_workers(Instant::now());
+        fixture.app.state.native_frames[&id]
+            .as_ref()
+            .is_ok_and(|f| {
+                f.composer.text_revision
+                    == fixture.app.state.native_editors[&id]
+                        .cut
+                        .composer
+                        .text_revision
+            })
+    })
+    .await;
+    crate::ui::compute_view_with_runtime_registry(
+        &mut fixture.app.state,
+        &fixture.app.terminal_runtimes,
+        ratatui::layout::Rect::new(0, 0, 100, 40),
+    );
+    let pane_id = fixture.app.state.workspaces[0].focused_pane_id().unwrap();
+    let pane = fixture
+        .app
+        .state
+        .view
+        .structured
+        .remove(&pane_id)
+        .unwrap()
+        .pane
+        .unwrap();
+    let (x, y) = pane
+        .positions()
+        .into_iter()
+        .find(|&(x, y)| {
+            matches!(
+                pane.hit(x, y),
+                Some(crate::structured::view::contracts::Action::Send(_))
+            )
+        })
+        .unwrap();
+    let painted = pane.into_intent(x, y).unwrap();
     let target = Target {
         agent_id: id.clone(),
         generation,
@@ -1434,7 +1466,7 @@ async fn d3a1_stale_painted_send_refuses_aba() {
     fixture.app.edit_native(&target, Edit::Insert('!')).unwrap();
     fixture.app.edit_native(&target, Edit::Backspace).unwrap();
     assert_eq!(
-        fixture.app.submit_native(target, old),
+        fixture.app.dispatch_native_intent(pane_id, painted),
         Err(crate::api::error_code::ErrorCode::InvalidParams)
     );
     assert!(fixture.app.native_submissions.is_empty());
@@ -1442,4 +1474,43 @@ async fn d3a1_stale_painted_send_refuses_aba() {
         fixture.app.state.native_editors[&id].cut.composer.text,
         "hello"
     );
+}
+
+mod composer;
+
+type HeldNativeAck = Result<crate::api::schema::AgentSendResult, crate::api::error_code::ErrorCode>;
+async fn hold_native_ack(
+    f: &mut AdmissionFixture,
+    id: &str,
+    generation: u64,
+) -> (HeldNativeAck, std::sync::mpsc::Sender<HeldNativeAck>) {
+    let receipt = f.app.state.native_editors[id].cut.receipt.as_ref().unwrap();
+    let (held, release) = f
+        .app
+        .structured_sends
+        .intercept_completion(id, generation, receipt)
+        .unwrap();
+    let mut ack = None;
+    let wake = f.app.render_notify.clone();
+    crate::structured::workers::tests::wait(&wake, || {
+        f.app.service_structured_workers(Instant::now());
+        match held.try_recv() {
+            Ok(result) => {
+                ack = Some(result);
+                true
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                panic!("owner completion producer disappeared")
+            }
+        }
+    })
+    .await;
+    let ack = ack.unwrap();
+    assert!(ack.is_ok(), "real owner refused admission: {ack:?}");
+    assert!(
+        f.app.native_submissions.contains_key(id),
+        "held acknowledgement must not settle the ticket"
+    );
+    (ack, release)
 }
