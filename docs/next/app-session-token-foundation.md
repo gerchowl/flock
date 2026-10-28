@@ -136,7 +136,10 @@ exclusive management fence makes hello wait within its original five-second
 deadline, without treating a valid token as an authentication failure. These
 kernel-lock waits have a separate eight-worker budget; only credential I/O and
 registration reserve one of the four shared store-I/O workers. Reconnecting
-hellos cannot consume the workers used by established subscriptions.
+hellos cannot consume the workers used by established subscriptions. When all
+eight lock waiters are released together, registration still competes for only
+four store-I/O slots. A hello that loses that capacity race closes with retryable
+1001; it does not invalidate its credential or close an established socket.
 
 App-session retirement and shutdown also wait outside the shared store-I/O
 pool. They publish revocation intent before acquiring exclusive ownership,
