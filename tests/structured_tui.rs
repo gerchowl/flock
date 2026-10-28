@@ -37,16 +37,18 @@ fn acceptance(permission: bool) {
         "pipes_not_pty",
         "descendants_gone",
         "temporary_removed",
+        "mcp_ignored_eof",
     ] {
         assert_eq!(proof[field], true, "{field}");
     }
+    assert_eq!(proof["permission_allow"], permission);
+    assert_eq!(proof["permission_deny"], permission);
 }
 #[test]
 fn structured_mvp_public_tui_composer_shell_and_stop() {
     acceptance(false);
 }
 #[test]
-#[ignore = "needs S10e (#1430 Q3a)"]
 fn structured_mvp_public_tui_permission_decision() {
     acceptance(true);
 }
