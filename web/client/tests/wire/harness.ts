@@ -34,6 +34,11 @@ export class VirtualClock implements Clock {
     this.#now = start;
   }
 
+  /** Timers still owned by the fixture, including callbacks whose handles were lost. */
+  get pendingTimers(): number {
+    return this.#timers.size;
+  }
+
   now(): number {
     return this.#now;
   }

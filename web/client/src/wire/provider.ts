@@ -29,16 +29,24 @@
  *   it, by one timer, and the connection switches to the new token through
  *   §3's resume path. The timer is armed in steps of at most
  *   {@link MAX_TIMER_DELAY} until the renewal time, so no lifetime is too long.
- *   It is cleared on Disconnect, and it renews only a running session: in
+ *   It is cleared on Disconnect. A late result's deadline waits without a timer
+ *   until Connect resumes it. If a user Disconnect/Connect invalidates an
+ *   in-flight renewal, token mode reuses the old bearer without a new lifetime
+ *   report; its renewal is reactive on an auth end. Bridge mode derives renewal
+ *   from the fresh open's reported remaining lifetime, never the discarded
+ *   result. It renews only a running session: in
  *   NeedsToken (a spent cap included) the reactive path owns the provider.
  *   A failed renewal is not retried; the session stays Live, the shell's
  *   message is {@link ShellTokens.notice}, and the reactive path takes over
  *   when the server ends the token. Without `expiresInMs` there is no timer.
  * - One call at a time: a request while one is in flight, or waiting, is
- *   the same request. A request skipped for the call in flight (a re-mint
+ *   the same request. A request skipped for the wait or call in flight (a re-mint
  *   after an end, or a bridged reconnect's session) is owed: when the call
  *   settles and the state still needs it, a value counts as that call, and a
- *   failure issues it at once, on its own streak delay.
+ *   failure issues it on its own streak delay. A request coalesced with a
+ *   wait keeps that wait's due time even if renewal cancels it. There is one
+ *   owed slot: the latest request kind wins, its due time is the maximum of
+ *   all coalesced waits, and `stillNeeded` decides whether it is served.
  * - Its token goes to the connection with `setToken`, which connects only
  *   from NeedsToken; after a Disconnect it is kept for the next Connect.
  * - A rejection, a synchronous throw or a value that is not a
@@ -46,15 +54,16 @@
  *   retried.
  * - **Bounded re-mints.** Consecutive re-mints back off on §3's reconnect
  *   backoff: the first is immediate, the next ones wait `backoffDelay(0…)`.
- *   After {@link MAX_REMINTS} in a row the provider is not asked again until
- *   the person asks. A session that stayed Live for §3's healthy period (the
- *   one that resets its backoff), or an `ack`ed command since the streak
- *   began, ends the streak.
+ *   After {@link MAX_REMINTS} in a row, pending waits and owed work are cleared:
+ *   unresolved results are discarded until the person asks. Only a user Connect
+ *   starts a fresh streak; internal renewal handoffs preserve it. A session that stayed
+ *   Live for §3's healthy period (the one that resets its backoff), or an
+ *   `ack`ed command since the streak began, ends the streak.
  *
  * @module
  */
 import type { BridgeSession, BridgeSocket, OpenBridge, ShellToken, TokenProvider } from "../config";
-import { DEADLINES, type WireConnection } from "./connection";
+import { DEADLINES, replaceProviderSession, type WireConnection } from "./connection";
 import { backoffDelay, type Clock, type TimerHandle } from "./env";
 
 /**
@@ -174,17 +183,23 @@ export function driveBridge(connection: WireConnection, openBridge: OpenBridge, 
 
 function driveShell<T>(connection: WireConnection, source: Source<T>, clock: Clock, random: () => number, changed: () => void): ShellTokens {
   let inFlight = false;
-  let waiting: TimerHandle | null = null;
+  let waiting: { readonly timer: TimerHandle; readonly due: number } | null = null;
   let renewal: TimerHandle | null = null;
   /** The current bearer's renewal time on the monotonic clock, or null for none. */
   let due: number | null = null;
   /** The current bearer's renewal was asked for: it is not asked again, even when a reconnect reports its lifetime. */
   let spent = false;
-  /** A request skipped for the call in flight, with its delay. */
-  let owed: { readonly kind: "mint" | "reconnect"; readonly delay: number } | null = null;
+  /** One slot, merged by owe; stillNeeded decides at settlement. */
+  let owed: { readonly kind: "mint" | "reconnect"; readonly due: number } | null = null;
+  /** Latest kind wins; neither a newer request nor cancellation shortens a wait. */
+  const owe = (kind: "mint" | "reconnect", at: number): void => {
+    owed = { kind, due: Math.max(at, waiting?.due ?? at, owed?.due ?? at) };
+  };
   let error: string | null = null;
   let notice: string | null = null;
   let disposed = false;
+  /** A cap or explicit Connect invalidates calls admitted in an older epoch. */
+  let capEpoch = 0;
   let streak = 0;
   let acksAtStreak = 0;
   let liveSince: number | null = null;
@@ -194,6 +209,10 @@ function driveShell<T>(connection: WireConnection, source: Source<T>, clock: Clo
 
   const cancel = (timer: TimerHandle | null): null => {
     if (timer !== null) clock.clearTimeout(timer);
+    return null;
+  };
+  const cancelWaiting = (): null => {
+    if (waiting !== null) clock.clearTimeout(waiting.timer);
     return null;
   };
   const running = (): boolean => connection.state !== "NeedsToken" && connection.state !== "Disconnected";
@@ -221,16 +240,16 @@ function driveShell<T>(connection: WireConnection, source: Source<T>, clock: Clo
   const adopt = ({ value, expiresInMs }: { readonly value: T; readonly expiresInMs?: number; readonly fresh?: boolean }, kept: boolean): void => {
     const before = kept ? { due, spent } : { due: null, spent: false };
     const reconnect = running() && !connection.awaitingSession;
-    if (reconnect) connection.disconnect();
-    source.hand(value);
-    if (reconnect) connection.connect();
+    if (reconnect) replaceProviderSession(connection, () => source.hand(value));
+    else source.hand(value);
     renewal = cancel(renewal);
     ({ due, spent } = before);
     if (expiresInMs !== undefined && !spent) {
       const at = clock.now() + Math.floor(expiresInMs * RENEW_AT);
       due = due === null ? at : Math.min(due, at);
     }
-    if (due !== null && !spent) renewAt(due);
+    // A late result may be kept for the next Connect, but Disconnect owns no timers.
+    if (due !== null && !spent && running()) renewAt(due);
   };
   /**
    * One provider call: a `renew`al, a `mint` (a new bearer: the connect from
@@ -241,8 +260,14 @@ function driveShell<T>(connection: WireConnection, source: Source<T>, clock: Clo
   const call = (kind: "renew" | "mint" | "reconnect"): void => {
     if (inFlight || disposed) return;
     const renewing = kind === "renew";
-    waiting = null;
+    if (waiting !== null) {
+      // Only renewal interrupts a wait: request queues competitors, timer callbacks
+      // clear waiting first. running excludes NeedsToken, so the old mint is obsolete.
+      // Any later demand enters owed through request, already keeping the max due.
+      waiting = cancelWaiting();
+    }
     inFlight = true;
+    const admittedEpoch = capEpoch;
     if (renewing) spent = true;
     else error = null;
     changed();
@@ -250,8 +275,16 @@ function driveShell<T>(connection: WireConnection, source: Source<T>, clock: Clo
       inFlight = false;
       const skipped = owed;
       owed = null;
-      if (disposed) {
+      const resumeOwed = (): void => {
+        if (skipped !== null && stillNeeded(skipped.kind)) request(Math.max(0, skipped.due - clock.now()), skipped.kind);
+      };
+      // Discard only this call's obsolete result, preserving a later Connect's work.
+      if (disposed || admittedEpoch !== capEpoch) {
         if (token !== null) source.discard(token.value);
+        if (!disposed) {
+          resumeOwed();
+          changed();
+        }
         return;
       }
       if (renewing && failure !== null) notice = failure;
@@ -267,7 +300,7 @@ function driveShell<T>(connection: WireConnection, source: Source<T>, clock: Clo
         // A failed renewal's notice stands until a new bearer: a reconnect's session runs on the same one.
         if (!kept) notice = null;
         adopt(token, kept);
-      } else if (renewing && skipped !== null && stillNeeded(skipped.kind)) request(skipped.delay, skipped.kind);
+      } else if (renewing) resumeOwed();
       changed();
     };
     Promise.resolve(renewing)
@@ -284,14 +317,20 @@ function driveShell<T>(connection: WireConnection, source: Source<T>, clock: Clo
   /** Whether the state still needs a skipped request: a reconnect waiting for its session, or a re-mint in NeedsToken. */
   const stillNeeded = (kind: "mint" | "reconnect"): boolean => (kind === "reconnect" ? connection.awaitingSession : connection.state === "NeedsToken" && error === null);
   const request = (delay: number, kind: "mint" | "reconnect"): void => {
-    if (disposed || waiting !== null) return;
-    if (inFlight) {
-      owed = { kind, delay };
+    if (disposed) return;
+    // A renewal can run before a waiting mint; it must inherit this request too.
+    if (inFlight || waiting !== null) {
+      owe(kind, clock.now() + delay);
       return;
     }
     if (delay === 0) call(kind);
     else {
-      waiting = clock.setTimeout(() => call(kind), delay);
+      const due = clock.now() + delay;
+      const timer = clock.setTimeout(() => {
+        waiting = null;
+        call(kind);
+      }, delay);
+      waiting = { timer, due };
       changed();
     }
   };
@@ -299,6 +338,9 @@ function driveShell<T>(connection: WireConnection, source: Source<T>, clock: Clo
     if (connection.acks > acksAtStreak) streak = 0;
     if (streak === 0) acksAtStreak = connection.acks;
     if (streak >= MAX_REMINTS) {
+      capEpoch++;
+      waiting = cancelWaiting();
+      owed = null;
       error = REMINTS_SPENT;
       forget();
       return changed();
@@ -307,7 +349,16 @@ function driveShell<T>(connection: WireConnection, source: Source<T>, clock: Clo
     request(streak === 1 ? 0 : backoffDelay(streak - 2, random), "mint");
   };
 
+  const freshEpoch = (): void => {
+    capEpoch++;
+    streak = 0;
+    error = null;
+  };
+  const stopUserConnect = connection.onUserConnect(freshEpoch);
   const stop = connection.onTransition((state) => {
+    // A late result keeps an absolute deadline without owning a timer while
+    // Disconnected. Connect resumes it, immediately if it is already overdue.
+    if (previous === "Disconnected" && running() && due !== null && !spent && renewal === null) renewAt(due);
     if (state === "Live") liveSince = clock.now();
     else if (liveSince !== null) {
       if (clock.now() - liveSince >= DEADLINES.healthy) streak = 0;
@@ -315,18 +366,17 @@ function driveShell<T>(connection: WireConnection, source: Source<T>, clock: Clo
     }
     if (state === "Disconnected") {
       const armed = waiting !== null || renewal !== null;
-      waiting = cancel(waiting);
+      waiting = cancelWaiting();
+      owed = null;
       forget();
       if (armed) changed();
     }
-    // A bridged attempt with no session asks for one: the person's Connect starts a fresh streak.
+    // This transition only requests a session; onUserConnect or ask resets the streak.
     if (state === "Connecting" && connection.awaitingSession) {
-      if (previous === "Disconnected") streak = 0;
       request(0, "reconnect");
     }
     if (state === "NeedsToken" && !refusing) {
       if (previous === "Disconnected") {
-        streak = 0;
         request(0, "mint");
       } else remint();
     }
@@ -348,16 +398,18 @@ function driveShell<T>(connection: WireConnection, source: Source<T>, clock: Clo
       changed();
     },
     ask() {
-      waiting = cancel(waiting);
-      streak = 0;
-      error = null;
+      waiting = cancelWaiting();
+      freshEpoch();
       request(0, "mint");
       changed();
     },
     dispose() {
       disposed = true;
+      stopUserConnect();
       stop();
-      waiting = cancel(waiting);
+      waiting = cancelWaiting();
+      // Release the record; the disposed guard already makes this work unobservable.
+      owed = null;
       forget();
     },
   };
