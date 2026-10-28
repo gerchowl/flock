@@ -13,6 +13,9 @@
   define transport recovery, snapshot bootstrap and `synced` before S7a.
   Numeric parameters in §5a are proposals with rationale for review; no
   transport implementation or deployment decision is claimed.
+- S6e design amendment proposed 2026-10-29 (#2242): recorded owner decisions
+  from #1717 are binding; additional routing/progress choices remain proposed.
+  No question-thread implementation is claimed.
 - Implemented: the S0 probes (#1356); the slices are tracked in #1307.
 - Date: 2026-10-13
 - Issues: #1299 (the spike this records, with the owner decisions of
@@ -666,6 +669,9 @@ of typing into a pane.
 
 ### 2a. Questions do not block, except honest blockers (#1301)
 
+**Historical design:** S6e (#2242) below supersedes the hold check and direct
+fork answer. Its recorded owner decisions govern the next question slices.
+
 A question is a record, not a state the turn waits in, unless the agent has
 nothing else to do.
 
@@ -788,6 +794,9 @@ nothing else to do.
 - **Unknown question shapes** go through §8 like every other unknown event.
 
 ### 2b. Two question channels: stdio first, an MCP tool for richer asks (owner decision 3)
+
+**Historical channel order:** S6e (#2242) below replaces this with one MCP ask
+channel plus conversion of stray stdio calls; the A.13 concurrency limits stand.
 
 Both channels end in the same question record of §2a and the same answer
 verbs; they differ in what the agent can say and in what can block them.
@@ -2443,6 +2452,348 @@ to this record:
 3. **The TUI's text fallback.** Every block kind has a plain-text rendering
    that the TUI shows; a kind without one is not admitted.
 
+### Amendment: S6e — Non-blocking question threads and routing (#2242)
+
+**Design only, post-MVP.** This amendment specifies #1301/#1717, not an
+implemented endpoint. The owner decisions recorded on #1717 and #2242 are
+binding; the additional choices labelled **(Recommended)** below await owner
+acceptance. Implementations must not silently pick another alternative. S6e
+supersedes §2a's System-One hold, §2b's two-channel preference, S6d, and the direct
+fork-to-answer path. Permissions in S6 remain blocking and separate.
+
+#### Recorded decisions and compatibility
+
+Owner decision 15 (typed “y” on #1717, 2026-10-19) retakes decision 3a: the asker
+chooses blocking. Omitted `blocking` means false. `blocking: true` requires
+`blocking_reason`, trimmed UTF-8, 1–512 bytes, one paragraph, checked with
+`prompt_control_bytes`. It is forbidden otherwise. One named schema constant
+owns the bound. Invalid input returns `invalid_params` before recording anything.
+S6d never holds a turn; no model judge may delay, downgrade or override this
+choice. A blocking question may hold its own tool call, never other sessions.
+
+`flock_question_ask` is the one taught question channel, including plain choices.
+The structured launch profile disallows `AskUserQuestion` and pre-allows the MCP
+question tool. A stray stdio question is converted to the same durable,
+non-blocking record and receives §2a/A.12's exact deferral text on the `deny`
+carrier. It is not a permission denial. Compiled context, recap extraction,
+CLI and harness adapters all target this service; a recap question is always
+non-blocking. Deduplicate the observed source/tool-call identity before opening
+anything. Unknown shapes retain their raw record under §8; no invented options.
+An MCP call cannot bypass a permission already open earlier in its message
+(A.13); agents must ask before starting work that may prompt.
+
+The server derives `asked_by` from the structured session lease, or from the
+PTY pane's attested agent attribution. No caller-supplied origin is accepted.
+An anonymous call is refused. The current `questions` policy still constrains
+routing; `deny` stays a refusal. A legacy harness without S6e capability keeps
+its existing adapter contract, visibly reported as legacy, rather than claiming
+non-blocking support. Enabling the S6e profile and service is one rollout gate.
+
+Owner decisions 12–14 require recipient review/edit before applying a proposal,
+durable original and applied texts plus edit attribution, stopping the thread
+fork after a successful merge while retaining its transcript/lineage, and a
+read-only fork through the general S19 permission-tier machinery (#1321).
+No thread-specific permission bypass is introduced.
+
+#### One typed record, with independent question and delivery lifecycles
+
+The following is a schema sketch for Rust types and generated TypeScript,
+not hand-maintained wire declarations. IDs use existing typed identifiers;
+question/proposal revisions and cursors use §6's integer representation.
+
+```text
+QuestionRecord {
+  question_id: QuestionId, content_digest: Sha256, revision: QuestionRevision,
+  asked_by: AgentIdentity, source: QuestionSource,
+  ask_point: Option<MessageBoundary>, source_ref: SourceRef,
+  prompt: BoundedText, context: Option<BoundedMarkdown>, refs: Vec<ContextRef>,
+  options: Vec<QuestionOption>, multi_select: bool, allow_other: bool,
+  blocking: bool, blocking_reason: Option<BlockingReason>,
+  recipient: Recipient, route: RouteReceipt, urgency: Urgency,
+  created_at: Timestamp, expires_at: Option<Timestamp>, state: QuestionState,
+  delivery: Option<DeliveryState>
+}
+QuestionOption { id: OptionId, label: BoundedText, description: Option<BoundedText> }
+Recipient = Operator | Agent(AgentIdentity)
+QuestionSource = Mcp | Session | Recap | Message | Screen
+QuestionState = Pending | Answered(AnswerReceipt)
+              | Superseded(Supersession) | Expired(ExpiryReceipt)
+Answer = Choices { option_ids: Vec<OptionId>, other: Option<BoundedText> }
+       | Text(BoundedText)
+AnswerReceipt { answer_id: AnswerId, by: AuthenticatedPrincipal, answer: Answer,
+                proposal_id: Option<ProposalId>, edited: bool,
+                route_revision: RouteRevision, delivery_id: ItemId }
+DeliveryState = PendingAdmission | Queued(ItemId) | Started(ItemId)
+              | Held(ItemId, DeliveryHold) | Failed(ItemId, DeliveryFailure)
+```
+
+`AgentIdentity` includes the durable agent identity, never its reusable label.
+A process generation pins a held call or operation, not the durable question's
+lifetime. `SourceRef` is a closed source-specific enum, not arbitrary JSON.
+`ContextRef` holds validated blob/file references and no authority. Text, options,
+context and attachment counts have explicit schema bounds before the first
+producer ships. Proposed limits below require owner review, not unlimited input.
+Option IDs are stable, unique within a record; answers use IDs, never label
+matching or key injection. Single-select requires one choice; multi-select
+rejects duplicates and unknown IDs; Other requires `allow_other`. Free-text
+questions accept Text; choice questions accept Choices. A reviewed prose
+proposal for a choice question must still include a valid typed selection.
+
+Keep §2a's canonical content hash and byte-stable rendering across re-asks,
+including its normalization and hash inputs. Persist the full digest and compare
+canonical content: a shortened-ID collision refuses rather than merging two
+questions. A repeated pending ask updates its observation/ask count without a
+new inbox card. Re-asking an answered question returns its recorded answer to
+that tool call (`via: record`), without a second queued reply. Terminal superseded
+or expired records do not reopen; a genuinely changed ask has new content.
+
+Pending may have zero or more threads and proposals: those are separate typed
+records, not extra terminal question states. GUI `open`, `threaded`, `proposed`
+are projections of Pending plus these records. Superseded carries a closed
+reason (`withdrawn`, `subject_replaced`, or an explicit replacement question ID);
+ADR-0028/G5's existing `withdrawn` projection remains compatible. Answered,
+Superseded and Expired are terminal. A compare-and-set on question identity and
+revision lets only the first valid answer/withdrawal/expiry win; stale answers
+return `question_closed` and the current projection, without mutating it.
+
+Recorded questions survive restart and handoff of the same asker. A held tool
+call lost with its process becomes deferred; the record stays Pending and a
+later answer goes through the queue. Identity replacement supersedes it with
+`subject_replaced`, stales every proposal and never retargets the successor.
+Screen-only PTY dialogs keep ADR-0028's withdrawal when the live dialog leaves.
+Durable JSONL is folded leniently under ADR-0028 §3a; unknown records are retained
+raw, logged and skipped. New record kinds require unknown-kind replay coverage.
+Checkpoint writes use temp-file fsync, rename, then directory fsync.
+
+#### Answer custody, idle delivery and crash limits
+
+Every accepted deferred answer owns one stable `AnswerId` and `ItemId`, anchored
+to its question. Persist the answer and a typed delivery obligation together in
+one authoritative append before acknowledging acceptance. The question stream
+cannot atomically append to a second queue file: recovery reconciles that
+obligation with the queue owner's durable idempotency key, rather than assuming
+two writes are a transaction. Admit one authenticated `reply` producer through
+§3's gate, `delivery: at_idle`, under that same key on recovery. Only this slice
+may enable the currently reserved Reply kind (#2364); a raw client naming Reply
+still has no authority to create one. Recipient answering authority authorizes
+this specific reply, not general sends to the asker.
+
+Repeated client commands replay their original receipt. A competing *new* answer
+gets `question_closed`. The delivery receipt appears separately from Answered:
+“answer recorded, delivery pending” is honest even while the queue is busy,
+held, or the agent is offline. Queue-full admission keeps the obligation durable
+and wakes recovery on capacity/readiness; it never silently drops the answer.
+The queue's persisted `command_lifecycle.started` drives one `reply.delivered`
+record, deduplicated by ItemId. A held blocking call, still live, consumes the
+answer once through that call instead; a serialized generation fence chooses
+held delivery OR queued delivery, including a racing runtime exit. If writing
+a held result may already have succeeded, recovery holds it unconfirmed instead
+of automatically falling through to queued delivery.
+
+**Exactly once** means one winning answer, one durable queue item, and one
+observed started receipt. It does not promise exactly-once model execution after
+an uncertain stdin write or exactly-once external side effects. Preserve §3's
+`session_unconfirmed` hold on restart: inspect receipts/transcript and require
+explicit recovery, never reissue a fresh reply identity to resolve uncertainty.
+A replaced asker fails the obligation visibly. A stopped asker keeps it pending
+for the same identity's restart; closing the question does not erase delivery.
+
+Render replies with §3's per-item random nonce frame. Put attested responder,
+question ID and optional fork ID in the header, outside untrusted answer text.
+Use the same saved frame on retries. Preserve §2a's stable interior text; nonce
+safety takes precedence over a byte-identical whole frame. Neither a proposal
+nor a recipient label in its body can forge the authenticated producer.
+
+#### Routing, escalation and configuration (ADR-0034; ADR-0042 #2724)
+
+The ask accepts `auto | operator | architect | agent(AgentId)` as a requested
+route, never as authority. Server policy resolves an admitted Recipient.
+`auto` follows ADR-0034 §2: live parent architect for route agents; operator for
+roots/ask_operator; deny for deny. For S6e questions `ask_human` still addresses
+the operator, through the shared inbox rather than an inline question dialog.
+An architect request with no live parent follows the documented orphan route.
+An explicit other-agent target must be a live, operator-authorized routing edge;
+an agent cannot address arbitrary peers or elevate its own route to the owner.
+Reassignment re-addresses Pending questions under the same QuestionId and logs
+old/new recipients. Old cards become stale. Only the *current* recipient may
+answer; knowing an old message correlation ID grants no authority.
+
+`RouteReceipt` records selected rule ID, config revision, recipient identity,
+route revision, visited recipients, escalation deadline and reason. Reassign,
+orphan and timeout serialize against answer acceptance. A bounded visited set
+prevents cycles; exhausting the hop limit leaves the question visible with a
+typed routing failure, never an implicit answer. Explicit `question.escalate`
+uses the same policy check and audit as timeout-driven escalation.
+
+The proposed config schema is a closed set, not arbitrary routing expressions:
+
+```text
+RouteRule { rule_id: RouteRuleId, asker: Option<AgentId>, project: Option<ProjectId>,
+            to: RecipientSelector, escalate_to: Option<RecipientSelector> }
+RecipientSelector = Operator | ParentArchitect | Agent(AgentId)
+```
+
+Selectors in a rule are ANDed; the first matching rule wins within the resolved
+list. No match uses the existing policy default. A rule cannot override `deny`
+or an authority floor; invalid/stale target IDs fail visibly before delivery.
+
+ADR-0042 is proposed in #2724, not yet a dependency we claim implemented. Its
+single Rust schema, scoped resolver, provenance and audited writer must own:
+
+| Proposed key | Typed value and admission | Apply boundary |
+| --- | --- | --- |
+| `questions.routing.rules` | Ordered RouteRule list: registered asker/project selectors, admitted recipient selector, escalation target | New asks; explicit reroute for pending records |
+| `questions.routing.escalate_after_ms` | Optional duration, proposed 1 second–30 days; null disables automatic escalation | Snapshot into RouteReceipt |
+| `questions.routing.max_hops` | Positive integer, proposed maximum 32 | New asks; existing chains keep their recorded budget |
+| `questions.expire_after_ms` | Optional duration, proposed 1 second–30 days; null means no automatic expiry | Persist one absolute deadline at ask |
+
+No routing map in env strings, CLI or GUI bypasses schema validation. Use
+ADR-0042's defaults < file < env < explicit flags < runtime resolution, with
+admitted global/node/project/agent scopes and stable IDs. Routing policy is
+operator-owned: a repository or agent cannot widen human access or weaken deny.
+Agents may narrow through existing policy. No secret or executable command is
+a route value. Writes require operate/local-operator authority, revision checks
+and audit; read views redact per the config contract. Existing
+`questions.human_tools` remains independent. Reload never silently rewrites a
+Pending route/deadline; an explicit audited reroute uses the new revision.
+
+**Owner choices still requiring acceptance:**
+
+| Choice | (Recommended) | Alternative and cost |
+| --- | --- | --- |
+| Escalation timing | Disabled by default; explicit policy may escalate after 5 minutes, along admitted architect edges, max 8 hops. Orphans follow the existing operator route immediately. | Automatic owner paging on every timeout reduces unattended waits but increases interruptions and may disclose an agent-only question to the owner without an admitted route. |
+| Expiry | No implicit expiry; an explicit admitted deadline expires without answering. Check persisted wall-clock deadlines on restart; a runtime deadline also bounds each wait. | Default 24-hour expiry bounds inbox growth but can discard a slow, still relevant decision. |
+| Other-agent routing | Explicit operator-managed edges only, local node initially. | Arbitrary peer or cross-node routing needs mesh identity, delegated scopes and custody proof; defer that implementation to ADR-0034's mesh follow-up. |
+| Input bounds | Prompt/answer 16 KiB each, context 32 KiB, up to 16 options (label 256 bytes, description 2 KiB), 32 typed refs (path 1 KiB), 4 live threads and 8 live proposals per question, total serialized record 128 KiB. Named schema constants validate trimmed UTF-8 and prompt control bytes; blocking reason keeps its already-decided 512-byte bound. | Reusing an entire prompt/blob allowance simplifies validation but makes question cards and replay substantially larger. |
+
+Timeout never applies a default choice. It reroutes or expires only as configured,
+including for blocking asks. Expiry ends a held call with a typed expired result,
+not a fabricated user answer. A timer is durable scheduling metadata, not a sleep
+loop. Manual answers, timeout, restart and reassign race through the same reducer.
+
+#### Authorization and proposals
+
+The following explicitly narrows ADR-0028 §8a's blanket MCP answer path and
+preserves ADR-0034 §3's architect answers. It agrees with ADR-0038 §5b:
+
+| Operation | Required authenticated authority |
+| --- | --- |
+| Read/list/subscribe | `read` plus recipient/agent visibility; an agent sees its own asks and questions addressed to it |
+| Answer an operator question | Client-token `answer` OR `operate`; attested local operator CLI/TUI; or an operator-bound channel's existing `reply` scope |
+| Answer an agent question | Its attested current recipient via CLI/MCP or authenticated reply capability; never a self-asserted label |
+| Create/resolve a thread proposal | Attested fork bound to that question; it may propose, never answer for the operator |
+| Start a thread fork | `operate`/local operator, or existing admitted architect lifecycle authority for its delegate; cost preview still checks visibility |
+| Permission `agent.decide`, lifecycle or tier widening | `operate` or the existing specific operator authority, unchanged |
+
+`answer` is sufficient for a question reply and insufficient for a permission
+prompt. `send` alone answers neither, starts no fork, and cannot act as the
+operator (#2585). Its later attributed-principal implementation is a separate
+slice; today's stricter send behavior remains until then. Keep the question
+handler separate from `agent.decide`, including when rendered in one inbox.
+MCP is not an operator credential; it may answer only agent-addressed questions.
+All auth is checked again at the mutation fence, with revocation and identity
+checks. Neither tool arguments nor source labels can mint an answering principal.
+
+Proposals use a shared typed envelope with #1719:
+`Proposal<T> { proposal_id, source_agent, target, base_revision, value: T }`.
+`T` is a closed return-kind union: question Answer or §9 Finding, not arbitrary
+instructions for the server. A fork's `question.resolve` persists
+`question.proposed`, leaving the question Pending. The recipient reviews and may
+edit the typed answer, then applies `question.answer { question_id, revision,
+proposal_id, answer }` (GUI `inbox.answer` delegates here). The log retains
+proposal, applied answer, responder and edit flag/text for later analysis (#1717).
+It checks proposal/question/fork identity and route revision; stale proposals
+remain inspectable but cannot auto-send. Only successful answer commit triggers
+idempotent fork stop; restart recovery completes a missed stop. Keep transcript
+and lineage. A losing thread is marked stale; it is never silently merged or
+stopped as though its answer won.
+
+#### Fork points and progress (#2365, #2726)
+
+`question.fork { question_id, at: ask_point | latest, dry_run? }` delegates to §9
+and #2365, without another fork engine. Persist the ask's complete message/tool
+result boundary. If it is not sealed yet, report pending availability; never cut
+between tool_use and tool_result. Recompute `fork_points` when compaction or
+retention changes: warm `resume_at`, cold `rehydrate`, or latest `fork_session`.
+A missing retained prefix is `fork_prefix_gone`, distinct from an invalid cut;
+PTY asks offer latest only. Dry-run reports mechanism, prefix size and estimated
+cache-read/write cost; admission revalidates it and refuses a changed point or
+cost needing new confirmation. Never fall back from ask_point to latest silently.
+The read-only tier is enforced by general permission machinery, not UI controls.
+
+For #2726, link ThreadRef to the fork's agent identity and normal subscriptions:
+phase/current step, recent actions/tool calls, token/time spend, blocked/waiting
+state and pending questions, with details opening its retained transcript.
+**(Recommended)** derive objective facts from the event log and allow a separate
+labelled self-reported step; latest-wins coalescing under the existing stream
+budgets, never coalescing terminal/custody records. Alternative: a progress tool
+alone costs model cooperation and can go silent; derivation alone cannot know
+intended next steps. The fork and parent viewers must independently pass read
+visibility; inheritance of lineage grants no transcript access. Parent progress
+is a subscription, not repeated prompt injection, and cannot apply a proposal.
+Detailed progress schema/rate tuning belongs to #2726; it must not gate answer
+custody or non-blocking questions.
+
+#### GUI, TUI and CLI contracts
+
+G5 #1597, TUI and `flk question list/show/answer/fork` project one reducer and
+invoke the same typed service. MCP `flock_question_ask/answer` are adapters, not
+second stores. Rust owns schemas with generated TypeScript; frontend records
+carry question identity/revision, recipient, blocking reason, choices, context,
+refs, threads/proposals, fork availability/cost and delivery receipt. Server
+ordering is blocking, urgency, age; Pending non-blocking questions do not change
+a working agent to NeedsHuman. A held explicit blocker does, with its reason.
+
+The card shows server-attested asker/recipient and untrusted body separately.
+Select by option IDs, support multi-select/Other and editable proposal review,
+and render all control text as data, never escape sequences or active HTML.
+Terminal states remove the inbox card but keep history/thread tiles inspectable.
+A failed stale apply displays the current state. Read-only or unauthorized users
+see disabled actions with the required authority; they cannot bypass it via CLI.
+Use existing TUI controls and G5's transcript tile, not a new screen protocol.
+Expose `fork_points` absence with its typed reason rather than a dead action.
+
+#### Pre-mortem
+
+| Failure | Prevention and observable result |
+| --- | --- |
+| Agent idles behind its ask | Non-blocking tool completes immediately after durable receipt; fake harness continues independent work before any answer. No S6d hold. |
+| Two answers, or crash between log and queue | Serialized question transition, durable obligation, same queue key; exactly one item/started receipt, uncertainty held visibly. |
+| An agent impersonates the owner | Lease/pane origin and recipient-specific auth; answer scope cannot approve tools; proposals require separate recipient apply. |
+| Escalation loops or leaks a question | Admitted edges, route revisions, bounded visited set, read checks and no timeout auto-answer. |
+| Proposal survives replacement | Identity and revision checks; superseded questions reject it and preserve the losing text. |
+| Cold fork surprises the user | Recomputed availability/cost, confirmation, no silent latest fallback; read-only tier enforced by the server. |
+| Poisoned answer changes producer labels | Per-item nonce framing, metadata outside body, no permission inferred from model text. |
+| Restart loses blocking call or fork stop | Held-to-deferred recovery and durable answer obligation; idempotent stop after apply. |
+| Progress claims completion or leaks context | Progress is advisory, separately scoped, with source labels; answer custody reads durable records. |
+
+#### Ordered implementation slices (each at most 400 production lines)
+
+These are proposed sub-slices of #2242, not new implementation claims. File each
+sub-issue before work; further splits keep the same public acceptance boundary.
+Dependencies on S12/S13 (#2365), S19 (#1321), G5 and ADR-0042 are explicit. Every
+row adds a fail-first test through public CLI/socket/MCP adapters into an isolated
+server and the existing `tests/fixtures/structured-public/claude.py` fake harness;
+no real model, ambient profile, sleeps or timeout widening. Use injected clocks,
+notifications and bounded event receives. Show one behavioral red before each
+slice; a parent compilation error is build evidence, not a behavioral failure.
+
+| Slice | Scope / production budget | Fail-first public-path acceptance |
+| --- | --- | --- |
+| S6e-1 | Typed records, bounds, generated DTOs and replay, ≤300 | Replay a stored ask/terminal pair through classifier; known shapes remain typed, unknown-kind line is preserved/skipped, invalid/overbound input leaves log unchanged. |
+| S6e-2 | Lease/pane origin and one ask adapter, ≤350 | Fake asks, emits independent work before answer; absent blocking returns Pending; forged origin refuses; true blocking without valid reason refuses. |
+| S6e-3 | Launch profile, MCP/stdio and recap convergence, ≤300 | Stray AskUserQuestion gets the exact deny-carried deferral and continues; duplicate source observation opens one question; permissions still block. |
+| S6e-4 | Reducer persistence and lifecycle, ≤300 | Restart preserves Pending; replacement supersedes; held exit becomes deferred; racing expiry/answer has one winner, no half-written checkpoint. |
+| S6e-5 | Recipient routing and config schema, ≤350 | Auto routes delegate to architect and root to operator; authorized other-agent edge works; forbidden widening refuses. Config round-trip/provenance through ADR-0042. |
+| S6e-6 | Reroute, escalation and deadlines, ≤300 | Inject clock, reassign/orphan/timeout; old recipient refuses, cycle stops at bound, disabled timeout never answers or expires. |
+| S6e-7 | Answer admission/auth and durable obligation, ≤350 | Answer-only token answers question but refuses agent.decide; send-only and wrong recipient refuse; concurrent answers retain one immutable receipt. |
+| S6e-8 | Reply producer and queue recovery, ≤350 | Answer while busy delivers only at result; crash after answer append/before queue ack recovers same ItemId; unknown write holds, no duplicate started receipt. Fake sees one reply. |
+| S6e-9 | Question fork adapter / availability, ≤300, after #2365/S19 | Dry-run advertises warm/cold path; compaction updates cost; missing prefix refuses; PTY latest only; read-only fork cannot widen tools. |
+| S6e-10 | Generic proposals and reviewed apply, ≤300 | Bound fork resolves proposal, original keeps working; recipient edit/apply logs both texts; stale/replaced/wrong-question proposal refuses. |
+| S6e-11 | Thread stop recovery and progress link, ≤250 | Crash after apply/before stop then restart stops once; lineage/transcript retained; unauthorized progress subscriber gets no details (#2726). |
+| S6e-12 | G5 projection / review controls, ≤350, after S6e-8/10 | GUI fixture and real-server adapter agree on revisions and delivery; duplicate tap shows current state; multiple-choice edits retain typed option IDs. |
+| S6e-13 | TUI/CLI projection and generated help, ≤350 | Same pending/answered data as GUI; fork proposal cannot be applied by another agent; late idle reply reaches fake with its question and fork attribution. |
+
 ## Failure modes and known limits
 
 - **Hidden flags move.** `--resume-session-at`, `--permission-prompt-tool
@@ -2518,8 +2869,9 @@ decision by the owner.
 2. **Build on `--resume-session-at`.** As recommended: yes, behind the §9
    capability probe, with the rehydrate path as the measured fallback
    (E11). (§9)
-3. **Question and permission channel.** Both, not stdio alone: stdio is
-   primary, and an MCP tool (`flock_question_ask`) is the richer path, used
+3. **Question and permission channel.** Superseded for questions by S6e
+   (#2242; owner direction on #1717). Original decision: both, not stdio
+   alone; stdio is primary, and an MCP tool (`flock_question_ask`) is the richer path, used
    for asks that need more than a choice and whenever stdio would block. The
    owner's concern that stdio can itself block is answered case by case in
    §2b: an open permission request (S0 measures whether it holds a
@@ -2532,8 +2884,10 @@ decision by the owner.
    before the prompting one ran first. A concurrency-safe `Read` behind
    the open permission was held too, and with no permission open a slow
    non-concurrency-safe call still held a later one. (§2b case 1, A.13)
-   - 3a. **Non-blocking questions (#1301).** As recommended (questions are
-     deferred, permission requests block), plus three additions now in
+   - 3a. **Non-blocking questions (#1301).** Retaken by owner decision 15
+     on #1717 (2026-10-19), carried in S6e: the asker decides, absent blocking
+     is false, and true requires a reason. Original decision: as recommended
+     (questions are deferred, permission requests block), plus three additions now in
      §2a: an honest-blocker question, where the agent has nothing else to
      do, holds, and a System-One check decides hold or continue from the
      last turn or turns, the question, and the open tasks and work packages
@@ -2667,9 +3021,10 @@ remaining slice-8 acceptance is tracked in #2467; #1833 and #1746 stay open.
 | S11 | Hot reload: idle → close → `--resume`, init diff event and notice, staged fleet reload | S5 | 300 |
 | S12 | Forks: `at` / `shape`, cut rules, `resume_at` / `rehydrate` / `slice` paths, capability probe, cost guard, warm-then-fan-out, lineage fields | S3 | 400 |
 | S13 | Return channel: `finding` items from forks into the parent's queue | S5, S12 | 150 |
-| S6b | Non-blocking questions: question records with stable hashed ids and fixed-template rendering, the placeholder result on the `deny` carrier (A.12) with the §2 deny carve-out, `question.answer` / `question.fork` / `question.resolve`, re-ask from the record, exactly one reply (§2a, #1301) | S0, S6, S12 | 350 |
-| S6c | The MCP question path: `flock_question_ask`'s new fields (`blocking`, `context`, `refs`, `waits_on`, `recipient`, `urgency`), pre-allowed in the launch profile, the placeholder as its result, the fallback to an MCP permission tool when the capability probe finds `stdio` gone (§2b, owner decision 3) | S6b | 250 |
-| S6d | The hold-or-continue System One check: state from the last turns, the question and the open task and work-package graph, hold on `strong` only, recorded for rating (§2a, owner decision 3a) | S6b | 200 |
+| S6b | Historical question plan, superseded by S6e sub-slices: question records with stable hashed ids and fixed-template rendering, the placeholder result on the `deny` carrier (A.12) with the §2 deny carve-out, `question.answer` / `question.fork` / `question.resolve`, re-ask from the record, exactly one reply (§2a, #1301) | S0, S6, S12 | 350 |
+| S6c | Historical MCP question plan, superseded by S6e sub-slices: `flock_question_ask`'s new fields (`blocking`, `context`, `refs`, `waits_on`, `recipient`, `urgency`), pre-allowed in the launch profile, the placeholder as its result, the fallback to an MCP permission tool when the capability probe finds `stdio` gone (§2b, owner decision 3) | S6b | 250 |
+| S6d | Superseded as a hold by S6e and owner decision 15 (#1717/#2242); no turn-holding judge is scheduled | — | 0 |
+| S6e | Non-blocking question service, recipient routing, reviewed fork proposals and idle reply custody; ordered sub-slices in the S6e amendment (#2242) | S6, S5; fork/UI/config dependencies per sub-slice | ≤400 each |
 | S14 | Codex `app-server` adapter onto `SessionEvent` | S4 | 400 |
 | S15 | opencode `serve` adapter | S4 | 400 |
 | S16 | Storage sealing (zstd segments) and thinking retention | S3 | 250 |

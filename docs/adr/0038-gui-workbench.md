@@ -478,6 +478,12 @@ Layout and tile state have **no wire type** (§2).
 
 ### 5b. Question threads (#1717)
 
+The backend S6e amendment is now specified in
+[ADR-0036](0036-structured-agent-sessions.md#amendment-s6e--non-blocking-question-threads-and-routing-2242)
+(#2242). Its recorded owner decisions supersede the historical hold/channel
+rules referenced below; additional routing/progress choices await acceptance.
+Neither this design nor that amendment claims an implemented thread service.
+
 The owner's direction of 2026-10-16 (#1717, quoted there verbatim) asks for three things:
 1. One question surface. Every question an agent asks reaches the person through the GUI inbox.
 2. A question does not block, unless the agent has literally nothing else to work on.
