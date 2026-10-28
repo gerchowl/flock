@@ -69,6 +69,14 @@ import { decodeServerFrame } from "./decode";
 import { backoffDelay, bridgeSocket, uuidv7, type Clock, type KeyValueStore, type SocketFactory, type SocketLike, type TimerHandle } from "./env";
 import { Outbox, type OutboxEntry } from "./outbox";
 
+// Only this module can name the connection's internal handoff method.
+const providerSessionHandoff = Symbol("provider session handoff");
+
+/** Provider-only capability; the source-boundary test rejects UI imports and calls. */
+export function replaceProviderSession(connection: WireConnection, install: () => void): void {
+  connection[providerSessionHandoff](install);
+}
+
 /**
  * The JSON wire version this client speaks: `WIRE_JSON_VERSION` in
  * `src/structured_wire/mod.rs`, which a test keeps in step.
@@ -323,7 +331,7 @@ export class WireConnection {
    * This internal handoff preserves the provider's auth budget: it is not a
    * user Connect. If installation throws, the connection stays Disconnected.
    */
-  replaceSession(install: () => void): void {
+  [providerSessionHandoff](install: () => void): void {
     this.disconnect();
     install();
     this.#attemptNow();
