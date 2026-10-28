@@ -864,6 +864,15 @@ same queue (owner decision 5): there is no second input path.
   body, attachments: [blob refs] }
 ```
 
+Queue-worker permission preflight and stdin admission wait for the permission
+book mutex (#2627). A transient contention refusal cannot be retried by an idle
+agent's event stream: releasing the book produces no event. The synchronous
+session-events worker already owns journal I/O and may block here; operator
+APIs retain nonblocking acquisition. Every book holder must finish its bounded
+in-memory state, JSON or hashing work before any await, I/O, logging or blocking
+channel operation. Audit persistence, pipe writes and notifications happen after
+release. Allocation and OS scheduling still have no hard wall-clock bound.
+
 - **One gate.** Each item passes `queue.gate` once: `send` (deliver per
   `delivery`), `hold` (until a human releases it), `stash` (keep, never
   deliver unless popped) or `drop`. The gate is the policy point;
@@ -1933,8 +1942,21 @@ the recheck and bounded callback, with exclusive locks for token mutation.
 Revocation intent fences new admissions before waiting for existing callbacks;
 readers check it again after shared acquisition. Revoke cannot return while an
 admitted callback remains in flight. This preserves S6 decision fencing and is
-the same shared/exclusive split recorded in ADR-0038 §6. A subscription's typed
-`session_busy` is retryable `later`, not a transport failure; unsafe storage and
+the same shared/exclusive split recorded in ADR-0038 §6. Hello lookup returns a snapshot and does not acquire the management lock.
+Registration still holds shared file ownership through insertion, but waits for
+management and any published revocation intent within the remaining original
+five-second handshake deadline. Its descriptor-only shared-lock helper is owned
+and reaped by a separate eight-slot hello-wait pool (four pending hellos per
+listener); abandoned async waiters retain that reservation until the bounded
+helper returns. No kernel-lock wait holds one of the four shared store-I/O
+permits. Only after acquiring the fence does registration acquire a store-I/O
+permit for credential recheck and insertion; the same fence stays owned across
+that transfer. Thus reconnects waiting on management cannot exhaust the store
+pool used by established subscriptions. The deadline also bounds welcome, and cancelled
+or expired waiters cannot insert a late registration. Command and subscription
+dispatch retain fail-fast admission with the existing retry class.
+
+A subscription's typed `session_busy` is retryable `later`, not a transport failure; unsafe storage and
 I/O failures retain their connection-close behavior.
 
 ### 6. One schema, generated TypeScript
@@ -4104,10 +4126,11 @@ are refused rather than followed or removed.
 
 The lock follows the **open file description**, including across SCM_RIGHTS.
 `perform_live_handoff` sends the API and terminal ownership descriptors after
-PTYs and the optional TCP listener, under handoff manifest version 3. Older
-importers refuse that version before transfer. `run_handoff_import_server`
-adopts both descriptors before acknowledging restoration or rebinding the
-public paths; the exporter retains its descriptors for rollback. Public Unix
+PTYs and the optional TCP listener. Internal handoff manifest version 4 also
+appends the native WebSocket ownership descriptor; builds without that extension
+retain version 3. Older importers refuse unsupported versions before transfer.
+`run_handoff_import_server` adopts these ownership descriptors before
+acknowledging restoration or rebinding the public paths; the exporter retains its descriptors for rollback. Public Unix
 listeners are rebound under those same locks; TCP retains its listening fd.
 `restore_public_sockets_after_failed_handoff` also reuses the retained locks.
 There is no unlocked interval during either transition. This changes only the
@@ -4131,11 +4154,28 @@ socket shares the API's mode `0600` constant and the ownership protocol above.
 `owner`, `SocketOwner::duplicate` and `SocketOwner::take` retain the same locked
 open description through descriptor transfer, rebind and rollback. `unlink`
 and destruction compare the recorded inode, so an old exporter cannot unlink
-an importer's replacement socket. This slice adds no production call to these
-listener methods and changes neither reachable endpoints nor TCP authentication.
-The following activation slice owns the server handoff manifest extension,
-LocalOperator admission, independent pre-auth pools and the atomic TCP
-app-session refusal.
+an importer's replacement socket. `HeadlessServer::prepare_client_wire` activates the foundation together with
+`Core::local_router` owner admission and TCP app-session refusal. The bounded
+`local_admission::Owner::service` obtains a sealed proof from the application
+owner. `Store::admit_peer` and the final registration check hold the existing
+revocation fence through insertion; `Lease::drop` prevents a cancelled waiter
+from leaving a registration behind. HTTP and hello permits are separate per
+transport; upgraded and per-credential caps belong to the single shared core.
+`client_listener::Listener::shutdown` cancels HTTP acceptance and drains the
+upgraded sessions through `Core::shutdown`; the HTTP task set alone does not
+own upgraded futures. Internal handoff manifest version 4 appends the native
+ownership descriptor after the API and terminal owners; import adopts it before
+preparation and rollback retains the same guard. No mesh or JSON wire version
+changes.
+
+
+PR3b refusal delivery uses four independent writer/drain tasks per listener.
+They do not consume normal HTTP reservations or block acceptance. Each retains
+the same absolute five-second deadline; when that separate budget is exhausted,
+additional over-cap connections are closed without a 503 response or another task.
+This trades a typed overload response for bounded memory and continued acceptance.
+A refused hello closes 4401 before registration; an exit after registration
+closes 4403 and includes every socket already admitted under the fence.
 
 ### Amendment: S10a1 native placement
 
@@ -4159,3 +4199,78 @@ Snapshot format version 3 is deliberately unchanged. Older builds ignore this
 additive field and spawn shells in native tile slots; their next save permanently
 drops `native_views`. This placement loss is preferable to a version bump, which
 would make older builds ignore the entire session, including its terminal tabs.
+
+### Amendment: native card identity and observed tool use
+
+`CardId { seq, ordinal }` separates fold/inspection identity from a shared source
+cursor. Ordinals are deterministic for a given record and projection parser
+version; sibling cards never share a fold key. `ObservedToolUse` retains the
+original id, name, typed input and raw source event, independently of the stdio
+permission `ToolRequest`. Neither observed cards nor their ids grant authority.
+
+The native projection retains at most `history::LIVE_RECORDS` (16) source
+cursors. `Snapshot.earlier_history` explicitly marks the eviction watermark so
+older history can be requested. Window eviction never rewinds the applied cursor
+or claims a storage gap. Live partials are keyed by message identity and block index (source
+cursor when no message id exists), with at most 16 active blocks and at most
+`transport::MAX_LINE_BYTES` (2 MiB) of text per block. Capacity or text overflow
+clears transient cards and marks replay lagged at the observed durable floor;
+further deltas at that floor are suppressed until durable progress. No synthetic
+cursor is allocated. Known live deltas retain only current partial state, rather
+than an additional raw card for every delta. Malformed or unsupported content
+remains inspectable as raw JSON with its original classifier provenance.
+Durable ordinals are raw event at zero, then content-block position plus one.
+Live cards use a disjoint provisional ordinal range, assigned in observation
+order within a source cursor; durable assistant records replace matching completed
+blocks and older cursor-only partials, while preserving unmatched named blocks.
+A block's public envelope is not a whole-message completion signal. Fold state is per-card:
+thinking, unprojected JSON and raw source beside typed cards start folded,
+independently of sibling text/tool cards. Raw inspection remains an explicit
+choice, so raw source cannot bypass a thinking fold by default.
+
+This amendment also specifies `ObservedToolUse.raw: Arc<str>` to share exact
+source events between tool cards, and a disjoint provisional live ordinal range
+beginning at `1 << 31`, as described above. `content_block_start` and
+`content_block_stop` are lifecycle signals ignored by the text projection;
+neither replaces accumulated text. Durable assistant records finalize correlated blocks.
+Fold choices for the 16 most recently retired live blocks survive gap recovery
+and transfer to the final card for the same message/block. Preferences outside
+that bounded live window may return to their defaults on later reconstruction.
+Claude Code 2.1.296 emits one assistant envelope per completed content block
+(E1, A.13). Its public envelope omits the internal API block index. Named
+text/thinking hints therefore transfer only when message identity, content kind
+and exact completed content select a unique retained hint (a bounded SHA-256 fingerprint
+retains no text). Single-block envelopes do not imply block zero. Bundled
+multi-block records additionally match their content positions. Unmatched named
+siblings remain within the same 16-hint cache; unrelated or ambiguous content
+uses default folding. Finalizing one block preserves unmatched named live blocks.
+Content equality correlates a provisional block and its fold preference with a
+completed block; it is not a message-lifetime condition. `Model::partial` retires
+all remaining blocks for a reported `message_stop` identity even if final text
+differs from the deltas. A delayed stop still retires its older partials after
+history catch-up, without recreating stale data or retiring newer partials.
+An anonymous stop retires cursor-only blocks through
+its live cursor; it cannot identify an unrelated named message. `Model::record`
+retires remaining partials at a known top-level turn result, including error
+results, without a content match. Nested tool results do not end the parent
+turn. Only partials preceding that durable result are retired, so already
+received output from a later turn survives history catch-up. Named blocks whose
+stop omits their identity remain until the top-level turn result rather than
+being assigned to a guessed message.
+
+Evicting a partial saves its fold before removing its card. Anonymous hints retire
+with their final message. Anonymous hints whose possible
+final record lies inside an actual missing history range are discarded rather
+than assigned to another message. Anonymous partials at the final record's own
+cursor belong to later output and are preserved.
+
+Permission snapshots retain the latest lifecycle observation per
+`(request_id, request_seq)`, in publication order. Pending opens have no local
+projection count limit or clock-based expiry: only a matching real close retires
+them, including host cancellation or session-end closes. The production producer
+bounds live opens with `permissions::MAX_OPEN_PERMISSION_REQUESTS` (16), and
+`permissions::Orphaned::into_closes` emits `SessionEnded` closes on recovery.
+These upstream bounds do not authorize the projection to drop an unmatched open;
+unmatched opens in older data remain visible until a matching close is observed. Only closed
+observations are bounded to the latest 16; older closed records remain in
+History. Displayed requests never substitute for S6 decision revalidation.

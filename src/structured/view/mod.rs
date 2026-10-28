@@ -1,5 +1,6 @@
 //! Native placement only: ADR-0036 §11, S10a1. Closing never stops an agent.
 pub(crate) mod contracts;
+pub(crate) mod model;
 pub(crate) mod placement;
 use crate::{app::AppState, layout::PaneId};
 use placement::View;

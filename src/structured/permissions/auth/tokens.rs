@@ -77,7 +77,7 @@ pub(crate) struct Session {
     digest: [u8; 32],
 }
 /// Store handles share a stable filesystem admission lock, including across processes.
-pub(crate) struct TokenStore(Namespace, Mutex<Box<dyn Entropy>>, PathBuf);
+pub(crate) struct TokenStore(std::sync::Arc<Namespace>, Mutex<Box<dyn Entropy>>, PathBuf);
 /// Injectable randomness; production uses the operating system, fixtures use a sequence.
 pub(crate) trait Entropy: Send {
     /// Fill the whole buffer or fail without issuing a credential.
@@ -95,7 +95,7 @@ struct PendingRevoke<'a> {
     store: &'a TokenStore,
     entry: String,
     guard: PendingLock,
-    _intent: priority::Intent<'a>,
+    _intent: priority::Intent<&'a Namespace>,
 }
 impl PendingRevoke<'_> {
     fn finish(self) -> Result<(), TokenError> {
@@ -139,7 +139,7 @@ impl TokenStore {
         entropy: impl Entropy + 'static,
     ) -> Result<Self, TokenError> {
         let store = Self(
-            Namespace::open(data)?,
+            std::sync::Arc::new(Namespace::open(data)?),
             Mutex::new(Box::new(entropy)),
             std::env::current_exe()?,
         );
@@ -201,8 +201,33 @@ impl TokenStore {
         }
         Ok(file)
     }
+    /// Hello alone waits for management ownership under its remaining handshake budget.
+    /// Dispatch still uses fail-fast shared admission and the existing retry class.
+    fn hello_lock(
+        &self,
+        budget: Duration,
+        mut on_wait: impl FnMut(),
+    ) -> Result<LockFile, TokenError> {
+        let deadline = std::time::Instant::now() + budget;
+        let remaining = || {
+            deadline
+                .checked_duration_since(std::time::Instant::now())
+                .filter(|left| !left.is_zero())
+                .ok_or_else(|| TokenError::Io(io::ErrorKind::TimedOut.into()))
+        };
+        loop {
+            priority::wait(&self.0, &self.2, deadline, &mut on_wait)?;
+            let guard = PendingLock::begin_shared(self.lock_file()?, &self.2)?
+                .finish_notifying(remaining()?, &mut on_wait)?;
+            if !priority::pending(&self.0)? {
+                return Ok(guard);
+            }
+            // A newly published revoker wins before this hello enters its callback.
+            drop(guard);
+        }
+    }
     fn begin_revoke_entry(&self, entry: String) -> Result<PendingRevoke<'_>, TokenError> {
-        let intent = priority::Intent::begin(&self.0, self.random::<16>()?)?;
+        let intent = priority::Intent::begin(&*self.0, self.random::<16>()?)?;
         let guard = PendingLock::begin(self.lock_file()?, &self.2)?;
         Ok(PendingRevoke {
             store: self,
