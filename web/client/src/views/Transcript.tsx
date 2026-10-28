@@ -14,6 +14,10 @@
  * expands on demand, and all but the last {@link VISIBLE_TURNS} turns fold
  * into one "N earlier turns" control.
  *
+ * Canonical permission facts present each request once; native control twins
+ * with the same request_id fold away (ADR-0038 §4, #2559). Raw event counts and
+ * cursor callbacks still include both facts. Uncorrelated natives remain visible.
+ *
  * Replay is linear (#1782): each entry is folded into the last turn as it
  * arrives ({@link foldEntry}), and only the unfolded turns are read to
  * render, so a long history costs O(1) per entry, not a regroup of it all.
@@ -251,7 +255,7 @@ export function Transcript(props: TranscriptProps): JSX.Element {
       <For each={turns.turns.slice(folded())}>
         {(turn) => (
           <div class="turn" data-testid="turn">
-            <For each={turn.entries}>{(entry) => <Entry entry={entry} turns={turns} />}</For>
+            <For each={turn.entries}>{(entry) => <Show when={entry}>{(shown) => <Entry entry={shown()} turns={turns} />}</Show>}</For>
           </div>
         )}
       </For>
