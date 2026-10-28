@@ -6,6 +6,8 @@ use std::{
     time::Duration,
 };
 
+mod identity;
+
 pub(crate) fn readable(fd: RawFd, timeout: Duration) -> bool {
     let mut p = libc::pollfd {
         fd,
@@ -32,6 +34,17 @@ impl Peer {
         Self::request(None)
     }
     pub(crate) fn request(request: Option<&str>) -> Self {
+        Self::request_to(request, None, false)
+    }
+    #[cfg(feature = "web")]
+    pub(crate) fn bridge(request: &str, path: &std::path::Path) -> Self {
+        Self::request_to(Some(request), Some(path), false)
+    }
+    #[cfg(feature = "web")]
+    pub(crate) fn bridge_pending(request: &str, path: &std::path::Path) -> Self {
+        Self::request_to(Some(request), Some(path), true)
+    }
+    fn request_to(request: Option<&str>, bridge: Option<&std::path::Path>, pending: bool) -> Self {
         let root = crate::test_support::TempDir::socket();
         let path = root.path().join("exit.sock");
         let listener = UnixListener::bind(&path).unwrap();
@@ -43,10 +56,17 @@ impl Peer {
             "--exact",
             "platform::process_exit::tests::peer_child",
             "--nocapture",
+            "--ignored",
         ]);
         command.env("FLOCK_TEST_PROCESS_EXIT_SOCKET", &path);
         if let Some(request) = request {
             command.env("FLOCK_TEST_PROCESS_EXIT_REQUEST", request);
+        }
+        if pending {
+            command.env("FLOCK_TEST_BRIDGE_PENDING", "1");
+        }
+        if let Some(path) = bridge {
+            command.env("FLOCK_TEST_NATIVE_BRIDGE", path);
         }
         for key in ["FLOCK_SOCKET_PATH", "FLOCK_PANE_ID", "FLOCK_AGENT_ID"] {
             command.env_remove(key);
@@ -120,7 +140,9 @@ impl Drop for Peer {
         let _ = self.child.wait();
     }
 }
+// Peer launches this helper with --ignored; it is not a standalone acceptance test.
 #[test]
+#[ignore]
 fn peer_child() {
     let Some(path) = std::env::var_os("FLOCK_TEST_PROCESS_EXIT_SOCKET") else {
         return;
@@ -130,6 +152,10 @@ fn peer_child() {
         writeln!(socket, "{request}").unwrap();
         let mut reply = String::new();
         BufReader::new(&socket).read_line(&mut reply).unwrap();
+        #[cfg(feature = "web")]
+        if let Some(path) = std::env::var_os("FLOCK_TEST_NATIVE_BRIDGE") {
+            bridge_sockets(&socket, std::path::Path::new(&path), &reply);
+        }
     }
     let mut input = Vec::new();
     std::io::stdin().read_to_end(&mut input).unwrap();
@@ -216,23 +242,6 @@ fn async_kernel_exit_wait_is_observable_by_exited() {
 }
 
 #[test]
-fn exit_after_kernel_arm_before_identity_check_is_refused() {
-    let mut peer = Peer::spawn();
-    let accepted = peer.credentials;
-    let witness = ExitWatch::arm(accepted).unwrap();
-    let result = ExitWatch::checked(accepted, |_| {
-        peer.exit();
-        assert!(readable(witness.as_raw_fd(), Duration::from_secs(5)));
-        assert!(peer.child.wait().unwrap().success());
-        accepted.birth
-    });
-    assert!(
-        result.is_err(),
-        "cached birth must not authorize an exited peer"
-    );
-}
-
-#[test]
 fn exit_watch_refuses_unreaped_exit_during_birth_read() {
     let mut child = Peer::spawn();
     let credentials = child.credentials;
@@ -241,4 +250,42 @@ fn exit_watch_refuses_unreaped_exit_during_birth_read() {
         crate::platform::process_start_time(pid)
     })
     .is_err());
+}
+
+#[cfg(feature = "web")]
+fn bridge_sockets(control: &UnixStream, path: &std::path::Path, reply: &str) {
+    use std::os::fd::AsRawFd;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let value: serde_json::Value = serde_json::from_str(reply).unwrap();
+    let token = value["result"]["issued"]["token"]
+        .as_str()
+        .expect("mint must succeed");
+    crate::web::wire::tests::runtime(async {
+        let mut sockets = Vec::new();
+        for _ in 0..2 {
+            let mut socket = tokio::net::UnixStream::connect(path).await.unwrap();
+            socket.write_all(b"GET /v1/ws HTTP/1.1\r\nHost: fixture.example\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n").await.unwrap(); // gitleaks:allow -- RFC 6455 public handshake example nonce
+            let mut header = Vec::new();
+            while !header.ends_with(b"\r\n\r\n") {
+                header.push(socket.read_u8().await.unwrap());
+                assert!(header.len() < 8192);
+            }
+            assert!(String::from_utf8(header)
+                .unwrap()
+                .starts_with("HTTP/1.1 101"));
+            let mut ws = crate::web::wire::tests::Socket(socket);
+            if std::env::var_os("FLOCK_TEST_BRIDGE_PENDING").is_none() {
+                ws.hello(crate::structured_wire::WIRE_JSON_VERSION, token)
+                    .await;
+            }
+            sockets.push(ws.0.into_std().unwrap());
+        }
+        // Transfer after both HTTP upgrades (and welcomes unless testing pending hello).
+        // Parent-owned descriptors keep the server's close observable after child exit.
+        crate::server::handoff::send_fds(
+            control,
+            &sockets.iter().map(AsRawFd::as_raw_fd).collect::<Vec<_>>(),
+        )
+        .unwrap();
+    });
 }

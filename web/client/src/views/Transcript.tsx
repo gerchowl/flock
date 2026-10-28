@@ -255,7 +255,7 @@ export function Transcript(props: TranscriptProps): JSX.Element {
       <For each={turns.turns.slice(folded())}>
         {(turn) => (
           <div class="turn" data-testid="turn">
-            <For each={turn.entries}>{(entry) => <Entry entry={entry} turns={turns} />}</For>
+            <For each={turn.entries}>{(entry) => <Show when={entry}>{(shown) => <Entry entry={shown()} turns={turns} />}</Show>}</For>
           </div>
         )}
       </For>
