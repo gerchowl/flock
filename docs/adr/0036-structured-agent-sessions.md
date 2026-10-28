@@ -4232,7 +4232,7 @@ This amendment also specifies `ObservedToolUse.raw: Arc<str>` to share exact
 source events between tool cards, and a disjoint provisional live ordinal range
 beginning at `1 << 31`, as described above. `content_block_start` and
 `content_block_stop` are lifecycle signals ignored by the text projection;
-neither replaces accumulated text. Durable assistant records finalize cards.
+neither replaces accumulated text. Durable assistant records finalize correlated blocks.
 Fold choices for the 16 most recently retired live blocks survive gap recovery
 and transfer to the final card for the same message/block. Preferences outside
 that bounded live window may return to their defaults on later reconstruction.
@@ -4244,6 +4244,20 @@ retains no text). Single-block envelopes do not imply block zero. Bundled
 multi-block records additionally match their content positions. Unmatched named
 siblings remain within the same 16-hint cache; unrelated or ambiguous content
 uses default folding. Finalizing one block preserves unmatched named live blocks.
+Content equality correlates a provisional block and its fold preference with a
+completed block; it is not a message-lifetime condition. `Model::partial` retires
+all remaining blocks for a reported `message_stop` identity even if final text
+differs from the deltas. A delayed stop still retires its older partials after
+history catch-up, without recreating stale data or retiring newer partials.
+An anonymous stop retires cursor-only blocks through
+its live cursor; it cannot identify an unrelated named message. `Model::record`
+retires remaining partials at a known top-level turn result, including error
+results, without a content match. Nested tool results do not end the parent
+turn. Only partials preceding that durable result are retired, so already
+received output from a later turn survives history catch-up. Named blocks whose
+stop omits their identity remain until the top-level turn result rather than
+being assigned to a guessed message.
+
 Evicting a partial saves its fold before removing its card. Anonymous hints retire
 with their final message. Anonymous hints whose possible
 final record lies inside an actual missing history range are discarded rather

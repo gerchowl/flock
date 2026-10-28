@@ -798,3 +798,231 @@ fn text_and_thinking_with_identical_bytes_keep_distinct_fold_hints() {
         );
     }
 }
+
+#[test]
+fn rewritten_partial_message_end_retires_only_its_message() {
+    let mut m = model();
+    m.live(message_delta(0, "first", "partial"));
+    m.live(message_delta(0, "second", "other"));
+    m.history(history::Item::Record(record(1, r#"{"type":"assistant","message":{"id":"first","content":[{"type":"text","text":"rewritten"}]}}"#, true))).unwrap();
+    m.live(live_value(
+        1,
+        json!({"type":"stream_event","api_message_id":"first","event":{"type":"message_stop"}}),
+    ));
+    assert!(
+        !contents(&m).any(|c| matches!(c, Content::Markdown(s) if s == "partial")),
+        "message end must retire rewritten deltas"
+    );
+    assert!(m
+        .snapshot
+        .transcript
+        .iter()
+        .any(|c| c.streaming && matches!(&c.content, Content::Markdown(s) if s == "other")));
+    assert_eq!(m.snapshot.applied_cursor, 1);
+}
+
+#[test]
+fn rewritten_partial_turn_end_preserves_later_output_and_ignores_nested_results() {
+    let mut m = model();
+    m.live(message_delta(0, "first", "partial"));
+    m.history(history::Item::Record(record(1, r#"{"type":"assistant","message":{"id":"first","content":[{"type":"text","text":"rewritten"}]}}"#, true))).unwrap();
+    m.history(history::Item::Record(record(2, r#"{"type":"result","subtype":"success","is_error":false,"parent_tool_use_id":"nested-tool"}"#, true))).unwrap();
+    assert!(contents(&m).any(|c| matches!(c, Content::Markdown(s) if s == "partial")));
+    m.live(message_delta(3, "later", "next turn"));
+    m.history(history::Item::Record(record(
+        3,
+        r#"{"type":"result","subtype":"success","is_error":false}"#,
+        true,
+    )))
+    .unwrap();
+    assert!(
+        !contents(&m).any(|c| matches!(c, Content::Markdown(s) if s == "partial")),
+        "turn end must retire rewritten deltas"
+    );
+    assert!(m
+        .snapshot
+        .transcript
+        .iter()
+        .any(|c| c.streaming && matches!(&c.content, Content::Markdown(s) if s == "next turn")));
+}
+
+#[test]
+fn rewritten_partial_anonymous_message_end_uses_its_live_cursor() {
+    let mut m = model();
+    m.live(delta(0));
+    m.live(message_delta(0, "named", "other"));
+    m.live(live_value(
+        0,
+        json!({"type":"stream_event","event":{"type":"message_stop"}}),
+    ));
+    assert!(
+        !contents(&m).any(|c| matches!(c, Content::Markdown(s) if s == "stale")),
+        "anonymous message end includes its current cursor"
+    );
+    assert!(m
+        .snapshot
+        .transcript
+        .iter()
+        .any(|c| c.streaming && matches!(&c.content, Content::Markdown(s) if s == "other")));
+    assert_eq!(m.snapshot.applied_cursor, 0);
+}
+
+#[tokio::test]
+async fn rewritten_partial_real_harness_retires_on_message_or_turn_end() {
+    for mode in [
+        "s10b-live-rewritten-message-end-exit",
+        "s10b-live-rewritten-turn-end-exit",
+    ] {
+        let notify = Arc::new(Notify::new());
+        let (mut registry, mut workers) = (Registry::default(), Workers::new(notify.clone()));
+        let (mut case, mut launch, factory) = Case::prepare(&mut registry, 920, "unused", vec![]);
+        let mut identity = registry.remove(&case.id, case.generation).unwrap();
+        identity.model = Some(mode.into());
+        launch.generation = registry.register(identity).unwrap();
+        let executable = case.fixture.root.path().join("claude");
+        let interpreter = std::fs::read_to_string(&executable)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap()
+            .to_owned();
+        case.fixture.file(
+            "claude",
+            format!(
+                "{interpreter}\n{}",
+                include_str!("../../../../tests/fixtures/structured-public/claude.py")
+            )
+            .as_bytes(),
+            0o700,
+        );
+        case.generation = workers.start(&mut registry, launch, factory).unwrap();
+        let mut live = workers.live(&registry, &case.id).unwrap();
+        let clock = Instant::now();
+        crate::structured::workers::tests::wait(&notify, || {
+            workers.poll(&mut registry, clock, 1000);
+            workers.report(&case.id, case.generation).is_some()
+        })
+        .await;
+        workers.shutdown(&mut registry).unwrap();
+        let mut m = model();
+        let mut observed_delta = false;
+        loop {
+            let item = tokio::time::timeout(Duration::from_secs(10), live.recv())
+                .await
+                .unwrap();
+            if matches!(item, live::Item::End(_)) {
+                break;
+            }
+            m.live(item);
+            if let Some(card) = m
+                .snapshot
+                .transcript
+                .iter()
+                .find(|c| matches!(&c.content, Content::Markdown(s) if s == "partial"))
+            {
+                observed_delta = true;
+                m.snapshot.collapsed.insert(card.id);
+            }
+        }
+        assert!(
+            observed_delta,
+            "the real reader must produce the divergent delta"
+        );
+        if mode.contains("message-end") {
+            assert!(
+                m.snapshot.transcript.iter().all(|c| !c.streaming),
+                "message end must retire rewritten deltas before history replay"
+            );
+        }
+        let mut cut = workers
+            .history(&registry, &case.id)
+            .unwrap()
+            .subscribe(Some(0))
+            .unwrap();
+        loop {
+            let item = cut.page().unwrap();
+            let done = matches!(item, history::Item::Synced(_));
+            m.history(item).unwrap();
+            if done {
+                break;
+            }
+        }
+        assert!(
+            m.snapshot.transcript.iter().all(|c| !c.streaming),
+            "{mode}: stale streaming card outlived the finished message/turn"
+        );
+        let final_card = m
+            .snapshot
+            .transcript
+            .iter()
+            .find(|c| matches!(&c.content, Content::Markdown(s) if s == "rewritten"))
+            .unwrap();
+        assert!(
+            !m.snapshot.collapsed.contains(&final_card.id),
+            "a different fingerprint must not transfer a fold"
+        );
+        assert!(!contents(&m).any(|c| matches!(c, Content::Markdown(s) if s == "partial")));
+    }
+}
+
+#[test]
+fn rewritten_partial_turn_end_cannot_transfer_anonymous_fold_to_next_turn() {
+    let mut m = model();
+    m.live(delta(0));
+    m.snapshot.collapsed.insert(m.snapshot.transcript[0].id);
+    m.history(history::Item::Record(record(
+        1,
+        r#"{"type":"result","subtype":"success","is_error":false}"#,
+        true,
+    )))
+    .unwrap();
+    m.history(history::Item::Record(record(
+        2,
+        r#"{"type":"assistant","message":{"content":[{"type":"text","text":"stale"}]}}"#,
+        true,
+    )))
+    .unwrap();
+    assert!(
+        !m.snapshot
+            .collapsed
+            .contains(&CardId { seq: 2, ordinal: 1 }),
+        "an ended turn cannot lend its anonymous fold to the next turn"
+    );
+    assert!(m.snapshot.transcript.iter().all(|card| !card.streaming));
+}
+
+#[test]
+fn rewritten_partial_delayed_message_stop_survives_history_catch_up() {
+    let mut m = model();
+    m.live(message_delta(0, "first", "partial"));
+    m.history(history::Item::Record(record(1, r#"{"type":"assistant","message":{"id":"first","content":[{"type":"text","text":"rewritten"}]}}"#, true))).unwrap();
+    m.history(history::Item::Record(record(
+        2,
+        r#"{"type":"user","message":{"content":[]}}"#,
+        true,
+    )))
+    .unwrap();
+    m.live(message_delta(2, "second", "later"));
+    let stop =
+        json!({"type":"stream_event","api_message_id":"first","event":{"type":"message_stop"}});
+    m.live(live_value(1, stop.clone()));
+    assert!(
+        !contents(&m).any(|c| matches!(c, Content::Markdown(s) if s == "partial")),
+        "history catch-up must not hide message completion"
+    );
+    assert!(m
+        .snapshot
+        .transcript
+        .iter()
+        .any(|c| c.streaming && matches!(&c.content, Content::Markdown(s) if s == "later")));
+    m.live(message_delta(3, "first", "newer"));
+    m.live(live_value(1, stop));
+    assert!(
+        m.snapshot
+            .transcript
+            .iter()
+            .any(|c| c.streaming && matches!(&c.content, Content::Markdown(s) if s == "newer")),
+        "a delayed stop cannot retire a newer partial"
+    );
+    assert_eq!(m.snapshot.applied_cursor, 2);
+}

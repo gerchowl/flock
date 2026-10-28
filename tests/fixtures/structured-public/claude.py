@@ -31,6 +31,17 @@ if "--model" in sys.argv and sys.argv[sys.argv.index("--model") + 1].startswith(
     init = json.loads((root / "restricted-init.json").read_text())
     init["session_id"] = sys.argv[sys.argv.index("--session-id") + 1]
     emit_live(init)
+    if "rewritten" in mode:
+        emit_block(0, "text_delta", "text", "partial", "first")
+        emit_live({"type": "assistant", "message": {"id": "first", "role": "assistant",
+                   "content": [{"type": "text", "text": "rewritten"}]}})
+        if "message-end" in mode:
+            emit_live({"type": "stream_event", "api_message_id": "first",
+                       "event": {"type": "message_stop"}})
+        else:
+            emit_live({"type": "result", "subtype": "success", "is_error": False,
+                       "result": "rewritten"})
+        sys.exit(0)
     if "interleaved" in mode:
         for identity, text in [("first", "partial"), ("second", "later")]:
             emit_block(0, "text_delta", "text", text, identity)
