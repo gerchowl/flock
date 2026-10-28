@@ -223,7 +223,7 @@ impl Scheduler {
             return Ok(Offer::Pending(pending));
         }
         let open = runtime
-            .waiting_on_human()
+            .queue_waiting_on_human()
             .map_err(|code| Failure { code, source: None })?;
         let cause = if !open.is_empty() {
             Some(PendingCause::WaitingOnHuman)
@@ -258,7 +258,7 @@ impl Scheduler {
             since_ms: now_ms,
             cancelled: false,
         });
-        if let Err(error) = runtime.try_submit(&batch.envelope) {
+        if let Err(error) = runtime.queue_submit(&batch.envelope) {
             // Refused input never owns result processing, even if undo fails.
             self.reserved = None;
             if error

@@ -19,6 +19,8 @@ pub(crate) use api::structured_queue::SendParams as StructuredSendParams;
 pub(crate) use api::LocalOperator;
 mod local_operator;
 pub(crate) use local_operator::LocalPeer;
+#[cfg(feature = "web")]
+pub(crate) use local_operator::LocalPeerRefusal;
 pub(crate) mod fleet_pause;
 pub(crate) mod guarded_submit;
 pub(crate) mod hibernation;

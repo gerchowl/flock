@@ -1,5 +1,6 @@
 use super::*;
 use crate::structured::launch::SessionConfigDir;
+use crate::structured_wire::fixture::TOKEN_PRINCIPAL;
 use std::fs;
 use std::os::fd::FromRawFd;
 use std::time::Instant;
@@ -816,7 +817,7 @@ fn decide(id: &str, decision: permissions::Decision, request_seq: u64) -> AgentD
 }
 fn owner() -> Principal<'static> {
     Principal::Token(crate::structured::permissions::auth::fixture(
-        "fixture-client",
+        TOKEN_PRINCIPAL,
         true,
     ))
 }
@@ -1002,7 +1003,7 @@ fn permission_decisions_are_audited_before_control_stdin_and_keep_turn_busy() {
         let closed: Value = serde_json::from_str(&audit[3].raw).unwrap();
         assert_eq!(closed["state"], "closed");
         assert_eq!(closed["decision"], serde_json::to_value(decision).unwrap());
-        assert_eq!(closed["principal"], "fixture-client");
+        assert_eq!(closed["principal"], TOKEN_PRINCIPAL);
         assert_eq!(audit[3].origin, RecordOrigin::Flk);
         assert_eq!(response["type"], "control_response");
         assert_eq!(response["response"]["request_id"], "request-example");
@@ -1805,7 +1806,7 @@ fn session_grant_matches_canonical_input_but_other_input_and_tools_prompt() {
     assert_eq!(audit["state"], "closed");
     assert_eq!(audit["source"], "session_grant");
     assert_eq!(audit["grant_request_id"], "grant");
-    assert_eq!(audit["principal"], "fixture-client");
+    assert_eq!(audit["principal"], TOKEN_PRINCIPAL);
     assert_eq!(
         input_line(&transport, &mut input)["response"]["response"]["behavior"],
         "allow"
@@ -3356,4 +3357,108 @@ fn operator_revocation_reaches_the_real_book_and_the_next_request_prompts() {
     );
     drop(output);
     reader_done(&transport).unwrap();
+}
+
+#[test]
+fn queue_permission_contention_releases_into_delivery_without_another_event() {
+    use crate::structured::{
+        queue::{
+            admission::{Gate, Principal},
+            scheduler::Offer,
+        },
+        workers::queue,
+    };
+    let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+    let (transport, _output, mut input) = start(&root);
+    let handle = transport.input_handle();
+    let (attempt_tx, attempt_rx) = mpsc::channel();
+    *handle.permission_attempt.lock() = Some(attempt_tx);
+    let permissions = handle.permissions.clone();
+    // This is the same book that session_grants and agent_decide hold.
+    let book = permissions.lock();
+    let (mut service, client) = queue::Service::open(
+        root.path(),
+        "fixture-agent",
+        std::num::NonZeroU64::new(u64::MAX).unwrap(),
+    )
+    .unwrap();
+    let mut idle = crate::api::agent_state::AgentState::unknown();
+    idle.lifecycle = crate::api::agent_state::Lifecycle::Live;
+    idle.turn = crate::api::agent_state::Turn::Idle;
+    idle.attention = crate::api::agent_state::Attention::None;
+    assert!(client.state(queue::Snapshot {
+        state: idle,
+        through: 0
+    }));
+    client
+        .enqueue(queue::Request {
+            item: crate::structured::queue::tests::item("00000000-0000-4000-8000-000000000001"),
+            principal: Principal::Operator,
+            gate: Gate::Send,
+        })
+        .unwrap();
+    let (done_tx, done_rx) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        assert!(!service.tick(&handle, false, &|| {}));
+        service.flush(false, &|| {});
+        // No more requests, snapshots or events arrive after the contended offer.
+        assert!(!service.tick(&handle, false, &|| {}));
+        service.flush(false, &|| {});
+        done_tx.send(()).unwrap();
+    });
+    assert!(attempt_rx.recv_timeout(Duration::from_secs(10)).unwrap());
+    drop(book);
+    done_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("queue worker must progress on book release");
+    worker.join().unwrap();
+    let mut submitted = false;
+    let mut offers = Vec::new();
+    while let Some(update) = client.update() {
+        submitted |= matches!(update.offer, Ok(Offer::Submitted { .. }));
+        offers.push(format!("{:?}", update.offer));
+    }
+    assert!(
+        submitted,
+        "idle queued message stranded after permission-book release: {offers:?}"
+    );
+    accepted(&transport);
+    let mut poll = [libc::pollfd {
+        fd: std::os::fd::AsRawFd::as_raw_fd(&input),
+        events: libc::POLLIN,
+        revents: 0,
+    }];
+    // SAFETY: poll points to one live descriptor and only waits for readability.
+    assert_eq!(unsafe { libc::poll(poll.as_mut_ptr(), 1, 10_000) }, 1);
+    let mut bytes = [0; 4096];
+    let count = input.read(&mut bytes).unwrap();
+    assert!(count > 0, "submitted input must reach the harness pipe");
+}
+
+#[test]
+fn queue_stdin_admission_waits_for_permission_book_release() {
+    let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+    let (transport, _output, _input) = start(&root);
+    let handle = transport.input_handle();
+    let permissions = handle.permissions.clone();
+    let book = permissions.lock();
+    let (attempt_tx, attempt_rx) = mpsc::channel();
+    *handle.permission_attempt.lock() = Some(attempt_tx);
+    let (done_tx, done_rx) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        done_tx
+            .send(handle.queue_submit(&serde_json::json!({"type":"user"})))
+            .unwrap();
+    });
+    assert!(attempt_rx.recv_timeout(Duration::from_secs(10)).unwrap());
+    drop(book);
+    let result = done_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("admission must progress on book release");
+    worker.join().unwrap();
+    assert!(
+        result.is_ok(),
+        "book contention must not refuse queued input: {result:?}"
+    );
+    accepted(&transport);
 }
