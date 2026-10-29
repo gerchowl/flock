@@ -61,9 +61,11 @@ impl Pane {
         core.text(
             mode,
             format!(
-                "Mode: {} (requested: {:?})",
+                "Mode: {} (requested: {})",
                 label(s.reported_permissions.as_deref().unwrap_or("unknown")),
-                s.requested_permissions
+                match s.requested_permissions {
+                    crate::structured::launch::PermissionMode::Default => "default",
+                }
             ),
         );
         let [indicator, history_actions] = Layout::horizontal([Length(12), Min(0)]).areas(history);
@@ -85,8 +87,19 @@ impl Pane {
         core.text(
             phase,
             format!(
-                "Status: {:?} | turn: {:?} | bg: {:?}",
-                s.agent.state.phase, s.agent.state.turn, s.agent.state.background
+                "Status: {} | turn: {} | bg: {}",
+                phase_label(s.agent.state.phase),
+                match s.agent.state.turn {
+                    crate::api::agent_state::Turn::Working => "working",
+                    crate::api::agent_state::Turn::Idle => "idle",
+                    crate::api::agent_state::Turn::Unknown => "unknown",
+                },
+                match s.agent.state.background {
+                    crate::api::agent_state::Background::None => "none".into(),
+                    crate::api::agent_state::Background::Running { count } =>
+                        format!("running ({count})"),
+                    crate::api::agent_state::Background::Unknown => "unknown".into(),
+                }
             ),
         );
         let (input, output) = s
@@ -164,6 +177,23 @@ impl Pane {
         for panel in &self.panels {
             panel.render(f);
         }
+    }
+}
+fn phase_label(phase: crate::api::agent_state::Phase) -> &'static str {
+    use crate::api::agent_state::Phase;
+    match phase {
+        Phase::Gone => "gone",
+        Phase::Hibernated => "hibernated",
+        Phase::Offline => "offline",
+        Phase::LimitReached => "limit reached",
+        Phase::Blocked => "blocked",
+        Phase::NeedsHuman => "needs human",
+        Phase::Working => "working",
+        Phase::WaitingOnEvent => "waiting on event",
+        Phase::FinishedWithBackground => "finished with background",
+        Phase::Finished => "finished",
+        Phase::Settling => "settling",
+        Phase::Unknown => "unknown",
     }
 }
 fn observed(value: Option<u64>) -> String {
