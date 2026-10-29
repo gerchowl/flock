@@ -22,13 +22,13 @@ const SOURCES: readonly TraceSource[] = ["setup", "client", "server", "client_fa
 
 /** Exact unwired inventory; each later provider slice must shrink this set (#2467). */
 export const PENDING_PART_2B = {
-  "agent-gap": "pending part 2b", "agent-send": "pending part 2b",
+  "agent-send": "pending part 2b",
   "heartbeat-missed": "pending part 2b",
   "ping-pong": "pending part 2b",
   "token-revoked": "pending part 2b",
 } satisfies Partial<Record<keyof typeof fixtureExamples, "pending part 2b">>;
 
-export const WIRED_SCRIPTS = ["token-refused", "permission-decision", "unknown-subscription", "clean"] as const;
+export const WIRED_SCRIPTS = ["token-refused", "permission-decision", "unknown-subscription", "clean", "agent-gap"] as const;
 
 /** Every selected script belongs exactly once to a real provider or the pending set. */
 export function assertInventory(scripts: readonly TraceScript[], wired: readonly string[]): void {

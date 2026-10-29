@@ -10,7 +10,7 @@ export const fixtureExamples = {
 {"not_before_ms":0,"step":"expect_connect","v":1,"within_ms":1},
 {"step":"open","v":1},
 {"absent":[],"fields":["protocol","token"],"frame":{"client":{"name":"fixture","version":"1"},"protocol":1,"t":"hello","token":"fixture-token"},"step":"expect","v":1},
-{"frame":{"capabilities":["read","send"],"idempotency_window_ms":86400000,"principal":"fixture-principal","protocol":1,"server_epoch":"fixture-epoch","server_version":"fixture","t":"welcome"},"step":"send","v":1},
+{"frame":{"capabilities":["read","send","answer","operate"],"idempotency_window_ms":86400000,"principal":"0123456789abcdef0123456789abcdef","protocol":1,"server_epoch":"00000000000000000000000000000001","server_version":{"$dynamic":"server_version","source":"build"},"t":"welcome"},"step":"send","v":1},
 {"absent":[],"fields":["sub_id","stream","after"],"frame":{"after":2,"stream":"agent/fixture","sub_id":"s1","t":"sub"},"step":"expect","v":1},
 {"frame":{"from":3,"sub_id":"s1","t":"gap","to":4},"step":"send","v":1},
 {"frame":{"ev":{"message":{},"type":"assistant"},"seq":5,"stream":"agent/fixture","sub_id":"s1","t":"ev","ts_ms":1},"step":"send","v":1},
