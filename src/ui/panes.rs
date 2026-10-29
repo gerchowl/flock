@@ -1557,6 +1557,18 @@ fn render_empty(app: &AppState, frame: &mut Frame, area: Rect) {
     );
 }
 
+/// Native dispatch consumes computed geometry; S10d supplies placement and input routing.
+/// No PTY lookup, subscription reads or state mutation happens during this paint.
+pub(super) fn render_structured(frame: &mut Frame, pane: &super::structured::Pane) {
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(pane.border),
+        pane.area,
+    );
+    pane.paint_content(frame);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -3,6 +3,9 @@
 use crate::api::agent_state::AgentState;
 use serde::{Deserialize, Serialize};
 
+/// First client-wire version that understands node/project fleet payloads.
+pub const FLEET_ENTITY_VERSION: u32 = 1;
+
 /// Structured-agent row in the minimal fleet snapshot and its upsert deltas.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -24,6 +27,79 @@ pub struct FleetAgentRow {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub route: Option<Box<crate::mesh::routes::Route>>,
+    /// Owning node; absent only in legacy or not-yet-bound observations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub node_id: Option<String>,
+    /// Exact Record.cwd project key; absent in legacy snapshots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub project: Option<String>,
+}
+
+/// Node status, keyed only by authenticated mesh identity (ADR-0043).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct FleetNodeRow {
+    /// Authenticated stable node identity, never a hostname.
+    pub node_id: String,
+    /// Read-scoped display alias.
+    pub name: String,
+    /// Owner-observed machine measurements; populated by N1b (#2750).
+    pub health: Option<crate::api::schema::PeerSystemSummary>,
+    /// Home-measured summary duration in milliseconds; N1b supplies observations.
+    #[cfg_attr(feature = "ts", ts(as = "Option<f64>"))]
+    pub latency_ms: Option<u64>,
+    /// Last success in home-clock Unix milliseconds; N1b supplies observations.
+    #[cfg_attr(feature = "ts", ts(as = "Option<f64>"))]
+    pub last_ok: Option<u64>,
+    /// Owner-reported software version, retained while offline.
+    pub version: Option<String>,
+    /// Classified, content-free failure; N1b supplies observations.
+    pub error: Option<FleetNodeError>,
+    /// Server-owned reachability classification, not agent liveness.
+    pub online: bool,
+    /// Actual chosen mesh route, with policy-projected name; N1b supplies it.
+    pub route: Option<Box<crate::mesh::routes::Route>>,
+    /// Last complete inventory; N1b supplies status counts.
+    pub counts: Option<FleetAgentCounts>,
+    /// Home-only count of unbound/unreached configured peers; N1b supplies it.
+    #[cfg_attr(feature = "ts", ts(as = "Option<f64>"))]
+    pub unbound_configured_peers: Option<u64>,
+}
+/// Safe classified node failure, never raw SSH output.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct FleetNodeError {
+    /// Stable classification token, including SshFailureReason tokens.
+    pub code: String,
+    /// Bounded content-free explanation.
+    pub message: String,
+}
+/// Complete owner inventory counts; unknown information is never zero-filled.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct FleetAgentCounts {
+    /// Unique agents, including hibernated/offline agents.
+    #[cfg_attr(feature = "ts", ts(as = "f64"))]
+    pub total: u64,
+    /// Disjoint phase buckets, including unknown, summing to total.
+    #[cfg_attr(feature = "ts", ts(as = "std::collections::BTreeMap<String, f64>"))]
+    pub by_phase: std::collections::BTreeMap<String, u64>,
+    /// Agents with open non-automatic requests; unknown remotely today.
+    #[cfg_attr(feature = "ts", ts(as = "Option<f64>"))]
+    pub waiting_on_human: Option<u64>,
+}
+/// Project on one owning node; its key is the registry's exact cwd.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct FleetProjectRow {
+    /// Exact Record.cwd as a UTF-8 path; no basename-based identity.
+    pub id: String,
+    /// Owning authenticated node identity.
+    pub node_id: String,
+    /// Display basename, not the project key.
+    pub name: String,
 }
 
 /// Closed payload vocabulary carried inside fleet stream ev frames.
@@ -43,6 +119,36 @@ pub enum FleetDelta {
     Remove {
         /// Opaque identity of the removed agent.
         id: String,
+        /// Owning node, omitted for legacy unbound agent removals.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(optional))]
+        node_id: Option<String>,
+    },
+    /// Insert or replace a complete node row.
+    #[serde(rename = "fleet.node.upsert")]
+    NodeUpsert {
+        /// Complete status, with explicit nulls for unknown observations.
+        row: FleetNodeRow,
+    },
+    /// Explicitly remove a node from the materialization.
+    #[serde(rename = "fleet.node.remove")]
+    NodeRemove {
+        /// Authenticated node identity.
+        node_id: String,
+    },
+    /// Insert or replace a project row.
+    #[serde(rename = "fleet.project.upsert")]
+    ProjectUpsert {
+        /// Complete project identity and label.
+        row: FleetProjectRow,
+    },
+    /// Remove a project from its owning node.
+    #[serde(rename = "fleet.project.remove")]
+    ProjectRemove {
+        /// Exact project cwd.
+        id: String,
+        /// Owning node identity.
+        node_id: String,
     },
 }
 

@@ -12,6 +12,7 @@ import type { ServerFrame } from "../src/gen/ServerFrame";
 import { createFixtureFleet, type AgentRow, type FleetObserver, type FleetSource } from "../src/fleet";
 import { createManager, emptyLayout, type Layout } from "../src/layout/model";
 import { createFixtureTransport } from "../src/transport/fixture";
+import { WIRE_PROTOCOL } from "../src/wire/connection";
 import { OUTBOX_KEY } from "../src/wire/outbox";
 import { createWireTransport } from "../src/wire/transport";
 import { STATUS_LABELS, phaseLine, rowLine, sendHint, type Sender } from "../src/workbench/Composer";
@@ -739,13 +740,13 @@ describe("wire mode, one transport per connection", () => {
       return f.t === "sub" && f.stream?.startsWith("agent/") ? [f.sub_id] : [];
     });
 
-  /** Mounts the wire App, Live with fleet rows atlas, kite and ember. */
-  function liveApp(): { h: Harness; root: HTMLElement } {
+  /** Mounts the wire App, Live (or as `welcome` decides) with fleet rows atlas, kite and ember. */
+  function liveApp(welcome: ServerFrame = WELCOME): { h: Harness; root: HTMLElement } {
     const h = new Harness();
     h.step(step({ step: "given", cursors: {}, outbox: [] }));
     const root = mount(() => <App config={{ ok: true, config }} env={{ clock: h.clock, sockets: h.net.factory, random: () => 0, store: h.store }} />);
     h.step(step({ step: "open" }));
-    h.step(step({ step: "send", frame: WELCOME }));
+    h.step(step({ step: "send", frame: welcome }));
     const fleet = (sentFrames(h).find((frame) => (frame as { stream?: string }).stream === "fleet") as { sub_id: string }).sub_id;
     const ids = ["atlas", "kite", "ember"];
     send(h, { t: "gap", sub_id: fleet, from: 1, to: 0, snapshot_to: ids.length });
@@ -786,6 +787,19 @@ describe("wire mode, one transport per connection", () => {
     expect(root.querySelector(".topbar__status")?.textContent).toContain("Saved layout could not be loaded");
     expect(root.querySelector(".connection-bar__state")?.textContent).toBe("NeedsToken");
     expect($(root, "connection-bar")?.textContent).toContain("The server refused the token.");
+  });
+
+  test("ReadOnly shows the version-gap banner, and the composer is held with the same message", () => {
+    const { h, root } = liveApp({ ...WELCOME, protocol: WIRE_PROTOCOL - 1 } as ServerFrame);
+    const gap = `Read-only: this server runs an older version (wire protocol ${WIRE_PROTOCOL - 1}; this client speaks ${WIRE_PROTOCOL}), so commands wait until it is updated.`;
+    expect(root.querySelector(".connection-bar__state")?.textContent).toBe("ReadOnly");
+    expect($(root, "read-only")?.textContent).toBe(gap);
+    // The fleet still renders, and the open agent's composer is held.
+    ($$(root, "agent-row")[0] as HTMLButtonElement).click();
+    expect($(root, "agent-phase")?.textContent).toBe(gap);
+    expect(($(root, "composer")?.querySelector("textarea") as HTMLTextAreaElement).disabled).toBe(true);
+    expect(($(root, "composer")?.querySelector('button[type="submit"]') as HTMLButtonElement).disabled).toBe(true);
+    expect(sentFrames(h).filter((frame) => (frame as { t: string }).t === "cmd")).toEqual([]);
   });
 
   test("wire mode shows no sample inbox cards; with no listed prompts the inbox says so", () => {
