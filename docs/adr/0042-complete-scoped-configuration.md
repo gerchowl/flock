@@ -562,26 +562,28 @@ synchronization is not a config export feature. This record changes no VERSION.
 
 ### Healthy-wait inventory shared with ADR-0045
 
-ADR-0045 in [#2732](https://github.com/gerchowl/flock/pull/2732), at `19127f25`,
-already names the following registry entries for ADR-0042. The [2026-10-29
-acceptance][acceptance] replaces its earlier longer ceilings: healthy waits have
-a hard maximum of four hours and a two-hour limit when nothing meaningfully
-changes. Successful polls alone do not renew either bound. No new key name is
-invented for the no-change limit.
+Accepted ADR-0045 in [#2732](https://github.com/gerchowl/flock/pull/2732), at
+`8a08fc94`, defines these registry entries for ADR-0042. GitHub healthy waits
+have a four-hour default and a configurable 24-hour ceiling. Receipt and
+agent-phase waits retain one-hour defaults and the same 24-hour ceiling. The
+named two-hour no-change limit is separate from those maximum-wait settings.
+All durations are integer milliseconds. G/N/A denotes global, node and
+operator-owned agent contexts; project files cannot change supervision timing.
 
-| Registry key | Default and allowed range (ms) | Scopes / consumer / reload |
+| Accepted registry key | Default / allowed range | Scope / consumer and reload |
 | --- | --- | --- |
-| `work.loops.wait.github_max_ms` | 14400000; 60000–14400000 | Global/node/agent; healthy-wait dispatcher; original-entry maximum. |
-| `work.loops.wait.receipt_max_ms` | 3600000; 60000–14400000 | Global/node/agent; healthy typed-receipt wait; original-entry maximum. |
-| `work.loops.wait.agent_phase_max_ms` | 3600000; 60000–14400000 | Global/node/agent; healthy assigned-work wait; original-entry maximum. |
+| `work.loops.wait.github_max_ms` | 14400000; 60000–86400000 | G/N/A; PR/CI/landing-batch healthy-wait maximum from original entry; reload may shorten, never extend that wait |
+| `work.loops.wait.no_subject_change_ms` | 7200000; 60000–7200000 | G/N/A; all supported healthy waits, from last verified check/job/status change; polls and replay never renew it |
+| `work.loops.wait.receipt_max_ms` | 3600000; 60000–86400000 | G/N/A; typed pending receipt subject with fresh producer coverage; original-entry maximum |
+| `work.loops.wait.agent_phase_max_ms` | 3600000; 60000–86400000 | G/N/A; pending assigned work with fresh phase coverage; original-entry maximum |
 
-The unchanged one-hour defaults for receipt/phase waits remain stricter than the
-four-hour ceiling. Every wait also expires after two hours without a meaningful
-subject change, even when its configured maximum is longer. Source staleness,
+`work.loops.wait.no_subject_change_ms` defaults to two hours, allows one minute
+to two hours, and applies to all supported healthy waits from the last verified
+check/job/status change. Polls and replay never renew it. Source staleness,
 errors and terminal observations retain ADR-0045's earlier exits. Reload may
-shorten an active wait, never extend its original maximum; re-entry, restart and
-handoff cannot renew it. Record key types, units, constraints, provenance and
-actual consumer outcomes through the shared descriptors. These entries are
+shorten an active wait, never extend its original maximum; re-entry, restart
+and handoff cannot renew it. Record key types, units, constraints, provenance
+and actual consumer outcomes through the shared descriptors. These entries are
 accepted design, not keys already implemented in Config.
 
 ## 7. Ordered implementation slices and fail-first evidence
