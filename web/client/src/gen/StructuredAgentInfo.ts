@@ -55,6 +55,6 @@ model: string | null,
  */
 lease_state: LeaseState,
 /**
- * No view is created by registration or process launch.
+ * Public start/focus attaches a real view; registration alone does not.
  */
 view?: StructuredAgentView, };
