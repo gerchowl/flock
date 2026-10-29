@@ -4,6 +4,7 @@ import { strict as assert } from "node:assert";
 import type { FixtureLine } from "../src/gen/FixtureLine";
 import { ExecutionLedger, WIRED_SCRIPTS, assertInventory, PENDING_PART_2B, coverage, loadS7MinScripts, runTrace, type CheckedStep, type StepHandlers, type TraceScript } from "./wire/endpoint-runner";
 import { VirtualClock, parseScript } from "./wire/harness";
+import { NativePort } from "./wire/native-port";
 
 const ROOT = `${import.meta.dir}/../test/fixtures/wire`;
 const script = (...middle: object[]): TraceScript => ({ name: "runner", lines: parseScript([
@@ -20,7 +21,7 @@ const base: StepHandlers = {
 test("selection uses covers containment, including multi-label headers", async () => {
   const selected = await loadS7MinScripts(ROOT);
   assertInventory(selected, WIRED_SCRIPTS);
-  expect(Object.keys(PENDING_PART_2B).sort()).toEqual(["agent-send", "heartbeat-missed", "token-revoked"]);
+  expect(Object.keys(PENDING_PART_2B).sort()).toEqual(["agent-send", "heartbeat-missed"]);
   expect(() => assertInventory(selected, [])).toThrow();
   expect(() => assertInventory(selected, [...WIRED_SCRIPTS, "agent-send"])).toThrow();
   expect(() => assertInventory([...selected, { ...selected[0]!, name: "new-unclassified" }], WIRED_SCRIPTS)).toThrow();
@@ -164,4 +165,19 @@ test("heartbeat trace pins the real socket nonce and a valid principal", async (
   expect(frames[1]).toEqual({ t: "ping", nonce: "00000000000000000000000000000001/1/1" });
   const pong = selected.lines.find((line) => line.step === "expect" && line.frame.t === "pong");
   expect(pong).toMatchObject({ frame: { t: "pong", nonce: "00000000000000000000000000000001/1/1" }, fields: ["nonce"] });
+});
+
+
+test("native transport drains the queued acknowledgement before reporting close", async () => {
+  const queued = { frame: { t: "ack", cmd_id: "buffered", ok: true }, delivered_at: 1 } as const;
+  const port = Object.assign(Object.create(NativePort.prototype) as NativePort, {
+    frames: [queued], error: new Error("endpoint closed"), order: ["frame", "close"],
+  });
+  await expect(port.next()).rejects.toThrow("endpoint closed");
+  await expect(port.next(true)).resolves.toEqual(queued);
+  await expect(port.next()).rejects.toThrow("endpoint closed");
+  port.frames.push(queued);
+  port.order.pop();
+  port.error = new Error("transport failed");
+  await expect(port.next(true)).rejects.toThrow("transport failed");
 });

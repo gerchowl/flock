@@ -215,8 +215,8 @@ connect assertion has its explicit virtual interval, and final quiet retains its
 authored virtual ceiling; neither advances server time or waits on a wall-clock
 sleep. There are no runtime event timestamps in this script, so it needs no
 persisted timestamp marker. All selected dynamic timestamps still require their
-explicit bound. The tested pending set now contains three scripts: agent-send,
-heartbeat-missed and token-revoked. Later providers must shrink it.
+explicit bound. The tested pending set now contains two scripts: agent-send and
+heartbeat-missed. Later providers must shrink it.
 Gaps and overlap fail.
 
 The permission fixture resumes after bootstrap and raw request (cursor 3), then
@@ -283,3 +283,28 @@ fail visibly. Clock-stage and transport waits retain the five-second guard;
 connect and quiet retain their authored virtual bounds. Quiet also checks
 buffered native output. No runtime event timestamp occurs in this script
 (ADR-0036 §5a; ADR-0038 §3).
+
+
+`endpoint-revocation.ts` executes all twelve `token-revoked` steps against the
+real token store and command owner. After matching the welcome, it waits for the
+driver to delete the actual credential file before sending the authored command.
+The owner must refuse that command with the exact registered `auth_revoked`
+envelope, including `command refused: auth_revoked`; no target agent is needed
+because authority is checked before dispatch. The native callbacks must show
+welcome, ACK, then close 4403. The client must retain `c1:failed`, enter
+`NeedsToken`, and stay quiet for the authored 45-second virtual interval.
+
+The shared native port exposes close receipts and callback order. Its default
+read still fails on an unexpected close. `next(true)` permits draining a frame
+queued before a known native close only when the caller later verifies that
+close; the revocation script does both. A unit test pins strict reads, buffered
+ACK draining and refusal to drain on a transport error without a close callback.
+
+Three causal controls run automatically: retaining the valid credential yields
+the wrong refusal, checking the wrong close code fails the native close receipt,
+and dropping ACK application leaves the command `sent` instead of `failed`.
+Each must exit 1 at its specified step. IPC EOF, unknown stages, producer exit
+and silent transport/owner work remain bounded by the five-second guards. All
+frames are received from the endpoint; no protocol output is injected. There
+are no runtime event timestamps or wall-clock sleeps. Connect and quiet retain
+their authored virtual bounds (ADR-0036 §5a; ADR-0038 §3).
