@@ -489,13 +489,13 @@ take longer than 30 s in total.
   show a "resyncing" marker. The outbox keeps sending, because every verb is
   verified by the server against its own current state (atomic answers, below).
 - **The resync marker** (`snapshot_to` and the unconfirmed set) is stored with
-  the stream's cursor and cleared when the snapshot ends. After a reconnect or
-  reload, the stream's new `sub` from the stored cursor starts in Replaying. If
-  a marker is stored and the cursor is below its `snapshot_to`, the stream
-  enters Resyncing at once with Replaying as its return state, and the server
-  replays the rest of the snapshot from the log. If the server no longer holds
-  those lines, it sends a new `gap`, which restarts Resyncing and marks every
-  entity unconfirmed again.
+  the stream's cursor and cleared when the snapshot ends. After a reconnect, or
+  a reload whose records are applied (**Load**, below), the stream's new `sub`
+  from the stored cursor starts in Replaying. If a marker is stored and the
+  cursor is below its `snapshot_to`, the stream enters Resyncing at once with
+  Replaying as its return state, and the server replays the rest of the snapshot
+  from the log. If the server no longer holds those lines, it sends a new `gap`,
+  which restarts Resyncing and marks every entity unconfirmed again.
 
 - **Hello.**
   - It sends `hello { protocol, client, token }`.
@@ -678,7 +678,8 @@ one-time code (single use, 60 s) and opens the loopback URL with the code in the
       that settles later is closed at once, as for **Late**. This happens before
       the cleanup tries that database. It opens that principal's database,
       unless persisting has stopped for this load (**Load**, below), restores
-      nothing from it, and bootstraps every stream without `after`. Nothing seen
+      nothing from it, writes its last-opened time once that open succeeds, as
+      **Fresh** does, and bootstraps every stream without `after`. Nothing seen
       under one principal is shown, or resumed from, under another.
     - **Tab locks.** Each tab holds a shared Web Lock named after its database,
       and takes it before it opens the database. A database is deleted only when
@@ -809,25 +810,68 @@ one-time code (single use, 60 s) and opens the loopback URL with the code in the
 - Ephemeral state lives in the store but is not persisted: in-flight streaming
   blocks (§4).
 
-**Load.** A page load with a stored principal tries to restore, under one **restore deadline** of 10 s (the connect deadline's value) from page load. Within it, the tab computes the database name, takes the shared lock, opens the database and reads every stream's record in one readonly transaction, alongside Connecting. Each load ends in exactly one row below. A `welcome` with the stored principal changes nothing while the restore runs: its streams wait, and are not Current. The progress deadline starts only when a `sub` is sent, so the wait does not use it up. A `welcome` with another principal after the records are applied is the principal-change rule (above), which drops them.
+**Load.** A page load with a stored principal and no code to exchange tries to
+restore, under one **restore deadline** of 10 s (the connect deadline's value)
+from page load. Within it, the tab computes the database name, takes the shared
+lock, opens the database and reads every stream's record in one readonly
+transaction, alongside Connecting. Each load ends in exactly one row below. A
+`welcome` with the stored principal changes nothing while the restore runs: its
+streams wait, and are not Current. The progress deadline starts only when a
+`sub` is sent, so the wait does not use it up. A `welcome` with another
+principal after the records are applied is the principal-change rule (above),
+which drops them.
 
 | Outcome | When | Records | Lock and database | `sub`s | Last-opened time | Persists for the rest of the load |
 |---|---|---|---|---|---|---|
 | **Fresh** | no stored principal, or the load exchanges a code, whether or not the exchange succeeds ("Getting and keeping the token", above) | none restored | the tab takes the lock and opens the database once `welcome` arrives, for that principal | sent at once, without `after` | written once that open succeeds | yes; a failure of that open stops it, as **Failed** does |
-| **Applied** | the readonly transaction completes within the deadline, before any `welcome` with another principal | applied together, in one synchronous step. A record that does not parse, or has an unknown or newer version, is absent; the others are applied | kept, until a `versionchange` (**Two tabs**, above) | released when the records are applied: from each record's cursor and marker, or without `after` where a record is absent | written in its own readwrite transaction after the apply | yes |
+| **Applied** | the readonly transaction completes within the deadline, before any `welcome` with another principal | applied together, in one synchronous step. A record that does not parse, or has an unknown or newer version, is absent; the others are applied | kept, until a `versionchange` (**Two tabs**, above) or a principal change (above) | released when the records are applied: from each record's cursor and marker, or without `after` where a record is absent | written in its own readwrite transaction after the apply | yes, until a `versionchange` |
 | **Late** | the deadline passes first, whatever step is pending | none applied; a transaction that completes later is ignored | a pending lock request is aborted (its `signal`), and a lock granted after the deadline is released at once; an open database is closed and its lock released; an open that settles later is closed at once, so a delete queued behind it waits only for that close | released at the deadline, without `after` | none | no, including after a later principal change, which then opens no database |
 | **Failed** | the database fails on load (above) before the deadline | none applied | any open database is closed, and the lock is released or its request aborted | released at once, without `after` | none | no, as for **Late** |
-| **Other principal** | a load that tries to restore gets a `welcome` with another principal before the first of: the records are applied, the deadline passes, the database fails on load | none applied | the restore's lock request is aborted or its lock released, and its database closed unused, so the cleanup can delete it; an open that settles later is closed at once, as for **Late**. The tab then opens the new principal's database, as **Fresh** does | released at once, without `after` | written for the new principal's database, as **Fresh** | yes, under the new principal |
+| **Other principal** | a load that tries to restore gets a `welcome` with another principal before the first of: the records are applied, the deadline passes, the database fails on load | none applied | freed as **A different principal** (above) says, so the cleanup can delete it. The tab then opens the new principal's database, as **Fresh** does | released at once, without `after` | written for the new principal's database, as **Fresh** | yes, under the new principal |
 
-So a tab never holds a lock on a database it does not use, a `sub` never waits longer than the deadline, and nothing read under one principal is shown under another.
+So a tab never holds a lock on a database it does not use, a `sub` never waits
+longer than the deadline, and nothing read under one principal is shown under
+another.
 
 - **Tests that must fail before the change** (one per row):
-  - **Fresh:** a load with no stored principal, and a load that exchanges a code, apply no record, send their `sub`s at once without `after`, open the database only after `welcome`, and then write the last-opened time;
-  - **Applied:** a reload renders the restored entities together, sends no `sub` before they are applied, re-`sub`s from the stored cursors and never applies a `(stream, seq)` twice; one record that does not parse is absent and the others are applied; the last-opened time is written in its own readwrite transaction after the apply;
-  - **Late:** a deadline that fires with the lock request pending, and one that fires mid-transaction, apply no record, release the `sub`s at the deadline, leave the tab holding no lock, write no last-opened time, and persist nothing for the rest of the load, even after a later `welcome` with another principal, which opens no database; an open that settles after the deadline is closed;
-  - **Failed:** unavailable storage, a missing `crypto.subtle`, a `VersionError` and a `blocked` open each release the `sub`s at once, not at the deadline, leave no lock held and persist nothing for the rest of the load;
-  - **Other principal:** a `welcome` with another principal during the restore applies no record, releases the `sub`s at once, frees the old database's lock so the cleanup can delete it, and opens the new principal's database; one that arrives while the open is pending closes that open once it settles; one that arrives after **Late** or **Failed** opens no database;
-  - **Across rows:** a **Fresh** load whose open fails persists nothing for the rest of the load; a load that exchanges a code in a tab with a stored principal and records applies none of them; a principal change after **Applied** closes the old database and releases its lock, so the cleanup can delete it; a restore transaction that errors releases the `sub`s at once; a `versionchange` releases this tab's lock, ends a running restore as **Failed** with no record applied and the `sub`s released at once, and after **Applied** makes no further write; two principal changes in one load, the second while the first's open is pending, leave only the newest database locked; a `welcome` with the stored principal during the restore leaves the streams not Current until the records are applied and each `synced` arrives; a principal change after **Fresh** closes its database and releases its lock.
+  - **Fresh:** a load with no stored principal, and a load that exchanges a
+    code, apply no record, send their `sub`s at once without `after`, open the
+    database only after `welcome`, and then write the last-opened time;
+  - **Applied:** a reload renders the restored entities together, sends no `sub`
+    before they are applied, re-`sub`s from the stored cursors and never applies
+    a `(stream, seq)` twice; one record that does not parse is absent and the
+    others are applied; the last-opened time is written in its own readwrite
+    transaction after the apply;
+  - **Late:** a deadline that fires with the lock request pending, and one that
+    fires mid-transaction, apply no record, release the `sub`s at the deadline,
+    leave the tab holding no lock, write no last-opened time, and persist
+    nothing for the rest of the load, even after a later `welcome` with another
+    principal, which opens no database; an open that settles after the deadline
+    is closed;
+  - **Failed:** unavailable storage, a missing `crypto.subtle`, a `VersionError`
+    and a `blocked` open each release the `sub`s at once, not at the deadline,
+    leave no lock held and persist nothing for the rest of the load;
+  - **Other principal:** a `welcome` with another principal during the restore
+    applies no record, releases the `sub`s at once, frees the old database's
+    lock so the cleanup can delete it, and opens the new principal's database;
+    one that arrives while the open is pending closes that open once it settles;
+    one that arrives after **Late** or **Failed** opens no database;
+  - **Across rows:** a **Fresh** load whose open fails persists nothing for the
+    rest of the load; a load that exchanges a code in a tab with a stored
+    principal and records applies none of them; a principal change after
+    **Applied** closes the old database and releases its lock, so the cleanup
+    can delete it; a restore transaction that errors releases the `sub`s at
+    once; a `versionchange` releases this tab's lock, ends a running restore as
+    **Failed** with no record applied and the `sub`s released at once, and after
+    **Applied** makes no further write; two principal changes in one load, the
+    second while the first's open is pending, leave only the newest database
+    locked; a `welcome` with the stored principal during the restore leaves the
+    streams not Current until the records are applied and each `synced` arrives;
+    a principal change after **Fresh** closes its database and releases its
+    lock; a principal change after **Applied** writes the new database's
+    last-opened time, and a cleanup in another tab after this tab closes keeps
+    it; an **Other principal** load whose hand-off open fails persists nothing
+    for the rest of the load.
 
 **The command outbox.**
 - Every `cmd` gets a `cmd_id` (UUIDv7) and is stored with its `verb`, `args`,
