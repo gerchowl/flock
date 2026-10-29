@@ -4286,7 +4286,11 @@ terminal queue refusal remains a typed failure on subsequent polls rather than
 becoming a successful end. Retirement clears old presentation state and leaves
 composer admission refused as `agent_not_found`; it does not grant a new target.
 
-Queue subscribers wake waiters after releasing the book on every result.
+Queue subscribers wake waiters after releasing the book on every result,
+including unwinding from a snapshot callback or registration. One guard owns
+both the mutex guard and its notify-on-drop field; declaration-order field
+destruction releases the book first. Publishers use the same guard for capture,
+finish, publication and teardown, waking both readiness and capture capacity.
 Failed try-locks never self-notify. Ended sources need this wake because their
 publisher has stopped. Capture capacity has a separate notification, armed
 before capture, so a full channel cannot self-wake a retry loop.
