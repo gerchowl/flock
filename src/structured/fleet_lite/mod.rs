@@ -1,9 +1,9 @@
 //! S7-min fleet-lite core (ADR-0036 §4/§5a, ADR-0038 §2a, #1832 slice 6a).
 //!
-//! No transport, subscriptions, EventHub, PTY, peer or node projection exists here.
-//! #1832 slice 6b supplies registry/activity/S6 inputs and publishes returned batches
-//! under subscription ownership. Reads create durable inline checkpoints: their
-//! allocated seqs must also reach existing subscribers before subsequent deltas.
+//! Local node/project projection extends the structured registry/S4/S6 cut.
+//! Remote observations, status counts and staleness are #2750 (N1b).
+//! Checkpoints reserve global positions but are delivered privately to their
+//! requesting subscriber; the shared ring carries only live deltas.
 //! The exclusive file lock fences local writers, not the deferred S7 handoff protocol.
 //! Unknown/invalid rows are warned, skipped and preserved raw (ADR-0028 §3a).
 //! A separate durable cursor reserves positions before snapshot replacement (#1976).
@@ -21,13 +21,17 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-pub use wire::{FleetAgentRow, FleetDelta};
+pub use wire::{FleetAgentRow, FleetDelta, FleetNodeRow, FleetProjectRow};
+mod rows;
+use rows::Key;
+pub use rows::{local_rows, Row};
 
-type Rows = BTreeMap<String, FleetAgentRow>;
+type Rows = BTreeMap<Key, Row>;
 
 /// Trusted structured-only projection inputs. S6 IDs come from the permission
 /// book, not phase inference. The provider must propagate unavailable observations
 /// rather than manufacture an empty fleet or empty attention list.
+#[derive(Clone, Copy)]
 pub struct StructuredAgent<'a> {
     /// Registry identity and optional user label; no PTY record fits this type.
     pub record: &'a Record,
@@ -43,6 +47,10 @@ pub struct StructuredAgent<'a> {
 pub trait Provider {
     /// Read structured agents only; observation failure must leave the store intact.
     fn agents(&self) -> io::Result<Vec<StructuredAgent<'_>>>;
+    /// Coherent heterogeneous rows, keyed by entity kind, owner and identity.
+    fn rows(&self) -> io::Result<Vec<Row>> {
+        local_rows(self.agents()?, None)
+    }
 }
 
 /// Project the existing generated wire contract without pane or task fields.
@@ -58,21 +66,23 @@ pub fn project(agent: StructuredAgent<'_>) -> FleetAgentRow {
         activity: agent.activity.map(str::to_owned),
         waiting_on_human: agent.waiting_on_human.to_vec(),
         route: None,
+        node_id: None,
+        project: None,
     }
 }
 
-/// Pure deterministic changes: removals by ID, then changed/new rows by ID.
-/// Unchanged rows consume no seq. Input maps must be keyed by their row IDs.
-pub fn changes(previous: &Rows, current: &Rows) -> Vec<FleetDelta> {
+/// Deterministic removals then upserts, ordered by entity kind, owner and ID.
+/// Unchanged rows consume no sequence positions.
+fn changes(previous: &Rows, current: &Rows) -> Vec<FleetDelta> {
     previous
         .keys()
         .filter(|id| !current.contains_key(*id))
-        .map(|id| FleetDelta::Remove { id: id.clone() })
+        .map(|id| previous[id].remove())
         .chain(
             current
                 .iter()
                 .filter(|(id, row)| previous.get(*id) != Some(*row))
-                .map(|(_, row)| FleetDelta::Upsert { row: row.clone() }),
+                .map(|(_, row)| row.clone().upsert()),
         )
         .collect()
 }
@@ -82,7 +92,7 @@ pub fn changes(previous: &Rows, current: &Rows) -> Vec<FleetDelta> {
 pub struct Delta {
     /// Persisted stream-local position, never reset at restart.
     pub seq: u64,
-    /// Closed fleet.upsert/fleet.remove vocabulary.
+    /// Closed agent/node/project fleet delta vocabulary.
     pub event: FleetDelta,
 }
 
@@ -126,7 +136,7 @@ pub struct Store {
     _lock: File,
     document: Value,
     rows: Rows,
-    encoded: BTreeMap<String, Value>,
+    encoded: BTreeMap<Key, Value>,
     retained: Vec<Value>,
     high_water: u64,
     writable: bool,
@@ -303,15 +313,23 @@ impl Store {
         let mut encoded = BTreeMap::new();
         let mut retained = Vec::new();
         for (index, value) in raw.iter().enumerate() {
-            let reason = match serde_json::from_value::<FleetAgentRow>(value.clone()) {
-                Ok(row) if !valid(&row) => "invalid",
-                Ok(row) if rows.contains_key(&row.id) => "duplicate",
+            let reason = match rows::decode(value.clone()) {
+                Ok(row) if !row.valid() => "invalid",
+                Ok(row) if rows.contains_key(&row.key()) => "duplicate",
                 Ok(row) => {
-                    encoded.insert(row.id.clone(), value.clone());
-                    rows.insert(row.id.clone(), row);
+                    encoded.insert(row.key(), value.clone());
+                    rows.insert(row.key(), row);
                     continue;
                 }
-                Err(_) if value.is_object() && value.get("id").is_none() => "unsupported",
+                Err(_)
+                    if value.get("kind").is_some_and(|k| {
+                        !matches!(k.as_str(), Some("agent" | "node" | "project"))
+                    }) || (value.is_object()
+                        && value.get("kind").is_none()
+                        && value.get("id").is_none()) =>
+                {
+                    "unsupported"
+                }
                 Err(_) => "invalid",
             };
             tracing::warn!(index, reason, "skipping and retaining fleet row");
@@ -345,9 +363,8 @@ impl Store {
     /// allocate nothing. Returned deltas are already durable and densely numbered.
     pub fn refresh(&mut self, provider: &dyn Provider) -> io::Result<Vec<Delta>> {
         let mut rows = Rows::new();
-        for agent in provider.agents()? {
-            let row = project(agent);
-            if !valid(&row) || rows.insert(row.id.clone(), row).is_some() {
+        for row in provider.rows()? {
+            if !row.valid() || rows.insert(row.key(), row).is_some() {
                 return Err(invalid("invalid or duplicate fleet projection"));
             }
         }
@@ -356,16 +373,14 @@ impl Store {
             return Ok(Vec::new());
         }
         let batch = self.number(events)?;
-        let changed: BTreeSet<_> = batch
+        let changed: BTreeSet<_> = rows
             .iter()
-            .map(|delta| match &delta.event {
-                FleetDelta::Upsert { row } => row.id.as_str(),
-                FleetDelta::Remove { id } => id.as_str(),
-            })
+            .filter(|(key, row)| self.rows.get(*key) != Some(*row))
+            .map(|(key, _)| key)
             .collect();
         let mut encoded = BTreeMap::new();
         for (id, row) in &rows {
-            if !changed.contains(id.as_str()) {
+            if !changed.contains(id) {
                 if let Some(value) = self.encoded.get(id) {
                     encoded.insert(id.clone(), value.clone());
                     continue;
@@ -373,20 +388,18 @@ impl Store {
             }
             encoded.insert(id.clone(), serde_json::to_value(row)?);
         }
-        let removed: BTreeSet<_> = batch
-            .iter()
-            .filter_map(|delta| match &delta.event {
-                FleetDelta::Remove { id } => Some(id.as_str()),
-                FleetDelta::Upsert { .. } => None,
-            })
+        let removed: BTreeSet<_> = self
+            .rows
+            .keys()
+            .filter(|key| !rows.contains_key(*key))
             .collect();
         let retained = self
             .retained
             .iter()
             .filter(|raw| {
-                raw.get("id")
-                    .and_then(Value::as_str)
-                    .is_none_or(|id| !removed.contains(id))
+                rows::decode((**raw).clone())
+                    .ok()
+                    .is_none_or(|row| !removed.contains(&row.key()))
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -406,13 +419,7 @@ impl Store {
     /// ADR-0036 §4; an empty checkpoint retains its nonzero head across restart.
     /// 6b serializes cut capture with live registration, then delivers it privately.
     pub fn snapshot(&mut self) -> io::Result<Snapshot> {
-        let rows = self.number(
-            self.rows
-                .values()
-                .cloned()
-                .map(|row| FleetDelta::Upsert { row })
-                .collect(),
-        )?;
+        let rows = self.number(self.rows.values().cloned().map(Row::upsert).collect())?;
         let snapshot_to = rows.last().map_or(self.high_water, |d| d.seq);
         let cut = Snapshot {
             to: self.high_water,
@@ -439,7 +446,7 @@ impl Store {
     fn commit(
         &mut self,
         head: u64,
-        encoded: &BTreeMap<String, Value>,
+        encoded: &BTreeMap<Key, Value>,
         retained: &[Value],
     ) -> io::Result<()> {
         if !self.writable {

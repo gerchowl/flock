@@ -481,7 +481,13 @@ fn minimal_fleet_fixture_has_typed_rows_deltas_and_fresh_snapshot_recovery() {
                         unconfirmed.remove(&row.id);
                         agents.insert(row.id.clone(), row);
                     }
-                    FleetDelta::Remove { id } => {
+                    FleetDelta::NodeUpsert { .. }
+                    | FleetDelta::NodeRemove { .. }
+                    | FleetDelta::ProjectUpsert { .. }
+                    | FleetDelta::ProjectRemove { .. } => {
+                        panic!("unexpected entity in agent-only fixture")
+                    }
+                    FleetDelta::Remove { id, .. } => {
                         assert!(
                             snapshot_to.is_none(),
                             "snapshot contains only complete rows"
@@ -770,4 +776,18 @@ fn build_version_matcher_is_typed_and_restricted_to_welcome() {
         invalid["frame"][field] = value;
         assert!(FixtureLine::parse(&invalid.to_string()).is_err());
     }
+}
+
+#[test]
+fn node_and_project_contracts_keep_explicit_nulls_and_scoped_identity() {
+    let node = crate::mesh::identity::NodeIdentity::fixture([71; 32]).node_id();
+    let value = json!({"node_id":node,"name":"Opaque node","health":null,
+        "latency_ms":null,"last_ok":null,"version":null,"error":null,
+        "online":false,"route":null,"counts":null,"unbound_configured_peers":null});
+    let row: FleetNodeRow = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(serde_json::to_value(row).unwrap(), value);
+    let cwd = crate::test_support::unique_temp_path("fleet-project");
+    let project = json!({"node_id":node,"id":cwd,"name":"Project"});
+    let row: FleetProjectRow = serde_json::from_value(project.clone()).unwrap();
+    assert_eq!(serde_json::to_value(row).unwrap(), project);
 }
