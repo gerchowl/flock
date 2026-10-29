@@ -199,6 +199,33 @@ describe("wire transport", () => {
     expect(h.connection.state).toBe("Live");
   });
 
+  test("a cursor_ahead reset opens a new sync epoch, so its re-sub's synced is delivered; a lagged re-sub's is not (#2234)", () => {
+    const h = new Harness();
+    live(h);
+    const seen: string[] = [];
+    createWireTransport(h.connection).subscribe("agent/a", null, {
+      entry: (entry) => seen.push(`entry ${entry.seq}`),
+      synced: () => seen.push("synced"),
+      failed: (failure) => seen.push(`failed: ${failure.message}`),
+      reset: () => seen.push("reset"),
+    });
+    const send = (frame: ServerFrame): void => h.step(step({ step: "send", frame }));
+    const sub = lastSub(h);
+    send({ t: "ev", sub_id: sub, stream: "agent/a", seq: 3, ts_ms: 0, ev: { type: "user", message: {} } });
+    send({ t: "synced", sub_id: sub, seq: 3 });
+    send({ t: "subfail", sub_id: sub, code: "cursor_ahead", message: "ahead" });
+    const fresh = lastSub(h);
+    expect(fresh).not.toBe(sub);
+    send({ t: "ev", sub_id: fresh, stream: "agent/a", seq: 1, ts_ms: 0, ev: { type: "user", message: {} } });
+    send({ t: "synced", sub_id: fresh, seq: 1 });
+    // A lagged re-sub stays inside the epoch: its barrier is not repeated.
+    send({ t: "lagged", sub_id: fresh, skipped_to: 9 });
+    const resub = lastSub(h);
+    expect(resub).not.toBe(fresh);
+    send({ t: "synced", sub_id: resub, seq: 9 });
+    expect(seen).toEqual(["entry 3", "synced", "reset", "entry 1", "synced"]);
+  });
+
   test("a stale gap after a lagged re-sub is dropped, so seqs only increase and no marker repeats", () => {
     const h = new Harness();
     live(h);
