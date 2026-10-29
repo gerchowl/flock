@@ -28,6 +28,13 @@ fn selected_from(root: &std::path::Path) -> Vec<(String, Vec<FixtureLine>)> {
                 .all(|(i, label)| !covers[..i].contains(label)),
             "{name}: duplicate coverage"
         );
+        assert!(
+            covers.iter().all(|label| matches!(
+                label,
+                FixtureCoverage::S7Min | FixtureCoverage::S7 | FixtureCoverage::ClientOnly
+            )),
+            "{name}: unknown coverage label"
+        );
         if covers.contains(&FixtureCoverage::S7Min) {
             assert!(
                 !covers.contains(&FixtureCoverage::ClientOnly),
@@ -86,46 +93,31 @@ fn scenario(name: &str, lines: &[FixtureLine]) -> Scenario {
     }
 }
 
-/// Restore every sandboxed path, including on a failed conformance assertion.
-struct Environment(Vec<(&'static str, Option<std::ffi::OsString>)>);
-impl Environment {
-    fn sandbox(root: &std::path::Path) -> Self {
-        let keys = [
-            "HOME",
-            "XDG_CONFIG_HOME",
-            "XDG_STATE_HOME",
-            "XDG_DATA_HOME",
-            "XDG_RUNTIME_DIR",
-            "FLOCK_CONFIG_PATH",
-        ];
-        let guard = Self(
-            keys.iter()
-                .map(|&key| (key, std::env::var_os(key)))
-                .collect(),
-        );
-        for key in keys {
-            if key == "FLOCK_CONFIG_PATH" {
-                std::env::remove_var(key);
-            } else {
-                std::env::set_var(key, root);
-            }
-        }
-        guard
-    }
-}
-impl Drop for Environment {
-    fn drop(&mut self) {
-        for (key, value) in &self.0 {
-            match value {
-                Some(value) => std::env::set_var(key, value),
-                None => std::env::remove_var(key),
-            }
+/// Configure only the child process: unrelated tests may read HOME/XDG without a lock.
+/// The child runs exactly one test, so App's path readers and background threads see
+/// the same sandbox for their entire lifetime, without any process-wide mutation.
+fn sandbox_command(root: &std::path::Path) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("FLOCK_") {
+            command.env_remove(key);
         }
     }
+    for key in [
+        "HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_STATE_HOME",
+        "XDG_DATA_HOME",
+        "XDG_RUNTIME_DIR",
+    ] {
+        command.env(key, root);
+    }
+    command.kill_on_drop(true);
+    command
 }
-async fn client_open_server() -> (Server, Bearer, Environment) {
+async fn client_open_server() -> (Server, Bearer) {
     let root = crate::structured::launch::SessionConfigDir::create(&std::env::temp_dir()).unwrap();
-    let environment = Environment::sandbox(root.path());
+    // Only the isolated child calls this helper; its environment is immutable.
     let data = crate::session::data_dir();
     fs::create_dir_all(&data).unwrap();
     let server = Server::from_store(root, TokenStore::open(&data).unwrap(), |clock| {
@@ -166,7 +158,7 @@ async fn client_open_server() -> (Server, Bearer, Environment) {
         .exchange(code, Instant::now())
         .expect("production exchange redeems ClientOpen once");
     assert!(app.client_codes.exchange(code, Instant::now()).is_none());
-    (server, bearer, environment)
+    (server, bearer)
 }
 
 #[test]
@@ -214,8 +206,78 @@ fn uncovered_inventory_entries_are_rejected() {
     assert!(std::panic::catch_unwind(|| selected_from(root.path())).is_err());
 }
 #[test]
+fn unknown_coverage_labels_are_rejected() {
+    let root = crate::structured::launch::SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+    let source = fs::read_to_string(fixture_root().join("clean.jsonl")).unwrap();
+    for labels in ["[\"future\"]", "[\"s7-min\",\"future\"]"] {
+        fs::write(
+            root.path().join("future.jsonl"),
+            source.replace("[\"s7-min\"]", labels),
+        )
+        .unwrap();
+        assert!(
+            std::panic::catch_unwind(|| selected_from(root.path())).is_err(),
+            "unknown coverage {labels} must fail"
+        );
+    }
+}
+
+#[test]
+fn sandbox_preserves_parent_environment() {
+    let keys = [
+        "HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_STATE_HOME",
+        "XDG_DATA_HOME",
+        "XDG_RUNTIME_DIR",
+        "FLOCK_CONFIG_PATH",
+    ];
+    let before: Vec<_> = keys.iter().map(std::env::var_os).collect();
+    let root = crate::structured::launch::SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+    let sandbox = sandbox_command(root.path());
+    let child_home = sandbox
+        .as_std()
+        .get_envs()
+        .find(|(key, _)| *key == "HOME")
+        .unwrap()
+        .1;
+    assert_eq!(child_home, Some(root.path().as_os_str()));
+    let during: Vec<_> = std::thread::spawn(move || keys.iter().map(std::env::var_os).collect())
+        .join()
+        .unwrap();
+    assert_eq!(
+        during, before,
+        "unlocked readers must retain the parent environment"
+    );
+}
+
+#[test]
 fn selected_welcome_capabilities_match_the_actual_endpoint() {
-    let (_lock, _scrub) = crate::config::test_config_env_guard();
+    if std::env::var_os("FLOCK_WIRE_CONFORMANCE_CHILD").is_none() {
+        let root =
+            crate::structured::launch::SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+        let mut child = sandbox_command(root.path());
+        let test = concat!(
+            module_path!(),
+            "::selected_welcome_capabilities_match_the_actual_endpoint"
+        );
+        child.args(["--exact", test.split_once("::").unwrap().1, "--nocapture"]);
+        child.env("FLOCK_WIRE_CONFORMANCE_CHILD", "1");
+        runtime(async {
+            let output = within(child.output()).await.unwrap();
+            assert!(
+                output.status.success(),
+                "isolated conformance failed: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "child must execute the conformance test"
+            );
+        });
+        return;
+    }
     runtime(async {
         for (name, lines) in selected() {
             let kind = scenario(&name, &lines);
@@ -255,11 +317,10 @@ fn selected_welcome_capabilities_match_the_actual_endpoint() {
                     _ => None,
                 })
                 .expect("scenario classification requires welcome");
-            let (server, bearer, _environment) = if kind == Scenario::ClientOpen {
-                let (server, bearer, environment) = client_open_server().await;
-                (server, bearer, Some(environment))
+            let (server, bearer) = if kind == Scenario::ClientOpen {
+                client_open_server().await
             } else {
-                (Server::new().await, Bearer("a".repeat(64)), None)
+                (Server::new().await, Bearer("a".repeat(64)))
             };
             let scopes = if kind == Scenario::ClientOpen {
                 let grants =
