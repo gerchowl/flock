@@ -587,7 +587,11 @@ impl App {
                 // #418: and say it in the log without saying it every poll —
                 // the edges, plus one summary per window while it lasts.
                 Err(error) => {
-                    summary.bind_node(pinned);
+                    // A failed transport proves no identity change. Only a known
+                    // replacement pin can rebind the cached owner facts.
+                    if pinned.is_some() {
+                        summary.bind_node(pinned);
+                    }
                     let reason = crate::peers::SshFailureReason::classify(&error);
                     let log = summary.dial.record_failure(reason, now, summary_every);
                     let consecutive = summary.dial.consecutive_failures;

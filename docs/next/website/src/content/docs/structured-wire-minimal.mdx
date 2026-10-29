@@ -62,7 +62,11 @@ peer observations and the signed route table by authenticated NodeId. A retained
 enrollment or a signed route supplies identity before a first summary; configured
 names and SSH targets never do. Node and route display names use the same full
 NodeId-derived alias. No private hostname or SSH error text reaches these rows.
-The freshest provable observation wins, with a stable ordering for ties.
+A signed route proves the node identity, not the source of an arbitrary summary.
+Direct facts require a matching independent enrollment pin. Relayed facts require
+the existing local channel binding to identify the immediate source as that same
+owner; third-party claims and carried snapshots cannot supply or freshen facts.
+The freshest proven owner observation wins, with a stable ordering for ties.
 Direct latency is the last home-to-owner summary request in
 milliseconds; relayed observations have `latency_ms: null`. Version and health
 retain their owner identity; rebinding a peer clears the old owner's facts.
@@ -78,6 +82,11 @@ protocol, poll failure, missing live route and age strictly greater than the
 effective `[gossip] stale_after_secs` threshold are offline. Failures use bounded
 `pending`, `stale`, `route`, `peer_incompatible`, or classified SSH reasons.
 A successful compatible observation with a live route clears the error.
+An unavailable home sample stays `health: null`; previous home health is not
+reported as current. Thermal severity and component remain, but host-authored
+thermal detail labels are omitted at read scope. A failed unpinned poll retains
+last-known peer facts for existing offline diagnostics; it does not prove a
+replacement identity or authorize those facts as a new owner observation.
 
 Partial observations and route withdrawal retain known offline nodes and their
 last-known health, version and display timestamp, including across store reopen.

@@ -17,11 +17,13 @@ pub(in crate::web::wire) struct Nodes(BTreeMap<String, (Stamp, Option<u64>)>);
 /// Complete owner cut; absent remote nodes are not an unenrollment assertion.
 #[derive(Clone, PartialEq, Eq)]
 pub(in crate::web::wire) struct Projection {
+    /// Rows from independently proven owner sources.
     pub nodes: Vec<FleetNodeRow>,
     observed: BTreeSet<String>,
     relayed: BTreeSet<String>,
 }
 impl Projection {
+    /// Retain offline owner facts; an unavailable home sample stays unknown.
     pub(super) fn reconcile(
         &self,
         mut rows: Vec<Row>,
@@ -34,22 +36,20 @@ impl Projection {
                 .iter_mut()
                 .find(|r| matches!(r, Row::Node(n) if n.node_id == old.node_id))
             {
-                if new.health.is_none() {
+                let remote = Some(new.node_id.as_str()) != home;
+                if new.health.is_none() && remote {
                     new.health = old.health;
                 }
                 if new.version.is_none() {
                     new.version = old.version;
                 }
-                if new.last_ok.is_none() {
+                if new.last_ok.is_none() && remote {
                     new.last_ok = old.last_ok;
                 }
                 if new.counts.is_none() {
                     new.counts = old.counts;
                 }
-                if new.latency_ms.is_none()
-                    && !self.relayed.contains(&new.node_id)
-                    && Some(new.node_id.as_str()) != home
-                {
+                if new.latency_ms.is_none() && !self.relayed.contains(&new.node_id) && remote {
                     new.latency_ms = old.latency_ms;
                 }
                 if !self.observed.contains(&new.node_id)
@@ -66,6 +66,11 @@ impl Projection {
                 old.route = None;
                 old.error = old.error.or_else(|| Some(Failure::Route.wire()));
                 rows.push(Row::Node(old));
+            }
+        }
+        for row in &mut rows {
+            if let Row::Node(row) = row {
+                row.health = row.health.take().map(read_health);
             }
         }
         rows
@@ -107,6 +112,11 @@ pub(super) fn age(peer: &PeerSummaryState, now: Instant) -> Option<Duration> {
     }
 }
 impl Nodes {
+    /// Test-only visibility into owner-observation cache retention.
+    #[cfg(test)]
+    pub(in crate::web::wire) fn stamp_count(&self) -> usize {
+        self.0.len()
+    }
     pub(in crate::web::wire) fn observe(&mut self, app: &App, now: Instant) -> Projection {
         let wall = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -119,15 +129,21 @@ impl Nodes {
             .into_iter()
             .map(|r| (r.node.clone(), r))
             .collect();
+        let pins: BTreeMap<_, _> = app
+            .state
+            .peers
+            .iter()
+            .filter_map(|peer| {
+                Some((
+                    peer.name.as_str(),
+                    crate::peer_stream::enrollment(peer).node_id?,
+                ))
+            })
+            .collect();
         let ids: BTreeSet<_> = routes
             .keys()
             .cloned()
-            .chain(
-                app.state
-                    .peers
-                    .iter()
-                    .filter_map(|p| crate::peer_stream::enrollment(p).node_id),
-            )
+            .chain(pins.values().cloned())
             .collect();
         let snapshot = app.state.fleet_snapshot.as_ref();
         let peers: Vec<_> = app
@@ -147,7 +163,23 @@ impl Nodes {
                     .flat_map(|s| s.peers.iter().chain(s.origin_summary.iter()))
                     .map(|s| (s, false)),
             )
+            .filter(|(peer, direct)| {
+                peer.node_id.as_ref().is_some_and(|id| {
+                    if *direct {
+                        pins.get(peer.peer.as_str()) == Some(id)
+                    } else {
+                        app.state.server_peer_node(peer) == Some(id.as_str())
+                    }
+                })
+            })
             .collect();
+        self.0.retain(|id, _| {
+            ids.contains(id)
+                && app.node_id.as_ref() != Some(id)
+                && peers
+                    .iter()
+                    .any(|(peer, _)| peer.node_id.as_ref() == Some(id))
+        });
         let mut projection = Projection {
             nodes: Vec::new(),
             observed: BTreeSet::new(),
@@ -189,23 +221,15 @@ impl Nodes {
                     projection.observed.insert(id.clone());
                     let observation_age = age(peer, now);
                     let stamp = (peer.last_ok, peer.origin_last_ok_secs, peer.ingested_at);
-                    let captured = self.0.entry(id.clone()).or_insert_with(|| {
-                        (
-                            stamp,
-                            wall.and_then(|w| {
+                    if observation_age.is_some() {
+                        if self.0.get(&id).is_none_or(|cached| cached.0 != stamp) {
+                            let captured = wall.and_then(|w| {
                                 w.checked_sub(u64::try_from(observation_age?.as_millis()).ok()?)
-                            }),
-                        )
-                    });
-                    if captured.0 != stamp {
-                        *captured = (
-                            stamp,
-                            wall.and_then(|w| {
-                                w.checked_sub(u64::try_from(observation_age?.as_millis()).ok()?)
-                            }),
-                        );
+                            });
+                            self.0.insert(id.clone(), (stamp, captured));
+                        }
+                        row.last_ok = self.0.get(&id).and_then(|cached| cached.1);
                     }
-                    row.last_ok = captured.1;
                     row.health = peer.system.clone();
                     row.version = peer.version.clone();
                     if direct && peer.proxy_jump.is_none() && peer.origin_last_ok_secs.is_none() {
@@ -241,4 +265,15 @@ impl Nodes {
         }
         projection
     }
+}
+
+/// Thermal detail is host-authored free text. Only its typed severity/component
+/// are read-scoped facts; clearing the label prevents hostname disclosure.
+fn read_health(
+    mut health: crate::api::schema::PeerSystemSummary,
+) -> crate::api::schema::PeerSystemSummary {
+    if let Some(thermal) = &mut health.thermal {
+        thermal.label.clear();
+    }
+    health
 }

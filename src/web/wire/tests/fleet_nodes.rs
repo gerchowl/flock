@@ -367,7 +367,7 @@ fn rebinding_a_peer_cannot_transfer_health_to_the_new_identity() {
 }
 
 #[test]
-fn relayed_observation_keeps_null_latency_stable_time_and_legacy_protocol_refusal() {
+fn proven_owner_relay_keeps_null_latency_stable_time_and_legacy_protocol_refusal() {
     let _guard = crate::config::test_config_env_guard();
     runtime(async {
         let mut case = Case::new().await;
@@ -393,31 +393,57 @@ fn relayed_observation_keeps_null_latency_stable_time_and_legacy_protocol_refusa
             "node_id":leaf.node_id(),"name":"leaf.example","ssh_target":"leaf.example","host":"leaf.example","origin":"origin.example",
             "version":"owner-version","protocol":crate::protocol::PROTOCOL_VERSION,"system":{"cpu_percent":14},"latency_ms":9999,"age_secs":5,"origin_last_ok_secs":5,"proxy_jump":"hub.example"
         }]}),2);
+        case.success(&peer,&hub.node_id(),json!({"relayed_fleet":[{
+            "node_id":hub.node_id(),"name":"hub.example","ssh_target":"hub.example","host":"hub.example","origin":"hub.example",
+            "version":"owner-version","protocol":crate::protocol::PROTOCOL_VERSION,"system":{"cpu_percent":14},"latency_ms":9999,"age_secs":5,"origin_last_ok_secs":5,"proxy_jump":"hub.example"
+        }]}),2);
+        // This local binding is the enrolled immediate channel, not a claim
+        // made by the relayed payload. Remove the direct reading to observe it.
+        case.app
+            .state
+            .server_nodes
+            .insert(peer.name.clone(), hub.node_id());
+        let index = case
+            .app
+            .state
+            .peer_summaries
+            .iter()
+            .position(|p| p.peer == peer.name)
+            .unwrap();
+        let direct = case.app.state.peer_summaries.remove(index);
         let capture = case
             .app
             .state
             .relayed_fleet_cache
             .values()
-            .next()
+            .find(|e| e.peer.node_id.as_deref() == Some(hub.node_id().as_str()))
             .unwrap()
             .peer
             .ingested_at
             .unwrap();
         case.server.clock.advance_to(capture);
         let rows = case.snapshot().await;
-        let row = rows[&leaf.node_id()].clone();
+        for field in ["health", "version", "last_ok", "latency_ms"] {
+            assert!(
+                rows[&leaf.node_id()][field].is_null(),
+                "unproven leaf {field}"
+            );
+        }
+        assert_eq!(rows[&leaf.node_id()]["error"]["code"], "pending");
+        let row = rows[&hub.node_id()].clone();
         assert_eq!(row["online"], true);
         assert!(row["latency_ms"].is_null());
         assert_eq!(row["health"]["cpu_percent"], 14);
         assert_eq!(row["route"]["next_hop"], hub.node_id());
-        assert_eq!(row["route"]["hops"], 2);
+        assert_eq!(row["route"]["hops"], 1);
         assert!(row["last_ok"].as_u64().is_some());
         case.server.clock.advance(7);
         assert_eq!(
-            case.snapshot().await[&leaf.node_id()]["last_ok"],
+            case.snapshot().await[&hub.node_id()]["last_ok"],
             row["last_ok"],
             "GUI traffic cannot freshen the owner"
         );
+        case.app.state.peer_summaries.insert(index, direct);
         case.success(&peer, &hub.node_id(), json!({"protocol":null}), 3);
         let legacy = case.snapshot().await[&hub.node_id()].clone();
         assert_eq!(legacy["online"], false);
@@ -433,8 +459,9 @@ fn relayed_observation_keeps_null_latency_stable_time_and_legacy_protocol_refusa
         assert_eq!(newer["error"]["code"], "peer_incompatible");
         case.app.state.relayed_fleet_cache.clear();
         case.success(&peer,&hub.node_id(),json!({"relayed_fleet":[{
-            "node_id":leaf.node_id(),"name":"leaf.example","ssh_target":"leaf.example","host":"leaf.example","origin":"origin.example", "protocol":crate::protocol::PROTOCOL_VERSION,"latency_ms":9999
+            "node_id":hub.node_id(),"name":"hub.example","ssh_target":"hub.example","host":"hub.example","origin":"origin.example", "protocol":crate::protocol::PROTOCOL_VERSION,"latency_ms":9999
         }]}),5);
+        case.app.state.peer_summaries.remove(index);
         let capture = case
             .app
             .state
@@ -446,12 +473,190 @@ fn relayed_observation_keeps_null_latency_stable_time_and_legacy_protocol_refusa
             .ingested_at
             .unwrap();
         case.server.clock.advance_to(capture);
-        let unknown_observer = case.snapshot().await[&leaf.node_id()].clone();
+        let unknown_observer = case.snapshot().await[&hub.node_id()].clone();
         assert!(
             unknown_observer["latency_ms"].is_null(),
             "a matching configured name does not establish a home observation"
         );
         assert_eq!(unknown_observer["online"], false);
+        case.server.finish().await;
+    });
+}
+
+async fn assert_unproven_claim_is_ignored(relayed: bool) {
+    let mut case = Case::new().await;
+    let owner = NodeIdentity::fixture([91; 32]);
+    let id = owner.node_id();
+    let peer = case.peer("verified.example");
+    crate::peer_stream::test_enroll(&peer, &id);
+    case.direct(&owner);
+    case.success(&peer, &id, json!({"system":{"cpu_percent":17}}), 7);
+    let original = case.snapshot().await[&id].clone();
+    case.fail(&peer, "Permission denied (publickey)");
+    if relayed {
+        let hub = NodeIdentity::fixture([92; 32]);
+        let via = case.peer("claims.example");
+        crate::peer_stream::test_enroll(&via, &hub.node_id());
+        case.success(&via,&hub.node_id(),json!({"relayed_fleet":[{"name":"claimed.example","host":"claimed.example","ssh_target":"claimed.example","origin":"claims.example","node_id":id,"age_secs":0,"origin_last_ok_secs":0,"protocol":crate::protocol::PROTOCOL_VERSION,"version":"invented-version","system":{"cpu_percent":99}}]}),1);
+        let capture = case
+            .app
+            .state
+            .relayed_fleet_cache
+            .values()
+            .next()
+            .unwrap()
+            .peer
+            .ingested_at
+            .unwrap();
+        case.server
+            .clock
+            .advance_to(capture + Duration::from_millis(1));
+    } else {
+        // A cached claim survives the source losing its independent binding.
+        let unpinned = case.peer("unpinned.example");
+        crate::peer_stream::test_enroll(&unpinned, &id);
+        case.success(
+            &unpinned,
+            &id,
+            json!({"system":{"cpu_percent":88},"version":"unproven-version"}),
+            2,
+        );
+        crate::peer_stream::reset_enrollment(&unpinned.name);
+    }
+    let row = case.snapshot().await[&id].clone();
+    case.server.finish().await;
+    assert_eq!(row["online"], false);
+    assert_eq!(row["error"]["code"], "auth_refused");
+    for field in ["health", "version", "last_ok", "latency_ms"] {
+        assert_eq!(
+            row[field], original[field],
+            "unproven source replaced {field}"
+        );
+    }
+}
+#[test]
+fn unproven_relay_claim_cannot_replace_a_pinned_refusal() {
+    let _guard = crate::config::test_config_env_guard();
+    runtime(assert_unproven_claim_is_ignored(true));
+}
+#[test]
+fn unproven_direct_claim_cannot_replace_a_pinned_refusal() {
+    let _guard = crate::config::test_config_env_guard();
+    runtime(assert_unproven_claim_is_ignored(false));
+}
+
+#[test]
+fn a_failed_poll_without_a_pin_preserves_the_previous_owner_observation() {
+    let _guard = crate::config::test_config_env_guard();
+    runtime(async {
+        let mut case = Case::new().await;
+        let peer = case.peer("retained.example");
+        let owner = NodeIdentity::fixture([93; 32]);
+        crate::peer_stream::test_enroll(&peer, &owner.node_id());
+        case.success(&peer,&owner.node_id(),json!({"system":{"cpu_percent":31},"icon":"cpu","workspaces":[{"workspace":"retained-project","agent":"claude","status":"working","pane_id":"fixture-pane"}],"structured_agents":[{"agent_id":"retained-agent","runtime":"structured","status":"working"}]}),9);
+        let before = case.app.state.peer_summaries[0].clone();
+        crate::peer_stream::reset_enrollment(&peer.name);
+        assert!(crate::peer_stream::enrollment(&peer).node_id.is_none());
+        case.fail(&peer, "Permission denied (publickey)");
+        let after = case.app.state.peer_summaries[0].clone();
+        case.server.finish().await;
+        assert!(before.last_ok.is_some());
+        assert!(before.system.is_some());
+        assert!(!before.workspaces.is_empty());
+        assert!(!before.structured_agents.is_empty());
+        assert_eq!(after.node_id, before.node_id);
+        assert_eq!(after.last_ok, before.last_ok);
+        assert_eq!(after.system, before.system);
+        assert_eq!(after.version, before.version);
+        assert_eq!(after.icon, before.icon);
+        assert_eq!(after.workspaces, before.workspaces);
+        assert_eq!(after.structured_agents, before.structured_agents);
+        assert_eq!(
+            after
+                .error
+                .as_deref()
+                .map(|error| crate::peers::SshFailureReason::classify(error).as_str()),
+            Some("auth_refused")
+        );
+    });
+}
+#[test]
+fn a_missing_home_sample_never_reuses_previous_health_as_current() {
+    let _guard = crate::config::test_config_env_guard();
+    runtime(async {
+        use crate::structured::fleet_lite::{Provider, Row, Store, StructuredAgent};
+        struct Previous(Row);
+        impl Provider for Previous {
+            fn agents(&self) -> std::io::Result<Vec<StructuredAgent<'_>>> {
+                Ok(Vec::new())
+            }
+            fn rows(&self) -> std::io::Result<Vec<Row>> {
+                Ok(vec![self.0.clone()])
+            }
+        }
+        let mut case = Case::new().await;
+        let home = case.app.node_id.clone().unwrap();
+        assert!(case.app.state.system_stats.is_none());
+        let mut old = crate::structured::fleet_lite::local_node(&home);
+        old.health = Some(serde_json::from_value(json!({"cpu_percent":91})).unwrap());
+        let mut store = Store::open(case.server._root.path().join("fleet.json")).unwrap();
+        store.refresh(&Previous(Row::Node(old))).unwrap();
+        drop(store);
+        let row = case.snapshot().await[&home].clone();
+        case.server.finish().await;
+        assert!(
+            row["health"].is_null(),
+            "an absent sampler cannot publish old health as current"
+        );
+    });
+}
+#[test]
+fn thermal_labels_cannot_disclose_a_hostname_at_read_scope() {
+    let _guard = crate::config::test_config_env_guard();
+    runtime(async {
+        let mut case = Case::new().await;
+        let owner = NodeIdentity::fixture([94; 32]);
+        let id = owner.node_id();
+        let peer = case.peer("thermal.example");
+        crate::peer_stream::test_enroll(&peer, &id);
+        case.direct(&owner);
+        case.success(&peer,&id,json!({"system":{"thermal":{"severity":3,"component":"gpu","label":"private.example"}}}),1);
+        let row = case.snapshot().await[&id].clone();
+        case.server.finish().await;
+        assert_eq!(row["health"]["thermal"]["severity"], 3);
+        assert_eq!(row["health"]["thermal"]["component"], "gpu");
+        assert!(
+            row["health"]["thermal"].get("label").is_none(),
+            "host-authored detail is not read-scoped metadata"
+        );
+    });
+}
+#[test]
+fn stamp_cache_drops_rebound_and_absent_owners() {
+    let _guard = crate::config::test_config_env_guard();
+    runtime(async {
+        let mut case = Case::new().await;
+        let a = NodeIdentity::fixture([95; 32]);
+        let b = NodeIdentity::fixture([96; 32]);
+        let peer = case.peer("stamp.example");
+        crate::peer_stream::test_enroll(&peer, &a.node_id());
+        case.direct(&a);
+        case.success(&peer, &a.node_id(), json!({}), 1);
+        case.service();
+        assert_eq!(case.server.core.fleet_nodes.stamp_count(), 1);
+        crate::peer_stream::test_enroll(&peer, &b.node_id());
+        case.direct(&b);
+        case.fail(&peer, "Permission denied (publickey)");
+        case.service();
+        assert_eq!(case.server.core.fleet_nodes.stamp_count(), 0);
+        case.success(&peer, &b.node_id(), json!({}), 1);
+        case.service();
+        assert_eq!(case.server.core.fleet_nodes.stamp_count(), 1);
+        case.app.state.peer_summaries.clear();
+        case.app.state.peers.clear();
+        case.app.mesh_routes.table.withdraw_edge(&b.node_id());
+        case.service();
+        assert_eq!(case.server.core.fleet_nodes.stamp_count(), 0);
         case.server.finish().await;
     });
 }
