@@ -107,7 +107,8 @@ pub(crate) struct MutationFence {
     _intent: priority::Intent<Arc<Namespace>>,
 }
 impl PendingMutation {
-    /// The two-second contention ceiling starts after bounded helper startup.
+    /// Five-second startup plus two-second contention: seven seconds of IPC wait.
+    /// Caller hooks and owned-child cleanup/scheduling add to this bound.
     /// Call only on the separately bounded retirement-wait worker.
     pub(crate) fn wait(self, on_wait: impl FnOnce()) -> Result<MutationFence, TokenError> {
         let guard = self

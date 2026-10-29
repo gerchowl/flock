@@ -160,26 +160,20 @@ struct SlowStartup {
     observed: std::rc::Rc<std::cell::Cell<bool>>,
 }
 impl HelperStream for SlowStartup {
-    fn read_timeout(&self, timeout: Duration) -> io::Result<()> {
+    fn read_byte(&mut self, timeout: Duration) -> io::Result<u8> {
         self.timeout.set(timeout);
-        Ok(())
-    }
-}
-impl Read for SlowStartup {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if !self.started.get() {
             assert!(!self.observed.get(), "on_wait preceded helper startup");
             if self.timeout.get() < Duration::from_millis(60) {
                 return Err(io::ErrorKind::TimedOut.into());
             }
             self.started.set(true);
-            buf[0] = b'S';
+            Ok(b'S')
         } else {
             assert!(self.observed.get(), "lock read preceded on_wait");
             assert_eq!(self.timeout.get(), Duration::from_millis(20));
-            buf[0] = b'L';
+            Ok(b'L')
         }
-        Ok(1)
     }
 }
 #[test]
@@ -233,17 +227,14 @@ struct Scripted {
     timeouts: std::cell::RefCell<Vec<Duration>>,
 }
 impl HelperStream for Scripted {
-    fn read_timeout(&self, timeout: Duration) -> io::Result<()> {
+    fn read_byte(&mut self, timeout: Duration) -> io::Result<u8> {
         self.timeouts.borrow_mut().push(timeout);
-        Ok(())
-    }
-}
-impl Read for Scripted {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if self.bytes.position() == self.bytes.get_ref().len() as u64 {
-            return Err(io::ErrorKind::WouldBlock.into());
+            return Err(io::ErrorKind::TimedOut.into());
         }
-        self.bytes.read(buf)
+        let mut byte = [0];
+        self.bytes.read_exact(&mut byte)?;
+        Ok(byte[0])
     }
 }
 #[test]
@@ -298,4 +289,57 @@ fn expired_absolute_budget_also_refuses_an_uncontended_lock() {
     let result = pending.finish_until(Instant::now(), || panic!("uncontended callback"));
     assert_eq!(result.err().unwrap().kind(), io::ErrorKind::TimedOut);
     assert!(open(&path).try_lock().is_ok());
+}
+
+#[test]
+fn closed_peer_buffered_lock_ack_is_still_accepted() {
+    let (mut parent, mut peer) = UnixStream::pair().unwrap();
+    peer.write_all(b"SL").unwrap();
+    let result = wait_for_lock(
+        &mut parent,
+        WaitBudget::Lock(Duration::from_secs(2)),
+        move || {
+            peer.shutdown(std::net::Shutdown::Both)?;
+            drop(peer);
+            Ok(())
+        },
+    );
+    assert!(
+        result.is_ok(),
+        "closed helper lost its buffered L: {result:?}"
+    );
+}
+
+#[test]
+fn peer_closed_before_start_read_keeps_both_acknowledgements() {
+    let (mut parent, mut peer) = UnixStream::pair().unwrap();
+    peer.write_all(b"SL").unwrap();
+    peer.shutdown(std::net::Shutdown::Both).unwrap();
+    drop(peer);
+    assert!(wait_for_lock(
+        &mut parent,
+        WaitBudget::Lock(Duration::from_secs(2)),
+        || Ok(())
+    )
+    .is_ok());
+}
+
+#[test]
+fn real_socket_silence_and_early_eof_remain_distinct() {
+    let (mut parent, mut peer) = UnixStream::pair().unwrap();
+    assert_eq!(
+        parent
+            .read_byte(Duration::from_millis(20))
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::TimedOut
+    );
+    peer.write_all(b"S").unwrap();
+    drop(peer);
+    let result = wait_for_lock(
+        &mut parent,
+        WaitBudget::Lock(Duration::from_secs(2)),
+        || Ok(()),
+    );
+    assert_eq!(result.unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
 }

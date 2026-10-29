@@ -1067,3 +1067,28 @@ async fn failed_assertion_releases_the_mutation_gate() {
     assert!(f.server.core.shared.store.authenticate(&token).is_err());
     f.finish().await;
 }
+
+#[tokio::test]
+async fn shutdown_deadline_stops_transports_even_when_revocation_is_held() {
+    let f = Native::new().await;
+    let lock = crate::platform::client_token_lock::LockFile::new(management_lock(&f));
+    let (waiting, release) = gate_mutation_wait(&f);
+    {
+        let shutdown = f.server.core.shutdown();
+        tokio::pin!(shutdown);
+        tokio::select! {
+            ready = within(waiting) => ready.expect("shutdown producer disappeared"),
+            result = &mut shutdown => panic!("shutdown bypassed held revocation: {result:?}"),
+        }
+        let result = tokio::time::timeout(SHUTDOWN_WAIT + Duration::from_secs(1), &mut shutdown)
+            .await
+            .expect("shutdown did not enforce its revocation deadline");
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert!(*f.server.core.shared.stop.borrow());
+    }
+    drop(lock);
+    release
+        .send(())
+        .expect("held revocation disappeared before release");
+    f.finish().await;
+}

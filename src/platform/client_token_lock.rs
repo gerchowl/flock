@@ -13,8 +13,9 @@ pub(crate) const WORKER_ARG: &str = "--client-token-lock";
 pub(crate) const SHARED_WORKER_ARG: &str = "--client-token-lock-shared";
 /// Ceiling for cold exec and descriptor validation before the started byte.
 /// Separate from lock contention: a silent/dead helper still fails boundedly.
-/// Absolute caller budgets (hello) additionally cap this phase.
-const HELPER_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
+/// Five seconds matches the existing hello ceiling, rather than allowing a
+/// thirty-second management stall. Absolute caller budgets can shorten it.
+const HELPER_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A management wait budgets only contention; hello retains its absolute ceiling.
 enum WaitBudget {
@@ -144,15 +145,17 @@ impl PendingLock {
     pub(crate) fn notify_waiting(&mut self, ready: std::sync::mpsc::Sender<()>) {
         self.waiting = Some(ready);
     }
-    /// Bound startup separately, then wait at most the supplied lock deadline.
+    /// Allow five seconds for startup, then the supplied contention budget.
+    /// A two-second management budget thus allows seven seconds of IPC waiting,
+    /// plus caller-hook and owned-child cleanup/scheduling time.
     /// Cleanup also runs when abandoned.
     pub(crate) fn finish(self, deadline: Duration) -> io::Result<LockFile> {
         self.finish_notifying(deadline, || {})
     }
     /// Observe a started helper before reading its bounded lock acknowledgement.
     /// Startup has its own ceiling; the callback precedes the lock-read timeout.
-    /// It must not wait for the helper or manage the guarded token store. Fixtures may pause here
-    /// with a sender-owned gate, keeping unrelated test work outside the read budget.
+    /// It must not wait for the helper or manage the guarded token store.
+    /// Fixtures may pause here with a sender-owned gate outside the read budget.
     pub(crate) fn finish_notifying(
         self,
         deadline: Duration,
@@ -190,12 +193,65 @@ impl PendingLock {
     }
 }
 /// IPC timeout seam; tests inject helper startup latency without wall-clock waits.
-trait HelperStream: Read {
-    fn read_timeout(&self, timeout: Duration) -> io::Result<()>;
+trait HelperStream {
+    fn read_byte(&mut self, timeout: Duration) -> io::Result<u8>;
 }
 impl HelperStream for UnixStream {
-    fn read_timeout(&self, timeout: Duration) -> io::Result<()> {
-        self.set_read_timeout(Some(timeout))
+    fn read_byte(&mut self, timeout: Duration) -> io::Result<u8> {
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or(io::ErrorKind::InvalidInput)?;
+        loop {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .filter(|left| !left.is_zero())
+                .ok_or(io::ErrorKind::TimedOut)?;
+            let millis = remaining
+                .as_nanos()
+                .div_ceil(1_000_000)
+                .min(i32::MAX as u128);
+            let mut ready = libc::pollfd {
+                fd: self.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: poll borrows one live socket descriptor and a writable record.
+            let result = unsafe { libc::poll(&mut ready, 1, millis as i32) };
+            if result < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error);
+            }
+            if result == 0 {
+                continue;
+            }
+            let mut byte = 0u8;
+            // SAFETY: recv borrows the live socket and a one-byte writable buffer.
+            // Nonblocking receive keeps a spurious readiness edge within the deadline.
+            let count = unsafe {
+                libc::recv(
+                    self.as_raw_fd(),
+                    (&mut byte as *mut u8).cast(),
+                    1,
+                    libc::MSG_DONTWAIT,
+                )
+            };
+            match count {
+                1 => return Ok(byte),
+                0 => return Err(io::ErrorKind::UnexpectedEof.into()),
+                _ => {
+                    let error = io::Error::last_os_error();
+                    if !matches!(
+                        error.kind(),
+                        io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+                    ) {
+                        return Err(error);
+                    }
+                }
+            }
+        }
     }
 }
 fn wait_for_lock(
@@ -208,16 +264,9 @@ fn wait_for_lock(
     read_ack(stream, budget.remaining()?, b'L')
 }
 fn read_ack(stream: &mut impl HelperStream, timeout: Duration, expected: u8) -> io::Result<()> {
-    stream.read_timeout(timeout)?;
-    let mut ack = [0];
-    stream.read_exact(&mut ack).map_err(|e| {
-        if e.kind() == io::ErrorKind::WouldBlock {
-            io::ErrorKind::TimedOut.into()
-        } else {
-            e
-        }
-    })?;
-    if ack != [expected] {
+    // Darwin may reject SO_RCVTIMEO after peer exit even with buffered data.
+    // Readiness + recv needs no socket-option rearm and drains data before EOF.
+    if stream.read_byte(timeout)? != expected {
         return Err(io::ErrorKind::InvalidData.into());
     }
     Ok(())

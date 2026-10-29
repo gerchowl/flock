@@ -98,6 +98,8 @@ struct PendingRevoke<'a> {
     _intent: priority::Intent<&'a Namespace>,
 }
 impl PendingRevoke<'_> {
+    /// Allow five-second helper startup plus two-second contention before store I/O.
+    /// Filesystem sweep/removal and owned-helper cleanup are separate operations.
     fn finish(self) -> Result<(), TokenError> {
         let _guard = self.guard.finish(Duration::from_secs(2))?;
         priority::sweep(&self.store.0)?;
