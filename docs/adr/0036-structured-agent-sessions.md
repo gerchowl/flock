@@ -4274,3 +4274,21 @@ These upstream bounds do not authorize the projection to drop an unmatched open;
 unmatched opens in older data remain visible until a matching close is observed. Only closed
 observations are bounded to the latest 16; older closed records remain in
 History. Displayed requests never substitute for S6 decision revalidation.
+
+### Amendment: native queue subscription recovery (S10b2)
+
+A lagged native queue reader is spent. Its owner retains the applied queue cursor
+and any incomplete replacement, discards the reader, and waits on the source's
+readiness notification when replacement capture is temporarily busy. Busy capture
+is not an end or a mutation retry. A successful capture resumes after the applied
+cursor; only a producer end or generation retirement ends the subscription. A
+terminal queue refusal remains a typed failure on subsequent polls rather than
+becoming a successful end. Retirement clears old presentation state and leaves
+composer admission refused as `agent_not_found`; it does not grant a new target.
+
+Queue subscribers wake waiters after releasing the book on every result.
+Failed try-locks never self-notify. Ended sources need this wake because their
+publisher has stopped. Capture capacity has a separate notification, armed
+before capture, so a full channel cannot self-wake a retry loop.
+A terminal queue refusal also stops history and live retirement. Canonical
+generation refresh still precedes presentation and can retire the failed view.
