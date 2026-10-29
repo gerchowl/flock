@@ -2,7 +2,9 @@
  * The transcript view: one session stream rendered as a list of events
  * (G1; ADR-0038 §4).
  *
- * It subscribes through a {@link Transport}, so the same view runs on the
+ * It reads the stream from the session store (`store/sessions.ts`, ADR-0038
+ * §3), which subscribes through a {@link Transport} and owns the entries; the
+ * view keeps no copy and opens no subscription. So the same view runs on the
  * fixture replay now and on G3's wire adapter later. It derives presentation
  * only (ADR-0038 §3): labels, collapse and layout, never agent state.
  *
@@ -18,8 +20,8 @@
  * with the same request_id fold away (ADR-0038 §4, #2559). Raw event counts and
  * cursor callbacks still include both facts. Uncorrelated natives remain visible.
  *
- * Replay is linear (#1782): each entry is folded into the last turn as it
- * arrives ({@link foldEntry}), and only the unfolded turns are read to
+ * Replay is linear (#1782): the store folds each entry into the last turn as it
+ * arrives (`foldEntry`), and only the unfolded turns are read to
  * render, so a long history costs O(1) per entry, not a regroup of it all.
  *
  * Known limits, left to ADR-0036's S9a and S18 (tracked in #1307): no
@@ -29,12 +31,12 @@
  * @module
  */
 import { ErrorBoundary, For, Match, Show, Switch, createSignal, onCleanup, type JSX } from "solid-js";
-import { createStore, produce, reconcile } from "solid-js/store";
 
 import type { JsonValue } from "../gen/serde_json/JsonValue";
 import type { KnownSessionEvent } from "../gen/KnownSessionEvent";
 import type { SessionEntry, SessionStream, Transport, TransportFailure } from "../transport";
-import { emptyFold, foldAll, foldEntry, type ToolRun, type TurnFold } from "./turns";
+import { sessionStore } from "../store/sessions";
+import { type ToolRun, type TurnFold } from "./turns";
 import { UnknownBlock } from "./UnknownBlock";
 
 /**
@@ -74,8 +76,6 @@ const WORDING = {
   replay: { loading: "Replaying…", synced: (count: number) => `End of recording · ${count} events`, failed: "Replay failed" },
   live: { loading: "Loading history…", synced: () => "Up to date", failed: "Couldn't load this agent's history" },
 } as const;
-
-type Progress = { readonly phase: "replaying" | "synced" } | { readonly phase: "failed"; readonly failure: TransportFailure };
 
 function json(value: JsonValue | undefined): string {
   return JSON.stringify(value, null, 2) ?? "";
@@ -209,35 +209,13 @@ function Entry(props: { readonly entry: SessionEntry; readonly turns: TurnFold }
 
 /** Renders a session stream from its first entry, as the transport delivers it. */
 export function Transcript(props: TranscriptProps): JSX.Element {
-  // Every entry, for the rare regroup; the store holds the turns the view reads.
-  const entries: SessionEntry[] = [];
-  const [count, setCount] = createSignal(0);
-  const [turns, setTurns] = createStore<TurnFold>(emptyFold());
-  const [progress, setProgress] = createSignal<Progress>({ phase: "replaying" });
-  props.onCurrent?.(false);
-  const subscription = props.transport.subscribe(props.stream, null, {
-    entry: (entry) => {
-      entries.push(entry);
-      setCount(entries.length);
-      let regroup = false;
-      setTurns(produce((fold) => void (regroup = !foldEntry(fold, entry))));
-      if (regroup) setTurns(reconcile(foldAll(entries), { key: "key" }));
-      props.onEntry?.(entry.seq, userText(entry));
-    },
-    reset: () => {
-      entries.length = 0;
-      setCount(0);
-      setTurns(emptyFold());
-      // Entries restart from the stream's first retained seq: replaying again, not Current.
-      props.onCurrent?.(false);
-    },
-    synced: () => {
-      setProgress({ phase: "synced" });
-      props.onCurrent?.(true);
-    },
-    failed: (failure) => setProgress({ phase: "failed", failure }),
+  // The store owns the entries, the turn fold and the progress; this view reads them (ADR-0038 §3).
+  const stream = sessionStore(props.transport).read(props.stream, {
+    entry: (entry) => props.onEntry?.(entry.seq, userText(entry)),
+    current: (current) => props.onCurrent?.(current),
   });
-  onCleanup(subscription.close);
+  onCleanup(stream.release);
+  const { turns, count, progress } = stream;
   const failure = (): TransportFailure | undefined => {
     const current = progress();
     return current.phase === "failed" ? current.failure : undefined;

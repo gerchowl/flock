@@ -19,7 +19,7 @@ mod permission;
 #[cfg_attr(feature = "web", allow(unused_imports))]
 pub use minimal::{
     AgentDecide, AgentDecideErrorCode, AgentDecideResult, AgentSendResult, FleetAgentRow,
-    FleetDelta, PermissionDecision,
+    FleetDelta, FleetNodeRow, FleetProjectRow, PermissionDecision,
 };
 pub use permission::{
     IgnoredPermissionReason, IgnoredPermissionSuggestions, PermissionAnswer, PermissionClose,
