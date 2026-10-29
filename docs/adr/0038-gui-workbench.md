@@ -332,7 +332,7 @@ The **progress deadline** runs while a stream waits for `synced` or for a snapsh
   - Rejected: persisting cursors alone, for the reason above.
   - **Which database.** There is one database per server identity and principal, named `flock.store.v1:` followed by the SHA-256 hex of the server identity and the principal joined by a newline. The client recognises its own databases by that prefix, and the name never shows the principal.
     - **Server identity** is the key the layout (§2) already uses: the socket's endpoint URL for the `wire` transport, and the fixed value `bridge:local` for the `bridge` transport (§6), since a device's own server is one server across restarts. It is never `server_epoch` or `server_version`, which change on every start.
-    - **The principal** is not known until `welcome`. So the tab keeps the principal of its last `welcome` in `sessionStorage`, beside the token. On a reload, the open of that database runs alongside Connecting, under its own 10 s deadline (the connect deadline's value). The streams' `sub`s wait until the open settles or its deadline passes, whichever comes first, and an open that settles after its deadline is closed unused. The progress deadline starts only when the `sub` is sent, so this wait does not use it up. A tab with no stored principal, such as a new tab or a new Tauri window, restores nothing and opens the database once `welcome` arrives.
+    - **The principal** is not known until `welcome`. So the tab keeps the principal of its last `welcome` in `sessionStorage`, beside the token. Restore of persisted records (deadline over lock+open+reads, principal check, code-exchange loads) is specified in #2764; until then nothing is restored. A tab with no stored principal, such as a new tab or a new Tauri window, restores nothing and opens the database once `welcome` arrives.
     - **A different principal.** If a `welcome` names a different principal than the tab's previous `welcome` (the same equality that drops the outbox, below), whether or not a database is open, the client drops every stream's entities, cursors and resync markers from memory, as for a new tab. It opens that principal's database, restores nothing from it, and bootstraps every stream without `after`. Nothing seen under one principal is shown, or resumed from, under another.
     - **Tab locks.** Each tab holds a shared Web Lock named after its database, and takes it before it opens the database. A database is deleted only when an exclusive lock on it is granted at once (`ifAvailable`), and the deleting tab holds that lock until `deleteDatabase` settles. So a database another tab still uses is never deleted. Where Web Locks are unavailable, the client deletes nothing, and records last until the browser clears the origin. Every engine the shells target ships Web Locks.
     - **Nothing kept with no end.** Each database stores when a tab last opened it for use. The cleanup reads that time under the exclusive lock, and its own open does not update it. On every open, the client lists its databases (`indexedDB.databases()`), and deletes each flock database that no tab holds (the lock above) and that was last opened more than 7 days ago. On a principal change, it also deletes the previous principal's database if no tab holds it. With Web Locks, records are never kept on disk with no end, the same reason `localStorage` was rejected for the token.
@@ -347,32 +347,28 @@ The **progress deadline** runs while a stream waits for `synced` or for a snapsh
   - **Failure never becomes an error or a loop.**
     - **On load,** the affected streams bootstrap with no `after`, as on a first load, in these cases:
       - IndexedDB is unavailable (private mode, blocked storage);
-      - opening it fails (for example a `VersionError` against a newer client's database), does not finish within its deadline (above), or reports `blocked`;
+      - opening it fails (for example a `VersionError` against a newer client's database), or reports `blocked`;
       - a record does not parse or has an unknown older version.
     - **After load,** a failed write (quota or abort) deletes that stream's record and stops persisting it until the next load. The stream in memory is untouched and is not re-subscribed. A failed write never rolls back an applied frame in memory.
     - The connection is unaffected in every case.
   - **Two tabs** of one principal share the database. Between tabs of the same client version, the last writer of a record wins, which is safe, because every record is consistent on its own. A `versionchange` from another tab closes this tab's database, and it stops persisting until its next load.
     - **Newer records are never overwritten.** A record with a newer format version than this client knows is treated as absent on load and left in place, never deleted. Each write reads the stored record inside its own readwrite transaction. If that record has a newer format version, the write skips its `put`, and that stream stops persisting until the next load. So an older tab cannot erase or overwrite a newer tab's records.
-  - **Restore.** Once the database is open, each stream starts from its record: its entities render at once, marked as restored. The stream is not Current, and does not count toward Live until its `synced`. Its `sub` goes out from the record's cursor, with the record's marker, as after a reconnect (above). The `cursor_ahead` rule clears the record together with the stream's entities in memory.
   - **Versioned.** Each record carries a format version. An unknown older version is dropped, as above.
   - **Tests that must fail before the change:**
-    - a reload mid-stream renders the restored entities, re-`sub`s from the stored cursor, and never applies a `(stream, seq)` twice;
     - a write aborted inside its transaction leaves the previous record, or none, after a reload, and never a cursor without its entities;
     - a burst of frames gives at most one write in flight per stream, and the stored cursor matches the stored entities;
     - a record past its cap is deleted whole and that stream replays in full on the next load;
     - past the database cap, the record viewed longest ago is deleted;
     - a quota failure sends no extra `sub` and leaves the stream in memory as it was;
     - a corrupt record, an unknown older version and unavailable storage each give a full replay, with the connection unaffected;
-    - an open that reports `blocked` or misses its deadline gives a full replay;
+    - an open that reports `blocked` gives a full replay;
     - a record with a newer version survives an older tab's load and an older tab's write;
-    - a `versionchange` from another tab stops this tab's persistence with its streams unaffected, and an open that settles past its deadline is closed unused;
+    - a `versionchange` from another tab stops this tab's persistence with its streams unaffected;
     - a `welcome` with another principal drops every stream's entities, cursors and markers, bootstraps every stream without `after`, and restores nothing;
     - a database another tab holds is never deleted, and a database no tab holds that was last opened more than 7 days ago is deleted;
     - a quiet stream with a tile on screen is never evicted, and when only on-screen records remain, the write that would pass the cap is skipped;
     - a `welcome` with another principal after storage was unavailable still drops every stream's state;
     - an open that rejects (`VersionError`) gives a full replay;
-    - `cursor_ahead` on a restored stream leaves no record behind;
-    - a restored stream does not count toward Live before its `synced`;
     - a stored marker below `snapshot_to` enters Resyncing at once.
 - The outbox is persisted too, each command before its first send (below). It keeps its own `flock.outbox.v1` key in `localStorage`, because it must be written before a send, not after an applied frame.
 - Ephemeral state lives in the store but is not persisted: in-flight streaming blocks (§4).
