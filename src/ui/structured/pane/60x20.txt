@@ -1,0 +1,20 @@
+┌──────────────────────────────────────────────────────────┐
+│demo | claude | structured                                │
+│Model: observed (requested: requested)                    │
+│Mode: observed-mode (requested: default)                  │
+│New output  [Follow tail] [Earlier history]               │
+│Assistant                                                 │
+│[Collapse] [Details]                                      │
+│Ready                                                     │
+│Status: needs human | turn: unknown | bg: unknown         │
+│Tokens I/O: 7/3 | age(ms):150 | #14 synced                │
+│Permission 1/1: Bash permission@9                         │
+│Input: {"command":"check check check check check check che│
+│[Full input] [Next]                                       │
+│[Deny] [Allow once] [Always (session)...]                 │
+│Queue: 1 queued for idle | 0 held                         │
+│> Please check                                            │
+│then report.                                              │
+│[Send at idle] [History]                                  │
+│Admission: ready                                          │
+└──────────────────────────────────────────────────────────┘
