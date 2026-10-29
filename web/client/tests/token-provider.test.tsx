@@ -18,7 +18,7 @@ import { App, SHELL_OWNS_TOKENS } from "../src/App";
 import { BRIDGE_ALONE, readShellConfig, type BridgeSocket, type OpenBridge, type ShellToken, type TokenProvider } from "../src/config";
 import type { ServerFrame } from "../src/gen/ServerFrame";
 import { OUTBOX_KEY } from "../src/wire/outbox";
-import { DEADLINES, WireConnection } from "../src/wire/connection";
+import { DEADLINES, WIRE_PROTOCOL, WireConnection } from "../src/wire/connection";
 import { MAX_REMINTS, MAX_TIMER_DELAY, REMINTS_SPENT, RENEW_AT, driveBridge, driveTokenProvider } from "../src/wire/provider";
 import { RUN_CLIENT_OPEN, type SessionLike } from "../src/wire/token";
 import { FIXTURE_TOKEN, Harness, WELCOME, live, sentFrames, step, type FakeNetwork, type FakeSocket } from "./wire/harness";
@@ -208,9 +208,9 @@ const started = (h: Harness, mode: Mode): number => (mode === "bridge" ? frames(
 const fleetSubs = (h: Harness): Record<string, unknown>[] => frames(h, "sub").filter((frame) => frame["stream"] === "fleet");
 
 /** Opens the current socket, welcomes it as `principal` and syncs the fleet stream at `seq`: Live. */
-function welcome(h: Harness, seq: number, principal = WELCOME.t === "welcome" ? WELCOME.principal : ""): void {
+function welcome(h: Harness, seq: number, principal = WELCOME.t === "welcome" ? WELCOME.principal : "", protocol = WIRE_PROTOCOL): void {
   h.step(step({ step: "open" }));
-  send(h, { ...WELCOME, principal });
+  send(h, { ...WELCOME, principal, protocol });
   const fleet = fleetSubs(h).at(-1)?.["sub_id"] as string;
   send(h, { t: "gap", sub_id: fleet, from: 1, to: seq, snapshot_to: seq });
   send(h, { t: "synced", sub_id: fleet, seq });
@@ -418,6 +418,23 @@ for (const mode of MODES) {
       send(h, { t: "ping", nonce: `n${revoked}` });
       h.clock.advanceTo(h.clock.now() + 30_000);
       expect(status(root)).toBe("Live");
+      h.step(step({ step: "token_refused", code: 4403 }));
+      await tick();
+      expect(tokens.calls).toBe(revoked + 1);
+    }
+  });
+
+  test("a session ReadOnly for §3's healthy period ends the streak too: every revocation re-mints at once", async () => {
+    const tokens = provider(mode, ...Array.from({ length: MAX_REMINTS + 3 }, (_, index) => `t${index}`));
+    const { h, root } = mount(tokens);
+    await tick();
+    for (let revoked = 1; revoked <= MAX_REMINTS + 2; revoked++) {
+      // A server one protocol older than the client: ReadOnly, which counts like Live (ADR-0038 §3, §6).
+      welcome(h, 0, undefined, WIRE_PROTOCOL - 1);
+      h.clock.advanceTo(h.clock.now() + 30_000);
+      send(h, { t: "ping", nonce: `n${revoked}` });
+      h.clock.advanceTo(h.clock.now() + 30_000);
+      expect(status(root)).toBe("ReadOnly");
       h.step(step({ step: "token_refused", code: 4403 }));
       await tick();
       expect(tokens.calls).toBe(revoked + 1);
