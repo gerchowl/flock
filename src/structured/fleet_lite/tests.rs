@@ -148,7 +148,10 @@ fn membership_activity_attention_and_removal_generate_dense_deltas() {
         store.refresh(&source).unwrap(),
         vec![Delta {
             seq: 5,
-            event: FleetDelta::Remove { id: "b".into() }
+            event: FleetDelta::Remove {
+                id: "b".into(),
+                node_id: None
+            }
         }]
     );
     assert_eq!(disk(&path)["high_water"], 5);
@@ -228,6 +231,7 @@ fn unknown_invalid_duplicate_rows_are_skipped_warned_and_preserved_on_save() {
     let mut source = Source(vec![agent("a")]);
     let mut known = serde_json::to_value(project(source.agents().unwrap().remove(0))).unwrap();
     known["future_field"] = json!({"keep":true});
+    known["kind"] = json!("legacy_extension");
     known["state"]["phase"] = json!("future_phase");
     let unknown = json!({"future_kind":"not_a_row","payload":[1,2]});
     let invalid = json!({"id":"broken","label":12});
@@ -256,6 +260,7 @@ fn unknown_invalid_duplicate_rows_are_skipped_warned_and_preserved_on_save() {
     let saved = disk(&path);
     assert_eq!(saved["future_header"], true);
     assert_eq!(saved["rows"][0]["future_field"], json!({"keep":true}));
+    assert_eq!(saved["rows"][0]["kind"], "legacy_extension");
     assert!(saved["rows"].as_array().unwrap().contains(&unknown));
     assert!(saved["rows"].as_array().unwrap().contains(&invalid));
     assert!(saved["rows"].as_array().unwrap().contains(&duplicate));
@@ -645,4 +650,112 @@ fn matching_cursor_retry_syncs_directory_before_marking() {
     assert_eq!(store.snapshot().unwrap().to, 0);
     drop(store);
     assert_eq!(Store::open(path).unwrap().snapshot().unwrap().to, 0);
+}
+
+struct Entities(Vec<Row>);
+impl Provider for Entities {
+    fn agents(&self) -> io::Result<Vec<StructuredAgent<'_>>> {
+        Ok(Vec::new())
+    }
+    fn rows(&self) -> io::Result<Vec<Row>> {
+        Ok(self.0.clone())
+    }
+}
+#[test]
+fn heterogeneous_rows_reopen_share_cursors_and_keep_private_cuts() {
+    let file = path();
+    let source = Source(vec![agent("same-id")]);
+    let home = crate::mesh::identity::NodeIdentity::fixture([71; 32]).node_id();
+    let rows = local_rows(source.agents().unwrap(), Some(&home)).unwrap();
+    let mut store = Store::open(file.clone()).unwrap();
+    assert_eq!(store.refresh(&Entities(rows.clone())).unwrap().len(), 3);
+    let cut = store.snapshot().unwrap();
+    assert_eq!(cut.rows.len(), 3);
+    drop(store);
+    let mut store = Store::open(file).unwrap();
+    assert!(store.refresh(&Entities(rows.clone())).unwrap().is_empty());
+    let removed = store.refresh(&Entities(Vec::new())).unwrap();
+    assert_eq!(removed.len(), 3);
+    assert_eq!(removed[0].seq, cut.snapshot_to + 1);
+    assert!(matches!(removed[0].event, FleetDelta::Remove { .. }));
+    assert!(matches!(removed[1].event, FleetDelta::NodeRemove { .. }));
+    assert!(matches!(removed[2].event, FleetDelta::ProjectRemove { .. }));
+    assert_eq!(cut.rows.len(), 3, "an already captured cut stays immutable");
+    assert!(store.snapshot().unwrap().rows.is_empty());
+}
+#[test]
+fn node_numbers_outside_javascript_safe_range_refuse_the_whole_cut() {
+    let source = Source(Vec::new());
+    let home = crate::mesh::identity::NodeIdentity::fixture([71; 32]).node_id();
+    let mut rows = local_rows(source.agents().unwrap(), Some(&home)).unwrap();
+    let Row::Node(row) = &mut rows[0] else {
+        panic!("home node")
+    };
+    row.latency_ms = Some(9_007_199_254_740_992);
+    let mut store = Store::open(path()).unwrap();
+    assert!(store.refresh(&Entities(rows)).is_err());
+    assert_eq!(store.high_water(), 0);
+}
+
+#[test]
+fn equal_agent_and_project_ids_on_two_owners_do_not_replace_each_other() {
+    let source = Source(vec![agent("same-agent")]);
+    let mut rows = Vec::new();
+    for byte in [71, 72] {
+        let home = crate::mesh::identity::NodeIdentity::fixture([byte; 32]).node_id();
+        rows.extend(local_rows(source.agents().unwrap(), Some(&home)).unwrap());
+    }
+    let mut store = Store::open(path()).unwrap();
+    assert_eq!(store.refresh(&Entities(rows.clone())).unwrap().len(), 6);
+    assert_eq!(store.snapshot().unwrap().rows.len(), 6);
+    let removed_owner = match rows.remove(0) {
+        Row::Agent(row) => row.node_id.unwrap(),
+        other => panic!("expected an agent, got {other:?}"),
+    };
+    rows.retain(|row| match row {
+        Row::Node(row) => row.node_id != removed_owner,
+        Row::Project(row) => row.node_id != removed_owner,
+        Row::Agent(_) => true,
+    });
+    let removed = store.refresh(&Entities(rows)).unwrap();
+    assert_eq!(removed.len(), 3);
+    assert!(matches!(&removed[0].event,
+        FleetDelta::Remove { id, node_id: Some(node) }
+        if id == "same-agent" && node == &removed_owner));
+    assert_eq!(store.snapshot().unwrap().rows.len(), 3);
+}
+
+#[test]
+fn non_utf8_cwd_keeps_agents_and_subsequent_durable_updates() {
+    use std::os::unix::ffi::OsStringExt;
+    let mut odd = agent("odd");
+    odd.record
+        .cwd
+        .push(std::ffi::OsString::from_vec(vec![0xff]));
+    let mut source = Source(vec![odd, agent("normal")]);
+    let home = crate::mesh::identity::NodeIdentity::fixture([71; 32]).node_id();
+    let mut store = Store::open(path()).unwrap();
+    let logs = crate::logging::capture_logs(|| {
+        let rows = local_rows(source.agents().unwrap(), Some(&home)).unwrap();
+        assert_eq!(store.refresh(&Entities(rows.clone())).unwrap().len(), 4);
+        let odd = rows
+            .iter()
+            .find_map(|r| match r {
+                Row::Agent(r) if r.id == "odd" => Some(r),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(odd.node_id.as_deref(), Some(home.as_str()));
+        assert_eq!(odd.project, None);
+        assert_eq!(
+            rows.iter().filter(|r| matches!(r, Row::Project(_))).count(),
+            1
+        );
+    });
+    assert!(logs.contains("fleet_project_unavailable"), "{logs}");
+    source.0[1].record.name = Some("renamed".into());
+    let rows = local_rows(source.agents().unwrap(), Some(&home)).unwrap();
+    let deltas = store.refresh(&Entities(rows)).unwrap();
+    assert_eq!(deltas.len(), 1);
+    assert!(matches!(&deltas[0].event, FleetDelta::Upsert { row } if row.label == "renamed"));
 }
