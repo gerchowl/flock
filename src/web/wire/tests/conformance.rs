@@ -69,7 +69,7 @@ fn scenario(name: &str, lines: &[FixtureLine]) -> Scenario {
             FixtureStep::Send {
                 frame: crate::structured_wire::fixture::FixtureServerFrame::Literal(
                     ServerFrame::Welcome { .. },
-                ),
+                ) | crate::structured_wire::fixture::FixtureServerFrame::Build(_),
                 ..
             }
         )
@@ -292,9 +292,10 @@ fn selected_welcome_capabilities_match_the_actual_endpoint() {
                 .find_map(|line| match &line.step {
                     FixtureStep::Send {
                         frame:
-                            crate::structured_wire::fixture::FixtureServerFrame::Literal(
-                                frame @ ServerFrame::Welcome { .. },
-                            ),
+                            frame @ (crate::structured_wire::fixture::FixtureServerFrame::Literal(
+                                ServerFrame::Welcome { .. },
+                            )
+                            | crate::structured_wire::fixture::FixtureServerFrame::Build(_)),
                         ..
                     } => Some(serde_json::to_value(frame).unwrap()),
                     _ => None,

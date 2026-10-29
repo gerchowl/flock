@@ -7,10 +7,17 @@ type Oracle = (event: Event) => Promise<{
   before_action: number; after_ack?: number; record_delivery?: number;
 }>;
 /** Match literals exactly; dynamic wall times need persisted equality and a declared zero-slack bound. */
-export async function matchFrame(actual: ServerFrame, expected: FixtureServerFrame, oracle?: Oracle): Promise<void> {
+export async function matchFrame(actual: ServerFrame, expected: FixtureServerFrame, oracle?: Oracle, buildVersion?: string): Promise<void> {
   const visit = async (got: unknown, want: unknown, path: string): Promise<void> => {
     if (want !== null && typeof want === "object" && !Array.isArray(want)) {
       if (Object.hasOwn(want, "$dynamic")) {
+        if ("$dynamic" in want && want.$dynamic === "server_version") {
+          assert.equal(path, "frame.server_version");
+          assert.deepEqual(want, { $dynamic: "server_version", source: "build" });
+          assert(actual.t === "welcome" && typeof buildVersion === "string" && buildVersion.length > 0, "missing build version oracle");
+          assert.equal(got, buildVersion, "build version");
+          return;
+        }
         assert.equal(path, "frame.ts_ms");
         assert("bound" in want && (want.bound === "after_ack" || want.bound === "record_delivery"), "missing or unknown timestamp bound");
         assert.deepEqual(want, { $dynamic: "ts_ms", source: "persisted", bound: want.bound });
@@ -25,6 +32,7 @@ export async function matchFrame(actual: ServerFrame, expected: FixtureServerFra
         return;
       }
       assert(got !== null && typeof got === "object" && !Array.isArray(got));
+      assert.deepEqual(Object.keys(got).sort(), Object.keys(want).sort(), `exact keys at ${path}`);
       for (const [key, value] of Object.entries(want)) {
         assert(Object.hasOwn(got, key), `missing ${path}.${key}`);
         await visit((got as Record<string, unknown>)[key], value, `${path}.${key}`);

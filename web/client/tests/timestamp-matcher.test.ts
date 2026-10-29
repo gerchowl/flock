@@ -30,3 +30,24 @@ test("literal fields remain exact and a marker outside ts_ms is refused", async 
   const misplaced = { ...expected, ev: { type: "assistant", message: { $dynamic: "ts_ms", source: "persisted" } } };
   await expect(matchFrame(actual, misplaced, async () => proof())).rejects.toThrow("frame.ts_ms");
 });
+
+test("literal objects reject extra fields at every nesting level", async () => {
+  for (const frame of [
+    { ...actual, extra: true },
+    { ...actual, ev: { ...actual.ev as object, extra: true } },
+    { ...actual, ev: { type: "assistant", message: { extra: true } } },
+  ]) await expect(matchFrame(frame, expected, async () => proof())).rejects.toThrow();
+  const ack = { t: "ack", cmd_id: "c1", ok: true, result: {} } as const;
+  await expect(matchFrame({ ...ack, result: { extra: true } }, ack)).rejects.toThrow();
+  await expect(matchFrame({ ...ack, extra: true } as ServerFrame, ack)).rejects.toThrow();
+  await expect(matchFrame({ t: "synced", sub_id: "s1", seq: 1, extra: true } as ServerFrame, { t: "synced", sub_id: "s1", seq: 1 })).rejects.toThrow();
+});
+
+test("welcome version matches the supplied build, not a pinned release", async () => {
+  const frame = { t: "welcome", protocol: 1, server_version: "9.8.7-test", capabilities: ["read"], principal: "0".repeat(32), server_epoch: "fixture", idempotency_window_ms: 1 } as const;
+  const expected = { ...frame, server_version: { $dynamic: "server_version", source: "build" } } as unknown as FixtureServerFrame;
+  const actual = { ...frame, capabilities: ["read"] } satisfies ServerFrame;
+  await matchFrame(actual, expected, undefined, "9.8.7-test");
+  await expect(matchFrame(actual, expected, undefined, "9.8.8-test")).rejects.toThrow("build version");
+  await expect(matchFrame(actual, expected)).rejects.toThrow("build version");
+});
