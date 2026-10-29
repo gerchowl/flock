@@ -141,7 +141,7 @@ export function createPermissionInbox(transport: Transport): PermissionInbox {
         if (fold?.open.has(id) || !fold?.closed.has(id)) keyed.push(card(agent, tracked, id, index));
       });
       for (const [key, bad] of fold?.invalid ?? []) {
-        if (bad.id === null || !tracked.ids.includes(bad.id)) notices.push(notice(agent, tracked, key, bad.id, bad.problem, notices.length));
+        if ((bad.id === null || !tracked.ids.includes(bad.id)) && bad.syncs === fold?.syncs) notices.push(notice(agent, tracked, key, bad.id, bad.problem, notices.length));
       }
     }
     // Records first by their server age; ids without a record follow by agent age and listed order.
@@ -149,21 +149,8 @@ export function createPermissionInbox(transport: Transport): PermissionInbox {
     setCards([...keyed, ...notices].map((entry) => entry.card));
   };
 
-  /** Drops the notices for records no listed id owns: they live until the next `reset` or `synced`. */
-  const expireNotices = (tracked: Tracked): void => {
-    for (const [key, bad] of tracked.reader?.permissions.invalid ?? []) if (bad.id === null || !tracked.ids.includes(bad.id)) tracked.reader?.permissions.invalid.delete(key);
-  };
-
   const open = (agent: string, tracked: Tracked): void => {
-    let joined = false;
-    tracked.reader = sessionStore(transport).read(`agent/${agent}`, {
-      // A notice lives until the next `synced`, not until a reader joins an already synced stream.
-      current: (current) => {
-        if (current && joined) expireNotices(tracked);
-      },
-      change: publish,
-    });
-    joined = true;
+    tracked.reader = sessionStore(transport).read(`agent/${agent}`, { change: publish });
   };
 
   return {

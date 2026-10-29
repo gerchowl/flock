@@ -25,8 +25,16 @@
  * question (a later slice), so until then a new first reader replays from the
  * start, as every subscription did before the store.
  *
- * A late reader is told the entries the stream already holds and whether it is
- * Current, so it sees what a reader that was there from the start saw.
+ * A late reader is told the entries the stream already holds, then whether it
+ * is Current, so it sees what a reader that was there from the start saw.
+ *
+ * A `failed` stream is over for good (the wire ends that `sub`, §3): its record
+ * leaves the store at once, readers that hold it keep the failure they saw, and
+ * the next reader opens a fresh subscription. Releasing a failed record never
+ * touches a newer record for the same stream.
+ *
+ * Memory: a stream's entries and turn fold are held while any reader holds it,
+ * so a permission-only agent holds them too, for as long as it is tracked.
  *
  * @module
  */
@@ -43,21 +51,31 @@ export type Progress = { readonly phase: "replaying" | "synced" } | { readonly p
 /** An open permission record, with the stream seq and server time it arrived at. */
 export type OpenPermission = { readonly seq: number; readonly tsMs: number; readonly record: OpenPermissionRecord };
 
-/** The permission records of one stream, by `request_id`. */
+/** A record that did not match the decided shape, with the {@link PermissionFold.syncs} count it arrived at. */
+export type InvalidPermission = { readonly id: string | null; readonly problem: string; readonly syncs: number };
+
+/**
+ * The permission records of one stream, by `request_id`. Readers never write
+ * it: what a reader hides or expires is its own state, derived from this.
+ */
 export type PermissionFold = {
   /** Open records; a closed record removes its entry. */
-  readonly open: Map<string, OpenPermission>;
+  readonly open: ReadonlyMap<string, OpenPermission>;
   /** Ids whose closed record arrived. */
-  readonly closed: Set<string>;
+  readonly closed: ReadonlySet<string>;
   /** Records that did not match the decided shape, by `request_id` (or a per-entry key when unreadable). */
-  readonly invalid: Map<string, { readonly id: string | null; readonly problem: string }>;
+  readonly invalid: ReadonlyMap<string, InvalidPermission>;
   /** A history gap arrived and nothing has followed it yet. */
-  stale: boolean;
+  readonly stale: boolean;
+  /** How many times the stream has reported `synced`; it keeps counting across a `reset`. */
+  readonly syncs: number;
 };
+
+type MutableFold = { open: Map<string, OpenPermission>; closed: Set<string>; invalid: Map<string, InvalidPermission>; stale: boolean; syncs: number };
 
 /** What a reader is told as the stream changes; every part is optional. */
 export type ReaderListener = {
-  /** Each entry, in seq order; a late reader gets the entries already held first. */
+  /** Each entry, in seq order; a late reader gets the entries already held first, then `current`. */
   readonly entry?: (entry: SessionEntry) => void;
   /** False when the stream is replaying (at the start and after a `reset`), true once `synced`. */
   readonly current?: (current: boolean) => void;
@@ -85,12 +103,12 @@ type StreamRecord = {
   readonly turns: TurnFold;
   readonly count: Accessor<number>;
   readonly progress: Accessor<Progress>;
-  readonly permissions: PermissionFold;
+  readonly permissions: MutableFold;
   readonly listeners: Set<ReaderListener>;
   subscription: Subscription | null;
 };
 
-function applyPermission(fold: PermissionFold, entry: SessionEntry): void {
+function applyPermission(fold: MutableFold, entry: SessionEntry): void {
   if (entry.kind === "gap") {
     fold.stale = true;
     return;
@@ -100,7 +118,7 @@ function applyPermission(fold: PermissionFold, entry: SessionEntry): void {
   const record = permissionRecord(entry.event);
   if (record === null) return;
   if (record.state === "invalid") {
-    fold.invalid.set(record.request_id ?? `seq-${entry.seq}`, { id: record.request_id, problem: record.problem });
+    fold.invalid.set(record.request_id ?? `seq-${entry.seq}`, { id: record.request_id, problem: record.problem, syncs: fold.syncs });
   } else if (record.state === "open") {
     fold.invalid.delete(record.request_id);
     fold.open.set(record.request_id, { seq: entry.seq, tsMs: entry.tsMs ?? 0, record });
@@ -120,7 +138,7 @@ function createSessionStore(transport: Transport): SessionStore {
     const [turns, setTurns] = createStore<TurnFold>(emptyFold());
     const [count, setCount] = createSignal(0);
     const [progress, setProgress] = createSignal<Progress>({ phase: "replaying" });
-    const permissions: PermissionFold = { open: new Map(), closed: new Set(), invalid: new Map(), stale: false };
+    const permissions: MutableFold = { open: new Map(), closed: new Set(), invalid: new Map(), stale: false, syncs: 0 };
     const record: StreamRecord = { entries, turns, count, progress, permissions, listeners: new Set(), subscription: null };
     const each = (call: (listener: ReaderListener) => void): void => {
       const readers = [...record.listeners];
@@ -153,10 +171,13 @@ function createSessionStore(transport: Transport): SessionStore {
       synced: () => {
         setProgress({ phase: "synced" });
         permissions.stale = false;
+        permissions.syncs++;
         each((listener) => listener.current?.(true));
       },
       failed: (failure) => {
         setProgress({ phase: "failed", failure });
+        // The subscription is over for good: the next reader opens a fresh one (§3, a Refused `sub` is final for that `sub`).
+        if (records.get(stream) === record) records.delete(stream);
         each(() => undefined);
       },
     });
@@ -168,10 +189,8 @@ function createSessionStore(transport: Transport): SessionStore {
     read: (stream, listener = {}) => {
       const record = records.get(stream) ?? open(stream);
       record.listeners.add(listener);
-      listener.current?.(record.progress().phase === "synced");
-      for (const entry of [...record.entries]) listener.entry?.(entry);
       let released = false;
-      return {
+      const reader: StreamReader = {
         turns: record.turns,
         count: record.count,
         progress: record.progress,
@@ -182,9 +201,17 @@ function createSessionStore(transport: Transport): SessionStore {
           record.listeners.delete(listener);
           if (record.listeners.size > 0) return;
           record.subscription?.close();
-          records.delete(stream);
+          // A failed record left the map already; a newer record for the stream is not ours to delete.
+          if (records.get(stream) === record) records.delete(stream);
         },
       };
+      // The order a reader that was there from the start saw: the entries, then Current.
+      for (const entry of [...record.entries]) {
+        if (released) return reader;
+        listener.entry?.(entry);
+      }
+      if (!released) listener.current?.(record.progress().phase === "synced");
+      return reader;
     },
   };
 }

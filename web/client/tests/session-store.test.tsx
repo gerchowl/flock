@@ -25,12 +25,14 @@ afterEach(() => {
 function counting() {
   const observers: SessionObserver[] = [];
   const opened: string[] = [];
+  const closed: boolean[] = [];
   let closes = 0;
   const transport: Transport = {
     subscribe: (stream, _after, observer) => {
-      opened.push(stream);
+      const index = opened.push(stream) - 1;
       observers.push(observer);
-      return { close: () => void closes++ };
+      closed.push(false);
+      return { close: () => void (closes++, (closed[index] = true)) };
     },
   };
   let seq = 0;
@@ -43,6 +45,12 @@ function counting() {
     transport,
     opened,
     closes: () => closes,
+    closed,
+    observer: (index: number): SessionObserver => {
+      const found = observers[index];
+      if (found === undefined) throw new Error(`no subscription ${index}`);
+      return found;
+    },
     send: (event: object) => only().entry(classifyStoredLine(++seq, JSON.stringify(event))),
     synced: () => only().synced(),
     reset: () => {
@@ -89,7 +97,13 @@ test("a reset reaches both readers once: the transcript clears and earlier promp
   wire.synced();
   expect(root.querySelectorAll('[data-testid="known-event"]')).toHaveLength(1);
   expect(inbox.cards()[0]?.detail).toContain("true");
+  const resets = [0, 0];
+  const store = sessionStore(wire.transport);
+  const readers = resets.map((_, index) => store.read("agent/atlas", { current: (current) => void (!current && resets[index]!++) }));
+  resets.fill(0);
   wire.reset();
+  expect(resets).toEqual([1, 1]);
+  readers.forEach((reader) => reader.release());
   expect(root.querySelectorAll('[data-testid="known-event"]')).toHaveLength(0);
   expect(root.querySelector('[data-testid="transcript-synced"]')).toBeNull();
   expect(inbox.cards()[0]?.detail).toBe("Loading details…");
@@ -119,11 +133,9 @@ test("a reader that joins late is told the entries and progress the stream alrea
   const early = store.read("agent/atlas");
   wire.send(open("r1"));
   wire.synced();
-  const seen: number[] = [];
-  const states: boolean[] = [];
-  const late = store.read("agent/atlas", { entry: (entry) => void seen.push(entry.seq), current: (current) => void states.push(current) });
-  expect(seen).toEqual([1]);
-  expect(states).toEqual([true]);
+  const told: string[] = [];
+  const late = store.read("agent/atlas", { entry: (entry) => void told.push(`entry ${entry.seq}`), current: (current) => void told.push(`current ${current}`) });
+  expect(told).toEqual(["entry 1", "current true"]);
   expect(wire.opened).toEqual(["agent/atlas"]);
   early.release();
   late.release();
@@ -131,4 +143,63 @@ test("a reader that joins late is told the entries and progress the stream alrea
   // The entry is dropped with the last reader: the next one subscribes again.
   store.read("agent/atlas").release();
   expect(wire.opened).toEqual(["agent/atlas", "agent/atlas"]);
+});
+
+test("a double release is harmless and never closes a stream another reader holds", () => {
+  const wire = counting();
+  const store = sessionStore(wire.transport);
+  const first = store.read("agent/atlas");
+  const second = store.read("agent/atlas");
+  first.release();
+  first.release();
+  expect(wire.closes()).toBe(0);
+  second.release();
+  second.release();
+  expect(wire.closes()).toBe(1);
+});
+
+test("after a failure a new transcript opens a fresh subscription while the inbox still holds the dead one", () => {
+  const wire = counting();
+  const { inbox } = mount(wire.transport);
+  wire.observer(0).failed({ message: "boom" });
+  expect(inbox.cards()[0]?.detail).toBe("Details unavailable: boom");
+  const root = document.createElement("div");
+  document.body.append(root);
+  disposers.push(render(() => <Transcript transport={wire.transport} stream="agent/atlas" source="live" />, root));
+  expect(wire.opened).toEqual(["agent/atlas", "agent/atlas"]);
+  wire.observer(1).entry(classifyStoredLine(1, JSON.stringify(open("r1"))));
+  wire.observer(1).synced();
+  expect(root.querySelectorAll('[data-testid="known-event"]')).toHaveLength(1);
+  expect(root.textContent).not.toContain("Couldn't load");
+  // The inbox's reader keeps the failure it saw.
+  expect(inbox.cards()[0]?.detail).toBe("Details unavailable: boom");
+});
+
+test("releasing a failed record leaves the newer record for the stream and its subscription open", () => {
+  const wire = counting();
+  const store = sessionStore(wire.transport);
+  const old = store.read("agent/atlas");
+  wire.observer(0).failed({ message: "boom" });
+  expect(old.progress().phase).toBe("failed");
+  const fresh = store.read("agent/atlas");
+  expect(wire.opened).toHaveLength(2);
+  old.release();
+  expect(wire.closed).toEqual([true, false]);
+  const shared = store.read("agent/atlas");
+  expect(wire.opened).toHaveLength(2);
+  fresh.release();
+  shared.release();
+  expect(wire.closed).toEqual([true, true]);
+});
+
+test("a permission notice expires on the next synced without the inbox writing the store's fold", () => {
+  const wire = counting();
+  const { inbox } = mount(wire.transport);
+  wire.send({ ...open("stranger"), request: 5 });
+  expect(inbox.cards().map((card) => card.id)).toContain("atlas:invalid:stranger");
+  wire.synced();
+  expect(inbox.cards().map((card) => card.id)).not.toContain("atlas:invalid:stranger");
+  const held = sessionStore(wire.transport).read("agent/atlas");
+  expect(held.permissions.invalid.has("stranger")).toBe(true);
+  held.release();
 });
