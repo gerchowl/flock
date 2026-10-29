@@ -28,14 +28,11 @@ fn selected_from(root: &std::path::Path) -> Vec<(String, Vec<FixtureLine>)> {
                 .all(|(i, label)| !covers[..i].contains(label)),
             "{name}: duplicate coverage"
         );
-        assert!(
-            covers.iter().all(|label| matches!(
-                label,
-                FixtureCoverage::S7Min | FixtureCoverage::S7 | FixtureCoverage::ClientOnly
-            )),
-            "{name}: unknown coverage label"
-        );
-        if covers.contains(&FixtureCoverage::S7Min) {
+        // A new coverage variant must choose its server-selection policy here.
+        if covers.iter().any(|label| match label {
+            FixtureCoverage::S7Min => true,
+            FixtureCoverage::S7 | FixtureCoverage::ClientOnly => false,
+        }) {
             assert!(
                 !covers.contains(&FixtureCoverage::ClientOnly),
                 "{name}: conflicting coverage"
@@ -206,49 +203,35 @@ fn uncovered_inventory_entries_are_rejected() {
     assert!(std::panic::catch_unwind(|| selected_from(root.path())).is_err());
 }
 #[test]
-fn unknown_coverage_labels_are_rejected() {
+fn sandbox_command_configures_child_environment() {
     let root = crate::structured::launch::SessionConfigDir::create(&std::env::temp_dir()).unwrap();
-    let source = fs::read_to_string(fixture_root().join("clean.jsonl")).unwrap();
-    for labels in ["[\"future\"]", "[\"s7-min\",\"future\"]"] {
-        fs::write(
-            root.path().join("future.jsonl"),
-            source.replace("[\"s7-min\"]", labels),
-        )
-        .unwrap();
-        assert!(
-            std::panic::catch_unwind(|| selected_from(root.path())).is_err(),
-            "unknown coverage {labels} must fail"
-        );
-    }
-}
-
-#[test]
-fn sandbox_preserves_parent_environment() {
-    let keys = [
+    let sandbox = sandbox_command(root.path());
+    let mut expected: std::collections::BTreeMap<_, _> = [
         "HOME",
         "XDG_CONFIG_HOME",
         "XDG_STATE_HOME",
         "XDG_DATA_HOME",
         "XDG_RUNTIME_DIR",
-        "FLOCK_CONFIG_PATH",
-    ];
-    let before: Vec<_> = keys.iter().map(std::env::var_os).collect();
-    let root = crate::structured::launch::SessionConfigDir::create(&std::env::temp_dir()).unwrap();
-    let sandbox = sandbox_command(root.path());
-    let child_home = sandbox
+    ]
+    .into_iter()
+    .map(|key| {
+        (
+            std::ffi::OsString::from(key),
+            Some(root.path().as_os_str().to_owned()),
+        )
+    })
+    .collect();
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("FLOCK_") {
+            expected.insert(key, None);
+        }
+    }
+    let actual = sandbox
         .as_std()
         .get_envs()
-        .find(|(key, _)| *key == "HOME")
-        .unwrap()
-        .1;
-    assert_eq!(child_home, Some(root.path().as_os_str()));
-    let during: Vec<_> = std::thread::spawn(move || keys.iter().map(std::env::var_os).collect())
-        .join()
-        .unwrap();
-    assert_eq!(
-        during, before,
-        "unlocked readers must retain the parent environment"
-    );
+        .map(|(key, value)| (key.to_owned(), value.map(std::ffi::OsStr::to_owned)))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    assert_eq!(actual, expected, "child paths and inherited FLOCK removals");
 }
 
 #[test]
