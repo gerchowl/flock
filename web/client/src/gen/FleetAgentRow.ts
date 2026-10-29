@@ -30,4 +30,12 @@ waiting_on_human: Array<string>,
  * Optional mesh node identity and actual route (ADR-0038 §9).
  * Local rows omit this; remote projection and forwarding await #1380.
  */
-route?: Route, };
+route?: Route,
+/**
+ * Owning node; absent only in legacy or not-yet-bound observations.
+ */
+node_id?: string,
+/**
+ * Exact Record.cwd project key; absent in legacy snapshots.
+ */
+project?: string, };

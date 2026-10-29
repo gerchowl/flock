@@ -22,8 +22,9 @@
  * - `reset` (wire only) means the server lost the stream's state
  *   (`cursor_ahead`): the caller drops every entry it holds, and entries
  *   restart from the stream's first retained seq.
- * - `synced` is called at most once, after the entries that existed when the
- *   subscription was made; later entries may follow it.
+ * - `synced` is called at most once per epoch, after the entries that existed
+ *   when the epoch began; later entries may follow it. A subscription's first
+ *   epoch begins when it is made, and each `reset` begins a new one (#2234).
  * - `failed` ends the subscription: no callback follows it.
  * - After `close()`, no callback runs.
  *
