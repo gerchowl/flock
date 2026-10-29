@@ -218,13 +218,20 @@ impl Core {
         self.command_owner.service(app);
     }
     /// Stop and drain every transport lease even when app revocation fails.
-    /// Return the revocation failure after bounded cleanup, logging it first.
+    /// Revocation and lease draining each have a five-second caller budget.
+    /// Abandoned store workers retain their slots/fences until actual completion
+    /// (#2742); a timeout does not claim a blocking syscall was cancelled.
     pub(crate) async fn shutdown(&self) -> io::Result<()> {
         let store = self.shared.store.clone();
-        let revocation = mutate_apps(store, None)
-            .await
-            .ok_or_else(|| io::Error::other("app revocation worker unavailable"))
-            .and_then(|out| out.map_err(io::Error::other));
+        let revocation = match tokio::time::timeout(SHUTDOWN_WAIT, mutate_apps(store, None)).await {
+            Ok(out) => out
+                .ok_or_else(|| io::Error::other("app revocation worker unavailable"))
+                .and_then(|out| out.map_err(io::Error::other)),
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "app revocation deadline elapsed",
+            )),
+        };
         if let Err(error) = &revocation {
             crate::logging::client_app_revocation_failed(error);
         }
