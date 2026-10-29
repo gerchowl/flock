@@ -31,6 +31,7 @@ impl Drop for Subscription {
     }
 }
 pub(super) struct Subscriptions {
+    protocol: u32,
     used: HashSet<String>,
     active: HashMap<String, Subscription>,
     hints: Hints,
@@ -49,6 +50,7 @@ impl Subscriptions {
     ) -> Self {
         let owner = shared.histories.clone();
         Self {
+            protocol: WIRE_JSON_VERSION,
             used: HashSet::new(),
             active: HashMap::new(),
             hints: Arc::default(),
@@ -58,6 +60,10 @@ impl Subscriptions {
             session,
             priority,
         }
+    }
+    pub(super) fn for_protocol(mut self, protocol: u32) -> Self {
+        self.protocol = protocol;
+        self
     }
     pub(super) fn unsubscribe(&mut self, id: &str) {
         self.active.remove(id);
@@ -93,6 +99,7 @@ impl Subscriptions {
             self.session.clone(),
             self.priority.clone(),
         );
+        let protocol = self.protocol;
         let task = tokio::spawn(async move {
             let result = if let Some(code) = refusal {
                 Err(Some(code))
@@ -105,7 +112,8 @@ impl Subscriptions {
                 {
                     Some(Ok(())) => {
                         if stream == "fleet" {
-                            super::fleet::replay(&shared.fleet, &data, &fence, &id, after).await
+                            super::fleet::replay(&shared.fleet, &data, &fence, &id, after, protocol)
+                                .await
                         } else if stream.starts_with("agent/") {
                             replay(&owner, &data, &fence, &hints, &id, &stream, after).await
                         } else {

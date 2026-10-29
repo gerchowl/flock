@@ -2358,6 +2358,9 @@ P16 and P17 have no source in the stream today and are not promised;
   admission, while the durable close retires the card. Unknown fields or future
   reasons retain the lossless unknown-event wrapper instead of being discarded.
   `session_ended` marks the restart sweep in #2236.
+  Fixture time markers declare `after_ack` for pre-ACK persistence, otherwise
+  `record_delivery`. Both require exact persisted equality and a zero-slack
+  window to that observed bound; missing bounds fail (#2467 slice-3 ruling).
 - **Startup permission recovery (S6, #2236).** The stream owner projects host
   audit headers while scanning the existing stream. Before admitting any new
   control request, it appends a `closed` / `session_ended` record without a
@@ -4274,3 +4277,25 @@ These upstream bounds do not authorize the projection to drop an unmatched open;
 unmatched opens in older data remain visible until a matching close is observed. Only closed
 observations are bounded to the latest 16; older closed records remain in
 History. Displayed requests never substitute for S6 decision revalidation.
+
+### Amendment: native queue subscription recovery (S10b2)
+
+A lagged native queue reader is spent. Its owner retains the applied queue cursor
+and any incomplete replacement, discards the reader, and waits on the source's
+readiness notification when replacement capture is temporarily busy. Busy capture
+is not an end or a mutation retry. A successful capture resumes after the applied
+cursor; only a producer end or generation retirement ends the subscription. A
+terminal queue refusal remains a typed failure on subsequent polls rather than
+becoming a successful end. Retirement clears old presentation state and leaves
+composer admission refused as `agent_not_found`; it does not grant a new target.
+
+Queue subscribers wake waiters after releasing the book on every result,
+including unwinding from a snapshot callback or registration. One guard owns
+both the mutex guard and its notify-on-drop field; declaration-order field
+destruction releases the book first. Publishers use the same guard for capture,
+finish, publication and teardown, waking both readiness and capture capacity.
+Failed try-locks never self-notify. Ended sources need this wake because their
+publisher has stopped. Capture capacity has a separate notification, armed
+before capture, so a full channel cannot self-wake a retry loop.
+A terminal queue refusal also stops history and live retirement. Canonical
+generation refresh still precedes presentation and can retire the failed view.

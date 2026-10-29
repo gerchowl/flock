@@ -57,7 +57,10 @@ impl App {
         }
         Ok(found)
     }
-    pub(super) fn structured_info(&self, id: &str) -> Result<StructuredAgentInfo, ErrorCode> {
+    pub(in crate::app) fn structured_info(
+        &self,
+        id: &str,
+    ) -> Result<StructuredAgentInfo, ErrorCode> {
         let (record, projection, _) = self
             .state
             .structured_agents

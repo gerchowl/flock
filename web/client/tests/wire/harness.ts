@@ -12,7 +12,7 @@ import type { ClientFrame } from "../../src/gen/ClientFrame";
 import type { FixtureLine } from "../../src/gen/FixtureLine";
 import type { ServerFrame } from "../../src/gen/ServerFrame";
 import type { WireEvent } from "../../src/gen/WireEvent";
-import { WireConnection, type Refusal, type StreamName, type Subscription } from "../../src/wire/connection";
+import { WIRE_PROTOCOL, WireConnection, type Refusal, type StreamName, type Subscription } from "../../src/wire/connection";
 import { memoryStore, type Clock, type SocketLike, type TimerHandle } from "../../src/wire/env";
 import { OUTBOX_KEY } from "../../src/wire/outbox";
 
@@ -214,6 +214,8 @@ export class Harness {
   readonly #subscriptions: Subscription[] = [];
   readonly #random: () => number;
   readonly #network: (clock: VirtualClock) => FakeNetwork;
+  /** The wire protocol the client under test speaks, when a test plays a newer client; else `WIRE_PROTOCOL`. */
+  readonly #protocol: number | undefined;
   #transitions: string[] = [];
   #changes = 0;
   #consumedFrames = 0;
@@ -222,9 +224,10 @@ export class Harness {
   #openedAt = 0;
   #lastServerFrameAt = 0;
 
-  constructor(random: () => number = () => 0, network = (clock: VirtualClock): FakeNetwork => new FakeNetwork(clock)) {
+  constructor(random: () => number = () => 0, networkOrProtocol: number | ((clock: VirtualClock) => FakeNetwork) = (clock) => new FakeNetwork(clock)) {
     this.#random = random;
-    this.#network = network;
+    this.#network = typeof networkOrProtocol === "function" ? networkOrProtocol : (clock) => new FakeNetwork(clock);
+    this.#protocol = typeof networkOrProtocol === "number" ? networkOrProtocol : undefined;
   }
 
   /** The connection, after `given`. */
@@ -259,13 +262,9 @@ export class Harness {
         this.#lastServerFrameAt = this.clock.now();
         return this.net.current().open();
       case "send":
+        if (step.frame.t === "welcome" && typeof step.frame.server_version !== "string") fail("dynamic build version requires compiled metadata oracle");
         if (step.frame.t === "ev" && typeof step.frame.ts_ms !== "number") fail("dynamic timestamp requires persisted and wall-window oracles");
-        if ((step.socket ?? "current") === "current") {
-          this.#lastServerFrameAt = this.clock.now();
-          if ("sub_id" in step.frame) this.#origins.set(`sub:${step.frame.sub_id}`, this.clock.now());
-          return this.net.current().deliver(step.frame as ServerFrame);
-        }
-        return this.net.previous().deliver(step.frame as ServerFrame);
+        return this.acceptServerFrame(step.frame as ServerFrame, step.socket ?? "current");
       case "expect":
         return this.#expect(step.frame, step.fields, step.absent ?? []);
       case "expect_close":
@@ -289,6 +288,15 @@ export class Harness {
     }
   }
 
+  /** Deliver an actual frame after the endpoint port has checked all independent oracles. */
+  acceptServerFrame(frame: ServerFrame, socket: "current" | "previous" = "current"): void {
+    if (socket === "current") {
+      this.#lastServerFrameAt = this.clock.now();
+      if ("sub_id" in frame) this.#origins.set(`sub:${frame.sub_id}`, this.clock.now());
+    }
+    (socket === "current" ? this.net.current() : this.net.previous()).deliver(frame);
+  }
+
   #given(step: Extract<Step, { step: "given" }>): void {
     if (this.conn !== null) fail("a second given");
     if (step.resync !== undefined && Object.keys(step.resync).length > 0) fail("resync markers are G3b's (#1595)");
@@ -308,6 +316,7 @@ export class Harness {
       random: this.#random,
       store: this.store,
       cursors: step.cursors,
+      ...(this.#protocol === undefined ? {} : { protocol: this.#protocol }),
     });
     this.conn.onTransition((state) => this.#transitions.push(state));
     this.conn.onChange(() => this.#changes++);
@@ -492,14 +501,14 @@ export const WELCOME: ServerFrame = {
   idempotency_window_ms: 86_400_000,
 };
 
-/** given → connect → open → hello → welcome: Live, with no subscriptions. */
-export function live(h: Harness, given: Partial<Extract<Step, { step: "given" }>> = {}): void {
+/** given → connect → open → hello → welcome: Live (or as `welcome` decides), with no subscriptions. */
+export function live(h: Harness, given: Partial<Extract<Step, { step: "given" }>> = {}, welcome: ServerFrame = WELCOME, protocol = 1): void {
   h.step(step({ step: "given", cursors: {}, outbox: [], ...given }));
   h.step(step({ step: "client", action: { kind: "connect" } }));
   h.step(step({ step: "expect_connect", within_ms: 1 }));
   h.step(step({ step: "open" }));
-  h.step(step({ step: "expect", frame: { t: "hello", protocol: 1, client: { name: "fixture", version: "1" }, token: FIXTURE_TOKEN }, fields: ["protocol", "token"] }));
-  h.step(step({ step: "send", frame: WELCOME }));
+  h.step(step({ step: "expect", frame: { t: "hello", protocol, client: { name: "fixture", version: "1" }, token: FIXTURE_TOKEN }, fields: ["protocol", "token"] }));
+  h.step(step({ step: "send", frame: welcome }));
 }
 
 /** Reaches a state with a socket, from a fresh harness. */
@@ -513,6 +522,8 @@ export const REACH: { readonly [state: string]: (h: Harness) => void } = {
     h.step(step({ step: "open" }));
   },
   Live: (h) => live(h),
+  // A server one protocol older than the client: ReadOnly (ADR-0038 §3).
+  ReadOnly: (h) => live(h, {}, { ...WELCOME, protocol: WIRE_PROTOCOL - 1 } as ServerFrame),
 };
 
 /** Asserts close `code` takes the connection from its state to NeedsToken, to stay. */

@@ -2,8 +2,9 @@ import { expect, test } from "bun:test";
 import { strict as assert } from "node:assert";
 
 import type { FixtureLine } from "../src/gen/FixtureLine";
-import { ExecutionLedger, assertInventory, PENDING_PART_2B, coverage, loadS7MinScripts, runTrace, type CheckedStep, type StepHandlers, type TraceScript } from "./wire/endpoint-runner";
+import { ExecutionLedger, WIRED_SCRIPTS, assertInventory, PENDING_PART_2B, coverage, loadS7MinScripts, runTrace, type CheckedStep, type StepHandlers, type TraceScript } from "./wire/endpoint-runner";
 import { VirtualClock, parseScript } from "./wire/harness";
+import { NativePort } from "./wire/native-port";
 
 const ROOT = `${import.meta.dir}/../test/fixtures/wire`;
 const script = (...middle: object[]): TraceScript => ({ name: "runner", lines: parseScript([
@@ -19,11 +20,11 @@ const base: StepHandlers = {
 
 test("selection uses covers containment, including multi-label headers", async () => {
   const selected = await loadS7MinScripts(ROOT);
-  assertInventory(selected, ["token-refused"]);
-  expect(Object.keys(PENDING_PART_2B).sort()).toEqual(["agent-gap", "agent-send", "clean", "heartbeat-missed", "permission-decision", "ping-pong", "token-revoked", "unknown-subscription"]);
+  assertInventory(selected, WIRED_SCRIPTS);
+  expect(Object.keys(PENDING_PART_2B).sort()).toEqual(["agent-send", "heartbeat-missed"]);
   expect(() => assertInventory(selected, [])).toThrow();
-  expect(() => assertInventory(selected, ["token-refused", "clean"])).toThrow();
-  expect(() => assertInventory([...selected, { ...selected[0]!, name: "new-unclassified" }], ["token-refused"])).toThrow();
+  expect(() => assertInventory(selected, [...WIRED_SCRIPTS, "agent-send"])).toThrow();
+  expect(() => assertInventory([...selected, { ...selected[0]!, name: "new-unclassified" }], WIRED_SCRIPTS)).toThrow();
   const clientOnly = { name: "client-fleet", lines: parseScript(await Bun.file(`${ROOT}/fleet-lite.jsonl`).text()) };
   expect(coverage(clientOnly)).toEqual(["client-only"]);
   expect(selected.map((value) => value.name)).not.toContain("fleet-lite");
@@ -132,4 +133,51 @@ test("invalid versions, repeated given and missing final quiet fail visibly", as
   await expect(runTrace({ name: "empty", lines: [] }, base)).rejects.toThrow("expected v1 given");
   await expect(runTrace({ name: "no-quiet", lines: script().lines.slice(0, 1) }, base)).rejects.toThrow("missing final quiet");
   await expect(runTrace(script({ v: 2, step: "quiet", ceiling_ms: 1 }), base)).rejects.toThrow("invalid version");
+});
+
+
+test("retained gap trace keeps literal resume, event and identity evidence", async () => {
+  const selected = (await loadS7MinScripts(ROOT)).find((value) => value.name === "agent-gap");
+  assert(selected);
+  expect(selected.lines[0]).toMatchObject({ cursors: { "agent/fixture": 2 } });
+  const frames = selected.lines.filter((line) => line.step === "send").map((line) => line.frame);
+  expect(frames[0]).toMatchObject({
+    principal: "0123456789abcdef0123456789abcdef",
+    server_version: { $dynamic: "server_version", source: "build" },
+  });
+  expect(frames.slice(1)).toEqual([
+    { t: "gap", sub_id: "s1", from: 3, to: 4 },
+    { t: "ev", sub_id: "s1", stream: "agent/fixture", seq: 5, ts_ms: 1, ev: { type: "assistant", message: {} } },
+    { t: "synced", sub_id: "s1", seq: 5 },
+  ]);
+});
+
+
+test("heartbeat trace pins the real socket nonce and a valid principal", async () => {
+  const selected = (await loadS7MinScripts(ROOT)).find((value) => value.name === "ping-pong");
+  assert(selected);
+  const frames = selected.lines.filter((line) => line.step === "send").map((line) => line.frame);
+  expect(frames[0]).toMatchObject({
+    principal: "0123456789abcdef0123456789abcdef",
+    server_epoch: "00000000000000000000000000000001",
+    server_version: { $dynamic: "server_version", source: "build" },
+  });
+  expect(frames[1]).toEqual({ t: "ping", nonce: "00000000000000000000000000000001/1/1" });
+  const pong = selected.lines.find((line) => line.step === "expect" && line.frame.t === "pong");
+  expect(pong).toMatchObject({ frame: { t: "pong", nonce: "00000000000000000000000000000001/1/1" }, fields: ["nonce"] });
+});
+
+
+test("native transport drains the queued acknowledgement before reporting close", async () => {
+  const queued = { frame: { t: "ack", cmd_id: "buffered", ok: true }, delivered_at: 1 } as const;
+  const port = Object.assign(Object.create(NativePort.prototype) as NativePort, {
+    frames: [queued], error: new Error("endpoint closed"), order: ["frame", "close"],
+  });
+  await expect(port.next()).rejects.toThrow("endpoint closed");
+  await expect(port.next(true)).resolves.toEqual(queued);
+  await expect(port.next()).rejects.toThrow("endpoint closed");
+  port.frames.push(queued);
+  port.order.pop();
+  port.error = new Error("transport failed");
+  await expect(port.next(true)).rejects.toThrow("transport failed");
 });

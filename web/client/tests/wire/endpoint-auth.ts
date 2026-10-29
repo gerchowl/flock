@@ -2,7 +2,7 @@
 import { strict as assert } from "node:assert";
 import type { FixtureLine } from "../../src/gen/FixtureLine";
 import { FakeNetwork, FakeSocket, Harness } from "./harness";
-import { assertInventory, loadS7MinScripts, runTrace, type CheckedStep, type StepHandlers, type TraceScript, type TraceFact } from "./endpoint-runner";
+import { WIRED_SCRIPTS, assertInventory, loadS7MinScripts, runTrace, type CheckedStep, type StepHandlers, type TraceScript, type TraceFact } from "./endpoint-runner";
 
 const [url] = process.argv.slice(2);
 assert(url);
@@ -55,7 +55,7 @@ async function tokenRefused(script: TraceScript): Promise<readonly TraceFact[]> 
 }
 const scripts = await loadS7MinScripts(`${import.meta.dir}/../../test/fixtures/wire`);
 const providers = { "token-refused": tokenRefused };
-assertInventory(scripts, Object.keys(providers));
+assertInventory(scripts, WIRED_SCRIPTS);
 const results: Record<string, readonly TraceFact[]> = {};
 for (const script of scripts) {
   if (Object.hasOwn(providers, script.name)) results[script.name] = await providers[script.name as keyof typeof providers](script);
