@@ -210,6 +210,8 @@ export class Harness {
   /** The script's subscriptions, which follow their ids across re-subs. */
   readonly #subscriptions: Subscription[] = [];
   readonly #random: () => number;
+  /** The wire protocol the client under test speaks: the script's `hello`, else the client's own. */
+  #protocol: number | undefined;
   #transitions: string[] = [];
   #changes = 0;
   #consumedFrames = 0;
@@ -218,8 +220,9 @@ export class Harness {
   #openedAt = 0;
   #lastServerFrameAt = 0;
 
-  constructor(random: () => number = () => 0) {
+  constructor(random: () => number = () => 0, protocol?: number) {
     this.#random = random;
+    this.#protocol = protocol;
   }
 
   /** The connection, after `given`. */
@@ -229,6 +232,9 @@ export class Harness {
 
   /** Runs every step, then requires that no output is left unasserted. */
   run(steps: readonly Step[]): void {
+    // A script whose `hello` names a newer protocol plays a newer client (`version-gap`).
+    const hello = steps.find((line) => line.step === "expect" && line.frame.t === "hello");
+    if (hello?.step === "expect" && hello.frame.t === "hello") this.#protocol ??= hello.frame.protocol;
     steps.forEach((step, index) => {
       try {
         this.step(step);
@@ -303,6 +309,7 @@ export class Harness {
       random: this.#random,
       store: this.store,
       cursors: step.cursors,
+      ...(this.#protocol === undefined ? {} : { protocol: this.#protocol }),
     });
     this.conn.onTransition((state) => this.#transitions.push(state));
     this.conn.onChange(() => this.#changes++);
@@ -487,14 +494,14 @@ export const WELCOME: ServerFrame = {
   idempotency_window_ms: 86_400_000,
 };
 
-/** given → connect → open → hello → welcome: Live, with no subscriptions. */
-export function live(h: Harness, given: Partial<Extract<Step, { step: "given" }>> = {}): void {
+/** given → connect → open → hello → welcome: Live (or as `welcome` decides), with no subscriptions. */
+export function live(h: Harness, given: Partial<Extract<Step, { step: "given" }>> = {}, welcome: ServerFrame = WELCOME, protocol = 1): void {
   h.step(step({ step: "given", cursors: {}, outbox: [], ...given }));
   h.step(step({ step: "client", action: { kind: "connect" } }));
   h.step(step({ step: "expect_connect", within_ms: 1 }));
   h.step(step({ step: "open" }));
-  h.step(step({ step: "expect", frame: { t: "hello", protocol: 1, client: { name: "fixture", version: "1" }, token: FIXTURE_TOKEN }, fields: ["protocol", "token"] }));
-  h.step(step({ step: "send", frame: WELCOME }));
+  h.step(step({ step: "expect", frame: { t: "hello", protocol, client: { name: "fixture", version: "1" }, token: FIXTURE_TOKEN }, fields: ["protocol", "token"] }));
+  h.step(step({ step: "send", frame: welcome }));
 }
 
 /** Reaches a state with a socket, from a fresh harness. */

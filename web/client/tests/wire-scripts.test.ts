@@ -23,7 +23,7 @@ import { Harness, parseScript } from "./wire/harness";
 
 const SCRIPTS = `${import.meta.dir}/../test/fixtures/wire`;
 
-/** The scripts G3a (#1747) replays. */
+/** The scripts G3a (#1747) and G3b (#1595) so far replay. */
 const REPLAYED = [
   "agent-gap",
   "agent-send",
@@ -57,13 +57,13 @@ const REPLAYED = [
   "token-refused",
   "token-revoked",
   "unknown-subscription",
+  "version-gap",
 ];
 
 /** Left to G3 #1595 (G3b), with the feature each one needs. */
 const G3B: { readonly [script: string]: string } = {
   "restored-resync": "persisted resync markers",
   "subfail-operator_only": "operator_only (not emitted by S7-min)",
-  "version-gap": "ReadOnly",
   "uncertain-command": "resume-only resends and unknown_outcome",
   "restored-outbox-status": "resume-only resends and unknown_outcome",
   "outbox-window-expiry-connecting": "window expiry",

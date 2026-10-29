@@ -9,7 +9,8 @@ import type { ServerFrame } from "../src/gen/ServerFrame";
 import { WIRE_PROTOCOL } from "../src/wire/connection";
 import { decodeServerFrame } from "../src/wire/decode";
 import { backoffDelay, endpointUrl } from "../src/wire/env";
-import { Harness, REACH, WELCOME, expectNeedsToken, live, step } from "./wire/harness";
+import { createWireSender } from "../src/workbench/sender";
+import { Harness, REACH, WELCOME, expectNeedsToken, live, sentFrames, step } from "./wire/harness";
 
 describe("auth refusal → NeedsToken from every state with a socket", () => {
   for (const [state, setup] of Object.entries(REACH)) {
@@ -83,12 +84,11 @@ describe("frames and versions", () => {
     expect(h.connection.state).toBe("Reconnecting");
   });
 
-  test("an older server stops the connection with a visible reason (ReadOnly is G3b)", () => {
+  test("an older server keeps the client working normally", () => {
     const h = new Harness();
-    REACH["Hello"]?.(h);
-    h.step(step({ step: "send", frame: { ...WELCOME, protocol: 0 } as ServerFrame }));
-    expect(h.connection.state).toBe("Disconnected");
-    expect(h.connection.error).toContain("wire protocol 0");
+    live(h, {}, { ...WELCOME, protocol: WIRE_PROTOCOL + 1 } as ServerFrame);
+    expect(h.connection.state).toBe("Live");
+    expect(h.connection.readOnly).toBeNull();
   });
 
   test("the token goes only into hello, never into the URL", () => {
@@ -106,5 +106,75 @@ describe("frames and versions", () => {
       expect(backoffDelay(n, () => 0.999_999)).toBe(ceiling);
     }
     expect(backoffDelay(10_000, () => 0.5)).toBeLessThanOrEqual(30_000);
+  });
+});
+
+describe("ReadOnly: a client newer than the server (ADR-0038 §3)", () => {
+  const NEWER = WIRE_PROTOCOL + 1;
+  /** A newer client, welcomed by a server one protocol behind it. */
+  const readOnly = (): Harness => {
+    const h = new Harness(() => 0, NEWER);
+    live(h, {}, { ...WELCOME, protocol: WIRE_PROTOCOL } as ServerFrame, NEWER);
+    return h;
+  };
+  const cmds = (h: Harness): unknown[] => sentFrames(h).filter((frame) => (frame as { t: string }).t === "cmd");
+
+  test("the welcome enters ReadOnly, not Syncing or a disconnect, and names the gap", () => {
+    const h = readOnly();
+    expect(h.connection.state).toBe("ReadOnly");
+    expect(h.connection.error).toBeNull();
+    expect(h.connection.readOnly).toContain(`wire protocol ${WIRE_PROTOCOL}, older than this client's ${NEWER}`);
+  });
+
+  test("streams render and settle, and the connection stays ReadOnly", () => {
+    const h = readOnly();
+    h.step(step({ step: "client", action: { kind: "subscribe", sub_id: "s1", stream: "agent/a" } }));
+    h.step(step({ step: "expect", frame: { t: "sub", sub_id: "s1", stream: "agent/a" }, fields: ["sub_id", "stream"], absent: ["after"] }));
+    h.step(step({ step: "send", frame: { t: "ev", sub_id: "s1", stream: "agent/a", seq: 1, ts_ms: 1, ev: { type: "x" } } }));
+    h.step(step({ step: "send", frame: { t: "synced", sub_id: "s1", seq: 1 } }));
+    expect(h.seen.get("s1")).toEqual([{ kind: "event", seq: 1, ev: { type: "x" } }, { kind: "synced" }]);
+    expect(h.connection.streams().get("s1")).toEqual({ stream: "agent/a", state: "Current", cursor: 1 });
+    expect(h.connection.state).toBe("ReadOnly");
+    h.step(step({ step: "send", frame: { t: "ping", nonce: "n1" } }));
+    expect(sentFrames(h).at(-1)).toEqual({ t: "pong", nonce: "n1" });
+  });
+
+  test("commands are held, never sent or dropped, and the controls say why", () => {
+    const h = readOnly();
+    const sender = createWireSender(h.connection, () => 0);
+    expect(sender.blocked()).toBe(h.connection.readOnly);
+    const id = h.connection.command("queue.add", {}, "c1");
+    h.clock.advanceTo(h.clock.now() + 40_000);
+    h.step(step({ step: "send", frame: { t: "ping", nonce: "n" } }));
+    expect(h.connection.commands().map((entry) => [entry.cmd_id, entry.status])).toEqual([[id, "pending"]]);
+    expect(cmds(h)).toEqual([]);
+  });
+
+  test("a lost socket reconnects, and the next welcome decides again: Live sends the held command", () => {
+    const h = readOnly();
+    h.connection.command("queue.add", {}, "c1");
+    h.step(step({ step: "drop" }));
+    expect(h.connection.state).toBe("Reconnecting");
+    h.step(step({ step: "expect_connect", not_before_ms: 250, within_ms: 500 }));
+    h.step(step({ step: "open" }));
+    h.step(step({ step: "send", frame: { ...WELCOME, protocol: NEWER } as ServerFrame }));
+    expect(h.connection.state).toBe("Live");
+    expect(h.connection.readOnly).toBeNull();
+    expect(cmds(h)).toEqual([{ t: "cmd", cmd_id: "c1", verb: "queue.add", args: {}, resume_only: false }]);
+  });
+
+  test("a missed heartbeat goes Stale, then Reconnecting", () => {
+    const h = readOnly();
+    const states: string[] = [];
+    h.connection.onTransition((state) => states.push(state));
+    h.step(step({ step: "heartbeat_missed" }));
+    expect(states).toEqual(["Stale", "Reconnecting"]);
+  });
+
+  test("foreground closes the possibly suspended socket and connects again", () => {
+    const h = readOnly();
+    h.connection.foreground();
+    expect(h.net.closes.at(-1)?.code).toBe(1000);
+    expect(h.connection.state).toBe("Connecting");
   });
 });
