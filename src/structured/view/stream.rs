@@ -7,7 +7,7 @@ use crate::structured::{
     queue,
     workers::{
         live,
-        queue::publication::{Page, Reader, Source},
+        queue::publication::{Page, Reader, Source, SubscribeError},
     },
 };
 use std::io;
@@ -26,7 +26,9 @@ pub(crate) struct Stream {
     cut: Option<Cut>,
     live: live::Subscription,
     source: Source,
-    queue: Reader,
+    queue: Option<Reader>,
+    queue_wake: std::sync::Arc<tokio::sync::Notify>,
+    queue_failure: Option<ErrorCode>,
     queue_cursor: u64,
     // Replacement contents stay private until their exact completion high-water.
     replacement: Option<(u64, Vec<queue::Item>)>,
@@ -48,7 +50,9 @@ impl Stream {
             cut: None,
             live,
             source,
-            queue,
+            queue_wake: queue.waker(),
+            queue: Some(queue),
+            queue_failure: None,
             queue_cursor: 0,
             replacement: None,
             ended: [false; 3],
@@ -58,6 +62,8 @@ impl Stream {
     pub fn retire(&mut self) {
         self.ended = [true; 3];
         self.cut = None;
+        self.queue = None;
+        self.queue_failure = None;
         self.replacement = None;
         self.queue_cursor = 0;
         self.queue_status = (None, None);
@@ -66,6 +72,7 @@ impl Stream {
         let agent = s.agent.clone();
         self.model = Model::new(target, agent, s.requested_permissions, vec![]);
         self.model.snapshot.replay = Replay::Ended;
+        self.model.snapshot.admission = Admission::Refused(ErrorCode::AgentNotFound);
     }
     fn apply_live(&mut self, item: live::Item) -> bool {
         if matches!(item, live::Item::End(live::End::Retired)) {
@@ -83,17 +90,36 @@ impl Stream {
     /// One bounded step; false means all producers ended. Callers bound stage waits.
     /// Cancelled blocking pages retain their I/O permits through completion.
     pub async fn next(&mut self) -> io::Result<bool> {
+        if let Some(code) = self.queue_failure {
+            return Err(io::Error::other(code));
+        }
         if self.ended == [true; 3] {
             return Ok(false);
         }
         let hw = self.history.waker();
-        let qw = self.queue.waker();
-        let (hn, qn) = (hw.notified(), qw.notified());
-        tokio::pin!(hn, qn);
+        let qw = self.queue_wake.clone();
+        let cw = self.source.capture_waker();
+        let (hn, qn, cn) = (hw.notified(), qw.notified(), cw.notified());
+        tokio::pin!(hn, qn, cn);
         hn.as_mut().enable();
         qn.as_mut().enable();
+        cn.as_mut().enable();
+        let mut capture_busy = false;
         if !self.ended[2] {
-            let page = self.queue.page();
+            // A lagged reader is spent. Busy capture waits on the source wake.
+            // it must never become a synthetic End from the old reader.
+            if self.queue.is_none() {
+                match self.source.subscribe_ready(Some(self.queue_cursor)) {
+                    Ok(reader) => self.queue = Some(reader),
+                    Err(SubscribeError::CaptureBusy) => capture_busy = true,
+                    Err(SubscribeError::Code(ErrorCode::SessionBusy)) => (),
+                    Err(SubscribeError::Code(code)) => {
+                        self.queue_failure = Some(code);
+                        return Err(io::Error::other(code));
+                    }
+                }
+            }
+            let page = self.queue.as_mut().map_or(Page::Pending, |q| q.page());
             let pending = matches!(page, Page::Pending);
             match page {
                 Page::Gap(g) => {
@@ -112,13 +138,12 @@ impl Stream {
                     }
                 }
                 Page::Status(p, e) => self.queue_status = (p, e),
-                Page::Refused(e) => return Err(io::Error::other(e)),
-                Page::Lagged(_) => {
-                    self.queue = self
-                        .source
-                        .subscribe(Some(self.queue_cursor))
-                        .map_err(io::Error::other)?
+                Page::Refused(code) => {
+                    self.queue_failure = Some(code);
+                    self.queue = None;
+                    return Err(io::Error::other(code));
                 }
+                Page::Lagged(_) => self.queue = None,
                 Page::End if self.replacement.is_some() => {
                     return Err(io::ErrorKind::UnexpectedEof.into())
                 }
@@ -165,7 +190,8 @@ impl Stream {
         }
         tokio::select! {
             _ = &mut hn, if !self.ended[0] => {},
-            _ = &mut qn, if !self.ended[2] => {},
+            _ = &mut qn, if !self.ended[2] && !capture_busy => {},
+            _ = &mut cn, if capture_busy => {},
             item = self.live.recv(), if !self.ended[1] => {
                 if !self.apply_live(item) { return Ok(false); }
             },
