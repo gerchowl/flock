@@ -3,4 +3,6 @@
 #![allow(dead_code)]
 pub(crate) mod controls;
 mod markdown;
+mod pane;
 pub(crate) mod transcript;
+pub(crate) use pane::Pane;
