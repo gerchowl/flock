@@ -905,7 +905,7 @@ async fn waiting_hellos_do_not_starve_established_subscriptions() {
     }
 }
 
-/// Pause a real contended helper before its two-second IPC read starts.
+/// Pause after helper startup, before the two-second lock-ack IPC read starts.
 /// The test owns every release sender; unwinding or a `within` failure drops
 /// them and releases this gate. The gate adds no deadline around later work.
 fn gate_mutation_wait(
@@ -1065,5 +1065,30 @@ async fn failed_assertion_releases_the_mutation_gate() {
     // The real retirement must finish after sender drop, bounded by within.
     assert_eq!(close_detail(&mut socket).await.0, AUTH_REVOKED_CLOSE);
     assert!(f.server.core.shared.store.authenticate(&token).is_err());
+    f.finish().await;
+}
+
+#[tokio::test]
+async fn shutdown_deadline_stops_transports_even_when_revocation_is_held() {
+    let f = Native::new().await;
+    let lock = crate::platform::client_token_lock::LockFile::new(management_lock(&f));
+    let (waiting, release) = gate_mutation_wait(&f);
+    {
+        let shutdown = f.server.core.shutdown();
+        tokio::pin!(shutdown);
+        tokio::select! {
+            ready = within(waiting) => ready.expect("shutdown producer disappeared"),
+            result = &mut shutdown => panic!("shutdown bypassed held revocation: {result:?}"),
+        }
+        let result = tokio::time::timeout(SHUTDOWN_WAIT + Duration::from_secs(1), &mut shutdown)
+            .await
+            .expect("shutdown did not enforce its revocation deadline");
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert!(*f.server.core.shared.stop.borrow());
+    }
+    drop(lock);
+    release
+        .send(())
+        .expect("held revocation disappeared before release");
     f.finish().await;
 }

@@ -5124,16 +5124,20 @@ pub struct PollerHealth {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct PeerSystemSummary {
     /// Global CPU utilization, 0..=100 (rounded; keeps the response `Eq`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpu_percent: Option<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<f64>"))]
     pub mem_used: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<f64>"))]
     pub mem_total: Option<u64>,
     /// Free space on the volume holding $HOME, in bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<f64>"))]
     pub disk_free: Option<u64>,
     /// Best-effort GPU utilization, 0..=100. Sampled locally since the status
     /// line shipped, but until #291 it never left the box — every peer row
@@ -5164,6 +5168,7 @@ impl PeerSystemSummary {
 /// Mac, the card on a GPU box. Flock never infers it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub enum ThermalComponent {
     /// Tint the CPU glyph.
     #[default]
@@ -5183,6 +5188,7 @@ pub enum ThermalComponent {
 /// flock would false-alarm on every inference run. The host owns calibration —
 /// flock ships no temperature table and colours by rank alone.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ThermalReport {
     /// 0 nominal / 1 fair / 2 serious / 3 critical. Clamped on receive.
     pub severity: u8,
