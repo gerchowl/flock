@@ -51,6 +51,12 @@ the full archive.
 | Test reliability | Producer liveness and condition evidence first, measured nextest hang ceilings across default and CI profiles, reproducible CI timing report | Accepted | ADR-0037 | #1317, #1314, #1334, #1342, #1349 |
 | Content-anchored selections | Runtime-owned terminal references follow scrolling and reflow; copy re-reads retained rows and visibly refuses invalid anchors | In review | ADR-0040 | #475, #2127 |
 
+**Multi-node GUI access (ADR-0043).** Accepted design; not implemented.
+The TLS home gateway supplies node status, destination grants without credential
+forwarding, replay/reconnect and bounded implementation slices. Mobile escalation
+notifications consume this remote-access design. Tracked by #2293, #2721, #1380
+and #2733.
+
 ## Accepted GUI artifact contract
 
 ADR-0038 and its artifact annex were accepted on 2026-10-29. Hosting,
