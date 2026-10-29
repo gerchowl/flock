@@ -5,8 +5,10 @@
  * Every `ev` on `fleet`, snapshot line or later delta, carries one
  * {@link FleetDelta}. A completed snapshot replaces every row, so an agent
  * missing from it is gone; deltas after it upsert or remove one row. A
- * payload that is not a delta ends the subscription with a visible failure,
- * as a refusal does.
+ * malformed agent delta ends the subscription with a visible failure, as a
+ * refusal does. Node/project and future kinds are deliberately ignored until
+ * G4 renders them. The connection advances its cursor after every accepted
+ * callback, including ignored deltas, and after complete snapshots.
  *
  * @module
  */
@@ -19,6 +21,11 @@ import type { WireConnection } from "./connection";
 
 /** Parse the generated fields presentation consumes; newer S4 axes stay opaque. */
 type RowView = Pick<FleetAgentRow, "id" | "label" | "activity" | "waiting_on_human"> & { readonly state: { readonly phase?: unknown } };
+type IgnoredKind = Exclude<FleetDelta, { type: "fleet.upsert" | "fleet.remove" }>["type"];
+const IGNORED: Record<IgnoredKind, true> = {
+  "fleet.node.upsert": true, "fleet.node.remove": true,
+  "fleet.project.upsert": true, "fleet.project.remove": true,
+};
 type DeltaView = (Omit<Extract<FleetDelta, { type: "fleet.upsert" }>, "row"> & { readonly row: RowView }) | Extract<FleetDelta, { type: "fleet.remove" }>;
 
 /** Typed against {@link Phase}, so a new state fails `tsc` until listed. */
@@ -52,12 +59,15 @@ function isRow(row: unknown): row is RowView {
   );
 }
 
-/** Reads one payload as a {@link FleetDelta}, or `null`. */
-export function fleetDelta(ev: WireEvent): DeltaView | null {
+/** Read agent deltas; skip typed entity and unknown kinds, refuse malformed agents. */
+export function fleetDelta(ev: WireEvent): DeltaView | { readonly type: "ignored" } | null {
   if (!isObject(ev)) return null;
-  if (ev["type"] === "fleet.upsert" && isRow(ev["row"])) return { type: "fleet.upsert", row: ev["row"] };
-  if (ev["type"] === "fleet.remove" && typeof ev["id"] === "string") return { type: "fleet.remove", id: ev["id"] };
-  return null;
+  if (ev["type"] === "fleet.upsert") return isRow(ev["row"]) ? { type: "fleet.upsert", row: ev["row"] } : null;
+  if (ev["type"] === "fleet.remove") return typeof ev["id"] === "string" ? { type: "fleet.remove", id: ev["id"] } : null;
+  if (typeof ev["type"] !== "string") return null;
+  if (Object.hasOwn(IGNORED, ev["type"])) return { type: "ignored" };
+  // Includes the sender's lossless `unknown` wrapper and future discriminators.
+  return { type: "ignored" };
 }
 
 function agentRow(row: RowView): AgentRow {
@@ -86,6 +96,7 @@ export function createWireFleet(connection: WireConnection): FleetSource {
           end(`The fleet stream sent something that is not a fleet delta: ${JSON.stringify(ev).slice(0, 200)}`);
           return false;
         }
+        if (delta.type === "ignored") return true;
         if (delta.type === "fleet.upsert") into.set(delta.row.id, agentRow(delta.row));
         else into.delete(delta.id);
         return true;
