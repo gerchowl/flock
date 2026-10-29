@@ -1689,10 +1689,14 @@ beside `flock_question_ask` (ADR-0036 S6c).
 - Content is a blob by sha256 (ADR-0036 §4). A record is a durable-log event
   `artifact.published`.
 - Limits:
-  - `[artifacts] max_bytes`: default 8 MiB per version normally, or 64 MiB with
-    a nonempty typed oversize_reason (at most 280 UTF-8 bytes), without
-    approval. At most two escalated publishes per agent per hour; every result
-    reports size, remaining budget, escalated and lean hints.
+  - `[artifacts] max_bytes`: default 8 MiB per version, standard.
+  - `[artifacts] max_bytes_escalated`: default 64 MiB with a nonempty typed
+    oversize_reason (at most 280 UTF-8 bytes), without approval. It is a
+    separate key, not another value of max_bytes.
+  - `[artifacts] escalations_per_agent_per_hour`: default 2. Every result
+    reports size, remaining budget, escalated and lean hints. Inline decoded
+    content is at most 64 KiB; larger content uses path, with preflight
+    auth/rate/quota and global upload-memory admission before file reads.
   - `max_versions`: default 50 per artifact.
   - Retention: §7a's lifetimes (a `session` default, then `idle_ttl`, 14 days by
     default after the last view, comment or answer), with holds, quotas and an
@@ -1884,6 +1888,12 @@ moment. It is never deleted at once.
 |---|---|---|---|
 | `[artifacts] max_bytes` | bytes | 8 MiB per version standard | non-sensitive operational limit; operator write; reload: server |
 | `[artifacts] max_bytes_escalated` | bytes | 64 MiB with typed oversize_reason | operator global/node write; reload: server |
+| `[artifacts] outer_request_max_bytes` | bytes | 1 MiB JSON, no transport increase | operator global/node write; reload: server |
+| `[artifacts] max_oversize_reason_bytes` | bytes | 280, hard maximum | operator global/node write; reload: server |
+| `[artifacts] inline_max_bytes` | bytes | 64 KiB decoded | operator global/node write; reload: server |
+| `[artifacts] inflight_upload_bytes` | bytes | 64 MiB global memory budget | operator global/node write; reload: server |
+| `[artifacts] upload_reservation_bytes` | bytes | 8 MiB per active publish | operator global/node write; reload: server |
+| `[artifacts] upload_buffer_bytes` | bytes | 64 KiB stream buffer | operator global/node write; reload: server |
 | `[artifacts] escalations_per_agent_per_hour` | int | 2 | operator global/node write; reload: server |
 | `[artifacts] max_versions` | int | 50 per artifact | non-sensitive operational limit; operator write; reload: server |
 | `[artifacts] idle_ttl` | duration | 14 d | non-sensitive operational limit; operator write; reload: server |
@@ -2080,6 +2090,12 @@ by default.**
 
 | Code | Retry | Meaning |
 |---|---|---|
+| `artifact_too_large` | `after_human` | above max_bytes_escalated; operator may raise global/node limits |
+| `artifact_inline_too_large` | `never` | above inline_max_bytes; use path |
+| `artifact_oversize_reason_required` | `never` | escalated publish has no reason |
+| `artifact_oversize_reason_invalid` | `never` | empty/non-UTF-8/reason over 280 bytes |
+| `artifact_escalation_rate_limited` | `later` | artifacts.escalations_per_agent_per_hour exhausted; retry_after_ms supplied |
+| `artifact_storage_busy` | `later` | global upload-memory reservation or bounded worker capacity unavailable, before body read |
 | `capability_not_declared` | `never` | not in the version's declaration |
 | `capability_not_granted` | `after_human` | no grant from the current viewer; the parent may prompt |
 | `capability_unsupported` | `never` | the kind is not implemented, or stream grants are disabled (v1: all) |

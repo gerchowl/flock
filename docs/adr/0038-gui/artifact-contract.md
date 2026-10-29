@@ -30,7 +30,11 @@ defaults:
 | `artifacts.max_bytes` | 8 MiB decoded content per version; standard |
 | `artifacts.max_bytes_escalated` | 64 MiB decoded content per version |
 | `artifacts.escalations_per_agent_per_hour` | 2 committed escalated publishes |
-| `artifacts.outer_request_max_bytes` | 90 MiB encoded request, allowing base64 and bounded metadata |
+| `artifacts.outer_request_max_bytes` | 1 MiB encoded JSON request, within the existing socket limit |
+| `artifacts.inline_max_bytes` | 64 KiB decoded content; larger content requires path |
+| `artifacts.inflight_upload_bytes` | 64 MiB global active-upload memory reservations |
+| `artifacts.upload_reservation_bytes` | 8 MiB fixed accounted memory per active publish, independent of file size |
+| `artifacts.upload_buffer_bytes` | 64 KiB maximum streaming copy/hash buffer |
 | `artifacts.max_oversize_reason_bytes` | 280 UTF-8 bytes, nonempty |
 | `artifacts.max_versions` | 50 non-purged versions per artifact |
 | `artifacts.quota_bytes_per_agent` | 256 MiB logical content bytes |
@@ -81,14 +85,18 @@ restart-only; the numeric operational keys are server-reloadable. Changes to
 wire shape bounds apply to new admissions without invalidating already committed
 records; advertised negotiated limits must describe the active values. Lowering
 budgets never deletes held content, and a cut keeps its captured expiry.
-Positive limits, max_oversize_reason_bytes ≤ 280, max_bytes ≤
-max_bytes_escalated ≤ outer_request_max_bytes, sufficient outer-request
-allowance for the configured decoded cap plus base64 and bounded metadata (at
-least ceil(max_bytes_escalated / 3) × 4 plus 64 KiB), gc_batch_candidates fixed
-to 1 for this implementation, default-page ≤ max-page, initial retry ≤ max
-retry, warning < full and re-arm < corresponding trigger are validated
-atomically. Durations above use the common typed duration syntax, not a
-free-form unit parser.
+Positive limits, max_oversize_reason_bytes ≤ 280, inline_max_bytes ≤ max_bytes ≤
+max_bytes_escalated, and encoded inline content plus bounded metadata fitting
+outer_request_max_bytes are validated atomically. outer_request_max_bytes may
+not exceed the transport's existing 1 MiB MAX_INITIAL_REQUEST_BYTES: increasing
+the decoded file cap does not increase the JSON limit. Validate
+upload_buffer_bytes ≤ upload_reservation_bytes ≤ inflight_upload_bytes; the
+reservation must cover the implementation's measured maximum live
+request/parse/metadata/staging allocations, not just the copy buffer. Reject a
+reload that makes that bound untrue. gc_batch_candidates stays 1; default-page ≤
+max-page, initial retry ≤ max retry, warning < full and re-arm < trigger are
+cross-field invariants. Durations above use the common typed duration syntax,
+not a free-form unit parser.
 
 **Cost:** shared reference tracking across all writer paths/processes,
 authenticated blob hosting, bounded persistent metadata, migration, durable
@@ -135,9 +143,10 @@ KiB encoded declarations. Total encoded annotation payload at most 24 KiB.
 Strings must be valid UTF-8; escape terminal controls in text presentation. JSON
 content must parse, markdown/html/svg are untrusted source, image signature must
 match the declared MIME. No executable MIME fallback or external resource fetch.
-Inline content is UTF-8 for text kinds and strict base64 for images; the decoded
-size is capped before allocating it, and the outer request cap allows base64
-overhead plus bounded metadata.
+Inline content is UTF-8 for text kinds and strict base64 for images, limited to
+inline_max_bytes (64 KiB decoded). Check encoded length before decoding into a
+bounded buffer. Larger content uses path, never a larger JSON String; the outer
+metadata/request cap stays 1 MiB.
 
 ### 2.1 Durable records
 
@@ -262,9 +271,72 @@ ceremony. Above 8 MiB and through 64 MiB is escalated and requires
 is nonempty. No approval is needed. A supplied reason is validated at either
 size; supplying one for a standard publish does not consume an escalation slot.
 Above 64 MiB refuses with artifact_too_large/after_human; only the operator can
-raise the global/node keys, never the repository. The encoded transport cap is
-checked before allocation; decoded content is checked before persistence,
-independent of base64 spelling or file input.
+raise the global/node keys, never the repository. The small encoded transport
+cap and inline threshold are checked before decode; path content uses the
+preflight and bounded stream below.
+
+**Transport choice: require path above 64 KiB inline (decided by this
+correctness amendment).** This fits the current MCP/socket publish contract and
+MAX_INITIAL_REQUEST_BYTES = 1 MiB in src/api/server.rs. Do not raise that limit
+to carry 64 MiB JSON or base64 strings. No new chunked-upload verb or transport
+is introduced. A caller with large inline content gets
+artifact_inline_too_large/never and a use-path hint; this does not mean the same
+bytes exceed max_bytes_escalated. A remote caller must arrange a file in its
+attested worktree through its existing execution surface; arbitrary remote
+paths, blob URLs and network fetches are not accepted.
+
+Admission order for path publishes is mandatory:
+
+1. Receive only the bounded metadata request under the transport's existing
+   pre-auth request/connection limits. Authenticate and attest the caller,
+   validate params/reason/identity and check its existing escalation window.
+2. Pin and stat the safe regular file without reading its content. Check its
+   decoded length, reserve byte quota and any escalation slot, and atomically
+   acquire upload_reservation_bytes from the **one server-wide**
+   inflight_upload_bytes budget shared across agents and writer workers. If any
+   reservation fails, return the typed refusal before reading the file body,
+   creating staging content or dispatching a copy worker. Budget exhaustion is
+   artifact_storage_busy/later. No per-agent worker pool may bypass the global
+   reservation. Recheck rate/quota atomically at this reservation boundary; the
+   early check alone is not authoritative.
+3. Only then stream file bytes through upload_buffer_bytes (64 KiB) into private
+   staging while incrementally computing sha256 and enforcing the reserved
+   length and escalated cap. No read_to_end, whole-file String/Vec, mmap
+   retained as payload, JSON parse of the entire artifact, or second decoded
+   copy is permitted. Validate JSON/image kind incrementally or with bounded
+   header/state inspection; the artifact is a blob, not a request JSON document.
+   File shrink/growth or cap violation refuses, cleans staging safely and
+   releases definite-abort reservations. Never reserve based on stat and then
+   accept unbounded growth.
+4. Commit the artifact using the existing staged-reference/fsync protocol. Hold
+   the upload-memory reservation through worker buffers, validation,
+   response/receipt encoding and all retained request copies; release only when
+   these allocations are dropped. Request/parse storage stays bounded by the
+   small metadata envelope. Inline publishes acquire the same global reservation
+   before decoding their small content; their already-received bounded JSON
+   envelope remains covered by transport pre-auth admission.
+
+The constant-memory rule includes duplicate-hash repair/verification: the
+existing whole-blob get helper cannot be used on the large publication path;
+verify any existing bytes incrementally through the bounded read interface.
+Incremental JSON validation uses the existing bounded nesting discipline and
+rejects excess nesting with artifact_kind_invalid, without building a
+whole-document Value. No library helper may silently collect the stream.
+
+The global budget is an operator-owned global/node key, never a project or agent
+override. At the defaults it permits at most eight active publishes, not
+unbounded concurrency across agent identities. Its charge is fixed memory, **not
+file length**: a 64 MiB file uses the same at-most-8 MiB live publish-memory
+allowance as a small path file, including metadata and buffer copies. Content
+byte quotas separately reserve disk liability. Blocked uploads are refused, not
+queued with bodies resident in memory. An unknown commit effect keeps quota/rate
+custody until reconciled, but must release upload buffers once the worker has
+actually dropped them. This bounds process-owned upload allocations
+independently of payload size; it does not claim to bound unrelated server state
+or OS file-cache pages. Reject incremental JSON/base64 upload for this release:
+the current request parser is whole-message and has no pre-body artifact
+handshake. Retrofitting it would widen the transport and memory-admission
+surface unnecessarily.
 
 At most artifacts.escalations_per_agent_per_hour escalated publishes commit per
 attested publishing agent in a rolling 60-minute window. Reserve the slot
@@ -281,19 +353,21 @@ and escalated flag, plus quota_remaining with agent_bytes and total_bytes after
 that commit. Replays return the original receipt's budget observation rather
 than pretending to describe current free space. The immutable artifact.published
 record keeps oversize_reason and escalated. ArtifactView carries both, and the
-trusted artifact card shows the reason beside size; it is not hidden inside the
-untrusted frame. Decoded content size, including escalated bytes, counts in the
-publisher's 256 MiB usage and the 4 GiB total. The bounded reason metadata
-counts in that publisher's annotation usage. No escalation bypasses byte quotas,
-version caps, authentication or record-size bounds.
+trusted artifact card shows the reason beside size as **plain text only**, with
+HTML/Markdown/control sequences escaped; it is never rendered as HTML, Markdown
+or executable markup, and is not hidden inside the untrusted frame. Decoded
+content size, including escalated bytes, counts in the publisher's 256 MiB usage
+and the 4 GiB total. The bounded reason metadata counts in that publisher's
+annotation usage. No escalation bypasses byte quotas, version caps,
+authentication or record-size bounds.
 
 LeanHint is the closed vocabulary prefer_text_or_svg, compress_images,
 link_large_data; hints contains those three short guidance items. The tool
 description says “Stay lean by default: prefer text or SVG over raster images,
 compress images, and link to large data rather than embedding it.” Expose that
 description in MCP onboarding under #2725. Hints are guidance, not another
-approval step. G7 renders the reason and hints in trusted chrome; G6 persists
-and returns the fields and tool description.
+approval step. G7 renders the reason and hints as escaped plain text in trusted
+chrome; G6 persists and returns the fields and tool description.
 
 **Cost:** durable per-agent rate reservations, larger bounded uploads and usage
 feedback. The owner chose this over the former small single cap; standard
@@ -312,9 +386,10 @@ refusal. No error is an invitation to allocate a new request_id.
 | `invalid_params`, `scope`, `not_authorized` | never | Shape, absent named scope or unattested authority; no mutation |
 | `artifact_not_found` | never | Authorized read of unknown/expired catalog identity; no existence leak before auth |
 | `artifact_owner_mismatch`, `artifact_request_conflict`, `artifact_request_expired` | never | Wrong publisher, altered replay, or obsolete replay receipt |
+| `artifact_inline_too_large` | never | Above inline_max_bytes; use an attested worktree path, not a larger JSON body |
 | `artifact_too_large` | after_human | Above max_bytes_escalated; only the operator may raise global/node limits |
 | `artifact_oversize_reason_required`, `artifact_oversize_reason_invalid` | never | Escalation needs a nonempty UTF-8 reason of at most 280 bytes |
-| `artifact_escalation_rate_limited` | later | More than two escalated publishes per attested agent in the rolling hour; retry_after_ms names the next eligibility |
+| `artifact_escalation_rate_limited` | later | artifacts.escalations_per_agent_per_hour exhausted for the attested agent in the rolling hour; retry_after_ms names the next eligibility |
 | `artifact_path_refused`, `artifact_kind_invalid` | never | Worktree/regular-file safety or invalid content/MIME |
 | `artifact_version_limit` | after_human | No eligible version can be removed to stay within max_versions |
 | `artifact_version_exhausted` | never | u32 version counter cannot advance; publish a new identity |
@@ -969,6 +1044,7 @@ role administration into G6.
 | Read/send/answer credential changes retention or charges a victim | Dispatcher scope matrix refuses pin/unpin/lifetime without operate; server-derived accounting charges new content only to the attested publisher and new control/comment overhead only to its author, never a claimed agent |
 | Ring overflow or paging silently loses a comment | Captured cursor bounds, atomic capture/registration mutation witness, explicit cursor-expired/lagged and snapshot recovery |
 | An artifact hash becomes a public download capability | Auth on GET/HEAD/range/conditional paths and private no-store; unknown hash and denied reference have common auth behavior |
+| A 64 MiB JSON upload or concurrent file readers exhaust memory | Keep JSON at 1 MiB and inline decoded content at 64 KiB; preflight auth/rate/quota and global fixed-memory reservation before path-body reads, stream/hash through a fixed buffer including dedup verification; slice 5 compares peak live allocations across content sizes and refuses excess concurrent readers |
 | Metadata fills disk although content is under 4 GiB | Separate annotation/catalog limits, disk staging reserve, retained pending custody blocks growth instead of being deleted |
 | Remote transfer delay becomes an irreversible purge | G6 rejects nonlocal origin; G11 owns pending-transfer semantics in #1602 |
 
@@ -995,12 +1071,12 @@ acceptance is not a claim that the code ships.
 | 2 / 300–390 | Durable artifact owner/publish ingress, §2 | Attested MCP/socket publish returns stable id/version/hash plus size, quota_remaining, escalated and lean hints; altered replay, forged author, bad MIME, overflow, symlink escape and pinned-handle race refuse without mutation; inject record/fsync failure |
 | 3 / 280–380 | Session backend/migration, §3 | Real pin/question/lifetime transaction migrates before ack; fail copy/hash/fsync and crash replay, source stays whole, concurrent sweep skips intent |
 | 4 / 300–390 | Lifecycle/viewing holds, §§1/3 | Stop purges, same-identity restart/handoff survives, open question/view/pin holds, injected loop clock checks post-hold TTL, 90 s lapse, eight-lease cap and non-operator budget |
-| 5 / 280–380 | Quotas/version/config, §§1/4 | Publish decoded 8 MiB standard / 64 MiB escalated boundaries, required/empty/281-byte reason refusals, third-per-hour later refusal, durable replay/rate recovery, 256 MiB-agent / 4 GiB-total limits and remaining-budget/hint results; version 51 held refusal, publisher-only oldest eligible eviction, atomic failed preflight, reload lowering, quota classes, 80/100% notice reset across restart |
+| 5 / 280–380 | Quotas/version/config, §§1/4 | Peak live publish allocations stay within the fixed reservation for both small and 64 MiB path inputs (bounded allocation/buffer instrumentation through real ingress); hold workers at the read barrier, exhaust the global upload-memory budget across agents, and assert the next request gets artifact_storage_busy before any file-body read. Check auth/rate/quota refusals also read zero content bytes, 64 KiB-inline threshold and unchanged 1 MiB JSON cap; publish decoded 8 MiB standard / 64 MiB escalated boundaries, required/empty/281-byte reason refusals, third-per-hour later refusal, durable replay/rate recovery, 256 MiB-agent / 4 GiB-total limits and remaining-budget/hint results; version 51 held refusal, publisher-only oldest eligible eviction, atomic failed preflight, reload lowering, quota classes, 80/100% notice reset across restart |
 | 6 / 260–370 | Pin/purge/redaction/missing-content, §§3/5/6 | Dispatcher scope matrix, live read held across purge, redaction after restart, old cut cannot reveal excerpts, automatic purge preserves them, shared hash remains for another live ref |
 | 7 / 180–300 | MCP list/comments and metadata retention, §§2/5/6 | Real MCP mine/filter/cursor pages retain order, byte/read bounds and no rescan; unauthorized read and expired cursor refuse, unknown persisted payload preserved, catalog/annotation budget blocks growth |
 | 8 / 300–390 | Durable comment custody, §7 | Actual artifact.comment at queue gate, exact-key replay after crash-before/after-enqueue, unknown-effect quiet-loop retry, permanent refusal operator-visible, changed-body request conflict never duplicates |
 | 9 / 280–390 | Artifacts provider/generated wire, §§2/5/6 | Real WS atomic replay/live registration with deterministic split-lock mutation failure, sparse filtered sequences, gap snapshot and quiet reconnect, lagged close, scope denial and TS drift |
-| 10 / 180–300 | TUI fallback/default deny, §§8/9 | Isolated TUI renders escaped title/version/size/open hint/comments/expired status; capability metadata bounded, no grant allocation; oversize reason visible on trusted artifact card through G7, bounded lean onboarding text via #2725. G7 supplies frame source/token/CSP/RPC-unsupported browser tests |
+| 10 / 180–300 | TUI fallback/default deny, §§8/9 | Isolated TUI renders escaped title/version/size/open hint/comments/expired status; capability metadata bounded, no grant allocation; oversize_reason with HTML/Markdown/script and terminal controls renders as escaped plain text in the exact trusted-card cells through G7, never executable markup; bounded lean onboarding text via #2725. G7 supplies frame source/token/CSP/RPC-unsupported browser tests |
 
 Each new acceptance behavior must be shown red once against the missing change
 or a precise regression mutation, then green through the real public ingress.
