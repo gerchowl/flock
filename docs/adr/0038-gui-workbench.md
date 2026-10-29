@@ -109,7 +109,7 @@ Operations, the same in every shell:
 | `close(tile)` | Unsubscribes the tile's streams if no other tile shares them. |
 
 **Persistence.**
-- **Client-local.** The layout is per device, keyed by server identity, in browser storage or the Tauri store.
+- **Client-local.** The layout is per device, keyed by server identity (defined in §3, "The store"), in browser storage or the Tauri store.
 - **Never sent to an agent.** It never enters an agent's context. Moving tiles is not a fact about the work.
 - **Server-synced named layouts are a later option** (owner decision 9).
 
@@ -326,30 +326,47 @@ The **progress deadline** runs while a stream waits for `synced` or for a snapsh
 **The store.**
 - Entities are kept normalised by kind and id. The store is their only owner: views read and subscribe to it, and hold no copy of a stream's entities. A view that keeps its own copy cannot be restored, and drifts from the cursor it would resume from.
 - Each stream has a cursor, persisted per device so a reload resumes without a full replay. It is persisted only after the event (or the empty snapshot) it names has been applied, and together with the stream's resync marker. The `*/live` streams are the exception: they carry deltas with no cursor (§5).
-- **A stream persists as one record, decided here (#1595).** The record holds the stream's entities, its cursor and its resync marker. They are written together, in one transaction, after the frames they reflect have been applied. They are never written apart. A cursor stored without the entities it covers would resume past state the reload lost, and the stream's tiles would stay empty or wrong.
-  - **Storage: IndexedDB**, in both shells; the Tauri webview has it too. There is one database per server identity and principal. Writes are asynchronous and transactional, and the record has room for transcripts.
+- **A stream persists as one record, decided here (#1595).** The record holds the stream's entities, its cursor and its resync marker, taken in one synchronous step at the same applied seq and written in one transaction. They are never written apart. A cursor stored without the entities it covers would resume past state the reload lost, and the stream's tiles would stay empty or wrong.
+  - **Storage: IndexedDB**, in both shells; the Tauri webview has it too. Writes are asynchronous and transactional, and the record has room for transcripts.
   - Rejected: `localStorage`, because it is synchronous, holds strings only and is capped at a few MiB per origin. A large transcript would block the page or fail partway.
   - Rejected: persisting cursors alone, for the reason above.
-  - **Bounds.** A stream's record is capped at 4 MiB, and the database at 64 MiB.
-    - A stream whose record would pass its cap is no longer persisted: its stored record is deleted whole.
-    - Past the total cap, the record of the stream viewed longest ago is deleted whole.
+  - **Which database.** There is one database per server identity and principal.
+    - **Server identity** is the `serverUrl` origin for the `wire` transport, and the fixed value `bridge:local` for the `bridge` transport (§6), since a device's own server is one server across restarts. It is never `server_epoch` or `server_version`, which change on every start. The layout (§2) uses the same key.
+    - **The principal** is not known until `welcome`. So the tab keeps the server identity and principal of its last `welcome` in `sessionStorage`, beside the token, and a reload opens that database before connecting. A tab with no stored `welcome`, such as a new tab or a new Tauri window, restores nothing and opens the database once `welcome` arrives.
+    - If a `welcome` names a different principal or server than the open database, the client clears the restored entities from memory, opens the matching database, and deletes the previous principal's database on this device. Records are never kept on disk for an identity the tab no longer holds, the same reason `localStorage` was rejected for the token.
+  - **Coalesced writes.** At most one write per stream is in flight. While one is in flight, further applied frames only mark the stream dirty. When it completes, one write takes the latest applied state. Each write captures entities, cursor and marker together at one applied seq, and IndexedDB copies the value when `put` is called. So a stored cursor is never ahead of its stored entities, however fast frames arrive.
+  - **Bounds.** A stream's record is capped at 4 MiB, and each database at 64 MiB.
+    - **Size** is the UTF-8 byte length of the record's JSON, stored in the record. A database's total is the sum of its records' sizes.
+    - Each record stores when it was **last viewed**, meaning one of its tiles was on screen.
+    - A stream whose record would pass its cap has its stored record deleted whole, and is not persisted again until the next load.
+    - Past the database cap, the record viewed longest ago is deleted whole.
     - A record is never truncated, because a truncated transcript under a head cursor would show history with a silent hole.
     - A deleted record costs one full replay of that stream on the next load, and nothing else.
-  - **Failure is a full replay, never an error.** In each of these cases the client drops the affected records, or all of them, and every affected stream bootstraps with no `after`, as on a first load:
-    - IndexedDB is unavailable (private mode, blocked storage);
-    - a write fails (quota);
-    - a record does not parse or has an unknown version;
-    - the principal or the server identity differs from the database's.
-    The connection is unaffected. A failed write never rolls back an applied frame in memory.
-  - **Restore.** On load, each stream starts from its record: its entities render at once, marked as restored, and the stream is not Current. Its `sub` goes out from the record's cursor, with the record's marker, as after a reconnect (above). The `cursor_ahead` rule clears the record together with the stream's entities in memory.
-  - **Versioned.** Each record carries a format version. An unknown version is dropped, as above.
+  - **Failure never becomes an error or a loop.**
+    - **On load,** the affected streams bootstrap with no `after`, as on a first load, in these cases:
+      - IndexedDB is unavailable (private mode, blocked storage);
+      - opening it does not finish within the connect deadline (§3), or reports `blocked`;
+      - a record does not parse or has an unknown older version.
+    - **After load,** a failed write (quota or abort) deletes that stream's record and stops persisting it until the next load. The stream in memory is untouched and is not re-subscribed. A failed write never rolls back an applied frame in memory.
+    - The connection is unaffected in every case.
+  - **Two tabs** of one principal share the database. The last writer of a record wins, which is safe, because every record is consistent on its own. A `versionchange` from another tab closes this tab's database, and it stops persisting until its next load. A record with a newer format version than this client knows is treated as absent and left in place, never deleted, so an older tab cannot erase a newer tab's records.
+  - **Restore.** Once the database is open, each stream starts from its record: its entities render at once, marked as restored. The stream is not Current, and does not count toward Live until its `synced`. Its `sub` goes out from the record's cursor, with the record's marker, as after a reconnect (above). The `cursor_ahead` rule clears the record together with the stream's entities in memory.
+  - **Versioned.** Each record carries a format version. An unknown older version is dropped, as above.
   - **Tests that must fail before the change:**
     - a reload mid-stream renders the restored entities, re-`sub`s from the stored cursor, and never applies a `(stream, seq)` twice;
-    - no cursor is ever stored without its entities, checked by a write fault injected between them;
-    - a record past its cap is deleted whole and that stream replays in full;
-    - a corrupt record, an unknown version, a principal change and unavailable storage each give a full replay with the connection unaffected;
+    - a write aborted inside its transaction leaves the previous record, or none, after a reload, and never a cursor without its entities;
+    - a burst of frames gives at most one write in flight per stream, and the stored cursor matches the stored entities;
+    - a record past its cap is deleted whole and that stream replays in full on the next load;
+    - past the database cap, the record viewed longest ago is deleted;
+    - a quota failure sends no extra `sub` and leaves the stream in memory as it was;
+    - a corrupt record, an unknown older version and unavailable storage each give a full replay, with the connection unaffected;
+    - an open that reports `blocked` or misses its deadline gives a full replay;
+    - a record with a newer version survives an older tab;
+    - a `welcome` with another principal clears the restored entities, opens that principal's database and deletes the old one;
+    - `cursor_ahead` on a restored stream leaves no record behind;
+    - a restored stream does not count toward Live before its `synced`;
     - a stored marker below `snapshot_to` enters Resyncing at once.
-- The outbox is persisted too, each command before its first send (below). It keeps its own `flock.outbox.v1` store, because it must be written before a send, not after an applied frame.
+- The outbox is persisted too, each command before its first send (below). It keeps its own `flock.outbox.v1` key in `localStorage`, because it must be written before a send, not after an applied frame.
 - Ephemeral state lives in the store but is not persisted: in-flight streaming blocks (§4).
 
 **The command outbox.**
