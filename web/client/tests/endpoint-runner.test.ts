@@ -20,7 +20,7 @@ const base: StepHandlers = {
 test("selection uses covers containment, including multi-label headers", async () => {
   const selected = await loadS7MinScripts(ROOT);
   assertInventory(selected, WIRED_SCRIPTS);
-  expect(Object.keys(PENDING_PART_2B).sort()).toEqual(["agent-send", "heartbeat-missed", "ping-pong", "token-revoked"]);
+  expect(Object.keys(PENDING_PART_2B).sort()).toEqual(["agent-send", "heartbeat-missed", "token-revoked"]);
   expect(() => assertInventory(selected, [])).toThrow();
   expect(() => assertInventory(selected, [...WIRED_SCRIPTS, "agent-send"])).toThrow();
   expect(() => assertInventory([...selected, { ...selected[0]!, name: "new-unclassified" }], WIRED_SCRIPTS)).toThrow();
@@ -149,4 +149,19 @@ test("retained gap trace keeps literal resume, event and identity evidence", asy
     { t: "ev", sub_id: "s1", stream: "agent/fixture", seq: 5, ts_ms: 1, ev: { type: "assistant", message: {} } },
     { t: "synced", sub_id: "s1", seq: 5 },
   ]);
+});
+
+
+test("heartbeat trace pins the real socket nonce and a valid principal", async () => {
+  const selected = (await loadS7MinScripts(ROOT)).find((value) => value.name === "ping-pong");
+  assert(selected);
+  const frames = selected.lines.filter((line) => line.step === "send").map((line) => line.frame);
+  expect(frames[0]).toMatchObject({
+    principal: "0123456789abcdef0123456789abcdef",
+    server_epoch: "00000000000000000000000000000001",
+    server_version: { $dynamic: "server_version", source: "build" },
+  });
+  expect(frames[1]).toEqual({ t: "ping", nonce: "00000000000000000000000000000001/1/1" });
+  const pong = selected.lines.find((line) => line.step === "expect" && line.frame.t === "pong");
+  expect(pong).toMatchObject({ frame: { t: "pong", nonce: "00000000000000000000000000000001/1/1" }, fields: ["nonce"] });
 });

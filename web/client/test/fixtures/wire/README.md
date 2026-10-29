@@ -215,8 +215,8 @@ connect assertion has its explicit virtual interval, and final quiet retains its
 authored virtual ceiling; neither advances server time or waits on a wall-clock
 sleep. There are no runtime event timestamps in this script, so it needs no
 persisted timestamp marker. All selected dynamic timestamps still require their
-explicit bound. The tested pending set now contains four scripts: agent-send,
-heartbeat-missed, ping-pong and token-revoked. Later providers must shrink it.
+explicit bound. The tested pending set now contains three scripts: agent-send,
+heartbeat-missed and token-revoked. Later providers must shrink it.
 Gaps and overlap fail.
 
 The permission fixture resumes after bootstrap and raw request (cursor 3), then
@@ -264,3 +264,22 @@ a wrong retained sequence changes the gap, a wrong persisted timestamp changes
 the event, and dropping application of the received event leaves the cursor at
 4. Each must exit 1 for its specific assertion. No expected server frame is
 injected or normalized (ADR-0036 §5a; ADR-0038 §3).
+
+
+`endpoint-ping.ts` executes all nine `ping-pong` steps through the endpoint.
+The driver waits for registration of the supplied monotonic clock's 15-second
+heartbeat deadline, then advances that clock exactly to it. The ping is genuine
+server output, matched against the literal epoch/socket/sequence nonce. The
+client's pong must also reach the real endpoint: the driver acknowledges that
+stage only after the heartbeat registers its renewed expiry at 60 seconds.
+Neither signal constructs a protocol frame. The welcome uses the deterministic
+32-hex principal and independently supplied build version.
+
+Two automatic controls run beside the positive trace: allocating socket 2 makes
+the literal socket-1 nonce fail, and dropping client application of the actual
+ping makes the authored pong expectation fail. Both must exit 1 at their exact
+step. Unexpected IPC stages, EOF, early server exit and missing clock deadlines
+fail visibly. Clock-stage and transport waits retain the five-second guard;
+connect and quiet retain their authored virtual bounds. Quiet also checks
+buffered native output. No runtime event timestamp occurs in this script
+(ADR-0036 §5a; ADR-0038 §3).
