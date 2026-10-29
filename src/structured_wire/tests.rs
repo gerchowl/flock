@@ -715,7 +715,7 @@ fn sub_id_reused_refusal_is_typed_for_both_live_and_closed_ids() {
 
 #[test]
 fn dynamic_timestamp_is_typed_and_restricted_to_event_wall_time() {
-    let line = json!({"v":1,"step":"send","frame":{"t":"ev","sub_id":"s","stream":"agent/fixture","seq":1,"ts_ms":{"$dynamic":"ts_ms","source":"persisted"},"ev":{"type":"assistant","message":{}}}});
+    let line = json!({"v":1,"step":"send","frame":{"t":"ev","sub_id":"s","stream":"agent/fixture","seq":1,"ts_ms":{"$dynamic":"ts_ms","source":"persisted","bound":"after_ack"},"ev":{"type":"assistant","message":{}}}});
     assert!(matches!(
         FixtureLine::parse(&line.to_string()).unwrap().step,
         FixtureStep::Send {
@@ -734,9 +734,11 @@ fn dynamic_timestamp_is_typed_and_restricted_to_event_wall_time() {
         assert!(FixtureLine::parse(&invalid.to_string()).is_err(), "{field}");
     }
     for marker in [
-        json!({"$dynamic":"future","source":"persisted"}),
-        json!({"$dynamic":"ts_ms","source":"socket"}),
-        json!({"$dynamic":"ts_ms","source":"persisted","extra":true}),
+        json!({"$dynamic":"future","source":"persisted","bound":"after_ack"}),
+        json!({"$dynamic":"ts_ms","source":"socket","bound":"after_ack"}),
+        json!({"$dynamic":"ts_ms","source":"persisted","bound":"after_ack","extra":true}),
+        json!({"$dynamic":"ts_ms","source":"persisted"}),
+        json!({"$dynamic":"ts_ms","source":"persisted","bound":"future"}),
     ] {
         let mut invalid = line.clone();
         invalid["frame"]["ts_ms"] = marker;
