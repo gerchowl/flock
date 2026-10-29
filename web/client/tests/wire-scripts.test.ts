@@ -60,6 +60,14 @@ const REPLAYED = [
   "version-gap",
 ];
 
+/**
+ * Scripts that play a client newer than this one, with the protocol their
+ * `hello` names; every other script runs the client's own `WIRE_PROTOCOL`.
+ */
+const NEWER_CLIENT: { readonly [script: string]: number } = {
+  "version-gap": 2,
+};
+
 /** Left to G3 #1595 (G3b), with the feature each one needs. */
 const G3B: { readonly [script: string]: string } = {
   "restored-resync": "persisted resync markers",
@@ -113,7 +121,7 @@ describe("S7a scripts", () => {
         const steps = await load(name);
         if (steps.some((line) => line.step === "send" && line.frame.t === "ev" && typeof line.frame.ts_ms !== "number")) {
           expect(() => new Harness(random).run(steps)).toThrow("dynamic timestamp requires persisted and wall-window oracles");
-        } else new Harness(random).run(steps);
+        } else new Harness(random, NEWER_CLIENT[name]).run(steps);
       });
     }
   }

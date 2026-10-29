@@ -303,7 +303,7 @@ export class WireConnection {
    */
   get readOnly(): string | null {
     if (this.#state !== "ReadOnly" || this.#welcome === null) return null;
-    return `Read-only: the server speaks wire protocol ${this.#welcome.protocol}, older than this client's ${this.#protocol()}. Commands are held until the server is upgraded and the page is reloaded.`;
+    return `Read-only: this server runs an older version (wire protocol ${this.#welcome.protocol}; this client speaks ${this.#protocol()}), so commands wait until it is updated.`;
   }
 
   /** The principal of the last `welcome`, or of the restored outbox. */

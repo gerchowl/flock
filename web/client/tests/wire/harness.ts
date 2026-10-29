@@ -12,7 +12,7 @@ import type { ClientFrame } from "../../src/gen/ClientFrame";
 import type { FixtureLine } from "../../src/gen/FixtureLine";
 import type { ServerFrame } from "../../src/gen/ServerFrame";
 import type { WireEvent } from "../../src/gen/WireEvent";
-import { WireConnection, type Refusal, type StreamName, type Subscription } from "../../src/wire/connection";
+import { WIRE_PROTOCOL, WireConnection, type Refusal, type StreamName, type Subscription } from "../../src/wire/connection";
 import { memoryStore, type Clock, type SocketLike, type TimerHandle } from "../../src/wire/env";
 import { OUTBOX_KEY } from "../../src/wire/outbox";
 
@@ -210,8 +210,8 @@ export class Harness {
   /** The script's subscriptions, which follow their ids across re-subs. */
   readonly #subscriptions: Subscription[] = [];
   readonly #random: () => number;
-  /** The wire protocol the client under test speaks: the script's `hello`, else the client's own. */
-  #protocol: number | undefined;
+  /** The wire protocol the client under test speaks, when a test plays a newer client; else `WIRE_PROTOCOL`. */
+  readonly #protocol: number | undefined;
   #transitions: string[] = [];
   #changes = 0;
   #consumedFrames = 0;
@@ -232,9 +232,6 @@ export class Harness {
 
   /** Runs every step, then requires that no output is left unasserted. */
   run(steps: readonly Step[]): void {
-    // A script whose `hello` names a newer protocol plays a newer client (`version-gap`).
-    const hello = steps.find((line) => line.step === "expect" && line.frame.t === "hello");
-    if (hello?.step === "expect" && hello.frame.t === "hello") this.#protocol ??= hello.frame.protocol;
     steps.forEach((step, index) => {
       try {
         this.step(step);
@@ -515,6 +512,8 @@ export const REACH: { readonly [state: string]: (h: Harness) => void } = {
     h.step(step({ step: "open" }));
   },
   Live: (h) => live(h),
+  // A server one protocol older than the client: ReadOnly (ADR-0038 §3).
+  ReadOnly: (h) => live(h, {}, { ...WELCOME, protocol: WIRE_PROTOCOL - 1 } as ServerFrame),
 };
 
 /** Asserts close `code` takes the connection from its state to NeedsToken, to stay. */
