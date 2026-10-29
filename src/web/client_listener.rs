@@ -214,13 +214,14 @@ impl Listener {
         Ok(())
     }
     /// Run history admission only on the application owner.
-    pub(crate) fn service(
+    pub(crate) fn service_local(
         &mut self,
         registry: &crate::structured::registry::Registry,
         workers: &mut crate::structured::workers::Workers,
         root: &std::path::Path,
+        home: Option<&str>,
     ) {
-        self.core.service(registry, workers, root);
+        self.core.service_local(registry, workers, root, home);
     }
     /// Service authenticated commands on the application owner.
     pub(crate) fn service_commands(&mut self, app: &mut crate::app::App) {

@@ -1,5 +1,6 @@
 /** #1833: actual endpoint, public admission and browser wire, with an owned fake harness. */
 import { strict as assert } from "node:assert";
+import { assertSeedSucceeded } from "./seed-process";
 import type { FleetDelta } from "../../src/gen/FleetDelta";
 import type { JsonValue } from "../../src/gen/serde_json/JsonValue";
 import type { ServerFrame } from "../../src/gen/ServerFrame";
@@ -108,7 +109,8 @@ try {
     // Seed the permission only after the byte-for-byte refusal check, so its
     // legitimate queue writes cannot race the negative assertion.
     const seed = Bun.spawn([binary, "--json", "agent", "send", agent, "fixture message"], { stdout: "pipe", stderr: "pipe" });
-    assert.equal(await seed.exited, 0, await new Response(seed.stderr).text());
+    const seeded = JSON.parse(await assertSeedSucceeded(seed)) as { result?: unknown };
+    assert(seeded.result, "operator seed acknowledges durable queue admission");
     await until(() => records().some((e) => e.type === "flk_permission_request" && e.state === "open"), "operator-created permission request");
     const prompt = records().find((e) => e.type === "flk_permission_request" && e.state === "open")!;
     await until(() => rows.get(agent)?.waiting_on_human.includes(String(prompt.request_id)) === true, "operator-created permission fleet handle");

@@ -82,11 +82,7 @@ pub(super) fn wait(
             }
         };
         let pending = PendingLock::begin_shared(file, executable)?;
-        let remaining = deadline
-            .checked_duration_since(std::time::Instant::now())
-            .filter(|left| !left.is_zero())
-            .ok_or_else(|| TokenError::Io(io::ErrorKind::TimedOut.into()))?;
-        drop(pending.finish_notifying(remaining, &mut on_wait)?);
+        drop(pending.finish_until(deadline, &mut on_wait)?);
     }
     namespace.check().map_err(TokenError::from)
 }

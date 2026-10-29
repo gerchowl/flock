@@ -185,14 +185,25 @@ impl Core {
         })
     }
     /// Service the bounded history mailbox from the registry-owning app loop.
+    #[cfg(test)]
     pub(crate) fn service(
         &mut self,
         registry: &crate::structured::registry::Registry,
         workers: &mut crate::structured::workers::Workers,
         root: &std::path::Path,
     ) {
+        self.service_local(registry, workers, root, None);
+    }
+    /// Observe local fleet facts using only the App's authenticated home identity.
+    pub(crate) fn service_local(
+        &mut self,
+        registry: &crate::structured::registry::Registry,
+        workers: &mut crate::structured::workers::Workers,
+        root: &std::path::Path,
+        home: Option<&str>,
+    ) {
         self.owner.service(registry, workers, root);
-        self.shared.fleet.observe(registry, workers, root);
+        self.shared.fleet.observe(registry, workers, root, home);
     }
     /// Mount only behind S2b-mount's loopback, Host/Origin and funnel guards.
     pub(crate) fn router(&self) -> Router {
@@ -218,13 +229,20 @@ impl Core {
         self.command_owner.service(app);
     }
     /// Stop and drain every transport lease even when app revocation fails.
-    /// Return the revocation failure after bounded cleanup, logging it first.
+    /// Revocation and lease draining each have a five-second caller budget.
+    /// Abandoned store workers retain their slots/fences until actual completion
+    /// (#2742); a timeout does not claim a blocking syscall was cancelled.
     pub(crate) async fn shutdown(&self) -> io::Result<()> {
         let store = self.shared.store.clone();
-        let revocation = mutate_apps(store, None)
-            .await
-            .ok_or_else(|| io::Error::other("app revocation worker unavailable"))
-            .and_then(|out| out.map_err(io::Error::other));
+        let revocation = match tokio::time::timeout(SHUTDOWN_WAIT, mutate_apps(store, None)).await {
+            Ok(out) => out
+                .ok_or_else(|| io::Error::other("app revocation worker unavailable"))
+                .and_then(|out| out.map_err(io::Error::other)),
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "app revocation deadline elapsed",
+            )),
+        };
         if let Err(error) = &revocation {
             crate::logging::client_app_revocation_failed(error);
         }
@@ -352,7 +370,7 @@ async fn authenticate(
     socket: &mut WebSocket,
     shared: &Shared,
     end: Instant,
-) -> Result<(Session, bool, Bearer), HandshakeFailure> {
+) -> Result<(Session, bool, Bearer, u32), HandshakeFailure> {
     let Some(Ok(Message::Text(text))) = before(shared.clock.as_ref(), end, socket.recv())
         .await
         .ok_or(HandshakeFailure::Unavailable)?
@@ -369,7 +387,7 @@ async fn authenticate(
     };
     let token = Bearer(token);
     let session = verify(shared, end, token.clone()).await?;
-    Ok((session, protocol > WIRE_JSON_VERSION, token))
+    Ok((session, protocol > WIRE_JSON_VERSION, token, protocol))
 }
 /// Handshake failures carry credential evidence separately from availability.
 enum HandshakeFailure {
@@ -467,7 +485,7 @@ async fn connection(
     }
     let end = shared.clock.now() + Duration::from_millis(HANDSHAKE_DEADLINE_MS);
     let session = tokio::select! { biased; _ = stop.changed() => return, session = authenticate(&mut socket, &shared, end) => session };
-    let (_session, read_only, token) = match session {
+    let (_session, read_only, token, client_protocol) = match session {
         Ok(session) => session,
         Err(failure) => {
             let Some(code) = failure.hello_code() else {
@@ -630,7 +648,8 @@ async fn connection(
         data.clone(),
         session.clone(),
         priority.clone(),
-    );
+    )
+    .for_protocol(client_protocol);
     let mut running = tokio::task::JoinSet::new();
     let mut heartbeat = Heartbeat::new(shared.clock.now());
     let mut code = loop {
