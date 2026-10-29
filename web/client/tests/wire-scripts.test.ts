@@ -23,7 +23,7 @@ import { Harness, parseScript } from "./wire/harness";
 
 const SCRIPTS = `${import.meta.dir}/../test/fixtures/wire`;
 
-/** The scripts G3a (#1747) replays. */
+/** The scripts G3a (#1747) and G3b (#1595) so far replay. */
 const REPLAYED = [
   "agent-gap",
   "agent-send",
@@ -57,13 +57,21 @@ const REPLAYED = [
   "token-refused",
   "token-revoked",
   "unknown-subscription",
+  "version-gap",
 ];
+
+/**
+ * Scripts that play a client newer than this one, with the protocol their
+ * `hello` names; every other script runs the client's own `WIRE_PROTOCOL`.
+ */
+const NEWER_CLIENT: { readonly [script: string]: number } = {
+  "version-gap": 2,
+};
 
 /** Left to G3 #1595 (G3b), with the feature each one needs. */
 const G3B: { readonly [script: string]: string } = {
   "restored-resync": "persisted resync markers",
   "subfail-operator_only": "operator_only (not emitted by S7-min)",
-  "version-gap": "ReadOnly",
   "uncertain-command": "resume-only resends and unknown_outcome",
   "restored-outbox-status": "resume-only resends and unknown_outcome",
   "outbox-window-expiry-connecting": "window expiry",
@@ -113,7 +121,7 @@ describe("S7a scripts", () => {
         const steps = await load(name);
         if (steps.some((line) => line.step === "send" && line.frame.t === "ev" && typeof line.frame.ts_ms !== "number")) {
           expect(() => new Harness(random).run(steps)).toThrow("dynamic timestamp requires persisted and wall-window oracles");
-        } else new Harness(random).run(steps);
+        } else new Harness(random, NEWER_CLIENT[name]).run(steps);
       });
     }
   }
