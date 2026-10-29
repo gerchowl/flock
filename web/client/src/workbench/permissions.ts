@@ -30,9 +30,11 @@
  * a request that changed meanwhile, and the card shows that refusal. A notice
  * for a record no listed id owns expires on the next `synced` or `reset`.
  *
- * One subscription per agent with listed ids, opened when its first id is
- * listed and closed when its list empties. The focused transcript tile's own
- * subscription is independent.
+ * One reader per agent with listed ids, opened when its first id is listed
+ * and released when its list empties. The records come from the session store
+ * (`store/sessions.ts`, ADR-0038 §3), which holds one subscription per stream
+ * for all its readers: the focused transcript tile shares it, and this module
+ * keeps no subscription and no copy of the stream.
  *
  * Order: every permission prompt blocks its agent, so all cards block, and
  * they sort by each request's own age: the open record's server timestamp
@@ -45,30 +47,18 @@
 import { createSignal, type Accessor } from "solid-js";
 
 import type { AgentRow } from "../fleet";
-import type { Subscription, Transport } from "../transport";
+import { sessionStore, type StreamReader } from "../store/sessions";
+import type { Transport } from "../transport";
 import { TITLE_MAX, boundText, inputSummary } from "../views/turns";
-import { permissionRecord, type OpenPermissionRecord } from "../wire/permission-record";
 import type { InboxCard } from "./inbox";
-
-/** An open record, with the stream seq and server time it arrived at. */
-type Open = { readonly seq: number; readonly tsMs: number; readonly record: OpenPermissionRecord };
 
 type Tracked = {
   label: string;
   ids: readonly string[];
   /** Orders agents: assigned when the list first became non-empty. */
   readonly listedAt: number;
-  /** Open records by `request_id`; a closed record removes its entry. */
-  readonly open: Map<string, Open>;
-  /** Ids whose closed record arrived: not shown as pending while the fleet still lists them. */
-  readonly closed: Set<string>;
-  /** Records that did not match the decided shape, by `request_id` (or a per-entry key when unreadable). */
-  readonly invalid: Map<string, { readonly id: string | null; readonly problem: string }>;
-  synced: boolean;
-  /** A history gap arrived and nothing has followed it yet. */
-  stale: boolean;
-  failure: string | null;
-  subscription: Subscription | null;
+  /** The store's record of the agent's stream: the permission fold and the progress live there. */
+  reader: StreamReader | null;
 };
 
 const CHOICES = ["Allow once", "Always allow", "Deny"] as const;
@@ -76,9 +66,9 @@ const CHOICES = ["Allow once", "Always allow", "Deny"] as const;
 /** The live permission inbox over `transport`. */
 export type PermissionInbox = {
   readonly cards: Accessor<readonly InboxCard[]>;
-  /** Applies the fleet's current rows: opens and closes agent subscriptions. */
+  /** Applies the fleet's current rows: reads and releases agent streams. */
   readonly track: (rows: readonly AgentRow[]) => void;
-  /** Closes every subscription. */
+  /** Releases every stream. */
   readonly close: () => void;
 };
 
@@ -99,12 +89,14 @@ export function createPermissionInbox(transport: Transport): PermissionInbox {
     agentLabel: tracked.label,
     choices: CHOICES,
     blocking: true,
-    ...(tracked.stale ? { stale: true as const } : {}),
+    ...(tracked.reader?.permissions.stale ? { stale: true as const } : {}),
   });
 
   const card = (agent: string, tracked: Tracked, id: string, index: number): Keyed => {
-    const found = tracked.open.get(id);
-    const bad = tracked.invalid.get(id);
+    const fold = tracked.reader?.permissions;
+    const progress = tracked.reader?.progress();
+    const found = fold?.open.get(id);
+    const bad = fold?.invalid.get(id);
     const pendingTitle = `${tracked.label} · permission ${id}`;
     const common = { tsMs: found?.tsMs ?? Number.POSITIVE_INFINITY, listedAt: tracked.listedAt, seq: found?.seq ?? Number.POSITIVE_INFINITY, index };
     if (found !== undefined && bad === undefined) {
@@ -114,9 +106,9 @@ export function createPermissionInbox(transport: Transport): PermissionInbox {
     const pending =
       bad !== undefined
         ? `Unusable permission record: ${bad.problem}`
-        : tracked.failure !== null
-          ? `Details unavailable: ${tracked.failure}`
-          : tracked.synced
+        : progress?.phase === "failed"
+          ? `Details unavailable: ${progress.failure.message}`
+          : progress?.phase === "synced"
             ? "This agent's stream has no open permission record for it."
             : "Loading details…";
     return { ...common, card: { ...base(agent, tracked, id), title: pendingTitle, detail: pending } };
@@ -144,10 +136,11 @@ export function createPermissionInbox(transport: Transport): PermissionInbox {
     const keyed: Keyed[] = [];
     const notices: Keyed[] = [];
     for (const [agent, tracked] of agents) {
+      const fold = tracked.reader?.permissions;
       tracked.ids.forEach((id, index) => {
-        if (tracked.open.has(id) || !tracked.closed.has(id)) keyed.push(card(agent, tracked, id, index));
+        if (fold?.open.has(id) || !fold?.closed.has(id)) keyed.push(card(agent, tracked, id, index));
       });
-      for (const [key, bad] of tracked.invalid) {
+      for (const [key, bad] of fold?.invalid ?? []) {
         if (bad.id === null || !tracked.ids.includes(bad.id)) notices.push(notice(agent, tracked, key, bad.id, bad.problem, notices.length));
       }
     }
@@ -158,53 +151,19 @@ export function createPermissionInbox(transport: Transport): PermissionInbox {
 
   /** Drops the notices for records no listed id owns: they live until the next `reset` or `synced`. */
   const expireNotices = (tracked: Tracked): void => {
-    for (const [key, bad] of tracked.invalid) if (bad.id === null || !tracked.ids.includes(bad.id)) tracked.invalid.delete(key);
+    for (const [key, bad] of tracked.reader?.permissions.invalid ?? []) if (bad.id === null || !tracked.ids.includes(bad.id)) tracked.reader?.permissions.invalid.delete(key);
   };
 
   const open = (agent: string, tracked: Tracked): void => {
-    tracked.subscription = transport.subscribe(`agent/${agent}`, null, {
-      entry: (entry) => {
-        if (entry.kind === "gap") {
-          tracked.stale = true;
-          return publish();
-        }
-        tracked.stale = false;
-        if (entry.kind !== "known") return publish();
-        const record = permissionRecord(entry.event);
-        if (record === null) return publish();
-        if (record.state === "invalid") {
-          tracked.invalid.set(record.request_id ?? `seq-${entry.seq}`, { id: record.request_id, problem: record.problem });
-        } else if (record.state === "open") {
-          tracked.invalid.delete(record.request_id);
-          tracked.open.set(record.request_id, { seq: entry.seq, tsMs: entry.tsMs ?? 0, record });
-          tracked.closed.delete(record.request_id);
-        } else {
-          tracked.invalid.delete(record.request_id);
-          tracked.open.delete(record.request_id);
-          tracked.closed.add(record.request_id);
-        }
-        publish();
+    let joined = false;
+    tracked.reader = sessionStore(transport).read(`agent/${agent}`, {
+      // A notice lives until the next `synced`, not until a reader joins an already synced stream.
+      current: (current) => {
+        if (current && joined) expireNotices(tracked);
       },
-      synced: () => {
-        tracked.synced = true;
-        tracked.stale = false;
-        expireNotices(tracked);
-        publish();
-      },
-      failed: (failure) => {
-        tracked.failure = failure.message;
-        tracked.subscription = null;
-        publish();
-      },
-      reset: () => {
-        tracked.open.clear();
-        tracked.closed.clear();
-        tracked.invalid.clear();
-        tracked.synced = false;
-        tracked.stale = false;
-        publish();
-      },
+      change: publish,
     });
+    joined = true;
   };
 
   return {
@@ -214,7 +173,7 @@ export function createPermissionInbox(transport: Transport): PermissionInbox {
       const waiting = new Map(rows.filter((row) => row.waitingOnHuman.length > 0).map((row) => [row.id, row]));
       for (const [agent, tracked] of agents) {
         if (waiting.has(agent)) continue;
-        tracked.subscription?.close();
+        tracked.reader?.release();
         agents.delete(agent);
       }
       for (const [agent, row] of waiting) {
@@ -228,13 +187,7 @@ export function createPermissionInbox(transport: Transport): PermissionInbox {
           label: row.label,
           ids: row.waitingOnHuman,
           listedAt: listed++,
-          open: new Map(),
-          closed: new Set(),
-          invalid: new Map(),
-          synced: false,
-          stale: false,
-          failure: null,
-          subscription: null,
+          reader: null,
         };
         agents.set(agent, fresh);
         open(agent, fresh);
@@ -243,7 +196,7 @@ export function createPermissionInbox(transport: Transport): PermissionInbox {
     },
     close: () => {
       closed = true;
-      for (const tracked of agents.values()) tracked.subscription?.close();
+      for (const tracked of agents.values()) tracked.reader?.release();
       agents.clear();
       setCards([]);
     },
