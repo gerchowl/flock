@@ -1,0 +1,1 @@
+- The desktop shell connects to a server on the same machine with no token input (ADR-0038 §6, #1601). Its native side mints an app-session token over `flock.sock` and carries the client's `/v1/ws` session itself over `flock-ws.sock`, so the token never enters the webview. A launch from inside a flk pane is refused with a plain message.

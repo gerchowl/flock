@@ -484,6 +484,7 @@ fn queue_provider_split_lock_mutation_is_observed_without_racing_threads() {
             result
         },
         None,
+        (&Notify::new(), &Notify::new()),
     );
     UNLOCK_WITNESS.with(|w| *w.borrow_mut() = None);
     assert_eq!(book.lock().readers.len(), 1);
@@ -981,4 +982,88 @@ fn custody_tracking_shares_retained_fold_across_many_committed_messages() {
         assert_eq!(client.custody_committed(key).ok(), Some(true));
     }
     close(t);
+}
+
+struct UnlockedWake {
+    book: Arc<Mutex<Book>>,
+    unlocked: std::sync::atomic::AtomicBool,
+}
+impl std::task::Wake for UnlockedWake {
+    fn wake(self: Arc<Self>) {
+        self.unlocked.store(
+            self.book.try_lock().is_some(),
+            std::sync::atomic::Ordering::SeqCst,
+        );
+    }
+}
+
+async fn snapshot_panic_wakes_waiting_subscriber(finishing: bool) {
+    let root = root();
+    let mut j = journal(&root, 1);
+    let (mut publisher, source) = Publisher::new("publication-fixture", j.replay(0).unwrap());
+    let _first = source.subscribe(None).unwrap();
+    let wake = source.2.notified();
+    let capacity = source.4.notified();
+    tokio::pin!(wake, capacity);
+    wake.as_mut().enable();
+    capacity.as_mut().enable();
+    let witness = Arc::new(UnlockedWake {
+        book: source.1.clone(),
+        unlocked: std::sync::atomic::AtomicBool::new(false),
+    });
+    let waker = std::task::Waker::from(witness.clone());
+    assert!(
+        std::future::Future::poll(wake.as_mut(), &mut std::task::Context::from_waker(&waker),)
+            .is_pending()
+    );
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let snapshot = || {
+            assert!(source.1.try_lock().is_none());
+            assert!(matches!(
+                source.subscribe(None),
+                Err(ErrorCode::SessionBusy)
+            ));
+            panic!("fixture snapshot panic while publication book is held");
+        };
+        if finishing {
+            publisher.finish(snapshot, None);
+        } else {
+            publisher.capture(snapshot, None);
+        }
+    }));
+    assert!(failed.is_err());
+    // Keep publisher alive: its destructor must not supply the missing wake.
+    tokio::time::timeout(Duration::from_secs(10), wake)
+        .await
+        .expect("unwinding snapshot never woke the waiting subscriber");
+    tokio::time::timeout(Duration::from_secs(10), capacity)
+        .await
+        .expect("unwinding snapshot never woke capture-capacity waiters");
+    assert!(
+        witness.unlocked.load(std::sync::atomic::Ordering::SeqCst),
+        "subscriber was notified before book release"
+    );
+    assert!(source.1.try_lock().is_some());
+    if finishing {
+        publisher.capture(|| j.subscription().map_err(Into::into), None);
+    }
+    let mut resumed = source.subscribe(None).unwrap();
+    publisher.capture(|| j.subscription().map_err(Into::into), None);
+    let replay = pages(&mut resumed);
+    let ids: Vec<_> = replay
+        .iter()
+        .filter_map(|page| match page {
+            Page::Record(value) => Some(value["item"]["item_id"].as_str().unwrap().to_owned()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ids, [item(0).item_id]);
+}
+#[tokio::test]
+async fn capture_snapshot_unwind_wakes_waiting_subscriber() {
+    snapshot_panic_wakes_waiting_subscriber(false).await;
+}
+#[tokio::test]
+async fn finish_snapshot_unwind_wakes_waiting_subscriber() {
+    snapshot_panic_wakes_waiting_subscriber(true).await;
 }
