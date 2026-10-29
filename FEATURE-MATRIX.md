@@ -20,6 +20,7 @@ the full archive.
 | Worktrees | Merge-gated kill, fleet sweep, workspace-as-unit | Shipped | — | #2, #4, #81, #83 |
 | Config | Twelve-factor config: four layers, env convention, settings pane as shim, fleet-source write target (planned) | Shipped | ADR-0002 | #108, #112, docs/PRs |
 | Config v2 | Env-above-file precedence, typed scoped config schema/read/write APIs, provenance and per-section reload outcomes | Accepted design; not implemented | ADR-0041 | #2367 |
+| Scoped configuration | Complete typed schema, source/scope precedence, operator APIs and durable audit, secret references and bounded healthy-wait inventory | Accepted design; not implemented | ADR-0042 | #2367, #2719, #2720 |
 | Governance | guardrails gates, clippy print funnel, trace-field debt registry; plus the ADR status sweep that records which designs are decided and names what each acceptance does **not** cover | Shipped | ADR-0024 | #21, #22, docs/DEBT.md, #544 |
 | Version identity | Restarted version line: first release **`0.7.0`** (not the `1.0.0` the ADR argued for), which `just release-plan`'s `minor` recommendation independently agrees with; deterministic `just release` path; release manifest may advertise only assets this repository published | Shipped | ADR-0025 | #506, #507, #509, #548 |
 | Observability | JSONL logging spine, named-facade schema surface (raw trace-field debt census: 0) | Shipped | — | #87, docs/DEBT.md |
@@ -55,3 +56,11 @@ The TLS home gateway supplies node status, destination grants without credential
 forwarding, replay/reconnect and bounded implementation slices. Mobile escalation
 notifications consume this remote-access design. Tracked by #2293, #2721, #1380
 and #2733.
+
+## Accepted GUI artifact contract
+
+ADR-0038 and its artifact annex were accepted on 2026-10-29. Hosting,
+origin-qualified records, two-tier size admission, retention, authenticated
+blob reads and comment custody are decided; implementation remains tracked
+by #1598/#1599/#1602 and the annex's twelve-slice plan. Acceptance does not
+claim that these surfaces are delivered.
