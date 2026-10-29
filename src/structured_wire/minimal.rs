@@ -2,7 +2,9 @@
 
 use serde::{Deserialize, Serialize};
 
-pub use crate::structured::fleet_lite::wire::{FleetAgentRow, FleetDelta};
+pub use crate::structured::fleet_lite::wire::{
+    FleetAgentRow, FleetDelta, FleetNodeRow, FleetProjectRow,
+};
 
 pub use crate::api::schema::AgentSendResult;
 
