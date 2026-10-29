@@ -39,6 +39,33 @@ function subscribed(): { h: Harness; seen: Seen[]; last: () => readonly AgentRow
 const send = (h: Harness, frame: ServerFrame): void => h.step(step({ step: "send", frame }));
 
 describe("wire fleet", () => {
+  test("unsupported entity kinds keep the snapshot, live agents and resume cursor", () => {
+    const { h, seen, last, close } = subscribed();
+    const payloads = [
+      { type: "fleet.node.upsert", row: { node_id: "a".repeat(64) } },
+      { type: "fleet.node.remove", node_id: "a".repeat(64) },
+      { type: "fleet.project.upsert", row: { id: "project", node_id: "a".repeat(64) } },
+      { type: "fleet.project.remove", id: "project", node_id: "a".repeat(64) },
+      { type: "unknown", raw: "future row", shape: "fixture:future" },
+      { type: "fleet.future", id: "future" },
+    ];
+    const delta = (seq: number, ev: object): void => send(h, { t: "ev", sub_id: "s1", stream: "fleet", seq, ts_ms: 0, ev: ev as never });
+    send(h, { t: "gap", sub_id: "s1", from: 1, to: 0, snapshot_to: 7 });
+    send(h, upsert(1, row("atlas")));
+    payloads.forEach((ev, i) => delta(i + 2, ev));
+    send(h, { t: "synced", sub_id: "s1", seq: 7 });
+    expect(last().map((r) => r.id)).toEqual(["atlas"]);
+    expect(h.connection.streams().get("s1")?.cursor).toBe(7);
+    send(h, upsert(8, row("kite")));
+    payloads.forEach((ev, i) => delta(i + 9, ev));
+    expect(last().map((r) => r.id)).toEqual(["atlas", "kite"]);
+    expect(seen.every((entry) => "rows" in entry)).toBe(true);
+    expect(h.connection.streams().get("s1")?.cursor).toBe(14);
+    close();
+    createWireFleet(h.connection).subscribe({ rows: () => undefined, failed: (message) => { throw new Error(message); } });
+    expect(sentFrames(h).at(-1)).toEqual({ t: "sub", sub_id: "s2", stream: "fleet", after: 14 });
+  });
+
   test("optional mesh metadata is compatible with local-only fleet presentation", () => {
     const routed: FleetAgentRow = {
       id: "fixture-agent", label: "Example", state: agentState("working"), waiting_on_human: [],
@@ -113,7 +140,7 @@ describe("wire fleet", () => {
   });
 
   test("a payload that is not a fleet delta ends the list visibly", () => {
-    for (const bad of [{ type: "fleet.upsert", row: row("a", { state: "working" }) }, { type: "fleet.upsert", row: { id: "a" } }, { type: "fleet.rename", id: "a" }, "atlas"]) {
+    for (const bad of [{ type: "fleet.upsert", row: row("a", { state: "working" }) }, { type: "fleet.upsert", row: { id: "a" } }, "atlas"]) {
       const { h, seen } = subscribed();
       send(h, { t: "gap", sub_id: "s1", from: 1, to: 0, snapshot_to: 0 });
       send(h, { t: "ev", sub_id: "s1", stream: "fleet", seq: 1, ts_ms: 0, ev: bad as never });
