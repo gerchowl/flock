@@ -30,10 +30,20 @@ impl Provider for Vec<Agent> {
             .collect())
     }
 }
-type Observation = (
-    PathBuf,
-    Result<Vec<Agent>, crate::api::error_code::ErrorCode>,
-);
+#[derive(Clone, PartialEq, Eq)]
+struct Local {
+    agents: Vec<Agent>,
+    home: Option<String>,
+}
+impl Provider for Local {
+    fn agents(&self) -> io::Result<Vec<StructuredAgent<'_>>> {
+        self.agents.agents()
+    }
+    fn rows(&self) -> io::Result<Vec<crate::structured::fleet_lite::Row>> {
+        crate::structured::fleet_lite::local_rows(self.agents()?, self.home.as_deref())
+    }
+}
+type Observation = (PathBuf, Result<Local, crate::api::error_code::ErrorCode>);
 type Request = (Option<u64>, oneshot::Sender<io::Result<Cut>>);
 // Shared ring: sixteen frames, each within the existing 64 KiB writer limit.
 const LIVE: usize = 16;
@@ -64,7 +74,13 @@ impl Client {
         }
     }
     /// Called only on the registry owner. No unavailable permission read becomes empty.
-    pub(super) fn observe(&self, registry: &Registry, workers: &Workers, root: &Path) {
+    pub(super) fn observe(
+        &self,
+        registry: &Registry,
+        workers: &Workers,
+        root: &Path,
+        home: Option<&str>,
+    ) {
         let agents = registry
             .records()
             .into_iter()
@@ -84,7 +100,11 @@ impl Client {
                 };
                 Ok(Agent(record, view.update.state.clone(), waiting))
             })
-            .collect();
+            .collect::<Result<Vec<_>, _>>()
+            .map(|agents| Local {
+                agents,
+                home: home.map(str::to_owned),
+            });
         let observation = Arc::new((root.join("fleet.json"), agents));
         self.updates.send_if_modified(|old| {
             if old.as_ref() == Some(&observation) {
@@ -316,15 +336,49 @@ pub(super) async fn replay(
     live: &Arc<AtomicBool>,
     id: &str,
     after: Option<u64>,
+    protocol: u32,
 ) -> Result<(), Option<SubfailCode>> {
     let mut cut = client.subscribe(after).await.map_err(|e| {
         (e.kind() == io::ErrorKind::InvalidInput).then_some(SubfailCode::CursorAhead)
     })?;
     loop {
-        let frame = cut.next(id).await.map_err(|error| {
+        let mut frame = cut.next(id).await.map_err(|error| {
             crate::logging::client_wire_unavailable("fleet_replay", Some(error.kind()));
             None
         })?;
+        // Node/project kinds belong to the initial unreleased wire version 1.
+        // A lower protocol receives the lossless sender-scoped unknown wrapper.
+        if protocol < crate::structured::fleet_lite::wire::FLEET_ENTITY_VERSION {
+            if let ServerFrame::Ev {
+                ev: WireEvent::Json(value),
+                ..
+            } = &mut frame
+            {
+                let kind = value["type"].as_str().unwrap_or("");
+                if matches!(
+                    kind,
+                    "fleet.node.upsert"
+                        | "fleet.node.remove"
+                        | "fleet.project.upsert"
+                        | "fleet.project.remove"
+                ) {
+                    let wrapped = WireEvent::Unknown(UnknownEvent {
+                        r#type: UnknownTag::Unknown,
+                        shape: format!("flk/wire/1/{kind}"),
+                        raw: serde_json::to_string(value).map_err(|_| None)?,
+                    });
+                    if let ServerFrame::Ev { ev, .. } = &mut frame {
+                        *ev = wrapped;
+                    }
+                    if !super::output::fits(&frame) {
+                        frame = ServerFrame::Lagged {
+                            sub_id: id.into(),
+                            skipped_to: cut.cursor,
+                        };
+                    }
+                }
+            }
+        }
         let ended = matches!(frame, ServerFrame::Lagged { .. });
         if !deliver(data, live, frame).await || ended {
             return Ok(());
