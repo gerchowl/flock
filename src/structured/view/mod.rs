@@ -2,6 +2,7 @@
 pub(crate) mod contracts;
 pub(crate) mod model;
 pub(crate) mod placement;
+pub(crate) mod stream;
 use crate::{app::AppState, layout::PaneId};
 use placement::View;
 use ratatui::layout::Direction;

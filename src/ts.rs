@@ -60,6 +60,8 @@ fn contracts() -> BTreeMap<PathBuf, String> {
     collector.add::<crate::structured_wire::ServerFrame>();
     collector.add::<crate::structured_wire::fixture::FixtureLine>();
     collector.add::<crate::structured_wire::FleetAgentRow>();
+    collector.add::<crate::structured_wire::FleetNodeRow>();
+    collector.add::<crate::structured_wire::FleetProjectRow>();
     collector.add::<crate::structured_wire::AgentDecide>();
     collector.add::<crate::structured_wire::PermissionDecision>();
     collector.add::<crate::structured_wire::FleetDelta>();

@@ -98,6 +98,8 @@ struct PendingRevoke<'a> {
     _intent: priority::Intent<&'a Namespace>,
 }
 impl PendingRevoke<'_> {
+    /// Allow five-second helper startup plus two-second contention before store I/O.
+    /// Filesystem sweep/removal and owned-helper cleanup are separate operations.
     fn finish(self) -> Result<(), TokenError> {
         let _guard = self.guard.finish(Duration::from_secs(2))?;
         priority::sweep(&self.store.0)?;
@@ -209,16 +211,10 @@ impl TokenStore {
         mut on_wait: impl FnMut(),
     ) -> Result<LockFile, TokenError> {
         let deadline = std::time::Instant::now() + budget;
-        let remaining = || {
-            deadline
-                .checked_duration_since(std::time::Instant::now())
-                .filter(|left| !left.is_zero())
-                .ok_or_else(|| TokenError::Io(io::ErrorKind::TimedOut.into()))
-        };
         loop {
             priority::wait(&self.0, &self.2, deadline, &mut on_wait)?;
             let guard = PendingLock::begin_shared(self.lock_file()?, &self.2)?
-                .finish_notifying(remaining()?, &mut on_wait)?;
+                .finish_until(deadline, &mut on_wait)?;
             if !priority::pending(&self.0)? {
                 return Ok(guard);
             }
