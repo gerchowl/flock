@@ -125,14 +125,18 @@ impl Server {
             fs::write(&path, json!({"token":token.repeat(64),"principal":principal.repeat(32),"scopes":["read","send","answer","operate"]}).to_string()).unwrap();
             fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
         }
+        let store = TokenStore::open(root.path()).unwrap();
+        Self::from_store(root, store, wrap).await
+    }
+    /// Serve an actual issued store; root owns its isolated filesystem lifetime.
+    async fn from_store(
+        root: crate::structured::launch::SessionConfigDir,
+        store: TokenStore,
+        wrap: impl FnOnce(TestClock) -> Arc<dyn Clock>,
+    ) -> Self {
         let clock = TestClock::new();
         let wake = Arc::new(tokio::sync::Notify::new());
-        let core = Core::with_clock(
-            TokenStore::open(root.path()).unwrap(),
-            wrap(clock.clone()),
-            wake.clone(),
-        )
-        .unwrap();
+        let core = Core::with_clock(store, wrap(clock.clone()), wake.clone()).unwrap();
         let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let bind = socket.local_addr().unwrap();
         let router = core.router();
