@@ -1648,6 +1648,14 @@ other client. It gets no private path.
 
 ### 8a. Open questions are first-class: structured options, a reply path, and one answer
 
+**S6e amendment (#2242):** [ADR-0036](0036-structured-agent-sessions.md#amendment-s6e--non-blocking-question-threads-and-routing-2242)
+narrows the MCP answer binding to agent-addressed questions. Operator questions
+require an authenticated operator surface (client `answer` or `operate`, attested
+local CLI/TUI, or an operator-bound `reply` channel). Architect CLI/MCP answers to
+their own questions remain valid. S6e adds durable non-blocking asks, reviewed
+proposals and idle reply custody; it does not change guarded live-screen
+selection for legacy dialogs. This is design, not a claim of shipped support.
+
 Added by the owner on 2026-10-11 (#1005, two additions: options, then a reply
 path). The main reason to reach an agent from a phone is to answer the question
 it is stuck on, and most such questions have choices. A question, and its
