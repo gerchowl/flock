@@ -228,7 +228,9 @@ export function Transcript(props: TranscriptProps): JSX.Element {
       entries.length = 0;
       setCount(0);
       setTurns(emptyFold());
-      // Entries restart from the stream's first retained seq: replaying again, not Current.
+      // Entries restart from the stream's first retained seq: replaying again, not
+      // Current, until the new epoch's `synced`.
+      setProgress({ phase: "replaying" });
       props.onCurrent?.(false);
     },
     synced: () => {

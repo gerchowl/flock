@@ -84,12 +84,12 @@ describe("Transcript", () => {
     expect(root.querySelector('[data-testid="unknown-event"]')).toBeNull();
   });
 
-  test("a reset mid-stream ends Current, so a send then records no echo cursor (#1791)", () => {
+  test("a reset mid-stream ends Current until the stream re-syncs, so only a send after that folds into its echo (#1791, #2234)", () => {
     let observer: Parameters<Transport["subscribe"]>[2] | undefined;
     const transport: Transport = { subscribe: (_stream, _after, given) => ((observer = given), { close: () => undefined }) };
     const composer = createComposerState();
     const currents: boolean[] = [];
-    mount(() => (
+    const root = mount(() => (
       <Transcript
         transport={transport}
         stream="agent/a"
@@ -101,13 +101,23 @@ describe("Transcript", () => {
     const said = (seq: number, text: string) => ({ seq, kind: "known", event: { type: "user", message: { role: "user", content: text } } }) as const;
     observer?.entry(said(1, "earlier"));
     observer?.synced();
+    const status = (): string | null | undefined => root.querySelector(".transcript__status")?.textContent;
+    expect(status()).toBe("Up to date");
     observer?.reset?.();
     expect(currents).toEqual([false, true, false]);
-    // Sent while the stream replays again: its cursor (1) is not the stream's.
-    const after = composer.cursor("a");
-    expect(after).toBeNull();
+    expect(status()).toBe("Loading history…");
+    // Sent while the stream replays again: had the reset kept Current, it would record cursor 1 and fold into seq 2.
+    const replaying = { cmdId: "c1", text: "hello", after: composer.cursor("a") };
+    observer?.entry(said(1, "earlier"));
     observer?.entry(said(2, "hello"));
-    expect([...composer.echoed("a", [{ cmdId: "c1", text: "hello", after }])]).toEqual([]);
+    expect([...composer.echoed("a", [replaying])]).toEqual([]);
+    // The re-subscription's barrier starts a new epoch: Current again, and a send now folds into its echo.
+    observer?.synced();
+    expect(currents).toEqual([false, true, false, true]);
+    expect(status()).toBe("Up to date");
+    const resynced = { cmdId: "c2", text: "again", after: composer.cursor("a") };
+    observer?.entry(said(3, "again"));
+    expect([...composer.echoed("a", [replaying, resynced])]).toEqual(["c2"]);
   });
 
   test("a failed subscription is shown, not swallowed", async () => {
