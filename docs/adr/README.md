@@ -51,7 +51,7 @@ can be exempted in `guardrails-adr-exempt.txt`.
 | [0039](0039-vigil-telemetry-integration.md) | flk's logs, metrics and traces go through vig-os/vigil as per-role OTLP/JSON Lines files, carry ids and never content, and are read back only by the flk server | Proposed |
 | [0040](0040-content-anchored-selection.md) | Pane selections retain content identity through scrolling and reflow, re-read surviving rows at copy, and visibly refuse evicted content | Accepted |
 | [0041](0041-configuration-v2.md) | Configuration v2: 12-factor precedence and a typed, scoped config API | Accepted |
-| [0045](0045-durable-work-and-supervision-loops.md) | Durable work records and server-owned supervision loops: acknowledged persistence, at-least-once wakes, explicit handling and goal/work projection | Proposed |
+| [0045](0045-durable-work-and-supervision-loops.md) | Durable work records and server-owned supervision loops: acknowledged persistence, at-least-once wakes, explicit handling and goal/work projection | Accepted |
 
 ADR-0026 supersedes the affected transport, reply, deferral and deduplication
 contracts in ADR-0006, ADR-0008, ADR-0009, ADR-0018 and ADR-0019. Their other
