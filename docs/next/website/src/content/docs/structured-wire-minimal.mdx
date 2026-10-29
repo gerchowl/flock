@@ -64,8 +64,10 @@ names and SSH targets never do. Node and route display names use the same full
 NodeId-derived alias. No private hostname or SSH error text reaches these rows.
 A signed route proves the node identity, not the source of an arbitrary summary.
 Direct facts require a matching independent enrollment pin. Relayed facts require
-the existing local channel binding to identify the immediate source as that same
-owner; third-party claims and carried snapshots cannot supply or freshen facts.
+the immediate source captured from a validated poll or enrolled inbound edge
+at ingestion to be that same owner. Rejected poll identities supply no relay
+rows, and rebinding an alias cannot authenticate its old cached claims. Third-party
+claims and carried snapshots cannot supply or freshen facts.
 The freshest proven owner observation wins, with a stable ordering for ties.
 Direct latency is the last home-to-owner summary request in
 milliseconds; relayed observations have `latency_ms: null`. Version and health
@@ -75,7 +77,8 @@ its classified failure with unknown owner metrics. Latency provenance comes
 from the direct observation source, never a matching configured name.
 
 `last_ok` is Unix epoch milliseconds in the home clock domain, captured once per
-successful observation. GUI requests and failed polls do not advance it.
+successful observation. Each poll shares one observation instant with all of its
+relayed rows. GUI requests and failed polls do not advance it.
 Online classification uses monotonic age, including origin age plus local
 residence for relayed observations. Unknown age, absent/incompatible peer
 protocol, poll failure, missing live route and age strictly greater than the

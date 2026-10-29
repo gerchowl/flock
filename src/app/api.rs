@@ -528,16 +528,15 @@ impl App {
                             .note_wake();
                         self.mesh_collect_at = None;
                     }
-                    // Gossip v3 (#101): merge the polled peer's relayed_fleet
-                    // into our cache BEFORE we mutate `summary`. Loop
-                    // prevention rides on the origin field: we drop entries
-                    // whose origin is us (the ONE full-cycle we could see —
-                    // hub A polls hub B, hub B relayed A's own peers back).
-                    crate::peers::merge_relayed_fleet(
-                        &mut self.state.relayed_fleet_cache,
-                        payload.relayed_fleet,
-                        &fetch.peer,
-                    );
+                    if let Some(source_node) = payload.node_id.as_deref() {
+                        crate::peers::merge_relayed_fleet(
+                            &mut self.state.relayed_fleet_cache,
+                            payload.relayed_fleet,
+                            &fetch.peer,
+                            Some(source_node),
+                            now,
+                        );
+                    }
                     summary.host = (!payload.host.is_empty()).then_some(payload.host);
                     summary.version = payload.version;
                     summary.protocol = payload.protocol;

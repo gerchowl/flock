@@ -255,7 +255,13 @@ impl App {
             }
             None => fleet.extend(hub_self),
         }
-        crate::peers::merge_hub_pushed_fleet(&mut self.state.relayed_fleet_cache, fleet, &hub);
+        crate::peers::merge_hub_pushed_fleet(
+            &mut self.state.relayed_fleet_cache,
+            fleet,
+            &hub,
+            hub_node.as_deref(),
+            std::time::Instant::now(),
+        );
         self.note_mesh_owners();
         self.state.evict_expired_relayed_entries();
         self.render_dirty
@@ -1539,6 +1545,8 @@ mod tests {
             &mut app.state.relayed_fleet_cache,
             vec![relayed_by_anvil("node-b.invalid", "ws00860001")],
             "kiln.invalid",
+            None,
+            std::time::Instant::now(),
         );
 
         let prepared = app
@@ -1592,6 +1600,8 @@ mod tests {
             &mut app.state.relayed_fleet_cache,
             vec![relayed_by_anvil("node-b.invalid", "ws00860001")],
             "kiln.invalid",
+            None,
+            std::time::Instant::now(),
         );
         assert!(app
             .prepare_switch_server(PeerSwitchRequest::RelayedPeer {
@@ -1624,6 +1634,8 @@ mod tests {
             &mut app.state.relayed_fleet_cache,
             vec![hub_row("node-b.invalid", "ws00860001", 0)],
             "hopper",
+            None,
+            std::time::Instant::now(),
         );
         assert!(app.state.relayed_fleet_cache["node-b.invalid"].hub_pushed);
         assert!(app
@@ -2205,6 +2217,13 @@ mod tests {
             .state
             .relayed_fleet_cache
             .contains_key("\0node:node-home.example:test-node-node-home.example"));
+        let ingested = &spoke.state.relayed_fleet_cache
+            ["\0node:node-home.example:test-node-node-home.example"];
+        assert_eq!(
+            ingested.source_node.as_deref(),
+            Some("test-node-node-home.example")
+        );
+        assert_eq!(ingested.peer.last_ok, ingested.peer.ingested_at);
     }
 
     #[tokio::test]

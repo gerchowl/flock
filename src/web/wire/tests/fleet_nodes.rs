@@ -397,12 +397,7 @@ fn proven_owner_relay_keeps_null_latency_stable_time_and_legacy_protocol_refusal
             "node_id":hub.node_id(),"name":"hub.example","ssh_target":"hub.example","host":"hub.example","origin":"hub.example",
             "version":"owner-version","protocol":crate::protocol::PROTOCOL_VERSION,"system":{"cpu_percent":14},"latency_ms":9999,"age_secs":5,"origin_last_ok_secs":5,"proxy_jump":"hub.example"
         }]}),2);
-        // This local binding is the enrolled immediate channel, not a claim
-        // made by the relayed payload. Remove the direct reading to observe it.
-        case.app
-            .state
-            .server_nodes
-            .insert(peer.name.clone(), hub.node_id());
+        // Ingress captured the enrolled source; observe it without a direct reading.
         let index = case
             .app
             .state
@@ -658,5 +653,132 @@ fn stamp_cache_drops_rebound_and_absent_owners() {
         case.service();
         assert_eq!(case.server.core.fleet_nodes.stamp_count(), 0);
         case.server.finish().await;
+    });
+}
+
+fn refresh_enrolled_sources(case: &mut Case) {
+    let response = case.app.handle_api_request(crate::api::schema::Request {
+        id: "bindings".into(),
+        method: crate::api::schema::Method::PeersEnrollment(crate::api::schema::EmptyParams {}),
+    });
+    assert!(serde_json::from_str::<Value>(&response)
+        .unwrap()
+        .get("error")
+        .is_none());
+}
+
+#[test]
+fn rejected_poll_identity_cannot_ingest_owner_relays() {
+    let _guard = crate::config::test_config_env_guard();
+    runtime(async {
+        let mut case = Case::new().await;
+        let owner = NodeIdentity::fixture([81; 32]);
+        let impostor = NodeIdentity::fixture([82; 32]);
+        let peer = case.peer("hub.example");
+        crate::peer_stream::test_enroll(&peer, &owner.node_id());
+        refresh_enrolled_sources(&mut case);
+        case.direct(&owner);
+        case.success(
+            &peer,
+            &impostor.node_id(),
+            json!({"relayed_fleet":[{
+                "node_id":owner.node_id(),"name":"hub.example","ssh_target":"hub.example",
+                "origin":"hub.example","age_secs":0,"system":{"cpu_percent":99}
+            }]}),
+            2,
+        );
+        let rows = case.snapshot().await;
+        case.server.finish().await;
+        assert!(
+            case.app.state.relayed_fleet_cache.is_empty(),
+            "rejected sender supplied relay rows"
+        );
+        assert_eq!(rows[&owner.node_id()]["online"], false);
+        assert!(rows[&owner.node_id()]["health"].is_null());
+    });
+}
+
+#[test]
+fn repinning_alias_cannot_authenticate_previously_ingested_relays() {
+    let _guard = crate::config::test_config_env_guard();
+    runtime(async {
+        let mut case = Case::new().await;
+        let old = NodeIdentity::fixture([81; 32]);
+        let new = NodeIdentity::fixture([82; 32]);
+        let peer = case.peer("hub.example");
+        crate::peer_stream::test_enroll(&peer, &old.node_id());
+        case.success(
+            &peer,
+            &old.node_id(),
+            json!({"relayed_fleet":[{
+                "node_id":new.node_id(),"name":"leaf.example","ssh_target":"leaf.example",
+                "origin":"hub.example","age_secs":0,"system":{"cpu_percent":99}
+            }]}),
+            2,
+        );
+        crate::peer_stream::test_enroll(&peer, &new.node_id());
+        refresh_enrolled_sources(&mut case);
+        case.direct(&new);
+        let rows = case.snapshot().await;
+        assert_eq!(
+            case.app
+                .state
+                .relayed_fleet_cache
+                .values()
+                .next()
+                .unwrap()
+                .source_node
+                .as_deref(),
+            Some(old.node_id().as_str())
+        );
+        case.success(&peer, &new.node_id(), json!({}), 2);
+        assert!(
+            case.app.state.relayed_fleet_cache.is_empty(),
+            "new source evicts the old source's entries"
+        );
+        case.server.finish().await;
+        assert_eq!(
+            rows[&new.node_id()]["online"],
+            false,
+            "old sender borrowed the new pin"
+        );
+        assert!(rows[&new.node_id()]["health"].is_null());
+    });
+}
+
+#[test]
+fn poll_and_its_relay_share_one_observation_instant() {
+    let _guard = crate::config::test_config_env_guard();
+    runtime(async {
+        let mut case = Case::new().await;
+        let owner = NodeIdentity::fixture([81; 32]);
+        let peer = case.peer("hub.example");
+        crate::peer_stream::test_enroll(&peer, &owner.node_id());
+        case.success(
+            &peer,
+            &owner.node_id(),
+            json!({"relayed_fleet":[{
+                "node_id":owner.node_id(),"name":"hub.example","ssh_target":"hub.example",
+                "origin":"hub.example","age_secs":0
+            }]}),
+            2,
+        );
+        let direct = case.app.state.peer_summaries[0].last_ok;
+        let relay = &case
+            .app
+            .state
+            .relayed_fleet_cache
+            .values()
+            .next()
+            .unwrap()
+            .peer;
+        let ingested = relay.ingested_at;
+        let last_ok = relay.last_ok;
+        case.server.finish().await;
+        assert_eq!(
+            ingested, direct,
+            "relay and poll must share the injected poll instant"
+        );
+        assert_eq!(last_ok, direct);
     });
 }

@@ -17,7 +17,7 @@ pub(in crate::web::wire) struct Nodes(BTreeMap<String, (Stamp, Option<u64>)>);
 /// Complete owner cut; absent remote nodes are not an unenrollment assertion.
 #[derive(Clone, PartialEq, Eq)]
 pub(in crate::web::wire) struct Projection {
-    /// Rows from independently proven owner sources.
+    /// Rows from pinned direct owners or owner senders proven at relay ingestion.
     pub nodes: Vec<FleetNodeRow>,
     observed: BTreeSet<String>,
     relayed: BTreeSet<String>,
