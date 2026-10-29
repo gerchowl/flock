@@ -7,7 +7,9 @@
   2026-10-29: [owner decision on #2728][owner-decision].
 - Scope of acceptance: Q1–Q10 and the H1–H10 implementation plan below,
   including the narrow receipt-bound wake coordination with ADR-0045 D9.
-  Acceptance records design, not shipped functionality.
+  Acceptance records design, not shipped functionality. Q2's upper bound,
+  Q8's maximum and H3's finite grace still require owner approval on #2717;
+  acceptance supplied no unmeasured numbers for them.
 - Implemented: none by this ADR. This PR changes documentation only.
 - Builds on: ADR-0028 (observations), ADR-0036 (structured runtime and custody),
   ADR-0038 (GUI), ADR-0041 (configuration); coordinates with accepted directions
@@ -140,7 +142,9 @@ Chosen (Recommended; accepted 2026-10-29): Opt-in idle timeout (Q10 path
 `sessions.structured_hibernate_idle_ms`), disabled at 0; use 300000 ms as the
 suggested enabled value. Eligibility requires confirmed idle, no background
 work, no prompts, no unresolved batch or admission, and no eligible queued item.
-Costs less savings for unknown/blocked agents and one resident server timer.
+Costs less savings for unknown/blocked agents and one resident server timer. The
+Q2 upper bound remains pending owner approval on #2717 before coding; the
+accepted default 0 and suggested enabled value 300000 ms are unchanged.
 
 Not selected (2026-10-29): Enable fleet-wide by default immediately. Saves
 sooner but surprises users with cold starts before cost/latency measurements.
@@ -189,9 +193,8 @@ record alone never spawns. After ownership recovery, an authorised new
 send/focus may wake its confirmed Hibernated target. Replay of an unhandled
 committed AnswerReceipt/LoopWakeReceipt may wake only its confirmed Hibernated
 recipient for the bound original item. Stop/crash states require explicit
-operator start. Resume failure never starts a fresh
-conversation silently. Costs visible manual repair for lost sessions or
-incompatible binaries.
+operator start. Resume failure never starts a fresh conversation silently. Costs
+visible manual repair for lost sessions or incompatible binaries.
 
 Not selected (2026-10-29): Automatically resume every saved live/intermediate
 state. Shorter recovery, but can resurrect stopped work or duplicate uncertain
@@ -214,7 +217,9 @@ launches but can occupy a wake slot indefinitely.
 Chosen (Recommended; accepted 2026-10-29): At most one wake per agent and a
 configurable per-node ceiling (default 2), still subject to existing spawn
 admission. Excess wakes retain their queue item and a typed capacity reason.
-Costs queueing delay and new scheduler bookkeeping.
+Costs queueing delay and new scheduler bookkeeping. The Q8 maximum remains
+pending owner approval on #2717 before coding; the accepted default 2 is
+unchanged.
 
 Not selected (2026-10-29): Unbounded simultaneous wakes. Lower burst latency but
 an idle fleet can exhaust memory/process limits together.
@@ -315,29 +320,23 @@ projection for recovery when none of the nine states can be established.
 
 A focus-only wake does not become observed Idle by silence. For Q9's special
 exit, the owner must prove this launch was focus-only, reached process
-readiness, and accepted **zero** user envelopes since spawn. This proof is
-durable: Waking was committed with a focus-only intent and a captured
-`queue_through`; that cursor is unchanged, and no stdin envelope is journaled
-for this `launch_epoch`. Every stdin offer is journaled before any possible
-write, so a lost completion cannot manufacture this proof. Check the journal
-fold, not a RAM-only counter. There must be no unresolved admission, queued
-eligible input, permission/control operation, reported tool or background work,
-or unclassified output that could conceal such work. This is a pristine-input
-proof for closing stdin, not proof of a model turn result. It must be obtained
-under the same generation-scoped transport/book freeze as ordinary hibernation
-and rechecked by the queue owner before committing the exit.
+readiness, and accepted **zero** user envelopes since spawn. This is an
+in-memory proof for the current launch only. There must be no unresolved
+admission, queued eligible input, permission/control operation, reported tool or
+background work, or unclassified output that could conceal such work. This is a
+pristine-input proof for closing stdin, not proof of a model turn result. It
+must be obtained under the same generation-scoped transport/book freeze as
+ordinary hibernation and rechecked by the queue owner before committing the
+exit.
 
 The timeout starts at process readiness and uses Q2's enabled idle duration.
 Repeated focus does not extend it. A send, input reservation, prompt or observed
 work invalidates the proof; then only the normal evidenced-idle path may
-hibernate. Clean EOF plus drain/reap is still required before Hibernated. The
-intent, captured cursor and input-epoch evidence survive checkpoints and restart
-for audit/reconciliation; they are not permission to resume a lost process. An
-interrupted Waking intent remains recovery required, even if its persisted proof
-showed no input. At policy value 0 this automatic exit is intentionally
-disabled; an explicit authorised hibernate can use the same proof. Neither path
-invents an opening turn or waits forever for a result of input that was never
-submitted.
+hibernate. Clean EOF plus drain/reap is still required before Hibernated. Do not
+recover this in-memory proof after restart: interrupted Waking remains recovery
+required. At policy value 0 this automatic exit is intentionally disabled; an
+explicit authorised hibernate can use the same proof. Neither path invents an
+opening turn or waits forever for a result of input that was never submitted.
 
 Persist `(agent_id, logical_session_id, lifecycle_seq, launch_epoch, state,
 intent, reason, stream_through, queue_through)` without credentials, raw tool
@@ -400,14 +399,15 @@ schema once #1430 is integrated; no new layout in the lifecycle journal.
    supervisor's EOF grace is 150 ms, then TERM 250 ms and KILL 2 s ([constants
    and `supervise`][source-15]); these existing stop timings are not a measured
    graceful-hibernation budget. H3 must measure model/MCP EOF-to-exit under
-   controlled gates and document the finite hibernation grace supported by those
-   measurements before enabling this path, and test a slow but cooperative MCP
-   child exiting within that grace without recording Crashed. It must also test
-   a child that never exits and requires escalation. This is a
-   lifecycle-specific design/measurement gate, not permission to widen existing
-   stop deadlines or classify a forced exit as clean hibernation. The profile
-   and journals remain; transient settings/MCP files and their agent credentials
-   do not survive.
+   controlled gates, propose a finite hibernation grace backed by those
+   measurements and obtain owner approval on #2717 before coding the hibernation
+   implementation. Documenting a number is not approval. Test a slow but
+   cooperative MCP child exiting within the approved grace without recording
+   Crashed. It must also test a child that never exits and requires escalation.
+   This is a lifecycle-specific design/measurement gate, not permission to widen
+   existing stop deadlines or classify a forced exit as clean hibernation. The
+   profile and journals remain; transient settings/MCP files and their agent
+   credentials do not survive.
 
 4. A send arriving before freeze commits cancels the idle attempt. A send after
    freeze commits durably enters the same queue and records wake owed; finish
@@ -524,15 +524,17 @@ ADR-0042 (#2724), not edits to that record or claims of shipped env support. H6
 must register them in its single schema registry before release:
 
 - **`sessions.structured_hibernate_idle_ms`**. Non-secret unsigned duration in
-  ms; default 0 disables, suggested enabled value 300000; H6 defines/tests the
-  finite validation bound; global/node scope only, no project/agent override in
-  this slice; env `FLOCK_SESSIONS_STRUCTURED_HIBERNATE_IDLE_MS`; live reload
+  ms; default 0 disables, suggested enabled value 300000; the finite upper bound
+  remains pending owner approval on #2717 before coding; global/node scope only,
+  no project/agent override in this slice; env
+  `FLOCK_SESSIONS_STRUCTURED_HIBERNATE_IDLE_MS`; live reload
   invalidates/recomputes owner deadlines.
 
 - **`sessions.structured_wake_concurrency`**. Non-secret positive integer,
-  default 2; H6 defines/tests the finite validation maximum; global/node scope
-  only; env `FLOCK_SESSIONS_STRUCTURED_WAKE_CONCURRENCY`; live reload gates
-  future starts, never kills an already admitted wake.
+  default 2; the finite maximum remains pending owner approval on #2717 before
+  coding; global/node scope only; env
+  `FLOCK_SESSIONS_STRUCTURED_WAKE_CONCURRENCY`; live reload gates future starts,
+  never kills an already admitted wake.
 
 Both entries declare defaults, file/env admission, provenance, constraints,
 redacted read behavior, consumer and reload outcome through ADR-0042's registry.
@@ -541,8 +543,10 @@ bespoke env parser or GUI setting is added. The file-only `structured.*`
 alternative was not selected. Retain the blocklist on existing credential/UID
 keys and diagnose attempts to set them through env. Test source admission as
 well as precedence: an ignored env variable is not an effective configuration.
-H6 must document and test finite validation ranges before enabling the keys.
-Configuration cannot relax lease, permission or unresolved-input gates.
+The owner must approve the pending Q2/Q8 ranges and bounds on #2717 before
+coding; H6 documents and tests those approved values. Accepted defaults do not
+authorise the implementer to choose the open bounds. Configuration cannot relax
+lease, permission or unresolved-input gates.
 
 There is no measured savings or latency claim yet. Hibernation removes the model
 and MCP processes and their resident memory, but retains a small owner,
@@ -625,9 +629,12 @@ All accepted slices remain tracked by #2717 until filed as child issues; these
 are implementation budgets, not permission to exceed them. Each PR is at most
 400 production lines, including wiring and migrations. If its measured scope
 exceeds that, split before opening it. Each adds a unique change fragment and
-documents its failure/refusal surface. No dormant producer/consumer seams.
-Q1–Q10 are decided on 2026-10-29. H3's accepted grace-measurement gate still
-applies before enabling hibernation; acceptance supplies no unmeasured number.
+documents its failure/refusal surface. No dormant producer/consumer seams. The
+recommended Q1–Q10 options were accepted on 2026-10-29; the unnamed Q2 upper
+bound and Q8 maximum remain pending owner approval before coding. H3 must
+propose a finite hibernation grace backed by measurements and obtain owner
+approval on #2717 before its hibernation implementation. Acceptance supplies no
+unmeasured number and does not delegate these gates.
 
 Use only the committed fake in `tests/fixtures/structured-public/claude.py`, an
 isolated real flk server and real CLI/MCP/wire clients. Extend its command/ack
@@ -666,13 +673,15 @@ public request must fail the lease assertion.
 Permission/transport quiesce and explicit structured hibernate, using existing
 supervision. After H2.
 
-Fail-first public-path acceptance: Measure EOF-to-exit and document the
-supported finite grace before enabling; a fake MCP child gated to exit within
-that grace produces Hibernated, while one that exceeds it escalates and reports
-Crashed. CLI hibernate idle fake: process/MCP absent before sandbox cleanup,
-transient files removed, profile/history retained. Fake open can_use_tool and
-reserved input each refuse hibernate with no child exit. Inject prompt at freeze
-gate: no lost prompt/approval. Delete freeze recheck to produce red.
+Fail-first public-path acceptance: Measure EOF-to-exit, propose a finite grace
+backed by those measurements and obtain owner approval on #2717 before coding
+the hibernation implementation. A fake MCP child gated to exit within that
+approved grace produces Hibernated, while one that exceeds it escalates and
+reports Crashed. CLI hibernate idle fake: process/MCP absent before sandbox
+cleanup, transient files removed, profile/history retained. Fake open
+can_use_tool and reserved input each refuse hibernate with no child exit. Inject
+prompt at freeze gate: no lost prompt/approval. Delete freeze recheck to produce
+red.
 
 ### H4 / ≤300 lines
 
@@ -706,18 +715,16 @@ ADR-0041/0042. After H5 and config schema/reload prerequisites in #2367/#2724.
 
 Fail-first public-path acceptance: Isolated server with short test policy:
 enabled env overrides file through the chosen registered sessions key; the
-security blocklist still diagnoses/refuses blocked env. Focus-only wake commits
-focus-only intent, preserves queue_through and journals no stdin envelope for
-launch_epoch. Inspect that durable evidence through the public status/history
-path and checkpoint/restart without inventing process authority. Mutate away the
-durable proof: the test fails even if RAM counters still say zero. The
-input-free wake expires to Hibernating with focus_wake_unused and then
-Hibernated; a send gated at the same boundary invalidates the proof and delivers
-once. Deleting this exit must fail the no-input test within LIMIT. Fake result
-arms idle, hibernates on deadline; busy/prompt/background-unknown ordinary turns
-never hibernate. Public reload disable cancels a gated expiry; invalid value
-changes nothing and reports rejection. Delete invalidation to fail. No time is
-advanced by sleeping.
+security blocklist still diagnoses/refuses blocked env. The focus-only wake
+sends zero envelopes and uses its current-launch in-memory pristine proof;
+restart must not recover that proof or turn interrupted Waking into a clean
+hibernate. The input-free wake expires to Hibernating with focus_wake_unused and
+then Hibernated; a send gated at the same boundary invalidates the proof and
+delivers once. Deleting this exit must fail the no-input test within LIMIT. Fake
+result arms idle, hibernates on deadline; busy/prompt/background-unknown
+ordinary turns never hibernate. Public reload disable cancels a gated expiry;
+invalid value changes nothing and reports rejection. Delete invalidation to
+fail. No time is advanced by sleeping.
 
 ### H7 / ≤250 lines
 
@@ -770,9 +777,9 @@ existing fixture controls cannot produce the boundary.
 Remaining work has named owners: remote routing/TLS/node aggregation is #2293;
 configuration precedence and typed read/write/reload is #2367; native placement
 and permission UI is #1430; queue editing, adapter expansion and hot reload
-remain #1307's listed slices. Performance validation with a real provider, the
-decided Q4 grant policy and all H-slice filing remain #2717. Nothing in this
-design defers those silently or implements them in this docs PR.
+remain #1307's listed slices. Performance validation with a real provider,
+implementation of the decided Q4 policy and all H-slice filing remain #2717.
+Nothing in this design defers those silently or implements them in this docs PR.
 
 [owner-decision]:
   https://github.com/gerchowl/flock/pull/2728#issuecomment-6485266386
