@@ -185,14 +185,25 @@ impl Core {
         })
     }
     /// Service the bounded history mailbox from the registry-owning app loop.
+    #[cfg(test)]
     pub(crate) fn service(
         &mut self,
         registry: &crate::structured::registry::Registry,
         workers: &mut crate::structured::workers::Workers,
         root: &std::path::Path,
     ) {
+        self.service_local(registry, workers, root, None);
+    }
+    /// Observe local fleet facts using only the App's authenticated home identity.
+    pub(crate) fn service_local(
+        &mut self,
+        registry: &crate::structured::registry::Registry,
+        workers: &mut crate::structured::workers::Workers,
+        root: &std::path::Path,
+        home: Option<&str>,
+    ) {
         self.owner.service(registry, workers, root);
-        self.shared.fleet.observe(registry, workers, root);
+        self.shared.fleet.observe(registry, workers, root, home);
     }
     /// Mount only behind S2b-mount's loopback, Host/Origin and funnel guards.
     pub(crate) fn router(&self) -> Router {
@@ -359,7 +370,7 @@ async fn authenticate(
     socket: &mut WebSocket,
     shared: &Shared,
     end: Instant,
-) -> Result<(Session, bool, Bearer), HandshakeFailure> {
+) -> Result<(Session, bool, Bearer, u32), HandshakeFailure> {
     let Some(Ok(Message::Text(text))) = before(shared.clock.as_ref(), end, socket.recv())
         .await
         .ok_or(HandshakeFailure::Unavailable)?
@@ -376,7 +387,7 @@ async fn authenticate(
     };
     let token = Bearer(token);
     let session = verify(shared, end, token.clone()).await?;
-    Ok((session, protocol > WIRE_JSON_VERSION, token))
+    Ok((session, protocol > WIRE_JSON_VERSION, token, protocol))
 }
 /// Handshake failures carry credential evidence separately from availability.
 enum HandshakeFailure {
@@ -474,7 +485,7 @@ async fn connection(
     }
     let end = shared.clock.now() + Duration::from_millis(HANDSHAKE_DEADLINE_MS);
     let session = tokio::select! { biased; _ = stop.changed() => return, session = authenticate(&mut socket, &shared, end) => session };
-    let (_session, read_only, token) = match session {
+    let (_session, read_only, token, client_protocol) = match session {
         Ok(session) => session,
         Err(failure) => {
             let Some(code) = failure.hello_code() else {
@@ -637,7 +648,8 @@ async fn connection(
         data.clone(),
         session.clone(),
         priority.clone(),
-    );
+    )
+    .for_protocol(client_protocol);
     let mut running = tokio::task::JoinSet::new();
     let mut heartbeat = Heartbeat::new(shared.clock.now());
     let mut code = loop {

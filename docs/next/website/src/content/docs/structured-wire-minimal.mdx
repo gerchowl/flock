@@ -26,9 +26,8 @@ Ed25519 public key, as returned by mesh `NodeIdentity::node_id()`, not a host
 label. `name` is its display name; `next_hop` is the first hop's node ID and
 `hops` is the actual mesh path length. Route metadata is informational and grants no dialing or control authority.
 
-The current local structured-agent producer omits `route`; its JSON remains
-byte-identical to the earlier row shape. Readers accept rows without it, and
-older clients ignore the additive field. The generated GUI contract reserves it
+The local structured-agent producer omits `route`. Legacy agent-only snapshots
+remain readable; bound local rows also carry `node_id` and `project`. The generated GUI contract reserves it
 for federated projection; remote fleet rows and remote command forwarding remain
 out of scope until [#1380](https://github.com/gerchowl/flock/issues/1380).
 The current GUI still presents a local flat fleet. Mesh protocol VERSION stays 5.
@@ -40,10 +39,37 @@ The `fleet` stream carries the closed `FleetDelta` union inside `ev`:
 {"type":"fleet.remove","id":"example-agent"}
 ```
 
+The N1a projection ([#2749](https://github.com/gerchowl/flock/issues/2749),
+ADR-0043 NODE STATUS/N1) adds `fleet.node.upsert/remove` and
+`fleet.project.upsert/remove` to the same union and durable cursor. Agent identity
+is `(node_id, id)`, project identity is `(node_id, exact Record.cwd)`, and node
+identity is the authenticated `node_id`. Project display basenames never define
+identity. An agent with a non-UTF-8 working directory remains in the stream with
+its node binding, but its optional `project` field is absent (project unavailable).
+A content-free `fleet_project_unavailable` diagnostic is logged; no lossy project
+identity is invented, and other rows and subsequent updates continue normally.
+Unsafe JSON integers still refuse the whole observation and stop the publisher,
+preserving its last durable cut until the source is corrected and the listener
+restarted. Typed persistence also reads legacy bare agent rows;
+unknown or invalid entries are skipped, logged and preserved raw.
+
+The home row uses its actual server identity, an opaque `Node <node_id>` alias,
+the build version and `online: true`. Health, latency, last success, error,
+route, counts and the home unbound-peer count are explicit `null` until N1b
+([#2750](https://github.com/gerchowl/flock/issues/2750)) supplies their sources.
+No remote node is synthesized from a configured name. The generated
+`FleetNodeRow` and `FleetProjectRow` declarations are authoritative. New entity
+payloads are understood from client-wire version 1; older readers receive the
+lossless `unknown` wrapper, including the original JSON and sender-scoped shape.
+Mesh VERSION remains 5. The flat GUI adapter renders agent deltas and skips
+node/project and unknown kinds without ending the subscription. Its cursor
+advances across skipped payloads, including snapshot rows. Rendering nodes and
+projects remains [G4 #1596](https://github.com/gerchowl/flock/issues/1596).
+
 Decode fleet payloads as `FleetDelta`, rather than session `WireEvent`. Bootstrap
 and recovery use ADR-0036 §5a's existing inline snapshot format: a `gap` announces
 `snapshot_to`, complete row upserts follow, then `synced`. This is the snapshot's
-collection of `FleetAgentRow` values, not a new transport frame. On snapshot
+collection of typed agent, node and project rows, not a new transport frame. On snapshot
 completion, remove previously displayed rows absent from the fresh snapshot.
 A `lagged` notification closes its subscription ID, like `subfail`. The server
 sends nothing more on it; the client drops late frames and subscribes with a
