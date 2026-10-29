@@ -226,6 +226,16 @@ impl App {
     }
 
     pub(crate) fn handle_internal_event(&mut self, ev: AppEvent) {
+        self.handle_internal_event_at(ev, std::time::Instant::now());
+    }
+
+    /// Apply an owner event with a supplied observation instant. Peer freshness
+    /// and poll health share that instant, including deterministic wire tests.
+    pub(crate) fn handle_internal_event_at(
+        &mut self,
+        ev: AppEvent,
+        observed_at: std::time::Instant,
+    ) {
         if let AppEvent::PasteConfirm { paste, respond_to } = ev {
             self.advance_paste(paste, respond_to);
             return;
@@ -479,7 +489,7 @@ impl App {
             // still proves the local poller is alive — dropping the health
             // update here would silently turn a config edit into a "poller
             // stopped" alert.
-            let now = std::time::Instant::now();
+            let now = observed_at;
             match &fetch.result {
                 Ok(_) => self.peer_poll_health.mark_success(now),
                 Err(msg) => self
@@ -487,6 +497,12 @@ impl App {
                     .mark_failure(now, crate::health::PeerPollErrorKind::classify(msg)),
             }
             let summary_every = self.state.config.gossip.dial_failure_summary();
+            let pinned = self
+                .state
+                .peers
+                .iter()
+                .find(|p| p.name == fetch.peer)
+                .and_then(|p| crate::peer_stream::enrollment(p).node_id);
             let Some(summary) = self
                 .state
                 .peer_summaries
@@ -502,15 +518,9 @@ impl App {
             summary.stream_error = fetch.stream_error;
             match fetch.result {
                 Ok(mut payload) => {
-                    let pinned = self
-                        .state
-                        .peers
-                        .iter()
-                        .find(|p| p.name == fetch.peer)
-                        .and_then(|p| crate::peer_stream::enrollment(p).node_id);
                     payload.node_id =
                         crate::peers::validated_summary_node(payload.node_id, pinned.as_deref());
-                    summary.node_id = payload.node_id.clone();
+                    summary.bind_node(payload.node_id.clone());
                     if payload.outbound_pending {
                         self.mesh_outbound_polls
                             .entry(fetch.peer.clone())
@@ -550,7 +560,7 @@ impl App {
                     summary.latency_ms = Some(payload.latency_ms);
                     summary.workspaces = payload.workspaces;
                     summary.structured_agents = payload.structured_agents;
-                    summary.last_ok = Some(std::time::Instant::now());
+                    summary.last_ok = Some(now);
                     summary.error = None;
                     if let crate::peers::DialLog::Recovered {
                         failures,
@@ -577,6 +587,7 @@ impl App {
                 // #418: and say it in the log without saying it every poll —
                 // the edges, plus one summary per window while it lasts.
                 Err(error) => {
+                    summary.bind_node(pinned);
                     let reason = crate::peers::SshFailureReason::classify(&error);
                     let log = summary.dial.record_failure(reason, now, summary_every);
                     let consecutive = summary.dial.consecutive_failures;

@@ -34,7 +34,15 @@ impl TestClock {
         }))
     }
     pub(crate) fn advance(&self, ms: u64) {
-        self.0.elapsed.fetch_add(ms, Ordering::SeqCst);
+        self.0
+            .elapsed
+            .fetch_add(ms.saturating_mul(1_000_000), Ordering::SeqCst);
+        self.0.signal.send_modify(|generation| *generation += 1);
+    }
+    /// Move to an actual producer capture instant without losing submillisecond precision.
+    pub(crate) fn advance_to(&self, at: Instant) {
+        let nanos = u64::try_from(at.saturating_duration_since(self.0.base).as_nanos()).unwrap();
+        self.0.elapsed.fetch_max(nanos, Ordering::SeqCst);
         self.0.signal.send_modify(|generation| *generation += 1);
     }
     pub(crate) async fn deadline(&self, ms: u64) {
@@ -73,7 +81,7 @@ impl TestClock {
 }
 impl Clock for TestClock {
     fn now(&self) -> Instant {
-        self.0.base + Duration::from_millis(self.0.elapsed.load(Ordering::SeqCst))
+        self.0.base + Duration::from_nanos(self.0.elapsed.load(Ordering::SeqCst))
     }
     fn until(&self, deadline: Instant) -> BoxFuture<'_, ()> {
         let mut signal = self.0.signal.subscribe();
@@ -1455,6 +1463,7 @@ fn subscriptions_are_accepted_on_the_actual_socket() {
 mod subscriptions;
 
 mod fleet;
+mod fleet_nodes;
 
 mod commands;
 

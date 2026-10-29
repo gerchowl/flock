@@ -6,6 +6,11 @@ use crate::app::App;
 use super::responses::{encode_error, encode_success};
 
 impl App {
+    /// Home health shared by discovery and the fleet, without a GUI poll.
+    pub(crate) fn fleet_home_health(&self) -> Option<PeerSystemSummary> {
+        self.state.system_stats.as_ref().map(system_summary)
+    }
+
     /// Serve this server's federated summary: one entry per workspace with
     /// project identity + attention-leading agent status. Peers poll this
     /// over SSH to fold our workspaces into their sidebars.
@@ -40,7 +45,7 @@ impl App {
                 version: Some(crate::build_info::version()),
                 protocol: Some(crate::protocol::PROTOCOL_VERSION),
                 icon: configured_node_icon(),
-                system: self.state.system_stats.as_ref().map(system_summary),
+                system: self.fleet_home_health(),
                 workspaces: self.self_workspace_summaries(),
                 structured_agents: self.self_structured_summaries(),
                 // Gossip v3 (#101): relay this server's OWN polled peers only —
@@ -274,7 +279,7 @@ impl App {
             host: Some(us.clone()),
             version: Some(crate::build_info::version()),
             protocol: Some(crate::protocol::PROTOCOL_VERSION),
-            system: self.state.system_stats.as_ref().map(system_summary),
+            system: self.fleet_home_health(),
             latency_ms: None,
             workspaces: self.self_workspace_summaries(),
             // We ARE the origin of our own reading, taken right now.

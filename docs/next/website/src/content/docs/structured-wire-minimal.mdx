@@ -54,10 +54,46 @@ restarted. Typed persistence also reads legacy bare agent rows;
 unknown or invalid entries are skipped, logged and preserved raw.
 
 The home row uses its actual server identity, an opaque `Node <node_id>` alias,
-the build version and `online: true`. Health, latency, last success, error,
-route, counts and the home unbound-peer count are explicit `null` until N1b
-([#2750](https://github.com/gerchowl/flock/issues/2750)) supplies their sources.
-No remote node is synthesized from a configured name. The generated
+the build version, the existing machine-health sampler and `online: true`.
+Its summary-request latency, last success and route remain `null`.
+
+N1b1 ([#2762](https://github.com/gerchowl/flock/issues/2762)) projects App-owned
+peer observations and the signed route table by authenticated NodeId. A retained
+enrollment or a signed route supplies identity before a first summary; configured
+names and SSH targets never do. Node and route display names use the same full
+NodeId-derived alias. No private hostname or SSH error text reaches these rows.
+The freshest provable observation wins, with a stable ordering for ties.
+Direct latency is the last home-to-owner summary request in
+milliseconds; relayed observations have `latency_ms: null`. Version and health
+retain their owner identity; rebinding a peer clears the old owner's facts.
+A failed first poll uses the independently enrolled owner identity and reports
+its classified failure with unknown owner metrics. Latency provenance comes
+from the direct observation source, never a matching configured name.
+
+`last_ok` is Unix epoch milliseconds in the home clock domain, captured once per
+successful observation. GUI requests and failed polls do not advance it.
+Online classification uses monotonic age, including origin age plus local
+residence for relayed observations. Unknown age, absent/incompatible peer
+protocol, poll failure, missing live route and age strictly greater than the
+effective `[gossip] stale_after_secs` threshold are offline. Failures use bounded
+`pending`, `stale`, `route`, `peer_incompatible`, or classified SSH reasons.
+A successful compatible observation with a live route clears the error.
+
+Partial observations and route withdrawal retain known offline nodes and their
+last-known health, version and display timestamp, including across store reopen.
+Missing observations are not an authoritative node-removal or unenrollment
+assertion. Local agent/project membership still uses complete registry cuts and
+snapshot replacement still removes absent entities only at completion.
+
+This slice publishes material status changes on the next App owner turn, without
+GUI polling or a debounce. The independent expiry wakeup, local and provably
+complete remote inventory counts, and the home unbound/unreached configured-peer
+count are the authorised N1b2 slice
+([#2761](https://github.com/gerchowl/flock/issues/2761)); counts remain `null` here.
+Remote structured discovery does not carry project cwd or the full S4/permission
+book, so this slice does not invent remote project or agent-state rows.
+
+The generated
 `FleetNodeRow` and `FleetProjectRow` declarations are authoritative. New entity
 payloads are understood from client-wire version 1; older readers receive the
 lossless `unknown` wrapper, including the original JSON and sender-scoped shape.

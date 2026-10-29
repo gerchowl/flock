@@ -320,6 +320,27 @@ impl PeerDialHealth {
 }
 
 impl PeerSummaryState {
+    /// Keep observations bound to one authenticated owner, including a pinned
+    /// expected owner whose first summary poll failed. Transport diagnostics
+    /// remain per configured path; owner facts never cross an identity change.
+    pub(crate) fn bind_node(&mut self, node: Option<String>) {
+        if self.node_id == node {
+            return;
+        }
+        self.node_id = node;
+        self.host = None;
+        self.version = None;
+        self.protocol = None;
+        self.system = None;
+        self.latency_ms = None;
+        self.last_ok = None;
+        self.icon = None;
+        self.origin_last_ok_secs = None;
+        self.ingested_at = None;
+        self.proxy_jump = None;
+        self.workspaces.clear();
+        self.structured_agents.clear();
+    }
     pub fn new(config: &PeerConfig) -> Self {
         Self {
             structured_agents: Vec::new(),
@@ -1531,7 +1552,10 @@ fn run_peer_ssh_with(
 
 /// Parse the CLI's response envelope:
 /// `{"id":..,"result":{"host":..,"version":..,"system":..,"workspaces":[..]}}`.
-fn parse_summary_response(stdout: &str, latency_ms: u64) -> Result<PeerSummaryPayload, String> {
+pub(crate) fn parse_summary_response(
+    stdout: &str,
+    latency_ms: u64,
+) -> Result<PeerSummaryPayload, String> {
     // Login shells can print banners before the JSON; find the envelope line.
     let line = stdout
         .lines()
