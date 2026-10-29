@@ -49,3 +49,11 @@ the full archive.
 | Structured agent sessions | An agent can run as a structured `claude -p` stream-json session as the `flk-agent` user: flk owns its process and one persisted input queue per agent that humans and agents share (one gate, one batch per turn FIFO across producers, editable and reorderable items, named stashes, send now, System One relatedness and relevance checks), maps its typed events onto agent state, non-blocking question records with stable ids (honest blockers held by a System One check; stdio first, an MCP tool for richer asks) and turn-end work (self-compact and continuation on `result`), switchable permission presets, serves the TUI and a Bun/TS (Solid) web client one WebSocket contract of messages and state (seq cursors, blobs by hash, idempotent commands, tokens, generated TS), passes unknown events through and logs each shape once, and forks at any message boundary. **Not implemented** | Not implemented | ADR-0036 | #1299, #1301, #697, #1300, #1305, #1307, #1308, #1309, #1321, #1323 |
 | Test reliability | Producer liveness and condition evidence first, measured nextest hang ceilings across default and CI profiles, reproducible CI timing report | Accepted | ADR-0037 | #1317, #1314, #1334, #1342, #1349 |
 | Content-anchored selections | Runtime-owned terminal references follow scrolling and reflow; copy re-reads retained rows and visibly refuses invalid anchors | In review | ADR-0040 | #475, #2127 |
+
+## Accepted GUI artifact contract
+
+ADR-0038 and its artifact annex were accepted on 2026-10-29. Hosting,
+origin-qualified records, two-tier size admission, retention, authenticated
+blob reads and comment custody are decided; implementation remains tracked
+by #1598/#1599/#1602 and the annex's twelve-slice plan. Acceptance does not
+claim that these surfaces are delivered.
