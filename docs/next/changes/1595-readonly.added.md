@@ -1,0 +1,1 @@
+- The GUI client now enters ReadOnly when the server speaks an older wire protocol: streams keep rendering, queued commands are held rather than sent, and the composer and answer controls show the version gap instead of the connection stopping.
