@@ -193,7 +193,9 @@ max_spawn_fanout = {fanout}
                 assert cli("agent", "status", target)["result"]["agent"]["agent_id"] == child_id
                 assert tool("flock_agent_get", {"target":target})["agent"]["agent_id"] == child_id
             assert tool("flock_agent_stop", {"target":child_id})["error"]["data"]["refusal"] == "not_authorized"
-            assert cli("agent", "focus", child_id, code=2)["error"]["code"] == "runtime_unsupported"
+            focused = cli("agent", "focus", child_id)["result"]["agent"]
+            assert focused["view"] == cli("agent", "get", child_id)["result"]["agent"]["view"]
+            assert focused["view"]["pane_id"], "focus exposes the native placement"
             assert api("agent.start", {"runtime":"structured","name":"argv-bypass","argv":["untrusted-binary"]})["error"]["code"] == "invalid_agent_argv"
             cli("agent", "stop", child_id)
             observe(child_id, "offline")
