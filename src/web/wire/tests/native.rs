@@ -905,7 +905,7 @@ async fn waiting_hellos_do_not_starve_established_subscriptions() {
     }
 }
 
-/// Pause a real contended helper before its two-second IPC read starts.
+/// Pause after helper startup, before the two-second lock-ack IPC read starts.
 /// The test owns every release sender; unwinding or a `within` failure drops
 /// them and releases this gate. The gate adds no deadline around later work.
 fn gate_mutation_wait(
