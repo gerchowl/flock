@@ -724,3 +724,38 @@ fn equal_agent_and_project_ids_on_two_owners_do_not_replace_each_other() {
         if id == "same-agent" && node == &removed_owner));
     assert_eq!(store.snapshot().unwrap().rows.len(), 3);
 }
+
+#[test]
+fn non_utf8_cwd_keeps_agents_and_subsequent_durable_updates() {
+    use std::os::unix::ffi::OsStringExt;
+    let mut odd = agent("odd");
+    odd.record
+        .cwd
+        .push(std::ffi::OsString::from_vec(vec![0xff]));
+    let mut source = Source(vec![odd, agent("normal")]);
+    let home = crate::mesh::identity::NodeIdentity::fixture([71; 32]).node_id();
+    let mut store = Store::open(path()).unwrap();
+    let logs = crate::logging::capture_logs(|| {
+        let rows = local_rows(source.agents().unwrap(), Some(&home)).unwrap();
+        assert_eq!(store.refresh(&Entities(rows.clone())).unwrap().len(), 4);
+        let odd = rows
+            .iter()
+            .find_map(|r| match r {
+                Row::Agent(r) if r.id == "odd" => Some(r),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(odd.node_id.as_deref(), Some(home.as_str()));
+        assert_eq!(odd.project, None);
+        assert_eq!(
+            rows.iter().filter(|r| matches!(r, Row::Project(_))).count(),
+            1
+        );
+    });
+    assert!(logs.contains("fleet_project_unavailable"), "{logs}");
+    source.0[1].record.name = Some("renamed".into());
+    let rows = local_rows(source.agents().unwrap(), Some(&home)).unwrap();
+    let deltas = store.refresh(&Entities(rows)).unwrap();
+    assert_eq!(deltas.len(), 1);
+    assert!(matches!(&deltas[0].event, FleetDelta::Upsert { row } if row.label == "renamed"));
+}

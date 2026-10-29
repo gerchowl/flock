@@ -44,10 +44,13 @@ ADR-0043 NODE STATUS/N1) adds `fleet.node.upsert/remove` and
 `fleet.project.upsert/remove` to the same union and durable cursor. Agent identity
 is `(node_id, id)`, project identity is `(node_id, exact Record.cwd)`, and node
 identity is the authenticated `node_id`. Project display basenames never define
-identity. Non-UTF-8 project paths and unsafe JSON integers refuse the whole
-observation and stop the fleet publisher, preserving its last durable cut.
-Correct the source and restart the listener before subscribing again; no partial
-cut or lossy path conversion is emitted. Typed persistence also reads legacy bare agent rows;
+identity. An agent with a non-UTF-8 working directory remains in the stream with
+its node binding, but its optional `project` field is absent (project unavailable).
+A content-free `fleet_project_unavailable` diagnostic is logged; no lossy project
+identity is invented, and other rows and subsequent updates continue normally.
+Unsafe JSON integers still refuse the whole observation and stop the publisher,
+preserving its last durable cut until the source is corrected and the listener
+restarted. Typed persistence also reads legacy bare agent rows;
 unknown or invalid entries are skipped, logged and preserved raw.
 
 The home row uses its actual server identity, an opaque `Node <node_id>` alias,
@@ -58,10 +61,10 @@ No remote node is synthesized from a configured name. The generated
 `FleetNodeRow` and `FleetProjectRow` declarations are authoritative. New entity
 payloads are understood from client-wire version 1; older readers receive the
 lossless `unknown` wrapper, including the original JSON and sender-scoped shape.
-Mesh VERSION remains 5. The existing flat GUI fleet adapter accepts only agent
-deltas and reports a stream failure on the new entity kinds; node-aware GUI
-consumption is tracked in [G4 #1596](https://github.com/gerchowl/flock/issues/1596).
-This slice supplies the server contract, not that GUI adapter.
+Mesh VERSION remains 5. The flat GUI adapter renders agent deltas and skips
+node/project and unknown kinds without ending the subscription. Its cursor
+advances across skipped payloads, including snapshot rows. Rendering nodes and
+projects remains [G4 #1596](https://github.com/gerchowl/flock/issues/1596).
 
 Decode fleet payloads as `FleetDelta`, rather than session `WireEvent`. Bootstrap
 and recovery use ADR-0036 §5a's existing inline snapshot format: a `gap` announces

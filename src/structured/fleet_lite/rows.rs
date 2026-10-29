@@ -81,19 +81,22 @@ fn exact(value: &Value) -> bool {
     }
 }
 /// Project a local coherent registry/S4/S6 cut. Missing home binding emits only
-/// legacy-compatible agents, never a synthetic node. Remote status is #2750.
+/// legacy-compatible agents, never a synthetic node. A non-UTF-8 cwd leaves the
+/// optional project absent with a diagnostic, without excluding the agent or
+/// stopping the cut. Remote status is #2750.
 pub fn local_rows(agents: Vec<StructuredAgent<'_>>, home: Option<&str>) -> io::Result<Vec<Row>> {
     let mut rows = Vec::new();
     let mut projects = BTreeMap::new();
     for agent in agents {
         let mut row = project(agent);
         if let Some(home) = home {
-            let id = agent
-                .record
-                .cwd
-                .to_str()
-                .ok_or_else(|| invalid("non-UTF-8 project cwd"))?;
             row.node_id = Some(home.into());
+            let Some(id) = agent.record.cwd.to_str() else {
+                // Keep the agent, but never invent a lossy project identity.
+                crate::logging::structured_fleet_project_unavailable();
+                rows.push(Row::Agent(row));
+                continue;
+            };
             row.project = Some(id.into());
             projects.insert(
                 id.to_owned(),

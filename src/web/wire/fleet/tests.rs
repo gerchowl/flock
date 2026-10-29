@@ -184,3 +184,78 @@ fn fleet_frame_bound_reserves_the_maximum_escaped_subscription_id() {
     *sub_id = "\0".repeat(super::super::subscriptions::ID_BYTES);
     assert!(super::super::output::encode(accepted).is_some());
 }
+
+#[tokio::test]
+async fn non_utf8_observation_keeps_the_publisher_and_live_reader_running() {
+    use std::os::unix::ffi::OsStringExt;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+        let (stop, stopped) = watch::channel(false);
+        let client = Client::new(Arc::new(Notify::new()), stopped);
+        let normal = registry(root.path()).records().remove(0);
+        let mut odd = normal.clone();
+        odd.agent_id = "odd".into();
+        odd.session_id = "odd-session".into();
+        odd.cwd.push(std::ffi::OsString::from_vec(vec![0xff]));
+        let state = crate::api::agent_state::AgentState::unknown();
+        let mut local = Local {
+            agents: vec![
+                Agent(odd, state.clone(), vec![]),
+                Agent(normal, state, vec![]),
+            ],
+            home: Some(crate::mesh::identity::NodeIdentity::fixture([72; 32]).node_id()),
+        };
+        // Exercise the typed publisher boundary. Registry JSON admission already
+        // rejects non-UTF-8 paths, independently of this projection's contract.
+        let path = root.path().join("fleet.json");
+        client
+            .updates
+            .send_replace(Some(Arc::new((path.clone(), Ok(local.clone())))));
+        let mut cut = client.subscribe(None).await.unwrap();
+        let mut rows = Vec::new();
+        loop {
+            let frame = cut.next("odd-cwd").await.unwrap();
+            if matches!(frame, ServerFrame::Synced { .. }) {
+                break;
+            }
+            if let ServerFrame::Ev {
+                ev: WireEvent::Json(row),
+                ..
+            } = frame
+            {
+                rows.push(row);
+            }
+        }
+        assert_eq!(rows.len(), 4);
+        let odd = &rows.iter().find(|r| r["row"]["id"] == "odd").unwrap()["row"];
+        assert!(odd.get("project").is_none());
+        assert_eq!(odd["node_id"], local.home.as_deref().unwrap());
+        assert_eq!(
+            rows.iter()
+                .filter(|r| r["type"] == "fleet.project.upsert")
+                .count(),
+            1
+        );
+        local.agents.pop();
+        client
+            .updates
+            .send_replace(Some(Arc::new((path, Ok(local)))));
+        let mut removed = Vec::new();
+        for _ in 0..2 {
+            let ServerFrame::Ev {
+                ev: WireEvent::Json(ev),
+                ..
+            } = cut.next("odd-cwd").await.unwrap()
+            else {
+                panic!("expected live removal");
+            };
+            removed.push(ev["type"].clone());
+        }
+        assert!(removed.contains(&serde_json::json!("fleet.remove")));
+        assert!(removed.contains(&serde_json::json!("fleet.project.remove")));
+        stop.send_replace(true);
+        client.closed().await;
+    })
+    .await
+    .expect("fleet observation producer stayed silent");
+}
