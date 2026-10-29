@@ -324,9 +324,32 @@ The **progress deadline** runs while a stream waits for `synced` or for a snapsh
 - **NeedsToken** clears the stored token, as above. A Tauri shell keeps its token in the platform keystore instead (§6).
 
 **The store.**
-- Entities are kept normalised by kind and id.
+- Entities are kept normalised by kind and id. The store is their only owner: views read and subscribe to it, and hold no copy of a stream's entities. A view that keeps its own copy cannot be restored, and drifts from the cursor it would resume from.
 - Each stream has a cursor, persisted per device so a reload resumes without a full replay. It is persisted only after the event (or the empty snapshot) it names has been applied, and together with the stream's resync marker. The `*/live` streams are the exception: they carry deltas with no cursor (§5).
-- The outbox is persisted too, each command before its first send (below).
+- **A stream persists as one record, decided here (#1595).** The record holds the stream's entities, its cursor and its resync marker. They are written together, in one transaction, after the frames they reflect have been applied. They are never written apart. A cursor stored without the entities it covers would resume past state the reload lost, and the stream's tiles would stay empty or wrong.
+  - **Storage: IndexedDB**, in both shells; the Tauri webview has it too. There is one database per server identity and principal. Writes are asynchronous and transactional, and the record has room for transcripts.
+  - Rejected: `localStorage`, because it is synchronous, holds strings only and is capped at a few MiB per origin. A large transcript would block the page or fail partway.
+  - Rejected: persisting cursors alone, for the reason above.
+  - **Bounds.** A stream's record is capped at 4 MiB, and the database at 64 MiB.
+    - A stream whose record would pass its cap is no longer persisted: its stored record is deleted whole.
+    - Past the total cap, the record of the stream viewed longest ago is deleted whole.
+    - A record is never truncated, because a truncated transcript under a head cursor would show history with a silent hole.
+    - A deleted record costs one full replay of that stream on the next load, and nothing else.
+  - **Failure is a full replay, never an error.** In each of these cases the client drops the affected records, or all of them, and every affected stream bootstraps with no `after`, as on a first load:
+    - IndexedDB is unavailable (private mode, blocked storage);
+    - a write fails (quota);
+    - a record does not parse or has an unknown version;
+    - the principal or the server identity differs from the database's.
+    The connection is unaffected. A failed write never rolls back an applied frame in memory.
+  - **Restore.** On load, each stream starts from its record: its entities render at once, marked as restored, and the stream is not Current. Its `sub` goes out from the record's cursor, with the record's marker, as after a reconnect (above). The `cursor_ahead` rule clears the record together with the stream's entities in memory.
+  - **Versioned.** Each record carries a format version. An unknown version is dropped, as above.
+  - **Tests that must fail before the change:**
+    - a reload mid-stream renders the restored entities, re-`sub`s from the stored cursor, and never applies a `(stream, seq)` twice;
+    - no cursor is ever stored without its entities, checked by a write fault injected between them;
+    - a record past its cap is deleted whole and that stream replays in full;
+    - a corrupt record, an unknown version, a principal change and unavailable storage each give a full replay with the connection unaffected;
+    - a stored marker below `snapshot_to` enters Resyncing at once.
+- The outbox is persisted too, each command before its first send (below). It keeps its own `flock.outbox.v1` store, because it must be written before a send, not after an applied frame.
 - Ephemeral state lives in the store but is not persisted: in-flight streaming blocks (§4).
 
 **The command outbox.**
