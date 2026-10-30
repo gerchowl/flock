@@ -3,7 +3,7 @@ use super::{contracts::*, model::Model};
 use crate::api::error_code::ErrorCode;
 use crate::structured::{
     history::{self, Cut, History},
-    publication::{Provider, Subscription},
+    publication::Subscription,
     queue,
     workers::{
         live,
@@ -14,6 +14,8 @@ use std::io;
 use tokio::sync::Semaphore;
 // At most 32 active pages process-wide; saturation returns WouldBlock.
 static IO: Semaphore = Semaphore::const_new(32);
+// None means the warm producer has not initialized its file yet.
+type PageTask = tokio::task::JoinHandle<io::Result<Option<(Cut, history::Item)>>>;
 /// One controller's replay/live/queue continuation. Drive `next` outside rendering;
 /// refresh canonical facts through App before exposing a snapshot or acting on it.
 /// Cold sources and storage/admission failures remain explicit errors. No recovery
@@ -24,9 +26,15 @@ pub(crate) struct Stream {
     pub queue_status: (Option<queue::scheduler::Pending>, Option<ErrorCode>),
     history: History,
     cut: Option<Cut>,
+    page: Option<PageTask>,
+    #[cfg(test)]
+    waiting: Option<tokio::sync::oneshot::Sender<()>>,
+    #[cfg(test)]
+    gate: Option<tests::CancelGate>,
     live: live::Subscription,
     source: Source,
     queue: Option<Reader>,
+    queue_started: bool,
     queue_wake: std::sync::Arc<tokio::sync::Notify>,
     queue_failure: Option<ErrorCode>,
     queue_cursor: u64,
@@ -35,23 +43,30 @@ pub(crate) struct Stream {
     ended: [bool; 3],
 }
 impl Stream {
-    /// Bind the three canonical sources without starting a writer or producer.
+    /// Bind without I/O. Initial queue admission waits inside next, so transient
+    /// book/capture contention cannot strand a newly opened view.
     pub fn new(
         model: Model,
         history: History,
         live: live::Subscription,
         source: Source,
     ) -> io::Result<Self> {
-        let queue = source.subscribe(None).map_err(io::Error::other)?;
+        let queue_wake = source.waker();
         Ok(Self {
             model,
             queue_status: (None, None),
             history,
             cut: None,
+            page: None,
+            #[cfg(test)]
+            waiting: None,
+            #[cfg(test)]
+            gate: None,
             live,
             source,
-            queue_wake: queue.waker(),
-            queue: Some(queue),
+            queue_wake,
+            queue: None,
+            queue_started: false,
             queue_failure: None,
             queue_cursor: 0,
             replacement: None,
@@ -62,7 +77,9 @@ impl Stream {
     pub fn retire(&mut self) {
         self.ended = [true; 3];
         self.cut = None;
+        self.page = None;
         self.queue = None;
+        self.queue_started = false;
         self.queue_failure = None;
         self.replacement = None;
         self.queue_cursor = 0;
@@ -88,7 +105,14 @@ impl Stream {
         true
     }
     /// One bounded step; false means all producers ended. Callers bound stage waits.
-    /// Cancelled blocking pages retain their I/O permits through completion.
+    /// Cancel-safe: self owns the blocking task, its cut and unapplied page across
+    /// every await. Dropping this future neither detaches that task nor reopens
+    /// its cut. Retirement deliberately discards its result; the task retains its
+    /// I/O permit until completion. Queue/resubscribe state also stays in self.
+    /// An uninitialized warm history waits on its producer's readiness. Actual
+    /// page I/O errors and failed producers remain terminal errors.
+    /// Readiness waits consume no item until ready. A resumed stale Pending page
+    /// yields one step so the following poll rechecks after arming fresh wakes.
     pub async fn next(&mut self) -> io::Result<bool> {
         if let Some(code) = self.queue_failure {
             return Err(io::Error::other(code));
@@ -109,8 +133,14 @@ impl Stream {
             // A lagged reader is spent. Busy capture waits on the source wake.
             // it must never become a synthetic End from the old reader.
             if self.queue.is_none() {
-                match self.source.subscribe_ready(Some(self.queue_cursor)) {
-                    Ok(reader) => self.queue = Some(reader),
+                match self
+                    .source
+                    .subscribe_ready(self.queue_started.then_some(self.queue_cursor))
+                {
+                    Ok(reader) => {
+                        self.queue = Some(reader);
+                        self.queue_started = true;
+                    }
                     Err(SubscribeError::CaptureBusy) => capture_busy = true,
                     Err(SubscribeError::Code(ErrorCode::SessionBusy)) => (),
                     Err(SubscribeError::Code(code)) => {
@@ -162,31 +192,66 @@ impl Stream {
             }
         }
         if !self.ended[0] {
-            let permit = IO.try_acquire().map_err(|_| io::ErrorKind::WouldBlock)?;
-            // Static semaphore ownership survives cancellation through the blocking closure.
-            let (cut, item) = (self.cut.take(), self.model.snapshot.applied_cursor);
-            let source = self.history.clone();
-            let (cut, item) = tokio::task::spawn_blocking(move || {
-                let _permit = permit;
-                let mut cut = match cut {
-                    Some(c) => c,
-                    None => source.subscribe(Some(item))?,
-                };
-                let item = cut.page()?;
-                Ok::<_, io::Error>((cut, item))
-            })
-            .await
-            .map_err(io::Error::other)??;
-            self.cut = Some(cut);
-            self.ended[0] = matches!(item, history::Item::End);
-            let pending = matches!(item, history::Item::Pending);
-            if matches!(item, history::Item::Lagged(_)) {
-                self.cut = None;
+            let resuming = self.page.is_some();
+            if self.page.is_none() {
+                let permit = IO.try_acquire().map_err(|_| io::ErrorKind::WouldBlock)?;
+                // Static semaphore ownership survives cancellation through the blocking closure.
+                let (cut, item) = (self.cut.take(), self.model.snapshot.applied_cursor);
+                let source = self.history.clone();
+                #[cfg(test)]
+                let gate = self.gate.take();
+                self.page = Some(tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
+                    let mut cut = match cut {
+                        Some(c) => c,
+                        None => match source.subscribe(Some(item)) {
+                            Ok(cut) => cut,
+                            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                                #[cfg(test)]
+                                if let Some(gate) = &gate {
+                                    gate.pause(2);
+                                }
+                                return Ok(None);
+                            }
+                            Err(error) => return Err(error),
+                        },
+                    };
+                    #[cfg(test)]
+                    if let Some(gate) = &gate {
+                        gate.pause(0);
+                    }
+                    let item = cut.page()?;
+                    #[cfg(test)]
+                    if let Some(gate) = &gate {
+                        gate.pause(1);
+                    }
+                    Ok::<_, io::Error>(Some((cut, item)))
+                }));
             }
-            self.model.history(item)?;
-            if !pending {
+            let result = match self.page.as_mut() {
+                Some(page) => page.await.map_err(io::Error::other),
+                None => return Err(io::Error::other(ErrorCode::InternalError)),
+            };
+            self.page = None;
+            if let Some((cut, item)) = result?? {
+                self.cut = Some(cut);
+                self.ended[0] = matches!(item, history::Item::End);
+                let pending = matches!(item, history::Item::Pending);
+                if matches!(item, history::Item::Lagged(_)) {
+                    self.cut = None;
+                }
+                self.model.history(item)?;
+                if !pending || resuming {
+                    return Ok(true);
+                }
+            } else if resuming {
+                // A cancelled opening may predate the freshly armed notification.
                 return Ok(true);
             }
+        }
+        #[cfg(test)]
+        if let Some(waiting) = self.waiting.take() {
+            let _ = waiting.send(());
         }
         tokio::select! {
             _ = &mut hn, if !self.ended[0] => {},

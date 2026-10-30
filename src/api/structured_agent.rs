@@ -5,7 +5,7 @@ use super::{
 };
 use serde::{Deserialize, Serialize};
 
-/// Optional placement of an attached view, absent until ADR-0036 S10.
+/// Optional real view placement, independent of runtime ownership.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct StructuredAgentView {
@@ -43,7 +43,7 @@ pub struct StructuredAgentInfo {
     pub model: Option<String>,
     /// Registry binding evidence, not caller authority or proof of liveness.
     pub lease_state: crate::structured::lease::LeaseState,
-    /// No view is created by registration or process launch.
+    /// Public start/focus attaches a real view; registration alone does not.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub view: Option<StructuredAgentView>,

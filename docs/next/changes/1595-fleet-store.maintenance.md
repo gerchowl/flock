@@ -1,0 +1,1 @@
+- Keep the fleet stream's entities (agents, nodes and projects) in one client store, normalised by kind and id, with a project keyed by its owning node and path. The sidebar, palette and permission inbox read that one record, and the wire layer no longer keeps rows of its own (ADR-0038 §3, part of #1595).

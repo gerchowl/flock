@@ -254,6 +254,53 @@ impl DerefMut for Workspace {
 }
 
 impl Workspace {
+    /// Native-only root placement; allocates no terminal state, runtime or process.
+    pub(crate) fn native(
+        target: crate::structured::view::Target,
+        cwd: PathBuf,
+        events: mpsc::Sender<AppEvent>,
+        render_notify: Arc<Notify>,
+        render_dirty: Arc<AtomicBool>,
+    ) -> Self {
+        let (layout, root) = crate::layout::TileLayout::new();
+        let tab = Tab {
+            custom_name: None,
+            number: 1,
+            root_pane: root,
+            layout,
+            panes: HashMap::new(),
+            native_views: HashMap::from([(
+                root,
+                crate::structured::view::placement::View::Ready(target),
+            )]),
+            #[cfg(test)]
+            runtimes: HashMap::new(),
+            zoomed: false,
+            events,
+            render_notify,
+            render_dirty,
+        };
+        Self {
+            id: generate_workspace_id(),
+            custom_name: None,
+            identity_cwd: cwd,
+            cached_git_branch: None,
+            cached_git_ahead_behind: None,
+            pr_state: None,
+            cached_git_space: None,
+            git_identity_resolved: false,
+            worktree_space: None,
+            public_pane_numbers: HashMap::from([(root, 1)]),
+            next_public_pane_number: 2,
+            next_public_tab_number: 2,
+            tabs: vec![tab],
+            active_tab: 0,
+            same_repo_family_memo: std::cell::RefCell::new(None),
+            display_label_memo: std::cell::RefCell::new(None),
+            #[cfg(test)]
+            test_runtimes: HashMap::new(),
+        }
+    }
     pub fn new(
         initial_cwd: PathBuf,
         rows: u16,
