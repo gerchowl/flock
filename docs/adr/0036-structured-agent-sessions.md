@@ -5014,3 +5014,12 @@ it across cancellation. This is not cold recovery: no second writer or loader is
 created. Producer failure and actual page I/O errors stay explicit errors. As with
 a cancelled Pending page, resuming an older opening yields one recheck step so
 an initialization preceding the new wait cannot be missed.
+
+### Amendment: admitted launch with failed placement (#2655)
+
+If placement fails after launch admission, return the typed
+`structured_agent_started_unplaced` result with the admitted ID, generation
+and registered placement cause. Keep the registry/worker under normal ownership
+so it remains inspectable and stoppable. CLI/MCP expose the result with exit 1;
+this is not a clean start refusal and must not trigger a fresh start blindly.
+Duplicate placement and invalid membership remain typed preflight refusals.
