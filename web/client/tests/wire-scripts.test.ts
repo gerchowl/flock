@@ -213,3 +213,13 @@ test("protocol trace uses a valid literal principal and exact ClientOpen grants"
   expect(welcome.frame.server_epoch).toBe("00000000000000000000000000000001");
   expect(welcome.frame.capabilities).toEqual(["read", "send", "answer", "operate"]);
 });
+
+
+test("clean trace starts fresh and declares every durable timestamp bound", async () => {
+  const lines = await load("clean");
+  const sub = lines.find((line) => line.step === "expect" && line.frame.t === "sub");
+  expect(sub?.step === "expect" && sub.absent).toEqual(["after"]);
+  const events = lines.flatMap((line) => line.step === "send" && line.frame.t === "ev" ? [line.frame] : []);
+  expect(events.map((frame) => frame.seq)).toEqual([1, 2, 3]);
+  expect(events.map((frame) => frame.ts_ms)).toEqual(Array(3).fill({ $dynamic: "ts_ms", source: "persisted", bound: "record_delivery" }));
+});
