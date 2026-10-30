@@ -1353,6 +1353,15 @@ uses the same `/v1/ws` protocol over a sibling Unix socket, with kernel peer
 credentials as an additional admission gate (the local-transport amendment
 below). That listener does not enable TCP exposure.
 
+The optional TCP listener's Tailscale forwarding guard has three typed
+outcomes (#2476): positive absence (`NotInstalled`) permits startup with one
+INFO record naming the checked CLI/bundle/socket paths; discovered CLI status
+(`Status`) keeps the five-second/64-KiB serve/funnel refusal checks;
+installation evidence with an unreadable status (`Unavailable`) refuses
+startup and names the evidence/failure. Standard platform paths are defined
+in `platform::tailscale`; lookup errors never count as absence. Host/Origin
+and loopback checks do not change, and no failed probe is silently skipped.
+
 Messages are JSON text frames, one object each, tagged by `t`:
 
 ```text
@@ -2367,6 +2376,9 @@ P16 and P17 have no source in the stream today and are not promised;
   admission, while the durable close retires the card. Unknown fields or future
   reasons retain the lossless unknown-event wrapper instead of being discarded.
   `session_ended` marks the restart sweep in #2236.
+  Fixture time markers declare `after_ack` for pre-ACK persistence, otherwise
+  `record_delivery`. Both require exact persisted equality and a zero-slack
+  window to that observed bound; missing bounds fail (#2467 slice-3 ruling).
 - **Startup permission recovery (S6, #2236).** The stream owner projects host
   audit headers while scanning the existing stream. Before admitting any new
   control request, it appends a `closed` / `session_ended` record without a
@@ -4944,3 +4956,48 @@ publisher has stopped. Capture capacity has a separate notification, armed
 before capture, so a full channel cannot self-wake a retry loop.
 A terminal queue refusal also stops history and live retirement. Canonical
 generation refresh still precedes presentation and can retire the failed view.
+
+### Amendment: S10d1 public native placement
+
+Public structured start and focus use the S10a1 placement lifecycle. Start
+attaches to the active tab, or creates a native-only workspace; focus reuses
+one placement and may rebind it to the current registry generation. Reported
+view IDs come from actual layout membership and public numbering. Detaching
+does not stop the worker. Placement preflight precedes worker admission.
+The App-owned subscription controller and renderer/input routing follow in
+separate S10d slices under #1430; placement itself creates no terminal runtime.
+
+### Amendment: S10d1b cancel-safe native continuation
+
+`Stream::next` is cancel-safe. Stream owns its in-flight history task, cut and
+unapplied page, as well as queue cursor/replacement and resubscribe state.
+Cancelling a caller's future preserves that continuation. Resuming an older
+Pending history page yields one step to recheck readiness; a publication that
+predates the new wait cannot leave the continuation asleep. Retirement alone
+discards a dead generation's page. Its blocking work retains the I/O permit
+until completion, even if the Stream is dropped. No timeout, sleep or mutation
+retry substitutes for source readiness.
+
+### Amendment: S10d1b copy-on-write publication
+
+Model owns its projection through an `Arc<Snapshot>` mutation gate. All mutable
+access uses `Arc::make_mut`. The additive Snapshot/card Clone implementations
+exist solely for this copy-on-write boundary. Published frames stay immutable;
+App and render share Arcs and never borrow Model. Unshared mutation reuses the
+allocation. A watch channel's retained last frame is itself a shared owner, so
+it can require a copy even when App has not separately retained that frame.
+No snapshot fields or intent shapes change.
+
+Initial queue admission also belongs to the continuation: opening a view does
+not acquire the publication book or capture channel. Its first poll arms the
+source readiness notification before trying admission, preserving the same
+pending state through contention and cancellation as a lagged resubscribe.
+
+### Amendment: S10d1b warm-history opening
+
+A canonical warm history handle can precede producer file initialization.
+`Stream::next` waits on that source's readiness for this opening state, retaining
+it across cancellation. This is not cold recovery: no second writer or loader is
+created. Producer failure and actual page I/O errors stay explicit errors. As with
+a cancelled Pending page, resuming an older opening yields one recheck step so
+an initialization preceding the new wait cannot be missed.

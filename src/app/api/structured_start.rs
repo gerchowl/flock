@@ -28,8 +28,6 @@ impl App {
         opening_turn: Option<crate::spawn::prompt::SpawnPrompt>,
     ) -> Result<ResponseResult, ErrorCode> {
         if params.dry_run
-            || params.focus
-            || params.active
             || params.here
             || params.split.is_some()
             || params.workspace_id.is_some()
@@ -57,6 +55,7 @@ impl App {
             })
             .transpose()?;
         let existing = self.structured_target(&params.name)?;
+        let destination = self.native_destination(existing.as_ref().map(|(id, _)| id.as_str()))?;
         // ADR-0036 §1a: neither history ownership nor a relay grants resume authority.
         if (existing.is_some()
             && (!matches!(caller, SpawnCaller::Operator { .. })
@@ -197,12 +196,22 @@ impl App {
                 })
             },
         );
-        if let Err(error) = started {
-            if is_new {
-                let _ = self.state.structured_agents.remove(&agent_id, generation);
+        let generation = match started {
+            Ok(generation) => generation,
+            Err(error) => {
+                if is_new {
+                    let _ = self.state.structured_agents.remove(&agent_id, generation);
+                }
+                return Err(error);
             }
-            return Err(error);
-        }
+        };
+        self.place_structured_view(
+            crate::structured::view::Target {
+                agent_id: agent_id.clone(),
+                generation,
+            },
+            destination,
+        )?;
         self.structured_info(&agent_id)
             .map(|agent| ResponseResult::StructuredAgentInfo { agent })
     }

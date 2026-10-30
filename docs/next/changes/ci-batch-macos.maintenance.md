@@ -1,1 +1,0 @@
-- Required `check (macos-15)` now fails when a full-matrix run (landing batch, merge group, push) completes without the planned macOS test-shard reports, so skipped shards can no longer pass vacuously.

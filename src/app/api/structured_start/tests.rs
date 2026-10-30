@@ -247,8 +247,8 @@ impl AdmissionFixture {
         .await;
         assert_eq!(
             self.app.state.workspaces.len(),
-            0,
-            "structured launch creates no pane"
+            1,
+            "structured launch creates one native placement"
         );
         (id, generation)
     }
@@ -543,9 +543,7 @@ async fn socket_structured_start_refuses_unavailable_launcher_and_unsupported_se
     assert!(!fixture.fixture.root.path().join("version.pid").exists());
     fixture.app.state.config.structured.run_as = crate::structured::launch::RunAs::Operator;
     for (field, value) in [
-        ("focus", json!(true)),
         ("here", json!(true)),
-        ("active", json!(true)),
         ("dry_run", json!(true)),
         ("workspace_id", json!("fixture-space")),
         ("tab_id", json!("fixture-tab")),
@@ -759,4 +757,61 @@ async fn directory_change_is_emitted_once_for_a_real_structured_launch() {
         fixture.request(Method::AgentList(Default::default())).await;
         assert_eq!(changes(&fixture.app), 1, "unchanged reads must not emit");
     }
+}
+
+#[tokio::test]
+async fn public_structured_start_and_focus_reuse_native_placement() {
+    let _guard = crate::config::test_config_env_guard();
+    let mut fixture = AdmissionFixture::new("s4-accepted-silent", 5000);
+    let (id, generation) = fixture.start().await;
+    let get = fixture
+        .request(Method::AgentGet(crate::api::schema::AgentTarget {
+            target: id.clone(),
+        }))
+        .await;
+    let view = get["result"]["agent"]["view"].clone();
+    assert!(
+        view.is_object(),
+        "public start must expose its real placement: {get}"
+    );
+    let count = fixture.app.state.workspaces[0].tabs[0].layout.pane_count();
+    let focused = fixture
+        .request(Method::AgentFocus(crate::api::schema::AgentTarget {
+            target: id.clone(),
+        }))
+        .await;
+    assert_eq!(focused["result"]["agent"]["view"], view);
+    assert_eq!(
+        fixture.app.state.workspaces[0].tabs[0].layout.pane_count(),
+        count
+    );
+    assert_eq!(fixture.app.terminal_runtimes.len(), 0);
+    assert!(fixture.app.state.terminals.is_empty());
+    let pane = fixture.app.state.workspaces[0].tabs[0].root_pane;
+    assert!(fixture.app.state.workspaces[0].close_pane(pane));
+    fixture.app.state.workspaces.clear();
+    fixture.app.state.active = None;
+    assert!(fixture
+        .app
+        .structured_workers
+        .runtime(&id, generation)
+        .is_some());
+    let detached = fixture
+        .request(Method::AgentGet(crate::api::schema::AgentTarget {
+            target: id.clone(),
+        }))
+        .await;
+    assert!(detached["result"]["agent"]["view"].is_null());
+    let reattached = fixture
+        .request(Method::AgentFocus(crate::api::schema::AgentTarget {
+            target: id.clone(),
+        }))
+        .await;
+    assert!(reattached["result"]["agent"]["view"].is_object());
+    assert!(fixture
+        .app
+        .structured_workers
+        .runtime(&id, generation)
+        .is_some());
+    assert!(fixture.app.state.terminals.is_empty());
 }

@@ -51,6 +51,7 @@ the full archive.
 | Structured lifecycle | Nine-state lifecycle, idle hibernation, receipt-bound wake | Accepted design; not implemented | ADR-0044 | #2717 |
 | Test reliability | Producer liveness and condition evidence first, measured nextest hang ceilings across default and CI profiles, reproducible CI timing report | Accepted | ADR-0037 | #1317, #1314, #1334, #1342, #1349 |
 | Content-anchored selections | Runtime-owned terminal references follow scrolling and reflow; copy re-reads retained rows and visibly refuses invalid anchors | In review | ADR-0040 | #475, #2127 |
+| Durable work supervision | Stable work records, durable wake custody, bounded healthy-source waits and enrolled Tauri notification endpoints. Accepted design; no implementation claimed | Not implemented | ADR-0045 | #2718, #2733, #2734 |
 
 **Multi-node GUI access (ADR-0043).** Accepted design; not implemented.
 The TLS home gateway supplies node status, destination grants without credential

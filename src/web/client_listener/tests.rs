@@ -511,3 +511,5 @@ async fn native_listener_is_prepared_when_tcp_is_disabled() {
 mod budgets;
 
 mod shutdown;
+
+mod funnel;

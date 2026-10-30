@@ -61,7 +61,7 @@ impl App {
         &self,
         id: &str,
     ) -> Result<StructuredAgentInfo, ErrorCode> {
-        let (record, projection, _) = self
+        let (record, projection, generation) = self
             .state
             .structured_agents
             .get(id)
@@ -80,7 +80,10 @@ impl App {
             cwd: record.cwd.to_string_lossy().into_owned(),
             model: record.model.clone(),
             lease_state: self.session_leases.state(id, &record.session_id),
-            view: None,
+            view: self.structured_placement(&crate::structured::view::Target {
+                agent_id: record.agent_id.clone(),
+                generation,
+            })?,
         })
     }
     pub(super) fn structured_infos(&self) -> Result<Vec<StructuredAgentInfo>, ErrorCode> {
