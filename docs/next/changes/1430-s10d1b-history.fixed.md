@@ -1,1 +1,0 @@
-- Wait on producer readiness when a native view opens before its warm history file is initialized, preserving cancellation and reporting producer failures.
