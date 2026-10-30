@@ -1570,3 +1570,5 @@ fn poisoned_client_map_still_retires_a_lease() {
 mod trace_auth;
 
 mod trace_protocol;
+
+mod trace_ping;
