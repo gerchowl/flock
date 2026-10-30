@@ -317,7 +317,7 @@ sets:
 | Parameter | Value | Where it acts here |
 |---|---|---|
 | connect deadline | 10 s per attempt | Connecting |
-| restore deadline | 10 s from page load, the connect deadline's value | the store's **Load** (below) |
+| restore deadline | 10 s from page load: its own value, equal to the connect deadline today; a change to ADR-0036 §5a's connect deadline does not move it | the store's **Load** (below) |
 | handshake deadline | 5 s from socket open to `welcome` | Hello |
 | heartbeat | the server sends `ping { nonce }` every 15 s; the client answers `pong { nonce }` at once | Syncing, Live, ReadOnly |
 | liveness window | 45 s without any valid server frame, `ping` included | heartbeat missed → Stale |
@@ -814,8 +814,8 @@ one-time code (single use, 60 s) and opens the loopback URL with the code in the
   blocks (§4).
 
 **Load.** A page load with a stored principal and no code to exchange tries to
-restore, under one **restore deadline** of 10 s (the connect deadline's value)
-from page load. Within it, the tab computes the database name, takes the shared
+restore, under one **restore deadline** of 10 s from page load (its own
+value, which does not follow the connect deadline). Within it, the tab computes the database name, takes the shared
 lock, opens the database and reads every stream's record in one readonly
 transaction, alongside Connecting. Each load ends in exactly one row below. A
 `welcome` with the stored principal changes nothing while the restore runs: its
@@ -839,7 +839,9 @@ another.
 - **Tests that must fail before the change** (one per row):
   - **Fresh:** a load with no stored principal, and a load that exchanges a
     code, apply no record, send their `sub`s at once without `after`, open the
-    database only after `welcome`, and then write the last-opened time;
+    database only after `welcome`, and then write the last-opened time; a
+    **Fresh** open that reports `blocked` persists nothing for the rest of the
+    load, and when it later succeeds it is closed at once, as for **Failed**;
   - **Applied:** a reload renders the restored entities together, sends no `sub`
     before they are applied, re-`sub`s from the stored cursors and never applies
     a `(stream, seq)` twice; one record that does not parse is absent and the
@@ -859,7 +861,9 @@ another.
     applies no record, releases the `sub`s at once, frees the old database's
     lock so the cleanup can delete it, and opens the new principal's database;
     one that arrives while the open is pending closes that open once it settles;
-    one that arrives after **Late** or **Failed** opens no database;
+    one that arrives after **Late** or **Failed** opens no database; a hand-off
+    open that reports `blocked` persists nothing for the rest of the load, and
+    when it later succeeds it is closed at once, as for **Failed**;
   - **Across rows:** a **Fresh** load whose open fails persists nothing for the
     rest of the load; a load that exchanges a code in a tab with a stored
     principal and records applies none of them; a principal change after
@@ -893,7 +897,7 @@ another.
 | Command state | Meaning | Exits |
 |---|---|---|
 | `pending` | queued, not yet sent | Live → sent with `resume_only: false` → `sent` |
-| `sent` | on the current socket, waiting for its `ack`: a first send (`resume_only: false`) or a resend (`resume_only: true`) | `ack` ok → `acked`; an error `ack` refusing a resume-only lookup as uncertain (`session_unconfirmed`, or an absent or expired key) → `unknown_outcome`; any other error `ack` → `failed`; the ack deadline (30 s) → `uncertain`; socket lost → waits for the resend below |
+| `sent` | on the current socket, waiting for its `ack`: a first send (`resume_only: false`) or a resend (`resume_only: true`) | `ack` ok → `acked`; on a first send, an error `ack` → `failed`; on a resend, every error `ack` → `unknown_outcome` (**Acks to a resend**, below); the ack deadline (30 s) → `uncertain`; socket lost → waits for the resend below |
 | `uncertain` | its delivery is unknown; the connection stays up, and nothing is resent on the same socket | a late `ack` on the same socket → as for `sent`; socket lost → waits for the resend below |
 | `unknown_outcome` | the client cannot learn whether it ran ("unknown outcome" in the prose below and in the UI) | none automatic: the user inspects the subject's server state and decides on any new command |
 | `acked`, `failed` | settled by the server | none |
@@ -935,6 +939,9 @@ another.
   `idempotency_window_ms` that `welcome` reports, counted from the first send.
   The server answers with the first `ack`, or refuses the lookup when it holds
   no claim (`session_unconfirmed`), which makes the command `unknown_outcome`.
+  Known limit: until the server keeps ADR-0036 §5a's durable journal (#2826),
+  it refuses every resend as `session_unconfirmed`, so every resend ends in
+  `unknown_outcome`. That is the safe outcome, not a client defect.
 - **Unknown outcome** also follows, without a resend, when the window has passed
   by the time the resend would go out, or when the client cannot establish a
   command's age after a restart. It is never resent automatically and never
@@ -943,6 +950,36 @@ another.
   says "unknown outcome", never "cancelled" or "not run".
   `session_unconfirmed`'s `retry: later` permits only the same resume-only
   resend, never a first send.
+- **Acks to a resend.** On a `resume_only: true` send, an `ok` ack is the
+  first ack and settles the command as `acked`. Every error ack makes it
+  `unknown_outcome`, whatever its code. ADR-0036 §5a has the server refuse an
+  absent, expired or lost key as `session_unconfirmed` and return a completed
+  duplicate's first ack, which may itself be an error. The wire does not mark
+  which of the two an error ack is, and a refusal (`session_unconfirmed`, or an
+  auth, rate or version refusal before the lookup) proves nothing about the
+  original. Only `failed` would claim that the command did not run, so the
+  client never infers it from a resend. A first send's error ack is still
+  `failed`, because nothing ran before it.
+- **Age and clocks.** Each record stores its first-send time as wall-clock
+  milliseconds (`first_sent_ms`), and the outbox stores the
+  `idempotency_window_ms` of the latest `welcome`. A later `welcome` replaces
+  it, and a record set without it stays readable, so the stored format stays
+  `flock.outbox.v1`. In the page that made the first send, age runs on the
+  monotonic clock from that send, as every other deadline in §3 does. After a
+  reload, the only clock that survives is the wall clock, so age is the wall
+  time minus `first_sent_ms`. A restored `sent` or `uncertain` command's age
+  **cannot be established**, and it becomes `unknown_outcome` at once, without
+  a resend, when its `first_sent_ms` is missing or not a finite number, or when
+  `first_sent_ms` lies in the future (the wall clock moved back). A missing
+  window is not a missing age. With no window stored and none received since
+  the reload, the expiry check waits for the first `welcome`, whose window
+  applies. That `welcome` is checked before any resend, because a resend goes
+  out only in Live. A restored `pending` command has no age and is unaffected.
+- **Open: the outbox across tabs.** `flock.outbox.v1` is one key for the whole
+  origin, so two tabs, or two servers in one browser, overwrite each other's
+  stored commands. Two tabs resending one command is harmless at the server,
+  because a resend keeps its `cmd_id`. A lost record is not. The key's scope and
+  its writer are decided with the store's Web Locks, before G3b-4 (#2827).
 - **Optimism is visual only.** A pending command marks its subject "pending" and
   never changes an entity. The entity changes when the server's event arrives.
   The composer lists an accepted message until a person's turn arrives after its
