@@ -127,7 +127,6 @@ async fn structured_pane_operations_refuse_and_cross_runtime_names_are_ambiguous
     );
     for method in [
         "agent.read",
-        "agent.focus",
         "agent.hibernate",
         "agent.resume",
         "agent.fork",
@@ -151,6 +150,8 @@ async fn structured_pane_operations_refuse_and_cross_runtime_names_are_ambiguous
             "{method}: {result}"
         );
     }
+    let focused = request(&mut app, "agent.focus", json!({"target":"fixture-agent"}));
+    assert!(focused["result"]["agent"]["view"].is_object(), "{focused}");
     for target in ["fixture-agent", "structured-fixture"] {
         let result = request(
             &mut app,
@@ -169,6 +170,7 @@ async fn structured_pane_operations_refuse_and_cross_runtime_names_are_ambiguous
     for method in [
         "agent.get",
         "agent.status",
+        "agent.focus",
         "agent.stop",
         "agent.read",
         "agent.send",
