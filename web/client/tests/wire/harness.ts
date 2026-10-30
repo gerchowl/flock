@@ -151,10 +151,13 @@ export class FakeNetwork {
   }
 
   readonly factory = (url: string): SocketLike => {
-    const socket = new FakeSocket(this);
+    const socket = this.makeSocket();
     this.attempts.push({ url, at: this.clock.now(), socket, claimed: false });
     return socket;
   };
+
+  /** Supply a real transport without replacing the shared client assertions. */
+  protected makeSocket(): FakeSocket { return new FakeSocket(this); }
 
   /** The latest attempt's socket. */
   current(): FakeSocket {
@@ -210,6 +213,7 @@ export class Harness {
   /** The script's subscriptions, which follow their ids across re-subs. */
   readonly #subscriptions: Subscription[] = [];
   readonly #random: () => number;
+  readonly #network: (clock: VirtualClock) => FakeNetwork;
   /** The wire protocol the client under test speaks, when a test plays a newer client; else `WIRE_PROTOCOL`. */
   readonly #protocol: number | undefined;
   #transitions: string[] = [];
@@ -220,9 +224,10 @@ export class Harness {
   #openedAt = 0;
   #lastServerFrameAt = 0;
 
-  constructor(random: () => number = () => 0, protocol?: number) {
+  constructor(random: () => number = () => 0, networkOrProtocol: number | ((clock: VirtualClock) => FakeNetwork) = (clock) => new FakeNetwork(clock)) {
     this.#random = random;
-    this.#protocol = protocol;
+    this.#network = typeof networkOrProtocol === "function" ? networkOrProtocol : (clock) => new FakeNetwork(clock);
+    this.#protocol = typeof networkOrProtocol === "number" ? networkOrProtocol : undefined;
   }
 
   /** The connection, after `given`. */
@@ -292,7 +297,7 @@ export class Harness {
     if (step.resync !== undefined && Object.keys(step.resync).length > 0) fail("resync markers are G3b's (#1595)");
     if (step.idempotency_window_ms != null) fail("window expiry is G3b's (#1595)");
     this.clock = new VirtualClock(step.now_ms ?? 0);
-    this.net = new FakeNetwork(this.clock);
+    this.net = this.#network(this.clock);
     if (step.outbox.length > 0) {
       const principal = step.outbox[0]?.principal ?? null;
       this.store.setItem(OUTBOX_KEY, JSON.stringify({ principal, commands: step.outbox }));
