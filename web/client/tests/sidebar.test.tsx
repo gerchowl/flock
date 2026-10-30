@@ -191,6 +191,12 @@ describe("the scope toggle", () => {
 describe("node status badges", () => {
   const node = (root: ParentNode, name: string): Element => $$(root, "group-node").find((each) => each.querySelector(".group__name")?.textContent === name)!;
 
+  test("two nodes with one name get different Fleet headings, as in the Projects tree", async () => {
+    const root = await mount({ nodes: [HOME, { ...REMOTE, name: "node-a" }] });
+    const headings = $$(root, "group-node").map((each) => each.querySelector(".group__name")?.textContent);
+    expect(headings).toEqual(["node-a (n-a)", "node-a (n-b)"]);
+  });
+
   test("shows online or offline, and staleness that follows the injected clock", async () => {
     const [now, setNow] = createSignal(5_000);
     const root = await mount({ now, nodes: [{ ...HOME, last_ok: SENT }, { ...REMOTE, online: false, route: null, last_ok: SENT - 60_000 }] });

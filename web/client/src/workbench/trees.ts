@@ -21,7 +21,7 @@ import type { FleetProjectRow } from "../gen/FleetProjectRow";
 export type ProjectEntry = { readonly key: string; readonly project: FleetProjectRow; readonly label: string; readonly agents: readonly AgentRow[] };
 
 /** One node of the Fleet tree. `node` is null for a `node_id` agents name that has no row. */
-export type NodeEntry = { readonly key: string; readonly nodeId: string; readonly node: FleetNodeRow | null; readonly projects: readonly ProjectEntry[]; readonly unfiled: readonly AgentRow[] };
+export type NodeEntry = { readonly key: string; readonly nodeId: string; readonly node: FleetNodeRow | null; readonly label: string; readonly projects: readonly ProjectEntry[]; readonly unfiled: readonly AgentRow[] };
 
 /** The two trees in one scope. */
 export type Trees = {
@@ -46,6 +46,16 @@ export function inScope(scope: SidebarScope, home: string | null, nodeId: string
   return scope === "all" || (home !== null && nodeId === home);
 }
 
+/**
+ * How both trees name a node: its name as sent, or the id when it has no row.
+ * Names are aliases (ADR-0043) and may collide; the id then tells them apart.
+ */
+export function nodeLabel(nodes: readonly FleetNodeRow[], nodeId: string): string {
+  const named = nodes.find((node) => node.node_id === nodeId);
+  if (named === undefined) return nodeId;
+  return nodes.filter((node) => node.name === named.name).length > 1 ? `${named.name} (${nodeId})` : named.name;
+}
+
 /** Groups `agents`, `nodes` and `projects` into both trees, in the order the server introduced them. */
 export function buildTrees(agents: readonly AgentRow[], nodes: readonly FleetNodeRow[], projects: readonly FleetProjectRow[], scope: SidebarScope, home: string | null): Trees {
   const visible = (nodeId: string | undefined): boolean => inScope(scope, home, nodeId);
@@ -59,14 +69,9 @@ export function buildTrees(agents: readonly AgentRow[], nodes: readonly FleetNod
     else if (row.project !== undefined && known.has(projectKey(row.nodeId, row.project))) push(byProject, projectKey(row.nodeId, row.project), row);
     else push(byNode, row.nodeId, row);
   }
-  const nodeName = (nodeId: string): string => {
-    const named = nodes.filter((node) => node.node_id === nodeId);
-    // Two nodes may share a name; the id then tells them apart.
-    return named.length === 0 ? nodeId : nodes.filter((node) => node.name === named[0]!.name).length > 1 ? `${named[0]!.name} (${nodeId})` : named[0]!.name;
-  };
   const entry = (project: FleetProjectRow): ProjectEntry => {
     const key = projectKey(project.node_id, project.id);
-    return { key, project, label: `${project.name} · ${nodeName(project.node_id)}`, agents: byProject.get(key) ?? [] };
+    return { key, project, label: `${project.name} · ${nodeLabel(nodes, project.node_id)}`, agents: byProject.get(key) ?? [] };
   };
   const shown = projects.filter((project) => visible(project.node_id)).map(entry);
   const rows = nodes.filter((node) => visible(node.node_id));
@@ -76,6 +81,7 @@ export function buildTrees(agents: readonly AgentRow[], nodes: readonly FleetNod
     key: `node:${nodeId}`,
     nodeId,
     node,
+    label: nodeLabel(nodes, nodeId),
     projects: shown.filter((each) => each.project.node_id === nodeId),
     unfiled: byNode.get(nodeId) ?? [],
   });

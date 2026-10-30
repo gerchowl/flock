@@ -113,7 +113,7 @@ function NodeGroup(props: { readonly entry: NodeEntry; readonly stamp: Stamps; r
       collapse={props.collapse}
       title={
         <>
-          <span class="group__name">{props.entry.node?.name ?? props.entry.nodeId}</span>
+          <span class="group__name">{props.entry.label}</span>
           <Show when={props.entry.node} fallback={<span class="node-status">no status row</span>}>
             {(node) => <NodeStatus node={node()} stamp={props.stamp(node().node_id)} now={props.now} />}
           </Show>
