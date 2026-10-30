@@ -34,9 +34,9 @@ export function Waits(props: { readonly label: string } & ({ readonly waitsFor: 
 }
 
 /** One sidebar row: status mark, name, activity, and the open-item count. */
-export function AgentRowButton(props: { readonly row: AgentRow; readonly focused: boolean; readonly onFocus: () => void }): JSX.Element {
+export function AgentRowButton(props: { readonly row: AgentRow; readonly focused: boolean; readonly onFocus: () => void; readonly testid?: string | undefined }): JSX.Element {
   return (
-    <button type="button" class="agent-row" aria-current={props.focused ? "true" : undefined} onClick={props.onFocus} data-testid="agent-row">
+    <button type="button" class="agent-row" aria-current={props.focused ? "true" : undefined} onClick={props.onFocus} data-testid={props.testid ?? "agent-row"}>
       <StatusMark mark={markFor(props.row)} label={PHASE_LABELS[props.row.state]} count={props.row.waitingOnHuman.length} />
       <span class="agent-row__text">
         <span class="agent-row__name">{props.row.label}</span>

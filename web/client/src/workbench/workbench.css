@@ -590,3 +590,64 @@
   font-size: 0.8rem;
   color: var(--muted);
 }
+
+.scope {
+  display: flex;
+  gap: 0.5rem;
+  padding: 0.25rem 0.5rem;
+}
+
+.scope .action[aria-pressed="true"] {
+  background: var(--bg);
+  font-weight: 600;
+}
+
+.group__head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  width: 100%;
+  min-height: 44px;
+  padding: 0.25rem 0.5rem;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.group--tree > .group__head {
+  font-weight: 700;
+}
+
+.group__name {
+  font-weight: 600;
+}
+
+.group__body {
+  padding-left: 0.75rem;
+}
+
+.node-status {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  color: var(--muted);
+  font-size: 0.875em;
+  font-weight: 400;
+}
+
+.node-status__badge--online {
+  color: inherit;
+}
+
+.node-status__badge--offline,
+.node-status__error {
+  text-decoration: underline wavy;
+}
+
+[data-stale="true"] {
+  font-style: italic;
+}
