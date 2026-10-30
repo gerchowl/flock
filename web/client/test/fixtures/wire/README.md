@@ -203,12 +203,31 @@ not a digest of the bearer, a runtime substitution, or a dynamic matcher.
 `endpoint-runner.ts` checks every ordered step and bounds silent producers.
 `endpoint-auth.ts` runs all eight `token-refused` steps through a real endpoint
 and client. `endpoint-permission.ts` runs the complete permission-decision trace.
-The tested pending-part-2b set contains the other seven selected scripts; later
-providers must shrink it. Gaps and overlap fail.
+`endpoint-protocol.ts` runs all eleven `unknown-subscription` steps. Its welcome
+is real server output; the impossible `synced` for `never-opened` is explicitly
+recorded as `client_fault`. The real client sends close 1002 on the native socket,
+and the interpreter checks the actual endpoint close before observing reconnect.
+The deterministic principal and epoch are literal, as in permission-decision;
+neither is rewritten in received frames (ADR-0036 §5a).
+
+Each protocol step has the interpreter's five-second silence ceiling. The authored
+connect assertion has its explicit virtual interval, and final quiet retains its
+authored virtual ceiling; neither advances server time or waits on a wall-clock
+sleep. There are no runtime event timestamps in this script, so it needs no
+persisted timestamp marker. All selected dynamic timestamps still require their
+explicit bound. The tested pending set now contains six scripts: agent-gap,
+agent-send, clean, heartbeat-missed, ping-pong and token-revoked. Later providers
+must shrink it. Gaps and overlap fail.
 
 The permission fixture resumes after bootstrap and raw request (cursor 3), then
 checks open at 4, close at 5, and permission handle 3. Its driver acknowledges
 stdin over IPC rather than injecting a fixture-only session echo. The open bound
 is `after_ack` (owner's durable-open receipt); close uses `record_delivery` (the
 WebSocket callback). Missing/unknown bounds fail (ADR-0036 #2224, slice-3 ruling).
-Literal version/epoch/principal remain exact; update the version on package bumps.
+Epoch and principal remain exact. Both actual-endpoint welcomes declare
+`server_version:{"$dynamic":"server_version","source":"build"}`. The Rust driver
+supplies `CARGO_PKG_VERSION` independently of the socket. Missing evidence or a
+mismatch fails; package bumps require no fixture edit. The pure virtual harness
+refuses this marker because it has no compiled-server oracle. All literal
+objects, including frame envelopes and nested payloads, require exact key sets
+and values; extra keys fail. Protocol transport decoding remains additive.

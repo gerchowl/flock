@@ -5,7 +5,7 @@ import { matchFrame } from "./timestamp-matcher";
 import type { FixtureLine } from "../../src/gen/FixtureLine";
 import { FakeNetwork, FakeSocket, Harness } from "./harness";
 import { loadS7MinScripts, runTrace, type CheckedStep, type StepHandlers } from "./endpoint-runner";
-const [url, history, start, ready, control] = process.argv.slice(2);
+const [url, history, start, ready, control, buildVersion] = process.argv.slice(2);
 assert(url && history && start && ready);
 assert(["", "persisted", "window", "delivery_window", "outbox", "cursor"].includes(control ?? ""));
 let before = Number(start), after = Number(ready);
@@ -59,7 +59,7 @@ const handlers: StepHandlers = {
       const records = (await Bun.file(history!).text()).trim().split("\n").map((raw) => JSON.parse(raw));
       const record = records.find((r) => r.seq === event.seq); assert(record, "missing persisted record");
       return { record: { ...record, received_at_ms: record.received_at_ms + (control === "persisted" ? 1 : 0) }, before_action: control === "window" || control === "delivery_window" ? before - 2 : before, after_ack: control === "window" ? before - 1 : after, record_delivery: control === "delivery_window" ? before - 1 : delivered_at };
-    });
+    }, buildVersion);
     if (!(control === "outbox" && actual.t === "ack") && !(control === "cursor" && actual.t === "ev" && actual.seq === 5)) harness.acceptServerFrame(actual);
     return checked("server");
   },

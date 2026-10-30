@@ -49,6 +49,7 @@ fn permission_script_checks_persisted_timestamps_outbox_and_cursor() {
             .arg(format!("ws://{}/v1/ws", case.server.bind))
             .arg(&path)
             .args([before.to_string(), after.to_string(), control])
+            .arg(env!("CARGO_PKG_VERSION"))
             .env_clear()
             .env("PATH", std::env::var_os("PATH").unwrap())
             .env("HOME", case.server._root.path())
