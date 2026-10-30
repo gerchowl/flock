@@ -29,7 +29,7 @@ const B = "b".repeat(64);
 const state: AgentState = { turn: "idle", background: "none", attention: "none", waiting: "none", lifecycle: "live", phase: "working", source: {} };
 const agent = (id: string, extra: object = {}): object => ({ id, label: id, state, waiting_on_human: [], ...extra });
 const node = (node_id: string, name = node_id.slice(0, 4)): FleetNodeRow => ({
-  node_id, name, health: null, latency_ms: null, last_ok: null, version: null, error: null, online: true, route: null, counts: null, unbound_configured_peers: null,
+  node_id, name, health: null, latency_ms: null, last_ok: null, version: null, error: null, online: true, route: null, counts: null, unbound_configured_peers: null, link_diagnostics: [],
 });
 const project = (node_id: string, id: string, name = "app"): FleetProjectRow => ({ id, node_id, name });
 

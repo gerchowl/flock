@@ -108,6 +108,7 @@ pub(crate) struct Core {
     command_owner: commands::Owner,
     admission: super::local_admission::Owner,
     shared: Arc<Shared>,
+    fleet_nodes: fleet::Nodes,
 }
 impl Drop for Core {
     fn drop(&mut self) {
@@ -165,6 +166,7 @@ impl Core {
         let (admission, admission_owner) = super::local_admission::channel(wake.clone());
         let (histories, owner) = crate::structured::history::owner::channel(wake);
         Ok(Self {
+            fleet_nodes: Default::default(),
             owner,
             command_owner,
             admission: admission_owner,
@@ -194,7 +196,8 @@ impl Core {
     ) {
         self.service_local(registry, workers, root, None);
     }
-    /// Observe local fleet facts using only the App's authenticated home identity.
+    /// Observe local-only fixture facts. Runtime projection uses the App owner.
+    #[cfg(test)]
     pub(crate) fn service_local(
         &mut self,
         registry: &crate::structured::registry::Registry,
@@ -203,7 +206,25 @@ impl Core {
         home: Option<&str>,
     ) {
         self.owner.service(registry, workers, root);
-        self.shared.fleet.observe(registry, workers, root, home);
+        self.shared
+            .fleet
+            .observe(registry, workers, root, home, None);
+    }
+    /// Capture peer, route, local registry and permission facts on the App owner.
+    pub(crate) fn service_app(&mut self, app: &mut crate::app::App, root: &std::path::Path) {
+        self.owner.service(
+            &app.state.structured_agents,
+            &mut app.structured_workers,
+            root,
+        );
+        let projection = self.fleet_nodes.observe(app, self.shared.clock.now());
+        self.shared.fleet.observe(
+            &app.state.structured_agents,
+            &app.structured_workers,
+            root,
+            app.node_id.as_deref(),
+            Some(projection),
+        );
     }
     /// Mount only behind S2b-mount's loopback, Host/Origin and funnel guards.
     pub(crate) fn router(&self) -> Router {

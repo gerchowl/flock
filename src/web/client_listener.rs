@@ -235,15 +235,9 @@ impl Listener {
         self.local.activate();
         Ok(())
     }
-    /// Run history admission only on the application owner.
-    pub(crate) fn service_local(
-        &mut self,
-        registry: &crate::structured::registry::Registry,
-        workers: &mut crate::structured::workers::Workers,
-        root: &std::path::Path,
-        home: Option<&str>,
-    ) {
-        self.core.service_local(registry, workers, root, home);
+    /// Publish one coherent App-owned fleet observation and service history reads.
+    pub(crate) fn service_app(&mut self, app: &mut crate::app::App, root: &std::path::Path) {
+        self.core.service_app(app, root);
     }
     /// Service authenticated commands on the application owner.
     pub(crate) fn service_commands(&mut self, app: &mut crate::app::App) {

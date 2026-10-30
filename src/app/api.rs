@@ -497,6 +497,12 @@ impl App {
                     .mark_failure(now, crate::health::PeerPollErrorKind::classify(msg)),
             }
             let summary_every = self.state.config.gossip.dial_failure_summary();
+            let pinned = self
+                .state
+                .peers
+                .iter()
+                .find(|p| p.name == fetch.peer)
+                .and_then(|p| crate::peer_stream::enrollment(p).node_id);
             let Some(summary) = self
                 .state
                 .peer_summaries
@@ -512,15 +518,9 @@ impl App {
             summary.stream_error = fetch.stream_error;
             match fetch.result {
                 Ok(mut payload) => {
-                    let pinned = self
-                        .state
-                        .peers
-                        .iter()
-                        .find(|p| p.name == fetch.peer)
-                        .and_then(|p| crate::peer_stream::enrollment(p).node_id);
                     payload.node_id =
                         crate::peers::validated_summary_node(payload.node_id, pinned.as_deref());
-                    summary.node_id = payload.node_id.clone();
+                    summary.bind_node(payload.node_id.clone());
                     if payload.outbound_pending {
                         self.mesh_outbound_polls
                             .entry(fetch.peer.clone())
@@ -584,6 +584,11 @@ impl App {
                 // #418: and say it in the log without saying it every poll —
                 // the edges, plus one summary per window while it lasts.
                 Err(error) => {
+                    // A failed transport proves no identity change. Only a known
+                    // replacement pin can rebind the cached owner facts.
+                    if pinned.is_some() {
+                        summary.bind_node(pinned);
+                    }
                     let reason = crate::peers::SshFailureReason::classify(&error);
                     let log = summary.dial.record_failure(reason, now, summary_every);
                     let consecutive = summary.dial.consecutive_failures;

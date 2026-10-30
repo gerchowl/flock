@@ -29,8 +29,8 @@ const click = (element: Element | null | undefined): void => (element as HTMLEle
 
 const NODE_BASE = { health: null, latency_ms: null, last_ok: null, version: null, error: null, unbound_configured_peers: null } as const;
 const ROUTE = { node: "n-b", name: "node-b", next_hop: "n-b", hops: 1 } as const;
-const HOME: FleetNodeRow = { ...NODE_BASE, node_id: "n-a", name: "node-a", online: true, route: null, counts: { total: 4, by_phase: { working: 4 }, waiting_on_human: 0 } };
-const REMOTE: FleetNodeRow = { ...NODE_BASE, node_id: "n-b", name: "node-b", online: true, route: ROUTE, counts: null };
+const HOME: FleetNodeRow = { ...NODE_BASE, link_diagnostics: [], node_id: "n-a", name: "node-a", online: true, route: null, counts: { total: 4, by_phase: { working: 4 }, waiting_on_human: 0 } };
+const REMOTE: FleetNodeRow = { ...NODE_BASE, link_diagnostics: [], node_id: "n-b", name: "node-b", online: true, route: ROUTE, counts: null };
 
 const agent = (id: string, nodeId?: string, project?: string): AgentRow => ({
   id,
