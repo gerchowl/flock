@@ -263,12 +263,7 @@ export class Harness {
         return this.net.current().open();
       case "send":
         if (step.frame.t === "ev" && typeof step.frame.ts_ms !== "number") fail("dynamic timestamp requires persisted and wall-window oracles");
-        if ((step.socket ?? "current") === "current") {
-          this.#lastServerFrameAt = this.clock.now();
-          if ("sub_id" in step.frame) this.#origins.set(`sub:${step.frame.sub_id}`, this.clock.now());
-          return this.net.current().deliver(step.frame as ServerFrame);
-        }
-        return this.net.previous().deliver(step.frame as ServerFrame);
+        return this.acceptServerFrame(step.frame as ServerFrame, step.socket ?? "current");
       case "expect":
         return this.#expect(step.frame, step.fields, step.absent ?? []);
       case "expect_close":
@@ -290,6 +285,15 @@ export class Harness {
       case "quiet":
         return this.#quiet(step.ceiling_ms);
     }
+  }
+
+  /** Deliver an actual frame after the endpoint port has checked all independent oracles. */
+  acceptServerFrame(frame: ServerFrame, socket: "current" | "previous" = "current"): void {
+    if (socket === "current") {
+      this.#lastServerFrameAt = this.clock.now();
+      if ("sub_id" in frame) this.#origins.set(`sub:${frame.sub_id}`, this.clock.now());
+    }
+    (socket === "current" ? this.net.current() : this.net.previous()).deliver(frame);
   }
 
   #given(step: Extract<Step, { step: "given" }>): void {
