@@ -3,6 +3,7 @@
  * All time is virtual (ADR-0037).
  */
 import { describe, expect, test } from "bun:test";
+import { createEffect, createRoot, on } from "solid-js";
 
 import type { FleetAgentRow } from "../src/gen/FleetAgentRow";
 import type { AgentState } from "../src/gen/AgentState";
@@ -10,6 +11,7 @@ import type { Phase } from "../src/gen/Phase";
 import type { ServerFrame } from "../src/gen/ServerFrame";
 import type { AgentRow } from "../src/fleet";
 import { fixtureExamples } from "../src/gen/FixtureExamples";
+import { fleetStore } from "../src/store/fleet";
 import { createWireFleet } from "../src/wire/fleet";
 import { Harness, live, sentFrames, step } from "./wire/harness";
 
@@ -20,50 +22,56 @@ const row = (id: string, extra: object = {}): object => ({ id, label: id.toUpper
 const upsert = (seq: number, value: object): ServerFrame => ({ t: "ev", sub_id: "s1", stream: "fleet", seq, ts_ms: 0, ev: { type: "fleet.upsert", row: value } as never });
 const remove = (seq: number, id: string): ServerFrame => ({ t: "ev", sub_id: "s1", stream: "fleet", seq, ts_ms: 0, ev: { type: "fleet.remove", id } });
 
+/** Reads the wire fleet through the fleet store, recording what a view of its agents sees each time it changes. */
+function watch(source: ReturnType<typeof createWireFleet>): { seen: Seen[]; last: () => readonly AgentRow[]; close: () => void } {
+  const seen: Seen[] = [];
+  let reader!: ReturnType<ReturnType<typeof fleetStore>["read"]>;
+  const dispose = createRoot((dispose) => {
+    reader = fleetStore(source).read();
+    createEffect(
+      on(
+        () => [reader.agents.items(), reader.agents.progress()] as const,
+        ([items, progress]) => void seen.push(progress.phase === "failed" ? { failed: progress.message } : { rows: items.map((r) => r.id) }),
+        { defer: true },
+      ),
+    );
+    return dispose;
+  });
+  return { seen, last: () => reader.agents.items(), close: () => (reader.release(), dispose()) };
+}
+
 function subscribed(): { h: Harness; seen: Seen[]; last: () => readonly AgentRow[]; close: () => void } {
   const h = new Harness();
   live(h);
-  const seen: Seen[] = [];
-  let rows: readonly AgentRow[] = [];
-  const close = createWireFleet(h.connection).subscribe({
-    rows: (next) => {
-      rows = next;
-      seen.push({ rows: next.map((r) => r.id) });
-    },
-    failed: (message) => seen.push({ failed: message }),
-  });
+  const watched = watch(createWireFleet(h.connection));
   expect(sentFrames(h).at(-1)).toEqual({ t: "sub", sub_id: "s1", stream: "fleet" });
-  return { h, seen, last: () => rows, close };
+  return { h, ...watched };
 }
 
 const send = (h: Harness, frame: ServerFrame): void => h.step(step({ step: "send", frame }));
 
 describe("wire fleet", () => {
-  test("unsupported entity kinds keep the snapshot, live agents and resume cursor", () => {
+  test("unknown entity kinds keep the snapshot, live agents and resume cursor", () => {
     const { h, seen, last, close } = subscribed();
     const payloads = [
-      { type: "fleet.node.upsert", row: { node_id: "a".repeat(64) } },
-      { type: "fleet.node.remove", node_id: "a".repeat(64) },
-      { type: "fleet.project.upsert", row: { id: "project", node_id: "a".repeat(64) } },
-      { type: "fleet.project.remove", id: "project", node_id: "a".repeat(64) },
       { type: "unknown", raw: "future row", shape: "fixture:future" },
       { type: "fleet.future", id: "future" },
     ];
     const delta = (seq: number, ev: object): void => send(h, { t: "ev", sub_id: "s1", stream: "fleet", seq, ts_ms: 0, ev: ev as never });
-    send(h, { t: "gap", sub_id: "s1", from: 1, to: 0, snapshot_to: 7 });
+    send(h, { t: "gap", sub_id: "s1", from: 1, to: 0, snapshot_to: 3 });
     send(h, upsert(1, row("atlas")));
     payloads.forEach((ev, i) => delta(i + 2, ev));
-    send(h, { t: "synced", sub_id: "s1", seq: 7 });
+    send(h, { t: "synced", sub_id: "s1", seq: 3 });
     expect(last().map((r) => r.id)).toEqual(["atlas"]);
-    expect(h.connection.streams().get("s1")?.cursor).toBe(7);
-    send(h, upsert(8, row("kite")));
-    payloads.forEach((ev, i) => delta(i + 9, ev));
+    expect(h.connection.streams().get("s1")?.cursor).toBe(3);
+    send(h, upsert(4, row("kite")));
+    payloads.forEach((ev, i) => delta(i + 5, ev));
     expect(last().map((r) => r.id)).toEqual(["atlas", "kite"]);
     expect(seen.every((entry) => "rows" in entry)).toBe(true);
-    expect(h.connection.streams().get("s1")?.cursor).toBe(14);
+    expect(h.connection.streams().get("s1")?.cursor).toBe(6);
     close();
-    createWireFleet(h.connection).subscribe({ rows: () => undefined, failed: (message) => { throw new Error(message); } });
-    expect(sentFrames(h).at(-1)).toEqual({ t: "sub", sub_id: "s2", stream: "fleet", after: 14 });
+    watch(createWireFleet(h.connection));
+    expect(sentFrames(h).at(-1)).toEqual({ t: "sub", sub_id: "s2", stream: "fleet", after: 6 });
   });
 
   test("optional mesh metadata is compatible with local-only fleet presentation", () => {
@@ -176,10 +184,8 @@ describe("wire fleet", () => {
 test("fleet sources on one connection never reuse a sub id, and a closed one's late frames are dropped", () => {
   const h = new Harness();
   live(h);
-  const quiet = { rows: () => undefined, failed: () => undefined };
-  createWireFleet(h.connection).subscribe(quiet)();
-  const seen: string[][] = [];
-  createWireFleet(h.connection).subscribe({ rows: (rows) => seen.push(rows.map((r) => r.id)), failed: (message) => seen.push([message]) });
+  watch(createWireFleet(h.connection)).close();
+  const second = watch(createWireFleet(h.connection));
   const subs = sentFrames(h).flatMap((frame) => ((frame as { t: string }).t === "sub" ? [(frame as { sub_id: string }).sub_id] : []));
   expect(new Set(subs).size).toBe(2);
   const current = subs[1] ?? "";
@@ -190,7 +196,7 @@ test("fleet sources on one connection never reuse a sub id, and a closed one's l
   send(h, { t: "gap", sub_id: "s1", from: 1, to: 0, snapshot_to: 1 });
   send(h, upsert(1, row("stale")));
   expect(h.connection.state).toBe("Live");
-  expect(seen).toEqual([["kite"]]);
+  expect(second.seen).toEqual([{ rows: ["kite"] }]);
 });
 
 test("generated S4 fleet state reaches presentation without discarding the row", () => {
