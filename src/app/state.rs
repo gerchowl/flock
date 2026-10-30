@@ -2862,7 +2862,7 @@ impl AppState {
                         .via
                         .as_ref()
                         .and_then(|via| self.server_nodes.get(via))
-                        .is_none_or(|bound| bound == claimed)
+                        .is_some_and(|bound| bound == claimed)
             })
             .map(|_| claimed)
     }
