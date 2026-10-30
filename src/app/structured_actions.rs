@@ -30,13 +30,18 @@ impl App {
                 decision,
                 message,
             } => {
-                // S10e supplies the operator capability and Always confirmation.
-                // The current interactive UID principal deliberately cannot authorize.
-                self.structured_workers
+                // Session-wide consent needs the separately specified confirmation flow.
+                if decision == crate::structured_wire::PermissionDecision::AllowAlways {
+                    return Err(ErrorCode::PermissionDecisionUnsupported);
+                }
+                let authority = self.native_decision_authority()?;
+                let runtime = self
+                    .structured_workers
                     .runtime(&target.agent_id, target.generation)
-                    .ok_or(ErrorCode::AgentNotFound)?
-                    .agent_decide(
-                        &Principal::Operator,
+                    .ok_or(ErrorCode::AgentNotFound)?;
+                authority.decide(|token| {
+                    runtime.agent_decide(
+                        &Principal::Token(token),
                         &AgentDecide {
                             agent: target.agent_id,
                             request_id: handle.request_id,
@@ -45,6 +50,7 @@ impl App {
                             message,
                         },
                     )
+                })
             }
             action => self
                 .structured_views
