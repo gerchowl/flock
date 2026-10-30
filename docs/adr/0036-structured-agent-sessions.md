@@ -4944,3 +4944,24 @@ publisher has stopped. Capture capacity has a separate notification, armed
 before capture, so a full channel cannot self-wake a retry loop.
 A terminal queue refusal also stops history and live retirement. Canonical
 generation refresh still precedes presentation and can retire the failed view.
+
+### Amendment: S10d1 public native placement
+
+Public structured start and focus use the S10a1 placement lifecycle. Start
+attaches to the active tab, or creates a native-only workspace; focus reuses
+one placement and may rebind it to the current registry generation. Reported
+view IDs come from actual layout membership and public numbering. Detaching
+does not stop the worker. Placement preflight precedes worker admission.
+The App-owned subscription controller and renderer/input routing follow in
+separate S10d slices under #1430; placement itself creates no terminal runtime.
+
+### Amendment: S10d1b cancel-safe native continuation
+
+`Stream::next` is cancel-safe. Stream owns its in-flight history task, cut and
+unapplied page, as well as queue cursor/replacement and resubscribe state.
+Cancelling a caller's future preserves that continuation. Resuming an older
+Pending history page yields one step to recheck readiness; a publication that
+predates the new wait cannot leave the continuation asleep. Retirement alone
+discards a dead generation's page. Its blocking work retains the I/O permit
+until completion, even if the Stream is dropped. No timeout, sleep or mutation
+retry substitutes for source readiness.
