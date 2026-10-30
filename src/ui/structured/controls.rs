@@ -22,6 +22,12 @@ impl Panel {
             .find(|(r, _)| r.contains((x, y).into()))
             .map(|(_, a)| a)
     }
+    pub(super) fn rects(&self) -> impl Iterator<Item = Rect> + '_ {
+        self.hits.iter().map(|(r, _)| *r)
+    }
+    pub(super) fn positions(&self) -> impl Iterator<Item = (u16, u16)> + '_ {
+        self.hits.iter().map(|(r, _)| (r.x, r.y))
+    }
     /// Transfer only complete painted button rectangles, retaining their owned payloads.
     pub(super) fn into_hits(self) -> impl Iterator<Item = (Rect, Action)> {
         self.hits.into_iter()
