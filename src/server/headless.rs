@@ -3947,12 +3947,7 @@ impl HeadlessServer {
         let structured_changed = self.app.service_structured_workers(now);
         #[cfg(feature = "web")]
         if let Some(wire) = &mut self.client_wire {
-            wire.service_local(
-                &self.app.state.structured_agents,
-                &mut self.app.structured_workers,
-                &crate::session::data_dir(),
-                self.app.node_id.as_deref(),
-            );
+            wire.service_app(&mut self.app, &crate::session::data_dir());
             wire.service_commands(&mut self.app);
         }
         self.app.start_ready_pastes();

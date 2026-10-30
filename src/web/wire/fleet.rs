@@ -1,4 +1,5 @@
 //! Serialized fleet recovery with off-executor persistence and frame preparation.
+mod nodes;
 use super::{
     subscriptions::{deliver, IO},
     *,
@@ -8,6 +9,7 @@ use crate::structured::{
     registry::{Record, Registry},
     workers::Workers,
 };
+pub(super) use nodes::Nodes;
 use std::{
     collections::VecDeque,
     path::Path,
@@ -34,13 +36,36 @@ impl Provider for Vec<Agent> {
 struct Local {
     agents: Vec<Agent>,
     home: Option<String>,
+    nodes: Option<nodes::Projection>,
 }
 impl Provider for Local {
     fn agents(&self) -> io::Result<Vec<StructuredAgent<'_>>> {
         self.agents.agents()
     }
     fn rows(&self) -> io::Result<Vec<crate::structured::fleet_lite::Row>> {
-        crate::structured::fleet_lite::local_rows(self.agents()?, self.home.as_deref())
+        let mut rows =
+            crate::structured::fleet_lite::local_rows(self.agents()?, self.home.as_deref())?;
+        if let Some(projection) = &self.nodes {
+            rows.retain(|r| !matches!(r, crate::structured::fleet_lite::Row::Node(_)));
+            rows.extend(
+                projection
+                    .nodes
+                    .iter()
+                    .cloned()
+                    .map(crate::structured::fleet_lite::Row::Node),
+            );
+        }
+        Ok(rows)
+    }
+    fn reconcile(
+        &self,
+        previous: Vec<crate::structured::fleet_lite::Row>,
+    ) -> io::Result<Vec<crate::structured::fleet_lite::Row>> {
+        let rows = self.rows()?;
+        Ok(match &self.nodes {
+            Some(p) => p.reconcile(rows, previous, self.home.as_deref()),
+            None => rows,
+        })
     }
 }
 type Observation = (PathBuf, Result<Local, crate::api::error_code::ErrorCode>);
@@ -80,6 +105,7 @@ impl Client {
         workers: &Workers,
         root: &Path,
         home: Option<&str>,
+        nodes: Option<nodes::Projection>,
     ) {
         let agents = registry
             .records()
@@ -104,6 +130,7 @@ impl Client {
             .map(|agents| Local {
                 agents,
                 home: home.map(str::to_owned),
+                nodes,
             });
         let observation = Arc::new((root.join("fleet.json"), agents));
         self.updates.send_if_modified(|old| {
