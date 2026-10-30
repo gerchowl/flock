@@ -20,7 +20,7 @@ const base: StepHandlers = {
 test("selection uses covers containment, including multi-label headers", async () => {
   const selected = await loadS7MinScripts(ROOT);
   assertInventory(selected, WIRED_SCRIPTS);
-  expect(Object.keys(PENDING_PART_2B).sort()).toEqual(["agent-gap", "agent-send", "clean", "heartbeat-missed", "ping-pong", "token-revoked", "unknown-subscription"]);
+  expect(Object.keys(PENDING_PART_2B).sort()).toEqual(["agent-gap", "agent-send", "clean", "heartbeat-missed", "ping-pong", "token-revoked"]);
   expect(() => assertInventory(selected, [])).toThrow();
   expect(() => assertInventory(selected, [...WIRED_SCRIPTS, "clean"])).toThrow();
   expect(() => assertInventory([...selected, { ...selected[0]!, name: "new-unclassified" }], WIRED_SCRIPTS)).toThrow();

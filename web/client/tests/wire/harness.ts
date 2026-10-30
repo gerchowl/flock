@@ -262,6 +262,7 @@ export class Harness {
         this.#lastServerFrameAt = this.clock.now();
         return this.net.current().open();
       case "send":
+        if (step.frame.t === "welcome" && typeof step.frame.server_version !== "string") fail("dynamic build version requires compiled metadata oracle");
         if (step.frame.t === "ev" && typeof step.frame.ts_ms !== "number") fail("dynamic timestamp requires persisted and wall-window oracles");
         return this.acceptServerFrame(step.frame as ServerFrame, step.socket ?? "current");
       case "expect":
