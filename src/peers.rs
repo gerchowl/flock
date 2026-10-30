@@ -653,6 +653,9 @@ pub struct RelayedEntry {
     /// message for one of its agents is handed to. Stamped at merge time, where
     /// the answering peer is known; `None` straight off the wire.
     pub via: Option<String>,
+    /// Immediate sender proven by the validated poll or enrolled inbound edge
+    /// at ingestion. A later alias binding cannot supply this proof.
+    pub source_node: Option<String>,
     /// A row a HUB pushed down to this spoke (#410), not one a peer we poll
     /// relayed up. Display-only: its ssh target and ProxyJump are never
     /// dialled. A spoke holds no key to anything, so a switch could not work
@@ -675,6 +678,13 @@ pub struct RelayedEntry {
 /// iterating the snapshot, so a bad row costs the fleet that row and no other.
 pub fn relayed_entry_from_wire(
     entry: crate::api::schema::RelayedFleetPeer,
+) -> Option<RelayedEntry> {
+    relayed_entry_from_wire_at(entry, Instant::now())
+}
+
+fn relayed_entry_from_wire_at(
+    entry: crate::api::schema::RelayedFleetPeer,
+    now: Instant,
 ) -> Option<RelayedEntry> {
     if !crate::remote::is_valid_ssh_destination(&entry.ssh_target) {
         crate::logging::peer_relay_entry_rejected(
@@ -739,17 +749,18 @@ pub fn relayed_entry_from_wire(
                 .collect(),
             last_ok: entry
                 .age_secs
-                .and_then(|secs| Instant::now().checked_sub(Duration::from_secs(secs))),
+                .and_then(|secs| now.checked_sub(Duration::from_secs(secs))),
             error: entry.error,
             // Prefer the explicit origin assertion; fall back to `age_secs` for
             // a v(N-1) hub that does not send one.
             origin_last_ok_secs: entry.origin_last_ok_secs.or(entry.age_secs),
             // Dwell starts now — this is when the reading entered this server.
-            ingested_at: Some(Instant::now()),
+            ingested_at: Some(now),
             proxy_jump: entry.proxy_jump,
             icon: entry.icon,
         },
         via: None,
+        source_node: None,
         hub_pushed: false,
     })
 }
@@ -764,6 +775,8 @@ pub fn relayed_entry_from_wire(
 /// Legacy loop prevention uses the origin field and reported host. Known
 /// proven node copies are consolidated in AppState. Claims are cached per
 /// supplying edge, so an unproven claim cannot overwrite another source.
+/// `source_node` is the sender proven by ingress, never a relayed claim. Every
+/// row in a delivery uses its caller's observation instant `now`.
 /// Freshest-wins within each source on the LIVE age (origin's reading plus
 /// dwell here), so a source that has
 /// gone quiet cannot keep winning against one still polling. #392: a row whose
@@ -773,8 +786,10 @@ pub(crate) fn merge_relayed_fleet(
     cache: &mut std::collections::HashMap<String, RelayedEntry>,
     entries: Vec<crate::api::schema::RelayedFleetPeer>,
     via: &str,
+    source_node: Option<&str>,
+    now: Instant,
 ) {
-    merge_relayed_rows(cache, entries, via, false);
+    merge_relayed_rows(cache, entries, via, false, source_node, now);
 }
 
 /// The same merge for rows a hub pushed DOWN (#410): marked display-only, and
@@ -784,8 +799,10 @@ pub(crate) fn merge_hub_pushed_fleet(
     cache: &mut std::collections::HashMap<String, RelayedEntry>,
     entries: Vec<crate::api::schema::RelayedFleetPeer>,
     hub: &str,
+    source_node: Option<&str>,
+    now: Instant,
 ) {
-    merge_relayed_rows(cache, entries, hub, true);
+    merge_relayed_rows(cache, entries, hub, true, source_node, now);
 }
 
 fn merge_relayed_rows(
@@ -793,7 +810,12 @@ fn merge_relayed_rows(
     entries: Vec<crate::api::schema::RelayedFleetPeer>,
     via: &str,
     hub_pushed: bool,
+    source_node: Option<&str>,
+    now: Instant,
 ) {
+    cache.retain(|_, entry| {
+        entry.via.as_deref() != Some(via) || entry.source_node.as_deref() == source_node
+    });
     let self_host = crate::app::short_host_name();
     let self_host_lower = self_host.to_ascii_lowercase();
     for entry in entries {
@@ -819,19 +841,20 @@ fn merge_relayed_rows(
             .as_ref()
             .map(|id| format!("\0node:{via}:{id}"))
             .unwrap_or(legacy_key);
-        let Some(mut materialised) = relayed_entry_from_wire(entry) else {
+        let Some(mut materialised) = relayed_entry_from_wire_at(entry, now) else {
             continue;
         };
         // #410: remember which edge told us, so a message for this row's
         // agents has a route instead of a refusal.
         materialised.via = Some(via.to_string());
+        materialised.source_node = source_node.map(str::to_owned);
         if hub_pushed {
             materialised.hub_pushed = true;
             materialised.peer.proxy_jump = Some(via.to_string());
         }
-        let challenger_age = materialised.peer.carried_age_secs();
+        let challenger_age = materialised.peer.carried_age_secs_at(now);
         let insert = match cache.get(&host_key) {
-            Some(existing) => match (existing.peer.carried_age_secs(), challenger_age) {
+            Some(existing) => match (existing.peer.carried_age_secs_at(now), challenger_age) {
                 (Some(cur), Some(new)) => new <= cur,
                 (None, Some(_)) => true,
                 (Some(_), None) => false,
@@ -1527,6 +1550,15 @@ fn run_peer_ssh_with(
     String::from_utf8(output.stdout).map_err(|_| PeerSshFailure {
         detail: "non-utf8 ssh output".to_string(),
     })
+}
+
+/// Test access to the same parser used by the real poll producer.
+#[cfg(test)]
+pub(crate) fn test_parse_summary_response(
+    stdout: &str,
+    latency_ms: u64,
+) -> Result<PeerSummaryPayload, String> {
+    parse_summary_response(stdout, latency_ms)
 }
 
 /// Parse the CLI's response envelope:

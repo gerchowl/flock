@@ -233,8 +233,8 @@ pub(crate) fn failure(code: ErrorCode, message: &str, exit_code: i32) -> i32 {
     error_as(&response, message, exit_code)
 }
 
-/// A send's effect failure (`unconfirmed`, `abandoned`; exit 8 or 9) is a
-/// result, not an error: under machine output it is the stdout document,
+/// An effect failure (send exit 8/9, or structured start without placement exit 1)
+/// is a result, not an error: under machine output it is the stdout document,
 /// otherwise it stays on stderr.
 pub(crate) fn effect(response: &Value, exit_code: i32) -> i32 {
     if json() {
