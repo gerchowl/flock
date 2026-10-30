@@ -47,10 +47,14 @@ can be exempted in `guardrails-adr-exempt.txt`.
 | [0035](0035-resident-repo-owner.md) | A repo has one resident owner: a hibernated agent that flk wakes on events it has not handled, that triages before it accepts, delegates through edges, and talks to other owners through mail | Accepted |
 | [0036](0036-structured-agent-sessions.md) | An agent can run as a structured session: flk owns its process and its one input queue, translates its typed event stream into flk's state, questions and waits, serves every frontend one wire contract, and forks it at any message boundary | Accepted |
 | [0037](0037-test-wait-liveness-and-hang-ceilings.md) | Condition waits fail on dead, unexpected or silent producers, with measured nextest termination ceilings for every binary | Accepted (2026-10-14) |
-| [0038](0038-gui-workbench.md) | The GUI is a tiled workbench over one wire: a client that holds only presentation state, artifacts in opaque-origin sandboxes with feedback through questions, and goals and work as records on the same log | Proposed |
+| [0038](0038-gui-workbench.md) | The GUI is a tiled workbench over one wire: a client that holds only presentation state, artifacts in opaque-origin sandboxes with feedback through questions, and goals and work as records on the same log | Accepted 2026-10-29; [artifact amendment](0038-gui/artifact-contract.md) |
 | [0039](0039-vigil-telemetry-integration.md) | flk's logs, metrics and traces go through vig-os/vigil as per-role OTLP/JSON Lines files, carry ids and never content, and are read back only by the flk server | Proposed |
 | [0040](0040-content-anchored-selection.md) | Pane selections retain content identity through scrolling and reflow, re-read surviving rows at copy, and visibly refuse evicted content | Accepted |
 | [0041](0041-configuration-v2.md) | Configuration v2: 12-factor precedence and a typed, scoped config API | Accepted |
+| [0042](0042-complete-scoped-configuration.md) | Typed configuration across files, env, scopes and clients | Accepted |
+| [0043](0043-multi-node-gui-access.md) | Multi-node GUI access through a TLS home server and the mesh | Accepted |
+| [0044](0044-structured-lifecycle-and-hibernation.md) | Durable structured lifecycle and idle hibernation | Accepted |
+| [0045](0045-durable-work-and-supervision-loops.md) | Durable work records and server-owned supervision loops: acknowledged persistence, at-least-once wakes, explicit handling and goal/work projection | Accepted |
 
 ADR-0026 supersedes the affected transport, reply, deferral and deduplication
 contracts in ADR-0006, ADR-0008, ADR-0009, ADR-0018 and ADR-0019. Their other

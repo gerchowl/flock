@@ -183,19 +183,19 @@ agent_spawn_enabled = true
             expect("native-transcript", "Tool: Bash (fixture-tool)", "Tool result: Bash (fixture-tool)",
                    "tool-card-result", "Status:", "Send at idle")
             command("begin")
-            expect("streaming-marker", "turn: Working")
+            expect("streaming-marker", "turn: working")
             # Keys travel through the attached TUI, never pane.send-text or a direct admission API.
             os.write(master, b"composer-message\r")
             expect("Queue: 1 queued for idle")
             inputs = command("inspect")
             assert inputs == [], ("busy turn consumed the queued composer", inputs)
             command("finish")
-            expect("composer-answer", "turn: Idle")
+            expect("composer-answer", "turn: idle")
             inputs = command("inspect")
             assert len(inputs) == 1 and inputs[0]["type"] == "user", inputs
             assert "composer-message" in json.dumps(inputs[0]), inputs
             command("begin")
-            expect("turn: Working")
+            expect("turn: working")
             invocation = shlex.join([binary, "--json", "agent", "send", "acceptance-native", "shell-message"])
             script = f"{invocation} > {shlex.quote(str(root / 'shell-response'))}; printf R > {shlex.quote(str(root / 'shell-ready'))}"
             cli("pane", "send-text", "--raw", shell, script)
@@ -207,7 +207,7 @@ agent_spawn_enabled = true
             expect("Queue: 1 queued for idle")
             assert len(command("inspect")) == 1, "busy turn consumed the shell send"
             command("finish")
-            expect("shell-answer", "turn: Idle")
+            expect("shell-answer", "turn: idle")
             inputs = command("inspect")
             assert len(inputs) == 2 and inputs[1]["type"] == "user", inputs
             assert "shell-message" in json.dumps(inputs[1]) and "operator via pane" in json.dumps(inputs[1]), inputs
@@ -215,16 +215,16 @@ agent_spawn_enabled = true
                 # The fake begins a turn before each can_use_tool request.
                 for index, (behavior, label) in enumerate([("deny", "[Deny]"), ("allow", "[Allow once]")]):
                     command("begin")
-                    expect("turn: Working")
+                    expect("turn: working")
                     assert cli("agent", "status", created["agent_id"])["result"]["agent"]["state"]["turn"] == "working"
                     command("permission-" + behavior)
                     expect(label, "Permission 1/1: Bash permission-" + behavior)
                     x, y = screen.location(label)
                     os.write(master, f"\x1b[<0;{x};{y}M\x1b[<0;{x};{y}m".encode())
                     if behavior == "allow":
-                        expect("permission-allow-resumed", "allowed-tool-result", "permission-allow-complete", "turn: Idle", decision=True)
+                        expect("permission-allow-resumed", "allowed-tool-result", "permission-allow-complete", "turn: idle", decision=True)
                     else:
-                        expect("permission-deny-reported", "permission-deny-complete", "turn: Idle", decision=True)
+                        expect("permission-deny-reported", "permission-deny-complete", "turn: idle", decision=True)
                     observed = command("inspect")
                     assert len(observed) == 3 + index, observed
                     response = observed[-1]

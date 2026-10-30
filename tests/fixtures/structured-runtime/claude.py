@@ -165,7 +165,10 @@ if mode.startswith("queue"):
                     sys.exit(0)
                 message = json.loads(line)
                 if message["type"] == "control_response":
-                    emit({"type": "fixture_control_input", "input": message})
+                    if mode == "queue-permission":
+                        driver.sendall((json.dumps(message) + "\n").encode())
+                    else:
+                        emit({"type": "fixture_control_input", "input": message})
                     continue
                 assert message["type"] == "user", "queue writes only user turns"
                 current_uuid = message["uuid"]

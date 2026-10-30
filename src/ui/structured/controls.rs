@@ -28,6 +28,21 @@ impl Panel {
     pub(super) fn positions(&self) -> impl Iterator<Item = (u16, u16)> + '_ {
         self.hits.iter().map(|(r, _)| (r.x, r.y))
     }
+    /// Expose prepared paint rectangles independently of hits to the test oracle.
+    #[cfg(test)]
+    pub(super) fn test_painted_areas(&self) -> impl Iterator<Item = Rect> + '_ {
+        self.rows.iter().map(|(rect, _)| *rect)
+    }
+    /// Inspect full registered geometry, including hidden or out-of-frame mistakes.
+    #[cfg(test)]
+    pub(super) fn test_hits(&self) -> &[(Rect, Action)] {
+        &self.hits
+    }
+    /// Inject a stray registration without changing paint for negative oracle tests.
+    #[cfg(test)]
+    pub(super) fn test_add_hit(&mut self, rect: Rect, action: Action) {
+        self.hits.push((rect, action));
+    }
     /// Transfer only complete painted button rectangles, retaining their owned payloads.
     pub(super) fn into_hits(self) -> impl Iterator<Item = (Rect, Action)> {
         self.hits.into_iter()

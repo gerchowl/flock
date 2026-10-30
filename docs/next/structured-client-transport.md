@@ -198,12 +198,28 @@ framing or form actions; every other response carries a deny-all policy
 (see [GUI bundle hosting](structured-gui-hosting.md#document-security-policy),
 #1848). There is no generated configuration script.
 
-Startup runs `tailscale serve status --json` off the async executor, bounded at
-five seconds and 64 KiB. Any serve or funnel configuration targeting the bound
-port, unsuccessful or malformed status, and an unavailable probe refuse the
-configured listener and server startup; there is no silent fallback. Exit status
-is checked before parsing JSON. Forwarding changes after startup are not
-monitored. The operator must keep forwarding to this port disabled.
+Startup distinguishes three forwarding-probe outcomes off the async executor:
+
+- `NotInstalled`: no CLI on PATH or in the standard macOS app bundle, and no
+  LocalAPI socket at the platform's standard locations. Start the listener
+  and emit one INFO record listing the paths checked and why the forwarding
+  check was skipped. Inspection errors never establish absence.
+- `Status`: use the discovered PATH or app-bundle CLI for
+  `tailscale serve status --json`, bounded at five seconds and 64 KiB. Any
+  serve/funnel rule targeting the bound port still refuses startup.
+- `Unavailable`: installation evidence exists but status cannot be obtained,
+  including a socket with no CLI, failed execution, nonzero exit or malformed
+  JSON. Refuse startup, naming the evidence and failure. Exit status is checked
+  before parsing JSON; there is no fallback after an unsuccessful probe.
+
+On macOS the standard bundle CLI is
+`/Applications/Tailscale.app/Contents/MacOS/Tailscale` and the default daemon
+socket is `/var/run/tailscaled.socket`. Linux checks both
+`/var/run/tailscale/tailscaled.sock` and `/run/tailscale/tailscaled.sock`.
+Custom installation/socket locations outside those defaults are not inferred;
+make the CLI available on the server's PATH. Host/Origin checks, IPv4 loopback
+binding and all other admission rules are unchanged. Forwarding changes after
+startup are not monitored; the operator must keep this port unforwarded.
 
 Live handoff transfers the bound listening descriptor rather than rebinding its
 port after commit. The importer validates a listening socket and its configured

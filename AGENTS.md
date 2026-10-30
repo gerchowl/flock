@@ -238,6 +238,8 @@ Before stable release, run `/pre-release-audit` and finalize `docs/next`: check 
 
 A release manifest is a promise about what a user can install, so it may only advertise assets this repository published. `scripts/changelog.py` refuses to write or verify a manifest whose assets are not `DEFAULT_RELEASE_REPO`'s, and drops foreign archived entries on the way past — an entry left in the archive is an entry re-published on every release. Before this repository has published a release, `website/latest.json` is a sentinel that advertises no installable version; regenerate it with `python3 scripts/changelog.py neutralize-latest-json` rather than by hand.
 
+The Promote workflow builds the release PR body with `python3 scripts/changelog.py pr-body --version V --output F [--limit N]`. Notes that fit in `N` characters (default 60000, under GitHub's 65536 limit) are inlined whole; longer notes are replaced whole by a link to `CHANGELOG.md` on `release/vV` plus each section heading's entry count. Notes are never truncated mid-way.
+
 The release workflows must publish these four assets:
 
 - `flock-linux-x86_64`

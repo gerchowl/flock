@@ -70,6 +70,9 @@
           inherit flock flock-web flock-client;
           default = flock;
         }
+        // lib.optionalAttrs pkgs.stdenv.hostPlatform.isDarwin {
+          flock-desktop = pkgs.callPackage ./nix/desktop.nix { inherit flock-client; };
+        }
       );
 
       apps = forAllSystems (system: {
@@ -143,6 +146,7 @@
           default = self.checks.${system}.flock;
         }
         // lib.optionalAttrs pkgs.stdenv.hostPlatform.isDarwin {
+          flock-desktop = self.packages.${system}.flock-desktop;
           macos-process-facts = pkgs.runCommand "flock-process-c-toolchain-check" {
             nativeBuildInputs = self.packages.${system}.default.nativeBuildInputs;
             SDKROOT = self.packages.${system}.default.SDKROOT;

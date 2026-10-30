@@ -126,6 +126,18 @@ jobs:
     with:
       leg: ubuntu-latest
 
+  # The Tauri desktop shell's tests (#2477), one reusable-workflow call per
+  # platform like the legs above. They follow `skip_rust`: desktop/ is never
+  # allow-listed in scripts/ci_changes.py, so any change to the shell runs them,
+  # and only docs/web-client-only PRs skip them, visibly, in the gates below.
+  desktop-ubuntu:
+    name: desktop (ubuntu-latest)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.skip_rust != 'true' }}
+    uses: ./.github/workflows/ci-desktop.yml
+    with:
+      leg: ubuntu-latest
+
   # The web client (ADR-0038 G1): lockfile install, bun tests, the fixture
   # screenshots, the strict type check and the Vite build. One platform is
   # enough: the bundle is static assets. It reports as its own `client` check.
@@ -181,6 +193,14 @@ jobs:
       # Batch PRs use head_ref; ref is refs/pull/<number>/merge on PR events.
       run-tests: ${{ github.event_name != 'pull_request' || startsWith(github.head_ref, 'land/') }}
 
+  desktop-macos:
+    name: desktop (macos-15)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.skip_rust != 'true' }}
+    uses: ./.github/workflows/ci-desktop.yml
+    with:
+      leg: macos-15
+
   # The required checks. Branch protection and the landing driver wait on
   # exactly `check (macos-15)` and `check (ubuntu-latest)`, so these keep the
   # names of the single job they replace, and pass only when every job of
@@ -189,7 +209,7 @@ jobs:
   # run the result gate and fail explicitly, rather than permit an untested merge.
   check-ubuntu:
     name: check (ubuntu-latest)
-    needs: [changes, ubuntu, script-tests]
+    needs: [changes, ubuntu, desktop-ubuntu, script-tests]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -237,9 +257,26 @@ jobs:
             exit 1
           fi
 
+      - name: Require the desktop shell tests
+        if: always()
+        env:
+          RESULT: ${{ needs.desktop-ubuntu.result }}
+          SKIP_RUST: ${{ needs.changes.outputs.skip_rust }}
+        run: |
+          # Same rule as the leg: `skipped` passes only when change detection
+          # succeeded and chose to skip; failed, cancelled or missing fails.
+          if [ "$RESULT" = skipped ] && [ "$SKIP_RUST" = true ]; then
+            echo "desktop (ubuntu-latest) skipped: docs/web-only change"
+            exit 0
+          fi
+          if [ "$RESULT" != success ]; then
+            echo "desktop (ubuntu-latest) ended as $RESULT" >&2
+            exit 1
+          fi
+
   check-macos:
     name: check (macos-15)
-    needs: [changes, macos]
+    needs: [changes, macos, desktop-macos]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -274,6 +311,23 @@ jobs:
           fi
           if [ "$RESULT" != success ]; then
             echo "macos-15 leg ended as $RESULT" >&2
+            exit 1
+          fi
+
+      - name: Require the desktop shell tests
+        if: always()
+        env:
+          RESULT: ${{ needs.desktop-macos.result }}
+          SKIP_RUST: ${{ needs.changes.outputs.skip_rust }}
+        run: |
+          # Same rule as the leg: `skipped` passes only when change detection
+          # succeeded and chose to skip; failed, cancelled or missing fails.
+          if [ "$RESULT" = skipped ] && [ "$SKIP_RUST" = true ]; then
+            echo "desktop (macos-15) skipped: docs/web-only change"
+            exit 0
+          fi
+          if [ "$RESULT" != success ]; then
+            echo "desktop (macos-15) ended as $RESULT" >&2
             exit 1
           fi
 
