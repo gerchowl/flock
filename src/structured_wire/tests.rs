@@ -783,7 +783,8 @@ fn node_and_project_contracts_keep_explicit_nulls_and_scoped_identity() {
     let node = crate::mesh::identity::NodeIdentity::fixture([71; 32]).node_id();
     let value = json!({"node_id":node,"name":"Opaque node","health":null,
         "latency_ms":null,"last_ok":null,"version":null,"error":null,
-        "online":false,"route":null,"counts":null,"unbound_configured_peers":null});
+        "online":false,"route":null,"counts":null,"unbound_configured_peers":null,
+        "link_diagnostics":[]});
     let row: FleetNodeRow = serde_json::from_value(value.clone()).unwrap();
     assert_eq!(serde_json::to_value(row).unwrap(), value);
     let cwd = crate::test_support::unique_temp_path("fleet-project");

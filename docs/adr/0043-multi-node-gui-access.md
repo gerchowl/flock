@@ -184,8 +184,11 @@ content-free code/message contract as `FleetNodeError`. These diagnostics are
 independent of the selected path and `online`; a direct `auth_refused` remains
 visible alongside a healthy relay. They update on owner capture, clear after
 direct recovery or removal of the current binding/observation, and are empty
-when no authenticated current direct diagnostic is available. They contain no
-alias, SSH destination, raw stderr, token or payload. Older persisted rows default the array to empty.
+when no authenticated current direct diagnostic is available. The wire field is
+always present: no diagnostics serialize as `"link_diagnostics": []`, never null
+or an omitted field. They contain no alias, SSH destination, raw stderr, token or
+payload. Older persisted rows that omit the field default to an empty array and
+serialize with that explicit array.
 
 **`route`**
 
