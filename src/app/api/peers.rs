@@ -2735,11 +2735,8 @@ mod tests {
         let request = serde_json::from_value(serde_json::json!({
             "id":"bindings", "method":"peers.enrollment", "params":{}}))
         .unwrap();
-        // Drive the owner-loop request seam without draining unrelated timer ticks.
-        // Poll deliveries in these fixtures are advanced explicitly below.
         let response: serde_json::Value =
-            serde_json::from_str(&app.handle_api_request_after_internal_events_drained(request))
-                .unwrap();
+            serde_json::from_str(&app.handle_api_request(request)).unwrap();
         assert!(response.get("error").is_none(), "{response}");
     }
     #[tokio::test]
