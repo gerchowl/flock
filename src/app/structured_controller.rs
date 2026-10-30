@@ -13,6 +13,7 @@ use crate::{
 use std::{collections::HashMap, sync::Arc};
 impl App {
     pub(in crate::app) fn sync_structured_views(&mut self) -> bool {
+        self.poll_native_submissions();
         let wanted: HashMap<String, Target> = self
             .state
             .workspaces
@@ -24,6 +25,13 @@ impl App {
             .collect();
         self.structured_views
             .retain(|id, d| wanted.get(id) == Some(&d.target));
+        self.state.native_editors.retain(|id, e| {
+            self.structured_views
+                .get(id)
+                .is_some_and(|d| d.target == e.target)
+        });
+        self.native_submissions
+            .retain(|id, _| self.state.native_editors.contains_key(id));
         let before = self.state.native_frames.len();
         self.state
             .native_frames
@@ -51,7 +59,13 @@ impl App {
                                 .copied()
                                 .unwrap_or_else(|| crate::cli::output::io_error_code(&err))
                         })?;
+                    let editor = crate::structured::view::editor::EditorState::new(
+                        stream.model.snapshot.target.clone(),
+                        &mut self.state.native_text_revision,
+                    )?;
                     let driver = Driver::new(stream, self.render_notify.clone());
+                    driver.editor(editor.cut.clone())?;
+                    self.state.native_editors.insert(id.clone(), editor);
                     let frame = driver.frame();
                     self.structured_views.insert(id.clone(), driver);
                     frame

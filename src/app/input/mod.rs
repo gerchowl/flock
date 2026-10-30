@@ -28,6 +28,7 @@ mod overlays;
 mod selection;
 mod settings;
 mod sidebar;
+mod structured;
 mod terminal;
 
 use self::modal::{
@@ -177,6 +178,9 @@ impl App {
         if self.state.mode != Mode::Terminal {
             return;
         }
+        if self.refuse_structured_paste() {
+            return;
+        }
         if let Some(rt) = self.terminal_input_runtime() {
             let _ = rt.send_paste(text).await;
         }
@@ -289,6 +293,10 @@ impl App {
                 self.state.drag = None;
                 return;
             }
+        }
+
+        if self.handle_structured_mouse(mouse) {
+            return;
         }
 
         if self.handle_modified_url_click(mouse) {
@@ -691,3 +699,19 @@ fn root_layout_ratio(snapshot: &crate::persist::SessionSnapshot) -> Option<f32> 
 // quietly stops covering the other (#402).
 #[cfg(test)]
 use crate::test_support::{unique_temp_path, wait_for_file_stable};
+
+#[cfg(test)]
+#[tokio::test]
+async fn regression_composer_paste_keeps_float_and_pty_ownership() {
+    let (mut app, mut pane, mut float, _) = app_with_visible_float();
+    app.handle_raw_input_event(crate::raw_input::RawInputEvent::Paste("float-route".into()))
+        .await;
+    assert_eq!(float.try_recv().unwrap().as_ref(), b"float-route");
+    assert!(pane.try_recv().is_err());
+    app.state.hide_active_float();
+    app.handle_raw_input_event(crate::raw_input::RawInputEvent::Paste("pane-route".into()))
+        .await;
+    assert_eq!(pane.try_recv().unwrap().as_ref(), b"pane-route");
+    assert!(float.try_recv().is_err());
+    assert!(app.state.toast.is_none());
+}
