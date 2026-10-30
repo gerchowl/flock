@@ -5,7 +5,7 @@ import type { FleetDelta } from "../../src/gen/FleetDelta";
 import type { JsonValue } from "../../src/gen/serde_json/JsonValue";
 import type { ServerFrame } from "../../src/gen/ServerFrame";
 import type { WireEvent } from "../../src/gen/WireEvent";
-import { WireConnection } from "../../src/wire/connection";
+import { WireConnection, type SnapshotLine } from "../../src/wire/connection";
 import { browserClock, memoryStore, type SocketLike } from "../../src/wire/env";
 
 const [url, token, readerToken, agent, binary, disabled, journal] = process.argv.slice(2);
@@ -69,7 +69,7 @@ const handler = { event(_seq: number, event: WireEvent) { events.push(event); ch
 connection.subscribe(`agent/${agent}`, handler);
 const fleetHandler = { ...handler,
   event(_seq: number, ev: WireEvent) { apply(ev); changed(); },
-  snapshot(values: readonly WireEvent[]) { rows.clear(); for (const value of values) apply(value); changed(); },
+  snapshot(lines: readonly SnapshotLine[]) { rows.clear(); for (const line of lines) apply(line.ev); changed(); },
 };
 function apply(value: WireEvent): void {
   const event = value as FleetDelta;
