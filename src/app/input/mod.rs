@@ -28,6 +28,7 @@ mod overlays;
 mod selection;
 mod settings;
 mod sidebar;
+mod structured;
 mod terminal;
 
 use self::modal::{
@@ -289,6 +290,10 @@ impl App {
                 self.state.drag = None;
                 return;
             }
+        }
+
+        if self.handle_structured_mouse(mouse) {
+            return;
         }
 
         if self.handle_modified_url_click(mouse) {

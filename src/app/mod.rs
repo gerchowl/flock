@@ -57,6 +57,7 @@ pub(crate) mod queue_events;
 mod runtime;
 mod session;
 pub mod state;
+mod structured_actions;
 mod structured_controller;
 mod structured_placement;
 pub(crate) mod structured_view;
@@ -784,6 +785,7 @@ impl App {
 
         let mut state = AppState {
             structured_agents,
+            native_control: None,
             native_frames: HashMap::new(),
             issue_drop: None,
             issue_repo_cache: None,
@@ -900,6 +902,7 @@ impl App {
                 config_diagnostic_lines: Vec::new(),
                 session_warning_lines: Vec::new(),
                 pane_infos: Vec::new(),
+                structured: HashMap::new(),
                 split_borders: Vec::new(),
             },
             drag: None,

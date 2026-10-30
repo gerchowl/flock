@@ -5023,3 +5023,35 @@ and registered placement cause. Keep the registry/worker under normal ownership
 so it remains inspectable and stoppable. CLI/MCP expose the result with exit 1;
 this is not a clean start refusal and must not trigger a fresh start blindly.
 Duplicate placement and invalid membership remain typed preflight refusals.
+
+### Amendment: S10d2 prepared native rendering
+
+Desktop and client-sized mobile geometry prepare S10c's pane from the App-owned
+immutable frame. The prepared pane and its owned hit-to-Intent payloads live in
+that ViewState, so paint and later input share one cut and geometry. Paint checks
+canonical generation and current placement again; stale cuts and source refusals
+produce a typed error tile. Ready and unavailable native members never fall
+through to PTY rendering. This slice wires rendering; input dispatch remains the
+next S10d2 slice and Unicode composer/admission semantics remain S10d3.
+
+### Amendment: S10d2 local control routing
+
+Native keyboard and mouse routing consumes only complete painted S10c controls,
+revalidating the original target generation before dispatch. Tab/Shift-Tab selects
+a painted control and Enter activates it; Ctrl-W detaches without stopping the
+worker. PageUp/PageDown move the source-card anchor and End follows the tail.
+Float input, global bindings, prefix commands and overlays retain precedence.
+Presentation edits reach the Model through a bounded driver channel, never an
+App borrow of the Model. Permission decision intents keep their exact handles;
+UID-only interactive context remains `not_authorized` under S6 until S10e supplies
+the approved capability and Always confirmation. Text/paste editing remains S10d3.
+Submission and inspection completion follow in the next S10d2 child under #1430.
+
+Native input consumes only unmodified left-button presses on painted controls and
+wheel events; other pointer events reach the workspace handler. An active layout
+or sidebar drag always keeps ownership through release, including over native
+content. Keyboard selection highlights the full painted control label. PageDown
+at the following tail is a no-op; End explicitly resumes following from an anchor.
+Collapse and scroll state are per-driver and shared between panes showing the same
+agent, rather than per frontend viewport. Permission decisions remain refused for
+UID-only Operator context without reserving or closing the exact live request.

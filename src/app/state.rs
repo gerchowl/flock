@@ -1307,6 +1307,7 @@ pub struct ViewState {
     /// lie about where it came from.
     pub session_warning_lines: Vec<String>,
     pub pane_infos: Vec<PaneInfo>,
+    pub(crate) structured: HashMap<PaneId, crate::ui::structured::Prepared>,
     pub split_borders: Vec<SplitBorder>,
 }
 
@@ -2253,6 +2254,7 @@ pub struct AppState {
     /// Pane-free agent records and S4 reducers, independent of terminal runtime.
     pub structured_agents: crate::structured::registry::Registry,
     /// Immutable presentation data only; subscriptions and tasks belong to App.
+    pub(crate) native_control: Option<(crate::structured::view::Target, usize)>,
     pub(crate) native_frames: HashMap<String, crate::structured::view::driver::Published>,
     pub terminals:
         std::collections::HashMap<crate::terminal::TerminalId, crate::terminal::TerminalState>,
@@ -3594,6 +3596,7 @@ impl AppState {
             issue_drop: None,
             issue_repo_cache: None,
             structured_agents: crate::structured::registry::Registry::default(),
+            native_control: None,
             native_frames: HashMap::new(),
             terminals: std::collections::HashMap::new(),
             direct_attach_resize_locks: std::collections::HashSet::new(),
@@ -3689,6 +3692,7 @@ impl AppState {
                 config_diagnostic_lines: Vec::new(),
                 session_warning_lines: Vec::new(),
                 pane_infos: Vec::new(),
+                structured: HashMap::new(),
                 split_borders: Vec::new(),
             },
             drag: None,
