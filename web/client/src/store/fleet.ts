@@ -196,7 +196,10 @@ function createFleetStore(source: FleetSource, monotonic: () => number): FleetSt
 
 const stores = new WeakMap<FleetSource, FleetStore>();
 
-/** The store for `source`: every view over one source shares it, so the fleet is subscribed once. */
+/**
+ * The store for `source`: every view over one source shares it, so the fleet is subscribed once.
+ * The store is cached per source, so a later caller's `monotonic` argument is ignored.
+ */
 export function fleetStore(source: FleetSource, monotonic: () => number = () => performance.now()): FleetStore {
   const found = stores.get(source);
   if (found !== undefined) return found;
