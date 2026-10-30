@@ -12,6 +12,27 @@ root = Path(os.environ["HOME"])
 if sys.argv[1:] == ["--version"]:
     print("2.1.296 (Claude Code)")
     sys.exit(0)
+# Composer tests need a ready fake session; queue admission is observed separately.
+if "--model" in sys.argv and sys.argv[sys.argv.index("--model") + 1] == "fixture-worker-model":
+    init = json.loads((root / "restricted-init.json").read_text())
+    init["session_id"] = sys.argv[sys.argv.index("--session-id") + 1]
+    print(json.dumps(init), flush=True)
+    if (root / "native-permission-fixture").exists():
+        for line in sys.stdin:
+            value = json.loads(line)
+            if value.get("type") == "user":
+                print(json.dumps({"type": "control_request", "request_id": "native-request", "request": {
+                    "subtype": "can_use_tool", "tool_name": "Bash", "tool_use_id": "native-tool",
+                    "input": {"command": "fixture input"}}}), flush=True)
+            elif value.get("type") == "control_response":
+                response = value["response"]["response"]
+                print(json.dumps({"type": "assistant", "message": {"role": "assistant", "content": [
+                    {"type": "text", "text": "native-decision:" + response["behavior"]}]}}), flush=True)
+                print(json.dumps({"type": "result", "subtype": "success", "is_error": False,
+                                  "result": "native-complete"}), flush=True)
+    else:
+        sys.stdin.read()
+    sys.exit(0)
 # Explicit test-only model selects partial streaming; ordinary launches bypass this.
 if "--model" in sys.argv and sys.argv[sys.argv.index("--model") + 1].startswith("s10b-live"):
     mode = sys.argv[sys.argv.index("--model") + 1]
@@ -86,6 +107,142 @@ profile = Path(os.environ["CLAUDE_CONFIG_DIR"])
 (profile / "sessions").mkdir(exist_ok=True, mode=0o700)
 (profile / "sessions" / f"{os.getpid()}.json").write_text("{}")
 print(json.dumps({"type": "system", "subtype": "hook_started", "hook_id": "fixture", "hook_name": "fixture", "hook_event": "SessionStart"}), flush=True)
+if model == "s10f-mvp":
+    # Deliberately gated turn: the public TUI must queue until this producer idles.
+    import signal
+    tool = subprocess.Popen([server["command"], *server["args"]],
+                            env=dict(os.environ, **server["env"]),
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    tool.stdin.write(b'{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n')
+    tool.stdin.flush()
+    assert select.select([tool.stdout], [], [], 10)[0], "MCP initialization missing"
+    assert json.loads(tool.stdout.readline())["id"] == 1
+    # This fake MCP descendant deliberately survives stdin EOF. Only flk's
+    # group cleanup may signal it; the model only waits and reaps it.
+    eof_mcp = subprocess.Popen([sys.executable, "-c", """
+import os, signal, sys
+assert os.getpgrp() == int(sys.argv[1])
+os.write(1, b'R')
+while os.read(0, 4096):
+    pass
+os.write(1, b'E')
+signal.pause()
+raise AssertionError('EOF-ignoring MCP unexpectedly resumed')
+""", str(os.getpgrp())], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    assert select.select([eof_mcp.stdout], [], [], 10)[0], "fake MCP readiness missing"
+    assert os.read(eof_mcp.stdout.fileno(), 1) == b"R"
+    cleaning = False
+    active_turn = False
+    def emit(value):
+        print(json.dumps(dict(value, session_id=session)), flush=True)
+    def finish(result="turn complete"):
+        global active_turn
+        active_turn = False
+        emit({"type": "result", "subtype": "success", "is_error": False, "result": result})
+    def begin():
+        global active_turn
+        active_turn = True
+        emit({"type": "command_lifecycle", "command_uuid": "00000000-0000-4000-8000-000000002495", "state": "started"})
+        emit({"type": "stream_event", "api_message_id": "live-turn", "event": {
+            "type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}})
+        emit({"type": "stream_event", "api_message_id": "live-turn", "event": {
+            "type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "streaming-marker"}}})
+    def terminate(_signal, _frame):
+        # TERM can arrive while EOF cleanup is already reaping the group.
+        if not cleaning:
+            raise SystemExit(0)
+    signal.signal(signal.SIGTERM, terminate)
+    listener = socket.socket(socket.AF_UNIX)
+    listener.bind(str(root / "control"))
+    listener.listen(1)
+    init = json.loads((root / "init.json").read_text())
+    init["session_id"] = session
+    print(json.dumps(init), flush=True)
+    emit({"type": "assistant", "message": {"role": "assistant", "content": [
+        {"type": "text", "text": "native-transcript"},
+        {"type": "tool_use", "id": "fixture-tool", "name": "Bash", "input": {"command": "printf tool-card"}}]}})
+    emit({"type": "user", "message": {"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "fixture-tool", "content": "tool-card-result"}]}})
+    with open(root / "ready", "wb", buffering=0) as ready:
+        ready.write(b"R")
+    inputs = []
+    try:
+        listener.settimeout(15)
+        control, _ = listener.accept()
+        control.settimeout(15)
+        with control, control.makefile("rb", buffering=0) as commands:
+            control.sendall((json.dumps({"pid": os.getpid(), "mcp_pid": tool.pid, "eof_mcp_pid": eof_mcp.pid,
+                "stdin_tty": os.isatty(0), "stdout_tty": os.isatty(1),
+                "temporary": str(config_path.parent), "profile": str(profile)}) + "\n").encode())
+            while True:
+                readable, _, _ = select.select([sys.stdin, commands], [], [], 15)
+                assert readable, "acceptance driver stopped servicing the fake"
+                if commands in readable:
+                    line = commands.readline()
+                    if not line:
+                        break
+                    command = json.loads(line)
+                    response = inputs
+                    if command == "finish":
+                        finish()
+                    elif command == "begin":
+                        begin()
+                    elif command in ("permission-deny", "permission-allow"):
+                        assert active_turn, "can_use_tool must belong to a started turn"
+                        emit({"type": "assistant", "message": {"role": "assistant", "content": [
+                            {"type": "tool_use", "id": command, "name": "Bash", "input": {"command": "true"}}]}})
+                        emit({"type": "control_request", "request_id": command, "request": {
+                            "subtype": "can_use_tool", "tool_name": "Bash", "tool_use_id": command,
+                            "input": {"command": "true"}, "requires_user_interaction": True,
+                            "permission_suggestions": []}})
+                    elif command == "mcp-eof":
+                        eof_mcp.stdin.close()
+                        assert select.select([eof_mcp.stdout], [], [], 10)[0], "fake MCP never saw EOF"
+                        assert os.read(eof_mcp.stdout.fileno(), 1) == b"E"
+                        assert eof_mcp.poll() is None, "fake MCP exited on EOF"
+                        response = {"eof_ignored": True, "pid": eof_mcp.pid}
+                    else:
+                        assert command == "inspect", command
+                    control.sendall((json.dumps(response) + "\n").encode())
+                if sys.stdin in readable:
+                    line = sys.stdin.readline()
+                    if not line:
+                        break
+                    value = json.loads(line)
+                    inputs.append(value)
+                    if value["type"] == "user":
+                        text = "".join(b.get("text", "") for b in value["message"]["content"])
+                        answer = "composer-answer" if "composer-message" in text else "shell-answer"
+                        emit({"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": answer}]}})
+                        finish()
+                    else:
+                        assert value["type"] == "control_response", value
+                        decision = value["response"]["response"]["behavior"]
+                        request = value["response"]["request_id"]
+                        assert request == "permission-" + decision, value
+                        text = "allowed-tool-result" if decision == "allow" else "permission-deny-reported"
+                        emit({"type": "user", "message": {"role": "user", "content": [
+                            {"type": "tool_result", "tool_use_id": request, "content": text, "is_error": decision == "deny"}]}})
+                        if decision == "allow":
+                            emit({"type": "assistant", "message": {"role": "assistant", "content": [
+                                {"type": "text", "text": "permission-allow-resumed"}]}})
+                        emit({"type": "assistant", "message": {"role": "assistant", "content": [
+                            {"type": "text", "text": request + "-complete"}]}})
+                        finish(request + "-complete")
+    finally:
+        cleaning = True
+        listener.close()
+        tool.stdin.close()
+        mcp_exit = tool.wait(timeout=10)
+        tool.stdout.close()
+        if not eof_mcp.stdin.closed:
+            eof_mcp.stdin.close()
+        eof_mcp_exit = eof_mcp.wait(timeout=10)
+        eof_mcp.stdout.close()
+        error = sys.exc_info()[1]
+        model_exit = error.code if isinstance(error, SystemExit) else (0 if error is None else 1)
+        (root / "stopped.json").write_text(json.dumps({"model_exit": model_exit, "mcp_exit": mcp_exit, "eof_mcp_exit": eof_mcp_exit}))
+    sys.exit(0)
 if model == "dogfood-parent":
     env = dict(os.environ, **server["env"])
     tool = subprocess.Popen([server["command"], *server["args"]], env=env,

@@ -166,16 +166,17 @@ fn run_pr_poll_round(
     })
 }
 
-/// Local-operator evidence borrowed from the classified API request.
-/// Only this dispatcher can construct it; it cannot outlive or mutate its caller.
+/// Local-operator evidence borrowed from a classified API request or sealed TUI peer.
+/// Only this module can construct it; it cannot outlive or mutate its caller.
 pub(crate) struct LocalOperator<'a> {
     _app: &'a mut App,
+    peer: crate::platform::peer::Credentials,
 }
 
 impl LocalOperator<'_> {
     /// Accepted kernel evidence from this proof's connection, never a caller argument.
     pub(crate) fn peer_credentials(&self) -> crate::platform::peer::Credentials {
-        self._app.api_peer_credentials()
+        self.peer
     }
 }
 
@@ -194,7 +195,16 @@ impl App {
         if !self.caller_is_local_operator() {
             return Err(crate::api::error_code::ErrorCode::OperatorOnly);
         }
-        Ok(LocalOperator { _app: self })
+        let peer = self.api_peer_credentials();
+        Ok(LocalOperator { _app: self, peer })
+    }
+
+    /// Reuse sealed transport admission for a TUI attach, without replacing API scope.
+    pub(crate) fn native_client_authority(&mut self, peer: &super::LocalPeer) -> LocalOperator<'_> {
+        LocalOperator {
+            peer: peer.credentials(),
+            _app: self,
+        }
     }
 
     /// Arm and spawn a transcript read for `pane_id` at the currently

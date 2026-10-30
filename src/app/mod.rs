@@ -48,6 +48,8 @@ pub(crate) mod issue_drop;
 pub(crate) mod line_editor;
 pub(crate) mod mailboxes;
 pub(crate) mod message_relay;
+mod native_auth;
+mod native_submission;
 pub(crate) mod notification_panel;
 pub(crate) mod notifications;
 pub(crate) mod owners;
@@ -57,6 +59,7 @@ pub(crate) mod queue_events;
 mod runtime;
 mod session;
 pub mod state;
+mod structured_actions;
 mod structured_controller;
 mod structured_placement;
 pub(crate) mod structured_view;
@@ -215,6 +218,8 @@ pub struct App {
     pub(crate) runtime_config: AppRuntimeConfig,
     /// Shared, in-memory one-time browser handoffs, never persisted across restart.
     pub(crate) client_codes: crate::client_open::Codes,
+    native_clients: native_auth::Clients,
+    native_input_client: Option<u64>,
     pub(crate) client_auth: crate::structured::permissions::auth::tokens::server::Owner,
     pub state: AppState,
     pub(crate) terminal_runtimes: crate::terminal::TerminalRuntimeRegistry,
@@ -400,6 +405,7 @@ pub struct App {
     pub(crate) input_writes: input_writes::InputWrites,
     directory_snapshot: directory::DirectorySnapshot,
     pub(crate) structured_workers: crate::structured::workers::Workers,
+    native_submissions: HashMap<String, native_submission::Submission>,
     structured_views: HashMap<String, crate::structured::view::driver::Driver>,
     queue_events: queue_events::QueueEvents,
     pub(crate) structured_sends: api::structured_queue::Sends,
@@ -784,6 +790,9 @@ impl App {
 
         let mut state = AppState {
             structured_agents,
+            native_control: None,
+            native_editors: HashMap::new(),
+            native_text_revision: 0,
             native_frames: HashMap::new(),
             issue_drop: None,
             issue_repo_cache: None,
@@ -900,6 +909,7 @@ impl App {
                 config_diagnostic_lines: Vec::new(),
                 session_warning_lines: Vec::new(),
                 pane_infos: Vec::new(),
+                structured: HashMap::new(),
                 split_borders: Vec::new(),
             },
             drag: None,
@@ -1139,6 +1149,8 @@ impl App {
             pending_agent_removals: Default::default(),
             client_codes: Default::default(),
             client_auth: Default::default(),
+            native_clients: Default::default(),
+            native_input_client: None,
             delegations: Default::default(),
             goals: Default::default(),
             owner_policies: Default::default(),
@@ -1162,6 +1174,7 @@ impl App {
             input_writes: input_writes::InputWrites::default(),
             directory_snapshot: directory::DirectorySnapshot::default(),
             structured_workers: crate::structured::workers::Workers::new(render_notify.clone()),
+            native_submissions: HashMap::new(),
             structured_views: HashMap::new(),
             queue_events: queue_events::QueueEvents::default(),
             structured_sends: api::structured_queue::Sends::default(),

@@ -678,3 +678,58 @@ async fn cancelled_opening_cannot_hide_initialization_before_its_next_poll() {
     drain(&mut s).await;
     assert_eq!(s.ended, [true; 3]);
 }
+
+#[tokio::test]
+async fn driver_page_down_at_tail_preserves_follow_mode() {
+    use crate::structured::view::{contracts::Action, driver::Driver};
+    let (_app, _case, mut stream) = fixture("s10b-live-lifecycle-exit").await;
+    drain(&mut stream).await;
+    let card = stream.model.snapshot.transcript[0].id;
+    let folded = stream.model.snapshot.collapsed.contains(&card);
+    let wake = Arc::new(Notify::new());
+    let driver = Driver::new(stream, wake.clone());
+    assert!(driver.frame().unwrap().scroll_anchor.is_none());
+    driver.control(Action::ScrollLines(1)).unwrap();
+    driver.control(Action::ToggleFold(card)).unwrap();
+    // FIFO sentinel proves the preceding scroll was applied, even when it is a no-op.
+    wait(&wake, || {
+        driver
+            .frame()
+            .is_ok_and(|f| f.collapsed.contains(&card) != folded)
+    })
+    .await;
+    assert!(
+        driver.frame().unwrap().scroll_anchor.is_none(),
+        "PageDown while following must not pin an anchor"
+    );
+}
+
+#[tokio::test]
+async fn driver_whitelist_and_full_channel_fail_closed() {
+    use crate::structured::view::{
+        contracts::{Action, Composer},
+        driver::Driver,
+    };
+    let (_app, _case, stream) = fixture("s10b-live-lifecycle-exit").await;
+    let driver = Driver::new(stream, Arc::new(Notify::new()));
+    for action in [
+        Action::Close,
+        Action::Stop,
+        Action::Resume,
+        Action::Send(Composer {
+            text: "never input".into(),
+            cursor: 0,
+            text_revision: 0,
+        }),
+    ] {
+        assert_eq!(driver.control(action), Err(ErrorCode::RuntimeUnsupported));
+    }
+    // Current-thread runtime: no await lets the consumer drain any of these slots.
+    for _ in 0..32 {
+        assert_eq!(driver.control(Action::FollowTail), Ok(()));
+    }
+    assert_eq!(
+        driver.control(Action::FollowTail),
+        Err(ErrorCode::SessionBusy)
+    );
+}
