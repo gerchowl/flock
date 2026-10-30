@@ -271,7 +271,9 @@ fn status_and_mode_have_explicit_display_labels() {
     assert!(rendered.contains("Status: needs human | turn: unknown | bg: running (3)"));
 }
 
-// Derive button rectangles from painted cells independently of the computed hit map.
+/// Verify exact button spans and one typed region target from independent paint evidence.
+/// Composer Focus alone may cover its visible preview: that box is the affordance.
+/// Its complete prepared paint rectangle must match; every other hit stays a button.
 fn assert_painted_buttons(b: &Buffer, pane: &Pane) -> Vec<String> {
     // This independent oracle recognizes the authored labels, not arbitrary brackets.
     const BUTTONS: &[&str] = &[
@@ -289,6 +291,32 @@ fn assert_painted_buttons(b: &Buffer, pane: &Pane) -> Vec<String> {
         "[Details]",
         "[Expand]",
     ];
+    use crate::structured::view::editor::Edit;
+    // These are the actual rectangles passed to Paragraph, not hit-derived geometry.
+    let mut composer_paint = pane.panels[2].test_painted_areas();
+    let preview =
+        composer_paint
+            .next()
+            .zip(composer_paint.next())
+            .and_then(|(preview, admission)| {
+                (preview.width > 0
+                    && preview.height > 0
+                    && admission.height > 0
+                    && b.area.intersection(preview) == preview
+                    && b[(preview.x, preview.y)].symbol() == ">")
+                    .then_some(preview)
+            });
+    let region_targets = [(Action::EditComposer(Edit::Focus), preview)];
+    let same_region_action = |expected: &Action, actual: &Action| {
+        matches!(
+            (expected, actual),
+            (
+                Action::EditComposer(Edit::Focus),
+                Action::EditComposer(Edit::Focus)
+            )
+        )
+    };
+    let mut painted_buttons = vec![];
     let mut painted = std::collections::BTreeSet::new();
     let mut labels = vec![];
     for y in b.area.y..b.area.bottom() {
@@ -323,9 +351,48 @@ fn assert_painted_buttons(b: &Buffer, pane: &Pane) -> Vec<String> {
             let expected: Vec<_> = (rect.x..rect.right()).map(|x| (x, y)).collect();
             assert_eq!(matching, expected, "painted/hit rectangle for {label}");
             painted.extend(expected);
+            painted_buttons.push((rect, action));
             labels.push(label.to_owned());
             offset = end;
         }
+    }
+    let registered: Vec<_> = pane
+        .panels
+        .iter()
+        .flat_map(Panel::test_hits)
+        .chain(pane.transcript.test_hits())
+        .map(|(rect, action)| (*rect, action))
+        .collect();
+    for (target, expected) in &region_targets {
+        let actual: Vec<_> = registered
+            .iter()
+            .filter(|(_, action)| same_region_action(target, action))
+            .map(|(rect, _)| *rect)
+            .collect();
+        assert_eq!(
+            actual,
+            expected.iter().copied().collect::<Vec<_>>(),
+            "painted region/hit rectangle"
+        );
+        if let Some(rect) = expected {
+            painted.extend(
+                (rect.y..rect.bottom()).flat_map(|y| (rect.x..rect.right()).map(move |x| (x, y))),
+            );
+        }
+    }
+    for (rect, action) in registered {
+        let region = region_targets.iter().any(|(target, expected)| {
+            *expected == Some(rect) && same_region_action(target, action)
+        });
+        let button = painted_buttons
+            .iter()
+            .any(|(painted_rect, painted_action)| {
+                *painted_rect == rect && std::ptr::eq(*painted_action, action)
+            });
+        assert!(
+            region || button,
+            "unpainted or untyped registered hit {rect:?}"
+        );
     }
     for y in b.area.y..b.area.bottom() {
         for x in b.area.x..b.area.right() {
@@ -337,6 +404,34 @@ fn assert_painted_buttons(b: &Buffer, pane: &Pane) -> Vec<String> {
         }
     }
     labels
+}
+
+#[test]
+fn painted_region_oracle_rejects_stray_unknown_and_unpainted_targets() {
+    use crate::structured::view::editor::Edit;
+    for case in 0..3 {
+        let (b, mut pane) = draw(&snapshot(), 100, 50);
+        assert_painted_buttons(&b, &pane);
+        let preview = pane.panels[2].test_painted_areas().next().unwrap();
+        let bad_rect = if case == 2 {
+            pane.panels[2] = Panel::default();
+            preview
+        } else {
+            Rect::new(0, 0, 1, 1)
+        };
+        let action = if case == 1 {
+            Action::Stop
+        } else {
+            Action::EditComposer(Edit::Focus)
+        };
+        pane.panels[2].test_add_hit(bad_rect, action);
+        let mut terminal = Terminal::new(TestBackend::new(100, 50)).unwrap();
+        terminal.draw(|frame| pane.render(frame)).unwrap();
+        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert_painted_buttons(terminal.backend().buffer(), &pane)
+        }));
+        assert!(rejected.is_err(), "stray target accepted in case {case}");
+    }
 }
 
 #[test]
