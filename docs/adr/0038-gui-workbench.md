@@ -815,9 +815,10 @@ one-time code (single use, 60 s) and opens the loopback URL with the code in the
 
 **Load.** A page load with a stored principal and no code to exchange tries to
 restore, under one **restore deadline** of 10 s from page load (its own
-value, which does not follow the connect deadline). Within it, the tab computes the database name, takes the shared
-lock, opens the database and reads every stream's record in one readonly
-transaction, alongside Connecting. Each load ends in exactly one row below. A
+value, which does not follow the connect deadline). Within it, the tab
+computes the database name, takes the shared lock, opens the database and
+reads every stream's record in one readonly transaction, alongside
+Connecting. Each load ends in exactly one row below. A
 `welcome` with the stored principal changes nothing while the restore runs: its
 streams wait, and are not Current. The progress deadline starts only when a
 `sub` is sent, so the wait does not use it up. A `welcome` with another
@@ -908,14 +909,17 @@ another.
   uses "uncertain" in two senses, neither of them a seventh state: the ack
   deadline passing, which is the client's `uncertain` state, and a resume-only
   lookup the server refuses "as uncertain" (`session_unconfirmed`, or an absent
-  or expired key), which makes the command `unknown_outcome`, as in the `sent`
-  row.
+  or expired key), which makes the command `unknown_outcome`, as **Acks to a
+  resend** (below) says for every error ack to a resend.
 - **Window expiry runs in every connection state.** For each `sent` or
   `uncertain` command, the client checks its age against `idempotency_window_ms`
   (from the last `welcome`, persisted with the outbox) in every connection
   state: Connecting, Hello, Syncing, Live, ReadOnly, Stale, Reconnecting,
   NeedsToken, and after a user `disconnect`. It does not check only when a
-  resend would go out. A command is expired when its age is **at least**
+  resend would go out. The one exception is a reloaded outbox with no stored
+  window: there is nothing to check against until the first `welcome`
+  (**Age and clocks**, below), so until then the command keeps its restored
+  state. A command is expired when its age is **at least**
   `idempotency_window_ms` (age ≥ window, where age is measured from its first
   send). Age is evaluated at the instant of each event that could change the
   command, such as the actual reconnect attempt or the `welcome` that follows
@@ -959,7 +963,7 @@ another.
   auth, rate or version refusal before the lookup) proves nothing about the
   original. Only `failed` would claim that the command did not run, so the
   client never infers it from a resend. A first send's error ack is still
-  `failed`, because nothing ran before it.
+  `failed`, because it reports that send's own outcome.
 - **Age and clocks.** Each record stores its first-send time as wall-clock
   milliseconds (`first_sent_ms`), and the outbox stores the
   `idempotency_window_ms` of the latest `welcome`. A later `welcome` replaces
@@ -970,7 +974,10 @@ another.
   time minus `first_sent_ms`. A restored `sent` or `uncertain` command's age
   **cannot be established**, and it becomes `unknown_outcome` at once, without
   a resend, when its `first_sent_ms` is missing or not a finite number, or when
-  `first_sent_ms` lies in the future (the wall clock moved back). A missing
+  `first_sent_ms` lies in the future (the wall clock moved back). That test
+  runs at restore and again at every later age check in the reloaded page, so
+  a wall clock that moves back later also makes the command `unknown_outcome`.
+  A missing
   window is not a missing age. With no window stored and none received since
   the reload, the expiry check waits for the first `welcome`, whose window
   applies. That `welcome` is checked before any resend, because a resend goes
@@ -990,8 +997,9 @@ another.
   event carries the command's `cmd_id` (#1677).
 - **Answers are atomic.** An answer to a question or a permission prompt is the
   server's atomic verify-then-apply (ADR-0011 §6: same question id, index not
-  text). A stale answer comes back as `failed` with the question's current
-  state.
+  text). A stale answer to a first send comes back as `failed` with the
+  question's current state. A resent answer that gets an error ack is
+  `unknown_outcome` (**Acks to a resend**).
 
 ### 4. The render flow
 
