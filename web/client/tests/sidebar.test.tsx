@@ -161,6 +161,16 @@ describe("the scope toggle", () => {
     expect(rowIds(second)).toEqual([]);
   });
 
+  test("storage that throws on read and write leaves the defaults, and the sidebar renders", async () => {
+    const storage = { getItem: () => { throw new Error("denied"); }, setItem: () => { throw new Error("quota"); } };
+    const store = createSidebarStore({ serverKey: "s", storage });
+    expect(store.load()).toEqual(DEFAULT_SIDEBAR);
+    expect(() => store.save({ scope: "node", collapsed: ["tree:fleet"] })).not.toThrow();
+    const root = await mount({ prefs: store.load() });
+    expect(button(root, "All nodes").getAttribute("aria-pressed")).toBe("true");
+    expect($$(root, "agent-row").length).toBe(6);
+  });
+
   test("an unreadable stored record falls back to the defaults", () => {
     const storage = { getItem: () => '{"version":1,"prefs":{"scope":"mars","collapsed":[]}}', setItem() {} };
     expect(createSidebarStore({ serverKey: "s", storage }).load()).toEqual(DEFAULT_SIDEBAR);
@@ -252,6 +262,35 @@ describe("node status badges", () => {
     expect($(node(offline, "node-b"), "node-counts")?.getAttribute("data-stale")).toBe("true");
     expect($(node(offline, "node-b"), "node-version")?.textContent).toBe("last v2.1.0");
     expect($(node(offline, "node-a"), "node-version")).toBeNull();
+  });
+
+  test("a node that goes offline keeps its latency, marked stale", async () => {
+    const root = await mount({ nodes: [{ ...HOME, latency_ms: 12 }, { ...REMOTE, online: false, route: null, latency_ms: 340 }] });
+    expect($(node(root, "node-a"), "node-latency")?.textContent).toBe("12 ms");
+    expect($(node(root, "node-a"), "node-latency")?.getAttribute("data-stale")).toBeNull();
+    expect($(node(root, "node-b"), "node-latency")?.textContent).toBe("last 340 ms (stale)");
+    expect($(node(root, "node-b"), "node-latency")?.getAttribute("data-stale")).toBe("true");
+    expect($(root, "node-latency")?.textContent).toBe("12 ms");
+  });
+
+  test("a row received between ticks is aged from its own receipt, on one clock for store and view", async () => {
+    const real = performance.now;
+    let t = 1_000;
+    performance.now = () => t;
+    try {
+      let observer!: FleetObserver;
+      const source: FleetSource = { subscribe: (each) => ((observer = each), queueMicrotask(() => each.snapshot([{ op: "upsert", kind: "node", row: HOME, tsMs: SENT }])), () => undefined) };
+      const root = document.createElement("div");
+      document.body.append(root);
+      dispose = render(() => <Workbench fleet={source} transport={createFixtureTransport("")} inbox={[]} sender={null} layout={emptyLayout()} saveLayout={() => undefined} mode="desktop" source="replay" />, root);
+      await tick();
+      // No tick of the view's 30 s timer has fired; the clock moved 20 s before the row arrived.
+      t = 21_000;
+      observer.change({ op: "upsert", kind: "node", row: { ...REMOTE, last_ok: SENT - 60_000 }, tsMs: SENT });
+      expect($(node(root, "node-b"), "node-seen")?.textContent).toBe("seen 1m ago");
+    } finally {
+      performance.now = real;
+    }
   });
 
   test("health and latency go in the tooltip, and only what was supplied", async () => {

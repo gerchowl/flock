@@ -45,7 +45,7 @@ export type WorkbenchProps = {
   /** The sidebar's saved scope and collapsed groups, and where to save changes; stored beside the layout. */
   readonly sidebar?: SidebarPrefs | undefined;
   readonly saveSidebar?: ((prefs: SidebarPrefs) => void) | undefined;
-  /** A monotonic clock in ms that node age is read against; it must be reactive. Defaults to `performance.now()`, refreshed every 30 s. */
+  /** A monotonic clock in ms that node age is read against; it must be reactive. Defaults to `performance.now()`, re-read every 30 s and when a node row changes. */
   readonly now?: (() => number) | undefined;
   /** A connection status line for the top bar, if any. */
   readonly status?: () => string | null;
@@ -70,7 +70,9 @@ export function Workbench(props: WorkbenchProps): JSX.Element {
   const composer = createComposerState();
   // The fleet store owns the agents (ADR-0038 §3): the sidebar, palette and permission tracker read its one record.
   const permissions = props.source === "live" ? createPermissionInbox(props.transport) : null;
-  const fleet = fleetStore(props.fleet, () => props.now?.() ?? performance.now()).read();
+  // One monotonic clock stamps a node row's receipt (the store) and reads its age (the view).
+  const clock = props.now ?? ((): number => performance.now());
+  const fleet = fleetStore(props.fleet, clock).read();
   const rows = fleet.agents.items;
   onCleanup(fleet.release);
   createEffect(() => permissions?.track(rows()));
@@ -79,12 +81,13 @@ export function Workbench(props: WorkbenchProps): JSX.Element {
     setPrefsSignal(next);
     props.saveSidebar?.(next);
   };
-  const [wall, setWall] = createSignal(performance.now());
+  const [tick, setTick] = createSignal(0);
   if (props.now === undefined) {
-    const timer = setInterval(() => setWall(performance.now()), 30_000);
+    const timer = setInterval(() => setTick((count) => count + 1), 30_000);
     onCleanup(() => clearInterval(timer));
   }
-  const now = (): number => props.now?.() ?? wall();
+  // Re-read on a tick and whenever a node row changes, so a row received between ticks is never aged against an older clock reading.
+  const now = (): number => (tick(), fleet.nodes.items(), clock());
   const home = createMemo(() => homeNodeId(fleet.nodes.items()));
   // Agents in scope: the summary, the palette and the phone list count these; the trees group them.
   const scoped = createMemo(() => rows().filter((row) => inScope(prefs().scope, home(), row.nodeId)));

@@ -63,6 +63,9 @@ export function NodeStatus(props: { readonly node: FleetNodeRow; readonly stamp:
       <span data-testid="node-seen">{seen()}</span>
       <Show when={props.node.error}>{(error) => <span class="node-status__error" data-testid="node-error">{error().code}: {error().message}</span>}</Show>
       <span data-testid="node-counts" data-stale={props.node.online ? undefined : "true"}>{counts()}{props.node.online ? "" : " (stale)"}</span>
+      <Show when={props.node.latency_ms !== null}>
+        <span data-testid="node-latency" data-stale={props.node.online ? undefined : "true"}>{props.node.online ? "" : "last "}{props.node.latency_ms} ms{props.node.online ? "" : " (stale)"}</span>
+      </Show>
       <Show when={props.node.version}>{(version) => <span data-testid="node-version">{props.node.online ? "" : "last "}v{version()}</span>}</Show>
     </span>
   );
