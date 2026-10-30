@@ -108,6 +108,17 @@ pub(crate) fn client_exchange_failed(
     tracing::warn!(event = "client.exchange.internal_failure", subsystem = "structured_client", reason, io_kind = ?io_kind, "browser credential exchange unavailable");
 }
 
+/// Once per listener startup, report positive absence rather than hiding a failed probe.
+#[cfg(feature = "web")]
+pub(crate) fn client_tailscale_not_installed(checked_paths: &str) {
+    tracing::info!(
+        event = "client.listener.tailscale_not_installed",
+        subsystem = "structured_client",
+        checked_paths,
+        "Tailscale forwarding check skipped because Tailscale is not installed"
+    );
+}
+
 /// Report secondary listener cleanup errors without replacing the primary server failure.
 #[cfg(feature = "web")]
 pub(crate) fn client_listener_shutdown_failed(error: &std::io::Error) {

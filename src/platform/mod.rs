@@ -4,6 +4,8 @@
 //! modules don't scatter `#[cfg]` branches through product logic.
 
 pub(crate) mod client_listener;
+#[cfg(feature = "web")]
+pub(crate) mod tailscale;
 mod url;
 pub use url::{open_url, validate_url, OpenUrlError};
 
