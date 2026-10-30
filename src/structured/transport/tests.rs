@@ -2955,10 +2955,83 @@ fn disconnected_acceptance_observer_requests_stop_without_admitting_bytes() {
     assert!(!handle.input_inflight());
 }
 
+// The replay cursor precedes the audit, but includes the raw control request.
+// Validate the independently authored handles before driving a real producer.
+fn permission_fixture_cut(script: &[Value]) -> u64 {
+    let cursors = script[0]["cursors"]
+        .as_object()
+        .expect("fixture replay cursors");
+    assert_eq!(
+        cursors.len(),
+        1,
+        "permission fixture must declare one stream"
+    );
+    let cut = cursors.values().next().unwrap().as_u64().unwrap();
+    assert!(
+        cut > 0,
+        "permission fixture must include its raw control request"
+    );
+    let mut audits = 0;
+    for line in script {
+        let frame = &line["frame"];
+        if frame["ev"]["type"] == "flk_permission_request" {
+            audits += 1;
+            assert_eq!(
+                frame["ev"]["request_seq"], cut,
+                "permission fixture handle drift: request_seq must equal the declared replay cut"
+            );
+            assert_eq!(
+                frame["seq"],
+                cut + audits,
+                "permission fixture sequence drift: audits must immediately follow the replay cut"
+            );
+        }
+    }
+    assert_eq!(
+        audits, 2,
+        "permission fixture must declare open and close audits"
+    );
+    cut
+}
+
+#[test]
+#[should_panic(expected = "permission fixture handle drift")]
+fn permission_fixture_rejects_handle_drift_before_producing() {
+    let mut script: Vec<Value> =
+        include_str!("../../../web/client/test/fixtures/wire/permission-decision.jsonl")
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+    let open = script
+        .iter_mut()
+        .find(|line| line["frame"]["ev"]["state"] == "open")
+        .unwrap();
+    let original = open["frame"]["ev"]["request_seq"].as_u64().unwrap();
+    open["frame"]["ev"]["request_seq"] = (original + 1).into();
+    permission_fixture_cut(&script);
+}
+
 #[test]
 fn stored_permission_pair_replays_as_known_events() {
     let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+    let script: Vec<Value> =
+        include_str!("../../../web/client/test/fixtures/wire/permission-decision.jsonl")
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+    let cut = permission_fixture_cut(&script);
     let (transport, mut output, mut input) = start(&root);
+    // Reproduce the durable prefix declared by the script's initial replay cursor.
+    // The raw control request occupies the cut, immediately before its open audit.
+    for seq in 1..cut {
+        writeln!(
+            output,
+            "{}",
+            serde_json::json!({"type":"system","subtype":"status"})
+        )
+        .unwrap();
+        assert_eq!(receive(&transport).record.seq, seq);
+    }
     permission(&mut output, "typed-request");
     receive(&transport);
     receive(&transport);
@@ -2978,12 +3051,11 @@ fn stored_permission_pair_replays_as_known_events() {
         })
         .collect();
     assert_eq!(audits.len(), 2);
-    let examples: Vec<Value> =
-        include_str!("../../../web/client/test/fixtures/wire/permission-decision.jsonl")
-            .lines()
-            .map(|line| serde_json::from_str::<Value>(line).unwrap())
-            .filter_map(|line| line.get("frame").and_then(|frame| frame.get("ev")).cloned())
-            .collect();
+    assert_eq!(seq, cut, "producer did not reach the fixture replay cut");
+    let examples: Vec<Value> = script
+        .iter()
+        .filter_map(|line| line.get("frame").and_then(|frame| frame.get("ev")).cloned())
+        .collect();
     assert_eq!(examples.len(), 2);
     for (record, example) in audits.into_iter().zip(examples) {
         assert_eq!(

@@ -12,11 +12,12 @@
  *
  * @module
  */
-import { For, Show, createMemo, createSignal, onCleanup, type JSX } from "solid-js";
+import { For, Show, createEffect, createMemo, createSignal, onCleanup, type JSX } from "solid-js";
 
-import type { AgentRow, FleetSource } from "../fleet";
+import type { FleetSource } from "../fleet";
 import { createManager, type Layout } from "../layout/model";
 import { isPhone, type Mode } from "../layout/phone";
+import { fleetStore } from "../store/fleet";
 import type { Transport } from "../transport";
 import { Transcript, type TranscriptSource } from "../views/Transcript";
 import type { InboxCard } from "./inbox";
@@ -59,27 +60,22 @@ export function Workbench(props: WorkbenchProps): JSX.Element {
   onCleanup(() => window.removeEventListener("resize", onResize));
   const phone = createMemo(() => isPhone(props.mode ?? "auto", width()));
   const composer = createComposerState();
-  const [rows, setRows] = createSignal<readonly AgentRow[]>([]);
-  const [fleetNote, setFleetNote] = createSignal<string | null>("Loading the agent list…");
-  // Live, the inbox is the open permission prompts the fleet lists; fixture mode keeps its samples.
+  // The fleet store owns the agents (ADR-0038 §3): the sidebar, palette and permission tracker read its one record.
   const permissions = props.source === "live" ? createPermissionInbox(props.transport) : null;
+  const fleet = fleetStore(props.fleet).read();
+  const rows = fleet.agents.items;
+  onCleanup(fleet.release);
+  createEffect(() => permissions?.track(rows()));
+  const fleetNote = createMemo((): string | null => {
+    const progress = fleet.agents.progress();
+    if (progress.phase === "failed") return progress.message;
+    if (progress.phase === "loading") return "Loading the agent list…";
+    return rows().length === 0 ? "No agents on this server yet." : null;
+  });
+  // Live, the inbox is the open permission prompts the fleet lists; fixture mode keeps its samples.
   onCleanup(() => permissions?.close());
   const cards = (): readonly InboxCard[] => permissions?.cards() ?? props.inbox;
   const closed = createClosedIds(cards);
-  onCleanup(
-    props.fleet.subscribe({
-      rows: (next) => {
-        setRows(next);
-        setFleetNote(next.length === 0 ? "No agents on this server yet." : null);
-        permissions?.track(next);
-      },
-      failed: (message) => {
-        setRows([]);
-        setFleetNote(message);
-        permissions?.track([]);
-      },
-    }),
-  );
   const [layout, setLayout] = createSignal<Layout>(structuredClone(props.layout));
   const manager = createManager(structuredClone(props.layout));
   const publish = (): void => {

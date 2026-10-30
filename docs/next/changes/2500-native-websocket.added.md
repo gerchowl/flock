@@ -1,2 +1,0 @@
-- Web-enabled servers expose the existing structured WebSocket protocol on a private sibling Unix socket, with kernel-verified local operator admission and process-bound app bearers. TCP app-session hellos are refused with `peer_process_changed`; browser credentials retain their existing scopes.
-- Valid browser hellos wait for concurrent token management within the existing five-second handshake deadline, on both TCP and Unix transports.
