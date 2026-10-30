@@ -23,7 +23,7 @@ import { Harness, parseScript } from "./wire/harness";
 
 const SCRIPTS = `${import.meta.dir}/../test/fixtures/wire`;
 
-/** The scripts G3a (#1747) replays. */
+/** The scripts G3a (#1747) and G3b (#1595) so far replay. */
 const REPLAYED = [
   "agent-gap",
   "agent-send",
@@ -57,13 +57,21 @@ const REPLAYED = [
   "token-refused",
   "token-revoked",
   "unknown-subscription",
+  "version-gap",
 ];
+
+/**
+ * Scripts that play a client newer than this one, with the protocol their
+ * `hello` names; every other script runs the client's own `WIRE_PROTOCOL`.
+ */
+const NEWER_CLIENT: { readonly [script: string]: number } = {
+  "version-gap": 2,
+};
 
 /** Left to G3 #1595 (G3b), with the feature each one needs. */
 const G3B: { readonly [script: string]: string } = {
   "restored-resync": "persisted resync markers",
   "subfail-operator_only": "operator_only (not emitted by S7-min)",
-  "version-gap": "ReadOnly",
   "uncertain-command": "resume-only resends and unknown_outcome",
   "restored-outbox-status": "resume-only resends and unknown_outcome",
   "outbox-window-expiry-connecting": "window expiry",
@@ -111,9 +119,11 @@ describe("S7a scripts", () => {
     for (const [jitter, random] of Object.entries(JITTER)) {
       test(`${name} (${jitter} jitter)`, async () => {
         const steps = await load(name);
-        if (steps.some((line) => line.step === "send" && line.frame.t === "ev" && typeof line.frame.ts_ms !== "number")) {
+        if (steps.some((line) => line.step === "send" && line.frame.t === "welcome" && typeof line.frame.server_version !== "string")) {
+          expect(() => new Harness(random).run(steps)).toThrow("dynamic build version requires compiled metadata oracle");
+        } else if (steps.some((line) => line.step === "send" && line.frame.t === "ev" && typeof line.frame.ts_ms !== "number")) {
           expect(() => new Harness(random).run(steps)).toThrow("dynamic timestamp requires persisted and wall-window oracles");
-        } else new Harness(random).run(steps);
+        } else new Harness(random, NEWER_CLIENT[name]).run(steps);
       });
     }
   }
@@ -191,4 +201,25 @@ test("permission script assigns one valid principal per scripted token", async (
   expect(observations).toBe(2);
   expect([...identities].map(([token, principals]) => [token, [...principals]]))
     .toEqual([["fixture-token", ["0123456789abcdef0123456789abcdef"]]]);
+});
+
+// The real endpoint must issue this exact principal; no received-frame normalization.
+test("protocol trace uses a valid literal principal and exact ClientOpen grants", async () => {
+  const welcome = (await load("unknown-subscription")).find(
+    (line) => line.step === "send" && line.frame.t === "welcome",
+  );
+  if (welcome?.step !== "send" || welcome.frame.t !== "welcome") throw new Error("missing welcome");
+  expect(welcome.frame.principal).toBe("0123456789abcdef0123456789abcdef");
+  expect(welcome.frame.server_epoch).toBe("00000000000000000000000000000001");
+  expect(welcome.frame.capabilities).toEqual(["read", "send", "answer", "operate"]);
+});
+
+
+test("clean trace starts fresh and declares every durable timestamp bound", async () => {
+  const lines = await load("clean");
+  const sub = lines.find((line) => line.step === "expect" && line.frame.t === "sub");
+  expect(sub?.step === "expect" && sub.absent).toEqual(["after"]);
+  const events = lines.flatMap((line) => line.step === "send" && line.frame.t === "ev" ? [line.frame] : []);
+  expect(events.map((frame) => frame.seq)).toEqual([1, 2, 3]);
+  expect(events.map((frame) => frame.ts_ms)).toEqual(Array(3).fill({ $dynamic: "ts_ms", source: "persisted", bound: "record_delivery" }));
 });

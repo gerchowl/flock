@@ -25,6 +25,11 @@ impl Transcript {
             .find(|(r, _)| r.contains((x, y).into()))
             .map(|(_, a)| a)
     }
+    /// Let the test oracle inspect every registered rectangle independently of hit lookup.
+    #[cfg(test)]
+    pub(super) fn test_hits(&self) -> &[(Rect, Action)] {
+        &self.hits
+    }
     /// Transfer the exact painted hit map to the pane's consuming intent adapter.
     pub(super) fn into_hits(self) -> impl Iterator<Item = (Rect, Action)> {
         self.hits.into_iter()

@@ -430,11 +430,12 @@ fn diff_output_keeps_escaped_text_and_adds_directional_style() {
         Rect::new(0, 0, 60, 5),
     ));
     assert!(text(&b).contains("\\u{1b}"));
-    for (symbol, color) in [("-", Color::Red), ("+", Color::Green)] {
-        assert!(b
-            .content
-            .iter()
-            .any(|c| c.symbol() == symbol && c.fg == color));
+    for (y, expected, color) in [(2, "- old", Color::Red), (3, "+ new\\u{1b}", Color::Green)] {
+        for (x, symbol) in expected.chars().enumerate() {
+            let cell = &b[(x as u16, y)];
+            assert_eq!(cell.symbol(), symbol.to_string(), "diff cell {x},{y}");
+            assert_eq!(cell.fg, color, "diff cell {x},{y}");
+        }
     }
 }
 

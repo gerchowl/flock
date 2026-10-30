@@ -58,3 +58,17 @@ event, and `check (ubuntu-latest)` requires it, so they are never skipped. Detec
 empty diff, a `land/` head, `merge_group`, push, or a failed `changes` job runs
 everything. The `check (...)` gates still run with `always()`; they accept a
 `skipped` leg only when `changes` explicitly reported `skip_rust=true`.
+
+## Desktop shell tests
+
+The `desktop (ubuntu-latest)` and `desktop (macos-15)` jobs (`ci-desktop.yml`,
+called from `ci.yml`, #2477) run `just desktop-test`: the client build that
+`tauri::generate_context!` embeds, then `cargo test --locked` in `desktop/`, a crate
+outside flk's workspace (Linux installs Tauri v2's WebKitGTK 4.1 prerequisites).
+They run on every ordinary PR and every other event, like the Rust legs, and follow
+the same `skip_rust` decision rather than a path filter of their own: `desktop/`,
+`justfile` and the workflow are not allow-listed, so only docs/web-client-only PRs
+skip them. `check (ubuntu-latest)` and `check (macos-15)` list their desktop job in
+`needs` and, in a step that runs with `always()`, accept `skipped` only when
+`changes` reported `skip_rust=true`; failed, cancelled or missing results fail the
+gate. Signing, notarisation and the nix build of the shell stay with G9c (#1636).
