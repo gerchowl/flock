@@ -10,6 +10,9 @@ use std::collections::BTreeSet;
 
 /// Coherent projection cut borrowed by a pure renderer (ADR-0036 §11).
 /// Builders own subscriptions and I/O. Neither snapshots nor intents confer authority.
+/// Clone supports only controller copy-on-write through `Arc::make_mut`; App and
+/// renderers share immutable `Arc<Snapshot>` frames instead of cloning contents.
+#[derive(Clone)]
 pub(crate) struct Snapshot {
     /// Generation-fenced identity matching `agent.agent_id`. Retire on generation change.
     pub target: Target,
@@ -68,7 +71,7 @@ pub(crate) struct CardId {
     pub ordinal: u32,
 }
 /// Observed assistant tool use, separate from permission control and authority.
-#[derive(serde::Deserialize)]
+#[derive(Clone, serde::Deserialize)]
 pub(crate) struct ObservedToolUse {
     /// Original tool-use identity, matched by tool results.
     pub id: String,
@@ -81,6 +84,7 @@ pub(crate) struct ObservedToolUse {
     pub raw: std::sync::Arc<str>,
 }
 /// One projected card with a stable originating stream identity.
+#[derive(Clone)]
 pub(crate) struct Card {
     /// Independent identity used by folding and inspection.
     pub id: CardId,
@@ -92,6 +96,7 @@ pub(crate) struct Card {
     pub streaming: bool,
 }
 /// Typed display payloads. Rendering performs no attachment lookup or other I/O.
+#[derive(Clone)]
 pub(crate) enum Content {
     /// Plain text rendered literally.
     Text(String),
@@ -134,6 +139,7 @@ pub(crate) enum Content {
     },
 }
 /// Replay lifecycle. Advertised heads never replace `Snapshot.applied_cursor`.
+#[derive(Clone)]
 pub(crate) enum Replay {
     /// Replaying toward the captured subscription head.
     Replaying {
@@ -154,6 +160,7 @@ pub(crate) enum Replay {
     Ended,
 }
 /// Observations only: absence is not a zero or a local token estimate.
+#[derive(Clone)]
 pub(crate) struct Usage {
     /// Original cursor of the latest usage observation.
     pub observed_seq: u64,
@@ -167,6 +174,7 @@ pub(crate) struct Usage {
     pub cache_write_tokens: Option<u64>,
 }
 /// Durable submission state used to preserve drafts and prevent duplicate sends.
+#[derive(Clone)]
 pub(crate) enum Admission {
     /// No admission in flight. Does not guarantee an idle harness.
     Ready,
@@ -176,6 +184,7 @@ pub(crate) enum Admission {
     Refused(crate::api::error_code::ErrorCode),
 }
 /// Unicode draft submitted through structured send at the admitted idle boundary.
+#[derive(Clone)]
 pub(crate) struct Composer {
     /// Draft text preserving Unicode and newlines.
     pub text: String,

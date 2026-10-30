@@ -1,6 +1,6 @@
 use super::*;
 use ratatui::{backend::TestBackend, buffer::Buffer, Terminal};
-fn snapshot() -> Snapshot {
+fn snapshot() -> impl std::ops::DerefMut<Target = Snapshot> {
     let agent = serde_json::from_value(serde_json::json!({"runtime":"structured","agent_id":"fixture-agent","harness":"claude","lifecycle":"offline","status":"unknown","state":crate::api::agent_state::AgentState::unknown(),"session_id":"fixture-session","cwd":".","model":null,"lease_state":"absent"})).unwrap();
     crate::structured::view::model::Model::new(
         crate::structured::view::Target {
