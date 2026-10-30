@@ -219,6 +219,10 @@ explicit bound. The tested pending set now contains two scripts: agent-send and
 heartbeat-missed. Later providers must shrink it.
 Gaps and overlap fail.
 
+The endpoint uses close code 4401 for missing, malformed and unknown tokens.
+The `token-refused` trace proves the refusal path, not which token the endpoint
+saw. Unexpected server frames fail the trace even after refusal has settled.
+
 The permission fixture resumes after bootstrap and raw request (cursor 3), then
 checks open at 4, close at 5, and permission handle 3. Its driver acknowledges
 stdin over IPC rather than injecting a fixture-only session echo. The open bound
