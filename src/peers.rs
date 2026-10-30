@@ -834,11 +834,9 @@ fn merge_relayed_rows(
     source_node: Option<&str>,
     now: Instant,
 ) {
-    if source_node.is_some() {
-        cache.retain(|_, entry| {
-            entry.via.as_deref() != Some(via) || entry.source_node.as_deref() == source_node
-        });
-    }
+    cache.retain(|_, entry| {
+        entry.via.as_deref() != Some(via) || entry.source_node.as_deref() == source_node
+    });
     let self_host = crate::app::short_host_name();
     let self_host_lower = self_host.to_ascii_lowercase();
     for entry in entries {
@@ -1575,12 +1573,18 @@ fn run_peer_ssh_with(
     })
 }
 
-/// Parse the CLI's response envelope:
-/// `{"id":..,"result":{"host":..,"version":..,"system":..,"workspaces":[..]}}`.
-pub(crate) fn parse_summary_response(
+/// Test access to the same parser used by the real poll producer.
+#[cfg(test)]
+pub(crate) fn test_parse_summary_response(
     stdout: &str,
     latency_ms: u64,
 ) -> Result<PeerSummaryPayload, String> {
+    parse_summary_response(stdout, latency_ms)
+}
+
+/// Parse the CLI's response envelope:
+/// `{"id":..,"result":{"host":..,"version":..,"system":..,"workspaces":[..]}}`.
+fn parse_summary_response(stdout: &str, latency_ms: u64) -> Result<PeerSummaryPayload, String> {
     // Login shells can print banners before the JSON; find the envelope line.
     let line = stdout
         .lines()

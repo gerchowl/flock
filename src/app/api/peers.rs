@@ -2717,7 +2717,7 @@ mod tests {
             "protocol":crate::protocol::PROTOCOL_VERSION, "workspaces":[],
             "relayed_fleet":if owner.is_empty() {vec![]} else {vec![serde_json::json!({"node_id":owner, "name":"leaf.example",
                 "ssh_target":"leaf.example", "origin":"hub.example", "age_secs":0})]}});
-        let payload = crate::peers::parse_summary_response(
+        let payload = crate::peers::test_parse_summary_response(
             &serde_json::json!({"result":result}).to_string(),
             2,
         )
@@ -2756,9 +2756,12 @@ mod tests {
             &owner,
             std::time::Instant::now(),
         );
-        assert!(
-            app.state.relayed_fleet_cache.is_empty(),
-            "rejected sender supplied relay rows"
+        let entry = app.state.relayed_fleet_cache.values().next().unwrap();
+        assert_eq!(entry.source_node, None);
+        assert_eq!(
+            app.state.server_peer_node(&entry.peer),
+            None,
+            "rejected sender supplied proven relay rows"
         );
     }
     #[tokio::test]
@@ -2789,6 +2792,120 @@ mod tests {
         let entry = app.state.relayed_fleet_cache.values().next().unwrap();
         assert_eq!(app.state.server_peer_node(&entry.peer), Some(new.as_str()));
     }
+    #[tokio::test]
+    async fn missing_current_binding_revokes_ingested_relay_proof() {
+        let _guard = crate::config::test_config_env_guard();
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        let mut app = test_app();
+        let peer = relay_ingest_peer(&mut app);
+        let owner = crate::mesh::identity::NodeIdentity::fixture([81; 32]).node_id();
+        crate::peer_stream::test_enroll(&peer, &owner);
+        ingest_bindings(&mut app);
+        ingest_relay_poll(&mut app, &peer, &owner, &owner, std::time::Instant::now());
+        let proven = |app: &App| {
+            let entry = app.state.relayed_fleet_cache.values().next().unwrap();
+            app.state.server_peer_node(&entry.peer).map(str::to_owned)
+        };
+        assert_eq!(proven(&app), Some(owner.clone()));
+        crate::peer_stream::reset_enrollment(&peer.name);
+        ingest_bindings(&mut app);
+        assert!(!app.state.server_nodes.contains_key(&peer.name));
+        assert_eq!(proven(&app), None, "removed binding retained proof");
+        crate::peer_stream::test_enroll(&peer, &owner);
+        ingest_bindings(&mut app);
+        assert_eq!(proven(&app), Some(owner));
+        app.state.peers.clear();
+        ingest_bindings(&mut app);
+        assert_eq!(proven(&app), None, "dropped configured peer retained proof");
+        crate::peer_stream::reset_enrollment(&peer.name);
+    }
+
+    #[tokio::test]
+    async fn store_read_failure_revokes_ingested_relay_proof() {
+        let _guard = crate::config::test_config_env_guard();
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        let mut app = test_app();
+        let peer = relay_ingest_peer(&mut app);
+        let owner = crate::mesh::identity::NodeIdentity::fixture([81; 32]).node_id();
+        crate::peer_stream::test_enroll(&peer, &owner);
+        ingest_bindings(&mut app);
+        ingest_relay_poll(&mut app, &peer, &owner, &owner, std::time::Instant::now());
+        let entry = app.state.relayed_fleet_cache.values().next().unwrap();
+        assert_eq!(
+            app.state.server_peer_node(&entry.peer),
+            Some(owner.as_str())
+        );
+        crate::peer_stream::reset_enrollment(&peer.name);
+        crate::mesh::runtime_store::failed("fixture store read failure".into());
+        assert!(crate::mesh::runtime_store::read(|store| {
+            store.get_pin(&peer.name).map_err(|error| error.to_string())
+        })
+        .is_err());
+        ingest_bindings(&mut app);
+        assert!(!app.state.server_nodes.contains_key(&peer.name));
+        let entry = app.state.relayed_fleet_cache.values().next().unwrap();
+        assert_eq!(
+            app.state.server_peer_node(&entry.peer),
+            None,
+            "server_pin_unavailable retained proof"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_poll_evicts_previously_proven_rows() {
+        let _guard = crate::config::test_config_env_guard();
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        let mut app = test_app();
+        let peer = relay_ingest_peer(&mut app);
+        let owner = crate::mesh::identity::NodeIdentity::fixture([81; 32]).node_id();
+        let impostor = crate::mesh::identity::NodeIdentity::fixture([82; 32]).node_id();
+        crate::peer_stream::test_enroll(&peer, &owner);
+        ingest_bindings(&mut app);
+        ingest_relay_poll(&mut app, &peer, &owner, &owner, std::time::Instant::now());
+        assert_eq!(
+            app.state
+                .relayed_fleet_cache
+                .values()
+                .next()
+                .unwrap()
+                .source_node
+                .as_deref(),
+            Some(owner.as_str())
+        );
+        ingest_relay_poll(&mut app, &peer, &impostor, "", std::time::Instant::now());
+        assert!(
+            app.state.relayed_fleet_cache.is_empty(),
+            "rejected poll retained old proven rows"
+        );
+        crate::peer_stream::reset_enrollment(&peer.name);
+    }
+
+    #[test]
+    fn absent_sender_has_the_same_unproven_cache_rule_on_both_paths() {
+        let owner = crate::mesh::identity::NodeIdentity::fixture([81; 32]).node_id();
+        let now = std::time::Instant::now();
+        for hub_push in [false, true] {
+            let mut cache = std::collections::HashMap::new();
+            let row = || {
+                let mut row = hub_row("leaf.example", "leaf.example", 0);
+                row.node_id = Some(owner.clone());
+                row
+            };
+            let merge = if hub_push {
+                crate::peers::merge_hub_pushed_fleet
+            } else {
+                crate::peers::merge_relayed_fleet
+            };
+            merge(&mut cache, vec![row()], "hub.example", Some(&owner), now);
+            assert_eq!(cache.len(), 1);
+            merge(&mut cache, vec![], "hub.example", None, now);
+            assert!(cache.is_empty(), "absent sender retained proven rows");
+            merge(&mut cache, vec![row()], "hub.example", None, now);
+            assert_eq!(cache.len(), 1);
+            assert_eq!(cache.values().next().unwrap().source_node, None);
+        }
+    }
+
     #[tokio::test]
     async fn poll_and_its_relay_share_one_observation_instant() {
         let _guard = crate::config::test_config_env_guard();

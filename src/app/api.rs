@@ -528,15 +528,13 @@ impl App {
                             .note_wake();
                         self.mesh_collect_at = None;
                     }
-                    if let Some(source_node) = payload.node_id.as_deref() {
-                        crate::peers::merge_relayed_fleet(
-                            &mut self.state.relayed_fleet_cache,
-                            payload.relayed_fleet,
-                            &fetch.peer,
-                            Some(source_node),
-                            now,
-                        );
-                    }
+                    crate::peers::merge_relayed_fleet(
+                        &mut self.state.relayed_fleet_cache,
+                        payload.relayed_fleet,
+                        &fetch.peer,
+                        payload.node_id.as_deref(),
+                        now,
+                    );
                     summary.host = (!payload.host.is_empty()).then_some(payload.host);
                     summary.version = payload.version;
                     summary.protocol = payload.protocol;
