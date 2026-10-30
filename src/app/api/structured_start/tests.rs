@@ -1059,3 +1059,37 @@ async fn public_native_placement_renders_its_frame_and_fences_a_stale_cut() {
     let stale = text(&terminal);
     assert!(stale.contains("agent_not_found") && !stale.contains("queued for idle"));
 }
+
+#[tokio::test]
+async fn public_native_keyboard_close_detaches_without_stopping() {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    let _guard = crate::config::test_config_env_guard();
+    let mut fixture = AdmissionFixture::new("init-socket-null", 5000);
+    let (id, generation) = fixture.start().await;
+    fixture.app.state.mode = crate::app::Mode::Terminal;
+    fixture
+        .app
+        .handle_terminal_key_headless(crate::input::TerminalKey::new(
+            KeyCode::Char('w'),
+            KeyModifiers::CONTROL,
+        ));
+    assert!(
+        fixture
+            .app
+            .state
+            .workspaces
+            .iter()
+            .flat_map(|w| &w.tabs)
+            .all(|t| t.native_views.is_empty()),
+        "native close key must detach placement"
+    );
+    assert_eq!(
+        fixture.app.state.structured_agents.get(&id).unwrap().2,
+        generation
+    );
+    assert!(fixture
+        .app
+        .structured_workers
+        .runtime(&id, generation)
+        .is_some());
+}
