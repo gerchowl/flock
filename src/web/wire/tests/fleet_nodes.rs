@@ -82,9 +82,11 @@ impl Case {
             .as_object_mut()
             .unwrap()
             .extend(extra.as_object().unwrap().clone());
-        let payload =
-            crate::peers::parse_summary_response(&json!({"result":result}).to_string(), latency)
-                .unwrap();
+        let payload = crate::peers::test_parse_summary_response(
+            &json!({"result":result}).to_string(),
+            latency,
+        )
+        .unwrap();
         self.app.handle_internal_event_at(
             crate::events::AppEvent::PeerSummaryFetched(crate::peers::PeerSummaryFetch {
                 peer: peer.name.clone(),
@@ -378,6 +380,7 @@ fn proven_owner_relay_keeps_null_latency_stable_time_and_legacy_protocol_refusal
         let leaf_peer = case.peer("leaf.example");
         crate::peer_stream::test_enroll(&leaf_peer, &leaf.node_id());
         crate::peer_stream::test_enroll(&peer, &hub.node_id());
+        refresh_enrolled_sources(&mut case);
         case.app
             .mesh_routes
             .table
@@ -700,10 +703,10 @@ fn rejected_poll_identity_cannot_ingest_owner_relays() {
         );
         let rows = case.snapshot().await;
         case.server.finish().await;
-        assert!(
-            case.app.state.relayed_fleet_cache.is_empty(),
-            "rejected sender supplied relay rows"
-        );
+        let entry = case.app.state.relayed_fleet_cache.values().next().unwrap();
+        assert_eq!(entry.source_node, None);
+        assert_eq!(case.app.state.server_peer_node(&entry.peer), None);
+
         assert_eq!(rows[&owner.node_id()]["online"], false);
         assert!(rows[&owner.node_id()]["health"].is_null());
     });
@@ -799,6 +802,7 @@ fn relay_and_direct_paths(case: &mut Case, origin_age: u64) -> (PeerConfig, Stri
     let id = owner.node_id();
     let relay = case.peer("relay.example");
     crate::peer_stream::test_enroll(&relay, &id);
+    refresh_enrolled_sources(case);
     case.direct(&owner);
     case.success(
         &relay,
