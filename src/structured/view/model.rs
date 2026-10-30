@@ -61,7 +61,9 @@ impl Model {
                 composer: Composer {
                     text: String::new(),
                     cursor: 0,
+                    text_revision: 0,
                 },
+                admission_receipt: None,
                 scroll_anchor: None,
                 new_output: false,
                 collapsed: Default::default(),

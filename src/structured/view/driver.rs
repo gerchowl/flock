@@ -1,6 +1,7 @@
 //! One read-only source task per view. App receives immutable, generation-fenced frames.
 use super::{
-    contracts::{Action, Admission, Composer, Snapshot},
+    contracts::{Action, Snapshot},
+    editor::EditorCut,
     stream::Stream,
     Target,
 };
@@ -23,7 +24,7 @@ pub(crate) struct Driver {
     error: watch::Receiver<Option<ErrorCode>>,
     task: JoinHandle<()>,
     commands: mpsc::Sender<Action>,
-    admission: watch::Sender<(Admission, Option<Composer>)>,
+    editor: watch::Sender<EditorCut>,
 }
 struct Wake(Arc<Notify>);
 impl Drop for Wake {
@@ -78,21 +79,22 @@ impl Driver {
         let (tx, frames) = watch::channel(Arc::clone(&stream.model.snapshot.0));
         let (errors, error) = watch::channel(None);
         let (commands, mut input) = mpsc::channel(32);
-        let (admission, mut admissions) =
-            watch::channel((stream.model.snapshot.admission.clone(), None::<Composer>));
+        let (editor, mut edits) = watch::channel(EditorCut {
+            composer: stream.model.snapshot.composer.clone(),
+            admission: stream.model.snapshot.admission.clone(),
+            receipt: None,
+        });
         let task = tokio::spawn(async move {
             let _exit = Wake(wake.clone());
             let mut ended = false;
             loop {
                 let result = tokio::select! { biased;
-                    changed = admissions.changed() => {
+                    changed = edits.changed() => {
                         if changed.is_err() { break; }
-                        let update = admissions.borrow_and_update();
-                        let s = &mut stream.model.snapshot;
-                        s.admission = update.0.clone();
-                        if update.1.as_ref().is_some_and(|d| s.composer.text == d.text && s.composer.cursor == d.cursor) {
-                            s.composer.text.clear(); s.composer.cursor = 0;
-                        }
+                        let update = edits.borrow_and_update();
+                        stream.model.snapshot.composer = update.composer.clone();
+                        stream.model.snapshot.admission = update.admission.clone();
+                        stream.model.snapshot.admission_receipt = update.receipt.clone();
                         None
                     },
                     command = input.recv() => {
@@ -145,14 +147,12 @@ impl Driver {
             error,
             task,
             commands,
-            admission,
+            editor,
         }
     }
-    /// Latest admission facts; clear only the exact durably acknowledged draft.
-    pub fn admission(&self, status: Admission, clear: Option<Composer>) -> Result<(), ErrorCode> {
-        self.admission
-            .send((status, clear))
-            .map_err(|_| ErrorCode::AgentNotFound)
+    /// Project one authoritative cut; latest-wins publication never discards edits.
+    pub fn editor(&self, cut: EditorCut) -> Result<(), ErrorCode> {
+        self.editor.send(cut).map_err(|_| ErrorCode::AgentNotFound)
     }
     /// Bounded view-only input. Runtime effects never enter the source task.
     pub fn control(&self, action: Action) -> Result<(), ErrorCode> {
