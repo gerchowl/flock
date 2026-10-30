@@ -45,11 +45,28 @@ export type FleetKind<T> = { readonly items: Accessor<readonly T[]>; readonly pr
 /** One reader's view of the fleet: the store's record, read-only, and the release. */
 export type FleetReader = {
   readonly agents: FleetKind<AgentRow>;
-  readonly nodes: FleetKind<FleetNodeRow>;
+  readonly nodes: FleetKind<FleetNodeRow> & {
+    /** The row's envelope stamp, or undefined when its frame carried no time. Read it after `items`. */
+    readonly stamp: (nodeId: string) => NodeStamp | undefined;
+  };
   readonly projects: FleetKind<FleetProjectRow>;
   /** Gives the fleet up; the last release closes the subscription. Idempotent. */
   readonly release: () => void;
 };
+
+/** When a node row's frame was sent (home clock) and when this client received it (monotonic). */
+export type NodeStamp = { readonly tsMs: number; readonly receivedAt: number };
+
+/**
+ * How long ago a node last succeeded, in ms (ADR-0043, `last_ok`): the home
+ * clock's gap at the frame (`tsMs - lastOk`) plus this client's monotonic dwell
+ * since the frame arrived. No wall clock is read. Null when `lastOk` is null
+ * (never observed) or the frame carried no time (age unprovable).
+ */
+export function nodeAgeMs(stamp: NodeStamp | undefined, lastOk: number | null, monotonicNow: number): number | null {
+  if (stamp === undefined || lastOk === null) return null;
+  return stamp.tsMs - lastOk + (monotonicNow - stamp.receivedAt);
+}
 
 /** The store of one source's fleet stream. */
 export interface FleetStore {
@@ -76,18 +93,20 @@ type FleetRecord = {
   readonly agents: Table<AgentRow>;
   readonly nodes: Table<FleetNodeRow>;
   readonly projects: Table<FleetProjectRow>;
+  readonly stamps: Map<string, NodeStamp>;
   /** Readers holding the record. */
   readers: number;
   unsubscribe: (() => void) | null;
 };
 
-function createFleetStore(source: FleetSource): FleetStore {
+function createFleetStore(source: FleetSource, monotonic: () => number): FleetStore {
   let current: FleetRecord | null = null;
 
   const open = (): FleetRecord => {
-    const record: FleetRecord = { agents: table(), nodes: table(), projects: table(), readers: 0, unsubscribe: null };
+    const record: FleetRecord = { agents: table(), nodes: table(), projects: table(), stamps: new Map(), readers: 0, unsubscribe: null };
     const tables = [record.agents, record.nodes, record.projects] as const;
     const clear = (): void => {
+      record.stamps.clear();
       for (const each of tables) {
         each.rows.clear();
         each.publish();
@@ -101,8 +120,14 @@ function createFleetStore(source: FleetSource): FleetStore {
         return record.agents;
       }
       if (change.kind === "node") {
-        if (change.op === "upsert") record.nodes.rows.set(change.row.node_id, change.row);
-        else record.nodes.rows.delete(change.node_id);
+        if (change.op === "upsert") {
+          record.nodes.rows.set(change.row.node_id, change.row);
+          if (change.tsMs === undefined) record.stamps.delete(change.row.node_id);
+          else record.stamps.set(change.row.node_id, { tsMs: change.tsMs, receivedAt: monotonic() });
+        } else {
+          record.nodes.rows.delete(change.node_id);
+          record.stamps.delete(change.node_id);
+        }
         return record.nodes;
       }
       if (change.op === "upsert") record.projects.rows.set(projectKey(change.row.node_id, change.row.id), change.row);
@@ -113,6 +138,7 @@ function createFleetStore(source: FleetSource): FleetStore {
     const snapshot = (changes: readonly FleetChange[]): void => {
       batch(() => {
         for (const each of tables) each.rows.clear();
+        record.stamps.clear();
         for (const change of changes) mutate(change);
         for (const each of tables) {
           each.publish();
@@ -152,7 +178,7 @@ function createFleetStore(source: FleetSource): FleetStore {
       let released = false;
       const reader: FleetReader = {
         agents: record.agents,
-        nodes: record.nodes,
+        nodes: { ...record.nodes, stamp: (nodeId) => record.stamps.get(nodeId) },
         projects: record.projects,
         release: () => {
           if (released) return;
@@ -170,11 +196,14 @@ function createFleetStore(source: FleetSource): FleetStore {
 
 const stores = new WeakMap<FleetSource, FleetStore>();
 
-/** The store for `source`: every view over one source shares it, so the fleet is subscribed once. */
-export function fleetStore(source: FleetSource): FleetStore {
+/**
+ * The store for `source`: every view over one source shares it, so the fleet is subscribed once.
+ * The store is cached per source, so a later caller's `monotonic` argument is ignored.
+ */
+export function fleetStore(source: FleetSource, monotonic: () => number = () => performance.now()): FleetStore {
   const found = stores.get(source);
   if (found !== undefined) return found;
-  const created = createFleetStore(source);
+  const created = createFleetStore(source, monotonic);
   stores.set(source, created);
   return created;
 }
