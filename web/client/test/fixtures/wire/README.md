@@ -215,9 +215,9 @@ connect assertion has its explicit virtual interval, and final quiet retains its
 authored virtual ceiling; neither advances server time or waits on a wall-clock
 sleep. There are no runtime event timestamps in this script, so it needs no
 persisted timestamp marker. All selected dynamic timestamps still require their
-explicit bound. The tested pending set now contains five scripts: agent-gap,
-agent-send, heartbeat-missed, ping-pong and token-revoked. Later providers
-must shrink it. Gaps and overlap fail.
+explicit bound. The tested pending set now contains four scripts: agent-send,
+heartbeat-missed, ping-pong and token-revoked. Later providers must shrink it.
+Gaps and overlap fail.
 
 The permission fixture resumes after bootstrap and raw request (cursor 3), then
 checks open at 4, close at 5, and permission handle 3. Its driver acknowledges
@@ -249,3 +249,18 @@ Each must fail for its specific assertion, so CI proves the provider can fail.
 All async steps retain the five-second interpreter ceiling; connect and quiet
 retain their authored virtual bounds. Quiet checks buffered output and virtual
 client behavior, without claiming future wall-clock silence (ADR-0036 §5a).
+
+`endpoint-gap.ts` executes all thirteen retained-history steps through a real
+endpoint. The owner starts cold, locates the registered session's durable JSONL
+file and installs its retained history. Resuming after 2 yields `gap 3–4`, event
+5 and `synced@5`, then `Current@5`, without an entity snapshot. The timestamp 1
+is literal persisted fixture data, not a runtime clock value; it must match
+exactly. The Rust driver reads back the durable sequence, payload and timestamp.
+Every async step has the five-second silence ceiling; connect and quiet retain
+their authored virtual bounds, with buffered output checked at quiet.
+
+Three causal controls run automatically alongside the complete positive trace:
+a wrong retained sequence changes the gap, a wrong persisted timestamp changes
+the event, and dropping application of the received event leaves the cursor at
+4. Each must exit 1 for its specific assertion. No expected server frame is
+injected or normalized (ADR-0036 §5a; ADR-0038 §3).
