@@ -205,13 +205,28 @@ impl App {
                 return Err(error);
             }
         };
-        self.place_structured_view(
+        #[cfg(test)]
+        let destination = if tests::FAIL_PLACEMENT.with(|flag| flag.replace(false)) {
+            Some((usize::MAX, 0))
+        } else {
+            destination
+        };
+        if let Err(code) = self.place_structured_view(
             crate::structured::view::Target {
                 agent_id: agent_id.clone(),
                 generation,
             },
             destination,
-        )?;
+        ) {
+            return Ok(ResponseResult::StructuredAgentStartedUnplaced {
+                agent_id, generation,
+                placement_error: crate::api::schema::ErrorBody {
+                    code: code.as_str().into(),
+                    message: "structured launch admitted; placement failed; inspect the agent before focusing or stopping it".into(),
+                    data: None,
+                },
+            });
+        }
         self.structured_info(&agent_id)
             .map(|agent| ResponseResult::StructuredAgentInfo { agent })
     }
