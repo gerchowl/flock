@@ -1,5 +1,6 @@
 use super::*;
 use crate::app::App;
+use crate::structured::publication::Provider;
 use crate::structured::{
     registry::Registry,
     view::Target,
@@ -155,13 +156,16 @@ async fn replacement_queue_is_published_only_when_complete() {
     let (_app, _case, mut s) = fixture("s10b-live-lifecycle-exit").await;
     assert!(s.next().await.unwrap());
     assert!(s.model.snapshot.queue.is_empty());
+    let held = Arc::clone(&s.model.snapshot.0);
     assert!(s.next().await.unwrap());
+    assert!(Arc::ptr_eq(&held, &s.model.snapshot.0));
     assert!(
         s.model.snapshot.queue.is_empty(),
         "partial replacement leaked"
     );
     assert!(s.next().await.unwrap());
     assert_eq!(s.model.snapshot.queue.len(), 2);
+    assert!(held.queue.is_empty());
 }
 
 fn poll<T>(future: std::pin::Pin<&mut impl std::future::Future<Output = T>>) -> std::task::Poll<T> {
@@ -182,6 +186,7 @@ async fn lag_recovery(busy: bool, replacement: bool) {
     owner.append(1);
     s.source = owner.source.clone();
     s.queue = Some(s.source.subscribe(None).unwrap());
+    s.queue_started = true;
     s.queue_wake = s.queue.as_ref().unwrap().waker();
     s.ended = [true, true, false];
     owner.capture();
@@ -226,15 +231,13 @@ async fn lag_recovery(busy: bool, replacement: bool) {
 
         {
             let mut step = std::pin::pin!(s.next());
-            assert!(matches!(
-                poll(step.as_mut()),
-                std::task::Poll::Ready(Ok(true))
-            ));
+            // Either readiness policy may make progress or wait for capture.
+            // The final exact FIFO assertion checks loss and duplication.
+            if let std::task::Poll::Ready(result) = poll(step.as_mut()) {
+                assert!(result.unwrap(), "live queue ended during resubscription");
+            }
         }
-        let mut step = std::pin::pin!(s.next());
-        assert!(poll(step.as_mut()).is_pending());
         owner.capture();
-        woke(step).await;
     }
     owner.finish(false);
     drain(&mut s).await;
@@ -267,6 +270,7 @@ async fn queue_refusal_stays_a_refusal() {
     let mut owner = Fixture::new();
     owner.finish(true);
     s.queue = Some(owner.source.subscribe(None).unwrap());
+    s.queue_started = true;
     s.queue_wake = s.queue.as_ref().unwrap().waker();
     for _ in 0..2 {
         let error = s.next().await.unwrap_err();
@@ -284,6 +288,7 @@ async fn ended_queue_resumes_after_a_real_competing_subscriber() {
     let mut owner = Fixture::new();
     s.source = owner.source.clone();
     s.queue = Some(s.source.subscribe(None).unwrap());
+    s.queue_started = true;
     s.queue_wake = s.queue.as_ref().unwrap().waker();
     s.ended = [true, true, false];
     owner.capture();
@@ -428,6 +433,7 @@ async fn cancellation_of_busy_resubscribe_preserves_its_cursor() {
     let mut owner = Fixture::new();
     s.source = owner.source.clone();
     s.queue = Some(s.source.subscribe(None).unwrap());
+    s.queue_started = true;
     s.queue_wake = s.queue.as_ref().unwrap().waker();
     s.ended = [true, true, false];
     owner.capture();
@@ -506,4 +512,169 @@ async fn cancelled_pending_page_cannot_hide_a_publication() {
     drain(&mut s).await;
     assert_eq!(s.model.snapshot.applied_cursor, 1);
     assert_eq!(s.model.snapshot.transcript.len(), 1);
+}
+#[tokio::test]
+async fn opening_during_book_contention_defers_admission_until_polling() {
+    let (_app, _case, s) = fixture("s10b-live-lifecycle-exit").await;
+    let mut owner = Fixture::new();
+    owner.finish(false);
+    let mut opened = None;
+    owner.competing_subscriber(|| {
+        let mut view = Stream::new(s.model, s.history, s.live, owner.source.clone())
+            .expect("opening a view must defer transient book contention");
+        view.ended = [true, true, false];
+        let mut step = Box::pin(view.next());
+        assert!(poll(step.as_mut()).is_pending());
+        drop(step);
+        opened = Some(view);
+    });
+    let mut view = opened.unwrap();
+    drain(&mut view).await;
+    assert!(view.ended[2]);
+}
+
+#[tokio::test]
+async fn driver_coalesces_facts_and_fences_a_retired_generation() {
+    use crate::structured::view::driver::{Driver, Facts};
+    let (_app, _case, stream) = fixture("s10b-live-lifecycle-exit").await;
+    let wake = Arc::new(Notify::new());
+    let driver = Driver::new(stream, wake.clone());
+    let old = driver.frame().unwrap();
+    for name in ["intermediate", "latest"] {
+        let mut agent = old.agent.clone();
+        agent.name = Some(name.into());
+        driver.refresh(Facts {
+            target: old.target.clone(),
+            agent,
+        });
+    }
+    wait(&wake, || {
+        driver
+            .frame()
+            .is_ok_and(|f| f.agent.name.as_deref() == Some("latest"))
+    })
+    .await;
+    assert_ne!(old.agent.name.as_deref(), Some("latest"));
+    let mut retired = old.target.clone();
+    retired.generation += 1;
+    driver.refresh(Facts {
+        target: retired,
+        agent: old.agent.clone(),
+    });
+    wait(&wake, || {
+        matches!(driver.frame(), Err(ErrorCode::AgentNotFound))
+    })
+    .await;
+    assert_eq!(old.target.generation, driver.target.generation);
+}
+
+#[tokio::test]
+async fn driver_preserves_a_terminal_source_refusal() {
+    use crate::structured::view::driver::Driver;
+    let (_app, _case, mut stream) = fixture("s10b-live-lifecycle-exit").await;
+    let mut owner = Fixture::new();
+    owner.finish(true);
+    stream.source = owner.source.clone();
+    stream.queue = None;
+    stream.queue_started = false;
+    stream.queue_wake = stream.source.waker();
+    let wake = Arc::new(Notify::new());
+    let driver = Driver::new(stream, wake.clone());
+    wait(&wake, || {
+        matches!(driver.frame(), Err(ErrorCode::InternalError))
+    })
+    .await;
+}
+
+async fn warm_opening(failed: bool) {
+    let (_app, _case, mut s) = fixture("s10b-live-lifecycle-exit").await;
+    let pending = History::default();
+    s.history = pending.clone();
+    s.ended = [false, true, true];
+    let (waiting, entered) = tokio::sync::oneshot::channel();
+    s.waiting = Some(waiting);
+    let mut step = Box::pin(s.next());
+    tokio::time::timeout(WITHIN, async {
+        tokio::select! {
+            result = &mut step => panic!("warm opening must wait for readiness: {result:?}"),
+            result = entered => result.unwrap(),
+        }
+    })
+    .await
+    .expect("warm opening never reached its readiness wait");
+    drop(step);
+    if failed {
+        pending.finish(true);
+        let error = tokio::time::timeout(WITHIN, s.next())
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+    } else {
+        let source =
+            history::tests::Fixture::new(vec![crate::structured::transport::StreamRecord {
+                seq: 1,
+                known: Some(false),
+                shape: None,
+                received_at_ms: 1,
+                origin: crate::structured::transport::RecordOrigin::Claude,
+                result_subtype: None,
+                permission_grant_request_id: None,
+                permission_request_seq: None,
+                raw: "{\"future_field\":\"ready\"}".into(),
+            }]);
+        pending
+            .initialize(&source.file, 1, source.file.metadata().unwrap().len())
+            .unwrap();
+        pending.finish(false);
+        drain(&mut s).await;
+        assert_eq!(s.model.snapshot.applied_cursor, 1);
+        assert_eq!(
+            s.model
+                .snapshot
+                .transcript
+                .iter()
+                .filter(|c| c.seq == 1)
+                .count(),
+            1
+        );
+    }
+}
+#[tokio::test]
+async fn warm_history_opening_survives_cancellation_and_initialization() {
+    warm_opening(false).await;
+}
+#[tokio::test]
+async fn warm_history_opening_reports_a_producer_failure() {
+    warm_opening(true).await;
+}
+
+#[tokio::test]
+async fn cancelled_opening_cannot_hide_initialization_before_its_next_poll() {
+    let (_app, _case, mut s) = fixture("s10b-live-lifecycle-exit").await;
+    let history = History::default();
+    s.history = history.clone();
+    s.ended = [false, true, true];
+    let source = history::tests::Fixture::new(vec![]);
+    let (entered, mut stages) = tokio::sync::mpsc::unbounded_channel();
+    let (release, gate) = std::sync::mpsc::channel();
+    s.gate = Some(CancelGate {
+        entered,
+        release: gate,
+    });
+    let mut step = Box::pin(s.next());
+    tokio::time::timeout(WITHIN, async {
+        tokio::select! {
+            result = &mut step => panic!("opening terminated before the gate: {result:?}"),
+            stage = stages.recv() => assert_eq!(stage, Some(2)),
+        }
+    })
+    .await
+    .unwrap();
+    drop(step);
+    history.initialize(&source.file, 0, 0).unwrap();
+    history.finish(false);
+    release.send(()).unwrap();
+    drain(&mut s).await;
+    assert_eq!(s.ended, [true; 3]);
 }

@@ -816,6 +816,75 @@ async fn public_structured_start_and_focus_reuse_native_placement() {
     assert!(fixture.app.state.terminals.is_empty());
 }
 
+#[tokio::test]
+async fn public_placement_owns_one_driver_and_detach_keeps_the_worker() {
+    let _guard = crate::config::test_config_env_guard();
+    let mut fixture = AdmissionFixture::new("init-socket-null", 5000);
+    let (id, generation) = fixture.start().await;
+    assert!(
+        fixture.app.state.native_frames.contains_key(&id),
+        "public start must register its native controller"
+    );
+    fixture.submit(&id, generation);
+    let wake = fixture.app.render_notify.clone();
+    crate::structured::workers::tests::wait(&wake, || {
+        fixture.app.service_structured_workers(Instant::now());
+        let frame = fixture.app.state.native_frames[&id]
+            .as_ref()
+            .expect("native source failure");
+        frame.applied_cursor > 0
+    })
+    .await;
+    let held = fixture.app.state.native_frames[&id]
+        .as_ref()
+        .unwrap()
+        .clone();
+    let task = fixture.app.structured_views[&id].id();
+    let reply = fixture
+        .request(Method::AgentFocus(crate::api::schema::AgentTarget {
+            target: id.clone(),
+        }))
+        .await;
+    assert!(reply["result"].is_object(), "{reply}");
+    assert_eq!(fixture.app.structured_views[&id].id(), task);
+    fixture.app.state.close_pane();
+    fixture.app.service_structured_workers(Instant::now());
+    assert!(!fixture.app.structured_views.contains_key(&id));
+    assert!(!fixture.app.state.native_frames.contains_key(&id));
+    assert!(fixture
+        .app
+        .structured_workers
+        .runtime(&id, generation)
+        .is_some());
+    fixture
+        .request(Method::AgentFocus(crate::api::schema::AgentTarget {
+            target: id.clone(),
+        }))
+        .await;
+    crate::structured::workers::tests::wait(&wake, || {
+        fixture.app.service_structured_workers(Instant::now());
+        let frame = fixture.app.state.native_frames[&id]
+            .as_ref()
+            .expect("native source failure");
+        frame.applied_cursor > 0
+    })
+    .await;
+    assert_ne!(fixture.app.structured_views[&id].id(), task);
+    fixture
+        .app
+        .state
+        .structured_agents
+        .begin_launch(&id, generation)
+        .unwrap();
+    fixture.app.service_structured_workers(Instant::now());
+    assert!(!fixture.app.structured_views.contains_key(&id));
+    assert!(matches!(
+        fixture.app.state.native_frames.get(&id),
+        Some(Err(ErrorCode::AgentNotFound))
+    ));
+    assert_eq!(held.target.generation, generation);
+}
+
 thread_local! {
     pub(super) static FAIL_PLACEMENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }

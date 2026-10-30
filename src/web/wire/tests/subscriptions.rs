@@ -769,3 +769,5 @@ fn explicit_revocation_ends_all_live_cuts_for_the_principal() {
         case.server.finish().await;
     });
 }
+
+mod trace_gap;

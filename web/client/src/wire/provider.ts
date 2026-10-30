@@ -359,7 +359,8 @@ function driveShell<T>(connection: WireConnection, source: Source<T>, clock: Clo
     // A late result keeps an absolute deadline without owning a timer while
     // Disconnected. Connect resumes it, immediately if it is already overdue.
     if (previous === "Disconnected" && running() && due !== null && !spent && renewal === null) renewAt(due);
-    if (state === "Live") liveSince = clock.now();
+    // The streak resets after 60 s of continuous Live or ReadOnly, like the backoff (ADR-0038 §3).
+    if (state === "Live" || state === "ReadOnly") liveSince = clock.now();
     else if (liveSince !== null) {
       if (clock.now() - liveSince >= DEADLINES.healthy) streak = 0;
       liveSince = null;

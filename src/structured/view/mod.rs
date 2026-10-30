@@ -1,5 +1,7 @@
 //! Native placement only: ADR-0036 §11, S10a1. Closing never stops an agent.
 pub(crate) mod contracts;
+pub(crate) mod driver;
+mod frame;
 pub(crate) mod model;
 pub(crate) mod placement;
 pub(crate) mod stream;

@@ -25,7 +25,7 @@ pub struct FixtureLine {
     pub step: FixtureStep,
 }
 
-/// Expected server frame, with explicit runtime wall-clock matching for events.
+/// Expected server frame, with explicit wall-clock and compiled-build oracles.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(untagged)]
@@ -34,6 +34,52 @@ pub enum FixtureServerFrame {
     Literal(ServerFrame),
     /// A dynamic event timestamp requires independent persistence and window oracles.
     Dynamic(DynamicEvent),
+    /// Welcome with an independently supplied build-version oracle.
+    Build(DynamicWelcome),
+}
+
+/// Welcome with a build marker; every other field remains literal.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(tag = "t", rename_all = "snake_case", deny_unknown_fields)]
+pub enum DynamicWelcome {
+    /// Authenticated build identity and exact grants.
+    Welcome {
+        /// Structured wire version.
+        protocol: u32,
+        /// Expected independently supplied build version.
+        server_version: BuildVersion,
+        /// Exact advertised grants.
+        capabilities: Vec<String>,
+        /// Literal token identity.
+        principal: String,
+        /// Literal diagnostic epoch.
+        server_epoch: String,
+        /// Literal command retention window.
+        #[cfg_attr(feature = "ts", ts(type = "number"))]
+        idempotency_window_ms: u64,
+    },
+}
+/// The only build matcher, permitted at welcome.server_version.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(
+    tag = "$dynamic",
+    content = "source",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum BuildVersion {
+    /// Compare with the Rust driver's package version.
+    ServerVersion(BuildSource),
+}
+/// Build evidence must come from the test driver's compiled package metadata.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum BuildSource {
+    /// Independently compiled version, never extracted from received frames.
+    Build,
 }
 
 /// The sole dynamic timestamp marker, valid only at an event's `ts_ms` field.
@@ -46,6 +92,18 @@ pub struct PersistedTimestamp {
     pub kind: TimestampKind,
     /// Independent oracle required by the interpreter.
     pub source: TimestampSource,
+    /// Explicit observed upper bound, with zero slack.
+    pub bound: TimestampBound,
+}
+/// Observed upper bound for a persisted event timestamp.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum TimestampBound {
+    /// The action acknowledgement, when persistence precedes it.
+    AfterAck,
+    /// Delivery of the durable record, when ACK only admits the action.
+    RecordDelivery,
 }
 /// Supported wall-clock field; arbitrary dynamic fields are refused.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -406,28 +464,31 @@ impl FixtureLine {
     /// Parse and validate a line; failures include a visible reason, never a fallback.
     pub fn parse(line: &str) -> Result<Self, String> {
         let raw: Value = serde_json::from_str(line).map_err(|e| e.to_string())?;
-        fn markers(value: &Value, path: &str, event_timestamp: bool) -> Result<(), String> {
+        fn markers(value: &Value, path: &str, raw: &Value) -> Result<(), String> {
             match value {
                 Value::Object(fields) => {
                     if fields.contains_key("$dynamic")
-                        && (path != ".frame.ts_ms" || !event_timestamp)
+                        && !(raw["step"] == "send"
+                            && ((path == ".frame.ts_ms" && raw["frame"]["t"] == "ev")
+                                || (path == ".frame.server_version"
+                                    && raw["frame"]["t"] == "welcome")))
                     {
-                        return Err("dynamic matcher outside a wall-clock field".into());
+                        return Err("dynamic matcher outside its declared field".into());
                     }
                     for (key, child) in fields {
-                        markers(child, &format!("{path}.{key}"), event_timestamp)?;
+                        markers(child, &format!("{path}.{key}"), raw)?;
                     }
                 }
                 Value::Array(items) => {
                     for child in items {
-                        markers(child, &format!("{path}[]"), event_timestamp)?;
+                        markers(child, &format!("{path}[]"), raw)?;
                     }
                 }
                 _ => (),
             }
             Ok(())
         }
-        markers(&raw, "", raw["step"] == "send" && raw["frame"]["t"] == "ev")?;
+        markers(&raw, "", &raw)?;
         let parsed: Self = serde_json::from_value(raw.clone()).map_err(|e| e.to_string())?;
         let emitted = serde_json::to_value(&parsed).map_err(|e| e.to_string())?;
         // Serde's flattened unit variants otherwise accept stray script fields.
