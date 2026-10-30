@@ -2,6 +2,543 @@
 
 ## Unreleased
 
+## [3.2.0] - 2026-10-30
+
+### Maintenance
+- Keep CI shard summaries advisory, cover shard inputs in Nix push checks, reject unsupported serial-group filters, and label shards with their selected binaries.
+- Documented the completed-PTY-write input acknowledgement decision and proposed cancellation, partial-write, retry and compatibility contract in ADR-0028; implementation follows design approval.
+- Propose ADR-0038, the GUI workbench design: information architecture, a tile manager, the client state machine, render flow, wire contract additions, one client bundle in browser and Tauri shells, sandboxed artifacts with feedback through questions, and goals and work as log-folded records; owner decisions and slices remain tracked by #1307.
+- Make delegate failed-start rollback coverage deterministic for child exit and readiness timeout, with bounded fixture handshakes and no retries.
+- Make the nextest timing checker enforce CI inheritance of the measured default hang ceiling.
+- Use a short configurable ping timeout in the headless silent-peer regression test while retaining the ten-second bound for real-server pings.
+- Reconcile ADR-0036 S0 wording with completed probe findings and remove a machine-specific reference.
+- Remove a redundant live-handoff timeout selector and detect provably shadowed nextest override settings; support isolated Python invocation of the timing checks.
+- Patch the dev-shell sccache startup race so concurrent builds share a live Unix socket safely and reclaim stale sockets after a server crash.
+- Clean up delegate deadline-test directories during assertion failures as well as successful runs.
+- Pin CI and Preview cargo-nextest installs to the devShell version from one shared file, with maintenance checks preventing drift.
+- Document the installed-version probe executor boundary and use plain-file targets in the drift regression fixture.
+- Check Claude session null-test coverage against the Rust model declarations, including shared envelope fields, nested metadata, and serde wire names, so optional-field additions cannot silently miss regression tests.
+- Make the mid-transfer live-handoff regression assert the typed failure and continued ownership of every pane, including a deterministic broken-pipe case.
+- Add exclusive structured-session leases and process-attributed callers, preserving agent identity and operator boundaries for pane-less tool calls.
+- Add invocation evidence and bounded pipe stages to question-hook watchdog fixtures, drain hook output, and avoid signaling reaped process groups.
+- Mesh test fixtures now observe their own readiness announcement and one API pong under a shared failure ceiling, retain bounded startup diagnostics, and fail on child exit or silence without repeating short ping probes.
+- Extend the structured-session optional-field drift guard to nested wrapped models, module source files, and private envelope metadata.
+- Make remote bridge failure and redial unit tests use an injected in-process SSH transport and explicit failure events instead of relying on shell startup and child-PID timing.
+- Restrict CI cache writes to dev, reuse Zig build caches with stable keys, cache the Nix store with garbage collection, and remove closed pull requests’ caches.
+- Clarified custody route snapshot semantics and strengthened missing-identity coverage to verify durable next-hop withdrawal while retaining custody.
+- Repair internal Rust documentation links and markup, and reject rustdoc warnings in CI.
+- Add the Codex rollout compatibility foundation: validate metadata and writer versions against the 0.160.1 fixture pin using one bounded version probe, diagnose failures for screen fallback, and clarify the accepted ADR policy; runtime authority follows in later slices.
+- Prove frozen-server delegate readiness structurally through client-side request abandonment and the timeout outcome, replacing a flaky total wall-clock assertion. Keep a finite failure ceiling and disable retries for this test.
+- Observe one-way mesh re-offers without consuming the inbox until sender delivery is confirmed, so read receipts cannot overtake the acceptance test’s delivery-state check.
+- Propose ordered mesh-v5 local move refusals and durable native-session claims, protected migration of existing copies, and a later fenced cross-node handoff, with separate geometry/composer verification plans.
+- Make each Codex spinner PTY test step start from settled idle so working-state hysteresis cannot hide a misread glyph.
+- Strengthen the frozen-server readiness regression with causal response-release timing, cumulative timeout bounds, and strict client-abandonment evidence.
+- Clarify the Codex lifecycle ADR rules for initial validation failure, false-idle diagnostics and future thread-replacement confirmation.
+- Guarded-submit test channels acknowledge completed writes, matching production uncertainty after interruption, and idle-wake attempts finalize exactly once.
+- Document the repository's stricter CI hang-ceiling inheritance rule and give explicit repair instructions when the checker rejects a CI profile timeout.
+- Require an initial stored next hop in the missing-identity custody test so an unassigned fixture cannot hide a withdrawal regression.
+- Cover the production handoff commit-recovery order and clean temporary socket fixtures during test unwinding.
+- Cover delegate rollback with event-driven exit/start-response orderings and precise interpreter launch diagnostics.
+- Amend ADR-0036 with bounded WebSocket recovery, heartbeat and reconnect parameters for review, durable command deduplication, inline snapshot bootstrap, all-stream synchronization barriers, and restart-safe empty queue checkpoints.
+- Upgrade the contributor sccache toolchain to 0.18.0 while retaining the isolated runtime directory and concurrent Unix-socket startup fix.
+- Clarify the proposed fenced-move command and incident regression proof, remote successor references, native-session claim release, and the pending fresh-launch compatibility decision.
+- Cover consecutive identical hollow Codex spinner redraws and independent glyph replays, with fixture guards against working-state hysteresis hiding missing idle resets.
+- Synchronize the fresh-session restart refusal test with the handled child-death event, deterministically covering delayed watcher delivery without changing restart behavior.
+- Share the message-target agent-id shape check between server and MCP refusals.
+- Propose an ADR-0028 amendment for causal detection-sample waits, output cursors and compatible deprecation of the unused revision field; owner approval and implementation remain tracked by #1574.
+- Specify the proposed detection-sample wait error, retry class and CLI exit mapping for respawn, live handoff and server restart, with implementation acceptance cases.
+- Propose guarded composer-draft inspection, clearing and submission in ADR-0029, composing revision/sample checks, bounded completed-write receipts, caller identity dependencies and recovery with pending owner decisions before implementation.
+- Clarify ADR-0008's existing pane-close removal path and retained-claim limits, and cross-reference harness reservation policy in its owner decision checklist.
+- Generate TypeScript contracts from the existing socket API records, questions, and Claude session events with `just gen-ts`, and check schema drift in CI.
+- Keep the fleet stream's entities (agents, nodes and projects) in one client store, normalised by kind and id, with a project keyed by its owning node and path. The sidebar, palette and permission inbox read that one record, and the wire layer no longer keeps rows of its own (ADR-0038 §3, part of #1595).
+- Keep each agent session stream's entities in one client store that owns them: a transcript and the permission inbox on the same agent now share one wire subscription, and a reset reaches both once (ADR-0038 §3, part of #1595).
+- Accept ADR-0038 and its artifact contract on 2026-10-29: versioned
+  records, bounded storage, independent scopes and recoverable comment
+  custody. Standard content is 8 MiB; reasoned escalation allows 64 MiB,
+  twice per agent per hour, within 256 MiB per agent and 4 GiB total.
+  The twelve-slice implementation plan remains to be built.
+- An in-repo Tauri v2 desktop shell (`desktop/`, `just desktop-build`) loads the web client against a loopback `flk` server, hardened per ADR-0011 §3; it is not yet packaged or released.
+- ADR-0038: record the owner's decisions (2026-10-16; telemetry through vig-os/vigil), add complete connection and per-stream state tables with a deadline on every wait, end inline snapshots at the `gap` frame's `snapshot_to` (with an explicit empty snapshot), list the telemetry and audit streams, and add notes on prior art in vig-os/revkit. ADR-0036: add the `synced` frame and `snapshot_to`, and drop #1323 as a gate on S7.
+- Make background-spawn geometry checks wait for native PTY split changes before comparing widths, avoiding an early shell measurement on fast runners.
+- Run full macOS test shards on landing batches and dev/main pushes; ordinary PRs retain full Linux tests and macOS build/lint with active required gates.
+- Propose ADR-0039, flk's telemetry through vig-os/vigil: what flk emits (typed log records, spans and metrics, never free text), the inventory and staged rewrite of today's string-typed logging facade, per-role OTLP/JSON Lines files with a stated disk bound, per-signal retention, a fail-closed audit trail with a bounded write deadline and a balloon reserve, the readers to migrate, and slices gated on vigil releases.
+- ADR-0038: adopt ADR-0036 §5a's transport recovery on the client side: a parameter table for every deadline, close codes 4401 and 4403 into NeedsToken, the ping/pong heartbeat, the per-stream progress deadline, `subfail` with a Refused stream state, snapshot and history streams (with `terminal/<pane>` as a snapshot stream), the empty-snapshot cursor and the bootstrap gap, and a persisted outbox with `uncertain` and "unknown outcome" commands resent only with `resume_only`.
+- Share test registry-path helpers across build profiles and bound scripted CLI child runs, including output collection and failure cleanup.
+- ADR-0039: define the telemetry ratchet's exact allowlist and its baseline of 439 untyped parameters (including `&'static str`, paths, raw input bytes and key events), make `FlkFailure` typed-only from the start, name the downcast-only `anyhow` reducer, keep the audit reserve's retry inside the 2 s deadline, count dead per-pid roles in the disk bound, and give the `server` role a single writer across a handoff.
+- Add pure framing and parent-turn reduction for validated Codex rollout records, with bounded memory and explicit failure reasons; runtime binding, reading and authority integration remain in subsequent slices.
+- Validate rollout framing against a neutralized real Codex 0.160.1 prefix, with reproducible derivation and partial-state checks at every byte split.
+- Add attributed Codex rollout binding and launch-scoped trust foundations, and forward SessionStart transcript paths and rebind sources without enabling lifecycle authority.
+- Clarify the remote architect presence limits in `delegate list`: relayed entries expire after about ten freshness windows, while direct cached summaries can persist indefinitely for unreachable configured peers. Exercise real relay expiry in the listing tests.
+- Share the compiled build profile’s app-directory helper across integration fixtures, so release tests inspect the same config, state, logs and delegate registry as their isolated server.
+- Pin Codex `-ckey=value` restart refusals through the API, including omission of the attached key and value from the complete error response.
+- Isolate the mesh lease-time validation test to one collector so late adverts and leases from a second hub cannot race its assertions.
+- Define generated S7-min fleet row/delta and permission-decision request/result contracts, with a fleet snapshot/recovery fixture and restored-outbox coverage checks.
+- Pin fresh subscription IDs and retired-ID frame handling in the structured wire contract and recovery fixtures, with the typed sub_id_reused refusal.
+- Explain the diamond mesh lease-test failure with a fixed-clock replay of
+  signed withdrawal adverts, next-hop reassignment and retained offer history.
+  Preserve the current custody policy and assert that stale-hop rejection adds
+  no offer rather than interpreting a lifetime count as proof of a new lease.
+- Synchronize the structured lease contention test with explicit signals and bounded failure receipts, avoiding a false failure when scheduling delays the observer past the registry snapshot deadline.
+- Add the worker-owned durable storage core for structured input queues, with replay, atomic checkpoints and exclusive writer ownership (part of #1428).
+- Name S4 reducer tests for their behavior and identify the reconstructed control-cancel fixture awaiting recapture confirmation.
+- Add a bounded internal history-owner bridge with generation-fenced retained recovery, and discard queued deliveries for closed subscription identities while preserving sibling traffic and heartbeat priority.
+- Add an isolated real-server/browser structured-agent dogfood with causal
+  controls for stream delivery, send, permission, decision, result, fleet and
+  revocation observations. Final S7-min selected-script trace execution is
+  tracked in #2467 under #1833.
+- Keep the SSH failure diagnostic test's node identity in its owned fixture,
+  so operator mesh state cannot change the expected SSH error.
+- Keep ignored local build outputs out of the CI-policy test's PR-input scan,
+  while continuing to check force-added tracked files and new source files.
+- Pin malformed queue enum shapes and single-record entropy recovery, document parsed JSON preservation for unknown variants, and clarify serialization-only enum attributes.
+- Diagnose stale Bun dependency pins with the refresh command, restore client dependency pins after interrupted refreshes, and compare rebuilt dependency hashes across Linux and macOS.
+- Add a pane-free structured-agent registry with session-derived state and runtime-tagged session persistence. Restored records remain offline without process authority; public launch and API routing follow in separate slices of #1439.
+- Preserve unknown, invalid and duplicate structured records across session saves without dropping terminal workspaces; remove conflicting retained duplicates when an agent is explicitly removed, and sync session snapshots before and after replacement. Unknown pane runtime tags preserve hibernation requests and disable automatic resume for that pane only.
+- Prepare structured agents through registry-owned runtime workers that bind their registered cwd/model, with bounded stream delivery, generation fencing, cleanup-aware lifecycle, and exact state deadlines; public start and routing remain in #1843.
+- Stop and join structured sessions before shutdown or live handoff, preserving explicit resume by session id; report worker panics and deadline overruns, with identity-checked child termination. Shutdown errors still save the session; handoff proceeds and carries uncertain agents as Unknown.
+- Clarify that raw `agent.start` remains unavailable through MCP, improve the session MCP fixture’s missing-binary diagnostic, and document the paired worker launch inputs.
+- Run permission capability compile-fail guards through the Rust nextest suite so CI checks token and local-operator constructor privacy.
+- Add a bounded Codex rollout file/cursor foundation with file identity and verified-prefix checks, shared record/ordinal validation, and partial-record checkpoints. Segment attribution, worker supervision and runtime lifecycle authority remain in the following slices.
+- Add verified Codex resume/fork segments and compaction continuity handoffs, with attribution checked before binding trust. Retain fork source and transcript path separately from the resumable session ID. Runtime lifecycle authority and supervised-reader integration remain in the following slices.
+- Add bounded Codex rollout worker supervision and capability-checked ownership delivery, keeping quiet lifecycle evidence intact while rejecting failed readers and stale callbacks. Runtime authority integration remains separate.
+- Stream Codex rollout verification, pre-launch snapshots and segment admission in bounded work units, removing the total-file size cliff while preserving prefix and ownership checks. Runtime lifecycle integration remains tracked separately.
+- Run GUI bundle fixture and feature-exclusion checks in Linux CI, compiling
+  only their test targets. Clarify the build-input symlink checks and the
+  filename-based immutable-cache assumptions.
+- Cover cold restoration of a failed deferred resume and clarify which deferred-launch failures suppress automatic retries.
+- Add durable structured-queue admission and bounded FIFO batch formation, with authenticated producer labels, isolated operator commands, and atomic position-preserving batch records (part of #1802 and #1428).
+- Frame non-command queue input with collision-checked random delimiters and header-only reply/blob metadata; validate reply UUIDs, acknowledge identical admission retries, preserve replacement provenance and durably fail oversized heads without blocking the queue.
+- Validate reply anchors on replacement and recover from unrenderable queue heads without blocking later input; escape Unicode line separators in headers and require canonical content-addressed blob refs.
+- Preserve queued input and journal bytes when batch formation encounters transient entropy or serialization errors.
+- Add worker-owned structured queue scheduling, durable batch reservations and atomic lifecycle updates; permission/working gates prevent delivery, and unresolved input is held on exit or a new runtime generation.
+- Report explicit pending causes for structured queue turns, preserving the transport boundary guard and rolling back uncertain refused offers without holding or resending input.
+- Make foreground-CWD test readiness follow the completed directory report and hold the foreground shell stable while sampling pane and agent APIs.
+- Document the resume failure reason for empty commands and cover explicit operator retries before and after repairing the saved plan.
+- Assert the assistant event's absent-only subtype directly in the TypeScript narrowing contract tests.
+- Keep PR comment checks from cancelling the pull-request tracker-hosts check, while still cancelling superseded runs of the same event kind.
+- Recover crashed test servers across binary rebuilds using recorded birth,
+  exact argv and private environment proof. Send TERM before bounded KILL
+  escalation, recheck identity before each signal, and exclude client PIDs from
+  detached-server records. Document CI's Python prerequisite and Darwin's
+  residual signal race.
+- Strengthen the dependency-refresh interrupt regression to require evidence that its restore gate fired before injecting a duplicate signal.
+- Specify the post-MVP non-blocking question service and reviewed fork threads, including recipient routing, scoped answers and durable idle delivery. This is design documentation, not an implemented feature.
+- Accept ADR-0043 for multi-node GUI access through a TLS home server and the
+  mesh, with per-node authorization, node-status streams, recovery and latency
+  budgets, owner decisions and bounded implementation slices. No runtime change.
+- Make real-PTY selection tests wait for each fixture command's final line feed before capturing selection rows.
+- Document and pin S7 unsupported-command refusals: the registered `server_version_gap` ack uses retry `after_handoff`, preserves the socket, and permits a subsequent valid permission decision.
+- Accept ADR-0041 for configuration v2: env-above-file precedence, typed scoped config APIs, redaction, provenance and explicit reload outcomes. Implementation follows in ordered slices.
+- Make structured-transport tests wait for permission response settlement and take contention-aware permission snapshots.
+- Document the selection fixture completion check's screen-row mapping and its unterminated-command exceptions.
+- Complete the internal configuration catalog through imported models and enum payloads, including secret-bearing check settings and user-map keys; use stable declared field types in deserializer diagnostics. No configuration read API is exposed.
+- Add an internal typed core config inventory with declaration-based coverage, compiled default and source metadata, conservative value/map-key sensitivity, and explicit unreadable imported boundaries. This adds no config read or write API; imported coverage and safe projections remain tracked by #2384.
+- Match core inventory reload owners to the current implementation, including live message/spawn policy, MCP-only startup settings and retained admission snapshots, and record accepted file aliases and serde representation names.
+- Add mandatory internal redacted configuration projections for defaults, candidate/running values and provenance, with explicit content categories and fail-closed handling of unknown content. No configuration read API or raw export is exposed; diagnostic sink completion follows in the next inventory slice.
+- Classify configuration reload ownership per consumer: message policy and spawn declarations apply live, while MCP body limits and reconnect options require restarting the MCP process; the push capability has both live and startup owners.
+- Keep configuration inventory ownership aligned with live MCP restart diagnostics while retaining captured MCP options and restart requirements.
+- Make the dependency-pin repeated-signal regression wait for EXIT cleanup readiness before sending process-group signals.
+- Add private kernel process-exit watches and a bounded, memory-only app-session credential foundation with fixed 12-hour expiry and shared/exclusive revocation fencing. The socket mint and live transport integration remain in #2442.
+- Execute the complete unknown-subscription conformance trace against the real
+  endpoint and client, distinguishing the injected protocol fault from server
+  output and checking the actual socket close. Six selected scripts remain
+  explicitly pending under #2467.
+- Match conformance welcome versions against compiled package metadata and
+  reject extra keys in literal frame expectations (#2635).
+- Execute the complete fresh-subscription conformance script against a real
+  worker and endpoint, checking durable timestamp evidence, absent resume cursors
+  and the final synced cursor. Four causal controls run in CI; five selected
+  scripts remain explicitly pending under #2467.
+- Execute the complete retained-history gap conformance script against a real
+  endpoint and cold session lookup, checking the replay gap, durable event and
+  final cursor. Three causal controls run in CI; four selected scripts remain
+  explicitly pending under #2467.
+- Execute the complete ping/pong conformance script against the real endpoint,
+  driving its supplied clock and verifying that the client's pong renews the
+  actual heartbeat. Two causal controls run in CI; three selected scripts
+  remain explicitly pending under #2467.
+- Execute the complete credential-revocation conformance script against the
+  real token store and command owner, checking ACK-before-close ordering and
+  the failed outbox entry. Three causal controls run in CI; two selected
+  scripts remain explicitly pending under #2467.
+- Correct S7 command fixtures to advertise their exact ClientOpen grants and
+  pin typed refusals when `answer` or `operate` is absent. Full selected-script
+  actual-endpoint replay remains tracked in #2467; send-scope policy is tracked
+  separately in #2585.
+- Type runtime wall-clock matchers in wire fixtures and require independent
+  persisted-record and action-window evidence for actual-endpoint execution.
+  Virtual-only consumers explicitly refuse markers; literal fields stay exact.
+- Author the permission scenario's token principal as a fixed valid 32-hex
+  literal, minted exactly by its endpoint fixtures without substitution.
+- Share the permission producer test's deterministic token identity with the
+  wire fixture assertion, keeping persisted-record replay byte-for-byte exact.
+- Add checked S7 trace execution and an exact pending-script inventory, with
+  full actual-endpoint `token-refused` replay through the real client.
+- Replay the full permission-decision script through a real worker, endpoint
+  and client, checking durable timestamps, action windows, outbox and cursor.
+- Exercise local PTY and structured message exchanges through real MCP bridges, including delivery, reply correlation and consume-once reads.
+- Enable the remote structured-recipient MCP messaging closure test, covering native discovery, delivery and a reply across two isolated servers.
+- Prepare the owned Unix HTTP listener and descriptor-transfer foundation for native structured clients. This preparatory slice exposes no new endpoint and preserves TCP authentication behavior.
+- Specify the server-side contract for the native shell’s structured WebSocket bridge over a local Unix socket, including process-bound bearer admission and separate TCP/Unix pre-auth budgets. Implementation follows the owner decision in #2500.
+- Pin logical-clock persistence for native-inbox consumption and expiry acknowledgements across restart and wall-clock rollback.
+- Make the WebSocket send/decide regression test wait for both harness input
+  echoes, including the ordering where a permission response precedes delivery
+  of a queued user turn. Command acknowledgements continue to confirm admission,
+  not model execution.
+- Harden the config inventory audit: follow reads through cloned live sections
+  and resolve config parameter imports without confusing unrelated `Config`
+  types. Correct reload reporting citations to ADR-0041 §5.
+- Wait for a non-empty Chromium compositor frame at the requested viewport
+  before taking each fixture-preview screenshot. Browser capture failures
+  remain failures, with a bounded readiness wait and no screenshot retries.
+- Cover pending and expiring suspend-inclusive timers through the native reactor, including a targeted macOS CI check, and isolate the registry documentation and process-identity regression tests.
+- Avoid cloning live structured-agent partials when nobody subscribes, and document that a generation can report a zero-sequence gap before observing its first persisted record.
+- Check replay welcome grants against the shared ClientOpen grant source, and prove a send refused for missing operate leaves the owned queue journal unchanged.
+- Make interrupted idle-wake restart tests deterministic on both sides of the type-to-Enter boundary.
+- Remove the manual S7 trace step-drop control and make unexpected auth-trace frames fail directly, including after refusal. Document that close code 4401 covers missing, malformed and unknown tokens.
+- Pin the transcript pairing index's opening-turn invariant and leading-slot scan bound, and document the lifetime and memory cost of canonical request markers.
+- Document hello registration-capacity refusals and cover the final handshake deadline check.
+- Keep internal client session replacement behind the provider's handoff capability, with type and source-boundary checks preventing UI bypasses of the user Connect contract.
+- Exercise real ClientOpen issuance in wire welcome conformance, derive command scenarios from the fixture inventory, reject uncovered fixtures, and consume the operator seed's complete output.
+- Reject unknown conformance coverage labels and isolate ClientOpen conformance paths in a dedicated test process, so parallel tests retain their own environment.
+- Make retirement contention tests gate the helper read deadline, and clarify shutdown capacity and finish-step overload behavior.
+- Require an explicit server conformance decision for every coverage variant and pin the child sandbox path overrides and inherited FLOCK variable removals.
+- Harden the client provider boundary scan against reflective imports and resolved connection-module re-exports, and clarify that CI enforces use of the public handoff helper.
+- Clarify structured queue documentation: keep the item schema with its introduction and describe queue admission’s no-op acceptance observer.
+- Pin Deny-first paint and hit order in narrow structured panes, and ignore non-button bracketed transcript text in pane geometry tests.
+- Align the permission replay producer test with the script's declared durable
+  replay cut, and reject inconsistent fixture handles before producing records.
+- Accept ADR-0045 for durable work and server-owned supervision loops,
+  including bounded healthy-source waits and Tauri operator notifications;
+  no runtime behaviour changes.
+- Recover crashed auto-detect and TUI-probe test sandboxes only after the owning test exits and durable server identity is verified; copied probe binaries share that cleanup lifecycle. No product behavior changes.
+- Required `check (macos-15)` now fails when a full-matrix run (landing batch, merge group, push) completes without the planned macOS test-shard reports, so skipped shards can no longer pass vacuously.
+- CI now runs the Tauri desktop shell's tests (`just desktop-test`) on `ubuntu-latest` and `macos-15`, and `check (ubuntu-latest)` / `check (macos-15)` fail if they fail, are cancelled or are skipped without a docs/web-only change.
+- Pull requests that touch only docs, the website or the web client skip the Rust build/test legs; detection fails safe and the required checks still report.
+- Document a verified isolated browser GUI smoke with a fake structured harness, composer sends, and Allow/Deny permission decisions.
+
+### Fixed
+- Cancelling a partially written guarded paste now discards its unsent remainder while retaining prefix evidence; the attempt remains unconfirmed and cannot submit Enter. Tracked PTY writes also retain exact counts across writer loss and check their deadline under the write/cancel gate.
+- Consolidate sidebar server rows by mesh node ID, preserve identity through client snapshots (client protocol 32), keep local pin names and live readings, and display actual routes and readable names in every icon mode. Unverified legacy rows remain separate.
+- Keep unproven relayed node-ID claims separate from pinned peers and preserve configured switch targets even while offline.
+- Keep rejected summary node-ID claims absent in outgoing gossip even when the sidebar has a local identity pin; local pin authority remains separate from received claims.
+- Exclude the selected hop from carried fleet snapshots even when its row has a node ID; identity merging cannot reintroduce that destination. Keep the carried Home destination ahead of display-only copies within a remote-only project, without merging their identities or data.
+- Preserve Claude restart options with known optional values and all tool/file arguments; report dropped workspace/PR selectors and refuse options whose optional arity or execution context cannot be preserved safely.
+- Keep inline variadic option values without replaying the original prompt on restart; preserve explicit debug filters and replace Claude’s short resume selector.
+- Recognize architects in cached direct and relayed fleet gossip when listing delegates, preventing false orphan labels for remote architects.
+- Label delegate submission summaries as “start base” so later rounds identify the recorded initial ref and commit; preserve the `base` and `base_sha` JSON fields.
+- Refresh detached allocation geometry before spawning or resuming background panes after a narrow client, while preserving existing live PTY sizes.
+- Prevent guarded submissions from retrying Enter onto an incomplete, fully visible composer suffix when wrapping whitespace falsely suggested hidden text.
+- Recognize idle Codex composers with clipped shortcut and model-status controls in narrow panes while preserving draft refusals; report pane dimensions and bottom rows when guarded sends cannot recognize the composer.
+- Script checks report incomplete output capture through marked output and warning diagnostics, preserving exit-status decisions and alert debounce.
+- Executor classification tests wait for completion independently of the product deadline, while a real subprocess test verifies timeout termination and reaping.
+- Report runtime-less deferred native-session restores as offline and resumable instead of idle/live; preserve hibernated status for explicitly parked agents and resume into their existing pane and session.
+- Protect deferred resumable bindings from scheduled reap and report offline executions as gone to settled waits, including waits without a timeout; align mesh and aggregate API status with the pane lifecycle.
+- Keep native queue subscriptions live across transient busy resubscription after lag, retaining incomplete replacements until they finish. Queue refusals remain explicit failures, and retired views refuse composer admission. Source subscribers wake busy waiters after releasing the registration lock, including after the producer has ended.
+- Wait on producer readiness when a native view opens before its warm history file is initialized, preserving cancellation and reporting producer failures.
+- Preserve native subscription history cuts and pending pages when their polling future is cancelled; resume without rereading or missing a readiness wake.
+- Build custody route snapshots from current live mesh attachments even when topology advert publication fails or node identity is unavailable. Closed edges are excluded from those snapshots; custody remains stored for rerouting within its existing TTL. Reuse one snapshot per custody-routing pass while retaining direct-edge preference and lease-time stale-hop validation.
+- Start guarded submission’s paste-to-Enter gap when the PTY finishes writing the paste, so a queued write cannot shorten the 120 ms interval. Failed or stalled writes remain bounded and send no Enter.
+- Keep local agent and fleet state objects identical within an agent listing by observing state ages once and reusing the same snapshot.
+- Protect tracking issues and epics from pending-release labelling and automatic closure, including trackers already labelled by older automation.
+- Guarded submission cancels an untouched queued paste on every attempt release, so a stalled writer cannot deliver it later. Inbox reads and busy transitions record the actual paste effect. A fully written paste interrupted by a guard reports `unconfirmed` / `paste_written`, independent of receipt polling. A partially written paste reports `unconfirmed` / `paste_write_incomplete` instead, warning callers to inspect the composer before retrying.
+- Preserve the original handoff failure kind and typed cause when committing the replacement and restoring the old public sockets both fail.
+- Recognize both Codex activity-indicator frames so the hollow spinner does not report a working turn as idle or done, including with background-terminal status.
+- Recover interrupted structured owner-record writes, remove generated files after clean spawn failures, and validate vanished session directories without recreating them.
+- Report script capture failures once per check when diagnostics change, while preserving exit classification and alert debounce.
+- Preserve typed pane-not-found errors in delegate-start readiness preflight and name the pane exit in the failed-start reason.
+- Return structured ambiguity candidates and consistent message-target error metadata in CLI JSON and MCP, without suggesting new argument shapes for an unknown valid agent id.
+- Recognize a dim, truncated Codex composer hint as empty in narrow panes while preserving draft and dialog refusals.
+- Make composer-draft refusals actionable with count-only evidence and manual-resolution guidance, and direct registered CLI delegates to their next-round workflow after the draft is resolved.
+- Bound structured-session lease mutations and cleanup lock waits, and release registry locks across process creation while retaining uncertain reservations on contention.
+- Preserve tracked input requests through injection leases and channel backlogs, retaining each request's cancellation, byte counts and deadline. Ownership changes retire held requests without replaying cancelled bytes; operator input retains FIFO order.
+- After a hard PTY write error, later queued operator keystrokes remain queued for recovery rather than disappearing while the writer still accepts new input. The failed front write keeps its existing error report; a writer explicitly marked broken retains its existing discard-and-refuse policy.
+- Retain typed input-write error evidence through API decoding and MCP, with explicit refusal and unconfirmed exit mappings. Malformed optional detail cannot hide the primary error code. Completed-write API replies and client rollout follow in #1687, #1688 and #1639; the capability remains false.
+- Retire tracked PTY input with the actual broken-writer, pane-loss or ownership-change cause, preserving byte counts and removing unsent payloads. Close write admission before reader-exit callbacks; unwinding also retires outstanding tickets as pane loss. Deadline checks accept exact equality at both syscall gates.
+- Bind client pane writes to completed-write capabilities, retain typed unknown effects without replay, and reserve cancellation reply time within CLI/delegate budgets. Enable the completed input-write capability; MCP preserves its evidence and retry policy.
+- Keep delegate workspaces and round cursors after unknown or partially applied submits, without startup replay. Derive the guarded-submit client cap from all server wait phases plus admission/reply margins, independently of the shorter injection lease.
+- Preserve completed socket replies after peers close, including submit refusals. Enforce read deadlines with readiness polling instead of re-arming socket timeouts after dispatch.
+- Preserve the CLI protocol-skew refusal and handoff guidance before input-write capability binding.
+- Show deferred native restores as offline in local sidebar, tab, mobile and navigator state signals, while preserving live pending resumes and explicit hibernation.
+- Emit the live pane status transition when a deferred native session resumes, including automatic and explicit resumes, so event consumers observe the restored execution.
+- Generate a narrowable `KnownSessionEvent` TypeScript union with literal nested discriminators and absent-only subtypes, and lint both Rust feature sets.
+- Pin all absent-only subtypes and nested narrowing branches with negative compile-time tests, and distinguish stored unknown JSON from the explicit agent-stream Unknown wrapper.
+- Preserve repeatable single-path Claude plugin directories on restart without replaying the opening prompt; treat Claude `-p`/`--print` as no-value flags.
+- Native restart preserves Pi’s no-value `-p`/`--print` without replaying the opening prompt, retains Codex’s value-taking `-p` profile selector, and refuses unverified `-p` arities for other harnesses with `restart_unsupported`. Native restart refuses unverified concatenated short options, including Codex `-pVALUE` and `-ckey=value`, without echoing their values.
+- Name Codex’s conversation lock as `codex_conversation_locked`, preserve blocked delegate starts, and report it from status/wait. Explicit `delegate send --resolve-lock retry|fork` records the choice, sends one guarded key and confirms the screen changed; normal briefs and automatic answers never enter the lock.
+- Keep unseen completion status in peer summaries when a pending resume has a live runtime and the local presentation cache has not refreshed.
+- Peer summaries keep Working activity consistent with live lifecycle status before view preparation, and stop reporting activity when a pending resume loses its runtime.
+- Raw keys/input API replies now wait for completed PTY writes, with one validated deadline, exact failure byte counts, bounded outstanding requests, and cancellation that removes held payloads before replying. Empty requests complete without a syscall.
+- Add `pane.write_keys` and `pane.write_input` alongside the strengthened legacy aliases.
+- Text and paste requests now wait for completed PTY writes before observing delivery. Deadlines, admission limits and typed byte-count failures also cover non-submit `agent.send` and the new `pane.write_text` method.
+- Restart refusals identify unsupported launch options without echoing their values.
+- Native restart refuses unverified inline long options and concatenated short forms, including combined short options and Codex `-pVALUE`/`-ckey=value`, reporting the option name with `(attached value omitted)` instead of the attached remainder.
+- Report viewer-gated git refresh as `idle` with a typed reason instead of treating old results as a broken poller. Preserve compatibility with older peer-summary readers.
+- Add explicit `[security] agent_account = "none"` for servers using no dedicated agent account, allowing operator mutations without NSS lookup while preserving lease-based agent exclusions. Default dedicated-account recognition still fails closed on pending/failed lookup; UID collisions refuse operator authority and report a typed diagnostic in logs and server status.
+- Refuse hard-linked Codex rollout transcripts during binding validation, and clarify the launch-writer checks and deferred fork authority integration.
+- Keep long-lived structured sessions available beyond 1024 permission prompts by retaining a bounded FIFO of closed IDs. Deny excess concurrent requests individually without ending the session. Decisions use a required flk-issued request sequence so a reused harness ID cannot accept a stale answer or session grant.
+- Scope operator-UID collision diagnostics to each server instance, and warn when dedicated-agent launches disable dedicated-account recognition.
+- Guard queue journals with format stamps and typed read-only status when a writer is too old or a known record is corrupt. Preserve the journal without mutation, expose the blocking reason, and retain existing crash-tail recovery for healthy supported journals.
+- Repair corrupt stored blobs atomically when the same content is written again, keeping structured sessions streaming and recording a structured repair diagnostic.
+- Bound blob reads by a caller-supplied byte cap, checking size before reading and bounding concurrent growth. Report real OS permission errors as I/O failures, distinct from unsafe storage entries. Crash-leftover temp-file cleanup remains deferred to #1712.
+- Keep retained-history head and byte boundaries from the same capture, and avoid copying stored raw payloads when live subscribers hold the record.
+- Keep structured launches counted during preparation, deduplicate pending slots with acquired leases, and release slots on failure rather than elapsed time.
+- Preserve successful handoff completion through the shared commit path, return typed errors for unavailable structured metadata, and restrict structured stop authority to the operator or the structured agent itself.
+- Keep server startup available when structured MCP endpoint provisioning fails, normalize relative socket paths, and report a typed warning plus a structured-start refusal instead of aborting startup.
+- Route every durable structured permission close into the session state reducer, clearing needs-human attention immediately after a decision, cancellation, result, interruption or session end. Harness output cannot spoof a host closure.
+- The browser GUI's entry document now sends one exact Content-Security-Policy (same-origin scripts, styles and API calls plus the listener's own `/v1/ws`; no inline script, inline style or eval; no objects, base override, framing or form submission) on GET, HEAD and 304 responses, defined once in the router. Every other response from the client listener (API replies, assets, refusals) gets a deny-all policy instead of a copy of the page's. A Chromium test runs the production bundle under the policy and fails on any violation.
+- Preserve unusable structured objects for rollback safety; bound only non-object elements and exact duplicates by age/count, with capture-time first-seen metadata and typed repair guidance for unknown collection shapes.
+- Preserve future-runtime structured agents that share only a name with a removed agent, and refuse new admission using a retained name.
+- Give pending client-token revocation priority over new admissions across store handles and processes. Contended revocation uses an owned helper that is reaped on timeout or cancellation, replacing the leaked blocking wait thread.
+- Keep an unsafe `.tmp-*` directory from denying access to every valid client, and move browser token verification to a bounded worker pool outside the async runtime.
+- Require parsed consent for client-token bearer output and reject dash-prefixed token names; a token operand named `--show-token` cannot disclose a bearer into a pipe.
+- Consume completed Codex reader work before checking for a stalled producer, and keep controller wake polling nonblocking.
+- Stop automatically retrying an invalid empty deferred resume command after its first diagnostic, retaining the saved plan for recovery. Agent info reports `blocked_reason: resume_failed` for these empty-argv plans.
+- Structured sessions report silence after accepted input under the caller's existing stall policy, even before the harness reports a started turn.
+- Clarify historical queue refusal IDs, remove a racing silent-harness assertion, and describe same-version journal checkpoint scheduling and reopen handling as requirements for the server worker.
+- Preserve structured session exit outcomes when input is submitted during I/O cancellation; only an unavailable acceptance observer requests a process stop.
+- Preserve structured-client credentials after transient post-registration handshake failures: use a non-auth close for deadline/store failures and drop a failed welcome transport without claiming revocation.
+- Honor the configured `[sessions] blob_min_bytes` for registry-worker launches.
+- Queue journals report invalid format stamps and unknown data blocking required checkpoints as typed read-only refusals, preserving bytes and preventing further growth after a refused rewrite.
+- Coordinate corrupt blob repairs with bounded clock-driven backoff; first writes never lock, and lock failures warn without losing publication.
+- Classify failed transcript reads and descriptor metadata queries after safe opening as metadata failures, distinct from path validation failures.
+- Preserve the shared app/API identity policy when dedicated-account recognition is disabled, and name its enabling setting in configuration warnings.
+- Prevent duplicate queue bootstrap replays, preserve operation errors, and keep readers and subscriptions progressing under completion backpressure. Cold queue sources report a distinct retryable refusal.
+- Register a terminal replay and its ended flag atomically, so late queue subscribers receive the retained snapshot and synced barrier before closure.
+- Resolve structured `agent.send` targets through the queue service while preserving cross-runtime name and ID ambiguity checks. Other pane-only operations retain their typed refusal.
+- Preserve non-input counts and worker failure codes in diagnostic reports, retain timestamp-first input logs and escape guidance, and extend input privacy canaries.
+- Preserve the fleet-lite high-water in an independent durable cursor so missing or corrupt snapshots recover without resetting client positions. Add typed recovery diagnostics and indexed row-skip reasons; drop unknown top-level fields only when a row changes.
+- Recover interrupted fleet-lite initialization from an empty unmarked lock, and clarify that deleting the cursor and initialization lock can reopen an older snapshot head.
+- Retry fleet-lite cursor directory durability before marking an interrupted initialization, and document empty legacy-lock recovery at zero.
+- Release client-token admission and revocation locks at operation boundaries even while a spawned child retains an inherited pre-exec descriptor.
+- Preserve the client token when initial structured-client authentication encounters unavailable or unsafe token storage, and reconnect using a non-authentication close code.
+- Treat explicit hello authentication-scope refusals as 4401, and document token-preserving 1001 when the initial hello misses its deadline.
+- Refuse invalid history subjects explicitly, recover finished workers without cleanup reports, and isolate page-capacity waits and unreadable stored payloads from sibling subscriptions.
+- Settle structured message custody after durable queue admission, retry recovered transient outcomes in process, expose terminal refusals through message status, and route replies using verified sender identity.
+- Wake idle servers at structured custody retry deadlines, preserve committed admissions across conflicting recovery, and keep peer lookup misses retryable.
+- Relayed native messages use mapped origin names consistently with legacy custody, keeping signing node ids in explicit attribution rather than host labels.
+- Primary-screen selections survive resize after a full-screen app exits. Selection invalidation now follows the owning screen: primary scrollback loss and alternate resize, clear or teardown still refuse copying visibly.
+- Refuse copying an anchored pane selection after DECCOLM column-mode changes or the DECALN screen alignment clear, preserving the clipboard and showing the existing erased-content message.
+- Native message custody now honors proven queue commitment across inbox expiry, recording `delivered_after_expiry:<item_id>` without restoring deleted payload, reclaiming quota, or extending reply deadlines. Recovery wake notifications respect a four-second retry floor for the same owner generation and report the journal owner's typed uncertainty cause. Attested sends reuse the cached node identity; pre-upgrade unsigned rows keep their terminal reply route for the existing inbox window. Positive commitment proof also preserves expiry protection when saving delivery fails, reporting `commit_proven_settle_pending` until settlement succeeds.
+- Repeated custody settlement failures after expiry retain proven keys on bounded backoff until the existing outcome-retention deadline. The restart limit for automatic correction of payload-less expired rows is documented. Startup preserves corrected terminal outcomes whose payload was already collected, and a failed final diagnostic save cannot extend correction retries.
+- Restore the client dependency manifest on interrupted hash refreshes even when a process-group termination is forwarded again during cleanup.
+- Bound auxiliary queue-custody tracking by sharing the committed journal fold, preserving historical commitment proof without a separate growing key index.
+- Keep unknown queue commitment recovering under the same message key until its inbox TTL, with capped backoff, a typed status reason and an explicit commitment-unknown expiry detail.
+- Permission requests and closes are known typed events on the structured agent stream, with generated client types and an open → decision ack → close fixture. Closed records preserve their existing fields and can arrive without a prior open.
+- After a history reset mid-stream, the GUI transcript shows it is loading again and marks the agent up to date once the stream re-syncs, so messages sent afterwards fold into their echo without remounting the view.
+- Restarting or resuming a structured session durably closes orphaned permission requests with `session_ended` before processing new controls, including interrupted automatic approvals. Repeated restarts do not duplicate closes.
+- Bound structured permission decision messages to 2048 UTF-8 bytes after CRLF normalization and trimming. Refuse oversized or unsafe messages with typed `invalid_params` before changing request state or sending harness input; expose the limit in generated client contract documentation.
+- Explain rejected permission messages in the client inbox, including the trimmed UTF-8 byte limit and permitted newlines and tabs.
+- Fix non-test web builds by selecting the full structured wire module exclusively, and lint that configuration with warnings denied through the shared local and CI lint recipe.
+- Build and run the shipped `web,ts` test inventory through local CI and CI archives, retaining exact shard partition checks so web listener and subscription tests cannot be omitted. Run archived shards in the dev shell on both platforms so fixtures receive their pinned runtime tools, including Bun.
+- Structured queue admission now refuses the reserved `finding`, `delegate_result` and `reload_notice` kinds with typed `queue_kind_reserved` until their tracked producers exist. Retained records stay readable; unresolved reserved records fail durably during restart, and formation refuses their delivery without blocking later supported input. JSON round trips and the session transcript’s raw JSON fallback are covered; a queue GUI renderer and transport are not yet implemented.
+- Permission command tests wait for each prompt to reach the owner and read published request handles instead of racing the transport book lock or the fixture driver buffer. Document fail-closed busy admission and verify that the client displays it without automatic resend.
+- Close every socket for a revoked browser token even when its command acknowledgement cannot flush, and pin permission-handle fencing across concurrent requests and runtime restarts.
+- Prevent browser terminal launches from panicking on inherited non-UTF-8 environment keys or values. Recognized `FLOCK_*` keys are still cleared except the config pointer; non-UTF-8 keys are left untouched.
+- Refuse non-UTF-8 CLI text arguments with `invalid_params` and usage exit 2 instead of panicking. Preserve native handoff socket paths without lossy conversion.
+- Apply valid `[msg]` and `[spawn.env]` policies on server config reload, including tightened authenticated sender allowlists and future spawn/resume environment selection. Invalid sections retain the running policy with diagnostics; existing process environments and already-admitted messages are preserved.
+- Report `partial` with an MCP-session `restart_required` diagnostic when reload changes effective channel push options, while applying server message policy live. Unrelated message changes do not require restarting MCP.
+- Preserve handoff importer socket paths when global session flags precede the server command, including paths containing non-UTF-8 bytes.
+- App-session re-mints retain a stable operator principal for command deduplication and outbox recovery while keeping each bearer’s revocation, expiry and process binding independent.
+- App-session socket budgets remain per credential, so an old app holding four live sockets does not block a newly minted app session sharing its operator identity.
+- Allow concurrent client-token admissions while preserving the exclusive
+  revocation fence. Pending token mutation refuses only the new subscription
+  with `session_busy`, keeping sibling streams and the socket connected.
+- Reclaim crashed revokers' unlocked intent files without readers contending
+  during probes. Busy subscriptions retry under fresh IDs with a three-attempt
+  per-stream backoff; other streams stay connected.
+- Let attested structured agents peek and consume their own inbox through socket, CLI and MCP, with ownership and lease refusals and consume-once mixed-batch expiry handling.
+- Keep tool-inbox sweeps and query-only reads free of store writes when nothing needs acknowledgement, preserving idle mesh behavior and read-only duplicate imports. Introduce the inbox retention setting with its actual consumer in the dependent read-path slice.
+- Advertise the authenticated token's exact scopes in the structured WebSocket
+  welcome. Newer-protocol clients receive only explicitly granted read access;
+  command and subscription admission continue to enforce current authority.
+- Report replies routed to structured senders through the normal reply event, durable message status and reply waits, including answers whose queue custody is already delivered.
+- Discover pane-free structured agents through peer summaries and JSON gossip, including remote MCP listings and native inbox message/reply routing, without changing mesh VERSION 5.
+- Preserve required workspace pane IDs, including empty strings, when relaying summaries to older v5 peers.
+- Start the loopback client listener when Tailscale is positively absent,
+  while refusing unreadable installation evidence or unsafe forwarding.
+  Discover the macOS app-bundle CLI as well as PATH installations and report
+  skipped checks with the paths inspected.
+- Peer discovery skips unsupported or invalid structured-agent rows with a diagnostic, preserving valid agents and workspaces in direct and relayed summaries.
+- Allow structured agent sends from positively verified operator root-shell children, with an “operator via pane” stamp in durable queue history and framed model input. PTY agent panes sending to structured agents are now refused; previously they were admitted as agent principals. Unknown and nested-program panes remain refused.
+- Stop and drain structured-client connections even when app-session revocation fails during shutdown, while logging and returning the revocation error.
+- Failed peer streams preserve and classify SSH diagnostics even when writing the initial handshake hits a broken pipe before stdout EOF is observed.
+- Protect local socket startup, stale-path cleanup, and live handoff with lifetime ownership locks, so a full listener backlog cannot cause another server to remove its socket. Refuse symlink, foreign-owner, and replaced socket paths.
+- Preserve accepting listeners from older builds that do not hold socket ownership locks. Legacy listeners with full backlogs can still evade the nonblocking probe; this rollout limitation is documented.
+- Preserve server startup under restrictive umasks by setting newly created socket ownership files to mode 0600; existing unsafe lock files remain refused without modification.
+- Show each browser transcript permission prompt once, using its canonical
+  permission record. Native control requests still render when they have no
+  canonical twin in the session stream.
+- Bundle and declare the GUI favicon so browser entry does not request a missing `/favicon.ico`.
+- Keep transcript permission pairing linear across non-adjacent and repeated native requests, while preserving unmatched requests and session isolation.
+- Keep bridge reconnect requests owed during re-mint backoff, so an overlapping failed renewal cannot strand the waiting attempt until its connect deadline.
+- Cancel the tracked re-mint timer when renewal starts, so it cannot open a duplicate session or run after Disconnect.
+- Preserve the longest owed backoff deadline when a newer reconnect and renewal overlap, so renewal failure cannot bring the next open forward.
+- Keep waiting client hellos off the shared credential-I/O pool so token management and reconnects do not close established subscriptions.
+- Preserve native transcript fold preferences across per-block assistant records and partial-card eviction; document the upstream permission-request bounds.
+- Preserve the default INFO logging fast path while keeping credential-safe WebSocket caps and opt-in flock TRACE logging.
+- Prevent an idle structured agent’s queued input from being stranded by concurrent permission-book inspection or decisions. Queue-worker admission waits for the short in-memory book operation; operator APIs remain nonblocking.
+- Use explicit status and permission-mode labels in structured panes; verify narrow consent controls and painted button hit areas.
+- Keep app-session retirement and shutdown lock waits out of the shared store-I/O pool, so concurrent revocations cannot starve established subscriptions.
+- Keep renewal timers cancelled when a shell renewal finishes after Disconnect; resume the late token's absolute renewal deadline on Connect, immediately if overdue.
+- Cancel pending re-mints and owed work when the re-mint cap is reached, and discard calls that settle while capped, preserving the cap message until the person asks to connect.
+- Let a fresh Connect proceed after an older capped call settles: discard by call epoch and serve the queued request instead of losing it.
+- Preserve the re-mint streak across internal renewal handoffs; only a user Connect starts a fresh streak. If user Disconnect/Connect invalidates a token renewal, token mode reuses the old bearer with reactive renewal; bridge mode uses the fresh open's reported lifetime.
+- Wake queue-publication waiters after the book unlocks even when a snapshot or subscriber unwinds, so a waiting subscriber can resume without another publication.
+- Retire native structured transcript streaming cards at message or turn completion even when final content differs from the accumulated deltas.
+- Separate client-token lock-helper startup from the lock-acquisition deadline,
+  preventing slow helper launches from aborting app-session retirement.
+- Read lock-helper acknowledgements through readiness deadlines, preserving
+  buffered bytes after helper exit on macOS. Cap helper startup at five seconds
+  and bound the wire shutdown caller's revocation wait separately.
+- Open the release PR even when the release notes exceed GitHub's 65536-character body limit: Promote now builds the body with `changelog.py pr-body`, which inlines the notes when they fit and otherwise links `CHANGELOG.md` on the release branch with each heading's entry count.
+- Worktree launch failures name the missing program and the server PATH length, with structured error detail. Missing working directories remain distinct from missing dependencies and ordinary worktree path errors.
+- Respect the attaching client’s local `[title] enabled = false` as a veto on server window titles and title restoration, including after client config reload.
+- Refuse removal of present but unverifiable worktree checkouts with `worktree_checkout_unreachable`, recovery instructions and a mount hint. Force never overrides the check, and cleanup never prunes unrelated worktrees.
+- Detach clients only when their selected tty is gone; retain known geometry on transient errors, wait up to two seconds for initial sizing, and report missing terminals visibly instead of inventing 80×24.
+- Anchor pane selections to terminal content across output, scrollback pruning and resize; visibly refuse copying evicted content instead of copying different rows.
+
+- Refuse copies after scrollback or display erasure instead of copying replacement rows; report a closed pane distinctly.
+- Recognize erase commands with trailing empty parameters and refuse stale selections after an inactive alternate screen is resized.
+- Refuse stale copies after XTRESTORE switches or clears terminal screens, including later resize after a restored screen mode.
+- Disconnect terminal observers after 30 seconds without socket write progress, preserving their panes and other attached clients.
+- Keep CLI and MCP message addressing consistent for bare fleet agent ids, and return typed MCP target errors with the accepted address forms.
+
+### Added
+- Expose a stable JSON `error.data.kind` for failed live handoffs so peer closure is classified by I/O kind, including connection resets, without parsing diagnostic text.
+- Add a pure structured-session state reducer with session authority, keyed permission tracking, provider-limit state and stall observations. Registry and stream consumers use its in-process sink; pane-free EventHub events remain tracked by #1804. Permission state closes on answers, cancellation, turn result or exit; only a rejected provider limit blocks, while warning and future statuses do not establish limits.
+- Add pure native-view placement state (ADR-0036 §11): one view per structured agent, registry-generation fencing and split membership independent of PTYs. Closing removes placement only. Cross-tab/workspace relocation is refused before layout mutation. Public start/render wiring follows in the remaining S10 slices.
+- Add typed native-view snapshots/intents and placement-only persistence. Unsupported saved views remain visible unavailable tiles with their reason, retain their original record bytes on save, and never start a process or attach to an agent. Explicit close removes them.
+- Added a read-only, generation-scoped live partial feed with 16-record capacity, explicit lag gaps at the latest durable cursor, and typed producer-end/retirement; durable history and its cursors remain unchanged.
+- Added a pure native transcript projection with observed metadata/usage, tool correlation, exact raw provenance, folded thinking, final-message reconciliation and explicit replay gaps. Live lag discards deltas below the gap’s sampled durable floor; recovery retains the applied history cursor. Native cards have independent fold/inspection identities. Observed tool use is distinct from permission requests and retains exact raw source data. Projection history and live partials are bounded; overflow requires replay without inventing cursor progress, and interleaved messages reconcile independently. Raw sources accompanying typed cards start folded; block lifecycle signals preserve streamed text and live fold choices survive reconciliation/replay gaps. Pending permissions remain visible until their matching close; only closed observations are windowed. Transcript eviction exposes an earlier-history watermark.
+- Add generation-fenced in-process native transcript subscriptions over the existing history, live partial and queue owners, with explicit lag recovery and canonical metadata refresh. Queue replacements become visible only after their complete snapshot is replayed. Public placement/input wiring remains S10d (#1430).
+- Add the pure structured transcript renderer component: streaming CommonMark/code, tool and JSON folds, source-anchored scrolling, escaped controls, and computed inspect/fold geometry (#1430 S10c1); pane composition and public input wiring follow separately.
+- Escape decoded Markdown controls and Unicode 17 format controls at the typed display boundary; preserve ordered list numbering, nested indentation, CRLF paragraphs and tab-indented Markdown code.
+- Add pure structured permission/composer panels with exact-handle hit geometry, preserved Unicode drafts and pending-admission feedback; adapt transcript folds and tool-result correlation to amended card identities (#1430 S10c2a).
+- Keep Deny and exact-input inspection available in narrow consent regions; measure button labels in display columns.
+- Add pure seven-region native pane composition and matching hit geometry, consuming structured projection data without a PTY; public placement/input wiring follows in S10d (#1430).
+- Style literal `+`/`-` tool-result lines and transfer painted hits into owned intents with the original snapshot target generation; routing and authority validation remain in S10d/S10e (#1430).
+- Structured start and focus create or reuse one native placement without a PTY; closing the placement leaves the structured runtime running.
+- Add structured Claude launch preparation with explicit permission mode, typed session settings, a persistent private harness profile, a redacted setup-token, an environment allowlist and a minimum harness version; process startup remains gated on the later runtime and identity slices.
+- Structured sessions receive a private flock MCP registration using a pinned executable and explicit owning server socket. Calls inherit lease-attested agent identity; operator profile configs remain untouched, credentials stay out of JSON, and session supervision owns config cleanup. Public structured starts (#1439), dedicated-user enforcement (#1208/#1629) and S6 permission handling (#1307) remain gated.
+- Added the bounded transport foundation for structured Claude sessions: dedicated pipe workers, a private idle-only stdin gate, and timestamped per-agent session streams. Structured agent start remains a later slice.
+- Session streams repair torn final records on reopen, mark transport-generated records with a trusted origin, reserve the queue filename, and end the idle gate on unmodelled result subtypes.
+- Added structured-session descendant supervision with process birth identities, bounded shutdown, retained crash snapshots, and conservative cleanup of generated session files and Claude transients. Persistent profiles remain available; runtime activation follows in later slices.
+- Structured recovery reports each session independently, quarantines uncertain spawns for operator inspection, removes stale messaging sockets and matching key files, and avoids unchanged owner-record flushes.
+- Assemble the internal structured-session runtime with verified launches, messaging-socket refusal, bounded transport and supervised lifecycle outcomes; public session start remains pending.
+- Preserve natural exit outcomes after confirmed slow-consumer cancellation, refuse uninspectable startup output, surface later loss as data, and report indeterminate turn boundaries explicitly.
+- Add the `web/client` GUI shell skeleton (Vite + Solid, Bun): a fixture replay of a recorded session in a transcript view, previewable with `just client-preview` without a flk server, and checked by `just client-check`.
+- The GUI client now enters ReadOnly when the server speaks an older wire protocol: streams keep rendering, queued commands are held rather than sent, and the composer and answer controls show the version gap instead of the connection stopping.
+- The desktop shell connects to a server on the same machine with no token input (ADR-0038 §6, #1601). Its native side mints an app-session token over `flock.sock` and carries the client's `/v1/ws` session itself over `flock-ws.sock`, so the token never enters the webview. A launch from inside a flk pane is refused with a plain message.
+- Define generated structured-wire frame contracts and versioned fake-server scripts for client recovery testing, without enabling an endpoint.
+- Pin client recovery fixture inputs, six outbox states, restored snapshot progress, absent-state assertions S7-min/full acceptance labels, and exact virtual deadline/backoff/expiry bounds.
+- Structured-session persistence gains a private, verified SHA-256 blob store for large complete tool results, attachments and thinking blocks. Partial deltas remain live-only. Public structured-session start and blob retention/GC are separate work.
+- Add `nix build .#flock-client`, the web client's production bundle built offline from a fixed-output fetch pinned by `web/client/bun.lock`; `just client-deps-hash` recomputes the pinned hash after a lock change.
+- Add the structured-agent permission control API with token-authorized allow-once and deny decisions, ordered session audit records, and an input gate while a tool permission is open. Audit lifecycle and host-fact closures, refuse stale answers, and deny oversized tool requests without ending the runtime. Session grants follow separately.
+- Support session-only allow-always decisions for structured-agent tool permissions through exact in-memory tool/input grants, isolated per agent and discarded on exit or a new runtime. Harness suggestions are never forwarded; the audit links ignored suggestions to their original request. Settings and persistent policy are unchanged. Automatic grant matches never open needs-human attention. Exceeding the MAX_GRANTS bound returns a typed permission_grant_limit refusal and leaves the request open.
+- Add private client-token authority with explicit scopes, sealed permission capabilities and revocation-serialized admission for the upcoming structured GUI endpoint.
+- Client-token verification skips unsafe entries individually; operator listing reports them for revocation. Hello verification does not hold the admission lock, and revocation waits with a bounded deadline.
+- Add a web-feature GUI bundle router for the server-owned loopback listener, consuming the prebuilt client dist with immutable fingerprinted assets, ETag revalidation, strict origin checks, and a typed missing-bundle refusal. Listener integration remains #1828; the existing terminal bridge keeps its routes.
+- Add local-operator client-token management and `flk client open [--print]` with a single-use, 60-second browser code in the URL fragment. A separate loopback-only exchange router supplies the bearer without logging credentials; the structured listener mounts it in the next slice.
+- Require terminal stdout or explicit `--json`/`--show-token` consent before client-token issuance can print a bearer. Browser-code failures cannot lock out valid operator exchanges; concurrent redemption succeeds exactly once.
+- Add generation-fenced structured-session history cuts with bounded live continuation, original replay provenance and explicit legacy-history gaps.
+- Bound replay read amplification with retained page buffers and source-fenced resume offsets; surface lag immediately during replay.
+- Publish authorized agent history over the structured WebSocket with independent subscription identities, ordered replay barriers, retained-history gaps and bounded live continuation.
+- Route local structured WebSocket `agent.send` through durable lifecycle-ID queue admission, retaining cross-runtime target ambiguity checks. Recheck token scopes per command, flush revocation acknowledgements before closing token sockets, and refuse uncertain resends without execution. Browser permission decisions are carried separately by #2370.
+- Route local structured WebSocket `agent.decide` commands through token-authorized permission handles. Recheck scopes on every command, flush revocation acknowledgements before closing token sockets, and preserve allowed reads after scope refusal. `agent.send` remains unavailable pending its queue-backed routing.
+- Add the internal structured-only fleet-lite projection and durable snapshot/high-water provider core. Subscription and transport integration follow in #1832.
+- Configure structured-session silence observations with `[sessions] stall_ms`: default 120000 milliseconds, valid range 5000–3600000 inclusive, with explicit config validation failures outside the range.
+- Share the gated structured launch route between CLI and socket admission, passing loaded session storage and stall policy to the owner worker while preserving pane-free read/control contracts.
+- Release pending admission when a launch producer disconnects, and use published lease counts without blocking; simultaneous contention of both copies returns retryable `session_busy`.
+- Open structured agent start through the CLI, socket and narrowed MCP admission, with capability negotiation and pane-free read/stop tools.
+- Add the unmounted structured WebSocket protocol core with token handshake, bounded heartbeat and writer resources, monotonic deadlines and verified-principal revocation fan-out. Listener mounting remains a separate slice.
+- Mount the structured GUI, one-time browser-code exchange and WebSocket handshake core on the opt-in IPv4 loopback listener, with origin/CSP/funnel guards, bounded connections, typed secret-free exchange diagnostics and handoff-safe listener transfer.
+- Refuse adopted or configured client listeners outside IPv4 loopback with a typed exposure-guard failure.
+- Add a configured queue-journal checkpoint policy with a positive `[sessions] queue_rewrite_bytes` threshold (default 8 MiB), atomic replay cuts and a typed unknown-data refusal re-derived on reopen. Production worker integration follows in #1955.
+- Integrate the structured worker’s single input queue with idle scheduling, lifecycle results, generation fencing and bounded committed-cut completions. Wire the configured checkpoint threshold into the worker and restore unknown-data read-only refusal on reopen. The production launch path supplies the configured checkpoint policy (#1843/#1928). Sequence-covered S4 snapshots guard subsequent turns, and the publication consumer drains terminal completions so operator resume works with and without an MCP opening turn. Threshold changes report restart required during live reload.
+- Admit authenticated MCP opening turns durably through the queue before Ready, preserving the starter identity and nonce frame. CLI starts remain idle.
+- Terminally settle unaccepted MCP opening turns after startup failure, fence unresolved openings on recovery, and stop the session after a failed stdin offer.
+- Add an internal worker-owned queue replay and publication provider with durable snapshot bootstrap, bounded continuation, and explicit terminal/refusal outcomes. Cold recovery and global lifecycle publication remain follow-up parts of #1956.
+- Recover retained queue streams on a bounded I/O worker, preserving checkpoint cursors and fencing installation against live owners and competing recoveries.
+- Exercise the real registration critical section, remove its redundant helper, and keep retained queue high-water monotonic.
+- Publish committed queue state transitions as typed, stream-linked global lifecycle facts and expose queue provider status through the app worker service.
+- Distinguish a missing retained queue with `queue_not_found`, and verify recovered-cursor continuation into the next live generation.
+- Structured `agent.send` now admits operator input through the durable idle queue, returns its lifecycle UUID after commit, and refuses draft-only sends before writing. Authenticated agent text stays framed; operator commands remain isolated.
+- Route authenticated local messages and replies to structured agents through the shared durable input queue, returning a lifecycle ID after commit and preserving proven producer attribution during custody recovery.
+- Route verified relay sends and replies through the structured queue with node-asserted attribution, durable lifecycle acknowledgements, and idempotent custody recovery. Relayed text never gains command or operator authority.
+- Serve the structured-only fleet stream over the authenticated S7 WebSocket
+  endpoint, with durable inline checkpoints, bounded live delivery and fresh-ID
+  recovery after lag. Checkpoints use only their requesting subscription's replay
+  path, so additional readers and resnapshots cannot lag existing readers.
+  Permission attention carries open, non-automatic harness
+  request IDs. Optional activity remains omitted until its producer lands (#2243).
+- Read generated S4 state objects in the GUI fleet source, retaining rows with
+  newer phases and presenting their phase as unknown.
+- Local operators can list and revoke exact live structured-session `allow_always` grants through `structured.grants.list` / `structured.grants.revoke` and `flk structured grants`. Generation-fenced revocation also prevents an in-flight decision from reinstalling the grant; an already admitted call may still complete once.
+- Added the internal durable structured-inbox projection, with independent consume/expiry acknowledgement and a persisted read window starting at harness delivery (default 24 hours). Public read/list and lifecycle binding follow in #2452.
+- Pre-wire optional mesh node identity and route metadata on generated fleet rows for federated GUI views. Local rows retain their existing JSON; remote projection and forwarding remain deferred to #1380.
+- Add the LocalOperator-only `client.app.mint` socket method for memory-only app credentials with fixed operator console scopes and a 12-hour lifetime. Credentials expire when the minting process exits and are revoked on restart or handoff; authenticated sockets close through the existing revocation protocol.
+- App-session mint responses include the server-computed remaining lifetime in `issued.info.expires_in_ms`, allowing native consoles to renew before expiry without hard-coding the TTL.
+- Persist structured tool-inbox delivery windows at actual harness start, recover their original deadlines after restart, and enforce consume-once acknowledgement across concurrent readers.
+- Web-enabled servers expose the existing structured WebSocket protocol on a private sibling Unix socket, with kernel-verified local operator admission and process-bound app bearers. TCP app-session hellos are refused with `peer_process_changed`; browser credentials retain their existing scopes.
+- Valid browser hellos wait for concurrent token management within the existing five-second handshake deadline, on both TCP and Unix transports.
+- Add durable `directory_changed` invalidations for local and remote agent
+  discovery. Clients can wait with `events.read` and re-read the directory
+  after changes, without polling agent listings. Mesh protocol remains unchanged.
+- Add typed local node and project rows to the durable fleet stream, with
+  node-scoped agent identities, exact registry working-directory project keys,
+  generated client types and legacy-safe snapshots (ADR-0043 N1a, part of #2721).
+  Peer observations, status counts and staleness follow in #2750; unavailable
+  status fields remain explicit nulls.
+  The flat GUI safely skips entity kinds it does not render while advancing its
+  resume cursor. Non-UTF-8 agent directories leave the agent's optional project
+  absent with a diagnostic, without stopping other rows or future updates.
+
+### Changed
+- Keep published native projection frames immutable through copy-on-write; unshared model updates retain their allocation.
+- Native view opening waits on queue publication readiness inside its cancel-safe continuation instead of refusing transient subscriber contention.
+- Change `agent restart` for runtime-less hibernated and deferred-resume bindings from `restart_busy` (retry later; exit 1 on the generic error path or 10 on the guarded path in v3.1.0) to `parked` (retry never; exit 2). Scripts that retry `restart_busy` must handle `parked` by calling `agent resume` first, rather than continuing to retry restart.
+- Navigator tabs prioritize unseen finished panes over working panes, matching workspace attention ordering.
+- Explicit deferred resumes no longer emit `agent_resumed_from_hibernation`, so the event digest no longer lists them as "resumed". Automatic deferred resumes never emitted that event. Both paths emit `pane_agent_status_changed`; consumers of explicit deferred resumes should watch the status event instead. Failed resume attempts retain their original deferred or hibernated plan slot for explicit retry and persistence.
+- Focusing a pane no longer retries a failed deferred launch; use `agent resume` explicitly. A cold server restart does not retain `resume_failed`, so the saved deferred plan can automatically launch once normal resume conditions are met, and a new failure stops automatic retries again. Explicit hibernation still survives restart and resumes on focus.
+- Add pane-free structured session list/get/status/stop contracts while keeping public structured launch gated.
+- Fence handoff-restored Unknown sessions before launch preparation and preserve successful handoff exit status alongside cleanup diagnostics.
+- Event subscriptions retain their existing live-start default. Explicit `after_sequence` opts into typed `events_lost` after an `events_live_start` capability check; legacy `after` and omitted cursors keep `lagged` notices. Acknowledgements include the initial cursor for every filter; stream events include `seq` and subscription identity, so quiet filters remain safe to resume. CLI/MCP durable cursors remain unchanged; resync uses per-verb reads until #2163.
+
+### Security
+- Bind pane API authority to the child process birth, preserve it across live handoff, and deny pane authority when birth metadata is missing or mismatched. Validate the macOS process helper with the Nix package toolchain.
+- Include agent and session identities in retained-lease diagnostics, distinguish busy release from unconfirmed cleanup, and document launcher-root retention after a bind timeout.
+- Keep unproven-birth pane candidates in relay refusals and self-protection checks without granting them pane authority.
+- Attest Unix API callers by kernel UID as well as process ancestry. Dedicated-user and unknown callers cannot gain operator authority by detaching; anonymous callers may read but cannot send or mutate state. Preserve UID evidence across queued requests and recovery continuations.
+- Separate unproven pane quota buckets without granting sender authority, and clean up the owned SSH ancestry test executable fixture (#1790).
+- Resolve the dedicated account lazily on one worker, with a bounded first-use wait, so a stalled directory service cannot hang server startup or live handoff. Pending and failed lookups remain read-only.
+- Prevent debug logs from recording typed pane characters, pasted text or raw input bytes. Input diagnostics retain only event and key classes, modifiers and byte counts, and reports exclude input fields.
+- Add per-reservation credentials and fail-closed server admission for scoped local API requests, including queued requests, held reads and subscriptions. Mandatory structured MCP transport provisioning follows in the second #1734 slice before structured starts are enabled.
+- Keep structured MCP requests scoped to their live lease across tool calls, compatibility probes and channel reconnects; refuse orphaned, buffered and queued requests without operator fallback. Preserve unscoped parse diagnostics and bound scoped verification without waiting on the registry lock.
+- Restrict structured session resume to the local operator and preserve its original lineage. Refuse structured start/spawn over mesh relay and reject unattended or reserved-name MCP spawns.
+- Prepare listener error recovery and typed health reporting, and prevent received handoff descriptors from leaking into child processes. The structured listener remains unmounted.
+- Validate transferred listener address family, socket type and listening state with typed refusals; isolate listener health per server and back off unclassified accept failures. Linux receives handoff descriptors atomically close-on-exec.
+- Structured sends require attested local operator authority for verbatim harness commands; relay and unknown callers are refused. Admission reserves operator capacity and rejects ambiguous or self targets.
+- Back off unsupported listener accepts, preserve socket-inspection errno in typed refusals, and verify handoff receive flags before the descriptor inheritance fallback. Make descriptor-cleanup tests independent of descriptor-number reuse.
+- Return typed binding-preparation refusals and retain the primary server error if listener cleanup also fails. Clarify the exact loopback address and full serve/funnel exposure guard.
+- Settle refused local queue admissions before returning errors so custody recovery cannot resurrect them; uncertain effects return inspection keys. Refuse unknown native recipients without creating legacy inbox projections.
+- Limit browser opening to HTTP/HTTPS links without raw whitespace or control characters, and show a non-fatal notice when a pane link is refused. macOS passes an option separator; Linux relies on validation because xdg-open rejects `--`.
+- Update Tokio from 1.53.1 to 1.53.3 to address the AsyncFd I/O-safety advisory RUSTSEC-2026-0386.
+- Generic config env type failures and rejected section or top-level scalar deserialization no longer echo supplied values or deserializer messages. Diagnostics retain structural keys, a trusted expected type and the supplying config layer. Malformed TOML diagnostics omit source excerpts and retain the file and byte line/column, or explicitly report unavailable locations. Loader fallback behavior is unchanged. Other diagnostic paths remain tracked in #2384.
+- Prevent keybinding, sound, spawn-environment, check and channel validation diagnostics from exposing configured text, including messages logged immediately. Keep schema locations, entry indices, typed causes and static repair hints, and retain unknown-key warnings without source spans.
+- Redact private configuration keys, source paths and parser text from loader/file-key diagnostics and CLI edit refusals. Keep typed causes, safe schema shapes, source categories and numeric positions; remaining validator/log producers follow in the next slice.
+- Retain actionable numeric positions, peer-entry indices and static recovery hints in redacted diagnostics without exposing values or private keys.
+- Document and pin the closed configuration diagnostic vocabulary separately from API error codes and retry policy.
+- Structured grant listings now omit full tool/input keys by default and show a short SHA-256 fingerprint and UTF-8 byte length. Local operators can explicitly disclose the key with `flk structured grants list --show-input` or socket `show_input: true`; the key may contain secrets and CLI output can persist in scrollback or logs. Revoke responses stay redacted.
+- Admit the captured local shell Origin and cross-site fetch metadata only on the exact structured WebSocket route, preserving existing admission limits and strict exchange guards.
+- App-session credentials expire after 12 suspend-inclusive hours on Linux and macOS, including idle sockets after resume. Relative mint lifetimes use the same clock; wall-clock changes cannot extend validity.
+- Require complete local operator and live process evidence for app credential minting, and prepare fenced process-bound admission for the local WebSocket listener.
+- Keep accepted peer credentials inseparable from their kernel exit watch and verify unreaped-exit and incomplete-ancestry refusals.
+- Prevent WebSocket dependency logging from recording client bearer credentials, even with explicit TRACE directives. Cap raw-frame logging in both file and web bridge subscribers.
+- Mask token-shaped process arguments, URL credentials and secret flag values while retaining command diagnostics. Move server handoff credentials from argv to an importer-only environment variable.
+- Reject unsafe or overlong agent names, reported agent labels and manual pane labels with `invalid_agent_name` before mutation, including invisible Unicode format characters except ZWJ. Drop invalid peer and restored identity labels with content-free typed warnings. Escape legacy identity text in displays and notifications, with a visible `…` for length truncation.
+- Publish SHA-256 metadata for stable release assets and verify it in local updates and remote bootstrap, retaining legacy URL-only manifests during the transition.
+
 ## [3.1.0] - 2026-10-14
 
 ### Maintenance
