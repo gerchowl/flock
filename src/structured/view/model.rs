@@ -1,5 +1,5 @@
 //! Pure native projection (ADR-0036 §8/§11). No subscriptions, I/O or authority.
-use super::{contracts::*, Target};
+use super::{contracts::*, frame::Frame, Target};
 use crate::api::structured_agent::StructuredAgentInfo;
 use crate::structured::{
     history,
@@ -29,7 +29,7 @@ mod folds;
 /// Projection plus ephemeral block indexes. Owners supply canonical S4 and queue facts.
 pub(crate) struct Model {
     /// Frozen renderer input; mutation belongs to the controller, never render.
-    pub snapshot: Snapshot,
+    pub snapshot: Frame,
     floor: u64,
     partials: BTreeMap<BlockKey, CardId>,
     folds: folds::Folds,
@@ -66,7 +66,8 @@ impl Model {
                 new_output: false,
                 collapsed: Default::default(),
                 selected_permission: None,
-            },
+            }
+            .into(),
             floor: 0,
             partials: BTreeMap::new(),
             folds: Default::default(),

@@ -3,7 +3,7 @@ use super::{contracts::*, model::Model};
 use crate::api::error_code::ErrorCode;
 use crate::structured::{
     history::{self, Cut, History},
-    publication::{Provider, Subscription},
+    publication::Subscription,
     queue,
     workers::{
         live,
@@ -33,6 +33,7 @@ pub(crate) struct Stream {
     live: live::Subscription,
     source: Source,
     queue: Option<Reader>,
+    queue_started: bool,
     queue_wake: std::sync::Arc<tokio::sync::Notify>,
     queue_failure: Option<ErrorCode>,
     queue_cursor: u64,
@@ -41,14 +42,15 @@ pub(crate) struct Stream {
     ended: [bool; 3],
 }
 impl Stream {
-    /// Bind the three canonical sources without starting a writer or producer.
+    /// Bind without I/O. Initial queue admission waits inside next, so transient
+    /// book/capture contention cannot strand a newly opened view.
     pub fn new(
         model: Model,
         history: History,
         live: live::Subscription,
         source: Source,
     ) -> io::Result<Self> {
-        let queue = source.subscribe(None).map_err(io::Error::other)?;
+        let queue_wake = source.waker();
         Ok(Self {
             model,
             queue_status: (None, None),
@@ -61,8 +63,9 @@ impl Stream {
             gate: None,
             live,
             source,
-            queue_wake: queue.waker(),
-            queue: Some(queue),
+            queue_wake,
+            queue: None,
+            queue_started: false,
             queue_failure: None,
             queue_cursor: 0,
             replacement: None,
@@ -75,6 +78,7 @@ impl Stream {
         self.cut = None;
         self.page = None;
         self.queue = None;
+        self.queue_started = false;
         self.queue_failure = None;
         self.replacement = None;
         self.queue_cursor = 0;
@@ -126,8 +130,14 @@ impl Stream {
             // A lagged reader is spent. Busy capture waits on the source wake.
             // it must never become a synthetic End from the old reader.
             if self.queue.is_none() {
-                match self.source.subscribe_ready(Some(self.queue_cursor)) {
-                    Ok(reader) => self.queue = Some(reader),
+                match self
+                    .source
+                    .subscribe_ready(self.queue_started.then_some(self.queue_cursor))
+                {
+                    Ok(reader) => {
+                        self.queue = Some(reader);
+                        self.queue_started = true;
+                    }
                     Err(SubscribeError::CaptureBusy) => capture_busy = true,
                     Err(SubscribeError::Code(ErrorCode::SessionBusy)) => (),
                     Err(SubscribeError::Code(code)) => {
