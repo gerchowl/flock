@@ -10,23 +10,34 @@ use unicode_segmentation::UnicodeSegmentation;
 pub(crate) const COMPOSER_MAX_BYTES: usize = 64 * 1024;
 /// Minimal MVP operations. Other key bindings remain outside D3a.
 pub(crate) enum Edit {
+    /// Insert one scalar, validating controls, bounds and the resulting grapheme.
     Insert(char),
+    /// Delete the preceding extended grapheme.
     Backspace,
+    /// Move to the preceding extended-grapheme boundary without changing text identity.
     Left,
+    /// Move to the next extended-grapheme boundary without changing text identity.
     Right,
+    /// Select the composer without moving its cursor or changing its text.
     Focus,
 }
 /// One coherent immutable projection, including the last admission identity.
 #[derive(Clone)]
 pub(crate) struct EditorCut {
+    /// Draft, cursor and text identity from the same committed edit.
     pub composer: Composer,
+    /// Admission state; Pending still waits for the owner's durable acknowledgement.
     pub admission: Admission,
+    /// Last admission lifecycle UUID; this never promises delivery or completion.
     pub receipt: Option<String>,
 }
 /// Pure authority scoped to exactly one driver lifetime, not a painted frame.
 pub(crate) struct EditorState {
+    /// Exact canonical agent and generation owned by this editor.
     pub target: Target,
+    /// Fresh counter value fencing completions from a detached driver.
     pub lifetime: u64,
+    /// Authoritative cut projected to the driver; frames never write it back.
     pub cut: EditorCut,
 }
 fn revision(counter: &mut u64) -> Result<u64, ErrorCode> {
@@ -34,6 +45,7 @@ fn revision(counter: &mut u64) -> Result<u64, ErrorCode> {
     Ok(*counter)
 }
 impl EditorState {
+    /// Allocate a fresh empty editor identity; counter exhaustion refuses with InternalError.
     pub fn new(target: Target, counter: &mut u64) -> Result<Self, ErrorCode> {
         let lifetime = revision(counter)?;
         Ok(Self {

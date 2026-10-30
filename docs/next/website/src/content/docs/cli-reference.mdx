@@ -481,6 +481,23 @@ Pane-only operations on structured records, including attach, readiness and
 settled waits, return `runtime_unsupported` (retry `never`, exit 2). Use the
 structured state for observation instead. PTY records keep their existing fields.
 Start a structured session with `flk agent start NAME --runtime structured --model MODEL --cwd /absolute/checkout -- claude`.
+
+In a native structured pane, printable Unicode edits the composer. Backspace deletes
+one extended grapheme; Left/Right move by grapheme. Drafts are limited to 64 KiB of
+UTF-8; overflow and invalid control characters refuse without truncation. App
+shortcuts and a visible float retain precedence. Enter submits the current text
+for durable queue admission. Moving the cursor while admission is pending does not
+retain an already admitted draft; editing its text preserves the newer draft.
+Admission is separate from delivery at the session's idle boundary.
+
+Tab/Shift-Tab select painted controls; Enter activates the selected control. Click
+the composer or edit it to leave that selection. Enter events marked as repeats never
+submit or activate controls. Legacy terminals may report repeats as fresh presses;
+those events cannot be distinguished. Native paste currently refuses with `invalid_params`, retaining
+the draft and queue (#2703); floats and PTY panes retain their paste routing. Further
+editor/newline keys and history follow in #2702 and #2704. Detaching drops the local
+draft; already admitted queue items remain durable.
+
 Start creates and focuses one native view in the active tab (a native-only
 workspace if none exists). Focus reuses that placement, including after resume;
 closing it detaches without stopping the worker. Explicit workspace/tab/split

@@ -5268,7 +5268,7 @@ reconciliation and the fix for silent latch loss belong to #2700; D3a does not
 claim that UX or invent a new queue owner.
 
 The composer receipt displays its lifecycle ID and owner-confirmed admission or
-typed refused/unknown outcome, independently of the newer draft revision. A
+typed refused/unknown outcome, independently of the newer text revision. A
 committed receipt means admission, never start, delivery or completion. Delivery
 continues through the existing queue's canonical idle boundary.
 
@@ -5343,7 +5343,7 @@ coverage below. Each child carries its own fail-first tests.
    until D3d lands. Public acceptance uses the actual raw-event/key path on the
    socket-started fake fixture:
    - Type Unicode and Enter without waiting for paint; assert one exact queue body.
-   - Type "hello", hold its acknowledgement, press Enter, move Left, then release it:
+   - Type "hello", press Enter, hold its acknowledgement, move Left, then release it:
      assert an empty draft and cursor zero; another Enter cannot resend "hello".
    - Hold a real ticket's completion, edit/delete back to the original text/cursor,
      then release it; the newer text revision survives. A cursor move leaves a
@@ -5364,7 +5364,8 @@ coverage below. Each child carries its own fail-first tests.
    bindings demonstrate the documented gaps without stealing App ownership. Test
    App bindings, prefix, modal, float and control focus. Clicking the composer leaves
    control selection; mouse caret placement is separate #2699. End still follows
-   tail as regression coverage. Repeat-Enter acceptance belongs to D3a.
+   tail as regression coverage. Key release performs no editor operation; test release-only
+   events here. Repeat-Enter acceptance belongs to D3a.
 3. **D3c — post-MVP: bounded byte-paste framing integration (#2705).** Shared
    parser hardening #2701 is a prerequisite, or is fixed in the first child here.
    Capture App destination policy/context at paste-begin, then stream existing
