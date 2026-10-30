@@ -12,7 +12,7 @@ import type { ServerFrame } from "../src/gen/ServerFrame";
 import type { AgentRow } from "../src/fleet";
 import { fixtureExamples } from "../src/gen/FixtureExamples";
 import { fleetStore } from "../src/store/fleet";
-import { createWireFleet } from "../src/wire/fleet";
+import { createWireFleet, fleetDelta } from "../src/wire/fleet";
 import { Harness, live, sentFrames, step } from "./wire/harness";
 
 type Seen = { readonly rows: readonly string[] } | { readonly failed: string };
@@ -51,6 +51,12 @@ function subscribed(): { h: Harness; seen: Seen[]; last: () => readonly AgentRow
 const send = (h: Harness, frame: ServerFrame): void => h.step(step({ step: "send", frame }));
 
 describe("wire fleet", () => {
+  test("a node upsert carries its frame's ts_ms; other kinds do not", () => {
+    const node = { node_id: "n", name: "n", health: null, latency_ms: null, last_ok: null, version: null, error: null, online: true, route: null, counts: null, unbound_configured_peers: null };
+    expect(fleetDelta({ type: "fleet.node.upsert", row: node } as never, 42)).toEqual({ op: "upsert", kind: "node", row: node, tsMs: 42 });
+    expect(fleetDelta({ type: "fleet.remove", id: "a" } as never, 42)).toEqual({ op: "remove", kind: "agent", id: "a" });
+  });
+
   test("unknown entity kinds keep the snapshot, live agents and resume cursor", () => {
     const { h, seen, last, close } = subscribed();
     const payloads = [
