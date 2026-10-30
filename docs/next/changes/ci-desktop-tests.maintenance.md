@@ -1,1 +1,0 @@
-- CI now runs the Tauri desktop shell's tests (`just desktop-test`) on `ubuntu-latest` and `macos-15`, and `check (ubuntu-latest)` / `check (macos-15)` fail if they fail, are cancelled or are skipped without a docs/web-only change.

@@ -1,1 +1,0 @@
-- Prepare the owned Unix HTTP listener and descriptor-transfer foundation for native structured clients. This preparatory slice exposes no new endpoint and preserves TCP authentication behavior.
