@@ -1,1 +1,0 @@
-- Classify configuration reload ownership per consumer: message policy and spawn declarations apply live, while MCP body limits and reconnect options require restarting the MCP process; the push capability has both live and startup owners.
