@@ -156,13 +156,16 @@ async fn replacement_queue_is_published_only_when_complete() {
     let (_app, _case, mut s) = fixture("s10b-live-lifecycle-exit").await;
     assert!(s.next().await.unwrap());
     assert!(s.model.snapshot.queue.is_empty());
+    let held = Arc::clone(&s.model.snapshot.0);
     assert!(s.next().await.unwrap());
+    assert!(Arc::ptr_eq(&held, &s.model.snapshot.0));
     assert!(
         s.model.snapshot.queue.is_empty(),
         "partial replacement leaked"
     );
     assert!(s.next().await.unwrap());
     assert_eq!(s.model.snapshot.queue.len(), 2);
+    assert!(held.queue.is_empty());
 }
 
 fn poll<T>(future: std::pin::Pin<&mut impl std::future::Future<Output = T>>) -> std::task::Poll<T> {
@@ -528,6 +531,59 @@ async fn opening_during_book_contention_defers_admission_until_polling() {
     let mut view = opened.unwrap();
     drain(&mut view).await;
     assert!(view.ended[2]);
+}
+
+#[tokio::test]
+async fn driver_coalesces_facts_and_fences_a_retired_generation() {
+    use crate::structured::view::driver::{Driver, Facts};
+    let (_app, _case, stream) = fixture("s10b-live-lifecycle-exit").await;
+    let wake = Arc::new(Notify::new());
+    let driver = Driver::new(stream, wake.clone());
+    let old = driver.frame().unwrap();
+    for name in ["intermediate", "latest"] {
+        let mut agent = old.agent.clone();
+        agent.name = Some(name.into());
+        driver.refresh(Facts {
+            target: old.target.clone(),
+            agent,
+        });
+    }
+    wait(&wake, || {
+        driver
+            .frame()
+            .is_ok_and(|f| f.agent.name.as_deref() == Some("latest"))
+    })
+    .await;
+    assert_ne!(old.agent.name.as_deref(), Some("latest"));
+    let mut retired = old.target.clone();
+    retired.generation += 1;
+    driver.refresh(Facts {
+        target: retired,
+        agent: old.agent.clone(),
+    });
+    wait(&wake, || {
+        matches!(driver.frame(), Err(ErrorCode::AgentNotFound))
+    })
+    .await;
+    assert_eq!(old.target.generation, driver.target.generation);
+}
+
+#[tokio::test]
+async fn driver_preserves_a_terminal_source_refusal() {
+    use crate::structured::view::driver::Driver;
+    let (_app, _case, mut stream) = fixture("s10b-live-lifecycle-exit").await;
+    let mut owner = Fixture::new();
+    owner.finish(true);
+    stream.source = owner.source.clone();
+    stream.queue = None;
+    stream.queue_started = false;
+    stream.queue_wake = stream.source.waker();
+    let wake = Arc::new(Notify::new());
+    let driver = Driver::new(stream, wake.clone());
+    wait(&wake, || {
+        matches!(driver.frame(), Err(ErrorCode::InternalError))
+    })
+    .await;
 }
 
 async fn warm_opening(failed: bool) {

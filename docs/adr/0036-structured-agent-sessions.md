@@ -4964,8 +4964,8 @@ attaches to the active tab, or creates a native-only workspace; focus reuses
 one placement and may rebind it to the current registry generation. Reported
 view IDs come from actual layout membership and public numbering. Detaching
 does not stop the worker. Placement preflight precedes worker admission.
-The App-owned subscription controller and renderer/input routing follow in
-separate S10d slices under #1430; placement itself creates no terminal runtime.
+The App-owned subscription controller is described below; renderer/input routing
+follows in separate S10d slices under #1430. Placement creates no terminal runtime.
 
 ### Amendment: S10d1b cancel-safe native continuation
 
@@ -4992,6 +4992,19 @@ Initial queue admission also belongs to the continuation: opening a view does
 not acquire the publication book or capture channel. Its first poll arms the
 source readiness notification before trying admission, preserving the same
 pending state through contention and cancellation as a lagged resubscribe.
+
+### Amendment: S10d1b App-owned frame driver
+
+This slice supplies the frame/controller lifecycle; renderer dispatch follows in S10d2.
+One typed task per native placement owns its Stream and Model. It publishes the
+same immutable Arc through a latest-wins watch channel, coalescing unread frames.
+App stores only published frames or typed source failures in pure presentation
+state. Render never borrows Model or performs subscription I/O. Canonical target
+facts fence every publish and App validates them again before presentation.
+Closing a placement aborts only its reader task; the worker continues. Reopening
+replays from canonical warm sources. Cold sources retain their typed refusal;
+source refusals remain visible instead of appearing as successful frozen frames.
+An ended stream still accepts canonical metadata updates until placement closes.
 
 ### Amendment: S10d1b warm-history opening
 

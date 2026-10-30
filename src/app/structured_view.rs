@@ -5,8 +5,6 @@ use crate::structured::{
     view::{model::Model, stream::Stream, Target},
 };
 use std::io;
-// S10d (#1430) wires the controller into placement and input dispatch.
-#[cfg_attr(not(test), allow(dead_code))]
 impl super::App {
     /// Warm sources only; cold recovery belongs to its owner. Mode is launch policy.
     pub(crate) fn open_structured_view(
@@ -30,6 +28,7 @@ impl super::App {
         Stream::new(model, history, live, queue)
     }
     /// Must precede snapshot presentation and intents. Never reuse stale prompts.
+    #[cfg(test)]
     pub(crate) fn refresh_structured_view(&self, stream: &mut Stream) -> Result<(), ErrorCode> {
         if stream.model.snapshot.target.validate(&self.state).is_err() {
             stream.retire();
