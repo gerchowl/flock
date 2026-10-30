@@ -884,3 +884,67 @@ async fn public_placement_owns_one_driver_and_detach_keeps_the_worker() {
     ));
     assert_eq!(held.target.generation, generation);
 }
+
+thread_local! {
+    pub(super) static FAIL_PLACEMENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+#[tokio::test]
+async fn admitted_start_returns_typed_unplaced_result_and_can_focus_later() {
+    let _guard = crate::config::test_config_env_guard();
+    let mut fixture = AdmissionFixture::new("s4-accepted-silent", 5000);
+    FAIL_PLACEMENT.with(|flag| flag.set(true));
+    let params = serde_json::from_value(json!({"name":"fixture-launch", "runtime":"structured", "model":"fixture-worker-model", "cwd":fixture.fixture.root.path().join("project"), "argv":["claude"]})).unwrap();
+    let reply = fixture.request(Method::AgentStart(params)).await;
+    assert_eq!(
+        reply["result"]["type"], "structured_agent_started_unplaced",
+        "{reply}"
+    );
+    let result = &reply["result"];
+    assert_eq!(result["placement_error"]["code"], "internal_error");
+    assert_eq!(
+        crate::api::effect_exit_code(result),
+        Some(crate::cli::exit::FAILURE)
+    );
+    let id = result["agent_id"].as_str().unwrap().to_owned();
+    let generation = result["generation"].as_u64().unwrap();
+    assert_eq!(fixture.app.state.structured_agents.records().len(), 1);
+    assert!(fixture.app.state.workspaces.is_empty());
+    let notify = fixture.app.render_notify.clone();
+    crate::structured::workers::tests::wait(&notify, || {
+        fixture.app.structured_workers.poll(
+            &mut fixture.app.state.structured_agents,
+            Instant::now(),
+            1000,
+        );
+        assert!(fixture
+            .app
+            .structured_workers
+            .report(&id, generation)
+            .is_none());
+        fixture
+            .app
+            .structured_workers
+            .runtime(&id, generation)
+            .is_some()
+    })
+    .await;
+    let get = fixture
+        .request(Method::AgentGet(crate::api::schema::AgentTarget {
+            target: id.clone(),
+        }))
+        .await;
+    assert_eq!(get["result"]["agent"]["agent_id"], id);
+    let focused = fixture
+        .request(Method::AgentFocus(crate::api::schema::AgentTarget {
+            target: id.clone(),
+        }))
+        .await;
+    assert!(focused["result"]["agent"]["view"].is_object(), "{focused}");
+    assert_eq!(fixture.app.state.structured_agents.records().len(), 1);
+    assert!(fixture
+        .app
+        .structured_workers
+        .runtime(&id, generation)
+        .is_some());
+    assert!(fixture.app.state.terminals.is_empty());
+}
