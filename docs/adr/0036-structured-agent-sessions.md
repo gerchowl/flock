@@ -4980,3 +4980,12 @@ Initial queue admission also belongs to the continuation: opening a view does
 not acquire the publication book or capture channel. Its first poll arms the
 source readiness notification before trying admission, preserving the same
 pending state through contention and cancellation as a lagged resubscribe.
+
+### Amendment: S10d1b warm-history opening
+
+A canonical warm history handle can precede producer file initialization.
+`Stream::next` waits on that source's readiness for this opening state, retaining
+it across cancellation. This is not cold recovery: no second writer or loader is
+created. Producer failure and actual page I/O errors stay explicit errors. As with
+a cancelled Pending page, resuming an older opening yields one recheck step so
+an initialization preceding the new wait cannot be missed.
