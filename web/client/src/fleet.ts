@@ -64,12 +64,16 @@ export interface FleetSource {
   subscribe(observer: FleetObserver): () => void;
 }
 
-/** A fixed list of rows, delivered once after `subscribe` returns. */
-export function createFixtureFleet(rows: readonly AgentRow[]): FleetSource {
+/** A fixed list of rows, and optionally nodes and projects, delivered once after `subscribe` returns. */
+export function createFixtureFleet(rows: readonly AgentRow[], entities: readonly FleetChange[] = []): FleetSource {
   return {
     subscribe(observer) {
       let open = true;
-      queueMicrotask(() => open && observer.rows(rows));
+      queueMicrotask(() => {
+        if (!open) return;
+        if (entities.length === 0) observer.rows(rows);
+        else observer.snapshot([...rows.map((row): FleetChange => ({ op: "upsert", kind: "agent", row })), ...entities]);
+      });
       return () => {
         open = false;
       };
