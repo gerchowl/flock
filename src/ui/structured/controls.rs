@@ -205,6 +205,7 @@ pub(crate) fn composer(s: &Snapshot, area: Rect) -> Panel {
                 Action::Send(Composer {
                     text: s.composer.text.clone(),
                     cursor: s.composer.cursor,
+                    text_revision: s.composer.text_revision,
                 }),
             ),
         );
