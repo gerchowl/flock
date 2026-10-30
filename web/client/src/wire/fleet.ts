@@ -87,12 +87,12 @@ function isProjectRow(row: unknown): row is FleetProjectRow {
 }
 
 /** Read one delta as a change; skip unknown kinds (`"ignored"`), refuse a malformed one (`null`). */
-export function fleetDelta(ev: WireEvent): FleetChange | "ignored" | null {
+export function fleetDelta(ev: WireEvent, tsMs?: number): FleetChange | "ignored" | null {
   if (!isObject(ev)) return null;
   const type = ev["type"];
   if (type === "fleet.upsert") return isRow(ev["row"]) ? { op: "upsert", kind: "agent", row: agentRow(ev["row"]) } : null;
   if (type === "fleet.remove") return isString(ev["id"]) ? { op: "remove", kind: "agent", id: ev["id"] } : null;
-  if (type === "fleet.node.upsert") return isNodeRow(ev["row"]) ? { op: "upsert", kind: "node", row: ev["row"] } : null;
+  if (type === "fleet.node.upsert") return isNodeRow(ev["row"]) ? { op: "upsert", kind: "node", row: ev["row"], ...(tsMs === undefined ? {} : { tsMs }) } : null;
   if (type === "fleet.node.remove") return isString(ev["node_id"]) ? { op: "remove", kind: "node", node_id: ev["node_id"] } : null;
   if (type === "fleet.project.upsert") return isProjectRow(ev["row"]) ? { op: "upsert", kind: "project", row: ev["row"] } : null;
   if (type === "fleet.project.remove") return isString(ev["id"]) && isString(ev["node_id"]) ? { op: "remove", kind: "project", node_id: ev["node_id"], id: ev["id"] } : null;
@@ -128,8 +128,8 @@ export function createWireFleet(connection: WireConnection): FleetSource {
         observer.failed(message);
       };
       /** The change `ev` carries, `undefined` when skipped; ends the subscription when `ev` is malformed. */
-      const read = (ev: WireEvent): FleetChange | undefined | null => {
-        const delta = fleetDelta(ev);
+      const read = (ev: WireEvent, tsMs: number): FleetChange | undefined | null => {
+        const delta = fleetDelta(ev, tsMs);
         if (delta === null) {
           end(`The fleet stream sent something that is not a fleet delta: ${JSON.stringify(ev).slice(0, 200)}`);
           return null;
@@ -137,16 +137,16 @@ export function createWireFleet(connection: WireConnection): FleetSource {
         return delta === "ignored" ? undefined : delta;
       };
       unsubscribe = connection.subscribe("fleet", {
-        event: (_seq, ev) => {
+        event: (_seq, ev, tsMs) => {
           if (!open) return;
-          const change = read(ev);
+          const change = read(ev, tsMs);
           if (change !== undefined && change !== null) observer.change(change);
         },
         snapshot: (lines) => {
           if (!open) return;
           const changes: FleetChange[] = [];
-          for (const ev of lines) {
-            const change = read(ev);
+          for (const { ev, tsMs } of lines) {
+            const change = read(ev, tsMs);
             if (change === null) return;
             if (change !== undefined) changes.push(change);
           }

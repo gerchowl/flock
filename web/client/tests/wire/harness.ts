@@ -342,7 +342,7 @@ export class Harness {
           event: (seq, ev) => seen.push({ kind: "event", seq, ev }),
           gap: (from, to) => seen.push({ kind: "gap", from, to }),
           synced: () => seen.push({ kind: "synced" }),
-          snapshot: (lines) => seen.push({ kind: "snapshot", lines }),
+          snapshot: (lines) => seen.push({ kind: "snapshot", lines: lines.map((line) => line.ev) }),
           reset: () => seen.push({ kind: "reset" }),
           refused: (refusal) => seen.push({ kind: "refused", refusal }),
         });

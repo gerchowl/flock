@@ -12,7 +12,7 @@ import type { FleetNodeRow } from "../src/gen/FleetNodeRow";
 import type { FleetProjectRow } from "../src/gen/FleetProjectRow";
 import type { ServerFrame } from "../src/gen/ServerFrame";
 import { emptyLayout } from "../src/layout/model";
-import { fleetStore, type FleetReader } from "../src/store/fleet";
+import { fleetStore, nodeAgeMs, type FleetReader } from "../src/store/fleet";
 import type { AgentRow, FleetObserver, FleetSource } from "../src/fleet";
 import { createWireFleet } from "../src/wire/fleet";
 import { Workbench } from "../src/workbench/Workbench";
@@ -244,4 +244,61 @@ test("fixture mode runs through the same store", () => {
   const fleet = read(source);
   expect(ids(fleet).agents).toEqual(["a"]);
   expect(fleet.agents.progress().phase).toBe("current");
+});
+
+describe("node age (ADR-0043 last_ok)", () => {
+  const SENT = 1_700_000_000_000;
+  const seenNode = (last_ok: number | null): FleetNodeRow => ({ ...node(A), last_ok });
+
+  /** A source the test drives by hand, read through a store with an injected monotonic clock. */
+  function driven() {
+    let observer!: FleetObserver;
+    let monotonic = 1_000;
+    const source: FleetSource = { subscribe: (each) => ((observer = each), () => undefined) };
+    const reader = createRoot(() => fleetStore(source, () => monotonic).read());
+    return { observer: () => observer, reader, advance: (ms: number) => void (monotonic += ms), now: () => monotonic };
+  }
+
+  test("a snapshot row and a delta row are each stamped with their own ts_ms and receipt time", () => {
+    const d = driven();
+    d.observer().snapshot([{ op: "upsert", kind: "node", row: seenNode(SENT - 5_000), tsMs: SENT }]);
+    d.advance(30_000);
+    d.observer().change({ op: "upsert", kind: "node", row: { ...node(B), last_ok: SENT + 20_000 }, tsMs: SENT + 30_000 });
+    expect(d.reader.nodes.stamp(A)).toEqual({ tsMs: SENT, receivedAt: 1_000 });
+    expect(d.reader.nodes.stamp(B)).toEqual({ tsMs: SENT + 30_000, receivedAt: 31_000 });
+    expect(nodeAgeMs(d.reader.nodes.stamp(A), SENT - 5_000, d.now())).toBe(35_000);
+    expect(nodeAgeMs(d.reader.nodes.stamp(B), SENT + 20_000, d.now())).toBe(10_000);
+  });
+
+  test("only the monotonic clock advances the age", () => {
+    const d = driven();
+    d.observer().snapshot([{ op: "upsert", kind: "node", row: seenNode(SENT), tsMs: SENT }]);
+    const age = (): number | null => nodeAgeMs(d.reader.nodes.stamp(A), SENT, d.now());
+    expect(age()).toBe(0);
+    d.advance(90_000);
+    expect(age()).toBe(90_000);
+  });
+
+  test("a wall clock skewed by an hour does not change the age", () => {
+    const d = driven();
+    d.observer().snapshot([{ op: "upsert", kind: "node", row: seenNode(SENT - 60_000), tsMs: SENT }]);
+    const real = Date.now;
+    Date.now = () => real() + 3_600_000;
+    try {
+      expect(nodeAgeMs(d.reader.nodes.stamp(A), SENT - 60_000, d.now())).toBe(60_000);
+    } finally {
+      Date.now = real;
+    }
+  });
+
+  test("a null last_ok or a frame without a time has no age, and a removed or replaced row loses its stamp", () => {
+    const d = driven();
+    d.observer().snapshot([{ op: "upsert", kind: "node", row: seenNode(null), tsMs: SENT }, { op: "upsert", kind: "node", row: { ...node(B), last_ok: SENT } }]);
+    expect(nodeAgeMs(d.reader.nodes.stamp(A), null, d.now())).toBeNull();
+    expect(nodeAgeMs(d.reader.nodes.stamp(B), SENT, d.now())).toBeNull();
+    d.observer().change({ op: "remove", kind: "node", node_id: A });
+    expect(d.reader.nodes.stamp(A)).toBeUndefined();
+    d.observer().reset();
+    expect(d.reader.nodes.stamp(B)).toBeUndefined();
+  });
 });
