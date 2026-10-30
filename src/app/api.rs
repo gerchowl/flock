@@ -226,6 +226,16 @@ impl App {
     }
 
     pub(crate) fn handle_internal_event(&mut self, ev: AppEvent) {
+        self.handle_internal_event_at(ev, std::time::Instant::now());
+    }
+
+    /// Apply an owner event with one observation instant shared by poll health
+    /// and every directly or indirectly delivered reading.
+    pub(crate) fn handle_internal_event_at(
+        &mut self,
+        ev: AppEvent,
+        observed_at: std::time::Instant,
+    ) {
         if let AppEvent::PasteConfirm { paste, respond_to } = ev {
             self.advance_paste(paste, respond_to);
             return;
@@ -479,7 +489,7 @@ impl App {
             // still proves the local poller is alive — dropping the health
             // update here would silently turn a config edit into a "poller
             // stopped" alert.
-            let now = std::time::Instant::now();
+            let now = observed_at;
             match &fetch.result {
                 Ok(_) => self.peer_poll_health.mark_success(now),
                 Err(msg) => self
@@ -518,16 +528,15 @@ impl App {
                             .note_wake();
                         self.mesh_collect_at = None;
                     }
-                    // Gossip v3 (#101): merge the polled peer's relayed_fleet
-                    // into our cache BEFORE we mutate `summary`. Loop
-                    // prevention rides on the origin field: we drop entries
-                    // whose origin is us (the ONE full-cycle we could see —
-                    // hub A polls hub B, hub B relayed A's own peers back).
-                    crate::peers::merge_relayed_fleet(
-                        &mut self.state.relayed_fleet_cache,
-                        payload.relayed_fleet,
-                        &fetch.peer,
-                    );
+                    if let Some(source_node) = payload.node_id.as_deref() {
+                        crate::peers::merge_relayed_fleet(
+                            &mut self.state.relayed_fleet_cache,
+                            payload.relayed_fleet,
+                            &fetch.peer,
+                            Some(source_node),
+                            now,
+                        );
+                    }
                     summary.host = (!payload.host.is_empty()).then_some(payload.host);
                     summary.version = payload.version;
                     summary.protocol = payload.protocol;
@@ -550,7 +559,7 @@ impl App {
                     summary.latency_ms = Some(payload.latency_ms);
                     summary.workspaces = payload.workspaces;
                     summary.structured_agents = payload.structured_agents;
-                    summary.last_ok = Some(std::time::Instant::now());
+                    summary.last_ok = Some(now);
                     summary.error = None;
                     if let crate::peers::DialLog::Recovered {
                         failures,
