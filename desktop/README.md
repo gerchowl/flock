@@ -14,8 +14,10 @@ a member of flk's build and never linked into `flk`.
   identity signing and notarisation are G9c (#1636). Elsewhere bundling is off
   and the build is the binary in `target/release/`.
 - `cd desktop && cargo test`: the bridge, mint, config and hardening tests,
-  against a fake unix-socket server. `bun test` there checks the init script's
-  `openBridge`. CI does not run them yet (#2477).
+  against a fake unix-socket server (`just desktop-test` builds the client first,
+  which `generate_context!` embeds). CI runs them on `ubuntu-latest` and
+  `macos-15` and the required checks need both (#2477). `bun test` there checks
+  the init script's `openBridge`; CI does not run it.
 
 ## Zero-touch, and the bridge
 

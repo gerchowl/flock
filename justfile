@@ -177,6 +177,12 @@ client-preview *args:
 desktop-dev:
     cd desktop && bun install --frozen-lockfile && bun x tauri dev
 
+# The desktop shell's tests (CI, #2477). `generate_context!` embeds
+# web/client/dist at compile time, so build the client first.
+desktop-test:
+    cd web/client && bun install --frozen-lockfile && bun run build
+    cd desktop && cargo test --locked
+
 # Build the client into a release desktop shell. macOS: an ad-hoc signed
 # flock.app in desktop/target/release/bundle/ (identity signing and
 # notarisation are #1636). Elsewhere: only the binary, desktop/target/release/.
