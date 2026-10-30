@@ -14,6 +14,7 @@ use std::io;
 use tokio::sync::Semaphore;
 // At most 32 active pages process-wide; saturation returns WouldBlock.
 static IO: Semaphore = Semaphore::const_new(32);
+type PageTask = tokio::task::JoinHandle<io::Result<(Cut, history::Item)>>;
 /// One controller's replay/live/queue continuation. Drive `next` outside rendering;
 /// refresh canonical facts through App before exposing a snapshot or acting on it.
 /// Cold sources and storage/admission failures remain explicit errors. No recovery
@@ -24,6 +25,11 @@ pub(crate) struct Stream {
     pub queue_status: (Option<queue::scheduler::Pending>, Option<ErrorCode>),
     history: History,
     cut: Option<Cut>,
+    page: Option<PageTask>,
+    #[cfg(test)]
+    waiting: Option<tokio::sync::oneshot::Sender<()>>,
+    #[cfg(test)]
+    gate: Option<tests::CancelGate>,
     live: live::Subscription,
     source: Source,
     queue: Option<Reader>,
@@ -48,6 +54,11 @@ impl Stream {
             queue_status: (None, None),
             history,
             cut: None,
+            page: None,
+            #[cfg(test)]
+            waiting: None,
+            #[cfg(test)]
+            gate: None,
             live,
             source,
             queue_wake: queue.waker(),
@@ -62,6 +73,7 @@ impl Stream {
     pub fn retire(&mut self) {
         self.ended = [true; 3];
         self.cut = None;
+        self.page = None;
         self.queue = None;
         self.queue_failure = None;
         self.replacement = None;
@@ -88,7 +100,12 @@ impl Stream {
         true
     }
     /// One bounded step; false means all producers ended. Callers bound stage waits.
-    /// Cancelled blocking pages retain their I/O permits through completion.
+    /// Cancel-safe: self owns the blocking task, its cut and unapplied page across
+    /// every await. Dropping this future neither detaches that task nor reopens
+    /// its cut. Retirement deliberately discards its result; the task retains its
+    /// I/O permit until completion. Queue/resubscribe state also stays in self.
+    /// Readiness waits consume no item until ready. A resumed stale Pending page
+    /// yields one step so the following poll rechecks after arming fresh wakes.
     pub async fn next(&mut self) -> io::Result<bool> {
         if let Some(code) = self.queue_failure {
             return Err(io::Error::other(code));
@@ -162,21 +179,38 @@ impl Stream {
             }
         }
         if !self.ended[0] {
-            let permit = IO.try_acquire().map_err(|_| io::ErrorKind::WouldBlock)?;
-            // Static semaphore ownership survives cancellation through the blocking closure.
-            let (cut, item) = (self.cut.take(), self.model.snapshot.applied_cursor);
-            let source = self.history.clone();
-            let (cut, item) = tokio::task::spawn_blocking(move || {
-                let _permit = permit;
-                let mut cut = match cut {
-                    Some(c) => c,
-                    None => source.subscribe(Some(item))?,
-                };
-                let item = cut.page()?;
-                Ok::<_, io::Error>((cut, item))
-            })
-            .await
-            .map_err(io::Error::other)??;
+            let resuming = self.page.is_some();
+            if self.page.is_none() {
+                let permit = IO.try_acquire().map_err(|_| io::ErrorKind::WouldBlock)?;
+                // Static semaphore ownership survives cancellation through the blocking closure.
+                let (cut, item) = (self.cut.take(), self.model.snapshot.applied_cursor);
+                let source = self.history.clone();
+                #[cfg(test)]
+                let gate = self.gate.take();
+                self.page = Some(tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
+                    let mut cut = match cut {
+                        Some(c) => c,
+                        None => source.subscribe(Some(item))?,
+                    };
+                    #[cfg(test)]
+                    if let Some(gate) = &gate {
+                        gate.pause(0);
+                    }
+                    let item = cut.page()?;
+                    #[cfg(test)]
+                    if let Some(gate) = &gate {
+                        gate.pause(1);
+                    }
+                    Ok::<_, io::Error>((cut, item))
+                }));
+            }
+            let result = match self.page.as_mut() {
+                Some(page) => page.await.map_err(io::Error::other),
+                None => return Err(io::Error::other(ErrorCode::InternalError)),
+            };
+            self.page = None;
+            let (cut, item) = result??;
             self.cut = Some(cut);
             self.ended[0] = matches!(item, history::Item::End);
             let pending = matches!(item, history::Item::Pending);
@@ -184,9 +218,13 @@ impl Stream {
                 self.cut = None;
             }
             self.model.history(item)?;
-            if !pending {
+            if !pending || resuming {
                 return Ok(true);
             }
+        }
+        #[cfg(test)]
+        if let Some(waiting) = self.waiting.take() {
+            let _ = waiting.send(());
         }
         tokio::select! {
             _ = &mut hn, if !self.ended[0] => {},
