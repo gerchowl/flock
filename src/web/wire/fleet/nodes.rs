@@ -2,7 +2,10 @@
 use crate::{
     app::App,
     peers::{PeerSummaryState, SshFailureReason},
-    structured::fleet_lite::{wire::FleetNodeError, FleetNodeRow, Row},
+    structured::fleet_lite::{
+        wire::{FleetNodeError, FleetNodeLinkDiagnostic},
+        FleetNodeRow, Row,
+    },
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -62,6 +65,7 @@ impl Projection {
                     }
                 }
             } else {
+                old.link_diagnostics.clear();
                 old.online = false;
                 old.route = None;
                 old.error = old.error.or_else(|| Some(Failure::Route.wire()));
@@ -109,6 +113,42 @@ pub(super) fn age(peer: &PeerSummaryState, now: Instant) -> Option<Duration> {
             Duration::from_secs(age).checked_add(now.checked_duration_since(peer.ingested_at?)?)
         }
         None => now.checked_duration_since(peer.last_ok?),
+    }
+}
+/// Classify an observation independently of selection or display state.
+fn link_failure(peer: &PeerSummaryState) -> Option<Failure> {
+    if peer
+        .protocol
+        .is_some_and(|p| p != crate::protocol::PROTOCOL_VERSION)
+    {
+        Some(Failure::Incompatible)
+    } else if let Some(error) = &peer.error {
+        Some(Failure::Ssh(SshFailureReason::classify(error)))
+    } else if peer.protocol.is_none()
+        && (peer.last_ok.is_some() || peer.origin_last_ok_secs.is_some())
+    {
+        Some(Failure::Incompatible)
+    } else {
+        None
+    }
+}
+/// A healthy selected path governs online, independently of other link failures.
+fn failure(
+    peer: &PeerSummaryState,
+    now: Instant,
+    routed: bool,
+    stale_after: Duration,
+) -> Option<Failure> {
+    if let Some(error) = link_failure(peer) {
+        Some(error)
+    } else if !routed {
+        Some(Failure::Route)
+    } else if peer.last_ok.is_none() && peer.origin_last_ok_secs.is_none() {
+        Some(Failure::Pending)
+    } else if age(peer, now).is_none_or(|a| a > stale_after) {
+        Some(Failure::Stale)
+    } else {
+        None
     }
 }
 impl Nodes {
@@ -201,6 +241,13 @@ impl Nodes {
                 .filter(|(s, _)| s.node_id.as_deref() == Some(&id))
                 .min_by_key(|(s, direct)| {
                     (
+                        failure(
+                            s,
+                            now,
+                            routes.contains_key(&id),
+                            app.state.config.gossip.stale_after(),
+                        )
+                        .is_some(),
                         age(s, now).unwrap_or(Duration::MAX),
                         !*direct,
                         s.peer.as_str(),
@@ -208,6 +255,19 @@ impl Nodes {
                 });
             let mut row = crate::structured::fleet_lite::local_node(&id);
             row.version = None;
+            for peer in &app.state.peer_summaries {
+                if pins.get(peer.peer.as_str()) == Some(&id) {
+                    if let (Some(error), Some(home)) = (link_failure(peer), &app.node_id) {
+                        let diagnostic = FleetNodeLinkDiagnostic {
+                            source_node_id: home.clone(),
+                            error: error.wire(),
+                        };
+                        if !row.link_diagnostics.contains(&diagnostic) {
+                            row.link_diagnostics.push(diagnostic);
+                        }
+                    }
+                }
+            }
             row.route = routes.get(&id).cloned().map(|mut route| {
                 route.name = row.name.clone();
                 Box::new(route)
@@ -235,28 +295,12 @@ impl Nodes {
                     if direct && peer.proxy_jump.is_none() && peer.origin_last_ok_secs.is_none() {
                         row.latency_ms = peer.latency_ms;
                     }
-                    if peer
-                        .protocol
-                        .is_some_and(|p| p != crate::protocol::PROTOCOL_VERSION)
-                    {
-                        Some(Failure::Incompatible)
-                    } else if let Some(error) = &peer.error {
-                        Some(Failure::Ssh(SshFailureReason::classify(error)))
-                    } else if peer.protocol.is_none()
-                        && (peer.last_ok.is_some() || peer.origin_last_ok_secs.is_some())
-                    {
-                        Some(Failure::Incompatible)
-                    } else if row.route.is_none() {
-                        Some(Failure::Route)
-                    } else if peer.last_ok.is_none() && peer.origin_last_ok_secs.is_none() {
-                        Some(Failure::Pending)
-                    } else if observation_age
-                        .is_none_or(|a| a > app.state.config.gossip.stale_after())
-                    {
-                        Some(Failure::Stale)
-                    } else {
-                        None
-                    }
+                    failure(
+                        peer,
+                        now,
+                        row.route.is_some(),
+                        app.state.config.gossip.stale_after(),
+                    )
                 }
             };
             row.online = failure.is_none();

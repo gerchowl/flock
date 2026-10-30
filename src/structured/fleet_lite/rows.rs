@@ -132,6 +132,7 @@ pub(crate) fn local_node(home: &str) -> FleetNodeRow {
         latency_ms: None,
         last_ok: None,
         error: None,
+        link_diagnostics: Vec::new(),
         online: true,
         route: None,
         counts: None,

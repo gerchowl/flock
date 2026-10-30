@@ -31,6 +31,10 @@ type FleetNodeRow = {
   last_ok: number | null;
   version: string | null;
   error: { code: string; message: string } | null;
+  link_diagnostics: {
+    source_node_id: string;
+    error: { code: string; message: string };
+  }[];
   online: boolean;
   route: Route | null;              // existing mesh Route, actual chosen path
   counts: {
@@ -133,22 +137,40 @@ version comparison.
 
 **`error`**
 
-Units, provenance and render contract: For SSH failures use
+Units, provenance and render contract: The selected path's failure, or a retained
+last-known cause while offline. For SSH failures use
 SshFailureReason::classify and its stable as_str token (src/peers.rs), with a
 bounded safe message, not raw PeerSummaryState.error or SSH stderr. Use
 separately typed pending/stale/route/peer_incompatible reasons for non-SSH
-states; null after success. No tokens, payloads or private paths. Preserve
-specific authorization/version causes. Unknown code renders a generic failure
+states; null for a healthy selected path. No tokens, payloads or private paths.
+Preserve specific authorization/version causes. Unknown code renders a generic failure
 with its safe message.
 
 **`online`**
 
-Units, provenance and render contract: Server classification: true only for a
-current local server, or a compatible remote with a live route, a successful
-observation no older than the effective stale threshold and no current failure.
-For an already authenticated identity it is false before first success, on
-failure/withdrawal/incompatibility, and after staleness; an unbound peer has no
-node row. It describes reachability, never command permission or agent liveness.
+Units, provenance and render contract: Server classification of the selected
+path. A current local server is online. An unbound peer has no node row; an
+already authenticated identity is offline before first success and when no
+healthy path remains. It describes reachability, never command permission or
+agent liveness.
+
+**Owner amendment: healthy-path precedence (2026-10-29, #2779 B).**
+
+A node is online when its selected owner-proven path has a compatible, fresh
+successful observation and a live route. Select a healthy observation before
+comparing observation ages. A direct-link failure does not make a node offline
+when a healthy proven relay is available. If no healthy path exists, the selected
+path retains its classified failure in `error` and the node is offline.
+
+`link_diagnostics` is an array of `{source_node_id, error}`. The containing row's
+`node_id` is the destination; `source_node_id` is the authenticated serving home
+that observed the direct-link failure. Each `error` uses the same bounded,
+content-free code/message contract as `FleetNodeError`. These diagnostics are
+independent of the selected path and `online`; a direct `auth_refused` remains
+visible alongside a healthy relay. They update on owner capture, clear after
+direct recovery or removal of the current binding/observation, and are empty
+when no authenticated current direct diagnostic is available. They contain no
+alias, SSH destination, raw stderr, token or payload. Older persisted rows default the array to empty.
 
 **`route`**
 

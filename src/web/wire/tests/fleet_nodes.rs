@@ -441,8 +441,12 @@ fn proven_owner_relay_keeps_null_latency_stable_time_and_legacy_protocol_refusal
         case.app.state.peer_summaries.insert(index, direct);
         case.success(&peer, &hub.node_id(), json!({"protocol":null}), 3);
         let legacy = case.snapshot().await[&hub.node_id()].clone();
-        assert_eq!(legacy["online"], false);
-        assert_eq!(legacy["error"]["code"], "peer_incompatible");
+        assert_eq!(legacy["online"], true);
+        assert!(legacy["error"].is_null());
+        assert_eq!(
+            legacy["link_diagnostics"][0]["error"]["code"],
+            "peer_incompatible"
+        );
         case.success(
             &peer,
             &hub.node_id(),
@@ -450,9 +454,16 @@ fn proven_owner_relay_keeps_null_latency_stable_time_and_legacy_protocol_refusal
             4,
         );
         let newer = case.snapshot().await[&hub.node_id()].clone();
-        assert_eq!(newer["online"], false);
-        assert_eq!(newer["error"]["code"], "peer_incompatible");
+        assert_eq!(newer["online"], true);
+        assert!(newer["error"].is_null());
+        assert_eq!(
+            newer["link_diagnostics"][0]["error"]["code"],
+            "peer_incompatible"
+        );
         case.app.state.relayed_fleet_cache.clear();
+        let without_relay = case.snapshot().await[&hub.node_id()].clone();
+        assert_eq!(without_relay["online"], false);
+        assert_eq!(without_relay["error"]["code"], "peer_incompatible");
         case.success(&peer,&hub.node_id(),json!({"relayed_fleet":[{
             "node_id":hub.node_id(),"name":"hub.example","ssh_target":"hub.example","host":"hub.example","origin":"origin.example", "protocol":crate::protocol::PROTOCOL_VERSION,"latency_ms":9999
         }]}),5);
@@ -781,4 +792,93 @@ fn poll_and_its_relay_share_one_observation_instant() {
         );
         assert_eq!(last_ok, direct);
     });
+}
+
+fn relay_and_direct_paths(case: &mut Case, origin_age: u64) -> (PeerConfig, String) {
+    let owner = NodeIdentity::fixture([81; 32]);
+    let id = owner.node_id();
+    let relay = case.peer("relay.example");
+    crate::peer_stream::test_enroll(&relay, &id);
+    case.direct(&owner);
+    case.success(
+        &relay,
+        &id,
+        json!({"relayed_fleet":[{
+            "node_id":id,"name":"hub.example","ssh_target":"hub.example",
+            "origin":"hub.example","age_secs":origin_age,
+            "protocol":crate::protocol::PROTOCOL_VERSION
+        }]}),
+        2,
+    );
+    // Keep the real-ingress relay while isolating it from a direct candidate.
+    case.app
+        .state
+        .peer_summaries
+        .retain(|p| p.peer != relay.name);
+    let direct = case.peer("direct.example");
+    crate::peer_stream::test_enroll(&direct, &id);
+    case.success(&direct, &id, json!({}), 2);
+    (direct, id)
+}
+
+#[test]
+fn healthy_owner_relay_wins_over_a_direct_refusal_and_keeps_its_diagnostic() {
+    let _guard = crate::config::test_config_env_guard();
+    runtime(async {
+        let mut case = Case::new().await;
+        let (peer, id) = relay_and_direct_paths(&mut case, 0);
+        case.fail(&peer, "Permission denied (publickey): private.example");
+        let row = case.snapshot().await[&id].clone();
+        assert_eq!(row["online"], true);
+        assert!(row["error"].is_null());
+        assert_eq!(
+            row["link_diagnostics"][0]["source_node_id"],
+            case.app.node_id.as_deref().unwrap()
+        );
+        assert_eq!(row["link_diagnostics"][0]["error"]["code"], "auth_refused");
+        assert_eq!(row["link_diagnostics"].as_array().unwrap().len(), 1);
+        assert!(!row.to_string().contains("private.example"));
+        case.server.clock.advance(
+            u64::try_from(case.app.state.config.gossip.stale_after().as_millis()).unwrap() + 1,
+        );
+        let offline = case.snapshot().await[&id].clone();
+        assert_eq!(offline["online"], false);
+        assert_eq!(offline["error"]["code"], "auth_refused");
+        assert_eq!(offline["link_diagnostics"], row["link_diagnostics"]);
+        case.success(&peer, &id, json!({}), 2);
+        let recovered = case.snapshot().await[&id].clone();
+        assert_eq!(recovered["online"], true);
+        assert_eq!(recovered["link_diagnostics"], json!([]));
+        case.server.finish().await;
+    });
+}
+
+#[test]
+fn healthy_older_relay_wins_over_a_fresher_failed_direct_reading() {
+    let _guard = crate::config::test_config_env_guard();
+    runtime(async {
+        let mut case = Case::new().await;
+        let (peer, id) = relay_and_direct_paths(&mut case, 1);
+        case.fail(&peer, "Connection refused");
+        let row = case.snapshot().await[&id].clone();
+        case.server.finish().await;
+        assert_eq!(row["online"], true);
+        assert!(row["error"].is_null());
+        assert_eq!(
+            row["link_diagnostics"][0]["error"]["code"],
+            "connect_refused"
+        );
+    });
+}
+
+#[test]
+fn legacy_node_rows_have_no_invented_link_diagnostics() {
+    let id = NodeIdentity::fixture([81; 32]).node_id();
+    let mut value = serde_json::to_value(crate::structured::fleet_lite::local_node(&id)).unwrap();
+    value.as_object_mut().unwrap().remove("link_diagnostics");
+    let row: crate::structured::fleet_lite::FleetNodeRow = serde_json::from_value(value).unwrap();
+    assert_eq!(
+        serde_json::to_value(row).unwrap()["link_diagnostics"],
+        json!([])
+    );
 }

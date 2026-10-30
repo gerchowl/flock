@@ -68,7 +68,8 @@ the immediate source captured from a validated poll or enrolled inbound edge
 at ingestion to be that same owner. Rejected poll identities supply no relay
 rows, and rebinding an alias cannot authenticate its old cached claims. Third-party
 claims and carried snapshots cannot supply or freshen facts.
-The freshest proven owner observation wins, with a stable ordering for ties.
+A healthy proven owner observation wins over failed paths. Among healthy
+observations, the freshest wins, with a stable ordering for ties.
 Direct latency is the last home-to-owner summary request in
 milliseconds; relayed observations have `latency_ms: null`. Version and health
 retain their owner identity; rebinding a peer clears the old owner's facts.
@@ -80,11 +81,19 @@ from the direct observation source, never a matching configured name.
 successful observation. Each poll shares one observation instant with all of its
 relayed rows. GUI requests and failed polls do not advance it.
 Online classification uses monotonic age, including origin age plus local
-residence for relayed observations. Unknown age, absent/incompatible peer
-protocol, poll failure, missing live route and age strictly greater than the
-effective `[gossip] stale_after_secs` threshold are offline. Failures use bounded
+residence for relayed observations. If no healthy path exists, unknown age,
+absent/incompatible peer protocol, poll failure, missing live route and age
+strictly greater than the effective `[gossip] stale_after_secs` threshold are
+offline. The selected path's failure (or retained last-known cause while offline)
+uses bounded
 `pending`, `stale`, `route`, `peer_incompatible`, or classified SSH reasons.
-A successful compatible observation with a live route clears the error.
+A successful compatible observation with a live route clears `error`, including
+when a direct link is failing. `link_diagnostics` independently retains current
+direct-link failures as `{source_node_id, error}`: the source is the authenticated
+serving home and the destination is this row's `node_id`. These classified,
+content-free errors contain no SSH aliases, targets or stderr. They clear on
+direct recovery or removal of the current binding/observation; the array is empty
+when no current direct failure is known. Older stored rows default it to empty.
 An unavailable home sample stays `health: null`; previous home health is not
 reported as current. Thermal severity and component remain, but host-authored
 thermal detail labels are omitted at read scope. A failed unpinned poll retains
