@@ -1551,3 +1551,5 @@ fn poisoned_client_map_still_retires_a_lease() {
         server.finish().await;
     });
 }
+
+mod trace_auth;
