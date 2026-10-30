@@ -279,13 +279,17 @@ describe("node age (ADR-0043 last_ok)", () => {
     expect(age()).toBe(90_000);
   });
 
-  test("a wall clock skewed by an hour does not change the age", () => {
-    const d = driven();
-    d.observer().snapshot([{ op: "upsert", kind: "node", row: seenNode(SENT - 60_000), tsMs: SENT }]);
+  test("a wall clock skewed by an hour, before the row arrives and after, does not change the age", () => {
     const real = Date.now;
-    Date.now = () => real() + 3_600_000;
+    let wall = real() + 3_600_000;
+    Date.now = () => wall;
     try {
-      expect(nodeAgeMs(d.reader.nodes.stamp(A), SENT - 60_000, d.now())).toBe(60_000);
+      const d = driven();
+      d.observer().snapshot([{ op: "upsert", kind: "node", row: seenNode(SENT - 60_000), tsMs: SENT }]);
+      // The wall clock jumps six more hours while the monotonic clock moves 90 s.
+      wall += 6 * 3_600_000;
+      d.advance(90_000);
+      expect(nodeAgeMs(d.reader.nodes.stamp(A), SENT - 60_000, d.now())).toBe(SENT - (SENT - 60_000) + 90_000);
     } finally {
       Date.now = real;
     }
