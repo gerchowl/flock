@@ -19,6 +19,32 @@ a member of flk's build and never linked into `flk`.
   `macos-15` and the required checks need both (#2477). `bun test` there checks
   the init script's `openBridge`; CI does not run it.
 
+## Nix build (macOS)
+
+Run `nix build .#flock-desktop` on an Apple Silicon or Intel Mac, then
+`open result/Applications/flock.app`. To install it, copy that bundle into
+`~/Applications/` (create the directory first if needed). Keep the Nix store
+closure available: the copied app still uses its store dependencies.
+
+The package embeds the flake's `flock-client` output and builds offline. Its
+check phase runs `cargo test --release`, including the DevTools guard, and
+the init script's `bun test`. The app is ad-hoc signed with hardened runtime
+and the checked-in entitlements after Nix fixups, using `rcodesign`; no Apple
+identity, keychain access or notarisation is involved (#1636).
+
+`desktop/bun.lock` contains only Tauri CLI 2.12.2 and its native bindings. Nix
+uses that CLI rather than nixpkgs' 2.11.0, alongside the 2.12.3 Tauri crate.
+`nix/desktop-deps.json` pins a platform-independent fetch of both Darwin
+bindings and records the Bun version and lock digest, following `flock-client`.
+After changing the desktop Bun lock or Bun, run `just desktop-deps-hash` and
+commit the refreshed pin. Cargo dependencies use `desktop/Cargo.lock` and
+its registry checksums directly. Refresh the pin after same-version nixpkgs
+Bun patches too, since those can reuse an existing fixed-output path.
+
+The Nix output is Darwin-only. Linux packaging needs WebKitGTK wrapping and
+desktop integration in a separate slice (#2790); the existing non-Nix binary build
+remains available with `just desktop-build`.
+
 ## Zero-touch, and the bridge
 
 On the server's machine the shell needs no token input (ADR-0038 §6, "The
