@@ -3371,6 +3371,12 @@ pub enum ResponseResult {
     AgentInfo {
         agent: AgentInfo,
     },
+    /// Launch admitted but native placement failed. Do not retry as a new start.
+    StructuredAgentStartedUnplaced {
+        agent_id: String,
+        generation: u64,
+        placement_error: ErrorBody,
+    },
     StructuredAgentInfo {
         agent: crate::api::structured_agent::StructuredAgentInfo,
     },
