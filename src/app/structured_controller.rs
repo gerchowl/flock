@@ -13,6 +13,7 @@ use crate::{
 use std::{collections::HashMap, sync::Arc};
 impl App {
     pub(in crate::app) fn sync_structured_views(&mut self) -> bool {
+        self.poll_native_submissions();
         let wanted: HashMap<String, Target> = self
             .state
             .workspaces

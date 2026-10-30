@@ -304,12 +304,8 @@ pub(super) fn render_panes(
     let terminal_active = app.mode == Mode::Terminal;
 
     for info in &app.view.pane_infos {
-        if let Some(Ok(crate::workspace::Content::Native(view))) =
-            ws.active_tab().map(|tab| tab.content(info.id))
-        {
-            if view.render_unavailable(frame, info.rect) {
-                continue;
-            }
+        if super::structured::render_native(app, frame, info) {
+            continue;
         }
         if let Some(rt) = app.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, info.id) {
             {

@@ -29,6 +29,12 @@ impl Transcript {
     pub(super) fn into_hits(self) -> impl Iterator<Item = (Rect, Action)> {
         self.hits.into_iter()
     }
+    pub(super) fn rects(&self) -> impl Iterator<Item = Rect> + '_ {
+        self.hits.iter().map(|(r, _)| *r)
+    }
+    pub(super) fn positions(&self) -> impl Iterator<Item = (u16, u16)> + '_ {
+        self.hits.iter().map(|(r, _)| (r.x, r.y))
+    }
     /// Paint only the prepared rows. The source snapshot and computed geometry stay immutable.
     pub fn render(&self, frame: &mut Frame) {
         // Per-frame row cloning is tracked in #2590.
