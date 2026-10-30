@@ -1,32 +1,31 @@
 /**
  * The wire {@link FleetSource}: S7-min's fleet-lite, the `fleet` snapshot
- * stream (ADR-0036 §5, #1746), mapped to presentation {@link AgentRow}s.
+ * stream (ADR-0036 §5, #1746), parsed into {@link FleetChange}s for the fleet
+ * store (`store/fleet.ts`, ADR-0038 §3), which owns the entities.
  *
  * Every `ev` on `fleet`, snapshot line or later delta, carries one
- * {@link FleetDelta}. A completed snapshot replaces every row, so an agent
- * missing from it is gone; deltas after it upsert or remove one row. A
- * malformed agent delta ends the subscription with a visible failure, as a
- * refusal does. Node/project and future kinds are deliberately ignored until
- * G4 renders them. The connection advances its cursor after every accepted
- * callback, including ignored deltas, and after complete snapshots.
+ * {@link FleetDelta}: an agent, node or project upsert, or a remove of one
+ * entity. This module parses and validates and holds no rows. A completed
+ * snapshot is handed over whole, so an entity of any kind missing from it is
+ * gone; deltas after it change one entity each. A malformed agent, node or
+ * project delta ends the subscription with a visible failure, as a refusal
+ * does. An unknown `type`, including the sender's lossless `unknown` wrapper
+ * and future discriminators, is skipped. The connection advances its cursor
+ * after every accepted callback, including skipped deltas, and after complete
+ * snapshots.
  *
  * @module
  */
 import type { FleetAgentRow } from "../gen/FleetAgentRow";
-import type { FleetDelta } from "../gen/FleetDelta";
+import type { FleetNodeRow } from "../gen/FleetNodeRow";
+import type { FleetProjectRow } from "../gen/FleetProjectRow";
 import type { Phase } from "../gen/Phase";
 import type { WireEvent } from "../gen/WireEvent";
-import type { AgentRow, FleetSource } from "../fleet";
+import type { AgentRow, FleetChange, FleetSource } from "../fleet";
 import type { WireConnection } from "./connection";
 
 /** Parse the generated fields presentation consumes; newer S4 axes stay opaque. */
-type RowView = Pick<FleetAgentRow, "id" | "label" | "activity" | "waiting_on_human"> & { readonly state: { readonly phase?: unknown } };
-type IgnoredKind = Exclude<FleetDelta, { type: "fleet.upsert" | "fleet.remove" }>["type"];
-const IGNORED: Record<IgnoredKind, true> = {
-  "fleet.node.upsert": true, "fleet.node.remove": true,
-  "fleet.project.upsert": true, "fleet.project.remove": true,
-};
-type DeltaView = (Omit<Extract<FleetDelta, { type: "fleet.upsert" }>, "row"> & { readonly row: RowView }) | Extract<FleetDelta, { type: "fleet.remove" }>;
+type RowView = Pick<FleetAgentRow, "id" | "label" | "activity" | "waiting_on_human" | "node_id" | "project"> & { readonly state: { readonly phase?: unknown } };
 
 /** Typed against {@link Phase}, so a new state fails `tsc` until listed. */
 const PHASES: { readonly [P in Phase]: true } = {
@@ -46,34 +45,74 @@ const PHASES: { readonly [P in Phase]: true } = {
 
 type Json = { readonly [key: string]: unknown };
 const isObject = (value: unknown): value is Json => typeof value === "object" && value !== null && !Array.isArray(value);
+const isNumber = (value: unknown): value is number => typeof value === "number";
 const isStrings = (value: unknown): value is string[] => Array.isArray(value) && value.every((item) => typeof item === "string");
+
+const isString = (value: unknown): value is string => typeof value === "string";
+const isNullable = (value: unknown, is: (value: unknown) => boolean): boolean => value === null || is(value);
 
 function isRow(row: unknown): row is RowView {
   return (
     isObject(row) &&
-    typeof row["id"] === "string" &&
-    typeof row["label"] === "string" &&
+    isString(row["id"]) &&
+    isString(row["label"]) &&
     isObject(row["state"]) &&
-    (row["activity"] === undefined || typeof row["activity"] === "string") &&
-    isStrings(row["waiting_on_human"])
+    (row["activity"] === undefined || isString(row["activity"])) &&
+    isStrings(row["waiting_on_human"]) &&
+    (row["node_id"] === undefined || isString(row["node_id"])) &&
+    (row["project"] === undefined || isString(row["project"]))
   );
 }
 
-/** Read agent deltas; skip typed entity and unknown kinds, refuse malformed agents. */
-export function fleetDelta(ev: WireEvent): DeltaView | { readonly type: "ignored" } | null {
+/** A node row: every field is present, with an explicit null where an observation is unknown. */
+function isNodeRow(row: unknown): row is FleetNodeRow {
+  return (
+    isObject(row) &&
+    isString(row["node_id"]) &&
+    isString(row["name"]) &&
+    typeof row["online"] === "boolean" &&
+    isNullable(row["health"], isObject) &&
+    isNullable(row["latency_ms"], isNumber) &&
+    isNullable(row["last_ok"], isNumber) &&
+    isNullable(row["version"], isString) &&
+    isNullable(row["error"], (error) => isObject(error) && isString(error["code"]) && isString(error["message"])) &&
+    isNullable(row["route"], isObject) &&
+    isNullable(row["counts"], isObject) &&
+    isNullable(row["unbound_configured_peers"], isNumber)
+  );
+}
+
+function isProjectRow(row: unknown): row is FleetProjectRow {
+  return isObject(row) && isString(row["id"]) && isString(row["node_id"]) && isString(row["name"]);
+}
+
+/** Read one delta as a change; skip unknown kinds (`"ignored"`), refuse a malformed one (`null`). */
+export function fleetDelta(ev: WireEvent, tsMs?: number): FleetChange | "ignored" | null {
   if (!isObject(ev)) return null;
-  if (ev["type"] === "fleet.upsert") return isRow(ev["row"]) ? { type: "fleet.upsert", row: ev["row"] } : null;
-  if (ev["type"] === "fleet.remove") return typeof ev["id"] === "string" ? { type: "fleet.remove", id: ev["id"] } : null;
-  if (typeof ev["type"] !== "string") return null;
-  if (Object.hasOwn(IGNORED, ev["type"])) return { type: "ignored" };
+  const type = ev["type"];
+  if (type === "fleet.upsert") return isRow(ev["row"]) ? { op: "upsert", kind: "agent", row: agentRow(ev["row"]) } : null;
+  if (type === "fleet.remove") return isString(ev["id"]) ? { op: "remove", kind: "agent", id: ev["id"] } : null;
+  if (type === "fleet.node.upsert") return isNodeRow(ev["row"]) ? { op: "upsert", kind: "node", row: ev["row"], ...(tsMs === undefined ? {} : { tsMs }) } : null;
+  if (type === "fleet.node.remove") return isString(ev["node_id"]) ? { op: "remove", kind: "node", node_id: ev["node_id"] } : null;
+  if (type === "fleet.project.upsert") return isProjectRow(ev["row"]) ? { op: "upsert", kind: "project", row: ev["row"] } : null;
+  if (type === "fleet.project.remove") return isString(ev["id"]) && isString(ev["node_id"]) ? { op: "remove", kind: "project", node_id: ev["node_id"], id: ev["id"] } : null;
+  if (!isString(type)) return null;
   // Includes the sender's lossless `unknown` wrapper and future discriminators.
-  return { type: "ignored" };
+  return "ignored";
 }
 
 function agentRow(row: RowView): AgentRow {
   const phase = row.state.phase;
   const state = typeof phase === "string" && Object.hasOwn(PHASES, phase) ? phase as Phase : "unknown";
-  return { id: row.id, label: row.label, state, activity: row.activity ?? "", waitingOnHuman: row.waiting_on_human };
+  return {
+    id: row.id,
+    label: row.label,
+    state,
+    activity: row.activity ?? "",
+    waitingOnHuman: row.waiting_on_human,
+    ...(row.node_id === undefined ? {} : { nodeId: row.node_id }),
+    ...(row.project === undefined ? {} : { project: row.project }),
+  };
 }
 
 /** Creates a {@link FleetSource} whose subscriptions run on `connection`. */
@@ -82,40 +121,42 @@ export function createWireFleet(connection: WireConnection): FleetSource {
     subscribe(observer) {
       let open = true;
       let unsubscribe = (): void => undefined;
-      let rows = new Map<string, AgentRow>();
       const end = (message: string): void => {
         if (!open) return;
         open = false;
         unsubscribe();
         observer.failed(message);
       };
-      /** Applies `ev` to `into`; false once the subscription has ended. */
-      const apply = (into: Map<string, AgentRow>, ev: WireEvent): boolean => {
-        const delta = fleetDelta(ev);
+      /** The change `ev` carries, `undefined` when skipped; ends the subscription when `ev` is malformed. */
+      const read = (ev: WireEvent, tsMs: number): FleetChange | undefined | null => {
+        const delta = fleetDelta(ev, tsMs);
         if (delta === null) {
           end(`The fleet stream sent something that is not a fleet delta: ${JSON.stringify(ev).slice(0, 200)}`);
-          return false;
+          return null;
         }
-        if (delta.type === "ignored") return true;
-        if (delta.type === "fleet.upsert") into.set(delta.row.id, agentRow(delta.row));
-        else into.delete(delta.id);
-        return true;
+        return delta === "ignored" ? undefined : delta;
       };
       unsubscribe = connection.subscribe("fleet", {
-        event: (_seq, ev) => open && apply(rows, ev) && observer.rows([...rows.values()]),
+        event: (_seq, ev, tsMs) => {
+          if (!open) return;
+          const change = read(ev, tsMs);
+          if (change !== undefined && change !== null) observer.change(change);
+        },
         snapshot: (lines) => {
-          const fresh = new Map<string, AgentRow>();
-          if (!open || !lines.every((ev) => apply(fresh, ev))) return;
-          rows = fresh;
-          observer.rows([...rows.values()]);
+          if (!open) return;
+          const changes: FleetChange[] = [];
+          for (const { ev, tsMs } of lines) {
+            const change = read(ev, tsMs);
+            if (change === null) return;
+            if (change !== undefined) changes.push(change);
+          }
+          observer.snapshot(changes);
         },
         // `fleet` is a snapshot stream; the connection refuses a history gap on one.
         gap: () => undefined,
         synced: () => undefined,
         reset: () => {
-          if (!open) return;
-          rows = new Map();
-          observer.rows([]);
+          if (open) observer.reset();
         },
         refused: (refusal) => end(refusal.message),
       }).close;

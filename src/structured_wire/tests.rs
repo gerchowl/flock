@@ -39,7 +39,7 @@ fn every_script_parses_and_round_trips_all_frame_kinds() {
                 FixtureStep::Send { frame, .. } => {
                     server.insert(value["frame"]["t"].as_str().unwrap().to_owned());
                     let encoded = serde_json::to_string(&frame).unwrap();
-                    if matches!(frame, fixture::FixtureServerFrame::Dynamic(_)) {
+                    if !matches!(frame, fixture::FixtureServerFrame::Literal(_)) {
                         assert!(serde_json::from_str::<ServerFrame>(&encoded).is_err());
                         continue;
                     }
@@ -715,7 +715,7 @@ fn sub_id_reused_refusal_is_typed_for_both_live_and_closed_ids() {
 
 #[test]
 fn dynamic_timestamp_is_typed_and_restricted_to_event_wall_time() {
-    let line = json!({"v":1,"step":"send","frame":{"t":"ev","sub_id":"s","stream":"agent/fixture","seq":1,"ts_ms":{"$dynamic":"ts_ms","source":"persisted"},"ev":{"type":"assistant","message":{}}}});
+    let line = json!({"v":1,"step":"send","frame":{"t":"ev","sub_id":"s","stream":"agent/fixture","seq":1,"ts_ms":{"$dynamic":"ts_ms","source":"persisted","bound":"after_ack"},"ev":{"type":"assistant","message":{}}}});
     assert!(matches!(
         FixtureLine::parse(&line.to_string()).unwrap().step,
         FixtureStep::Send {
@@ -734,9 +734,11 @@ fn dynamic_timestamp_is_typed_and_restricted_to_event_wall_time() {
         assert!(FixtureLine::parse(&invalid.to_string()).is_err(), "{field}");
     }
     for marker in [
-        json!({"$dynamic":"future","source":"persisted"}),
-        json!({"$dynamic":"ts_ms","source":"socket"}),
-        json!({"$dynamic":"ts_ms","source":"persisted","extra":true}),
+        json!({"$dynamic":"future","source":"persisted","bound":"after_ack"}),
+        json!({"$dynamic":"ts_ms","source":"socket","bound":"after_ack"}),
+        json!({"$dynamic":"ts_ms","source":"persisted","bound":"after_ack","extra":true}),
+        json!({"$dynamic":"ts_ms","source":"persisted"}),
+        json!({"$dynamic":"ts_ms","source":"persisted","bound":"future"}),
     ] {
         let mut invalid = line.clone();
         invalid["frame"]["ts_ms"] = marker;
@@ -753,6 +755,27 @@ fn permission_fixture_principal_is_a_literal_valid_token_identity() {
         .find(|line| line["frame"]["ev"]["state"] == "closed")
         .unwrap();
     assert_eq!(close["frame"]["ev"]["principal"], TOKEN_PRINCIPAL);
+}
+
+#[test]
+fn build_version_matcher_is_typed_and_restricted_to_welcome() {
+    let line = json!({"v":1,"step":"send","frame":{"t":"welcome","protocol":1,"server_version":{"$dynamic":"server_version","source":"build"},"capabilities":["read"],"principal":"fixture","server_epoch":"fixture","idempotency_window_ms":1}});
+    assert!(FixtureLine::parse(&line.to_string()).is_ok());
+    for (field, value) in [
+        (
+            "server_version",
+            json!({"$dynamic":"server_version","source":"socket"}),
+        ),
+        (
+            "server_version",
+            json!({"$dynamic":"server_version","source":"build","extra":true}),
+        ),
+        ("server_epoch", line["frame"]["server_version"].clone()),
+    ] {
+        let mut invalid = line.clone();
+        invalid["frame"][field] = value;
+        assert!(FixtureLine::parse(&invalid.to_string()).is_err());
+    }
 }
 
 #[test]

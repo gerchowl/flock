@@ -135,6 +135,28 @@ impl Listener {
         health: Health,
         core: Core,
     ) -> io::Result<Option<Self>> {
+        Self::prepare_with_funnel(
+            bind,
+            codes,
+            data,
+            inherited,
+            local,
+            (health, core),
+            check_funnel,
+        )
+        .await
+    }
+    /// Use the same startup path with an injected, off-executor forwarding check.
+    async fn prepare_with_funnel(
+        bind: Option<SocketAddr>,
+        codes: Codes,
+        data: PathBuf,
+        inherited: Option<TcpListener>,
+        local: (PathBuf, Option<crate::ipc::SocketOwner>),
+        state: (Health, Core),
+        probe: impl FnOnce(u16) -> io::Result<()> + Send + 'static,
+    ) -> io::Result<Option<Self>> {
+        let (health, core) = state;
         let local =
             super::local_listener::Listener::prepare(local.0, local.1, core.local_router())?;
         let Some(bind) = bind else {
@@ -175,7 +197,7 @@ impl Listener {
                 },
             ));
         }
-        tokio::task::spawn_blocking(move || check_funnel(actual.port()))
+        tokio::task::spawn_blocking(move || probe(actual.port()))
             .await
             .map_err(io::Error::other)??;
         socket.set_nonblocking(true)?;
@@ -281,22 +303,64 @@ struct FunnelStatus {
     #[serde(flatten)]
     rest: serde_json::Map<String, serde_json::Value>,
 }
+/// Absence is distinct from an installed but unreadable forwarding configuration.
+enum FunnelProbe {
+    NotInstalled,
+    Status(FunnelStatus),
+    Unavailable(String),
+}
 fn check_funnel(port: u16) -> io::Result<()> {
-    let output = crate::process::TracedCommand::new("tailscale", "client-wire")
-        .args(["serve", "status", "--json"])
-        .output_traced_with_timeout_and_limit(FUNNEL_DEADLINE, FUNNEL_STATUS_BYTES)?;
-    validate_funnel(output, port)
+    check_funnel_with(
+        port,
+        &crate::platform::tailscale::Locations::current(),
+        |cli| {
+            crate::process::TracedCommand::new(cli, "client-wire")
+                .args(["serve", "status", "--json"])
+                .output_traced_with_timeout_and_limit(FUNNEL_DEADLINE, FUNNEL_STATUS_BYTES)
+        },
+    )
+}
+fn check_funnel_with(
+    port: u16,
+    paths: &crate::platform::tailscale::Locations,
+    run: impl FnOnce(&std::path::Path) -> io::Result<std::process::Output>,
+) -> io::Result<()> {
+    let probe = match paths.discover() {
+        Ok(None) => FunnelProbe::NotInstalled,
+        Ok(Some(cli)) => match run(&cli).and_then(parse_funnel) {
+            Ok(status) => FunnelProbe::Status(status),
+            Err(error) => FunnelProbe::Unavailable(format!(
+                "Tailscale CLI {} present but serve status unavailable: {error}",
+                cli.display()
+            )),
+        },
+        Err(error) => FunnelProbe::Unavailable(error.to_string()),
+    };
+    match probe {
+        FunnelProbe::NotInstalled => {
+            crate::logging::client_tailscale_not_installed(&paths.checked_paths());
+            Ok(())
+        }
+        FunnelProbe::Status(status) => validate_status(status, port),
+        FunnelProbe::Unavailable(reason) => Err(io::Error::other(reason)),
+    }
 }
 /// Validate successful probe output before any request can reach admission.
+#[cfg(test)]
 fn validate_funnel(output: std::process::Output, port: u16) -> io::Result<()> {
+    validate_status(parse_funnel(output)?, port)
+}
+fn parse_funnel(output: std::process::Output) -> io::Result<FunnelStatus> {
     if !output.status.success() {
         return Err(io::Error::other(format!(
             "tailscale serve status failed: {}",
             output.status
         )));
     }
-    let status: FunnelStatus = serde_json::from_slice(&output.stdout)
-        .map_err(|_| io::Error::other("invalid tailscale status JSON"))?;
+    serde_json::from_slice(&output.stdout)
+        .map_err(|_| io::Error::other("invalid tailscale status JSON"))
+}
+fn validate_status(status: FunnelStatus, port: u16) -> io::Result<()> {
     if status
         .enabled
         .iter()
