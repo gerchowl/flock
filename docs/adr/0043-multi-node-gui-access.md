@@ -95,6 +95,21 @@ only by authenticated NodeId, under the identity choice above. A name/alias or
 two diamond routes cannot create a second row. Project names through the
 exposure policy in §2; unbound labels never become routing authority.
 
+Relay provenance is captured at ingress and remains valid only while the
+current local binding exists and equals the captured sender NodeId. If an
+enrollment/config removal or a failed pin-store read leaves no current binding,
+the captured proof is revoked. A missing binding never means permission to
+retain authority. Neither an alias nor a later rebind can create provenance for
+an old reading.
+
+Poll and hub-push deliveries with no validated sender identity may retain
+observations as unproven display data, never as authenticated node readings.
+Such a delivery evicts previously proven rows from that supplying alias before
+merging the unproven observations. This also applies to a rejected poll identity:
+its earlier proven rows cannot survive that delivery with their old authority.
+The current hub-push API requires an enrolled NodeId before admission; the
+shared cache merge still applies the same fail-closed rule to absent provenance.
+
 **`health`**
 
 Units, provenance and render contract: Reuse PeerSystemSummary:
