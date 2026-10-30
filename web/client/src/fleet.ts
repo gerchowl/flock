@@ -39,7 +39,8 @@ export type AgentRow = {
  */
 export type FleetChange =
   | { readonly op: "upsert"; readonly kind: "agent"; readonly row: AgentRow }
-  | { readonly op: "upsert"; readonly kind: "node"; readonly row: FleetNodeRow }
+  /** `tsMs` is the envelope time of the frame that carried the row (ADR-0043: age is read against it). */
+  | { readonly op: "upsert"; readonly kind: "node"; readonly row: FleetNodeRow; readonly tsMs?: number }
   | { readonly op: "upsert"; readonly kind: "project"; readonly row: FleetProjectRow }
   | { readonly op: "remove"; readonly kind: "agent"; readonly id: string }
   | { readonly op: "remove"; readonly kind: "node"; readonly node_id: string }

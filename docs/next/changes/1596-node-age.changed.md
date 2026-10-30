@@ -1,0 +1,1 @@
+- Age node rows by the frame's envelope time instead of the browser's wall clock: each snapshot line now reaches the fleet stream's handler with its own `ts_ms`, and the fleet store stamps a node row with that time and a monotonic receipt time, so a node's age is `(ts_ms - last_ok)` plus the dwell since receipt (ADR-0043 `last_ok`, ADR-0038 §3, part of #1596).

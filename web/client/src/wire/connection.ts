@@ -138,6 +138,9 @@ export function isHistoryStream(stream: string): boolean {
   return stream.startsWith("agent/") || stream === "events";
 }
 
+/** One snapshot line and its frame's `ts_ms`, as `event` receives a live event's. */
+export type SnapshotLine = { readonly ev: WireEvent; readonly tsMs: number };
+
 /**
  * Receives one stream's progress. Each callback runs synchronously, and may
  * close its own subscription ({@link Subscription.close}); nothing of that
@@ -154,7 +157,7 @@ export interface StreamHandler {
    * A completed snapshot: these lines are now every entity of the stream,
    * and anything not among them is gone. Snapshot streams only.
    */
-  snapshot(lines: readonly WireEvent[]): void;
+  snapshot(lines: readonly SnapshotLine[]): void;
   /** Drop every entity of the stream: `cursor_ahead`. */
   reset(): void;
   /** The stream is Refused and ends here. */
@@ -214,7 +217,7 @@ type Snapshot = {
   readonly end: number;
   /** The last seq received so far. */
   last: number;
-  readonly lines: WireEvent[];
+  readonly lines: SnapshotLine[];
   /** The state to return to at the end: Replaying, or Current. */
   readonly resume: StreamState;
 };
@@ -748,7 +751,7 @@ export class WireConnection {
       case "ev": {
         if (frame.stream !== sub.stream) return this.#protocolError(`ev for ${frame.stream} on ${sub.stream}'s subscription`);
         if (frame.seq === undefined) return this.#protocolError(`ev without seq on ${sub.stream}`);
-        if (sub.snapshot !== null) return this.#snapshotLine(sub, sub.snapshot, frame.seq, frame.ev);
+        if (sub.snapshot !== null) return this.#snapshotLine(sub, sub.snapshot, frame.seq, frame.ev, frame.ts_ms);
         if (sub.cursor !== null && frame.seq <= sub.cursor) return;
         sub.handler.event(frame.seq, frame.ev, frame.ts_ms);
         if (this.#subs.get(sub.id) !== sub) return this.#changed();
@@ -815,10 +818,10 @@ export class WireConnection {
   }
 
   /** Lines are contiguous from the gap's `to + 1`; a repeat is dropped. */
-  #snapshotLine(sub: Sub, snapshot: Snapshot, seq: number, ev: WireEvent): void {
+  #snapshotLine(sub: Sub, snapshot: Snapshot, seq: number, ev: WireEvent, tsMs: number): void {
     if (seq <= snapshot.last) return;
     if (seq !== snapshot.last + 1) return this.#protocolError(`snapshot line ${seq} on ${sub.stream} after ${snapshot.last}`);
-    snapshot.lines.push(ev);
+    snapshot.lines.push({ ev, tsMs });
     snapshot.last = seq;
     if (seq === snapshot.end) return this.#endSnapshot(sub, snapshot);
     this.#startProgress(sub);
