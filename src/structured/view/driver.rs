@@ -1,6 +1,6 @@
 //! One read-only source task per view. App receives immutable, generation-fenced frames.
 use super::{
-    contracts::{Action, Snapshot},
+    contracts::{Action, Admission, Composer, Snapshot},
     stream::Stream,
     Target,
 };
@@ -23,6 +23,7 @@ pub(crate) struct Driver {
     error: watch::Receiver<Option<ErrorCode>>,
     task: JoinHandle<()>,
     commands: mpsc::Sender<Action>,
+    admission: watch::Sender<(Admission, Option<Composer>)>,
 }
 struct Wake(Arc<Notify>);
 impl Drop for Wake {
@@ -77,11 +78,23 @@ impl Driver {
         let (tx, frames) = watch::channel(Arc::clone(&stream.model.snapshot.0));
         let (errors, error) = watch::channel(None);
         let (commands, mut input) = mpsc::channel(32);
+        let (admission, mut admissions) =
+            watch::channel((stream.model.snapshot.admission.clone(), None::<Composer>));
         let task = tokio::spawn(async move {
             let _exit = Wake(wake.clone());
             let mut ended = false;
             loop {
                 let result = tokio::select! { biased;
+                    changed = admissions.changed() => {
+                        if changed.is_err() { break; }
+                        let update = admissions.borrow_and_update();
+                        let s = &mut stream.model.snapshot;
+                        s.admission = update.0.clone();
+                        if update.1.as_ref().is_some_and(|d| s.composer.text == d.text && s.composer.cursor == d.cursor) {
+                            s.composer.text.clear(); s.composer.cursor = 0;
+                        }
+                        None
+                    },
                     command = input.recv() => {
                         let Some(action) = command else { break; };
                         let s = &mut stream.model.snapshot;
@@ -132,7 +145,14 @@ impl Driver {
             error,
             task,
             commands,
+            admission,
         }
+    }
+    /// Latest admission facts; clear only the exact durably acknowledged draft.
+    pub fn admission(&self, status: Admission, clear: Option<Composer>) -> Result<(), ErrorCode> {
+        self.admission
+            .send((status, clear))
+            .map_err(|_| ErrorCode::AgentNotFound)
     }
     /// Bounded view-only input. Runtime effects never enter the source task.
     pub fn control(&self, action: Action) -> Result<(), ErrorCode> {
