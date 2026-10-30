@@ -1307,6 +1307,7 @@ pub struct ViewState {
     /// lie about where it came from.
     pub session_warning_lines: Vec<String>,
     pub pane_infos: Vec<PaneInfo>,
+    pub(crate) structured: HashMap<PaneId, crate::ui::structured::Prepared>,
     pub split_borders: Vec<SplitBorder>,
 }
 
@@ -3689,6 +3690,7 @@ impl AppState {
                 config_diagnostic_lines: Vec::new(),
                 session_warning_lines: Vec::new(),
                 pane_infos: Vec::new(),
+                structured: HashMap::new(),
                 split_borders: Vec::new(),
             },
             drag: None,

@@ -5023,3 +5023,13 @@ and registered placement cause. Keep the registry/worker under normal ownership
 so it remains inspectable and stoppable. CLI/MCP expose the result with exit 1;
 this is not a clean start refusal and must not trigger a fresh start blindly.
 Duplicate placement and invalid membership remain typed preflight refusals.
+
+### Amendment: S10d2 prepared native rendering
+
+Desktop and client-sized mobile geometry prepare S10c's pane from the App-owned
+immutable frame. The prepared pane and its owned hit-to-Intent payloads live in
+that ViewState, so paint and later input share one cut and geometry. Paint checks
+canonical generation and current placement again; stale cuts and source refusals
+produce a typed error tile. Ready and unavailable native members never fall
+through to PTY rendering. This slice wires rendering; input dispatch remains the
+next S10d2 slice and Unicode composer/admission semantics remain S10d3.
