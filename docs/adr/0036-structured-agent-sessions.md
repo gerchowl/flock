@@ -5015,6 +5015,15 @@ created. Producer failure and actual page I/O errors stay explicit errors. As wi
 a cancelled Pending page, resuming an older opening yields one recheck step so
 an initialization preceding the new wait cannot be missed.
 
+### Amendment: admitted launch with failed placement (#2655)
+
+If placement fails after launch admission, return the typed
+`structured_agent_started_unplaced` result with the admitted ID, generation
+and registered placement cause. Keep the registry/worker under normal ownership
+so it remains inspectable and stoppable. CLI/MCP expose the result with exit 1;
+this is not a clean start refusal and must not trigger a fresh start blindly.
+Duplicate placement and invalid membership remain typed preflight refusals.
+
 ### Amendment: S10d2 prepared native rendering
 
 Desktop and client-sized mobile geometry prepare S10c's pane from the App-owned

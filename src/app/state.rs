@@ -2849,7 +2849,8 @@ impl AppState {
     }
 
     /// Only a local binding can authenticate a row's identity. Relayed claims
-    /// are proven only when their immediate enrolled source is that same node.
+    /// are proven only when their ingestion-bound source is that same node.
+    /// A current alias binding can revoke old proof, never manufacture it.
     /// Carried snapshots have no such proof and cannot borrow a local alias.
     pub(crate) fn server_peer_node<'a>(
         &'a self,
@@ -2863,6 +2864,7 @@ impl AppState {
             .values()
             .find(|entry| {
                 std::ptr::eq(&entry.peer, peer)
+                    && entry.source_node.as_deref() == Some(claimed)
                     && entry
                         .via
                         .as_ref()
@@ -3991,6 +3993,11 @@ mod tests {
             .get_mut("spoke2.invalid")
             .unwrap()
             .via = Some(local.peer.clone());
+        state
+            .relayed_fleet_cache
+            .get_mut("spoke2.invalid")
+            .unwrap()
+            .source_node = Some("fixture-node".into());
         state.peer_summaries = vec![local];
 
         let rows = state.remote_peers();
