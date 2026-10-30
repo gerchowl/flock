@@ -76,6 +76,20 @@ pub(crate) struct Sends {
     pub staged: Option<Staged>,
 }
 impl Sends {
+    /// Intercept the real owner's completion without fabricating an acknowledgement.
+    #[cfg(test)]
+    pub(crate) fn intercept_completion(
+        &mut self,
+        agent: &str,
+        generation: u64,
+        id: &str,
+    ) -> Option<(Receiver<ResultId>, Sender<ResultId>)> {
+        let key = (agent.to_owned(), generation, id.to_owned());
+        let original = self.waiting.remove(&key)?;
+        let (send, receive) = mpsc::channel();
+        self.waiting.insert(key, send);
+        Some((receive, original))
+    }
     /// Recovery without a backoff is due now; paused fleets do not call this.
     pub(crate) fn recovery_deadline(&self, now: std::time::Instant) -> Option<std::time::Instant> {
         self.recovering
