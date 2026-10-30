@@ -1,4 +1,4 @@
-//! Decide-only port of the approved command tests: real authenticated sockets and harness stdin.
+//! Real authenticated command and replay traces with owned harness input.
 use super::*;
 use crate::structured::{workers::tests::Case as Worker, workers::Workers};
 use crate::web::wire::commands as wire_commands;
@@ -807,3 +807,5 @@ fn previous_runtime_permission_handle_is_refused_after_restart() {
 }
 
 mod trace_permission;
+
+mod trace_clean;
