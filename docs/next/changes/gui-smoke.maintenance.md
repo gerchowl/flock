@@ -1,1 +1,0 @@
-- Document a verified isolated browser GUI smoke with a fake structured harness, composer sends, and Allow/Deny permission decisions.

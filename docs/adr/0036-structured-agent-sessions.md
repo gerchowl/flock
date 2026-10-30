@@ -1353,6 +1353,15 @@ uses the same `/v1/ws` protocol over a sibling Unix socket, with kernel peer
 credentials as an additional admission gate (the local-transport amendment
 below). That listener does not enable TCP exposure.
 
+The optional TCP listener's Tailscale forwarding guard has three typed
+outcomes (#2476): positive absence (`NotInstalled`) permits startup with one
+INFO record naming the checked CLI/bundle/socket paths; discovered CLI status
+(`Status`) keeps the five-second/64-KiB serve/funnel refusal checks;
+installation evidence with an unreadable status (`Unavailable`) refuses
+startup and names the evidence/failure. Standard platform paths are defined
+in `platform::tailscale`; lookup errors never count as absence. Host/Origin
+and loopback checks do not change, and no failed probe is silently skipped.
+
 Messages are JSON text frames, one object each, tagged by `t`:
 
 ```text
@@ -2367,6 +2376,9 @@ P16 and P17 have no source in the stream today and are not promised;
   admission, while the durable close retires the card. Unknown fields or future
   reasons retain the lossless unknown-event wrapper instead of being discarded.
   `session_ended` marks the restart sweep in #2236.
+  Fixture time markers declare `after_ack` for pre-ACK persistence, otherwise
+  `record_delivery`. Both require exact persisted equality and a zero-slack
+  window to that observed bound; missing bounds fail (#2467 slice-3 ruling).
 - **Startup permission recovery (S6, #2236).** The stream owner projects host
   audit headers while scanning the existing stream. Before admitting any new
   control request, it appends a `closed` / `session_ended` record without a

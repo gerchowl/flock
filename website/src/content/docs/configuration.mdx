@@ -5,6 +5,58 @@ description: Configure Flock keybindings, themes, sidebar behavior, notification
 
 Flock works without a config file. Add one when you want custom keys, themes, sidebar settings, notifications, or advanced behavior.
 
+## Private config diagnostics
+
+Config warnings identify schema fields, available file positions and zero-based
+entry indices without printing configured names, shortcut strings, commands,
+environment names or file paths. A missing source position is reported as
+unavailable. Static hints still describe accepted forms and fallback behavior.
+For a conflict, inspect the kept and rejected entry indices in the named schema
+field. This applies to startup, reload, config checks and keybinding validation.
+
+## Structured launch policy (preparation only)
+
+The structured Claude launch profile is being built in stages. This release adds preparation and validation only (#1437); it does not start structured processes or add a start flag. Process supervision follows in #1438. Lease-based caller identity (#1426) must land before #1439 enables structured start.
+
+The file-only policy defaults to `run_as = "flk-agent"`. Preparation in that mode fails with `structured_needs_agent_user` until the dedicated-user launcher in #1208 is available, even if a user with that name already exists. An explicit operator-mode policy is accepted and emits a warning on every preparation:
+
+```toml
+[structured]
+run_as = "operator"
+token_file = "/absolute/path/to/dedicated-setup-token"
+profile = "default"
+```
+
+Use a dedicated, revocable token from `claude setup-token`. The file must be a regular file owned by the launching user with permissions exactly `0600`; symlinks, relative paths, malformed tokens and files over 16 KiB are refused. The token is redacted in debug output and kept out of argv, settings and MCP files. It is intended for `CLAUDE_CODE_OAUTH_TOKEN` in the child environment. The token is readable by the agent in both modes; operator mode also permits tools to read files accessible to the operator, including the token file. This opt-in accepts that access.
+
+Preparation requires a canonical absolute Claude binary path and a successful `--version` result of at least **2.1.290**. Older or unrecognised versions fail with `structured_harness_version_unsupported`: older Claude releases can open a messaging socket despite `--restricted`. The runtime must also check the session registry for `messagingSocketPath` before input, and refuse `system/init.messaging_socket_path` (#1438). An absent registry is no evidence of readiness. Registry checks refuse malformed records, symlinks, special files and files over 1 MiB. The injected version reader in #1438 must enforce a timeout. A version check followed by exec through the resolved path still has a replacement race; only `fexecve` fully closes it.
+
+The harness profile is persistent: in operator mode `CLAUDE_CONFIG_DIR` is `<flk state>/structured/claude/<profile>`, with `profile = "default"` unless configured otherwise. Profile names use only ASCII letters, digits, hyphens and underscores. The directory is created with mode `0700` if missing; existing directories with another owner or mode, and symlinks, are refused. Sessions never delete this profile, so transcripts remain available for resume, hot reload and forks. It is separate from the operator's normal Claude profile. Once #1208 enables the dedicated user, its profiles belong under `~flk-agent/.flk/claude/<profile>`.
+
+A separate random `0700` per-session directory holds flock's generated `0600` JSON files. Settings contain only `permissions.defaultMode = "default"` and empty `allow` and `deny` lists; MCP config contains an empty `mcpServers` map; isolated flock MCP registration is tracked in #1441. The profile explicitly passes stream-json input/output, `--restricted`, `--permission-mode default` and `--permission-prompt-tool stdio`. Session persistence is enabled for later resume support. The environment allowlist contains only `PATH`, `HOME`, `USER`, `LOGNAME`, `LANG`, `LC_ALL` and `TMPDIR` when provided, plus the persistent private `CLAUDE_CONFIG_DIR` and dedicated token. The runtime must apply it with `env_clear()`.
+
+Permission requests will only be streamed by #1438 and remain open until S6 supplies answers. The deny carrier for deferred questions belongs to S6b and is not a launch setting. The session-directory guard removes only generated settings/MCP files and their temporary directory on drop, including unwinding; the runtime must retain it until descendants have exited. The persistent harness profile is retained. Abrupt termination such as SIGKILL or a filesystem failure can prevent cleanup, and removal errors are logged.
+
+## Structured session queue journal
+
+```toml
+[sessions]
+queue_rewrite_bytes = 8388608 # 8 MiB, the default
+```
+
+`queue_rewrite_bytes` is a positive integer byte count. A structured worker
+checkpoints its queue journal when the file exceeds this threshold, before
+further appends. Checkpoint and append share one worker and writer lease;
+replacement uses fsync, rename and directory fsync. This is a rewrite trigger,
+not a maximum snapshot size. Zero is invalid.
+
+A changed value requires a **server restart**. Live reload keeps the active
+threshold and reports a partial reload with a `restart required` diagnostic;
+it does not claim to reconfigure existing queues. On reopen the configured
+threshold is checked again. Torn-tail bytes count toward this check: if unknown
+data block a required checkpoint, the journal opens with a typed read-only
+refusal and the torn suffix is preserved for operator recovery.
+
 ## Config file
 
 Flock reads config from:
@@ -55,6 +107,29 @@ flk server reload-config
 You can also open the global menu in Flock and choose `reload config`.
 
 Reload applies most UI settings without restarting panes. Startup-only settings still need a restart.
+
+Valid `[msg]` settings apply to subsequent server operations immediately, including
+`enabled`, the authenticated-origin `allow_from` policy, message limits and idle-wake
+policy. Tightening the allowlist does not remove messages already admitted to an inbox.
+
+Valid `[spawn.env]` declarations apply to subsequent starts, forks, profile recording
+and resumes. Existing agent processes keep their environments. Recorded launch
+snapshots are retained; resume filters them through the newly declared keys. Newly
+declared values cannot be reconstructed for an already-hibernated agent if they were
+never recorded. Hibernating a running agent records its profile using the current
+declarations before stopping it.
+Invalid `[msg]` or `[spawn]` sections retain their last running values and produce reload
+diagnostics, while other valid sections can still apply.
+
+An already running `flk mcp serve` is a separate process: it keeps its startup channel
+push capability, body limit and reconnect interval. Restart that MCP process to apply
+`msg.channel_push`, `msg.channel_push_body_max_bytes` or
+`msg.channel_push_reconnect_secs` there; server reload does not renegotiate an existing
+MCP session. A reload that changes these effective channel options returns `partial`
+with a `restart_required` diagnostic naming the existing MCP sessions and the
+`flk mcp serve` process to restart. Server-side message policy still applies live.
+Unrelated message changes do not produce this diagnostic, and rejected `[msg]`
+sections only report their validation diagnostics.
 
 ## Terminal defaults
 
@@ -358,7 +433,7 @@ A consequence worth stating: a name you gave an agent yourself — `flk agent st
 
 `[ui] agent_aliases` overrides the agent field, with one rule that differs by mode. An alias that **names a harness** (`agent_aliases = { researcher = "codex" }`) re-attributes the row to that harness, so a mislabelled agent can be corrected without editing anything else — that works in all three modes. An alias that is **anything else** is drawn as written in `shortcut` and `name`. In `symbol` the field is a single cell, so the alias has to fit one: a one-cell glyph (including a Nerd Font codepoint from a font you installed yourself) is drawn, and anything wider is ignored in favour of the built-in symbol, because a value that does not fit would push every column to the right of it out of alignment.
 
-`server_label` controls how a server is IDENTIFIED across the sidebar — the servers band, the spaces list's member rows, and the agents panel. `both` (the default) shows the server's self-declared icon glyph followed by its hostname, `icon` shows the glyph alone, and `name` shows the hostname alone. A node declares its own glyph with the top-level `icon` key (`icon = "laptop"`), which is gossiped to the fleet as a name and resolved to a glyph by whoever renders it, so every viewer draws it from its own font. A server that declares no icon, or one whose name the viewer does not recognise, falls back to its hostname in every mode. The setting is viewer-local: it changes how you read the fleet, not what any node reports.
+`server_label` controls how a server is IDENTIFIED across the sidebar — the servers band, the spaces list's member rows, and the agents panel. `both` (the default) shows the server's self-declared icon glyph followed by its hostname, `icon` shows the glyph alone, and `name` shows the hostname alone. A node declares its own glyph with the top-level `icon` key (`icon = "laptop"`), which is gossiped to the fleet as a name and resolved to a glyph by whoever renders it, so every viewer draws it from its own font. A server that declares no icon, or one whose name the viewer does not recognise, falls back to its hostname in every mode. The setting is viewer-local: it changes how you read the fleet, not what any node reports. In the servers band, every mode retains a readable name (or the short node ID). Rows merge only by node ID, using local pins or enrollment to bind configured aliases (configured aliases take precedence over inbound pin names); ID-less legacy observations stay separate and are marked `legacy/unverified`. Reported node IDs are claims: only a local pin or pinned enrollment proves identity. A relayed row can fold into a configured row only when its immediate enrolled source is that very node. Configured rows always retain their configured dial target and outrank relayed readings, including while offline. Other claims and snapshots stay separate and unverified; they cannot borrow pinned aliases. An ID-less home remains unverified until a fresh snapshot supplies its identity; a matching name cannot refresh it. The route badge shows a held direct edge or the learned next hop, never the peer that supplied gossip; `unrouted` means no current mesh path is known. Client snapshot protocol 32 preserves these node IDs and refuses older client/server builds through the existing version check. Mesh protocol 5 is unchanged.
 
 `confirm_close` controls whether closing a workspace asks for confirmation. `prompt_new_tab_name` controls whether new tabs ask for a label first.
 
@@ -437,8 +512,17 @@ it off with:
 enabled = false
 ```
 
-Disabled, Flock writes nothing at all: the window title stays whatever your
-shell last set it to.
+Both the server and the attaching client must enable titles. The server decides
+whether to publish its title, and the client reads its own local `[title]` config
+before writing it to the terminal. Set `enabled = false` locally to silence a
+remote attach, or on the server to prevent publishing to every client.
+
+A disabled client writes no title sequences, including on exit: it neither sets
+nor restores a title. Disabling it after a title was set leaves that title in
+place. The local setting is read at attach and refreshed by the existing client
+config reload request. If a title is unexpectedly absent, check both configs
+and terminal passthrough support. If disabling it on the server appears to have
+no effect, check that you edited the attached server's config and reloaded it.
 
 Inside tmux, the title only reaches the outer terminal if tmux is allowed to
 pass the sequence through:
@@ -448,8 +532,8 @@ set -g allow-passthrough on
 ```
 
 Without it tmux swallows the sequence and the window title is unchanged — the
-same as not publishing at all. The setting is read from the server you are
-attached to, so a remote attach follows the remote host's `[title]` section.
+same as not publishing at all. Allowing titles on one side cannot override the
+other side's veto.
 
 ## Sound
 
@@ -674,6 +758,17 @@ issue is untrusted input.
 
 Actions are a closed enum today: `notify` (routed through the same `[ui.toast]` policy as everything else) or `event` (emit a `check_fired` durable event with no side effect). Programs are argv only — never a shell string — and script paths must be absolute or live under `~/.flock/checks/`. See the [Socket API's Checks section](./socket-api.mdx#checks) for the built-in check behaviours in depth.
 
+Script checks trip on exit status `0`; any nonzero exit means the check passed.
+Timeouts, signal termination, and spawn or wait failures are mechanical errors
+that leave the debounce counter unchanged. Stdout and stderr capture is bounded
+to 4 KiB per stream. If a background descendant keeps a pipe open, or a reader
+does not finish within the one-second capture bound, Flock marks that stream's
+capture incomplete. One warning per check reports both stream failures when
+capture diagnostics first appear or change. Repeated identical failures stay
+quiet; a run without capture failures resets the warning state. Restarting the
+server (or a handoff) also resets it. Capture failures do not change the
+exit-status decision or suppress alert debounce.
+
 ## Agent messages
 
 The `[msg]` section governs agent-to-agent messages arriving at this node.
@@ -772,7 +867,7 @@ When flock types a sentence into an agent pane and presses Enter for it (an inbo
 enabled = true   # the kill switch
 ```
 
-- **Your keystrokes are held, not dropped.** Keys and pastes from an attached client, and `pane send-text` / `send-keys` / `agent send` calls from other tools, are kept in order in memory while flock types. They are replayed into the pane, in the order you sent them, as soon as the injection ends. If the pane's input channel is full at that moment, they wait and are retried, still in order, rather than dropped. The pane's bottom border reads `flock is typing…` meanwhile. Other panes are not affected. An `agent send` paste made while the pane is held reports `unconfirmed` with reason `held_by_injection`: it is delivered after the injection, but the screen cannot prove it.
+- **Your keystrokes wait in order.** Keys and pastes from an attached client are kept while flock types and replay when the injection ends. If the input channel is temporarily full, they wait in order. The pane's bottom border reads `flock is typing…` meanwhile; other panes remain usable. Automated text calls normally refuse with `injection_pending` while an injection holds an agent pane. Raw `pane send-text` and non-submit `agent send` calls can wait behind it, but stay pending until their PTY write completes or the write deadline expires. Expiry discards the unsent payload and reports whether any prefix was written. Paste observation starts only after the completed write. See [completed input writes](./socket-api.mdx#completed-input-writes) for budgets and byte-count failures.
 - **Esc and Ctrl-C stop it.** Either key ends the hold at once. It reaches the pane straight away, after anything already held, and the injection is abandoned (`operator_active`) before its Enter. A draft that was moved aside and not yet typed back goes to the stash.
 - **The hold is bounded.** It ends with the injection, whatever the outcome, and never lasts longer than 7 seconds (5 seconds plus the 2-second submit confirmation). It also ends before the server stops or hands off, so held keys reach the pane first.
 - **A draft moves aside and comes back.** For an inbox wake or `agent send`, a one-row draft in a Claude, Codex or OpenCode composer is cleared (End, then Backspace), the sentence is typed and submitted, and the draft is typed back into the emptied composer and read back exactly. The draft lives in flock's memory only, never in the system clipboard. A draft of several rows, or one holding a paste or image chip, is refused as before (`input_not_empty`), because the screen cannot show it exactly. So is any draft in an unrecognised composer, and any draft for `pane.submit` and `delegate start`, which type into panes nobody should be typing in.
@@ -889,6 +984,42 @@ Until then the previously adopted version applies, and before any adoption nothi
 - A pending change is reported by `flk owner policy show`, not yet by a notification (#1239).
 - Repos are keyed by their canonical git common dir.
 
+## Socket account policy
+
+```toml
+[security]
+agent_account = "flk-agent" # default; "none" explicitly disables recognition
+```
+
+This file-only setting requires a server restart. Reload reports a change and
+keeps the active policy. `structured.run_as = "operator"` selects launch identity
+and does not disable account recognition.
+
+With the default, the first socket classification starts one lazy `flk-agent`
+account lookup, waiting at most 100 ms; later calls do not wait for a stuck
+lookup. Pending/failed resolution leaves callers read-only, including the
+operator: mutations such as server stop are refused. An absent account or a
+resolved UID different from the server UID permits the operator, subject to
+ancestry checks. A dedicated UID equal to the server UID is a misconfiguration:
+operator authority is refused, `agent_account_uid_collision` is logged once and
+retained in `flk status server` (including its JSON diagnostic) until restart.
+
+Use `agent_account = "none"` only when no dedicated agent account is used. It
+avoids the directory-service availability cost entirely: no dedicated-account
+NSS lookup runs, and the server UID passes the UID check immediately. Known
+leased or pane agents still cannot act as the operator; other/missing UIDs
+remain read-only. This gives up dedicated-UID recognition of anonymous/detached
+agents. Same-UID callers without lease or pane ancestry cannot be distinguished
+from the operator (the cooperative limit tracked in #1177; ADR-0036 §1a).
+
+`flk config check` and startup diagnostics warn if `agent_account = "none"` is
+combined with `[structured] run_as = "flk-agent"`. A launched agent using a
+separate dedicated UID then remains `Unknown` (read-only). Set
+`security.agent_account = "flk-agent"` when using that launch identity, or
+explicitly select operator-mode launch when no dedicated account is used. The warning does not change authority.
+Account lookup and collision diagnostics belong to each server instance; its app
+and API listener share the same policy, and Ping never starts or waits for NSS.
+
 ## Environment variables
 
 | Variable | Purpose |
@@ -914,6 +1045,8 @@ Common log files:
 ```
 
 Logs rotate automatically. Include the current log and rotated siblings when reporting issues.
+
+`FLOCK_LOG` controls file logging; the `flk web` console subscriber uses `RUST_LOG`. WebSocket dependency targets `tungstenite` and `tokio_tungstenite` are always capped at DEBUG because TRACE dumps raw frames, including bearer credentials in `hello`. The `tungstenite::protocol` target is capped at INFO because its DEBUG events include arbitrary close reasons. These subscriber caps also apply to explicit module or span directives and cannot be lifted by either environment variable. Flock TRACE events remain available when selected.
 
 ## System One advice
 
@@ -1030,3 +1163,24 @@ survey, trust, login, or update settings.
 The goal supervisor tracked in #573 is not implemented in this checkout, so this
 restart lifecycle does not yet re-arm or re-inject a Flock goal. Stable agent
 identity and spawning-supervisor routing are retained for that integration.
+
+
+### Structured session observations
+
+```toml
+[sessions]
+stall_ms = 120000
+```
+
+`stall_ms` is optional and defaults to 120000 milliseconds (2 minutes). Valid
+values are 5000 through 3600000 milliseconds, inclusive. Other values, including
+zero, produce a config validation error through the sessions table loader;
+invalid reloads retain the previous table settings and report the failure.
+There is no disabled value, and values are never clamped.
+
+A stall reports accepted or started input with no stdout progress and no open
+control request or tool call. It leaves the phase unchanged and never kills or
+retries a process. Provider retries and rate-limit backoff can cause tens of
+seconds of silence, so the default avoids reporting those as stalls. A
+long-running tool is never a stall while its tool call is open. Public
+structured start remains gated until the final #1843 routing slice.
