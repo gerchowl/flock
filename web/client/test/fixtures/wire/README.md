@@ -178,11 +178,11 @@ Whether send alone should suffice is pending owner decision in #2585.
 ## Runtime timestamp matchers
 
 A genuinely runtime `ev.ts_ms` may be authored as
-`{"$dynamic":"ts_ms","source":"persisted"}` (#2467 timestamp ruling).
+`{"$dynamic":"ts_ms","source":"persisted","bound":"after_ack"}` (#2467).
 The fixture schema permits this marker only at that wall-clock field. The
 actual-endpoint interpreter must verify equality with the corresponding persisted
 record (sequence and event payload included), and membership in its independently
-observed `[before_action, after_ack]` wall-clock window. Missing evidence, an
+observed zero-slack `[before_action, bound]` window. Missing evidence, an
 unsupported source, or a marker elsewhere fails. Literal timestamps and all other
 literal fields stay exact. Receipt wall times are not promised monotonic by
 ADR-0036; event ordering remains sequence-based.
@@ -197,3 +197,118 @@ fixture authoring only, with no product clock injection.
 `0123456789abcdef0123456789abcdef`, a deterministic valid 32-hex identity.
 Its scenario token must be minted with exactly that literal; the principal is
 not a digest of the bearer, a runtime substitution, or a dynamic matcher.
+
+## Actual endpoint interpreter
+
+`endpoint-runner.ts` checks every ordered step and bounds silent producers.
+`endpoint-auth.ts` runs all eight `token-refused` steps through a real endpoint
+and client. `endpoint-permission.ts` runs the complete permission-decision trace.
+`endpoint-protocol.ts` runs all eleven `unknown-subscription` steps. Its welcome
+is real server output; the impossible `synced` for `never-opened` is explicitly
+recorded as `client_fault`. The real client sends close 1002 on the native socket,
+and the interpreter checks the actual endpoint close before observing reconnect.
+The deterministic principal and epoch are literal, as in permission-decision;
+neither is rewritten in received frames (ADR-0036 §5a).
+
+Each protocol step has the interpreter's five-second silence ceiling. The authored
+connect assertion has its explicit virtual interval, and final quiet retains its
+authored virtual ceiling; neither advances server time or waits on a wall-clock
+sleep. There are no runtime event timestamps in this script, so it needs no
+persisted timestamp marker. All selected dynamic timestamps still require their
+explicit bound. The tested pending set now contains two scripts: agent-send and
+heartbeat-missed. Later providers must shrink it.
+Gaps and overlap fail.
+
+The endpoint uses close code 4401 for missing, malformed and unknown tokens.
+The `token-refused` trace proves the refusal path, not which token the endpoint
+saw. Unexpected server frames fail the trace even after refusal has settled.
+
+The permission fixture resumes after bootstrap and raw request (cursor 3), then
+checks open at 4, close at 5, and permission handle 3. Its driver acknowledges
+stdin over IPC rather than injecting a fixture-only session echo. The open bound
+is `after_ack` (owner's durable-open receipt); close uses `record_delivery` (the
+WebSocket callback). Missing/unknown bounds fail (ADR-0036 #2224, slice-3 ruling).
+Epoch and principal remain exact. Actual-endpoint welcomes declare
+`server_version:{"$dynamic":"server_version","source":"build"}`. The Rust driver
+supplies `CARGO_PKG_VERSION` independently of the socket. Missing evidence or a
+mismatch fails; package bumps require no fixture edit. The pure virtual harness
+refuses this marker because it has no compiled-server oracle. All literal
+objects, including frame envelopes and nested payloads, require exact key sets
+and values; extra keys fail. Protocol transport decoding remains additive.
+
+
+`endpoint-clean.ts` executes all fourteen fresh-subscription steps through a real
+worker and endpoint. It retains the `sub` assertion that `after` is absent, then
+replays the real hook-start, init and assistant records before `synced@3` and the
+`Current@3` observation. Each timestamp declares `record_delivery`: its lower
+bound is captured before the worker starts (bootstrap) or before its driver writes
+(assistant), and its upper bound is captured in the native WebSocket callback.
+The independently read durable sequence, payload and timestamp must match exactly,
+with zero slack. The native delivery port is shared with permission-decision.
+
+The Rust test always runs four causal controls as well as the complete positive
+trace: corrupt persisted time, an invalid delivery window, a restored zero cursor
+that incorrectly adds `after`, and withholding the client's synced application.
+Each must fail for its specific assertion, so CI proves the provider can fail.
+All async steps retain the five-second interpreter ceiling; connect and quiet
+retain their authored virtual bounds. Quiet checks buffered output and virtual
+client behavior, without claiming future wall-clock silence (ADR-0036 §5a).
+
+`endpoint-gap.ts` executes all thirteen retained-history steps through a real
+endpoint. The owner starts cold, locates the registered session's durable JSONL
+file and installs its retained history. Resuming after 2 yields `gap 3–4`, event
+5 and `synced@5`, then `Current@5`, without an entity snapshot. The timestamp 1
+is literal persisted fixture data, not a runtime clock value; it must match
+exactly. The Rust driver reads back the durable sequence, payload and timestamp.
+Every async step has the five-second silence ceiling; connect and quiet retain
+their authored virtual bounds, with buffered output checked at quiet.
+
+Three causal controls run automatically alongside the complete positive trace:
+a wrong retained sequence changes the gap, a wrong persisted timestamp changes
+the event, and dropping application of the received event leaves the cursor at
+4. Each must exit 1 for its specific assertion. No expected server frame is
+injected or normalized (ADR-0036 §5a; ADR-0038 §3).
+
+
+`endpoint-ping.ts` executes all nine `ping-pong` steps through the endpoint.
+The driver waits for registration of the supplied monotonic clock's 15-second
+heartbeat deadline, then advances that clock exactly to it. The ping is genuine
+server output, matched against the literal epoch/socket/sequence nonce. The
+client's pong must also reach the real endpoint: the driver acknowledges that
+stage only after the heartbeat registers its renewed expiry at 60 seconds.
+Neither signal constructs a protocol frame. The welcome uses the deterministic
+32-hex principal and independently supplied build version.
+
+Two automatic controls run beside the positive trace: allocating socket 2 makes
+the literal socket-1 nonce fail, and dropping client application of the actual
+ping makes the authored pong expectation fail. Both must exit 1 at their exact
+step. Unexpected IPC stages, EOF, early server exit and missing clock deadlines
+fail visibly. Clock-stage and transport waits retain the five-second guard;
+connect and quiet retain their authored virtual bounds. Quiet also checks
+buffered native output. No runtime event timestamp occurs in this script
+(ADR-0036 §5a; ADR-0038 §3).
+
+
+`endpoint-revocation.ts` executes all twelve `token-revoked` steps against the
+real token store and command owner. After matching the welcome, it waits for the
+driver to delete the actual credential file before sending the authored command.
+The owner must refuse that command with the exact registered `auth_revoked`
+envelope, including `command refused: auth_revoked`; no target agent is needed
+because authority is checked before dispatch. The native callbacks must show
+welcome, ACK, then close 4403. The client must retain `c1:failed`, enter
+`NeedsToken`, and stay quiet for the authored 45-second virtual interval.
+
+The shared native port exposes close receipts and callback order. Its default
+read still fails on an unexpected close. `next(true)` permits draining a frame
+queued before a known native close only when the caller later verifies that
+close; the revocation script does both. A unit test pins strict reads, buffered
+ACK draining and refusal to drain on a transport error without a close callback.
+
+Three causal controls run automatically: retaining the valid credential yields
+the wrong refusal, checking the wrong close code fails the native close receipt,
+and dropping ACK application leaves the command `sent` instead of `failed`.
+Each must exit 1 at its specified step. IPC EOF, unknown stages, producer exit
+and silent transport/owner work remain bounded by the five-second guards. All
+frames are received from the endpoint; no protocol output is injected. There
+are no runtime event timestamps or wall-clock sleeps. Connect and quiet retain
+their authored virtual bounds (ADR-0036 §5a; ADR-0038 §3).

@@ -43,7 +43,7 @@ describe("live permission inbox", () => {
     expect(cards(root)).toHaveLength(1);
     expect(cards(root)[0]).toContain("Bash");
     expect(cards(root)[0]).toContain("true");
-    expect($$(root, "inbox-card")[0]?.getAttribute("data-request-seq")).toBe("1");
+    expect($$(root, "inbox-card")[0]?.getAttribute("data-request-seq")).toBe("3");
     raw("fixture", records[1] as object);
     expect(cards(root)).toEqual([]);
   });
