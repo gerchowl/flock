@@ -1,7 +1,7 @@
 ┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
 │demo | claude | structured                                                                        │
 │Model: observed (requested: requested)                                                            │
-│Mode: observed-mode (requested: Default)                                                          │
+│Mode: observed-mode (requested: default)                                                          │
 │New output  [Follow tail] [Earlier history]                                                       │
 │Assistant                                                                                         │
 │[Collapse] [Details]                                                                              │
@@ -16,7 +16,7 @@
 │+ new                                                                                             │
 │Unknown / extra JSON                                                                              │
 │[Expand] [Details]                                                                                │
-│Status: NeedsHuman | turn: Unknown | bg: Unknown                                                  │
+│Status: needs human | turn: unknown | bg: unknown                                                 │
 │Tokens I/O: 7/3 | age(ms):150 | #14 synced                                                        │
 │Permission 1/1: Bash permission@9                                                                 │
 │Input: {"command":"check check check check check check check check check check check check check c│
