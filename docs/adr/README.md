@@ -52,6 +52,8 @@ can be exempted in `guardrails-adr-exempt.txt`.
 | [0040](0040-content-anchored-selection.md) | Pane selections retain content identity through scrolling and reflow, re-read surviving rows at copy, and visibly refuse evicted content | Accepted |
 | [0041](0041-configuration-v2.md) | Configuration v2: 12-factor precedence and a typed, scoped config API | Accepted |
 | [0042](0042-complete-scoped-configuration.md) | Typed configuration across files, env, scopes and clients | Accepted |
+| [0043](0043-multi-node-gui-access.md) | Multi-node GUI access through a TLS home server and the mesh | Accepted |
+| [0044](0044-structured-lifecycle-and-hibernation.md) | Durable structured lifecycle and idle hibernation | Accepted |
 
 ADR-0026 supersedes the affected transport, reply, deferral and deduplication
 contracts in ADR-0006, ADR-0008, ADR-0009, ADR-0018 and ADR-0019. Their other

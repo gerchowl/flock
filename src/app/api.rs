@@ -229,8 +229,8 @@ impl App {
         self.handle_internal_event_at(ev, std::time::Instant::now());
     }
 
-    /// Apply an owner event with a supplied observation instant. Peer freshness
-    /// and poll health share that instant, including deterministic wire tests.
+    /// Apply an owner event with one observation instant shared by poll health
+    /// and every directly or indirectly delivered reading.
     pub(crate) fn handle_internal_event_at(
         &mut self,
         ev: AppEvent,

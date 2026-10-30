@@ -1,0 +1,1 @@
+- Keep each agent session stream's entities in one client store that owns them: a transcript and the permission inbox on the same agent now share one wire subscription, and a reset reaches both once (ADR-0038 §3, part of #1595).

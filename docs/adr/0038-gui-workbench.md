@@ -198,8 +198,8 @@ Operations, the same in every shell:
 | `close(tile)` | Unsubscribes the tile's streams if no other tile shares them. |
 
 **Persistence.**
-- **Client-local.** The layout is per device, keyed by server identity, in
-  browser storage or the Tauri store.
+- **Client-local.** The layout is per device, keyed by server identity (defined
+  in §3, "The store"), in browser storage or the Tauri store.
 - **Never sent to an agent.** It never enters an agent's context. Moving tiles
   is not a fact about the work.
 - **Server-synced named layouts are a later option** (owner decision 9).
@@ -634,12 +634,146 @@ one-time code (single use, 60 s) and opens the loopback URL with the code in the
   token in the platform keystore instead (§6).
 
 **The store.**
-- Entities are kept normalised by kind and id.
+- Entities are kept normalised by kind and id. The store is their only owner:
+  views read and subscribe to it, and hold no copy of a stream's entities. A
+  view that keeps its own copy cannot be restored, and drifts from the cursor it
+  would resume from.
 - Each stream has a cursor, persisted per device so a reload resumes without a
   full replay. It is persisted only after the event (or the empty snapshot) it
   names has been applied, and together with the stream's resync marker. The
   `*/live` streams are the exception: they carry deltas with no cursor (§5).
-- The outbox is persisted too, each command before its first send (below).
+- **A stream persists as one record, decided here (#1595).** The record holds
+  the stream's entities, its cursor and its resync marker, taken in one
+  synchronous step at the same applied seq and written in one transaction. They
+  are never written apart. A cursor stored without the entities it covers would
+  resume past state the reload lost, and the stream's tiles would stay empty or
+  wrong.
+  - **Storage: IndexedDB**, in both shells; the Tauri webview has it too. Writes
+    are asynchronous and transactional, and the record has room for transcripts.
+  - Rejected: `localStorage`, because it is synchronous, holds strings only and
+    is capped at a few MiB per origin. A large transcript would block the page
+    or fail partway.
+  - Rejected: persisting cursors alone, for the reason above.
+  - **Which database.** There is one database per server identity and principal,
+    named `flock.store.v1:` followed by the SHA-256 hex of the server identity
+    and the principal joined by a newline. The client recognises its own
+    databases by that prefix, and the name never shows the principal.
+    - **Server identity** is the key the layout (§2) already uses: the socket's
+      endpoint URL for the `wire` transport, and the fixed value `bridge:local`
+      for the `bridge` transport (§6), since a device's own server is one server
+      across restarts. It is never `server_epoch` or `server_version`, which
+      change on every start.
+    - **The principal** is not known until `welcome`. So the tab keeps the
+      principal of its last `welcome` in `sessionStorage`, beside the token.
+      Restore of persisted records (deadline over lock+open+reads, principal
+      check, code-exchange loads) is specified in #2764; until then nothing is
+      restored. A tab with no stored principal, such as a new tab or a new Tauri
+      window, restores nothing and opens the database once `welcome` arrives.
+    - **A different principal.** If a `welcome` names a different principal than
+      the tab's previous `welcome` (the same equality that drops the outbox,
+      below), whether or not a database is open, the client drops every stream's
+      entities, cursors and resync markers from memory, as for a new tab. It
+      opens that principal's database, restores nothing from it, and bootstraps
+      every stream without `after`. Nothing seen under one principal is shown,
+      or resumed from, under another.
+    - **Tab locks.** Each tab holds a shared Web Lock named after its database,
+      and takes it before it opens the database. A database is deleted only when
+      an exclusive lock on it is granted at once (`ifAvailable`), and the
+      deleting tab holds that lock until `deleteDatabase` settles. So a database
+      another tab still uses is never deleted. Where Web Locks are unavailable,
+      the client deletes nothing, and records last until the browser clears the
+      origin. Every engine the shells target ships Web Locks.
+    - **Nothing kept with no end.** Each database stores when a tab last opened
+      it for use. The cleanup reads that time under the exclusive lock, and its
+      own open does not update it. On every open, the client lists its databases
+      (`indexedDB.databases()`), and deletes each flock database that no tab
+      holds (the lock above) and that was last opened more than 7 days ago. On a
+      principal change, it also deletes the previous principal's database if no
+      tab holds it. With Web Locks, records are never kept on disk with no end,
+      the same reason `localStorage` was rejected for the token.
+  - **Coalesced writes.** At most one write per stream is in flight, and at most
+    one starts per stream per second, plus one on `pagehide`. The `pagehide`
+    write is best effort: it cannot start while another is in flight, and the
+    page may unload before it commits. Losing it costs a replay of the frames
+    since the previous write. Between writes, applied frames only mark the
+    stream dirty, and the next write takes the latest applied state. Each write
+    captures entities, cursor and marker together at one applied seq, and
+    IndexedDB copies the value when `put` is called. So a stored cursor is never
+    ahead of its stored entities, however fast frames arrive.
+  - **Bounds.** A stream's record is capped at 4 MiB, and each database at 64
+    MiB.
+    - **Size** is the UTF-8 byte length of the record's JSON, stored in the
+      record. A database's total is the sum of its records' sizes.
+    - Each record stores when it was **last viewed**, meaning one of its tiles
+      was on screen.
+    - A stream whose record would pass its cap has its stored record deleted
+      whole, and is not persisted again until the next load.
+    - Past the database cap, the record viewed longest ago is deleted whole. A
+      record with a tile on screen in this tab is never evicted; across tabs,
+      last viewed is the only signal. If every remaining record has a tile on
+      screen in this tab, the write that would pass the cap is skipped, and its
+      stream is not persisted again until the next load. An evicted stream is
+      not persisted again until the next load.
+    - A record is never truncated, because a truncated transcript under a head
+      cursor would show history with a silent hole.
+    - A deleted record costs a full replay of that stream on the next load, and
+      nothing else. A stream that stays over its cap replays in full on each
+      load.
+  - **Failure never becomes an error or a loop.**
+    - **On load,** the affected streams bootstrap with no `after`, as on a first
+      load, in these cases:
+      - IndexedDB is unavailable (private mode, blocked storage);
+      - opening it fails (for example a `VersionError` against a newer client's
+        database), or reports `blocked`;
+      - a record does not parse or has an unknown older version.
+    - **After load,** a failed write (quota or abort) deletes that stream's
+      record and stops persisting it until the next load. The stream in memory
+      is untouched and is not re-subscribed. A failed write never rolls back an
+      applied frame in memory.
+    - The connection is unaffected in every case.
+  - **Two tabs** of one principal share the database. Between tabs of the same
+    client version, the last writer of a record wins, which is safe, because
+    every record is consistent on its own. A `versionchange` from another tab
+    closes this tab's database, and it stops persisting until its next load.
+    - **Newer records are never overwritten.** A record with a newer format
+      version than this client knows is treated as absent on load and left in
+      place, never deleted. Each write reads the stored record inside its own
+      readwrite transaction. If that record has a newer format version, the
+      write skips its `put`, and that stream stops persisting until the next
+      load. So an older tab cannot erase or overwrite a newer tab's records.
+  - **Versioned.** Each record carries a format version. An unknown older
+    version is dropped, as above.
+  - **Tests that must fail before the change:**
+    - a write aborted inside its transaction leaves the previous record, or
+      none, after a reload, and never a cursor without its entities;
+    - a burst of frames gives at most one write in flight per stream, and the
+      stored cursor matches the stored entities;
+    - a record past its cap is deleted whole and that stream replays in full on
+      the next load;
+    - past the database cap, the record viewed longest ago is deleted;
+    - a quota failure sends no extra `sub` and leaves the stream in memory as it
+      was;
+    - a corrupt record, an unknown older version and unavailable storage each
+      give a full replay, with the connection unaffected;
+    - an open that reports `blocked` gives a full replay;
+    - a record with a newer version survives an older tab's load and an older
+      tab's write;
+    - a `versionchange` from another tab stops this tab's persistence with its
+      streams unaffected;
+    - a `welcome` with another principal drops every stream's entities, cursors
+      and markers, bootstraps every stream without `after`, and restores
+      nothing;
+    - a database another tab holds is never deleted, and a database no tab holds
+      that was last opened more than 7 days ago is deleted;
+    - a quiet stream with a tile on screen is never evicted, and when only
+      on-screen records remain, the write that would pass the cap is skipped;
+    - a `welcome` with another principal after storage was unavailable still
+      drops every stream's state;
+    - an open that rejects (`VersionError`) gives a full replay;
+    - a stored marker below `snapshot_to` enters Resyncing at once.
+- The outbox is persisted too, each command before its first send (below). It
+  keeps its own `flock.outbox.v1` key in `localStorage`, because it must be
+  written before a send, not after an applied frame.
 - Ephemeral state lives in the store but is not persisted: in-flight streaming
   blocks (§4).
 
@@ -905,6 +1039,12 @@ Each is refused for another node's agent until #1380.
 Layout and tile state have **no wire type** (§2).
 
 ### 5b. Question threads (#1717)
+
+The backend S6e amendment is now specified in
+[ADR-0036](0036-structured-agent-sessions.md#amendment-s6e--non-blocking-question-threads-and-routing-2242)
+(#2242). Its owner decisions, including routing/progress choices accepted on
+2026-10-29, supersede the historical hold/channel rules referenced below.
+Neither this design nor that amendment claims an implemented thread service.
 
 The owner's direction of 2026-10-16 (#1717, quoted there verbatim) asks for
 three things:
@@ -1412,7 +1552,8 @@ still do. Agent-addressed questions keep MCP.
         bridge's open, send and close. A remote server's keychain token reaches
         the webview through `tokenProvider` (#2293), which is that path's own
         design. The native side never logs or persists the bearer or the `hello`
-        frame it rewrote. A reload opens a new session; nothing is persisted.
+        frame it rewrote. A reload opens a new session; the bearer is never
+        persisted.
       - **One protocol, two sockets.** `flock.sock` carries the mint, and the
         server's unix-socket `/v1/ws` carries the session. That is a **sibling
         socket, `flock-ws.sock`**, in the same directory as `flock.sock`, with
