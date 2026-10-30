@@ -15,6 +15,7 @@ import pty
 import re
 import select
 import shlex
+import signal
 import socket
 import struct
 import subprocess
@@ -129,6 +130,8 @@ agent_spawn_enabled = true
         server = subprocess.Popen([binary, "server"], env=env, cwd=root / "project",
                                   stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         client = control = channel = master = None
+        metadata = None
+        completed = False
         try:
             output = b""
             deadline = time.monotonic() + 15
@@ -145,9 +148,11 @@ agent_spawn_enabled = true
                                       stdout=slave, stderr=slave, start_new_session=True)
             os.close(slave)
             screen = Screen()
-            def expect(*markers):
+            def expect(*markers, decision=False):
                 deadline = time.monotonic() + 15
                 while not all(marker in screen.text() for marker in markers):
+                    if decision:
+                        assert "Structured action refused" not in screen.text(), ("permission decision refused", markers, screen.text())
                     left = deadline - time.monotonic()
                     assert client.poll() is None and server.poll() is None and left > 0, (markers, screen.text())
                     assert select.select([master], [], [], left)[0], ("TUI evidence missing", markers, screen.text())
@@ -207,23 +212,35 @@ agent_spawn_enabled = true
             assert len(inputs) == 2 and inputs[1]["type"] == "user", inputs
             assert "shell-message" in json.dumps(inputs[1]) and "operator via pane" in json.dumps(inputs[1]), inputs
             if permission:
-                # Enable with S10e: each painted decision must reach model stdin.
-                for behavior, label in [("deny", "[Deny]"), ("allow", "[Allow once]")]:
+                # The fake begins a turn before each can_use_tool request.
+                for index, (behavior, label) in enumerate([("deny", "[Deny]"), ("allow", "[Allow once]")]):
+                    command("begin")
+                    expect("turn: working")
+                    assert cli("agent", "status", created["agent_id"])["result"]["agent"]["state"]["turn"] == "working"
                     command("permission-" + behavior)
-                    expect(label)
+                    expect(label, "Permission 1/1: Bash permission-" + behavior)
                     x, y = screen.location(label)
                     os.write(master, f"\x1b[<0;{x};{y}M\x1b[<0;{x};{y}m".encode())
-                    expect("permission-" + behavior + "-answer")
-                    response = command("inspect")[-1]
+                    if behavior == "allow":
+                        expect("permission-allow-resumed", "allowed-tool-result", "permission-allow-complete", "turn: idle", decision=True)
+                    else:
+                        expect("permission-deny-reported", "permission-deny-complete", "turn: idle", decision=True)
+                    observed = command("inspect")
+                    assert len(observed) == 3 + index, observed
+                    response = observed[-1]
                     assert response["type"] == "control_response", response
+                    assert response["response"]["request_id"] == "permission-" + behavior, response
                     assert response["response"]["response"]["behavior"] == behavior, response
+            eof = command("mcp-eof")
+            assert eof == {"eof_ignored": True, "pid": metadata["eof_mcp_pid"]}, eof
+            os.kill(metadata["eof_mcp_pid"], 0)
             cli("agent", "stop", created["agent_id"])
             after = 0
             deadline = time.monotonic() + 15
             while cli("agent", "status", created["agent_id"])["result"]["agent"]["lifecycle"] != "offline":
                 assert time.monotonic() < deadline and server.poll() is None, "stop never reached offline"
                 after = api("events.read", {"after":after, "wait_ms":1000})["next_after"]
-            for pid in (metadata["pid"], metadata["mcp_pid"]):
+            for pid in (metadata["pid"], metadata["mcp_pid"], metadata["eof_mcp_pid"]):
                 try:
                     os.kill(pid, 0)
                 except OSError as error:
@@ -233,8 +250,8 @@ agent_spawn_enabled = true
             stopped = json.loads((root / "stopped.json").read_text())
             assert stopped["model_exit"] == 0, stopped
             # The server owns the whole model group; its MCP may receive the same TERM.
-            import signal
             assert stopped["mcp_exit"] in (0, -signal.SIGTERM), stopped
+            assert stopped["eof_mcp_exit"] == -signal.SIGTERM, stopped
             assert not Path(metadata["temporary"]).exists(), "temporary launch files survived stop"
             assert Path(metadata["profile"]).exists(), "persistent resume profile must be retained"
             # Detach through the real UI and drain its terminal until EOF so a
@@ -254,8 +271,10 @@ agent_spawn_enabled = true
             assert client.wait(timeout=15) == 0
             cli("server", "stop")
             assert server.wait(timeout=15) == 0
+            completed = True
             return {"status":"passed", "real_tui":True, "composer":True, "shell_cli":True,
-                    "pipes_not_pty":True, "descendants_gone":True, "temporary_removed":True}
+                    "pipes_not_pty":True, "descendants_gone":True, "temporary_removed":True,
+                    "mcp_ignored_eof":True, "permission_allow":permission, "permission_deny":permission}
         finally:
             if channel is not None:
                 channel.close()
@@ -270,6 +289,15 @@ agent_spawn_enabled = true
                     except subprocess.TimeoutExpired:
                         child.kill()
                         child.wait(timeout=5)
+            if not completed and metadata is not None:
+                # Assertions precede this failure-only teardown. Never signal a
+                # reused PID outside the model's recorded, owned process group.
+                for pid in (metadata["pid"], metadata["mcp_pid"], metadata["eof_mcp_pid"]):
+                    try:
+                        if os.getpgid(pid) == metadata["pid"]:
+                            os.kill(pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
             if master is not None:
                 os.close(master)
             server.stdout.close()
