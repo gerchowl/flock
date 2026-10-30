@@ -4,7 +4,7 @@ import type { FixtureLine } from "../../src/gen/FixtureLine";
 import { FakeNetwork, FakeSocket, Harness } from "./harness";
 import { WIRED_SCRIPTS, assertInventory, loadS7MinScripts, runTrace, type CheckedStep, type StepHandlers, type TraceScript, type TraceFact } from "./endpoint-runner";
 
-const [url, dropped] = process.argv.slice(2);
+const [url] = process.argv.slice(2);
 assert(url);
 class NativeSocket extends FakeSocket {
   readonly native: WebSocket;
@@ -21,7 +21,7 @@ class NativeSocket extends FakeSocket {
     this.native.onopen = open;
     this.native.onclose = (event) => { close(event.code); failOpen(new Error("closed before upgrade")); };
     this.native.onerror = () => { const error = new Error("endpoint transport failed"); failOpen(error); failClose(error); };
-    this.native.onmessage = () => failClose(new Error("unasserted server frame on refused auth"));
+    this.native.onmessage = () => assert.fail("unasserted server frame on refused auth");
   }
   override send(text: string): void {
     super.send(text);
@@ -50,7 +50,6 @@ async function tokenRefused(script: TraceScript): Promise<readonly TraceFact[]> 
       harness.step(line); return checked("observation");
     },
   };
-  if (dropped) handlers[dropped as FixtureLine["step"]] = async () => undefined;
   try { return await runTrace(script, handlers); }
   finally { harness.conn?.disconnect(); }
 }
