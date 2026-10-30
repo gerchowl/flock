@@ -64,6 +64,24 @@ describe("streams", () => {
     expect(h.seen.get("s1")?.slice(1)).toEqual([{ kind: "synced" }, { kind: "event", seq: 5, ev: { id: "c" } }]);
   });
 
+  test("each snapshot line reaches the handler with its own frame's ts_ms", () => {
+    const h = new Harness();
+    live(h);
+    const lines: { id: unknown; tsMs: number }[] = [];
+    h.connection.subscribe("fleet", {
+      event: () => undefined,
+      gap: () => undefined,
+      synced: () => undefined,
+      snapshot: (each) => lines.push(...each.map((line) => ({ id: (line.ev as { id: unknown }).id, tsMs: line.tsMs }))),
+      reset: () => undefined,
+      refused: () => undefined,
+    });
+    h.step(step({ step: "send", frame: { t: "gap", sub_id: "s1", from: 1, to: 2, snapshot_to: 4 } }));
+    h.step(step({ step: "send", frame: { ...fleetLine(3, "a"), ts_ms: 111 } as ServerFrame }));
+    h.step(step({ step: "send", frame: { ...fleetLine(4, "b"), ts_ms: 222 } as ServerFrame }));
+    expect(lines).toEqual([{ id: "a", tsMs: 111 }, { id: "b", tsMs: 222 }]);
+  });
+
   test("a newer snapshot supersedes an unfinished one", () => {
     const h = new Harness();
     live(h);

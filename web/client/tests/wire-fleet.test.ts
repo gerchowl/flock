@@ -12,7 +12,7 @@ import type { ServerFrame } from "../src/gen/ServerFrame";
 import type { AgentRow } from "../src/fleet";
 import { fixtureExamples } from "../src/gen/FixtureExamples";
 import { fleetStore } from "../src/store/fleet";
-import { createWireFleet } from "../src/wire/fleet";
+import { createWireFleet, fleetDelta } from "../src/wire/fleet";
 import { Harness, live, sentFrames, step } from "./wire/harness";
 
 type Seen = { readonly rows: readonly string[] } | { readonly failed: string };
@@ -51,6 +51,31 @@ function subscribed(): { h: Harness; seen: Seen[]; last: () => readonly AgentRow
 const send = (h: Harness, frame: ServerFrame): void => h.step(step({ step: "send", frame }));
 
 describe("wire fleet", () => {
+  test("wire frames reach the store's node stamps, each with its own ts_ms", () => {
+    const h = new Harness();
+    live(h);
+    let monotonic = 500;
+    const reader = createRoot(() => fleetStore(createWireFleet(h.connection), () => monotonic).read());
+    const node = (id: string): object => ({ node_id: id, name: id, health: null, latency_ms: null, last_ok: null, version: null, error: null, online: true, route: null, counts: null, unbound_configured_peers: null });
+    const nodeFrame = (seq: number, id: string, ts_ms: number): ServerFrame => ({ t: "ev", sub_id: "s1", stream: "fleet", seq, ts_ms, ev: { type: "fleet.node.upsert", row: node(id) } as never });
+    send(h, { t: "gap", sub_id: "s1", from: 1, to: 0, snapshot_to: 2 });
+    send(h, nodeFrame(1, "n-a", 1111));
+    send(h, nodeFrame(2, "n-b", 2222));
+    send(h, { t: "synced", sub_id: "s1", seq: 2 });
+    monotonic = 800;
+    send(h, nodeFrame(3, "n-c", 3333));
+    expect(reader.nodes.stamp("n-a")).toEqual({ tsMs: 1111, receivedAt: 500 });
+    expect(reader.nodes.stamp("n-b")).toEqual({ tsMs: 2222, receivedAt: 500 });
+    expect(reader.nodes.stamp("n-c")).toEqual({ tsMs: 3333, receivedAt: 800 });
+    reader.release();
+  });
+
+  test("a node upsert carries its frame's ts_ms; other kinds do not", () => {
+    const node = { node_id: "n", name: "n", health: null, latency_ms: null, last_ok: null, version: null, error: null, online: true, route: null, counts: null, unbound_configured_peers: null };
+    expect(fleetDelta({ type: "fleet.node.upsert", row: node } as never, 42)).toEqual({ op: "upsert", kind: "node", row: node, tsMs: 42 });
+    expect(fleetDelta({ type: "fleet.remove", id: "a" } as never, 42)).toEqual({ op: "remove", kind: "agent", id: "a" });
+  });
+
   test("unknown entity kinds keep the snapshot, live agents and resume cursor", () => {
     const { h, seen, last, close } = subscribed();
     const payloads = [
