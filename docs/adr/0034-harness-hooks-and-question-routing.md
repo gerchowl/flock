@@ -421,6 +421,13 @@ trigger action). Only the first is a human who may be watching the pane.
 
 ### 3. Mechanism: intercept the question, convert it into a question to the architect, and answer it in the same tool call
 
+**S6e amendment (#2242):** [ADR-0036](0036-structured-agent-sessions.md#amendment-s6e--non-blocking-question-threads-and-routing-2242)
+specifies the replacement contract for recorded questions: non-blocking by default,
+no System-One hold, one ask service, and later delivery through the idle queue.
+Its recipient-specific authorization preserves architect answers through CLI/MCP.
+The historical hold/defer text below remains evidence for legacy adapters; it
+does not require S6e askers to end their turn. Permissions stay separate.
+
 Decided: option **(c)**, built on the denial path of **(b)**, with **(a)**
 rejected as the primary mechanism (see Alternatives).
 

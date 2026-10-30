@@ -27,7 +27,10 @@ from scripts.changelog import (
     ensure_manifest_is_outdated,
     ensure_manifest_matches_expected,
     ensure_version_is_releasable,
+    build_release_pr_body,
+    cmd_pr_body,
     extract_section_body,
+    release_pr_preamble,
     foreign_release_entries,
     infer_protocol_from_notes,
     load_json,
@@ -971,6 +974,40 @@ class VersionCheckTests(unittest.TestCase):
 
         ensure_version_is_releasable(plan, "0.0.1", set())
         ensure_version_is_releasable(plan, "1.0.0", set())
+
+
+class ReleasePrBodyTests(unittest.TestCase):
+    def test_small_notes_are_inlined_unchanged(self) -> None:
+        notes = "### Fixed\n- One.\n"
+
+        body = build_release_pr_body("1.2.3", notes)
+
+        self.assertEqual(body, release_pr_preamble("1.2.3") + notes)
+
+    def test_oversized_notes_become_a_pointer_under_the_limit(self) -> None:
+        notes = "### Added\n" + "- Entry with é and 日本語.\n" * 4000 + "### Fixed\n- Only.\n"
+        self.assertGreater(len(release_pr_preamble("1.2.3") + notes), 65536)
+
+        body = build_release_pr_body("1.2.3", notes)
+
+        self.assertLess(len(body), 65536)
+        self.assertIn("https://github.com/gerchowl/flock/blob/release/v1.2.3/CHANGELOG.md", body)
+        self.assertIn(release_pr_preamble("1.2.3").rstrip("\n"), body)
+        self.assertIn("- Added: 4000 entries", body)
+        self.assertIn("- Fixed: 1 entry", body)
+        self.assertNotIn("Entry with", body)
+
+    def test_command_writes_the_body_from_the_changelog(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            changelog = Path(tmp) / "CHANGELOG.md"
+            changelog.write_text("# Changelog\n\n## [1.2.3] - 2026-01-01\n\n### Fixed\n- " + "x" * 2000 + "\n")
+            out = Path(tmp) / "body.md"
+
+            cmd_pr_body(argparse.Namespace(path=str(changelog), version="1.2.3", limit=100000, output=str(out)))
+            self.assertIn("x" * 2000, out.read_text())
+            cmd_pr_body(argparse.Namespace(path=str(changelog), version="1.2.3", limit=1500, output=str(out)))
+            self.assertNotIn("x" * 2000, out.read_text())
+            self.assertIn("- Fixed: 1 entry", out.read_text())
 
 
 if __name__ == "__main__":

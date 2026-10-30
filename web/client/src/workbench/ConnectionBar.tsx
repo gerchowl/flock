@@ -1,6 +1,7 @@
 /**
  * The live connection's strip (ADR-0038 §3): its state, the latest failure
- * while reconnecting or stopped, the always-offered *Disconnect* (or
+ * while reconnecting or stopped, in ReadOnly the banner naming the version
+ * gap, the always-offered *Disconnect* (or
  * *Connect*), in NeedsToken a field for a new token (or, when the shell
  * provides tokens, a *Connect* that asks it again), what restoring
  * the stored outbox had to drop, if anything, and what a changed principal
@@ -26,12 +27,20 @@ export function ConnectionBar(props: ConnectionBarProps): JSX.Element {
   const [token, setToken] = createSignal("");
   const state = (): WireConnection["state"] => (props.revision(), props.connection.state);
   const error = (): string | null => (props.revision(), props.connection.error);
+  const readOnly = (): string | null => (props.revision(), props.connection.readOnly);
   const outboxProblem = (): string | null => (props.revision(), props.connection.outboxProblem);
   const outboxDropped = (): string | null => (props.revision(), props.connection.outboxDropped);
   return (
     <div class="connection-bar" classList={{ "connection-bar--live": state() === "Live" }} role="status" data-testid="connection-bar">
       <strong class="connection-bar__state">{state()}</strong>
       <Show when={error()}>{(message) => <span class="connection-bar__error">{message()}</span>}</Show>
+      <Show when={readOnly()}>
+        {(message) => (
+          <span class="connection-bar__error" data-testid="read-only">
+            {message()}
+          </span>
+        )}
+      </Show>
       <Show when={outboxProblem()}>
         {(problem) => (
           <span class="connection-bar__error" data-testid="outbox-problem">

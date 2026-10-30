@@ -22,6 +22,17 @@ pub(crate) fn structured_fleet_stopped(error: &io::Error) {
     tracing::error!(event = "structured.fleet.stopped", kind = ?error.kind(), "fleet stream owner stopped");
 }
 
+/// A directory without a UTF-8 identity cannot be a fleet project. No path or
+/// agent contents are logged, and the agent remains available in the stream.
+pub(crate) fn structured_fleet_project_unavailable() {
+    tracing::warn!(
+        event = "structured.fleet.project_unavailable",
+        code = "fleet_project_unavailable",
+        reason = "non_utf8_cwd",
+        "fleet agent project unavailable"
+    );
+}
+
 /// Recovery facts contain only a closed variant and a durable cursor floor.
 #[cfg(feature = "web")]
 pub(crate) fn structured_fleet_recovered(diagnostic: &crate::structured::fleet_lite::Diagnostic) {
@@ -95,6 +106,17 @@ pub(crate) fn client_exchange_failed(
         None => ("worker_unavailable", None),
     };
     tracing::warn!(event = "client.exchange.internal_failure", subsystem = "structured_client", reason, io_kind = ?io_kind, "browser credential exchange unavailable");
+}
+
+/// Once per listener startup, report positive absence rather than hiding a failed probe.
+#[cfg(feature = "web")]
+pub(crate) fn client_tailscale_not_installed(checked_paths: &str) {
+    tracing::info!(
+        event = "client.listener.tailscale_not_installed",
+        subsystem = "structured_client",
+        checked_paths,
+        "Tailscale forwarding check skipped because Tailscale is not installed"
+    );
 }
 
 /// Report secondary listener cleanup errors without replacing the primary server failure.

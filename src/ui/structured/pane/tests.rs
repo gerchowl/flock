@@ -261,3 +261,157 @@ fn intent_hits_use_absolute_paint_geometry_and_omit_invisible_actions() {
     ));
     assert!(narrow().into_intent(8, 13).is_none());
 }
+
+#[test]
+fn status_and_mode_have_explicit_display_labels() {
+    let mut s = snapshot();
+    s.agent.state.background = crate::api::agent_state::Background::Running { count: 3 };
+    let rendered = image(&draw(&s, 100, 30).0);
+    assert!(rendered.contains("Mode: observed-mode (requested: default)"));
+    assert!(rendered.contains("Status: needs human | turn: unknown | bg: running (3)"));
+}
+
+// Derive button rectangles from painted cells independently of the computed hit map.
+fn assert_painted_buttons(b: &Buffer, pane: &Pane) -> Vec<String> {
+    // This independent oracle recognizes the authored labels, not arbitrary brackets.
+    const BUTTONS: &[&str] = &[
+        "[Follow tail]",
+        "[Earlier history]",
+        "[Full input]",
+        "[View]",
+        "[Next]",
+        "[Deny]",
+        "[Allow once]",
+        "[Always (session)...]",
+        "[Send at idle]",
+        "[History]",
+        "[Collapse]",
+        "[Details]",
+        "[Expand]",
+    ];
+    let mut painted = std::collections::BTreeSet::new();
+    let mut labels = vec![];
+    for y in b.area.y..b.area.bottom() {
+        let row: Vec<_> = (b.area.x..b.area.right())
+            .map(|x| b[(x, y)].symbol())
+            .collect();
+        let mut offset = 0;
+        while let Some(start) = row[offset..]
+            .iter()
+            .position(|s| *s == "[")
+            .map(|n| n + offset)
+        {
+            let Some((label, end)) = BUTTONS.iter().find_map(|label| {
+                let end = start + label.len();
+                row.get(start..end)
+                    .is_some_and(|cells| cells.concat() == *label)
+                    .then_some((*label, end))
+            }) else {
+                offset = start + 1;
+                continue;
+            };
+            let rect = Rect::new(b.area.x + start as u16, y, (end - start) as u16, 1);
+            let action = pane.hit(rect.x, rect.y).expect(label);
+            let matching: Vec<_> = (b.area.y..b.area.bottom())
+                .flat_map(|hy| {
+                    (b.area.x..b.area.right()).filter_map(move |hx| {
+                        (pane.hit(hx, hy).is_some_and(|a| std::ptr::eq(a, action)))
+                            .then_some((hx, hy))
+                    })
+                })
+                .collect();
+            let expected: Vec<_> = (rect.x..rect.right()).map(|x| (x, y)).collect();
+            assert_eq!(matching, expected, "painted/hit rectangle for {label}");
+            painted.extend(expected);
+            labels.push(label.to_owned());
+            offset = end;
+        }
+    }
+    for y in b.area.y..b.area.bottom() {
+        for x in b.area.x..b.area.right() {
+            assert_eq!(
+                pane.hit(x, y).is_some(),
+                painted.contains(&(x, y)),
+                "ghost/missing hit {x},{y}"
+            );
+        }
+    }
+    labels
+}
+
+#[test]
+fn every_painted_button_has_exact_hit_rectangle() {
+    for (w, h) in [(100, 50), (60, 30), (40, 30), (20, 30)] {
+        let (b, pane) = draw(&snapshot(), w, h);
+        let labels = assert_painted_buttons(&b, &pane);
+        assert!(labels.iter().any(|l| l == "[Collapse]"));
+        if w >= 40 {
+            assert!(labels.iter().any(|l| l == "[Details]"), "{w}x{h}");
+        }
+    }
+}
+
+#[test]
+fn bracketed_transcript_text_is_not_a_button() {
+    let mut s = snapshot();
+    s.transcript[0].content = Content::Text("record [x] and [unfinished".into());
+    s.transcript[0].streaming = true;
+    for (w, h) in [(100, 50), (60, 30), (40, 30), (20, 30)] {
+        let (b, pane) = draw(&s, w, h);
+        assert!(
+            image(&b).contains("[x]"),
+            "regression text must be visible at {w}x{h}"
+        );
+        let labels = assert_painted_buttons(&b, &pane);
+        assert!(labels.iter().any(|label| label == "[Collapse]"));
+        assert!(!labels
+            .iter()
+            .any(|label| label == "[x]" || label == "[streaming]"));
+    }
+}
+
+#[test]
+fn narrow_panes_keep_deny_and_inspection_without_approval() {
+    for w in 20..=40 {
+        let (b, pane) = draw(&snapshot(), w, 30);
+        let labels = assert_painted_buttons(&b, &pane);
+        // Inspection has its own row; Deny leads both paint and hits on the decision row.
+        let decision_row = 30 - 7;
+        let painted_row: String = (1..w - 1).map(|x| b[(x, decision_row)].symbol()).collect();
+        assert!(
+            painted_row.starts_with("[Deny]"),
+            "Deny must paint first at width {w}: {painted_row}"
+        );
+        let first_hit =
+            (1..w - 1).find_map(|x| pane.hit(x, decision_row).map(|action| (x, action)));
+        assert!(
+            matches!(
+                first_hit,
+                Some((
+                    1,
+                    Action::Decide {
+                        decision: crate::structured_wire::PermissionDecision::Deny,
+                        ..
+                    }
+                ))
+            ),
+            "Deny must be the first hit at width {w}"
+        );
+        assert!(labels.iter().any(|l| l == "[Full input]"));
+        assert!(!labels
+            .iter()
+            .any(|l| l.contains("Allow") || l.contains("Always")));
+        assert!((0..30).all(|y| (0..w).all(|x| !matches!(pane.hit(x,y), Some(Action::Decide { decision, .. }) if *decision != crate::structured_wire::PermissionDecision::Deny))));
+    }
+}
+
+#[test]
+fn degenerate_and_overflowing_regions_have_no_unpainted_hits() {
+    for w in 0..=22 {
+        for h in 0..=19 {
+            let (b, pane) = draw(&snapshot(), w, h);
+            assert_painted_buttons(&b, &pane);
+            assert!(pane.hit(w, h).is_none());
+        }
+    }
+}

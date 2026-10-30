@@ -93,3 +93,51 @@ pub(super) fn pause_subscription() {
         }
     });
 }
+
+#[tokio::test]
+async fn subscriber_unwind_wakes_waiting_subscriber_on_ended_source() {
+    let mut owner = Fixture::new();
+    owner.append(0);
+    owner.finish(false);
+    let source = owner.source.clone();
+    let (ready, entered) = mpsc::sync_channel(1);
+    let (release, gate) = mpsc::sync_channel(1);
+    let panicking_source = source.clone();
+    let (completed, completion) = mpsc::sync_channel(1);
+    let competing = std::thread::spawn(move || {
+        GATE.with(|slot| *slot.borrow_mut() = Some((ready, gate)));
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            panicking_source.subscribe(None).map(drop)
+        }))
+        .is_err();
+        completed.send(panicked).unwrap();
+    });
+    entered.recv_timeout(WITHIN).unwrap();
+    let wake = source.2.notified();
+    tokio::pin!(wake);
+    wake.as_mut().enable();
+    assert!(matches!(
+        source.subscribe(None),
+        Err(ErrorCode::SessionBusy)
+    ));
+    // Disconnect the existing real-subscriber gate to panic inside its book lock.
+    drop(release);
+    assert!(completion
+        .recv_timeout(WITHIN)
+        .expect("subscriber never completed its unwind"));
+    competing.join().unwrap();
+    tokio::time::timeout(WITHIN, wake)
+        .await
+        .expect("unwinding subscriber never woke the waiting subscriber");
+    assert!(source.1.try_lock().is_some());
+    let mut resumed = source.subscribe(None).unwrap();
+    let replay = super::tests::pages(&mut resumed);
+    let ids: Vec<_> = replay
+        .iter()
+        .filter_map(|page| match page {
+            Page::Record(value) => Some(value["item"]["item_id"].as_str().unwrap()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ids, ["item-0"]);
+}

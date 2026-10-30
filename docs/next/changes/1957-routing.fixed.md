@@ -1,1 +1,0 @@
-- Resolve structured `agent.send` targets through the queue service while preserving cross-runtime name and ID ambiguity checks. Other pane-only operations retain their typed refusal.
