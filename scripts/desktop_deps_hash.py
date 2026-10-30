@@ -32,8 +32,7 @@ def main():
 
     def build():
         return subprocess.run(
-            ["nix", "build", ".#flock-desktop.deps", "--no-link",
-             "--cores", "2", "--max-jobs", "1"],
+            ["nix", "build", ".#flock-desktop.deps", "--no-link"],
             text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         )
 

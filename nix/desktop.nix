@@ -72,17 +72,10 @@ let
   };
   # The npm CLI is the same Rust CLI with a Node entry point. Cargo passes
   # its subcommand name as argv[1]; the npm entry point expects only its args.
-  cli =
-    (writeShellScriptBin "cargo-tauri" ''
-      if [ "''${1-}" = tauri ]; then shift; fi
-      exec ${nodejs}/bin/node ${deps}/node_modules/@tauri-apps/cli/tauri.js "$@"
-    '').overrideAttrs
-      {
-        meta = {
-          maintainers = [ ];
-          broken = false;
-        };
-      };
+  cli = writeShellScriptBin "cargo-tauri" ''
+    if [ "''${1-}" = tauri ]; then shift; fi
+    exec ${nodejs}/bin/node ${deps}/node_modules/@tauri-apps/cli/tauri.js "$@"
+  '';
 in
 assert lib.assertMsg (pinned.lock == lockSha256) ''
   desktop/bun.lock changed since nix/desktop-deps.json was computed.
@@ -135,6 +128,9 @@ rustPlatform.buildRustPackage (finalAttrs: {
     "--config"
     config
   ];
+  # --config supplies the CLI build; TAURI_CONFIG also reaches the separate
+  # cargo test check phase, whose build.rs/tauri::generate_context! must use
+  # the same store frontend instead of the absent local client dist directory.
   env.TAURI_CONFIG = config;
   # The existing Rust hardening test checks the manifest. Also check Cargo's
   # resolved features so enabling tauri/devtools through build flags fails.
@@ -177,7 +173,7 @@ rustPlatform.buildRustPackage (finalAttrs: {
   meta = {
     description = "Flock desktop shell with the flock-client bundle";
     license = lib.licenses.agpl3Plus;
-    # WebKitGTK wrapping and Linux desktop integration need their own slice.
+    # WebKitGTK wrapping and Linux desktop integration need their own slice (#2790).
     platforms = lib.platforms.darwin;
   };
 })
