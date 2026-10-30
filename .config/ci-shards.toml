@@ -52,7 +52,7 @@ rest = true
 name = "serial-1"
 serial = true
 # mesh_forwarding 256/273, mesh_routes 72/62, peer_federation 30/11
-binaries = ["mesh_forwarding", "mesh_routes", "peer_federation"]
+binaries = ["mesh_forwarding", "mesh_routes", "peer_federation", "structured_tui"]
 
 [[shards]]
 name = "serial-2"
