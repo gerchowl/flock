@@ -55,6 +55,7 @@ impl App {
         target: Target,
         destination: Option<(usize, usize)>,
     ) -> Result<(), ErrorCode> {
+        let id = target.agent_id.clone();
         target
             .validate(&self.state)
             .map_err(|_| ErrorCode::AgentNotFound)?;
@@ -83,6 +84,14 @@ impl App {
             self.state.active = Some(self.state.workspaces.len() - 1);
         }
         self.state.mode = super::Mode::Terminal;
+        if self
+            .structured_views
+            .get(&id)
+            .is_some_and(|d| d.frame().is_err())
+        {
+            self.structured_views.remove(&id);
+        }
+        self.sync_structured_views();
         Ok(())
     }
     /// Report only the placement bound to this current generation.
