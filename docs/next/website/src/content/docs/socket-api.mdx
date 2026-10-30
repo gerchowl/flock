@@ -118,8 +118,8 @@ retained across restart as offline hints.
 
 `peers.summary` optionally includes `structured_agents` beside `workspaces`.
 Each row carries `agent_id`, `agent` (harness label), `status`, and
-`runtime: "structured"`; `pane_id` is absent because these identities have no
-pane placement. Workspace agent rows keep their required `pane_id` field,
+`runtime: "structured"`; `pane_id` is absent because native placement is local
+and is not advertised by gossip. Workspace agent rows keep their required `pane_id` field,
 including an empty string; a separate structured row type omits it. The list is omitted when empty and defaults to empty when
 reading older peers. Readers skip individual unsupported or invalid structured
 rows (including unknown `runtime` or `status` values) with a diagnostic, keeping
@@ -1414,8 +1414,16 @@ Pane-only operations return `runtime_unsupported` (retry `never`, CLI exit 2).
 `agent.send` instead uses structured queue admission: `submit:false` returns
 `structured_submit_required`; `submit:true` acknowledges the durable lifecycle ID.
 A name or ID shared with a terminal still returns `agent_target_ambiguous`.
-These contracts do not enable public structured start; that remains gated until
-all #1843 routing and #1734 credential protection land. Mesh VERSION remains 5.
+Structured start retains its launcher and credential-protection gates.
+Mesh VERSION remains 5.
+
+Structured `agent.start` creates and focuses one native view in the active tab,
+or a native-only workspace when none exists. `agent.focus` reuses that placement
+without starting another worker. `StructuredAgentInfo.view` is the real
+`{workspace_id, tab_id, pane_id}`, absent while detached; closing the view does not
+stop its runtime. A resumed generation rebinds the same placement. Explicit
+workspace/tab/split selectors, `here`, labels and dry runs remain unsupported
+for structured starts. Native views allocate no PTY or terminal identity.
 
 ### Queue item lifecycle facts
 
