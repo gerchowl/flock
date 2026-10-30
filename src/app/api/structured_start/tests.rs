@@ -948,3 +948,114 @@ async fn admitted_start_returns_typed_unplaced_result_and_can_focus_later() {
         .is_some());
     assert!(fixture.app.state.terminals.is_empty());
 }
+
+#[tokio::test]
+async fn public_native_placement_renders_its_frame_and_fences_a_stale_cut() {
+    use ratatui::{backend::TestBackend, Terminal};
+    let _guard = crate::config::test_config_env_guard();
+    let mut fixture = AdmissionFixture::new("init-socket-null", 5000);
+    let (id, generation) = fixture.start().await;
+    fixture.submit(&id, generation);
+    let wake = fixture.app.render_notify.clone();
+    crate::structured::workers::tests::wait(&wake, || {
+        fixture.app.service_structured_workers(Instant::now());
+        matches!(fixture.app.state.native_frames.get(&id), Some(Ok(f)) if f.applied_cursor > 0)
+    })
+    .await;
+    let frame = fixture.app.state.native_frames[&id]
+        .as_ref()
+        .unwrap()
+        .clone();
+    let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    let text = |terminal: &Terminal<TestBackend>| {
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>()
+    };
+    crate::ui::compute_view_with_runtime_registry(
+        &mut fixture.app.state,
+        &fixture.app.terminal_runtimes,
+        ratatui::layout::Rect::new(0, 0, 100, 30),
+    );
+    terminal
+        .draw(|f| {
+            crate::ui::render_with_runtime_registry(
+                &fixture.app.state,
+                &fixture.app.terminal_runtimes,
+                f,
+            )
+        })
+        .unwrap();
+    let first = text(&terminal);
+    assert!(
+        first.contains("queued for idle"),
+        "native queue region missing: {first}"
+    );
+    assert!(first.contains("Tokens I/O:") && first.contains("Admission:"));
+    assert!(
+        fixture.app.state.terminals.is_empty(),
+        "native painting needs no PTY"
+    );
+    terminal
+        .draw(|f| {
+            crate::ui::render_with_runtime_registry(
+                &fixture.app.state,
+                &fixture.app.terminal_runtimes,
+                f,
+            )
+        })
+        .unwrap();
+    assert_eq!(text(&terminal), first);
+    assert_eq!(frame.target.generation, generation);
+    fixture
+        .app
+        .state
+        .native_frames
+        .insert(id.clone(), Err(ErrorCode::QueueSourceCold));
+    crate::ui::compute_view_with_runtime_registry(
+        &mut fixture.app.state,
+        &fixture.app.terminal_runtimes,
+        ratatui::layout::Rect::new(0, 0, 100, 30),
+    );
+    terminal
+        .draw(|f| {
+            crate::ui::render_with_runtime_registry(
+                &fixture.app.state,
+                &fixture.app.terminal_runtimes,
+                f,
+            )
+        })
+        .unwrap();
+    assert!(text(&terminal).contains("queue_source_cold"));
+    fixture
+        .app
+        .state
+        .native_frames
+        .insert(id.clone(), Ok(frame.clone()));
+    crate::ui::compute_view_with_runtime_registry(
+        &mut fixture.app.state,
+        &fixture.app.terminal_runtimes,
+        ratatui::layout::Rect::new(0, 0, 100, 30),
+    );
+    fixture
+        .app
+        .state
+        .structured_agents
+        .begin_launch(&id, generation)
+        .unwrap();
+    terminal
+        .draw(|f| {
+            crate::ui::render_with_runtime_registry(
+                &fixture.app.state,
+                &fixture.app.terminal_runtimes,
+                f,
+            )
+        })
+        .unwrap();
+    let stale = text(&terminal);
+    assert!(stale.contains("agent_not_found") && !stale.contains("queued for idle"));
+}
