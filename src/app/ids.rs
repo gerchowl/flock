@@ -15,22 +15,45 @@ impl App {
         if !self.socket_birth_valid() {
             return crate::structured::lease::Caller::Uncertain;
         }
-        let evidence = self.caller_pane_evidence();
+        if let Some(scope) = &self.current_api_scope {
+            return scope.caller();
+        }
+        self.lease_caller_for(self.current_api_peer_pid, principal)
+    }
+
+    /// Resolve origin from supplied kernel facts without an API request context.
+    pub(super) fn lease_caller_for(
+        &self,
+        peer: Option<u32>,
+        principal: Option<crate::structured::identity::Principal>,
+    ) -> crate::structured::lease::Caller {
+        use crate::structured::identity::Principal;
+        let evidence = self.pane_evidence_for(peer);
         let pane = evidence
             .as_ref()
             .ok()
             .copied()
             .flatten()
             .and_then(|(_, pane)| self.pane_child_pid(pane));
-        let caller = self
-            .session_leases
-            .caller_with_pane(self.current_api_peer_pid, pane);
+        let caller = self.session_leases.caller_with_pane(peer, pane);
         if caller == crate::structured::lease::Caller::Unrelated
             && (evidence.is_err() || (principal == Some(Principal::Agent) && pane.is_none()))
         {
             crate::structured::lease::Caller::Uncertain
         } else {
             caller
+        }
+    }
+
+    /// Internal authentication probes execute no user method or effect.
+    pub(crate) fn respond_scope_probe(&self, msg: &crate::api::ApiRequestMessage) -> bool {
+        if let Some(reply) = msg.scope.as_ref().and_then(|scope| {
+            scope.probe_reply(&self.session_leases, &self.runtime_config.uid_policy)
+        }) {
+            let _ = msg.respond_to.send(reply.into());
+            true
+        } else {
+            false
         }
     }
 
@@ -229,7 +252,15 @@ impl App {
     /// A possible caller pane for refusal, self-protection and warning routing only.
     /// PID ancestry is not identity evidence and must never grant authority.
     pub(super) fn caller_pane_candidate(&self) -> Option<(usize, crate::layout::PaneId)> {
-        self.resolve_pane_in_chain(&peer_ancestor_chain(self.current_api_peer_pid?))
+        self.caller_pane_candidate_for(self.current_api_peer_pid)
+    }
+
+    /// Possible pane origin for an explicitly supplied accepted peer.
+    pub(super) fn caller_pane_candidate_for(
+        &self,
+        peer: Option<u32>,
+    ) -> Option<(usize, crate::layout::PaneId)> {
+        self.resolve_pane_in_chain(&peer_ancestor_chain(peer?))
     }
 
     /// The API caller's own pane, bound to the child's original birth identity.
@@ -238,7 +269,14 @@ impl App {
     }
 
     fn caller_pane_evidence(&self) -> Result<Option<(usize, crate::layout::PaneId)>, ()> {
-        let Some(peer) = self.current_api_peer_pid else {
+        self.pane_evidence_for(self.current_api_peer_pid)
+    }
+
+    fn pane_evidence_for(
+        &self,
+        peer: Option<u32>,
+    ) -> Result<Option<(usize, crate::layout::PaneId)>, ()> {
+        let Some(peer) = peer else {
             return Ok(None);
         };
         let chain = peer_ancestor_chain(peer);

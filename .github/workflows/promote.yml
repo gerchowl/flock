@@ -116,12 +116,7 @@ jobs:
           git commit -m "release: v$VERSION"
           git push --force origin "$branch"
           if ! gh pr view "$branch" --json number >/dev/null 2>&1; then
-            python3 scripts/changelog.py extract --version "$VERSION" --output "$RUNNER_TEMP/notes.md"
-            {
-              printf 'Prepares v%s on `dev`. Opened by the Promote workflow.\n\n' "$VERSION"
-              printf 'When this merges, release-follow-up.yml waits for the merged commit to pass its checks on `dev`, then fast-forwards `main` to it and tags it `v%s`, which starts the Release workflow.\n\n' "$VERSION"
-              cat "$RUNNER_TEMP/notes.md"
-            } > "$RUNNER_TEMP/body.md"
+            python3 scripts/changelog.py pr-body --version "$VERSION" --output "$RUNNER_TEMP/body.md"
             gh pr create --base dev --head "$branch" --title "release: v$VERSION" --body-file "$RUNNER_TEMP/body.md"
           fi
           gh pr merge "$branch" --squash --auto --delete-branch
