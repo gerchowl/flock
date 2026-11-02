@@ -748,7 +748,9 @@ class CheckedInManifestTests(unittest.TestCase):
                 self.assertIsInstance(asset, dict, name)
                 url = asset.get("url")
                 self.assertIsInstance(url, str, name)
-                self.assertRegex(str(asset.get("sha256")), r"^[0-9a-f]{64}$", name)
+                digest = asset.get("sha256")
+                self.assertIsInstance(digest, str, name)
+                self.assertRegex(digest, r"^[0-9a-f]{64}$", name)
             self.assertIn(f"/releases/download/v{version}/", url, name)
 
 
