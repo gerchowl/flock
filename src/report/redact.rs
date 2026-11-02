@@ -27,6 +27,8 @@
 //! That is a deliberate, tested deviation from "drop anything free-text"; the
 //! composed block is always previewed before it can be sent.
 
+pub(crate) mod argv;
+
 use std::sync::OnceLock;
 
 use regex::Regex;
@@ -146,10 +148,11 @@ impl Scrubber {
             }
         }
 
+        out = mask_labeled_credentials(&out);
+
         for (pattern, replacement) in [
             (git_remote_re(), "<git-remote>"),
             (secret_token_re(), "<redacted-token>"),
-            (labeled_secret_re(), "$1=<redacted>"),
             (email_re(), "<email>"),
             (ssh_target_re(), "<ssh-target>"),
             (ipv6_re(), "<ip>"),
@@ -185,9 +188,7 @@ impl Scrubber {
 /// path an operator needs to read (`connect to host <host>: refused`).
 pub(crate) fn mask_credentials(value: &str) -> String {
     let masked = secret_token_re().replace_all(value, "<redacted-token>");
-    labeled_secret_re()
-        .replace_all(&masked, "$1=<redacted>")
-        .into_owned()
+    mask_labeled_credentials(&masked)
 }
 
 /// Mask known token shapes without the report scrubber's identity rules.
@@ -222,30 +223,99 @@ fn secret_token_re() -> &'static Regex {
 /// API-key spelling shared by secret labels and long argument flags.
 pub(crate) const API_KEY_LABEL_PATTERN: &str = r"api[-_]?key";
 
-/// Share label suffixes while callers choose identifier and value boundaries.
+const QUALIFIED_KEY_PREFIXES: &[&str] = &["api", "access", "private", "secret"];
+
+const SECRET_LABEL_WORDS: &str =
+    "authorization|authentication|bearer|token|password|passwd|passphrase|secret|credentials?|cookie|session|signature";
+
+/// Argument labels and headers allow broad key/auth words. Report text uses
+/// qualified key labels, so ordinary key/auth diagnostic prose survives.
 pub(crate) fn secret_label_pattern(prefix: &str) -> String {
+    format!(r"{prefix}(?:{SECRET_LABEL_WORDS}|auth|key|{API_KEY_LABEL_PATTERN})")
+}
+
+/// Split compound labels before lowercasing so camelCase remains evidence of
+/// a boundary. In particular, hotkey and monkey have no key segment.
+fn report_secret_label(label: &str, explicit: bool) -> bool {
+    let mut segmented = String::new();
+    let mut previous_lower = false;
+    for ch in label.chars() {
+        if ch.is_uppercase() && previous_lower {
+            segmented.push('_');
+        }
+        segmented.extend(ch.to_lowercase());
+        previous_lower = ch.is_lowercase() || ch.is_ascii_digit();
+    }
+    let parts: Vec<_> = segmented.split(['_', '-']).collect();
+    let last = parts.last().copied().unwrap_or_default();
+    let strong = SECRET_LABEL_WORDS.split('|').any(|word| word == last)
+        || matches!(last, "credential" | "credentials" | "apikey");
+    strong
+        || (matches!(last, "key" | "auth") && (parts.len() > 1 || explicit))
+        // AWS uses key_id for credential material rather than ending at key.
+        || (parts.len() > 2 && parts.ends_with(&["key", "id"]))
+}
+
+fn mask_labeled_credentials(value: &str) -> String {
+    labeled_secret_re()
+        .replace_all(value, |captures: &regex::Captures<'_>| {
+            let explicit =
+                &captures[4] == "=" || (captures[1].ends_with('"') && captures[3].ends_with('"'));
+            if report_secret_label(&captures[2], explicit) {
+                format!("{}{}=<redacted>", &captures[1], &captures[2])
+            } else {
+                captures[0].to_owned()
+            }
+        })
+        .into_owned()
+}
+
+/// Apply shared option and assignment rules to explicit shell command text.
+pub(crate) fn mask_argv_text(value: &str) -> String {
+    mask_argv_assignments(&argv::mask_options(value))
+}
+
+/// Every argument uses assignment rules. Colon labels remain with the header
+/// classifier so refspec boundaries stay readable.
+pub(crate) fn mask_argv_assignments(value: &str) -> String {
+    static ASSIGNMENT: OnceLock<Regex> = OnceLock::new();
+    ASSIGNMENT
+        .get_or_init(|| {
+            Regex::new(&labeled_secret_pattern(
+                &secret_label_pattern(r"[\w-]*"),
+                "=",
+                r"(?:\\[\s\S]|[^\s&;\\])+",
+            ))
+            .expect("static argv assignment pattern")
+        })
+        .replace_all(value, |captures: &regex::Captures<'_>| {
+            let label = &captures[2];
+            if label.starts_with('-') && !argv::named_secret_flag(label) {
+                captures[0].to_owned()
+            } else {
+                format!("{}{}=<redacted>", &captures[1], label)
+            }
+        })
+        .into_owned()
+}
+
+fn labeled_secret_pattern(labels: &str, delimiters: &str, unquoted_value: &str) -> String {
     format!(
-        r"{prefix}(?:authorization|bearer|token|password|passwd|secret|credentials?|cookie|session|{API_KEY_LABEL_PATTERN})"
+        r#"(?i)(^|[^A-Za-z0-9])({})\\?["']?\s*[{}]\s*(?:\\?"[^"\n]*"|\\?'[^'\n]*'|(?:(?:bearer|basic|digest|token)\s+)?{})"#,
+        labels, delimiters, unquoted_value,
     )
 }
 
 fn labeled_secret_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        // The label may be a SUFFIX of a longer identifier: `refresh_token`,
-        // `access_token`, `client_secret`, `github_token`. `\b` does not help
-        // there — `_` is a word character, so there is no boundary before
-        // `token` in `refresh_token` and the rule never fires.
-        //
-        // The value may be preceded by an auth SCHEME word. `\S+` alone stops
-        // at the first space, so `authorization: Bearer ab12…` masked only
-        // "Bearer" and emitted the credential itself in the clear. Consume the
-        // scheme and the token that follows it as one value.
+        // Capture complete identifiers and delimiters before deciding whether
+        // key/auth is prose or an explicit assignment. Quoted values and auth
+        // schemes consume the complete credential, including escaped spaces.
         Regex::new(&format!(
-            r"(?i)(?:^|[^A-Za-z0-9])({})\s*[=:]\s*(?:(?:bearer|basic|digest|token)\s+)?\S+",
-            secret_label_pattern(r"\w*"),
-        ))
-        .expect("static labeled-secret pattern")
+            r#"(?i)(^|[^A-Za-z0-9_-])({}(?:[-_]id)?)(\\?["']?)\s*([=:])\s*(?:\\?"[^"\n]*"|\\?'[^'\n]*'|(?:(?:bearer|basic|digest|token)\s+)?(?:\\[\s\S]|\S)+)"#,
+            secret_label_pattern(r"[\w-]*"),
+        )).expect("static labeled-secret pattern")
     })
 }
 
@@ -545,6 +615,142 @@ mod tests {
 
     fn rendered(line: &str) -> String {
         extract_one(line).render()
+    }
+
+    macro_rules! report_label_regression {
+        ($name:ident, $label:expr) => {
+            #[test]
+            fn $name() {
+                let secret = ["round3", "fixture", "credential"].join("-");
+                for delimiter in ["=", ":"] {
+                    let input = format!("{}{}{}", $label, delimiter, secret);
+                    for masked in [
+                        mask_credentials(&input),
+                        Scrubber::new(None, None).scrub(&input),
+                    ] {
+                        assert!(!masked.contains(&secret), "{masked}");
+                    }
+                }
+            }
+        };
+    }
+
+    report_label_regression!(shape_2868_deploy_key, "DEPLOY_KEY");
+    report_label_regression!(shape_2868_stripe_key, "STRIPE_KEY");
+    report_label_regression!(shape_2868_ssh_key, "ssh_key");
+    report_label_regression!(shape_2868_signing_key, "signing_key");
+    report_label_regression!(shape_2868_master_key, "master_key");
+    report_label_regression!(shape_2868_encryption_key, "encryption-key");
+    report_label_regression!(shape_2868_license_key, "license_key");
+    report_label_regression!(shape_2868_camel_key, "authKey");
+    report_label_regression!(shape_2868_aws_key_id, "aws_access_key_id");
+
+    #[test]
+    fn shape_2868_bare_key_auth_explicit_values() {
+        let secret = ["round3", "fixture", "credential"].join("-");
+        for label in ["key", "auth"] {
+            for input in [
+                format!("{label}={secret}"),
+                format!("\"{label}\": \"{secret}\""),
+            ] {
+                for masked in [
+                    mask_credentials(&input),
+                    Scrubber::new(None, None).scrub(&input),
+                ] {
+                    assert!(!masked.contains(&secret), "{masked}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn review_2868_report_scope_preserves_ordinary_key_and_auth_labels() {
+        for value in [
+            "primary key: id",
+            "hotkey: ctrl-a",
+            "monkey=banana",
+            "auth: ok",
+        ] {
+            assert_eq!(mask_credentials(value), value);
+            assert_eq!(Scrubber::new(None, None).scrub(value), value);
+        }
+    }
+
+    #[test]
+    fn credential_vocabulary_respects_surface_scope() {
+        let secret = ["fixture2868", "credential"].join("-");
+        for word in [
+            "auth",
+            "authentication",
+            "authorization",
+            "bearer",
+            "token",
+            "password",
+            "passwd",
+            "passphrase",
+            "secret",
+            "credential",
+            "credentials",
+            "cookie",
+            "session",
+            "key",
+            "api-key",
+            "api_key",
+        ] {
+            for dash in ["-", "--"] {
+                let program = if dash == "-" { "tool" } else { "curl" };
+                assert!(
+                    argv::option_value(&format!("{dash}{word}"), program == "curl").is_some(),
+                    "{word}"
+                );
+                for delimiter in ['=', ' '] {
+                    let masked =
+                        mask_argv_text(&format!("{program} {dash}{word}{delimiter}{secret}"));
+                    assert!(!masked.contains(&secret), "{masked}");
+                }
+            }
+            let labelled = format!("{word}: {secret}");
+            let masked = mask_credentials(&labelled);
+            if matches!(word, "auth" | "key") {
+                assert_eq!(masked, labelled);
+            } else {
+                assert!(!masked.contains(&secret), "{masked}");
+            }
+        }
+    }
+
+    #[test]
+    fn quoted_assignments_and_shell_credential_options_mask_complete_values() {
+        let first = ["fixture2868", "first"].join("-");
+        let second = ["fixture2868", "second"].join("-");
+        for text in [
+            format!("TOKEN=\"{first} {second}\" curl https://example.com/"),
+            format!("password='{first} {second}' curl https://example.com/"),
+            format!("password={first}<{second}>"),
+            format!("curl -u'{first} {second}' https://example.com/"),
+            format!("curl --user '{first} {second}' --cookie sid={first}"),
+            format!("curl -u{first} -bsid={second}"),
+        ] {
+            let masked = mask_argv_text(&text);
+            assert!(!masked.contains(&first), "{masked}");
+            assert!(!masked.contains(&second), "{masked}");
+        }
+    }
+
+    #[test]
+    fn report_quoted_labels_and_punctuation_do_not_expose_credential_tails() {
+        let first = ["fixture2868", "first"].join("-");
+        let second = ["fixture2868", "second"].join("-");
+        for text in [
+            format!(r#"{{"Authorization": "Bearer {first}"}}"#),
+            format!("token={first};{second}"),
+            format!("token={first}<{second}>"),
+            format!("token={first}\\ {second}"),
+        ] {
+            let masked = mask_credentials(&text);
+            assert!(!masked.contains(&first), "{masked}");
+            assert!(!masked.contains(&second), "{masked}");
+        }
     }
 
     #[test]
