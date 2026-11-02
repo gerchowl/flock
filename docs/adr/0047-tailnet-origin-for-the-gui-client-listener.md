@@ -128,8 +128,16 @@ Tailscale version, because the design depends on it.
   Funnel or local-machine traffic, no identity is set.
 - For a TCP backend, `Out.Host = In.Host`, so the browser's Host
   (`<name>.ts.net`) reaches flk. tailscaled also sets `X-Forwarded-Host`, sets
-  `X-Forwarded-Proto: https` when the inbound leg was TLS, and sets
-  `X-Forwarded-For` to the tailnet source address.
+  `X-Forwarded-Proto: https` only when the inbound leg was TLS (`serve.go`
+  1146-1148), and sets `X-Forwarded-For` to the tailnet source address.
+- tailscaled itself never deletes a client-supplied `X-Forwarded-Proto`. Go's
+  `httputil.ReverseProxy` does: when `Rewrite` is set, it removes `Forwarded`,
+  `X-Forwarded-For`, `X-Forwarded-Host` and `X-Forwarded-Proto` from the
+  outbound request before `Rewrite` runs (`net/http/httputil/reverseproxy.go`
+  128-131 for the contract, 521-524 for the deletion). On a plain `--http`
+  handler, `X-Forwarded-Proto` is therefore absent and not client-controlled.
+  This depends on Go's proxy behavior, not on tailscaled's own code, so A18
+  pins it.
 - For a `unix:` backend, `Out.Host` is rewritten to the backend URL's host.
 - Raw TCP forwarding (`serve --tcp`, `--tls-terminated-tcp`) is not HTTP, so
   none of the above happens. The remote client controls every byte, including
@@ -164,11 +172,15 @@ Trust boundary, as ADR-0036 §5 and ADR-0043 §8 state it:
   - the public internet through Funnel;
   - whoever sees a printed URL.
 
-The adversaries come from ADR-0043 §8, plus three this front end adds:
+The adversaries come from ADR-0043 §8, plus four this front end adds:
 
 - a tailnet peer that can reach `<name>.ts.net:443` under the tailnet ACLs;
 - a raw TCP forward or Funnel rule that the operator turns on later, which
   silently replaces the proxy's header stripping;
+- any relay to `127.0.0.1:<port>` that is not Tailscale's (`socat`, Caddy,
+  `cloudflared`, `ssh -R`, or a process behind another serve port that forwards
+  here). No probe can see one, and each makes every header client-controlled
+  (R2);
 - another backend mounted under the same ts.net origin.
 
 Invariants this ADR must keep:
@@ -208,6 +220,13 @@ refuses startup:
   as given.
 - `bind` must be set, with a nonzero port (`client_open::endpoint` already
   refuses port 0).
+- The `public_origin` port, 443 when omitted, must differ from the `bind`
+  port. If they were equal, a page on any origin that resolves
+  `<name>.ts.net` to `127.0.0.1` (for example a split-DNS or hosts-file entry on
+  the server host, or a rebinding resolver) would reach the listener directly
+  over plain HTTP with `Host: <name>.ts.net:<port>`. That is the public
+  authority, without tailscaled in the path. With different ports, that Host
+  can only mean the serve listener.
 - Both fields are restart-only, like `bind`. A config reload that changes them
   is refused with a diagnostic that names the restart.
 
@@ -230,7 +249,7 @@ loopback-peer check (`peer == 127.0.0.1`, which stays):
 | `Host` | exactly one, equal to the public authority |
 | `Origin` | exactly one on every `/v1/` path, equal to `https://<public authority>`. On a non-`/v1/` GET (the document and assets), absent or equal to that value. `http://`, `null`, a `tauri://` shell origin and any other value are refused. Shell origins are never admitted on the public class. |
 | `Sec-Fetch-Site` | `/v1/client/exchange`: exactly one, `same-origin`. Non-`/v1/` GET: absent, `none` or `same-origin`. `/v1/ws`: absent or `same-origin`. `same-site`, `cross-site` and duplicates are always refused. |
-| `X-Forwarded-Proto` | exactly one, `https`. This proves the inbound leg was the TLS serve listener and not a plain `--http` handler, as far as the header can prove anything (see R2). |
+| `X-Forwarded-Proto` | exactly one, `https`. Behind tailscaled the client cannot supply it, because Go's `ReverseProxy` deletes it before tailscaled's `Rewrite` runs, and tailscaled sets it only for a TLS inbound leg (see "What tailscaled does", above). So it separates the TLS serve listener from a plain `--http` handler. Like every header here, it is forgeable by any other relay (R2). |
 | `Tailscale-Funnel-Request` | must be absent |
 | `Tailscale-User-Login` | exactly one, in `public_users` (R2) |
 
@@ -280,15 +299,63 @@ port would replace header stripping with attacker-controlled bytes. With
 - off the executor, every 60 s;
 - immediately before every public-class code exchange.
 
-Any outcome other than a passing `Status` **latches public admission closed**
-for the life of the process. Public-class requests then get 403
+A positive bad-configuration finding (defined below) **latches public
+admission closed** for the life of the process. Public-class requests then get 403
 `public_origin_unverified`, and public-class `/v1/ws` sessions already upgraded
 are closed with 4403. The server logs one WARN naming the failed condition
 without the configuration body. The listener's `Health`
-(`src/api/client_listener.rs:6-9`, today `Listening` or `Failed`) gains a
-public-class state so that server status reports the latch. Loopback admission continues. Only a restart
-re-opens the public class. A transient probe failure therefore costs the remote
-tab a restart, which is the accepted price of failing closed.
+(`src/api/client_listener.rs:12`, which holds a `Status` from `:6-9`, today
+`Listening` or `Failed`) gains a public-class state so that server status
+reports the latch. Loopback admission continues. Only a restart re-opens a
+latched class. A live handoff counts as a restart (below).
+
+**What latches, and what only closes.** Only a **positive bad-configuration
+finding** latches: a parsed `Status` that fails conditions 2–5, `NotInstalled`,
+or a non-timeout `Unavailable` (the CLI ran and failed, or its output did not
+parse). A probe that **times out** (the 5 s deadline) does not latch. It counts
+as "no passing probe", and the freshness rule below closes the class until a
+probe passes again. Otherwise anyone who can slow the host could turn one slow
+`tailscale` call into a permanent outage.
+
+**Freshness: the guard fails closed when the monitor dies.** The guard admits a
+public-class request only while the last *passing* probe is younger than 90 s,
+on the monotonic clock. That is one 60 s period plus the 5 s probe deadline plus
+margin. The guard compares that timestamp itself and does not trust the
+monitor's liveness. A monitor task that panics, is aborted, or stalls behind a
+blocked `spawn_blocking` pool stops refreshing the timestamp, so the public
+class closes within 90 s with 403 `public_origin_unverified`. Upgraded public
+sockets are closed with 4403 on the same edge. This is a close, not a latch: a
+later passing probe re-opens the class. A monitor that exits restarts once,
+with a WARN, and the freshness rule covers the gap.
+
+**Exchange probes cannot be used for denial of service.**
+- The per-exchange probe runs only **after** every header check has passed:
+  public class, Origin, `Sec-Fetch-Site`, `X-Forwarded-Proto`, no Funnel header,
+  an allow-listed `Tailscale-User-Login` and the body limit. A request that
+  fails any of these never spawns a `tailscale` process.
+- At most **one** probe is in flight. Concurrent exchanges await the same
+  result, and the 60 s monitor shares that slot too, so N exchanges cost one
+  subprocess.
+- A timeout refuses that exchange with a retryable 503 and does not consume the
+  code. It does not latch (above).
+
+**A live handoff counts as a restart, and resets the latch on purpose.** The
+importer always runs the full startup probe on the inherited socket
+(`client_listener.rs:200`, which runs for adopted and freshly bound sockets
+alike) with every R1 condition. It starts with a fresh passing timestamp, or
+with a refused import, and the old process then keeps serving with its class
+still latched. The latch state does not cross the handoff. That is intended:
+
+- a restart is the only documented way to re-open the class;
+- the evidence it needs is exactly one fresh, full, passing probe, which the
+  importer produces;
+- carrying the latch would add a handoff field whose only effect is to make a
+  handoff stricter than the restart it stands in for.
+
+The latch exists so that a running process never re-opens on its own. It is not
+meant to outlive an operator-initiated process change. An operator who has
+fixed the serve configuration can re-open the class with a handoff or a
+restart, and a still-bad configuration fails the importer's probe.
 
 **Rejected alternatives**
 
@@ -334,12 +401,20 @@ principal is still the bearer.
 - It is **unforgeable by a remote tailnet peer** only when all of these hold:
   - the listener is bound to `127.0.0.1` (invariant 1), so a remote machine's
     bytes reach flk only through a local relay;
-  - the only relay is tailscaled's HTTP proxy, which deletes client-supplied
-    `Tailscale-*` headers before it sets its own;
+  - the only relay to `127.0.0.1:<port>` is tailscaled's HTTP proxy, which
+    deletes client-supplied `Tailscale-*` headers before it sets its own;
   - no raw TCP forward exists.
 
-  R1's startup and running checks keep the second and third conditions true.
-  If any one of them fails, the header is attacker-controlled.
+  **flk cannot verify the second condition.** R1's probe sees only Tailscale's
+  own rules. Any other relay to `127.0.0.1:<port>` gives a remote client control
+  of Host, `X-Forwarded-Proto` and `Tailscale-User-Login`, and nothing in
+  `serve status` shows it. Examples: `socat`, Caddy or another reverse proxy,
+  `cloudflared`, an `ssh -R` from another machine, or a `serve` rule that targets
+  a different local port whose process forwards here. The identity check is
+  therefore exactly as strong as the operator's assurance that tailscaled is the
+  only relay. It narrows who can try. It is not a proof. **The bearer remains
+  the real gate**, as it already is for the loopback class today: a code or the
+  bearer is still needed, and neither can be obtained over the network.
 - It is **forgeable by every local process**, at all times, because flk cannot
   tell tailscaled's loopback connection from anyone else's. That includes
   agents, and the operator's own SSH `-L` forwards from other machines. This
@@ -356,7 +431,8 @@ turns "anyone the tailnet ACLs let reach port 443 on this node" into "the
 operator's own logins". That matters in four ways:
 
 - **Codes are bearer secrets.** A code that leaks in its 60 seconds (pre-mortem
-  P6) is useless to anyone outside `public_users`, even on the tailnet.
+  P6) is useless to a *remote* tailnet peer outside `public_users`, while
+  tailscaled is the only relay. It is **not** useless to a local process (P6).
 - **Shared tailnets.** Shared-in nodes, family or organization tailnets and
   tagged service nodes become refused by default and not merely unauthenticated.
 - **Exposure.** An unauthenticated tailnet peer cannot load the bundle, so it
@@ -407,6 +483,23 @@ operator's own logins". That matters in four ways:
   operator-public` cuts off every remote browser without touching the local
   operator's `operator` bearer. The remote tab keeps it in `sessionStorage`
   under ADR-0038 §3's rules.
+- **The two names are reserved.** Today `TokenStore::issue`
+  (`tokens.rs:283-300`) accepts any name, and `operator_token` reuses whatever
+  record named `operator` has the operator scopes. So a record that `flk
+  client token add operator-public --scopes read,send,answer,operate` created
+  earlier would be handed to every remote browser, and its bearer was already
+  printed to whoever ran `token add`. W3 therefore:
+  - makes `issue`, the `token add` path, refuse `operator` and `operator-public`
+    with `invalid_params`;
+  - mints them only through a private reserved-name path used by
+    `operator_token` and its public twin;
+  - has that path write a `reserved: true` marker into the record, and makes the
+    public twin refuse to reuse an `operator-public` record without the marker
+    (`TokenError::Unsafe`, with a diagnostic naming `flk client token rm
+    operator-public`).
+
+  Existing `operator` records predate the marker, so they stay reusable, and
+  the reservation applies to them from now on.
 - **`--origin public` requires `--print`.** Opening a browser on the server's
   own host at the public URL is not a remote use, and it would put the code in
   the opener's argv (ADR-0036 §5's argv exception) for no benefit.
@@ -518,14 +611,24 @@ the control that answers it.
       latter.
     - The Host comparison is exact equality with configured strings, never a
       suffix match.
-  - *Test:* A3, A8.
+    - If `<name>.ts.net` resolves to `127.0.0.1` on the server host (split DNS,
+      a hosts-file entry or a rebinding resolver), a browser there would reach
+      the listener directly on the bind port. Refusing a `public_origin` port
+      equal to the `bind` port (R1) means that a Host carrying the public
+      authority can never arrive on the bind port without tailscaled in the
+      path.
+  - *Test:* A3, A8, A22.
 - **P2. Header spoofing from a tailnet peer.**
   - *Attack:* the operator later runs `tailscale serve --tcp 443
     tcp://127.0.0.1:7699`, or `funnel`, on the port, and a peer then sends its
     own `Tailscale-User-Login` and `X-Forwarded-Proto`.
   - *Control:* the running check (60 s, and before every exchange) latches the
     public class closed and closes public sockets with 4403. The window is at
-    most 60 s for already-upgraded sockets and zero for code exchange.
+    most 60 s for already-upgraded sockets and zero for code exchange. If the
+    monitor itself has died, the 90 s freshness rule closes the class anyway.
+    A relay that is not Tailscale's (`socat`, Caddy, `cloudflared`, `ssh -R`)
+    is invisible to every probe. Against that, only the bearer gate holds
+    (R2).
   - *Residual:* within that window a forged identity still needs a code or the
     `operator-public` bearer.
   - *Test:* A10, A11.
@@ -535,15 +638,18 @@ the control that answers it.
     bundle and a 401 at exchange, and nothing more than it gets from the
     loopback class today. Codes are minted only for the LocalOperator, over the
     unix socket.
-  - *Residual:* documented. The `unix:` backend upgrade path is open question 3.
+  - *Residual:* documented, including local redemption of a seen code (P6). The `unix:` backend upgrade path is open question 3.
 - **P4. CSRF or CSWSH from another tailnet origin.**
-  - *Attack:* a page served at `<other>.ts.net`, which may be same-site or
-    cross-site depending on how the Public Suffix List treats `ts.net`, issues
-    `fetch` or `WebSocket` calls to `<name>.ts.net`.
+  - *Attack:* a page served at `<other>.<tailnet>.ts.net` issues `fetch` or
+    `WebSocket` calls to `<name>.<tailnet>.ts.net`. `ts.net` is on the Public
+    Suffix List, so the registrable domain is `<tailnet>.ts.net`, and sibling
+    nodes in one tailnet are **same-site** with this one. Same-site is exactly
+    the case where a browser would attach `SameSite` cookies and send
+    `Sec-Fetch-Site: same-site`.
   - *Control:*
     - `Origin` must equal the one public origin on every `/v1/` path.
-    - `Sec-Fetch-Site: same-site` is refused, whichever way the PSL classifies
-      `ts.net`.
+    - R1 refuses `Sec-Fetch-Site: same-site` on every path. Because siblings
+      are same-site, that rule is what stops them, not a side effect.
     - There is no cookie or other ambient credential (ADR-0038 §6). A forged
       upgrade still needs the bearer in `hello`.
   - *Test:* A4, A5.
@@ -566,9 +672,18 @@ the control that answers it.
       `replaceState`.
     - A replay needs an allow-listed tailnet identity (R2).
     - Output goes to a terminal only (R3).
-  - *Residual:* a same-identity device that replays within 60 s, before the
-    operator does, wins the code. The operator then sees "expired or already
-    used" and knows.
+  - *Residual:*
+    - A same-identity device that replays within 60 s, before the operator
+      does, wins the code. The operator then sees "expired or already used" and
+      knows.
+    - **A local process that sees the code can redeem it.** Any local uid that
+      reads the printed URL (from a shared tmux scrollback, a pane capture, a
+      terminal log or the clipboard) can forge every public-class header over
+      loopback and exchange it within 60 s. R2's allow-list does not stop it.
+      This is no worse than a loopback code today, which a local process can
+      redeem the same way. The controls are the same as for loopback codes:
+      single use, 60 s, fragment only, terminal-only output. The `unix:`
+      backend (open question 3) is the only change that would close it.
   - *Test:* A14, A15, A16.
 - **P7. Funnel misconfiguration.**
   - *Attack:* `tailscale funnel 443 on` is enabled for `<name>.ts.net`.
@@ -593,8 +708,9 @@ the control that answers it.
   - *Control:* both policies are precomputed from configuration, and each
     names only its own authority.
   - *Test:* A12.
-- **P10. Breakage, not exploitation.** A probe hiccup latches the public class
-  closed and the remote tab drops. That is the intended fail-closed cost. It
+- **P10. Breakage, not exploitation.** A probe timeout closes the public class
+  until the next passing probe, and a bad-configuration finding latches it.
+  Either way the remote tab drops. That is the intended fail-closed cost. It
   shows in health status with the failed condition, and the SSH interim path
   still works. A Tailscale release that renames serve JSON fields breaks the
   shape check. A6 runs against the pinned Tailscale version's real
@@ -644,13 +760,16 @@ until one exists.
    #2476 decided.
 9. **A9.** Startup refuses a second handler path (for example `/grafana`) on the
    public host:port.
-10. **A10.** At runtime, an injected probe result that turns into funnel, a TCP
-    forward or a failure latches the public class closed: public `GET`s and
-    exchanges get 403 `public_origin_unverified`, an upgraded public socket is
-    closed with 4403, and the loopback class is unaffected.
-11. **A11.** A public exchange runs the probe first. A failing probe refuses
-    that exchange, and **does not** consume the code. Only an audience mismatch
-    consumes it.
+10. **A10.** At runtime, an injected probe result that turns into funnel, a
+    TCP forward, `NotInstalled` or a non-timeout failure latches the public
+    class closed: public `GET`s and exchanges get 403
+    `public_origin_unverified`, an upgraded public socket is closed with 4403,
+    the loopback class is unaffected, and a later passing probe does **not**
+    re-open it.
+11. **A11.** A public exchange that passes every header check runs the probe
+    first. A bad-configuration result refuses that exchange and latches. A
+    timeout refuses it with a retryable 503, does not latch, and **does not**
+    consume the code. Only an audience mismatch consumes it.
 12. **A12.** The public document's CSP is exactly the template with
     `wss://<name>.ts.net/v1/ws`, and contains no `ws://127.0.0.1`. The loopback
     document's CSP contains no `wss://`. A Chromium CSP test (like `csp.test.ts`)
@@ -676,9 +795,34 @@ until one exists.
     session with 4403 and leaves a loopback session live.
 18. **A18 (live).** Through real tailscaled, a request carrying a client-supplied
     `Tailscale-User-Login: attacker@example.com` arrives at flk with the
-    proxied identity, or with none from a tagged node. This pins the
-    header-stripping behavior that R2 depends on, for the pinned Tailscale
-    version.
+    proxied identity, or with none from a tagged node. A client-supplied
+    `X-Forwarded-Proto: https` sent to a plain `--http` serve handler arrives
+    with **no** `X-Forwarded-Proto`, and one sent to the HTTPS handler arrives
+    as exactly one `https`. This pins the header-stripping behavior of
+    tailscaled and of Go's `ReverseProxy` that R1 and R2 depend on, for the
+    pinned Tailscale version.
+19. **A19.** Freshness: with the monitor task aborted, or panicking on an
+    injected fault, and an injected clock, public requests are admitted at
+    89 s after the last passing probe and refused at 90 s, with 4403 on an
+    upgraded public socket. A subsequent passing probe re-opens the class.
+    Repeated probe timeouts never latch.
+20. **A20.** Exchange probe cost: 64 concurrent public exchanges that pass all
+    header checks spawn exactly one probe and all see its result. 64 public
+    exchanges that fail any header check (no login, wrong Origin, same-site)
+    spawn none. The probe runner counts spawns.
+21. **A21.** Live handoff: a latched process hands off to an importer whose
+    probe passes, and the importer serves the public class. With the serve
+    configuration still bad, the import is refused, and the old process stays
+    latched and keeps serving loopback.
+22. **A22.** Configuration with a `public_origin` port equal to the `bind`
+    port refuses to load. This covers both `https://<name>.ts.net:7699` with
+    `bind = "127.0.0.1:7699"`, and an omitted port (443) with
+    `bind = "127.0.0.1:443"`.
+23. **A23.** `flk client token add operator-public ...` and `token add operator
+    ...` are refused with `invalid_params`. A pre-existing `operator-public`
+    record without the reserved marker makes `client open --origin public` fail
+    with a diagnostic and never hands out its bearer. On the base, `token add
+    operator-public` succeeds.
 
 Regression guards, which pass before and after and must keep passing: with
 `public_origin` unset, the A1 request still returns 403; every existing
@@ -690,13 +834,16 @@ Each slice stays at or below 400 own production lines (ADR-0043 §9's cap).
 
 - **W1. Configuration and pure checks.** `ClientConfig` fields and validation;
   the authority classifier; public-class header rules; the serve-shape validator
-  over parsed JSON. Tests A2–A9 and A14 (unit level). About 250 lines.
+  over parsed JSON, and the port-collision rule. Tests A2–A9, A14 and A22
+  (unit level). About 250 lines.
 - **W2. Listener wiring.** Two document policies, the guard's class dispatch,
-  exchange audience, the running probe, the latch and 4403 on latch. Tests A1,
-  A10–A12 and A16. About 300 lines.
+  exchange audience, the running probe, the latch, 4403 on latch, the 90 s
+  freshness gate, single-flight exchange probes, and the latch reset on handoff.
+  Tests A1, A10–A12, A16 and A19–A21. About 350 lines; split at the
+  probe/latch boundary if it runs over.
 - **W3. Issuance.** The `ClientOpen` origin parameter, the `operator-public`
-  record, the CLI flag and the terminal-output rule. Tests A15 and A17. About
-  150 lines.
+  record, reserved token names with their marker, the CLI flag and the
+  terminal-output rule. Tests A15, A17 and A23. About 180 lines.
 - **W4. Live verification and documentation.** A13 and A18, a next-docs page
   for the setup, and the interim SSH path. Documentation and tests only.
 
@@ -716,16 +863,33 @@ Each slice stays at or below 400 own production lines (ADR-0043 §9's cap).
 
 ## Open questions for the owner
 
+Each question carries the review's recommendation. These are recommendations
+only, not decisions. Questions 3, 4 and 6 affect safety. Questions 1, 2 and 5
+do not.
+
 1. Is a 60 s code lifetime enough for copying a URL between two Macs, or should
    public codes get a longer one, for example 120 s?
+   *Recommendation:* keep 60 s. This does not affect safety.
 2. Should a code be bound to one login (`--for <login>`) when `public_users` has
    more than one entry?
+   *Recommendation:* no `--for` binding. This does not affect safety: a local
+   redeemer forges the login anyway (P6).
 3. Should the public front end move to a `tailscale serve` `unix:` backend with
    peer-credential checks, once the pinned Tailscale version supports it, to
    close local header forgery (P3)?
+   *Recommendation:* yes, as the planned upgrade path. It is the only change
+   that closes both the unverifiable-relay gap (R2, P2) and local redemption of
+   a seen code (P6), because only a kernel peer credential can prove that
+   tailscaled is the sender.
 4. Should `operator-public` carry a TTL, so that a forgotten remote tab expires
    without a manual `token rm`?
+   *Recommendation:* yes. A remote bearer that never expires is the largest
+   residual of P8.
 5. Are VM-guest servers worth a host-attested probe later, or is "run tailscaled
    in the guest" the permanent answer?
+   *Recommendation:* keep VM guests unsupported. This does not affect safety
+   beyond R4.
 6. Should a public-class tab keep its transcript cache in IndexedDB at all
    (ADR-0038 §3), or run memory-only, so a lost Mac holds no session content?
+   *Recommendation:* yes, memory-only storage by default for the public class,
+   so a lost or shared remote Mac holds no session content at rest.
