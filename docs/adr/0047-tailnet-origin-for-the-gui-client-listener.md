@@ -1,18 +1,20 @@
 # ADR-0047: An opt-in tailnet origin for the GUI client listener, fronted by `tailscale serve`
 
-- Status: Proposed
+- Status: Accepted
+- Accepted: 2026-11-02; owner decision: accepted with all recommended answers.
 - Date: 2026-11-02
 - Issues: [#2794](https://github.com/gerchowl/flock/issues/2794); related
   [#2476](https://github.com/gerchowl/flock/issues/2476) (startup without
   Tailscale) and [#2293](https://github.com/gerchowl/flock/issues/2293)
   (remote code exchange, multi-node GUI).
-- Decision owner: repository owner. The owner asked for this ADR on 2026-11-02.
-  The four recommendations (R1–R4) and the open questions at the end are
-  pending the owner's decision.
+- Decision owner: repository owner. The owner asked for this ADR on 2026-11-02
+  and accepted it the same day ("Accept ADR-0047 with the reviewers'
+  recommendations"). That decides R1–R4 and every recommended answer in
+  "Owner decisions" below. Acceptance claims a decision, not code.
 - Builds on: ADR-0036 §5 (client wire, tokens, one-time codes), ADR-0038 §6
   (browser shell, shell origins, identity), ADR-0043 §3 and §8 (remote ingress
   and its threat model).
-- Amends, if accepted: ADR-0043 §3's sentence "Do not expose the current
+- Amends: ADR-0043 §3's sentence "Do not expose the current
   loopback-only one-time-code exchange remotely as an unreviewed shortcut".
   This ADR is that review, and it covers only the `tailscale serve` front end
   defined here. It does not change ADR-0043's own TLS listener (T1–T3).
@@ -364,8 +366,10 @@ with a WARN, and the freshness rule covers the gap.
   read **after** the request arrived. A change made between that read and the
   code consumption, a window of milliseconds, is not seen. Every check-then-use
   has that window.
-- A timeout refuses that exchange with a retryable 503 and does not consume the
-  code. It does not latch (above).
+- A timeout, an `Unavailable` result or a runtime `NotInstalled` each refuse
+  that exchange with a retryable 503. None of them consumes the code or
+  latches. Each closes the class until a probe passes (above). Only a parsed
+  bad configuration refuses and latches.
 
 **A live handoff counts as a restart, and resets the latch on purpose.** The
 importer always runs the full startup probe on the inherited socket
@@ -446,8 +450,8 @@ following and retry the handoff or update:
   tailscaled, which loopback TCP cannot. Rejected for now: `unix:` targets are
   recent and version-dependent, macOS tailscaled variants run under different
   identities (system extension, App Store sandbox), and the guard would need a
-  second socket type in the handoff path. It is recorded as the upgrade path if
-  local header forgery ever needs to be closed (open question 3).
+  second socket type in the handoff path. Owner decision D3 makes it the
+  hardening path, as a follow-up after W1–W5.
 
 ### R2. A tailnet identity allow-list is **required**, as an admission precondition, never as a principal
 
@@ -522,7 +526,7 @@ operator's own logins". That matters in four ways:
   authority.
 - *Bind each code to one login (`--for <login>`).* Rejected for v1: with a
   required allow-list of the operator's own logins, per-code binding adds a flag
-  for little gain. It is open question 2.
+  for little gain. The owner decided against it (D2).
 
 ### R3. A remote browser gets a code from `flk client open --print --origin public`
 
@@ -548,6 +552,15 @@ operator's own logins". That matters in four ways:
   operator-public` cuts off every remote browser without touching the local
   operator's `operator` bearer. The remote tab keeps it in `sessionStorage`
   under ADR-0038 §3's rules.
+- **`operator-public` expires (owner decision D4).**
+  - The record carries a wall-clock expiry that counts suspended time, as
+    owner decision 18 decided for app-session tokens.
+  - An expired record authenticates nothing. A live session on it is closed
+    with 4403, and the client goes to NeedsToken (ADR-0038 §6).
+  - The next `client open --origin public` replaces the expired record with a
+    new bearer and a new expiry.
+  - W3 fixes the value. The proposed default is 12 h, the app-session lifetime
+    (ADR-0038 owner decision 16).
 - **The two names are reserved.** Today `TokenStore::issue`
   (`tokens.rs:283-300`) accepts any name, and `operator_token` reuses whatever
   record named `operator` has the operator scopes. So a record that `flk
@@ -588,8 +601,8 @@ operator's own logins". That matters in four ways:
 - *An in-memory, TTL-bound token, like app-session tokens.* Rejected:
   app-session bearers are bound to a minting PID and refused on TCP by owner
   decision 18 (ADR-0038 §6), and every restart or live handoff would push the
-  remote tab back to NeedsToken. A follow-up may add a TTL to durable tokens
-  (open question 4).
+  remote tab back to NeedsToken. Owner decision D4 instead gives the durable
+  `operator-public` record a TTL (R3).
 - *Paste a long-lived token into the remote browser.* Rejected because it puts
   the bearer itself on the clipboard and in scrollback, where a code expires in
   60 s.
@@ -597,7 +610,7 @@ operator's own logins". That matters in four ways:
   Rejected because it adds a pre-auth network verb and an approval UI. That is
   #2293's remote-exchange design space, and this ADR does not open it.
 - *A longer TTL for remote codes.* Rejected, since copying a URL between two
-  Macs fits in 60 s. Open question 1 asks whether 60 s is too short in practice.
+  Macs fits in 60 s. Owner decision D1 keeps 60 s.
 
 ### R4. VM-guest servers behind a host's tailscaled: **unsupported**
 
@@ -637,7 +650,7 @@ The supported options are:
   Rejected because it turns R1 and R2 into configuration claims. If the owner
   wants VM guests, the right shape is a probe that runs on the VM host and
   reports a signed or socket-attested result to the guest. That is out of scope
-  here (open question 5).
+  here (owner decision D5 keeps VM guests unsupported).
 
 ### Interim, with no code change
 
@@ -697,8 +710,8 @@ the control that answers it.
     A relay that is not Tailscale's (`socat`, Caddy, `cloudflared`, `ssh -R`)
     is invisible to every probe. Against that, only the bearer gate holds
     (R2).
-  - *Residual:* within that window a forged identity still needs a code or the
-    `operator-public` bearer.
+  - *Residual:* within the 60 s socket window a forged identity still needs a
+    code or the `operator-public` bearer.
   - *Test:* A10, A11.
 - **P3. Header spoofing from a local process.**
   - *Attack:* an agent forges every public-class header over loopback.
@@ -706,7 +719,7 @@ the control that answers it.
     bundle and a 401 at exchange, and nothing more than it gets from the
     loopback class today. Codes are minted only for the LocalOperator, over the
     unix socket.
-  - *Residual:* documented, including local redemption of a seen code (P6). The `unix:` backend upgrade path is open question 3.
+  - *Residual:* documented, including local redemption of a seen code (P6). The `unix:` backend upgrade path is owner decision D3.
 - **P4. CSRF or CSWSH from another tailnet origin.**
   - *Attack:* a page served at `<other>.<tailnet>.ts.net` issues `fetch` or
     `WebSocket` calls to `<name>.<tailnet>.ts.net`. `ts.net` is on the Public
@@ -751,7 +764,7 @@ the control that answers it.
       This is no worse than a loopback code today, which a local process can
       redeem the same way. The controls are the same as for loopback codes:
       single use, 60 s, fragment only, terminal-only output. The `unix:`
-      backend (open question 3) is the only change that would close it.
+      backend (owner decision D3) is the only change that would close it.
   - *Test:* A14, A15, A16.
 - **P7. Funnel misconfiguration.**
   - *Attack:* `tailscale funnel 443 on` is enabled for `<name>.ts.net`.
@@ -766,9 +779,10 @@ the control that answers it.
   - *Control:* `flk client token rm operator-public` revokes every remote tab.
     Existing revocation closes live sessions with 4403 (ADR-0036 §5a). The local
     `operator` bearer is unaffected.
-  - *Residual:* transcripts cached in that browser's IndexedDB stay on that
-    machine (open question 6).
-  - *Test:* A17.
+  - *Residual:* the bearer works until revocation or its expiry (D4). Public-class
+    tabs keep transcripts in memory only (D6), so no session content stays at
+    rest on that machine.
+  - *Test:* A17, A24, A25.
 - **P9. CSP regression.**
   - *Attack:* the public document's policy lists the loopback `ws://` source,
     or a request-derived host, so a script injection could exfiltrate over a
@@ -843,8 +857,9 @@ until one exists.
     that started before the exchange and whose injected result passes, while
     the configuration injected for the next probe is a funnel, the exchange is
     refused and latches; it never uses the earlier passing result. A
-    bad-configuration result refuses that exchange and latches. A timeout or
-    `Unavailable` refuses it with a retryable 503, does not latch, and **does
+    bad-configuration result refuses that exchange and latches. A timeout, an
+    `Unavailable` result or a runtime `NotInstalled` each refuse it with a
+    retryable 503, close the class until a probe passes, do not latch, and **do
     not** consume the code. Only an audience mismatch consumes it.
 12. **A12.** The public document's CSP is exactly the template with
     `wss://<name>.ts.net/v1/ws`, and contains no `ws://127.0.0.1`. The loopback
@@ -904,6 +919,16 @@ until one exists.
     record without the reserved marker makes `client open --origin public` fail
     with a diagnostic and never hands out its bearer. On the base, `token add
     operator-public` succeeds.
+24. **A24.** With an injected wall clock, including a suspend interval, an
+    `operator-public` bearer authenticates before its expiry and is refused at
+    it. A live public session is closed with 4403 at expiry. The next `client
+    open --origin public` issues a different bearer. On the base, durable
+    tokens have no expiry.
+25. **A25.** A client loaded from an `https:` public-class page opens no
+    IndexedDB database. It keeps stream records in memory, recovers by fresh
+    subscription after a reload, and still keeps its token in `sessionStorage`.
+    A loopback-class page keeps ADR-0038 §3's IndexedDB store unchanged. On the
+    base, every page opens IndexedDB.
 
 Regression guards, which pass before and after and must keep passing: with
 `public_origin` unset, the A1 request still returns 403; every existing
@@ -923,10 +948,15 @@ Each slice stays at or below 400 own production lines (ADR-0043 §9's cap).
   Tests A1, A10–A12, A16 and A19–A21. About 350 lines; split at the
   probe/latch boundary if it runs over.
 - **W3. Issuance.** The `ClientOpen` origin parameter, the `operator-public`
-  record, reserved token names with their marker, the CLI flag and the
-  terminal-output rule. Tests A15, A17 and A23. About 180 lines.
+  record, reserved token names with their marker, the `operator-public` expiry,
+  the CLI flag and the terminal-output rule. Tests A15, A17, A23 and A24. About
+  230 lines.
 - **W4. Live verification and documentation.** A13 and A18, a next-docs page
   for the setup, and the interim SSH path. Documentation and tests only.
+- **W5. Memory-only client store for the public class (D6).** The browser
+  client skips IndexedDB on a public-class page. It selects that mode from its
+  own page origin (`https:` and not a loopback host), not from a server flag.
+  Test A25. About 120 lines of TypeScript.
 
 ## Consequences
 
@@ -942,35 +972,38 @@ Each slice stays at or below 400 own production lines (ADR-0043 §9's cap).
 - When ADR-0043 T1–T3 ship, the owner can keep this front end for tailnet-only
   nodes or withdraw it. Nothing here blocks or replaces them.
 
-## Open questions for the owner
+## Owner decisions (2026-11-02)
 
-Each question carries the review's recommendation. These are recommendations
-only, not decisions. Questions 3, 4 and 6 affect safety. Questions 1, 2 and 5
-do not.
+The owner accepted every recommended answer. Questions 3, 4 and 6 affect
+safety. Questions 1, 2 and 5 do not.
 
-1. Is a 60 s code lifetime enough for copying a URL between two Macs, or should
-   public codes get a longer one, for example 120 s?
-   *Recommendation:* keep 60 s. This does not affect safety.
-2. Should a code be bound to one login (`--for <login>`) when `public_users` has
-   more than one entry?
-   *Recommendation:* no `--for` binding. This does not affect safety: a local
-   redeemer forges the login anyway (P6).
-3. Should the public front end move to a `tailscale serve` `unix:` backend with
-   peer-credential checks, once the pinned Tailscale version supports it, to
-   close local header forgery (P3)?
-   *Recommendation:* yes, as the planned upgrade path. It is the only change
-   that closes both the unverifiable-relay gap (R2, P2) and local redemption of
-   a seen code (P6), because only a kernel peer credential can prove that
-   tailscaled is the sender.
-4. Should `operator-public` carry a TTL, so that a forgotten remote tab expires
-   without a manual `token rm`?
-   *Recommendation:* yes. A remote bearer that never expires is the largest
-   residual of P8.
-5. Are VM-guest servers worth a host-attested probe later, or is "run tailscaled
-   in the guest" the permanent answer?
-   *Recommendation:* keep VM guests unsupported. This does not affect safety
-   beyond R4.
-6. Should a public-class tab keep its transcript cache in IndexedDB at all
-   (ADR-0038 §3), or run memory-only, so a lost Mac holds no session content?
-   *Recommendation:* yes, memory-only storage by default for the public class,
-   so a lost or shared remote Mac holds no session content at rest.
+- **D1. Code lifetime: keep 60 s.** Public codes use the same 60 s lifetime as
+  loopback codes.
+- **D2. No `--for <login>` binding.** Codes are not bound to a tailnet login,
+  because a local redeemer would forge the login anyway (P6).
+- **D3. A `unix:` serve backend is the hardening path, as a follow-up.** Once
+  the pinned Tailscale version supports it, the public front end moves to a
+  `tailscale serve` `unix:` backend with kernel peer-credential checks. That is
+  the only change that closes both the relay gap flk cannot verify (R2, P2) and
+  local redemption of a seen code (P6), because only a peer credential proves
+  that tailscaled is the sender. It is not part of W1–W5.
+- **D4. `operator-public` gets a TTL.** See R3 and A24.
+- **D5. VM guests stay unsupported**, as R4 says.
+- **D6. The public class keeps transcripts in memory only, by default.**
+  Public-class tabs do not use ADR-0038 §3's IndexedDB store, so a lost or
+  shared remote Mac holds no session content at rest. The token stays in
+  `sessionStorage` under ADR-0038 §3. See W5 and A25.
+
+## Follow-ups (to be filed)
+
+The architect files these. No issue numbers exist yet.
+
+- W1: configuration and pure checks (R1, R2).
+- W2: listener wiring, probe, latch, freshness and handoff (R1).
+- W3: issuance, reserved token names and the `operator-public` TTL (R3, D4).
+- W4: live verification (A13, A18) and next-docs setup with the SSH interim
+  path.
+- W5: the memory-only client store for the public class (D6).
+- The `unix:` serve backend with peer-credential checks (D3).
+- `flk web`: require a loopback peer before trusting `Tailscale-User-Login`
+  (`src/web/mod.rs:287-292`).
