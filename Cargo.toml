@@ -95,7 +95,7 @@ tokio = { version = "1", features = ["net", "io-util", "process"] }
 rusqlite = { version = "0.40.2", features = ["hooks"] }
 
 # Parse adapter declarations and CLI match patterns for coverage drift tests.
-syn = { version = "2", features = ["full", "visit"] }
+syn = { version = "3", features = ["full", "visit"] }
 
 [build-dependencies]
 # Use SDK declarations for Darwin kinfo_proc rather than copying its ABI.
