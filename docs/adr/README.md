@@ -56,6 +56,7 @@ can be exempted in `guardrails-adr-exempt.txt`.
 | [0044](0044-structured-lifecycle-and-hibernation.md) | Durable structured lifecycle and idle hibernation | Accepted |
 | [0045](0045-durable-work-and-supervision-loops.md) | Durable work records and server-owned supervision loops: acknowledged persistence, at-least-once wakes, explicit handling and goal/work projection | Accepted |
 | [0046](0046-slatedb-not-now.md) | Do not adopt SlateDB now: per-store verdicts and revisit triggers | Accepted |
+| [0047](0047-tailnet-origin-for-the-gui-client-listener.md) | The GUI client listener may admit one opt-in tailnet origin behind a verified `tailscale serve` HTTPS proxy, with a required identity allow-list, audience-bound one-time codes and a separately revocable bearer; VM-guest fronting is unsupported | Accepted |
 
 ADR-0026 supersedes the affected transport, reply, deferral and deduplication
 contracts in ADR-0006, ADR-0008, ADR-0009, ADR-0018 and ADR-0019. Their other
