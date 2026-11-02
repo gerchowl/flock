@@ -16,6 +16,22 @@ const DEFAULT_MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
 // cap, and the failure being diagnosed usually lived in the tail just dropped.
 const DEFAULT_RETAINED_LOG_FILES: usize = 2;
 
+// Keep failure categories and I/O kinds observable without logging OS error payloads.
+pub(crate) fn system_information_unavailable(operation: &'static str, error: &sysinfo::Error) {
+    let (reason, io_kind) = match error {
+        sysinfo::Error::Unsupported => ("unsupported", None),
+        sysinfo::Error::Io(error) => ("io", Some(error.kind())),
+        sysinfo::Error::Other(_) => ("other", None),
+    };
+    tracing::warn!(
+        event = "system.information.unavailable",
+        operation,
+        reason,
+        io_kind = ?io_kind,
+        "system information unavailable"
+    );
+}
+
 /// Fleet storage failures expose only the typed I/O kind.
 #[cfg(feature = "web")]
 pub(crate) fn structured_fleet_stopped(error: &io::Error) {
@@ -5290,6 +5306,34 @@ pub(crate) fn client_wire_unavailable(cause: &'static str, kind: Option<io::Erro
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn system_information_failures_log_typed_reasons_without_error_payloads() {
+        let out = capture_logs(|| {
+            system_information_unavailable("cpu", &sysinfo::Error::Unsupported);
+            system_information_unavailable(
+                "disk",
+                &sysinfo::Error::Io(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "private system error payload",
+                )),
+            );
+            system_information_unavailable(
+                "network",
+                &sysinfo::Error::from("private system error payload"),
+            );
+        });
+        for expected in [
+            "system.information.unavailable",
+            "unsupported",
+            "io",
+            "PermissionDenied",
+            "other",
+        ] {
+            assert!(out.contains(expected), "{out}");
+        }
+        assert!(!out.contains("private system error payload"), "{out}");
+    }
 
     #[cfg(feature = "web")]
     #[test]

@@ -486,7 +486,7 @@ pub(crate) fn ssh_agent_rescan_roots() -> &'static [&'static str] {
 pub(crate) fn machine_identity() -> std::io::Result<String> {
     super::machine_id::read_machine_id(
         std::path::Path::new("/etc/machine-id"),
-        sysinfo::System::boot_time(),
+        sysinfo::System::boot_time().map_err(std::io::Error::other)?,
     )
 }
 
