@@ -1141,4 +1141,6 @@ mod tests {
 mod deadline_tests;
 
 #[cfg(test)]
+mod deadline_liveness_tests;
+#[cfg(test)]
 mod deadline_round2_tests;

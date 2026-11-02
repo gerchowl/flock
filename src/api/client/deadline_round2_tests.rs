@@ -113,6 +113,7 @@ fn assert_pre_dispatch(error: &io::Error) {
 async fn full_backlog_mutation_is_pre_dispatch_timeout_exit_124() {
     let root = TempDir::socket();
     let path = root.path().join("backlog");
+    let _owner = crate::ipc::SocketOwner::acquire(&path).unwrap();
     let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
     let _holders = crate::platform::socket_deadline::saturate_backlog(&listener, &path);
     let client = ApiClient::for_target(ConnectionTarget::SocketPath(path.clone()));
@@ -154,6 +155,7 @@ async fn full_backlog_mutation_is_pre_dispatch_timeout_exit_124() {
 fn completed_input_connect_uses_its_existing_absolute_deadline() {
     let root = TempDir::socket();
     let path = root.path().join("input-backlog");
+    let _owner = crate::ipc::SocketOwner::acquire(&path).unwrap();
     let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
     let _holders = crate::platform::socket_deadline::saturate_backlog(&listener, &path);
     let client = ApiClient::for_target(ConnectionTarget::SocketPath(path));

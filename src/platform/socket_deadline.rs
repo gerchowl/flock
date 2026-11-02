@@ -22,6 +22,7 @@ fn connect_with_retry(
     mut wait: impl FnMut(Duration, &io::Error),
 ) -> io::Result<UnixStream> {
     let mut backoff = Duration::from_millis(1);
+    let mut unverified_until = None;
     loop {
         match connect_once(path, deadline) {
             Ok(stream) => return Ok(stream),
@@ -30,13 +31,32 @@ fn connect_with_retry(
                     || (cfg!(target_os = "macos")
                         && error.kind() == io::ErrorKind::ConnectionRefused) =>
             {
-                let remaining = deadline.saturating_duration_since(Instant::now());
+                let now = Instant::now();
+                let remaining = deadline.saturating_duration_since(now);
+                let retry_until = match crate::ipc::SocketOwner::is_held(path) {
+                    Ok(false) => return Err(error),
+                    Ok(true) => {
+                        unverified_until = None;
+                        deadline
+                    }
+                    Err(_) => {
+                        // Invalid or inaccessible ownership evidence gets only a few
+                        // retry slots (50 ms), at most a tenth of the remaining budget.
+                        // Preserve the native refusal when that grace expires.
+                        *unverified_until.get_or_insert_with(|| {
+                            now + Duration::from_millis(50).min(remaining / 10)
+                        })
+                    }
+                };
                 if remaining.is_zero() {
                     return Err(io::ErrorKind::TimedOut.into());
                 }
+                if now >= retry_until {
+                    return Err(error);
+                }
                 // A full Darwin Unix backlog reports ECONNREFUSED, not EAGAIN.
                 // A fresh descriptor on each attempt also discards failed socket state.
-                wait(backoff.min(remaining), &error);
+                wait(backoff.min(retry_until.duration_since(now)), &error);
                 backoff = backoff.saturating_mul(2).min(Duration::from_millis(10));
             }
             Err(error) => return Err(error),
@@ -172,9 +192,53 @@ mod tests {
     const CEILING: Duration = Duration::from_secs(5);
 
     #[test]
+    fn stale_and_missing_sockets_preserve_native_errors_without_retry() {
+        let root = crate::test_support::TempDir::socket();
+        let path = root.path().join("stale");
+        let listener = UnixListener::bind(&path).unwrap();
+        drop(listener);
+        for owned in [false, true] {
+            if owned {
+                drop(crate::ipc::SocketOwner::acquire(&path).unwrap());
+            }
+            let error = connect_with_retry(&path, Instant::now() + CEILING, |_, _| {
+                panic!("stale socket must not retry admission")
+            })
+            .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
+            assert_eq!(error.raw_os_error(), Some(libc::ECONNREFUSED));
+        }
+        std::fs::remove_file(&path).unwrap();
+        let error = connect_with_retry(&path, Instant::now() + CEILING, |_, _| {
+            panic!("missing socket must not retry admission")
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert_eq!(error.raw_os_error(), Some(libc::ENOENT));
+    }
+
+    #[test]
+    fn unavailable_ownership_evidence_caps_refusals_and_preserves_native_error() {
+        let root = crate::test_support::TempDir::socket();
+        let path = root.path().join("stale");
+        let listener = UnixListener::bind(&path).unwrap();
+        drop(listener);
+        let target = root.path().join("retain");
+        std::fs::write(&target, "retain").unwrap();
+        std::os::unix::fs::symlink(&target, root.path().join("stale.lock")).unwrap();
+        let started = Instant::now();
+        let error = connect(&path, started + CEILING).unwrap_err();
+        assert!(started.elapsed() < Duration::from_millis(750), "{error}");
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
+        assert_eq!(error.raw_os_error(), Some(libc::ECONNREFUSED));
+        assert_eq!(std::fs::read_to_string(target).unwrap(), "retain");
+    }
+
+    #[test]
     fn full_backlog_connect_succeeds_when_admission_opens_before_deadline() {
         let root = crate::test_support::TempDir::socket();
         let path = root.path().join("admit");
+        let _owner = crate::ipc::SocketOwner::acquire(&path).unwrap();
         let listener = UnixListener::bind(&path).unwrap();
         let holders = saturate_backlog(&listener, &path);
         listener.set_nonblocking(true).unwrap();
