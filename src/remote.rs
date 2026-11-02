@@ -2504,8 +2504,13 @@ pub(crate) fn is_valid_ssh_proxy_jump(chain: &str) -> bool {
 /// and a relayed peer via the relayer alone. `None` when nothing is left.
 pub(crate) fn client_relative_proxy_jump(chain: Option<&str>) -> Option<String> {
     let short = crate::app::short_host_name();
-    let full = sysinfo::System::host_name().unwrap_or_default();
-    relative_proxy_jump(chain?, &[short.as_str(), full.as_str()])
+    match sysinfo::System::host_name() {
+        Ok(full) => relative_proxy_jump(chain?, &[short.as_str(), full.as_str()]),
+        Err(error) => {
+            crate::logging::system_information_unavailable("proxy_jump_host_name", &error);
+            relative_proxy_jump(chain?, &[short.as_str()])
+        }
+    }
 }
 
 /// Cut `chain` after the last hop naming one of `self_names`. Matched EXACTLY

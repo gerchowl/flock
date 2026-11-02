@@ -746,6 +746,7 @@ mod tests {
                         }
                     }
                     syn::Pat::Paren(pattern) => self.pattern(&pattern.pat),
+                    syn::Pat::Guard(pattern) => self.pattern(&pattern.pat),
                     syn::Pat::TupleStruct(pattern) if pattern.path.is_ident("Some") => {
                         for element in &pattern.elems {
                             self.pattern(element);
@@ -782,16 +783,23 @@ mod tests {
                 }
                 match optional {
                     Some("list" | "show") => (),
+                    Some("guarded") if optional == Some("guard-expression-only") => (),
                     _ => (),
                 }
             }
         "#,
         );
-        assert_eq!(verbs.len(), 5);
-        for verb in ["get", "status", "stop", "list", "show"] {
+        assert_eq!(verbs.len(), 6);
+        for verb in ["get", "status", "stop", "list", "show", "guarded"] {
             assert!(verbs.contains(verb), "missing routed verb {verb}");
         }
-        for verb in ["comment-only", "string-only", "body-only", "deleted"] {
+        for verb in [
+            "comment-only",
+            "string-only",
+            "body-only",
+            "deleted",
+            "guard-expression-only",
+        ] {
             assert!(!verbs.contains(verb), "invented routed verb {verb}");
         }
     }
