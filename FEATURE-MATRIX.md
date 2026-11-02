@@ -53,6 +53,7 @@ the full archive.
 | Content-anchored selections | Runtime-owned terminal references follow scrolling and reflow; copy re-reads retained rows and visibly refuses invalid anchors | In review | ADR-0040 | #475, #2127 |
 | Durable work supervision | Stable work records, durable wake custody, bounded healthy-source waits and enrolled Tauri notification endpoints. Accepted design; no implementation claimed | Not implemented | ADR-0045 | #2718, #2733, #2734 |
 | State storage engine | Keep SQLite and local fsync; SlateDB not adopted now, with revisit triggers | Accepted | ADR-0046 | #2845 |
+| Tailnet GUI origin | An opt-in `[client] public_origin` admits one `https://<name>.ts.net` origin behind a verified `tailscale serve` HTTPS proxy (serve yes, funnel and raw TCP never, re-checked while running), with a required tailnet login allow-list, audience-bound one-time codes, a reserved, expiring `operator-public` bearer and a memory-only client store; VM-guest fronting is unsupported. Accepted design; no implementation claimed | Not implemented | ADR-0047 | #2794 |
 
 **Multi-node GUI access (ADR-0043).** Accepted design; not implemented.
 The TLS home gateway supplies node status, destination grants without credential
