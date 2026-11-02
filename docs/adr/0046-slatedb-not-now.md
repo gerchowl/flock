@@ -8,8 +8,6 @@
 - Builds on: ADR-0009 (no second trust domain, no interval polling), ADR-0026
   (never memory-only mail), ADR-0031 (storage), ADR-0039 (vigil telemetry),
   ADR-0043 (fail-closed node status), ADR-0045 (durable work records).
-- Implemented: nothing to implement. This ADR records a decision not to change
-  storage.
 
 ## Context
 
@@ -23,7 +21,8 @@ Facts the decision rests on, with their source:
 
 - **Latency.** SlateDB durable writes are bounded below by the 100 ms
   `flush_interval` plus an object PUT. Flock's current local fsync and SQLite
-  paths measure about 4 ms p99 (ADR-0031) and 83 us p50 for the mesh store.
+  paths measure p50 about 4 ms, p99 under 12 ms (ADR-0031), and 83 us p50 for
+  the mesh store.
 - **Query shape.** The mesh mail store depends on SQL indexes and
   `BEGIN IMMEDIATE` state machines.
 - **Pre-1.0 churn.** SlateDB promises on-disk format compatibility only between
@@ -39,8 +38,7 @@ Facts the decision rests on, with their source:
   "second trust domain" ADR-0009 rejected.
 - **Handoff fencing.** Live handoff today transfers single-writer ownership of
   `mesh-mail.sqlite` cooperatively (`runtime_store::suspend`,
-  `src/server/headless.rs:1434`, then reopen after `wait_committed`,
-  `headless.rs:4532-4544`). SlateDB fences on open regardless of whether the
+  then reopen after `wait_committed` in the handoff import path). SlateDB fences on open regardless of whether the
   old writer handed over. If a handoff crashes after the importer opened the
   database, the two processes can keep fencing each other.
 - **Silent mail loss.** If someone sets `await_durable=false` to fit the
@@ -63,7 +61,7 @@ Flock does not adopt SlateDB now. Verdict per store:
 
 | Store | Verdict | Reason |
 | --- | --- | --- |
-| Event log | Keep as is | Local fsync at about 4 ms p99 (ADR-0031) beats the 100 ms flush interval plus PUT; SlateDB is clearly worse. |
+| Event log | Keep as is | Local fsync at p50 about 4 ms, p99 under 12 ms (ADR-0031) beats the 100 ms flush interval plus PUT; SlateDB is clearly worse. |
 | Mesh mail store | Keep SQLite | Needs SQL indexes and `BEGIN IMMEDIATE` state machines; 83 us p50 today; cooperative handoff works. |
 | Inbox / Stop-hook path | Keep as is | The hook budget cannot absorb a durable-write floor of 100 ms plus PUT, and the workaround (`await_durable=false`) violates ADR-0026. |
 | Atomic-write stores | Keep; consolidate later | SlateDB is clearly worse. A cheaper path is folding them into the existing rusqlite database (see Follow-ups). |
