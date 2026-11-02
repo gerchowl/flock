@@ -1555,15 +1555,17 @@ are deferred to S6 (#1429); this types slice names the contracts only.
   and angle brackets (`<`, `>`) terminate URL tokens: malformed userinfo with
   these characters can leave a password prefix visible. This backstop cannot
   replace keeping credentials in stdin or the environment.
-  Query/fragment names containing a full credential label (shared with the
-  report scrubber), or `code`, `key` or `signature`, have their values masked
+  Query, fragment and semicolon parameter names containing a full credential
+  argument/header label, or `code`, `key`, `auth`, `pwd`,
+  `jwt` or `signature`, have their values masked
   even when the label is mid-name, such as `api_key_v2` or `token_type`.
   This intentionally also masks false positives such as `keyboard`, `monkey`,
   `unicode` and `sessionid`; the short `sig` alias
   matches only the complete name, preserving ordinary `design` parameters.
-  Exact credential header names (`Authorization`, `Proxy-Authorization`,
-  `Private-Token`, `Cookie`, `Set-Cookie`, API-key names and the `X-`
-  credential-header family)
+  Credential header names include `Authentication`, standard credential headers,
+  API-key names and any hyphenated name with a credential-label segment
+  (for example `X-Access-Key`, `Ocp-Apim-Subscription-Key`, `X-Signature`
+  or `X-Hub-Signature-256`). These names
   allow horizontal whitespace before `:` and mask values even without space
   after it, including names glued to curl's `-H` option or a short-flag
   cluster ending in uppercase `H`, such as `-sSLH`, `-4H`, `-0sH`, `-#H`
@@ -1573,11 +1575,12 @@ are deferred to S6 (#1429); this types slice names the contracts only.
   than a `Cookie` header. Generic credential labels such as `token`, `session`
   and `secret`, including prefixed labels, require whitespace or end-of-string
   after `:`. This preserves refspecs and terminal targets such as
-  `refs/heads/token:refs/heads/x`, `token:main`, `deploy-token:main` and
+  `refs/heads/token:refs/heads/x`, `token:main` and
   `mysession:0`.
   Bare compact refspecs such as `cookie:cookie` and `authorization:main` are
-  masked in logs because they are indistinguishable from compact credential
-  headers, an acceptable loss of diagnostic detail to avoid exposing secrets.
+  masked in logs, along with hyphenated names such as `deploy-token:main`
+  and `custom-cookie:main`, because they are indistinguishable from compact
+  credential headers, an acceptable loss of diagnostic detail to avoid exposing secrets.
   Everything after the first header-shaped label is value, never part of a
   later label. If a later credential-header match would retain text following
   an earlier colon, mask the whole argument instead. Curl's leading `-:` switch
@@ -1585,6 +1588,40 @@ are deferred to S6 (#1429); this types slice names the contracts only.
   as `-:Hfoo:HAuthorization:z`, including `z`, and may hide option labels in that
   argument; the program and other arguments remain logged. Skipped matches never
   promote earlier values into a retained label.
+  JSON-quoted header names allow a closing quote before the colon. Labels
+  followed by `=` are scrubbed in every argument, including shell command text.
+  A backslash-escaped space belongs to the value and cannot expose its suffix.
+  Named flags match whole hyphen/underscore segments of the shared credential
+  vocabulary, including single-dash Go-style options. Key labels in compound
+  flags require a credential qualifier (`api`, `access`, `private` or `secret`),
+  so `--ssh-key-path`, `--hotkey`, `--keys`, `--keyring` and `--author` retain
+  their diagnostic values. Negated and known boolean prefixes (`no-`,
+  `disable-`, `enable-`, `show-`) never consume a following value.
+  Credential aliases (`-u`, `-b`, `-U`, `--user`, `--cookie`,
+  `--proxy-user`, `--oauth2-bearer`) use the value's shape independently of the
+  program: user/proxy values contain `:` or start with `@`; cookie values contain
+  `=` or start with `@`; OAuth bearer values are always secret. This also covers
+  wrappers, executable aliases, remote command strings and nested shell text.
+  Recognizing curl adds masking of its unshaped credential values, but never
+  gates the value-shape rule. Thus `git worktree add -b fix-1`,
+  `git push -u origin main`, `git add -u src` and `sort -u x` retain their
+  diagnostic values.
+  Labelled assignments and token-shaped secrets are scrubbed independently.
+  Short options are case-sensitive and clusters follow the
+  [curl option rules](https://curl.se/docs/manpage.html#options): the first
+  argument-taking letter owns the remainder, or the next argument. A public
+  option such as `-A` prevents a later `u` in its value from becoming a credential
+  switch. Both attached and `=` forms use the same value classifier. Quote and
+  escape handling retains value spans for masking; executed commands are unchanged.
+  The report/stderr scrubber splits labels on `_`, `-` and camelCase boundaries.
+  Compound labels ending in `key`, `auth`, `token`, `secret`, `password` or
+  `credential` mask with either delimiter, including `DEPLOY_KEY`, `ssh_key`,
+  `authKey` and the AWS `access_key_id` spelling. Strong credential words such as
+  `authorization`, `signature` and `password` also mask as bare labels. Bare
+  `key` and `auth` require `=` or a quoted JSON key. Consequently
+  `primary key: id`, `hotkey: ctrl-a`, `monkey=banana` and `auth: ok` stay visible.
+  Glued non-option prefixes such as `SECRET-HAuthorization` remain
+  conservatively masked as header labels.
   These rules shape diagnostic logs only; executed argv is never rewritten.
   The token then travels in the unchanged normal `hello` frame.
   The served client derives its server and transport from its own location

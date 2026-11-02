@@ -597,14 +597,15 @@ impl TracedCommand {
 /// still needs log masking.
 fn redact_arg(arg: &str) -> String {
     let urls = redact_url_credentials(arg);
-    let arg = urls.as_str();
+    let text = crate::report::redact::mask_argv_assignments(&urls);
+    let arg = text.as_str();
     static HEADER: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     static COMPACT_HEADER: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let header = HEADER.get_or_init(|| {
         // Capture complete names, including ref paths and glued curl options.
         // Stop at the first viable H/header pair so no credential enters the label.
         regex::Regex::new(&format!(
-            r"(?i)(((?:-[A-Za-z0-9#:]*?(?-i:H))?[\w/-]*{})[ \t]*:)",
+            r#"(?i)(((?:-[A-Za-z0-9#:]*?(?-i:H))?[\w/#-]*{}(?:-[\w-]+)*)\\?["']?[ \t]*:)"#,
             crate::report::redact::secret_label_pattern("")
         ))
         .expect("static secret header pattern")
@@ -613,8 +614,9 @@ fn redact_arg(arg: &str) -> String {
         // Curl clusters include digit, # and : flags. H is intentionally
         // uppercase-only: lowercase h requests help, not a header.
         regex::Regex::new(&format!(
-            r"^(?:-[A-Za-z0-9#:]*H)?(?i:authorization|proxy-authorization|private-token|cookie|set-cookie|{}|x-[\w-]*{})$",
+            r"^(?:-[A-Za-z0-9#:]*H)?(?i:authorization|authentication|proxy-authorization|private-token|cookie|set-cookie|{}|(?:\w+-)+{}(?:-\w+)*|{}(?:-\w+)+)$",
             crate::report::redact::API_KEY_LABEL_PATTERN,
+            crate::report::redact::secret_label_pattern(""),
             crate::report::redact::secret_label_pattern("")
         ))
         .expect("static compact credential header pattern")
@@ -677,7 +679,7 @@ fn redact_url_credentials(arg: &str) -> String {
     });
     let param = PARAM.get_or_init(|| {
         Regex::new(&format!(
-            r"(?i)([?#&](?:[\w-]*(?:code|key|signature|{})[\w-]*|sig)=)[^&#]*",
+            r"(?i)([?#&;](?:[\w-]*(?:code|key|signature|pwd|jwt|{})[\w-]*|sig)=)[^&#;]*",
             crate::report::redact::secret_label_pattern("")
         ))
         .expect("static secret URL parameter pattern")
@@ -728,25 +730,6 @@ pub(crate) fn shape_stderr_tail(stderr: &[u8]) -> Option<String> {
     Some(format!("{ARG_TRUNCATED_MARKER}{}", &tail[cut..]))
 }
 
-/// Long secret-flag aliases are matched only for logging, never execution.
-fn secret_flag(flag: &str) -> bool {
-    flag.strip_prefix("--").is_some_and(|name| {
-        let name = name.to_ascii_lowercase();
-        ["token", "secret", "password"]
-            .iter()
-            .any(|label| name.contains(label))
-            || (name.contains("api") && {
-                static API_KEY: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-                API_KEY
-                    .get_or_init(|| {
-                        regex::Regex::new(crate::report::redact::API_KEY_LABEL_PATTERN)
-                            .expect("static API-key flag pattern")
-                    })
-                    .is_match(&name)
-            })
-    })
-}
-
 /// Shape a `Command`'s argv into a single log-safe string: args joined with
 /// spaces, capped at `MAX_ARG_LOG_CHARS`, with an ellipsis marker on overflow.
 /// Non-UTF8 args become lossy strings so the audit trail never fails to render.
@@ -755,26 +738,60 @@ fn secret_flag(flag: &str) -> bool {
 /// and a consumed secret switch carries that masking forward through a chain.
 /// Arbitrary unlabelled secrets cannot be identified; callers must use stdin/env.
 /// Short `-t` is ambiguous (for example, a type or terminal option), so only
-/// descriptive long secret flags consume a value. Callers must keep secrets off argv.
+/// descriptive secret flags and curl credential aliases consume a value.
+/// Callers must keep secrets off argv.
 #[allow(dead_code)] // Called from the wrapper commit's impl (also under #[allow]); real callers land in the migration.
 fn shape_args(command: &Command) -> String {
     let mut buf = String::new();
-    let mut secret_value = false;
+    let program = command.get_program().to_string_lossy();
+    let curl = crate::report::redact::argv::is_curl(&program);
+    let shell = crate::report::redact::argv::is_shell(&program);
+    let mut script_next = false;
+    let mut script_seen = false;
+    let mut pending: Option<crate::report::redact::argv::OptionValue> = None;
+    let mut options = true;
     for arg in command.get_args() {
         if !buf.is_empty() {
             buf.push(' ');
         }
         let arg = arg.to_string_lossy();
-        if secret_value {
-            buf.push_str("<redacted>");
-            // A consumed switch can introduce another secret value in a chain.
-            secret_value = secret_flag(&arg) && !arg.contains('=');
-        } else if let Some((flag, _)) = arg.split_once('=').filter(|(flag, _)| secret_flag(flag)) {
-            buf.push_str(flag);
-            buf.push_str("=<redacted>");
+        let script = script_next;
+        script_next = shell
+            && !script_seen
+            && arg.starts_with('-')
+            && !arg.starts_with("--")
+            && arg[1..].contains('c');
+        let option = crate::report::redact::argv::option_value(&arg, curl && options);
+        if script {
+            script_seen = true;
+            script_next = false;
+            buf.push_str(&redact_arg(&crate::report::redact::mask_argv_text(&arg)));
+        } else if let Some(previous) = pending.take() {
+            if previous.masks(&arg) {
+                buf.push_str("<redacted>");
+                pending = option.filter(|value| value.attached.is_none());
+            } else {
+                buf.push_str(&redact_arg(
+                    &crate::report::redact::argv::mask_nested_options(&arg),
+                ));
+            }
+        } else if let Some(option) = option {
+            if let Some(start) = option.attached.filter(|start| option.masks(&arg[*start..])) {
+                buf.push_str(&arg[..start]);
+                buf.push_str("<redacted>");
+            } else {
+                pending = option.attached.is_none().then_some(option);
+                buf.push_str(&redact_arg(
+                    &crate::report::redact::argv::mask_nested_options(&arg),
+                ));
+            }
         } else {
-            secret_value = secret_flag(&arg);
-            buf.push_str(&redact_arg(&arg));
+            if arg == "--" {
+                options = false;
+            }
+            buf.push_str(&redact_arg(
+                &crate::report::redact::argv::mask_nested_options(&arg),
+            ));
         }
         if buf.len() >= MAX_ARG_LOG_CHARS {
             break;
@@ -934,6 +951,448 @@ mod tests {
                 .status_traced()
                 .expect("fixture command");
         })
+    }
+
+    fn shaped_for(program: &str, args: &[&str]) -> String {
+        let mut command = Command::new(program);
+        command.args(args);
+        shape_args(&command)
+    }
+
+    fn logged_program_fixture_args(name: &str, args: &[String]) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture =
+            crate::structured::launch::SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+        let program = fixture.path().join(name);
+        std::fs::write(&program, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        capture_logs(|| {
+            TracedCommand::new(&program, "argv-fixture")
+                .args(args)
+                .status_traced()
+                .expect("inert program fixture");
+        })
+    }
+
+    fn logged_curl_fixture_args(args: &[String]) -> String {
+        logged_program_fixture_args("curl", args)
+    }
+
+    // Each case runs through the real process.exec emitter with an inert fixture.
+    macro_rules! value_shape_regression {
+        ($name:ident, $prefix:expr, $suffix:expr) => {
+            #[test]
+            fn $name() {
+                let secret = ["round3", "fixture", "credential"].join("-");
+                let credentials = format!("a:{secret}");
+                let script = [$prefix, credentials.as_str(), $suffix].join("");
+                let logged = logged_program_fixture_args("sh", &["-c".to_owned(), script]);
+                assert!(!logged.contains(&secret), "{logged}");
+            }
+        };
+    }
+
+    value_shape_regression!(shape_2868_env, "env curl -u ", "");
+    value_shape_regression!(shape_2868_sudo, "sudo curl -u ", "");
+    value_shape_regression!(shape_2868_nice, "nice curl -u ", "");
+    value_shape_regression!(shape_2868_xcrun, "xcrun curl -u ", "");
+    value_shape_regression!(shape_2868_timeout, "timeout 5 curl -u ", "");
+    value_shape_regression!(shape_2868_command, "command curl -u ", "");
+    value_shape_regression!(shape_2868_exec, "exec curl -u ", "");
+    value_shape_regression!(shape_2868_noglob, "noglob curl -u ", "");
+    value_shape_regression!(shape_2868_exe, "curl.exe -u ", "");
+    value_shape_regression!(shape_2868_variable, "$CURL -u ", "");
+    value_shape_regression!(shape_2868_docker, "docker exec c curl -u ", "");
+    value_shape_regression!(shape_2868_ssh, "ssh example.com \"curl -u ", "\"");
+    value_shape_regression!(shape_2868_if, "if true; then curl -u ", "; fi");
+    value_shape_regression!(shape_2868_group, "{ curl -u ", "; }");
+    value_shape_regression!(shape_2868_backticks, "echo `curl -u ", "`");
+    value_shape_regression!(shape_2868_bash_separator, "bash -c -- 'curl -u ", "'");
+    value_shape_regression!(shape_2868_user_equals, "tool --user=", "");
+    value_shape_regression!(shape_2868_proxy_equals, "tool --proxy-user=", "");
+    value_shape_regression!(shape_2868_short_equals, "tool -u=", "");
+    value_shape_regression!(shape_2868_proxy_short, "tool -U ", "");
+    value_shape_regression!(shape_2868_cluster, "tool -sSu ", "");
+    value_shape_regression!(shape_2868_cluster_equals, "tool -ku=", "");
+
+    macro_rules! option_shape_regression {
+        ($name:ident, $flag:expr, $prefix:expr) => {
+            #[test]
+            fn $name() {
+                let secret = ["round3", "fixture", "credential"].join("-");
+                let value = format!("{}{}", $prefix, secret);
+                let logged = logged_fixture_args(&[$flag.to_owned(), value.clone()]);
+                assert!(!logged.contains(&secret), "{logged}");
+                let logged = logged_fixture_args(&[format!("{}={value}", $flag)]);
+                assert!(!logged.contains(&secret), "{logged}");
+            }
+        };
+    }
+
+    option_shape_regression!(shape_2868_user_file, "-u", "@");
+    option_shape_regression!(shape_2868_proxy_file, "--proxy-user", "@");
+    option_shape_regression!(shape_2868_cookie_short, "-b", "sid=");
+    option_shape_regression!(shape_2868_cookie_file, "--cookie", "@");
+    option_shape_regression!(shape_2868_cookie_cluster, "-sSb", "sid=");
+    option_shape_regression!(shape_2868_bearer, "--oauth2-bearer", "");
+
+    #[test]
+    fn review_2868_curl_clusters_mask_values() {
+        let secret = ["review2868", "credential"].join("-");
+        let credential = format!("alice:{secret}");
+        for cluster in ["-sSu", "-ku", "-sSb", "-sSuattached"] {
+            let args = if cluster.ends_with("attached") {
+                vec![format!("-sSu{credential}")]
+            } else {
+                vec![cluster.into(), credential.clone()]
+            };
+            let refs: Vec<_> = args.iter().map(String::as_str).collect();
+            let masked = shaped_for("curl", &refs);
+            assert!(!masked.contains(&secret), "{masked}");
+        }
+        assert_eq!(shaped_for("curl", &["-Asu", "ordinary"]), "-Asu ordinary");
+        assert_eq!(
+            shaped_for("curl", &["-A", "-u", "ordinary"]),
+            "-A -u ordinary"
+        );
+        assert_eq!(
+            shaped_for("curl", &["--", "-u", "ordinary"]),
+            "-- -u ordinary"
+        );
+        let shell = ["curl", "-sSu", &credential, "https://example.com/"].join(" ");
+        let masked = shaped_for("sh", &["-c", &shell]);
+        assert!(!masked.contains(&secret), "{masked}");
+    }
+
+    #[test]
+    fn review_2868_proxy_credentials_are_explicit_and_case_sensitive() {
+        let secret = ["review2868", "credential"].join("-");
+        let credential = format!("alice:{secret}");
+        for option in ["--proxy-user", "-U", "-sSU"] {
+            let masked = shaped_for("curl", &[option, &credential]);
+            assert!(!masked.contains(&secret), "{masked}");
+            let shell = ["curl", option, &credential].join(" ");
+            let masked = shaped_for("bash", &["-c", &shell]);
+            assert!(!masked.contains(&secret), "{masked}");
+        }
+        assert_eq!(shaped_for("curl", &["-B", "ordinary"]), "-B ordinary");
+        assert_eq!(
+            shaped_for("curl", &["--USER", "ordinary"]),
+            "--USER ordinary"
+        );
+    }
+
+    #[test]
+    fn review_2868_shell_escaped_spaces_are_part_of_secret_values() {
+        let first = ["review2868", "first"].join("-");
+        let second = ["review2868", "second"].join("-");
+        let assignment = format!("KEY={first}\\ {second}");
+        for program in ["true", "sh", "bash"] {
+            let masked = shaped_for(program, &["-c", &assignment]);
+            assert!(!masked.contains(&first), "{masked}");
+            assert!(!masked.contains(&second), "{masked}");
+        }
+    }
+
+    #[test]
+    fn review_2868_signature_header_segments_mask_values() {
+        let secret = ["review2868", "signature"].join("-");
+        for header in ["X-Signature", "X-Hub-Signature-256"] {
+            let logs = logged_fixture_args(&[format!("{header}:{secret}")]);
+            assert!(logs.contains("process.exec"), "{logs}");
+            assert!(!logs.contains(&secret), "{logs}");
+        }
+    }
+
+    #[test]
+    fn review_2868_curl_aliases_preserve_other_program_diagnostics() {
+        for (program, args) in [
+            (
+                "git",
+                vec!["worktree", "add", "-b", "fix-1", "worktree-dir"],
+            ),
+            ("git", vec!["push", "-u", "origin", "main"]),
+            ("git", vec!["add", "-u", "src"]),
+            ("sort", vec!["-u", "input"]),
+            ("git", vec!["--user", "ordinary"]),
+            ("true", vec!["-U", "ordinary"]),
+        ] {
+            assert_eq!(shaped_for(program, &args), args.join(" "));
+            let shell = std::iter::once(program)
+                .chain(args.iter().copied())
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert_eq!(shaped_for("sh", &["-c", &shell]), format!("-c {shell}"));
+        }
+        for alias in [
+            "-u",
+            "-b",
+            "-U",
+            "--user",
+            "--cookie",
+            "--proxy-user",
+            "--oauth2-bearer",
+        ] {
+            for value in ["ordinary", "user:ordinary", "token=ordinary"] {
+                let masked = shaped_for("git", &[alias, value]);
+                // Labelled assignments are still independently scrubbed.
+                let credential = alias == "--oauth2-bearer"
+                    || (matches!(alias, "-b" | "--cookie") && value.contains('='))
+                    || (matches!(alias, "-u" | "-U" | "--user" | "--proxy-user")
+                        && value.contains(':'));
+                let expected = if credential {
+                    "<redacted>"
+                } else if value == "token=ordinary" {
+                    "token=<redacted>"
+                } else {
+                    value
+                };
+                assert_eq!(masked, format!("{alias} {expected}"));
+            }
+        }
+        let secret = ["review2868", "credential"].join("-");
+        let program = std::env::temp_dir().join("bin").join("curl");
+        let masked = shaped_for(&program.to_string_lossy(), &["-u", &secret]);
+        assert!(!masked.contains(&secret), "{masked}");
+    }
+
+    #[test]
+    fn review_2868_flag_segments_preserve_noncredential_values() {
+        for args in [
+            vec!["--author", "Bob <b@example.com>"],
+            vec!["--author=bob"],
+            vec!["--author", "curl -u ordinary"],
+            vec!["--no-auth", "https://example.com/"],
+            vec!["--hotkey", "ctrl-a"],
+            vec!["--hotkey=ctrl-a"],
+            vec!["--no-auth=true", "https://example.com/"],
+            vec!["--keys", "ordinary"],
+            vec!["--keyring", "ordinary"],
+            vec!["--ssh-key-path", "key-path"],
+        ] {
+            assert_eq!(shaped_for("git", &args), args.join(" "));
+        }
+    }
+
+    #[test]
+    fn masking_2868_curl_short_user() {
+        let secret = ["fixture2868", "credential"].join("-");
+        let logs = logged_curl_fixture_args(&["-u".into(), format!("alice:{secret}")]);
+        assert!(logs.contains("process.exec"), "{logs}");
+        assert!(!logs.contains(&secret), "{logs}");
+    }
+
+    #[test]
+    fn masking_2868_curl_long_user() {
+        let secret = ["fixture2868", "credential"].join("-");
+        let logs = logged_curl_fixture_args(&["--user".into(), format!("alice:{secret}")]);
+        assert!(logs.contains("process.exec"), "{logs}");
+        assert!(!logs.contains(&secret), "{logs}");
+    }
+
+    #[test]
+    fn masking_2868_curl_oauth() {
+        let secret = ["fixture2868", "credential"].join("-");
+        let logs = logged_curl_fixture_args(&["--oauth2-bearer".into(), secret.clone()]);
+        assert!(logs.contains("process.exec"), "{logs}");
+        assert!(!logs.contains(&secret), "{logs}");
+    }
+
+    #[test]
+    fn masking_2868_curl_short_cookie() {
+        let secret = ["fixture2868", "credential"].join("-");
+        let logs = logged_curl_fixture_args(&["-b".into(), format!("sid={secret}")]);
+        assert!(logs.contains("process.exec"), "{logs}");
+        assert!(!logs.contains(&secret), "{logs}");
+    }
+
+    #[test]
+    fn masking_2868_curl_long_cookie() {
+        let secret = ["fixture2868", "credential"].join("-");
+        let logs = logged_curl_fixture_args(&["--cookie".into(), format!("sid={secret}")]);
+        assert!(logs.contains("process.exec"), "{logs}");
+        assert!(!logs.contains(&secret), "{logs}");
+    }
+
+    #[test]
+    fn masking_2868_header_auth_key() {
+        let secret = ["fixture2868", "credential"].join("-");
+        let logs = logged_fixture_args(&["-H".into(), format!("X-Auth-Key:{secret}")]);
+        assert!(logs.contains("process.exec"), "{logs}");
+        assert!(!logs.contains(&secret), "{logs}");
+    }
+
+    #[test]
+    fn masking_2868_header_subscription_key() {
+        let secret = ["fixture2868", "credential"].join("-");
+        let logs =
+            logged_fixture_args(&["-H".into(), format!("Ocp-Apim-Subscription-Key:{secret}")]);
+        assert!(logs.contains("process.exec"), "{logs}");
+        assert!(!logs.contains(&secret), "{logs}");
+    }
+
+    #[test]
+    fn masking_2868_header_access_key() {
+        let secret = ["fixture2868", "credential"].join("-");
+        let logs = logged_fixture_args(&["-H".into(), format!("X-Access-Key:{secret}")]);
+        assert!(logs.contains("process.exec"), "{logs}");
+        assert!(!logs.contains(&secret), "{logs}");
+    }
+
+    #[test]
+    fn masking_2868_header_authentication() {
+        let secret = ["fixture2868", "credential"].join("-");
+        let logs = logged_fixture_args(&["-H".into(), format!("Authentication:{secret}")]);
+        assert!(logs.contains("process.exec"), "{logs}");
+        assert!(!logs.contains(&secret), "{logs}");
+    }
+
+    #[test]
+    fn masking_2868_json_headers() {
+        let secret = ["fixture2868", "credential"].join("-");
+        let logs = logged_fixture_args(&[
+            "--headers".into(),
+            format!("{{\"Authorization\": \"Bearer {secret}\"}}"),
+        ]);
+        assert!(logs.contains("process.exec"), "{logs}");
+        assert!(!logs.contains(&secret), "{logs}");
+    }
+
+    #[test]
+    fn masking_2868_json_data() {
+        let secret = ["fixture2868", "credential"].join("-");
+        let logs = logged_fixture_args(&[
+            "--data".into(),
+            format!("{{\"authorization\":\"Bearer {secret}\"}}"),
+        ]);
+        assert!(logs.contains("process.exec"), "{logs}");
+        assert!(!logs.contains(&secret), "{logs}");
+    }
+
+    #[test]
+    fn masking_2868_password_assignment() {
+        let secret = ["fixture2868", "credential"].join("-");
+        let logs = logged_fixture_args(&["-d".into(), format!("password={secret}&user=a")]);
+        assert!(logs.contains("process.exec"), "{logs}");
+        assert!(!logs.contains(&secret), "{logs}");
+    }
+
+    #[test]
+    fn masking_2868_client_secret_assignment() {
+        let secret = ["fixture2868", "credential"].join("-");
+        let logs =
+            logged_fixture_args(&["--data-urlencode".into(), format!("client_secret={secret}")]);
+        assert!(logs.contains("process.exec"), "{logs}");
+        assert!(!logs.contains(&secret), "{logs}");
+    }
+
+    #[test]
+    fn masking_2868_shell_assignment() {
+        let secret = ["fixture2868", "credential"].join("-");
+        let logs = logged_fixture_args(&[
+            "-c".into(),
+            format!("TOKEN={secret} curl https://example.com/"),
+        ]);
+        assert!(logs.contains("process.exec"), "{logs}");
+        assert!(!logs.contains(&secret), "{logs}");
+    }
+
+    #[test]
+    fn masking_2868_shell_curl_user() {
+        let secret = ["fixture2868", "credential"].join("-");
+        let credentials = format!("bob:{secret}");
+        let shell = ["curl", "-u", &credentials, "https://example.com/"].join(" ");
+        let logs = logged_program_fixture_args("sh", &["-c".into(), shell]);
+        assert!(logs.contains("process.exec"), "{logs}");
+        assert!(!logs.contains(&secret), "{logs}");
+    }
+
+    #[test]
+    fn masking_2868_flag_passwd() {
+        let secret = ["fixture2868", "credential"].join("-");
+        let logs = logged_fixture_args(&["--passwd".into(), secret.clone()]);
+        assert!(logs.contains("process.exec"), "{logs}");
+        assert!(!logs.contains(&secret), "{logs}");
+    }
+
+    #[test]
+    fn masking_2868_flag_passphrase() {
+        let secret = ["fixture2868", "credential"].join("-");
+        let logs = logged_fixture_args(&["--passphrase".into(), secret.clone()]);
+        assert!(logs.contains("process.exec"), "{logs}");
+        assert!(!logs.contains(&secret), "{logs}");
+    }
+
+    #[test]
+    fn masking_2868_flag_authorization() {
+        let secret = ["fixture2868", "credential"].join("-");
+        let logs = logged_fixture_args(&["--authorization".into(), secret.clone()]);
+        assert!(logs.contains("process.exec"), "{logs}");
+        assert!(!logs.contains(&secret), "{logs}");
+    }
+
+    #[test]
+    fn masking_2868_flag_bearer() {
+        let secret = ["fixture2868", "credential"].join("-");
+        let logs = logged_fixture_args(&["--bearer".into(), secret.clone()]);
+        assert!(logs.contains("process.exec"), "{logs}");
+        assert!(!logs.contains(&secret), "{logs}");
+    }
+
+    #[test]
+    fn masking_2868_go_token() {
+        let secret = ["fixture2868", "credential"].join("-");
+        let logs = logged_fixture_args(&[format!("-token={secret}")]);
+        assert!(logs.contains("process.exec"), "{logs}");
+        assert!(!logs.contains(&secret), "{logs}");
+    }
+
+    #[test]
+    fn masking_2868_go_password() {
+        let secret = ["fixture2868", "credential"].join("-");
+        let logs = logged_fixture_args(&["-password".into(), secret.clone()]);
+        assert!(logs.contains("process.exec"), "{logs}");
+        assert!(!logs.contains(&secret), "{logs}");
+    }
+
+    #[test]
+    fn masking_2868_url_auth() {
+        let secret = ["fixture2868", "credential"].join("-");
+        let logs = logged_fixture_args(&[format!("https://example.com/?auth={secret}")]);
+        assert!(logs.contains("process.exec"), "{logs}");
+        assert!(!logs.contains(&secret), "{logs}");
+    }
+
+    #[test]
+    fn masking_2868_url_pwd() {
+        let secret = ["fixture2868", "credential"].join("-");
+        let logs = logged_fixture_args(&[format!("https://example.com/?pwd={secret}")]);
+        assert!(logs.contains("process.exec"), "{logs}");
+        assert!(!logs.contains(&secret), "{logs}");
+    }
+
+    #[test]
+    fn masking_2868_url_jwt() {
+        let secret = ["fixture2868", "credential"].join("-");
+        let logs = logged_fixture_args(&[format!("https://example.com/?jwt={secret}")]);
+        assert!(logs.contains("process.exec"), "{logs}");
+        assert!(!logs.contains(&secret), "{logs}");
+    }
+
+    #[test]
+    fn masking_2868_url_session_separator() {
+        let secret = ["fixture2868", "credential"].join("-");
+        let logs = logged_fixture_args(&[format!("https://example.com/;jsessionid={secret}")]);
+        assert!(logs.contains("process.exec"), "{logs}");
+        assert!(!logs.contains(&secret), "{logs}");
+    }
+
+    #[test]
+    fn masking_2868_glued_prefix() {
+        let secret = ["fixture2868", "credential"].join("-");
+        let logs = logged_fixture_args(&[format!("SECRET-HAuthorization:Bearer {secret}")]);
+        assert!(logs.contains("process.exec"), "{logs}");
+        assert!(!logs.contains(&secret), "{logs}");
     }
 
     #[test]
@@ -1229,7 +1688,7 @@ mod tests {
         command.args(["push", "deploy-token:main", "mysession:0", "ordinary"]);
         assert_eq!(
             shape_args(&command),
-            "push deploy-token:main mysession:0 ordinary"
+            "push deploy-token: <redacted> mysession:0 ordinary"
         );
         assert_eq!(redact_arg("Authorization:"), "Authorization: <redacted>");
     }
@@ -1338,14 +1797,18 @@ mod tests {
 
     #[test]
     fn prefixed_credential_labels_without_header_spacing_stay_visible() {
-        for argument in [
-            "deploy-token:main",
-            "mysession:0",
-            "custom-cookie:main",
-            "customauthorization:main",
-            "prefix-X-Api-Key:main",
-        ] {
+        for argument in ["mysession:0", "customauthorization:main"] {
             assert_eq!(redact_arg(argument), argument);
+        }
+    }
+
+    #[test]
+    fn compound_header_refspec_ambiguity_is_conservatively_masked() {
+        for name in ["deploy-token", "custom-cookie", "prefix-X-Api-Key"] {
+            assert_eq!(
+                redact_arg(&format!("{name}:main")),
+                format!("{name}: <redacted>")
+            );
         }
     }
 
@@ -1389,7 +1852,6 @@ mod tests {
             "+refs/heads/cookie:refs/x",
             "token:main",
             "session:0",
-            "deploy-token:main",
             "mysession:0",
         ] {
             assert_eq!(redact_arg(argument), argument);
