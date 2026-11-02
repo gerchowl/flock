@@ -3,6 +3,7 @@ pub mod client;
 pub(crate) mod client_listener;
 pub mod client_tokens;
 pub(crate) mod compatibility;
+pub(crate) mod deadline;
 pub(crate) mod error_code;
 mod event_hub;
 mod events_read;

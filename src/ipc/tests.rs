@@ -119,6 +119,7 @@ fn lock_symlink_is_refused_and_mode_is_private() {
     let lock = path.with_extension("sock.lock");
     symlink(&target, &lock).unwrap();
     assert!(SocketOwner::acquire(&path).is_err());
+    assert!(SocketOwner::is_held(&path).is_err());
     assert_eq!(fs::read_to_string(&target).unwrap(), "retain");
     fs::remove_file(&lock).unwrap();
     let _owner = SocketOwner::acquire(&path).unwrap();
@@ -355,4 +356,23 @@ fn a_real_server_start_preserves_both_legacy_listener_inodes() {
         output.contains("legacy") && output.contains("full backlog"),
         "missing rollout limitation: {output}"
     );
+}
+
+#[test]
+fn ownership_observation_preserves_handoff_and_released_lock() {
+    let (_dir, path) = fixture();
+    let lock = path.with_extension("sock.lock");
+    assert!(!SocketOwner::is_held(&path).unwrap());
+    assert!(
+        !lock.exists(),
+        "a client probe must not create ownership files"
+    );
+    let owner = SocketOwner::acquire(&path).unwrap();
+    assert!(SocketOwner::is_held(&path).unwrap());
+    let imported = owner.duplicate().unwrap();
+    drop(owner);
+    assert!(SocketOwner::is_held(&path).unwrap());
+    drop(imported);
+    assert!(!SocketOwner::is_held(&path).unwrap());
+    assert!(lock.exists(), "the permanent ownership file must remain");
 }

@@ -37,6 +37,27 @@ impl SocketOwner {
         Self::validate(&file, Path::new(&lock))?;
         Ok(Self(std::sync::Arc::new(file), path.to_owned()))
     }
+    /// Observe lifetime listener ownership using an independently opened descriptor.
+    /// A successful probe lock is released only by closing that descriptor. Never
+    /// unlock the server's shared handoff description or create a client-side file.
+    pub(crate) fn is_held(path: &Path) -> io::Result<bool> {
+        let mut lock = path.as_os_str().to_os_string();
+        lock.push(".lock");
+        let path = Path::new(&lock);
+        let file = match crate::platform::socket::read_owner(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        Self::validate(&file, path)?;
+        let held = match crate::platform::socket::lock_owner(&file) {
+            Ok(()) => false,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => true,
+            Err(error) => return Err(error),
+        };
+        Self::validate(&file, path)?;
+        Ok(held)
+    }
     fn validate(file: &fs::File, path: &Path) -> io::Result<()> {
         let metadata = file.metadata()?;
         if !metadata.is_file()
