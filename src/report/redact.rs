@@ -149,7 +149,7 @@ impl Scrubber {
         for (pattern, replacement) in [
             (git_remote_re(), "<git-remote>"),
             (secret_token_re(), "<redacted-token>"),
-            (labeled_secret_re(), "$1=<redacted>"),
+            (labeled_secret_re(), "${1}${2}=<redacted>"),
             (email_re(), "<email>"),
             (ssh_target_re(), "<ssh-target>"),
             (ipv6_re(), "<ip>"),
@@ -186,7 +186,7 @@ impl Scrubber {
 pub(crate) fn mask_credentials(value: &str) -> String {
     let masked = secret_token_re().replace_all(value, "<redacted-token>");
     labeled_secret_re()
-        .replace_all(&masked, "$1=<redacted>")
+        .replace_all(&masked, "${1}${2}=<redacted>")
         .into_owned()
 }
 
@@ -225,7 +225,48 @@ pub(crate) const API_KEY_LABEL_PATTERN: &str = r"api[-_]?key";
 /// Share label suffixes while callers choose identifier and value boundaries.
 pub(crate) fn secret_label_pattern(prefix: &str) -> String {
     format!(
-        r"{prefix}(?:authorization|bearer|token|password|passwd|secret|credentials?|cookie|session|{API_KEY_LABEL_PATTERN})"
+        r"{prefix}(?:authorization|authentication|bearer|token|password|passwd|passphrase|secret|credentials?|cookie|session|auth|key|{API_KEY_LABEL_PATTERN})"
+    )
+}
+
+const CURL_SHORT_SECRET_OPTIONS: &str = "-[ub]";
+
+/// Credential option spellings shared by argv elements and embedded shell text.
+pub(crate) fn secret_option_pattern() -> String {
+    format!(
+        r"(?:--?[\w-]*{}[\w-]*|--user|{CURL_SHORT_SECRET_OPTIONS})",
+        secret_label_pattern("")
+    )
+}
+
+/// Apply assignment and option rules inside each argument, including shell text.
+/// Colon labels are handled by the header classifier to retain refspec boundaries.
+pub(crate) fn mask_argv_text(value: &str) -> String {
+    static ASSIGNMENT: OnceLock<Regex> = OnceLock::new();
+    static OPTION: OnceLock<Regex> = OnceLock::new();
+    let option = OPTION.get_or_init(|| {
+        Regex::new(&format!(
+            r#"(?i)(^|[\s;|&])({}(?:=|[ \t]+)|{CURL_SHORT_SECRET_OPTIONS})(?:"[^"]*"|'[^']*'|[^\s;|&<>]+)"#,
+            secret_option_pattern()
+        ))
+        .expect("static credential option pattern")
+    });
+    let masked = option.replace_all(value, "${1}${2}<redacted>");
+    ASSIGNMENT
+        .get_or_init(|| {
+            Regex::new(&labeled_secret_pattern("=", r"[^\s&;]+"))
+                .expect("static argv assignment pattern")
+        })
+        .replace_all(&masked, "${1}${2}=<redacted>")
+        .into_owned()
+}
+
+fn labeled_secret_pattern(delimiters: &str, unquoted_value: &str) -> String {
+    format!(
+        r#"(?i)(^|[^A-Za-z0-9])({})\\?["']?\s*[{}]\s*(?:\\?"[^"\n]*"|\\?'[^'\n]*'|(?:(?:bearer|basic|digest|token)\s+)?{})"#,
+        secret_label_pattern(r"[\w-]*"),
+        delimiters,
+        unquoted_value,
     )
 }
 
@@ -241,11 +282,7 @@ fn labeled_secret_re() -> &'static Regex {
         // at the first space, so `authorization: Bearer ab12…` masked only
         // "Bearer" and emitted the credential itself in the clear. Consume the
         // scheme and the token that follows it as one value.
-        Regex::new(&format!(
-            r"(?i)(?:^|[^A-Za-z0-9])({})\s*[=:]\s*(?:(?:bearer|basic|digest|token)\s+)?\S+",
-            secret_label_pattern(r"\w*"),
-        ))
-        .expect("static labeled-secret pattern")
+        Regex::new(&labeled_secret_pattern("=:", r"\S+")).expect("static labeled-secret pattern")
     })
 }
 
@@ -545,6 +582,73 @@ mod tests {
 
     fn rendered(line: &str) -> String {
         extract_one(line).render()
+    }
+
+    #[test]
+    fn credential_vocabulary_is_shared_by_labels_and_option_patterns() {
+        let secret = ["fixture2868", "credential"].join("-");
+        let options = Regex::new(&format!("(?i)^{}$", secret_option_pattern())).unwrap();
+        for word in [
+            "auth",
+            "authentication",
+            "authorization",
+            "bearer",
+            "token",
+            "password",
+            "passwd",
+            "passphrase",
+            "secret",
+            "credential",
+            "credentials",
+            "cookie",
+            "session",
+            "key",
+            "api-key",
+            "api_key",
+        ] {
+            for dash in ["-", "--"] {
+                assert!(options.is_match(&format!("{dash}{word}")), "{word}");
+                for delimiter in ['=', ' '] {
+                    let masked = mask_argv_text(&format!("curl {dash}{word}{delimiter}{secret}"));
+                    assert!(!masked.contains(&secret), "{masked}");
+                }
+            }
+            let masked = mask_credentials(&format!("{word}: {secret}"));
+            assert!(!masked.contains(&secret), "{masked}");
+        }
+    }
+
+    #[test]
+    fn quoted_assignments_and_shell_credential_options_mask_complete_values() {
+        let first = ["fixture2868", "first"].join("-");
+        let second = ["fixture2868", "second"].join("-");
+        for text in [
+            format!("TOKEN=\"{first} {second}\" curl https://example.com/"),
+            format!("password='{first} {second}' curl https://example.com/"),
+            format!("password={first}<{second}>"),
+            format!("curl -u'{first} {second}' https://example.com/"),
+            format!("curl --user '{first} {second}' --cookie sid={first}"),
+            format!("curl -u{first} -bsid={second}"),
+        ] {
+            let masked = mask_argv_text(&text);
+            assert!(!masked.contains(&first), "{masked}");
+            assert!(!masked.contains(&second), "{masked}");
+        }
+    }
+
+    #[test]
+    fn report_quoted_labels_and_punctuation_do_not_expose_credential_tails() {
+        let first = ["fixture2868", "first"].join("-");
+        let second = ["fixture2868", "second"].join("-");
+        for text in [
+            format!(r#"{{"Authorization": "Bearer {first}"}}"#),
+            format!("token={first};{second}"),
+            format!("token={first}<{second}>"),
+        ] {
+            let masked = mask_credentials(&text);
+            assert!(!masked.contains(&first), "{masked}");
+            assert!(!masked.contains(&second), "{masked}");
+        }
     }
 
     #[test]
