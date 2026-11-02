@@ -166,6 +166,14 @@ Trust boundary, as ADR-0036 §5 and ADR-0043 §8 state it:
   - other local uids, including `flk-agent` (ADR-0035 §6.3) and pane-started
     processes. They can reach `127.0.0.1:<port>` and forge Host, Origin and the
     Tailscale headers;
+  - `pty` agents that still run as the operator's uid (#1177). The socket
+    classifies an operator-uid caller as the operator when its process ancestry
+    reaches no agent pane: `spawn_caller`, `src/app/api/spawn.rs:473-522`. A
+    re-parented or daemonized caller leaves no ancestry evidence
+    (`src/app/ids.rs:175-178`). So such an agent can detach a child and call
+    operator-only verbs, including `server.live_handoff` and `client.open`.
+    That is an existing residual, and this ADR does not widen it: such a process
+    can already mint codes directly;
   - web pages in any browser, on any machine;
   - other tailnet nodes and users, including shared-in nodes, tagged nodes and
     other people in a multi-user tailnet;
@@ -310,12 +318,22 @@ reports the latch. Loopback admission continues. Only a restart re-opens a
 latched class. A live handoff counts as a restart (below).
 
 **What latches, and what only closes.** Only a **positive bad-configuration
-finding** latches: a parsed `Status` that fails conditions 2–5, `NotInstalled`,
-or a non-timeout `Unavailable` (the CLI ran and failed, or its output did not
-parse). A probe that **times out** (the 5 s deadline) does not latch. It counts
-as "no passing probe", and the freshness rule below closes the class until a
-probe passes again. Otherwise anyone who can slow the host could turn one slow
-`tailscale` call into a permanent outage.
+finding** latches: a probe that ran, parsed, and shows a `serve` configuration
+failing conditions 2–5. Every other non-passing outcome only **closes** the
+class until a probe passes again, through the freshness rule below:
+
+- a timeout (the 5 s deadline);
+- `Unavailable` (the CLI ran and failed, or its output did not parse);
+- `NotInstalled` at runtime (the CLI vanished, as it can for a moment during a
+  Tailscale upgrade).
+
+A tailscaled restart or upgrade shows up as one of these, and recovery then
+needs no flk restart. This is still fail closed: no public request is admitted
+without a passing probe younger than 90 s. Latching only on positive evidence
+also means that anyone who can slow the host or disturb tailscaled cannot turn
+one bad `tailscale` call into a permanent outage. At **startup**, all three
+outcomes still refuse (condition 1). A process that has never seen a passing
+probe has nothing to re-open.
 
 **Freshness: the guard fails closed when the monitor dies.** The guard admits a
 public-class request only while the last *passing* probe is younger than 90 s,
@@ -333,9 +351,19 @@ with a WARN, and the freshness rule covers the gap.
   public class, Origin, `Sec-Fetch-Site`, `X-Forwarded-Proto`, no Funnel header,
   an allow-listed `Tailscale-User-Login` and the body limit. A request that
   fails any of these never spawns a `tailscale` process.
-- At most **one** probe is in flight. Concurrent exchanges await the same
-  result, and the 60 s monitor shares that slot too, so N exchanges cost one
-  subprocess.
+- At most **one** probe is in flight. The 60 s monitor shares that slot.
+- **An exchange joins only a probe that started after the exchange arrived.**
+  If the probe in flight started earlier, which might be the monitor's, the
+  exchange does not use its result: that probe may predate a `funnel` or
+  `--tcp` change. The exchange waits for it to finish, and then joins the next
+  probe, which starts as soon as the slot is free. All exchanges that arrive
+  during one probe share the same next probe. So N concurrent exchanges cost at
+  most two subprocesses, and the latency an exchange can add is bounded by two
+  probe deadlines (10 s).
+- Every redeemed code was therefore checked against a `serve` configuration
+  read **after** the request arrived. A change made between that read and the
+  code consumption, a window of milliseconds, is not seen. Every check-then-use
+  has that window.
 - A timeout refuses that exchange with a retryable 503 and does not consume the
   code. It does not latch (above).
 
@@ -353,9 +381,46 @@ still latched. The latch state does not cross the handoff. That is intended:
   handoff stricter than the restart it stands in for.
 
 The latch exists so that a running process never re-opens on its own. It is not
-meant to outlive an operator-initiated process change. An operator who has
-fixed the serve configuration can re-open the class with a handoff or a
-restart, and a still-bad configuration fails the importer's probe.
+meant to outlive a process change that has the operator's authority.
+
+**Who can trigger a handoff.** The CLI `flk server live-handoff`
+(`src/cli/server.rs:14`, request at `:103`) and `flk update`
+(`src/update.rs:1394-1410`) both send `ServerLiveHandoff` over the unix socket.
+The headless server sends it through `peer_uid_refusal` with the request's
+peer credentials (`src/server/headless.rs:3051-3073`). That function returns
+`OperatorOnly` unless `spawn_caller` is `SpawnCaller::Operator`
+(`src/app/api.rs:1481-1496`).
+
+- Refused: `flk-agent`-uid callers, structured-lease agents, and callers whose
+  ancestry reaches an agent pane.
+- Admitted: the operator, and an operator-uid `pty` agent's detached child (the
+  #1177 residual in the threat model).
+
+Such a process gains nothing from the reset that it does not already have.
+
+- A still-bad configuration fails the importer's probe, so the reset cannot
+  re-open an unsafe class.
+- A good configuration re-opens it on fresh evidence, which is correct.
+- The same process can already call `client.open` and mint a code without any
+  handoff.
+
+An operator who has fixed the serve configuration can re-open the class with a
+handoff or a restart.
+
+**Availability cost: a bad serve configuration blocks every handoff.** With
+`public_origin` set, an importer whose startup probe fails is refused. Every
+live handoff and every `flk update` then fails while the serve configuration
+is bad, or while tailscaled is down long enough for the importer's probe to
+time out. The old process keeps serving, loopback included, so nothing goes
+dark. Upgrades are coupled to Tailscale health, and that coupling is the price
+of never starting an unverified public class. To recover, do one of the
+following and retry the handoff or update:
+
+- fix the `serve` rule (`tailscale serve status` shows it), and wait for
+  tailscaled to answer;
+- remove `public_origin` from `[client]`. Without it, the importer runs
+  today's probe, under which no rule may target the port. So if a rule still
+  targets the port, remove that rule too.
 
 **Rejected alternatives**
 
@@ -624,7 +689,10 @@ the control that answers it.
     own `Tailscale-User-Login` and `X-Forwarded-Proto`.
   - *Control:* the running check (60 s, and before every exchange) latches the
     public class closed and closes public sockets with 4403. The window is at
-    most 60 s for already-upgraded sockets and zero for code exchange. If the
+    most 60 s for already-upgraded sockets. For code exchange there is no
+    window relative to the request: an exchange is redeemed only on a probe
+    that started after it arrived (R1). The only gap is the milliseconds
+    between that probe's read and the code consumption. If the
     monitor itself has died, the 90 s freshness rule closes the class anyway.
     A relay that is not Tailscale's (`socat`, Caddy, `cloudflared`, `ssh -R`)
     is invisible to every probe. Against that, only the bearer gate holds
@@ -708,9 +776,12 @@ the control that answers it.
   - *Control:* both policies are precomputed from configuration, and each
     names only its own authority.
   - *Test:* A12.
-- **P10. Breakage, not exploitation.** A probe timeout closes the public class
-  until the next passing probe, and a bad-configuration finding latches it.
-  Either way the remote tab drops. That is the intended fail-closed cost. It
+- **P10. Breakage, not exploitation.** A probe timeout, an `Unavailable` result
+  or a runtime `NotInstalled` (a tailscaled restart or upgrade) closes the
+  public class until the next passing probe, with no flk restart. A parsed
+  bad-configuration finding latches it. Either way the remote tab drops. That
+  is the intended fail-closed cost. While the serve configuration is bad, live
+  handoffs and `flk update` are refused (R1, "Availability cost"). It
   shows in health status with the failed condition, and the SSH interim path
   still works. A Tailscale release that renames serve JSON fields breaks the
   shape check. A6 runs against the pinned Tailscale version's real
@@ -760,16 +831,21 @@ until one exists.
    #2476 decided.
 9. **A9.** Startup refuses a second handler path (for example `/grafana`) on the
    public host:port.
-10. **A10.** At runtime, an injected probe result that turns into funnel, a
-    TCP forward, `NotInstalled` or a non-timeout failure latches the public
-    class closed: public `GET`s and exchanges get 403
-    `public_origin_unverified`, an upgraded public socket is closed with 4403,
-    the loopback class is unaffected, and a later passing probe does **not**
-    re-open it.
-11. **A11.** A public exchange that passes every header check runs the probe
-    first. A bad-configuration result refuses that exchange and latches. A
-    timeout refuses it with a retryable 503, does not latch, and **does not**
-    consume the code. Only an audience mismatch consumes it.
+10. **A10.** At runtime, an injected parsed probe result that turns into
+    funnel, a TCP forward or a second handler latches the public class closed:
+    public `GET`s and exchanges get 403 `public_origin_unverified`, an upgraded
+    public socket is closed with 4403, the loopback class is unaffected, and a
+    later passing probe does **not** re-open it. An injected `Unavailable`, a
+    runtime `NotInstalled` or a timeout instead closes the class, and the next
+    passing probe re-opens it without a restart.
+11. **A11.** A public exchange that passes every header check is redeemed only
+    on a probe that started after it arrived. With a monitor probe in flight
+    that started before the exchange and whose injected result passes, while
+    the configuration injected for the next probe is a funnel, the exchange is
+    refused and latches; it never uses the earlier passing result. A
+    bad-configuration result refuses that exchange and latches. A timeout or
+    `Unavailable` refuses it with a retryable 503, does not latch, and **does
+    not** consume the code. Only an audience mismatch consumes it.
 12. **A12.** The public document's CSP is exactly the template with
     `wss://<name>.ts.net/v1/ws`, and contains no `ws://127.0.0.1`. The loopback
     document's CSP contains no `wss://`. A Chromium CSP test (like `csp.test.ts`)
@@ -806,14 +882,19 @@ until one exists.
     89 s after the last passing probe and refused at 90 s, with 4403 on an
     upgraded public socket. A subsequent passing probe re-opens the class.
     Repeated probe timeouts never latch.
-20. **A20.** Exchange probe cost: 64 concurrent public exchanges that pass all
-    header checks spawn exactly one probe and all see its result. 64 public
-    exchanges that fail any header check (no login, wrong Origin, same-site)
-    spawn none. The probe runner counts spawns.
+20. **A20.** Exchange probe cost. 64 concurrent public exchanges that pass all
+    header checks and arrive while a probe is in flight spawn at most two
+    probes: the one in flight and one shared next probe. Never more than one
+    runs at a time, and every exchange takes the result of a probe that started
+    after it arrived. 64 public exchanges that fail any header check (no
+    login, wrong Origin, same-site) spawn none. The probe runner counts spawns
+    and their overlap.
 21. **A21.** Live handoff: a latched process hands off to an importer whose
     probe passes, and the importer serves the public class. With the serve
     configuration still bad, the import is refused, and the old process stays
-    latched and keeps serving loopback.
+    latched and keeps serving loopback. With `public_origin` then removed and no
+    rule targeting the port, the retried handoff succeeds. A handoff request
+    from a `flk-agent`-uid caller is refused with `operator_only`, as today.
 22. **A22.** Configuration with a `public_origin` port equal to the `bind`
     port refuses to load. This covers both `https://<name>.ts.net:7699` with
     `bind = "127.0.0.1:7699"`, and an omitted port (443) with
