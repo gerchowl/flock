@@ -116,20 +116,26 @@ pub fn local_rows(agents: Vec<StructuredAgent<'_>>, home: Option<&str>) -> io::R
         rows.push(Row::Agent(row));
     }
     if let Some(home) = home {
-        rows.push(Row::Node(FleetNodeRow {
-            node_id: home.into(),
-            name: format!("Node {home}"),
-            version: Some(crate::build_info::version()),
-            health: None,
-            latency_ms: None,
-            last_ok: None,
-            error: None,
-            online: true,
-            route: None,
-            counts: None,
-            unbound_configured_peers: None,
-        }));
+        rows.push(Row::Node(local_node(home)));
     }
     rows.extend(projects.into_values().map(Row::Project));
     Ok(rows)
+}
+
+/// Base row for the current local identity; owner observations fill status.
+pub(crate) fn local_node(home: &str) -> FleetNodeRow {
+    FleetNodeRow {
+        node_id: home.into(),
+        name: format!("Node {home}"),
+        version: Some(crate::build_info::version()),
+        health: None,
+        latency_ms: None,
+        last_ok: None,
+        error: None,
+        link_diagnostics: Vec::new(),
+        online: true,
+        route: None,
+        counts: None,
+        unbound_configured_peers: None,
+    }
 }

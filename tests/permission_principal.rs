@@ -97,8 +97,8 @@ fn permission_token_compile_fail() {
     );
 }
 
-#[test]
-fn permission_local_operator_compile_fail() {
+// Stub only dependency types; the witness fields and privacy come from production.
+fn local_operator_context() -> String {
     let api = include_str!("../src/app/api.rs");
     let start = api
         .find("pub(crate) struct LocalOperator<'a> {")
@@ -109,16 +109,22 @@ fn permission_local_operator_compile_fail() {
         + 2;
     let declaration = &api[start..start + length];
     syn::parse_str::<syn::ItemStruct>(declaration).expect("complete witness struct");
-    let context = format!(
-        "mod app {{ pub struct App; mod api {{ use super::App;\n{declaration}\n}} \
+    format!(
+        "mod platform {{ pub mod peer {{ pub struct Credentials; }} }} \
+         mod app {{ pub struct App; mod api {{ use super::App;\n{declaration}\n}} \
          pub(crate) use api::LocalOperator; }}"
-    );
+    )
+}
+
+#[test]
+fn permission_local_operator_compile_fail() {
+    let context = local_operator_context();
     check_probes(
         &context,
         &[
             ("let _: Option<app::LocalOperator<'static>> = None;", None),
             (
-                "let mut app = app::App; let _ = app::LocalOperator { _app: &mut app };",
+                "let mut app = app::App; let _ = app::LocalOperator { _app: &mut app, peer: platform::peer::Credentials };",
                 Some("E0451"),
             ),
         ],
@@ -131,15 +137,8 @@ fn websocket_token_cannot_become_local_operator() {
     let auth = include_str!("../src/structured/permissions/auth.rs");
     let boundary = "\npub(crate) mod tokens;";
     assert_eq!(auth.matches(boundary).count(), 1);
-    let api = include_str!("../src/app/api.rs");
-    let start = api.find("pub(crate) struct LocalOperator<'a> {").unwrap();
-    let length = api[start..].find("\n}").unwrap() + 2;
-    let declaration = &api[start..start + length];
-    syn::parse_str::<syn::ItemStruct>(declaration).unwrap();
-    let context = format!(
-        "mod auth {{ {} }} mod app {{ pub struct App; mod api {{ use super::App; {declaration} }} pub(crate) use api::LocalOperator; }}",
-        auth.replace(boundary, "")
-    );
+    let operator = local_operator_context();
+    let context = format!("mod auth {{ {} }} {operator}", auth.replace(boundary, ""));
     check_probes(&context, &[
         ("fn keep(token: auth::VerifiedToken<'static>) -> auth::VerifiedToken<'static> { token }", None),
         ("fn elevate(token: auth::VerifiedToken<'static>) -> app::LocalOperator<'static> { token.into() }", Some("E0277")),

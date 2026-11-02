@@ -1,4 +1,7 @@
 //! Server-owned union of persistent and ephemeral credentials (ADR-0038 §6).
+/// App-peer registration ceiling shared with the GUI authenticated handshake.
+pub(crate) const HANDSHAKE_DEADLINE_MS: u64 = 5_000;
+
 use super::*;
 use std::sync::Arc;
 /// Identity sealed by either source; callers cannot substitute a source or digest.
@@ -132,8 +135,6 @@ impl Store {
     }
     /// Await management and revocation ownership under the remaining hello deadline.
     /// Run on the separately bounded hello-wait worker, never the store-I/O pool.
-    // Native registration is compiled but unused without the web transport.
-    #[cfg_attr(not(feature = "web"), allow(dead_code))]
     pub(crate) fn wait_peer(&self, budget: Duration) -> Result<PeerFence, TokenError> {
         let guard = self.files.hello_lock(budget, || {
             #[cfg(all(test, feature = "web"))]
@@ -156,8 +157,6 @@ impl Store {
     }
     /// Recheck identity and register while retaining the previously acquired fence.
     /// The callback must stay bounded and must not acquire an exclusive store lock.
-    // Native registration is compiled but unused without the web transport.
-    #[cfg_attr(not(feature = "web"), allow(dead_code))]
     pub(crate) fn register_peer<T>(
         &self,
         fence: PeerFence,
@@ -233,23 +232,20 @@ impl Store {
         self.apps.on_waiting(action);
     }
     /// Publish revocation intent before waiting outside the store-I/O pool.
-    #[cfg(feature = "web")]
     pub(crate) fn begin_mutation(&self) -> Result<app_sessions::PendingMutation, TokenError> {
         self.apps.begin_mutation()
     }
     /// Await exclusive ownership on the separate bounded retirement worker.
-    #[cfg(feature = "web")]
     pub(crate) fn wait_mutation(
         &self,
         pending: app_sessions::PendingMutation,
     ) -> Result<app_sessions::MutationFence, TokenError> {
         pending.wait(|| {
-            #[cfg(test)]
+            #[cfg(all(test, feature = "web"))]
             self.apps.notify_waiting();
         })
     }
     /// Commit the exact app retirement, retaining the fence through notification.
-    #[cfg(feature = "web")]
     pub(crate) fn finish_mutation(
         &self,
         fence: app_sessions::MutationFence,
@@ -297,6 +293,18 @@ impl Owner {
         let opened = Arc::new(Store::new(TokenStore::open(data)?, clock));
         *store = Some(opened.clone());
         Ok(opened)
+    }
+}
+
+#[cfg(test)]
+impl Store {
+    /// Keep the test credential snapshot and enforcing app source at the same reduced grants.
+    pub(crate) fn answer_only_app_for_test(&self, session: &mut Session) {
+        let Source::App(app) = &mut session.source else {
+            panic!("app-session fixture required")
+        };
+        self.apps.answer_only_for_test(app);
+        session.info = app.info.clone();
     }
 }
 

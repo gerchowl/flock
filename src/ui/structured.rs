@@ -6,3 +6,6 @@ mod markdown;
 mod pane;
 pub(crate) mod transcript;
 pub(crate) use pane::Pane;
+
+mod dispatch;
+pub(crate) use dispatch::{prepare, render_native, validate, Prepared};

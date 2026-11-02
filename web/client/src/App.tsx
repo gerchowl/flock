@@ -28,6 +28,7 @@ import { pageSearch, type BridgeShellConfig, type ConfigResult, type FixtureShel
 import { createFixtureFleet } from "./fleet";
 import { emptyLayout } from "./layout/model";
 import { createLayoutStore } from "./layout/persistence";
+import { createSidebarStore } from "./layout/sidebar";
 import { previewMode } from "./layout/phone";
 import { createFixtureTransport } from "./transport/fixture";
 import { WireConnection } from "./wire/connection";
@@ -40,7 +41,7 @@ import { createWireTransport } from "./wire/transport";
 import { ConnectionBar } from "./workbench/ConnectionBar";
 import { createWireSender } from "./workbench/sender";
 import { SAMPLE_INBOX } from "./workbench/inbox";
-import { SAMPLE_AGENTS } from "./workbench/samples";
+import { SAMPLE_AGENTS, SAMPLE_ENTITIES } from "./workbench/samples";
 import { Workbench } from "./workbench/Workbench";
 
 /** What a live connection runs on; tests inject virtual ones. */
@@ -81,7 +82,8 @@ export const SHELL_OWNS_TOKENS = "This app gets its token from its shell, so the
 function FixtureApp(props: { readonly config: FixtureShellConfig }): JSX.Element {
   const store = createLayoutStore({ serverKey: "fixture" });
   const { layout, notice } = store.load();
-  const fleet = createFixtureFleet(SAMPLE_AGENTS);
+  const sidebar = createSidebarStore({ serverKey: "fixture" });
+  const fleet = createFixtureFleet(SAMPLE_AGENTS, SAMPLE_ENTITIES);
   const transport = createFixtureTransport(props.config.fixtureJsonl);
   return (
     <>
@@ -93,6 +95,8 @@ function FixtureApp(props: { readonly config: FixtureShellConfig }): JSX.Element
         sender={null}
         layout={layout}
         saveLayout={(next) => store.save(next)}
+        sidebar={sidebar.load()}
+        saveSidebar={sidebar.save}
         status={() => notice}
         mode={previewMode(pageSearch(globalThis))}
         source="replay"
@@ -240,6 +244,7 @@ function WireApp(props: { readonly config: WireShellConfig | BridgeShellConfig; 
   onCleanup(() => page.removeEventListener("hashchange", onHashChange));
   const store = createLayoutStore({ serverKey: url ?? BRIDGE_KEY, initial: emptyLayout });
   const { layout, notice } = store.load();
+  const sidebar = createSidebarStore({ serverKey: url ?? BRIDGE_KEY });
   // One fleet source and one transport per connection (ADR-0038 §3, sub ids).
   const fleet = createWireFleet(connection);
   const transport = createWireTransport(connection);
@@ -273,6 +278,8 @@ function WireApp(props: { readonly config: WireShellConfig | BridgeShellConfig; 
         sender={sender}
         layout={layout}
         saveLayout={(next) => store.save(next)}
+        sidebar={sidebar.load()}
+        saveSidebar={sidebar.save}
         status={() => [notice, status()].filter((part) => part !== null).join(" · ")}
         mode={previewMode(pageSearch(globalThis))}
         source="live"

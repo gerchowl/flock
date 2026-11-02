@@ -21,7 +21,7 @@ async fn unavailable_observation_preserves_rows_and_fresh_readers_can_recover() 
         let client = Client::new(wake.clone(), stopped);
         let registry = registry(root.path());
         let workers = Workers::new(wake);
-        client.observe(&registry, &workers, root.path(), None);
+        client.observe(&registry, &workers, root.path(), None, None);
         let mut cut = client.subscribe(None).await.unwrap();
         for _ in 0..3 {
             cut.next("old").await.unwrap();
@@ -37,7 +37,7 @@ async fn unavailable_observation_preserves_rows_and_fresh_readers_can_recover() 
         );
         assert!(cut.next("old").await.is_err());
         assert_eq!(std::fs::read(&path).unwrap(), before);
-        client.observe(&registry, &workers, root.path(), None);
+        client.observe(&registry, &workers, root.path(), None, None);
         let mut fresh = client.subscribe(Some(2)).await.unwrap();
         assert!(matches!(
             fresh.next("fresh").await.unwrap(),
@@ -60,7 +60,7 @@ async fn cancelled_cut_does_not_allocate_a_checkpoint() {
     let (stop, stopped) = watch::channel(false); let wake = Arc::new(Notify::new());
     let client = Client::new(wake.clone(), stopped);
     let registry = registry(root.path()); let workers = Workers::new(wake);
-    client.observe(&registry, &workers, root.path(), None);
+    client.observe(&registry, &workers, root.path(), None, None);
     let (reply, cancelled) = oneshot::channel(); drop(cancelled);
     client.requests.try_send((None,reply)).unwrap();
     assert!(matches!(client.subscribe(Some(100)).await, Err(e) if e.kind()==io::ErrorKind::InvalidInput));
@@ -118,7 +118,7 @@ async fn preparing_worker_is_unavailable_until_its_real_permission_book_is_ready
             .unwrap();
         started.await.unwrap();
         assert!(workers.runtime(&worker.id, worker.generation).is_none());
-        client.observe(&registry, &workers, root.path(), None);
+        client.observe(&registry, &workers, root.path(), None, None);
         assert!(
             matches!(client.subscribe(None).await, Err(e) if e.kind()==io::ErrorKind::WouldBlock)
         );
@@ -126,7 +126,7 @@ async fn preparing_worker_is_unavailable_until_its_real_permission_book_is_ready
         release.send(()).unwrap();
         let now = Instant::now();
         worker.ready(&mut registry, &mut workers, &wake, now).await;
-        client.observe(&registry, &workers, root.path(), None);
+        client.observe(&registry, &workers, root.path(), None, None);
         let mut cut = client.subscribe(None).await.unwrap();
         assert!(matches!(
             cut.next("ready").await.unwrap(),
@@ -204,6 +204,7 @@ async fn non_utf8_observation_keeps_the_publisher_and_live_reader_running() {
                 Agent(normal, state, vec![]),
             ],
             home: Some(crate::mesh::identity::NodeIdentity::fixture([72; 32]).node_id()),
+            nodes: None,
         };
         // Exercise the typed publisher boundary. Registry JSON admission already
         // rejects non-UTF-8 paths, independently of this projection's contract.

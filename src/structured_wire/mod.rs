@@ -37,7 +37,8 @@ pub const WIRE_JSON_VERSION: u32 = 1;
 #[cfg_attr(feature = "web", allow(dead_code))]
 pub const CONNECT_DEADLINE_MS: u64 = 10_000;
 /// WebSocket-open to authenticated welcome ceiling, on both peers.
-pub const HANDSHAKE_DEADLINE_MS: u64 = 5_000;
+pub const HANDSHAKE_DEADLINE_MS: u64 =
+    crate::structured::permissions::auth::tokens::server::HANDSHAKE_DEADLINE_MS;
 /// Server application ping cadence, independent of other traffic.
 pub const HEARTBEAT_INTERVAL_MS: u64 = 15_000;
 /// Missing valid frame/pong ceiling; unrelated streams do not renew progress.

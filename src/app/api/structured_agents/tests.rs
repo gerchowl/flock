@@ -643,3 +643,65 @@ async fn grant_socket_methods_redact_input_unless_operator_opts_in_and_fence_rev
     )
     .await;
 }
+
+#[tokio::test]
+async fn public_get_and_focus_refuse_duplicate_or_invalid_native_membership() {
+    for duplicate in [true, false] {
+        let mut app = app();
+        register(&mut app);
+        let target = crate::structured::view::Target {
+            agent_id: "structured-fixture".into(),
+            generation: app
+                .state
+                .structured_agents
+                .get("structured-fixture")
+                .unwrap()
+                .2,
+        };
+        let native = |target| {
+            crate::workspace::Workspace::native(
+                target,
+                std::env::temp_dir(),
+                app.event_tx.clone(),
+                app.render_notify.clone(),
+                app.render_dirty.clone(),
+            )
+        };
+        let mut ws = native(target.clone());
+        if duplicate {
+            let mut second = native(target.clone());
+            let mut tab = second.tabs.remove(0);
+            tab.number = 2;
+            ws.register_new_pane(tab.root_pane);
+            ws.tabs.push(tab);
+            assert!(ws.tabs.iter().all(|t| t.membership_valid()));
+        } else {
+            ws.tabs[0].native_views.insert(
+                crate::layout::PaneId::alloc(),
+                crate::structured::view::placement::View::Ready(target),
+            );
+            assert!(!ws.tabs[0].membership_valid());
+        }
+        app.state.workspaces.push(ws);
+        app.state.active = Some(0);
+        let before: Vec<_> = app.state.workspaces[0]
+            .tabs
+            .iter()
+            .map(|t| (t.layout.pane_ids(), t.native_views.len()))
+            .collect();
+        for method in ["agent.get", "agent.focus"] {
+            let reply = request(&mut app, method, json!({"target":"structured-fixture"}));
+            assert_eq!(
+                reply["error"]["code"], "internal_error",
+                "{method}: {reply}"
+            );
+            assert_eq!(app.state.workspaces.len(), 1);
+            let after: Vec<_> = app.state.workspaces[0]
+                .tabs
+                .iter()
+                .map(|t| (t.layout.pane_ids(), t.native_views.len()))
+                .collect();
+            assert_eq!(before, after);
+        }
+    }
+}

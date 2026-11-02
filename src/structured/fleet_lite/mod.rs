@@ -23,6 +23,8 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 pub use wire::{FleetAgentRow, FleetDelta, FleetNodeRow, FleetProjectRow};
 mod rows;
+#[cfg(feature = "web")]
+pub(crate) use rows::local_node;
 use rows::Key;
 pub use rows::{local_rows, Row};
 
@@ -47,6 +49,10 @@ pub struct StructuredAgent<'a> {
 pub trait Provider {
     /// Read structured agents only; observation failure must leave the store intact.
     fn agents(&self) -> io::Result<Vec<StructuredAgent<'_>>>;
+    /// Reconcile a cut with retained facts. Default providers are authoritative.
+    fn reconcile(&self, _previous: Vec<Row>) -> io::Result<Vec<Row>> {
+        self.rows()
+    }
     /// Coherent heterogeneous rows, keyed by entity kind, owner and identity.
     fn rows(&self) -> io::Result<Vec<Row>> {
         local_rows(self.agents()?, None)
@@ -363,7 +369,7 @@ impl Store {
     /// allocate nothing. Returned deltas are already durable and densely numbered.
     pub fn refresh(&mut self, provider: &dyn Provider) -> io::Result<Vec<Delta>> {
         let mut rows = Rows::new();
-        for row in provider.rows()? {
+        for row in provider.reconcile(self.rows.values().cloned().collect())? {
             if !row.valid() || rows.insert(row.key(), row).is_some() {
                 return Err(invalid("invalid or duplicate fleet projection"));
             }

@@ -55,8 +55,12 @@ pub struct FleetNodeRow {
     pub last_ok: Option<u64>,
     /// Owner-reported software version, retained while offline.
     pub version: Option<String>,
-    /// Classified, content-free failure; N1b supplies observations.
+    /// Classified selected-path failure or retained offline cause; null when healthy.
     pub error: Option<FleetNodeError>,
+    /// Current authenticated direct-link failures, independent of selected path and online.
+    /// Empty if none are available; legacy persisted rows default to empty.
+    #[serde(default)]
+    pub link_diagnostics: Vec<FleetNodeLinkDiagnostic>,
     /// Server-owned reachability classification, not agent liveness.
     pub online: bool,
     /// Actual chosen mesh route, with policy-projected name; N1b supplies it.
@@ -66,6 +70,17 @@ pub struct FleetNodeRow {
     /// Home-only count of unbound/unreached configured peers; N1b supplies it.
     #[cfg_attr(feature = "ts", ts(as = "Option<f64>"))]
     pub unbound_configured_peers: Option<u64>,
+}
+/// A current failed direct link; its destination is the containing node row.
+/// Cleared on direct recovery or binding/observation removal. Never includes
+/// SSH aliases, destinations or raw stderr, and never overrides a healthy relay.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct FleetNodeLinkDiagnostic {
+    /// Authenticated serving home that observed the direct-link failure.
+    pub source_node_id: String,
+    /// Bounded, content-free classification of that link's failure.
+    pub error: FleetNodeError,
 }
 /// Safe classified node failure, never raw SSH output.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

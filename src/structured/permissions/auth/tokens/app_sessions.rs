@@ -346,4 +346,19 @@ impl Store {
     }
 }
 #[cfg(test)]
+impl Store {
+    /// Construct an Answer-only app session for scope-refusal tests; issuance stays fixed in production.
+    pub(crate) fn answer_only_for_test(&self, session: &mut Session) {
+        session.info.scopes = [Scope::Answer].into();
+        self.entries
+            .lock()
+            .unwrap()
+            .get_mut(&session.digest)
+            .unwrap()
+            .session
+            .info = session.info.clone();
+    }
+}
+
+#[cfg(test)]
 mod tests;

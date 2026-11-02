@@ -22,6 +22,27 @@ impl Panel {
             .find(|(r, _)| r.contains((x, y).into()))
             .map(|(_, a)| a)
     }
+    pub(super) fn rects(&self) -> impl Iterator<Item = Rect> + '_ {
+        self.hits.iter().map(|(r, _)| *r)
+    }
+    pub(super) fn positions(&self) -> impl Iterator<Item = (u16, u16)> + '_ {
+        self.hits.iter().map(|(r, _)| (r.x, r.y))
+    }
+    /// Expose prepared paint rectangles independently of hits to the test oracle.
+    #[cfg(test)]
+    pub(super) fn test_painted_areas(&self) -> impl Iterator<Item = Rect> + '_ {
+        self.rows.iter().map(|(rect, _)| *rect)
+    }
+    /// Inspect full registered geometry, including hidden or out-of-frame mistakes.
+    #[cfg(test)]
+    pub(super) fn test_hits(&self) -> &[(Rect, Action)] {
+        &self.hits
+    }
+    /// Inject a stray registration without changing paint for negative oracle tests.
+    #[cfg(test)]
+    pub(super) fn test_add_hit(&mut self, rect: Rect, action: Action) {
+        self.hits.push((rect, action));
+    }
     /// Transfer only complete painted button rectangles, retaining their owned payloads.
     pub(super) fn into_hits(self) -> impl Iterator<Item = (Rect, Action)> {
         self.hits.into_iter()
@@ -184,6 +205,12 @@ pub(crate) fn permission(s: &Snapshot, area: Rect) -> Panel {
 pub(crate) fn composer(s: &Snapshot, area: Rect) -> Panel {
     let mut p = Panel::default();
     p.text(preview(area), format!("> {}", s.composer.text));
+    if area.height >= 4 && area.width > 0 {
+        p.hits.push((
+            preview(area),
+            Action::EditComposer(crate::structured::view::editor::Edit::Focus),
+        ));
+    }
     let status = match &s.admission {
         Admission::Ready => "ready".into(),
         Admission::Pending => "pending; retain draft".into(),
@@ -199,6 +226,7 @@ pub(crate) fn composer(s: &Snapshot, area: Rect) -> Panel {
                 Action::Send(Composer {
                     text: s.composer.text.clone(),
                     cursor: s.composer.cursor,
+                    text_revision: s.composer.text_revision,
                 }),
             ),
         );

@@ -2,6 +2,7 @@ use crate::config::{Keybinds, NewTerminalCwdConfig, ToastConfig, ToastDelivery};
 use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::layout::{Direction, Rect};
 use ratatui::style::Color;
+use std::collections::HashMap;
 
 use crate::detect::AgentState;
 use crate::layout::{PaneId, PaneInfo, SplitBorder};
@@ -1306,6 +1307,7 @@ pub struct ViewState {
     /// lie about where it came from.
     pub session_warning_lines: Vec<String>,
     pub pane_infos: Vec<PaneInfo>,
+    pub(crate) structured: HashMap<PaneId, crate::ui::structured::Prepared>,
     pub split_borders: Vec<SplitBorder>,
 }
 
@@ -2251,6 +2253,13 @@ pub(crate) struct SectionGroupingMemo {
 pub struct AppState {
     /// Pane-free agent records and S4 reducers, independent of terminal runtime.
     pub structured_agents: crate::structured::registry::Registry,
+    /// Immutable presentation data only; subscriptions and tasks belong to App.
+    pub(crate) native_control: Option<(crate::structured::view::Target, usize)>,
+    /// Pure draft authorities, each scoped to one App-owned driver lifetime.
+    pub(crate) native_editors: HashMap<String, crate::structured::view::editor::EditorState>,
+    /// Checked App-wide counter shared by editor creation and actual text changes.
+    pub(crate) native_text_revision: u64,
+    pub(crate) native_frames: HashMap<String, crate::structured::view::driver::Published>,
     pub terminals:
         std::collections::HashMap<crate::terminal::TerminalId, crate::terminal::TerminalState>,
     /// Terminal ids whose size is currently owned by a direct attach client.
@@ -2842,7 +2851,8 @@ impl AppState {
     }
 
     /// Only a local binding can authenticate a row's identity. Relayed claims
-    /// are proven only when their immediate enrolled source is that same node.
+    /// are proven only when their ingestion-bound source is that same node.
+    /// A current alias binding can revoke old proof, never manufacture it.
     /// Carried snapshots have no such proof and cannot borrow a local alias.
     pub(crate) fn server_peer_node<'a>(
         &'a self,
@@ -2856,6 +2866,7 @@ impl AppState {
             .values()
             .find(|entry| {
                 std::ptr::eq(&entry.peer, peer)
+                    && entry.source_node.as_deref() == Some(claimed)
                     && entry
                         .via
                         .as_ref()
@@ -3589,6 +3600,10 @@ impl AppState {
             issue_drop: None,
             issue_repo_cache: None,
             structured_agents: crate::structured::registry::Registry::default(),
+            native_control: None,
+            native_editors: HashMap::new(),
+            native_text_revision: 0,
+            native_frames: HashMap::new(),
             terminals: std::collections::HashMap::new(),
             direct_attach_resize_locks: std::collections::HashSet::new(),
             pane_id_aliases: std::collections::HashMap::new(),
@@ -3683,6 +3698,7 @@ impl AppState {
                 config_diagnostic_lines: Vec::new(),
                 session_warning_lines: Vec::new(),
                 pane_infos: Vec::new(),
+                structured: HashMap::new(),
                 split_borders: Vec::new(),
             },
             drag: None,
@@ -3979,6 +3995,11 @@ mod tests {
             .get_mut("spoke2.invalid")
             .unwrap()
             .via = Some(local.peer.clone());
+        state
+            .relayed_fleet_cache
+            .get_mut("spoke2.invalid")
+            .unwrap()
+            .source_node = Some("fixture-node".into());
         state.peer_summaries = vec![local];
 
         let rows = state.remote_peers();

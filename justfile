@@ -164,6 +164,10 @@ client-deps-hash:
 client-browsers:
     cd web/client && bun install --frozen-lockfile && bun x playwright install --with-deps chromium
 
+# Refresh the desktop CLI's fixed-output hash after desktop/bun.lock or Bun changes.
+desktop-deps-hash:
+    python3 scripts/desktop_deps_hash.py
+
 # Build the client in fixture mode (a replay of the recorded session; no flk
 # server needed) and serve it with `vite preview` on the loopback address.
 # To try it from a phone on the local network, opt in explicitly:

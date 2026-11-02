@@ -56,7 +56,7 @@ describe("wire fleet", () => {
     live(h);
     let monotonic = 500;
     const reader = createRoot(() => fleetStore(createWireFleet(h.connection), () => monotonic).read());
-    const node = (id: string): object => ({ node_id: id, name: id, health: null, latency_ms: null, last_ok: null, version: null, error: null, online: true, route: null, counts: null, unbound_configured_peers: null });
+    const node = (id: string): object => ({ node_id: id, name: id, health: null, latency_ms: null, last_ok: null, version: null, error: null, online: true, route: null, counts: null, unbound_configured_peers: null, link_diagnostics: [] });
     const nodeFrame = (seq: number, id: string, ts_ms: number): ServerFrame => ({ t: "ev", sub_id: "s1", stream: "fleet", seq, ts_ms, ev: { type: "fleet.node.upsert", row: node(id) } as never });
     send(h, { t: "gap", sub_id: "s1", from: 1, to: 0, snapshot_to: 2 });
     send(h, nodeFrame(1, "n-a", 1111));
@@ -71,7 +71,7 @@ describe("wire fleet", () => {
   });
 
   test("a node upsert carries its frame's ts_ms; other kinds do not", () => {
-    const node = { node_id: "n", name: "n", health: null, latency_ms: null, last_ok: null, version: null, error: null, online: true, route: null, counts: null, unbound_configured_peers: null };
+    const node = { node_id: "n", name: "n", health: null, latency_ms: null, last_ok: null, version: null, error: null, online: true, route: null, counts: null, unbound_configured_peers: null, link_diagnostics: [] };
     expect(fleetDelta({ type: "fleet.node.upsert", row: node } as never, 42)).toEqual({ op: "upsert", kind: "node", row: node, tsMs: 42 });
     expect(fleetDelta({ type: "fleet.remove", id: "a" } as never, 42)).toEqual({ op: "remove", kind: "agent", id: "a" });
   });
