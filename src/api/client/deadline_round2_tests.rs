@@ -85,30 +85,6 @@ async fn agent_start_outlasts_the_ordinary_request_cap() {
 }
 
 #[tokio::test]
-async fn default_guarded_write_reserves_write_and_confirmation() {
-    let method = Method::PaneSendInput(crate::api::schema::PaneSendInputParams {
-        pane_id: "w1:p1".into(),
-        text: "brief".into(),
-        keys: vec!["Enter".into()],
-        write_timeout_ms: None,
-        raw: false,
-    });
-    delayed_operation(method.clone()).await;
-    assert_eq!(
-        deadline::request_timeout(
-            &Request {
-                id: "default".into(),
-                method
-            },
-            REQUEST_TIMEOUT
-        ),
-        Duration::from_millis(crate::api::schema::DEFAULT_RAW_WRITE_TIMEOUT_MS)
-            + crate::app::guarded_submit::CONFIRM_WINDOW
-            + OPERATION_MARGIN
-    );
-}
-
-#[tokio::test]
 async fn handoff_reply_reserves_synchronous_server_phases() {
     delayed_operation(Method::ServerLiveHandoff(Default::default())).await;
     let request = Request {
@@ -170,4 +146,36 @@ async fn full_backlog_mutation_is_pre_dispatch_timeout_exit_124() {
         Instant::now(),
         io::ErrorKind::WouldBlock.into(),
     ));
+}
+
+#[test]
+fn completed_input_connect_uses_its_existing_absolute_deadline() {
+    let root = TempDir::socket();
+    let path = root.path().join("input-backlog");
+    let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+    let _holders = crate::platform::socket_deadline::saturate_backlog(&listener, &path);
+    let client = ApiClient::for_target(ConnectionTarget::SocketPath(path));
+    let request: Request = serde_json::from_value(serde_json::json!({
+        "id":"input-connect", "method":"pane.write_text", "params":{"pane_id":"w1:p1", "text":"brief"}
+    })).unwrap();
+    let (send, receive) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let _ = send.send(client.exchange_until(&request, Instant::now()));
+    });
+    let completion = receive.recv_timeout(OPERATION_MARGIN);
+    let on_time = completion.is_ok();
+    drop(_holders);
+    drop(listener);
+    let result = completion.unwrap_or_else(|_| {
+        receive
+            .recv_timeout(OPERATION_MARGIN)
+            .expect("closing the owned backlog must release connect")
+    });
+    worker.join().unwrap();
+    assert!(on_time, "input connect exceeded its absolute deadline");
+    let error = result.unwrap_err().into_error();
+    let ApiClientError::Io(error) = error else {
+        panic!("unexpected failure: {error}")
+    };
+    assert_pre_dispatch(&error);
 }

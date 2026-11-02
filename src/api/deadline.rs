@@ -46,7 +46,7 @@ pub(crate) fn request_timeout(request: &Request, ordinary: Duration) -> Duration
     operation_timeout(&request.method, ordinary)
 }
 
-/// Shared client cap table, including the server's write and confirmation budgets.
+/// Client allowances for ordinary requests, server work and long polls.
 /// Explicit caller deadlines may still shorten this transport allowance.
 pub(crate) fn operation_timeout(method: &Method, ordinary: Duration) -> Duration {
     if let Some(allowance) = client_work_allowance(method) {
@@ -63,32 +63,12 @@ pub(crate) fn operation_timeout(method: &Method, ordinary: Duration) -> Duration
         }
         Method::EventsWait(p) => Some(p.timeout_ms.map(Duration::from_millis).unwrap_or(MAX_WAIT)),
         Method::EventsRead(p) => Some(Duration::from_millis(p.wait_ms.unwrap_or(0))),
-        Method::AgentSend(p) => Some(write_budget(p.write_timeout_ms.as_ref())),
-        Method::PaneSendText(p) | Method::PaneWriteText(p) => {
-            Some(write_budget(p.write_timeout_ms.as_ref()))
-        }
-        Method::PaneSendKeys(p) | Method::PaneWriteKeys(p) => {
-            Some(write_budget(p.write_timeout_ms.as_ref()))
-        }
-        Method::PaneSendInput(p) | Method::PaneWriteInput(p) => {
-            Some(write_budget(p.write_timeout_ms.as_ref()))
-        }
-        Method::PaneSubmit(_) => Some(write_budget(None)),
         Method::ServerLiveHandoff(_) => Some(crate::server::handoff::operation_budget()),
         _ => None,
     };
     wait.map_or(ordinary, |wait| {
         ordinary.max(wait.saturating_add(OPERATION_MARGIN))
     })
-}
-
-fn write_budget(timeout: Option<&serde_json::Value>) -> Duration {
-    Duration::from_millis(
-        timeout
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(super::schema::DEFAULT_RAW_WRITE_TIMEOUT_MS),
-    )
-    .saturating_add(crate::app::guarded_submit::CONFIRM_WINDOW)
 }
 
 /// Safely retryable transport expiry: no dispatch, or a declared read/idempotent call.
@@ -191,17 +171,15 @@ impl DeadlineStream {
     }
     fn transfer(
         &mut self,
-        mut operation: impl FnMut(&mut UnixStream) -> io::Result<usize>,
+        mut operation: impl FnMut(&mut UnixStream, Duration) -> io::Result<usize>,
         read: bool,
     ) -> io::Result<usize> {
         loop {
             let left = self.remaining()?;
-            if read {
-                self.stream.set_read_timeout(Some(left))?;
-            } else {
+            if !read {
                 self.stream.set_write_timeout(Some(left))?;
             }
-            match operation(&mut self.stream) {
+            match operation(&mut self.stream, left) {
                 Err(e)
                     if matches!(
                         e.kind(),
@@ -224,12 +202,15 @@ impl DeadlineStream {
 }
 impl Read for DeadlineStream {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
-        self.transfer(|s| s.read(out), true)
+        self.transfer(
+            |s, left| crate::platform::socket::read_ready(s, out, left),
+            true,
+        )
     }
 }
 impl Write for DeadlineStream {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.transfer(|s| s.write(bytes), false)
+        self.transfer(|s, _| s.write(bytes), false)
     }
     fn flush(&mut self) -> io::Result<()> {
         self.stream.flush()

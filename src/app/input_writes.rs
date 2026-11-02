@@ -179,7 +179,7 @@ impl InputWrites {
 /// Optional JSON detail is validated here so malformed values remain invalid_params.
 pub(super) fn deadline(timeout: Option<&serde_json::Value>) -> Option<Instant> {
     let millis = match timeout {
-        None => crate::api::schema::DEFAULT_RAW_WRITE_TIMEOUT_MS,
+        None => 10000,
         Some(value) => value.as_u64()?,
     };
     (1..=30000)

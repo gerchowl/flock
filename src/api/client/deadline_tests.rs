@@ -74,6 +74,12 @@ async fn wedged(unknown: bool, call: impl FnOnce(ApiClient) -> io::Result<()> + 
     };
     worker.join().unwrap();
     assert!(on_time, "request exceeded its bounded harness: {result:?}");
+    assert!(
+        tokio::time::timeout(SHORT, listener.accept())
+            .await
+            .is_err(),
+        "a completed deadline must not trigger another exchange"
+    );
     let error = result.unwrap_err();
     if unknown {
         let outcome = error
@@ -120,6 +126,20 @@ async fn compatibility_probe_reports_a_typed_timeout() {
             .map_err(io_error)
     })
     .await;
+}
+
+#[tokio::test]
+async fn cached_diagnosis_timeout_refuses_mutation_without_another_probe() {
+    wedged(false, |client| {
+        crate::api::compatibility::begin_cli(&client, true, |_| {});
+        assert!(crate::api::compatibility::server_version(&client).is_none());
+        let request: Request = serde_json::from_value(serde_json::json!({
+            "id":"after-diagnosis", "method":"workspace.rename", "params":{"workspace_id":"ws_1", "label":"brief"}
+        })).unwrap();
+        let result = client.request_value(&request).map(|_| ()).map_err(io_error);
+        crate::api::compatibility::end_cli();
+        result
+    }).await;
 }
 
 async fn long_poll(reply: bool) {
@@ -223,7 +243,13 @@ async fn cli_timeout(mutating: bool) {
     let root = TempDir::socket();
     let path = root.path().join("cli");
     let listener = tokio::net::UnixListener::bind(&path).unwrap();
-    let binary = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/flk");
+    let binary = std::env::current_exe()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("flk");
     let mut command = tokio::process::Command::new(binary);
     command
         .env_clear()

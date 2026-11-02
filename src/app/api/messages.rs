@@ -146,7 +146,7 @@ pub(super) fn mint_correlation_id() -> String {
 /// ([`App::apply_blocking_budget`]), so nobody can be silenced by someone
 /// else exhausting it. The key space is therefore bounded by the panes on
 /// this server, plus one.
-fn blocking_budget_key(attested_agent: Option<&str>, from_pane: Option<&str>) -> String {
+pub(super) fn blocking_budget_key(attested_agent: Option<&str>, from_pane: Option<&str>) -> String {
     match (attested_agent, from_pane) {
         (Some(agent), _) => agent.to_string(),
         (None, Some(pane)) => format!("pane/{pane}"),
@@ -189,11 +189,11 @@ pub(crate) struct WakeSuppression {
     pub muted_until_ms: Option<u64>,
 }
 
-/// `msg.send` / `msg.reply` / `msg.list` (#175 M1). Messages are queued per
-/// recipient pane and delivered at the recipient's next settled turn
-/// boundary — never mid-turn (§8.3). Sender identity is stamped from API
-/// process ancestry and is routing/audit metadata only (P3): no code path
-/// in this module branches on WHO sent a message, only on WHERE it goes.
+/// `msg.send` / `msg.reply` / `msg.list` (#175 M1). Terminal mailboxes
+/// deliver at a settled turn boundary, using ancestry stamps for routing and
+/// audit (P3). Structured recipients enter the shared durable queue through
+/// the authenticated local adapter, which derives producer authority separately
+/// from client-supplied routing metadata (ADR-0036 §3/S5).
 impl App {
     pub(super) fn handle_msg_send(&mut self, id: String, params: MsgSendParams) -> String {
         if self.lease_caller() == crate::structured::lease::Caller::Uncertain {
@@ -233,22 +233,31 @@ impl App {
                 Ok(false) => (),
             }
         }
-        let resolved = match self.resolve_message_target(&params.to) {
-            Ok(resolved) => resolved,
-            Err(error) => {
-                return error.encode(id, !params.to.is_well_formed_agent_id());
+        let structured = if let MessageTarget::Agent { agent } = &params.to {
+            match self.structured_send_target(agent) {
+                Ok(target) => target,
+                Err(code) => return encode_error(id, code.as_str(), "ambiguous message target"),
+            }
+        } else {
+            None
+        };
+        let (to_ws_idx, to_pane_id, to_pane) = if let Some((agent, _)) = &structured {
+            (None, None, agent.clone())
+        } else {
+            match self.resolve_message_target(&params.to) {
+                Ok(ResolvedTarget::Local(ws, pane)) => {
+                    let Some(public) = self.public_pane_id(ws, pane) else {
+                        return encode_error(id, "internal_error", "target pane has no public id");
+                    };
+                    (Some(ws), Some(pane), public)
+                }
+                Ok(ResolvedTarget::Remote(location)) => {
+                    return self.relay_message_to_host(id, &location, &body, params)
+                }
+                Err(error) => return error.encode(id, !params.to.is_well_formed_agent_id()),
             }
         };
-        let (to_ws_idx, to_pane_id) = match resolved {
-            ResolvedTarget::Local(ws_idx, pane_id) => (ws_idx, pane_id),
-            ResolvedTarget::Remote(location) => {
-                return self.relay_message_to_host(id, &location, &body, params)
-            }
-        };
-        let Some(to_pane) = self.public_pane_id(to_ws_idx, to_pane_id) else {
-            return encode_error(id, "internal_error", "target pane has no public id");
-        };
-        let to_repo = self.workspace_repo_label(to_ws_idx);
+        let to_repo = to_ws_idx.and_then(|ws| self.workspace_repo_label(ws));
 
         // Sender stamp: process ancestry of the API peer, an empty claim so
         // ancestry is the only evidence (P3 — routing, never authorization).
@@ -274,7 +283,7 @@ impl App {
 
         let possible_sender = self.caller_pane_candidate();
         if from_pane.as_deref() == Some(to_pane.as_str())
-            || possible_sender == Some((to_ws_idx, to_pane_id))
+            || possible_sender.is_some() && possible_sender == to_ws_idx.zip(to_pane_id)
         {
             return encode_error(id, "self_message_forbidden", "a pane cannot message itself");
         }
@@ -322,6 +331,9 @@ impl App {
             intent: applied_intent,
         };
 
+        if let Some((target, _)) = structured {
+            return self.local_structured_message(id, target, message, warnings, None);
+        }
         self.queue_message_tiered(id, message, warnings, &blocking_key)
     }
 
@@ -439,9 +451,14 @@ impl App {
                 format!("no message with correlation id {}", params.correlation_id),
             );
         };
-        let local = from_host
-            .as_deref()
-            .is_none_or(|host| host == crate::app::short_host_name());
+        let local = key.as_ref().map_or_else(
+            || {
+                from_host
+                    .as_deref()
+                    .is_none_or(|host| host == crate::app::short_host_name())
+            },
+            |key| self.node_id.as_deref() == Some(key.origin_node.as_str()),
+        );
         if !local && self.node_id.is_none() {
             return encode_error(
                 id,
@@ -486,6 +503,63 @@ impl App {
             delivery_attempts: 0,
             intent,
         };
+        let attested = if let Some(key) = key.as_ref().filter(|_| local) {
+            let original = match crate::mesh::hello::with_store(|s| {
+                let binding = s.recipient_binding(key).map_err(|e| e.to_string())?;
+                Ok(s.get(key).map_err(|e| e.to_string())?.filter(|r| {
+                    binding.as_ref().is_some_and(|(agent, session)| {
+                        agent == &r.envelope.target_agent && session == &r.envelope.target_session
+                    })
+                }))
+            }) {
+                Ok(original) => original,
+                Err(_) => {
+                    return encode_error(
+                        id,
+                        crate::api::error_code::ErrorCode::MailStoreUnavailable.as_str(),
+                        "message custody unavailable",
+                    )
+                }
+            };
+            original
+                .filter(|r| {
+                    matches!(r.state.as_str(), "inbox" | "read" | "delivered")
+                        && self.node_id.as_deref() == Some(r.envelope.key.origin_node.as_str())
+                        && self.node_id.as_deref()
+                            == Some(r.envelope.return_binding.recipient_node.as_str())
+                        && crate::mesh::sign::verify(&r.envelope).is_ok()
+                })
+                .map(|r| r.envelope.sender)
+        } else {
+            None
+        };
+        if local {
+            if let Some(target) = attested.as_ref().filter(|s| !s.is_empty()) {
+                match self.structured_send_target(target) {
+                    Ok(Some((target, _))) => {
+                        let response = self.local_structured_message(
+                            id,
+                            target,
+                            message,
+                            downgrade.into_iter().map(str::to_owned).collect(),
+                            key,
+                        );
+                        if let Some(super::structured_queue::Staged(_, _, Some(ack))) =
+                            &mut self.structured_sends.staged
+                        {
+                            ack.reply = Some(super::structured_messages::Reply {
+                                correlation: params.correlation_id,
+                                root,
+                                enqueued,
+                            });
+                        }
+                        return response;
+                    }
+                    Err(code) => return encode_error(id, code.as_str(), "ambiguous reply target"),
+                    Ok(None) => (),
+                }
+            }
+        }
         let result = if local {
             self.local_reply(key.as_ref(), from_pane, from_agent, enqueued, message)
         } else if let Some(key) = &key {
@@ -496,20 +570,15 @@ impl App {
         };
         match result {
             Ok((answer_key, state)) => {
-                let round_trips = self.mailboxes.bump_round_trips(&root);
-                self.emit_event(EventEnvelope {
-                    event: EventKind::MessageReplied,
-                    data: EventData::MessageReplied {
-                        correlation_id: params.correlation_id,
-                        reply_correlation_id: reply_correlation_id.clone(),
-                        reply_latency_ms: now.saturating_sub(enqueued),
-                        round_trips,
-                        body: None,
-                        from_pane: None,
-                        from_agent: None,
-                        held: state == "held",
+                self.emit_reply_observation(
+                    super::structured_messages::Reply {
+                        correlation: params.correlation_id,
+                        root,
+                        enqueued,
                     },
-                });
+                    &reply_correlation_id,
+                    state == "held",
+                );
                 let mut warnings: Vec<String> = downgrade.into_iter().map(str::to_owned).collect();
                 if state == "held" && local {
                     warnings.push(REPLY_HELD_FOR_WAITER.into());
@@ -517,6 +586,7 @@ impl App {
                 encode_success(
                     id,
                     ResponseResult::MsgQueued {
+                        item_id: None,
                         message_key: answer_key,
                         correlation_id: reply_correlation_id,
                         state: state.into(),
@@ -538,6 +608,29 @@ impl App {
         }
     }
 
+    /// Pane and native replies publish the same accepted-reply observation.
+    pub(super) fn emit_reply_observation(
+        &mut self,
+        reply: super::structured_messages::Reply,
+        reply_correlation_id: &str,
+        held: bool,
+    ) {
+        let round_trips = self.mailboxes.bump_round_trips(&reply.root);
+        self.emit_event(EventEnvelope {
+            event: EventKind::MessageReplied,
+            data: EventData::MessageReplied {
+                correlation_id: reply.correlation,
+                reply_correlation_id: reply_correlation_id.into(),
+                reply_latency_ms: now_ms().saturating_sub(reply.enqueued),
+                round_trips,
+                body: None,
+                from_pane: None,
+                from_agent: None,
+                held,
+            },
+        });
+    }
+
     /// Who is calling the API, as far as this server can attest: the pane
     /// the caller's process runs in, its repo, and the agent in that pane.
     /// All `None` for a caller outside any pane (an ssh shell, a script).
@@ -551,6 +644,9 @@ impl App {
     }
 
     pub(super) fn handle_msg_list(&mut self, id: String, params: MsgListParams) -> String {
+        if let Some(response) = self.native_inbox_request(&id, params.pane.as_deref(), false) {
+            return response;
+        }
         let pane_filter = match params.pane {
             Some(pane) => match self.resolve_terminal_target(&pane) {
                 Ok(resolved) => self.public_pane_id(resolved.ws_idx, resolved.pane_id),
@@ -597,7 +693,7 @@ impl App {
                     let reply = status.reply.or_else(|| {
                         crate::api::best_answer(
                             self.event_hub
-                                .events_after(0)
+                                .ring_snapshot_after(0)
                                 .iter()
                                 .map(|(_, event)| event),
                             &params.correlation_id,
@@ -637,7 +733,7 @@ impl App {
             }
         }
         let mut found: Option<ResponseResult> = None;
-        for (_, event) in self.event_hub.events_after(0) {
+        for (_, event) in self.event_hub.ring_snapshot_after(0) {
             match &event.data {
                 EventData::MessageQueued { correlation_id, .. }
                     if *correlation_id == params.correlation_id =>
@@ -735,7 +831,7 @@ impl App {
         // can be the only trace of the exchange on this server.
         let answer = crate::api::best_answer(
             self.event_hub
-                .events_after(0)
+                .ring_snapshot_after(0)
                 .iter()
                 .map(|(_, event)| event),
             &params.correlation_id,
@@ -1041,6 +1137,9 @@ impl App {
     /// emitted on the same edge, so the audit trail gets truer rather than
     /// noisier.
     pub(super) fn handle_msg_read(&mut self, id: String, params: MsgReadParams) -> String {
+        if let Some(response) = self.native_inbox_request(&id, params.pane.as_deref(), true) {
+            return response;
+        }
         let pane = match self.resolve_inbox_pane(&id, params.pane, "read") {
             Ok(pane) => pane,
             Err(refusal) => return refusal,
@@ -1180,6 +1279,7 @@ impl App {
             return encode_success(
                 id,
                 ResponseResult::MsgQueued {
+                    item_id: None,
                     message_key: Some(mesh.envelope.key),
                     correlation_id,
                     state: "queued".into(),
@@ -1464,6 +1564,7 @@ impl App {
                 encode_success(
                     id,
                     ResponseResult::MsgQueued {
+                        item_id: None,
                         message_key: message_key.clone(),
                         correlation_id,
                         state: "queued".into(),
@@ -1476,6 +1577,7 @@ impl App {
             EnqueueOutcome::Duplicate => encode_success(
                 id,
                 ResponseResult::MsgQueued {
+                    item_id: None,
                     message_key: message_key.clone(),
                     correlation_id,
                     state: "duplicate".into(),
@@ -1509,11 +1611,14 @@ impl App {
         use crate::app::terminal_targets::TerminalTargetError;
         let candidates = match &error {
             TerminalTargetError::Ambiguous { candidates, .. } => candidates.clone(),
-            TerminalTargetError::NotFound { .. } => Vec::new(),
+            TerminalTargetError::NotFound { .. }
+            | TerminalTargetError::RuntimeUnsupported { .. } => Vec::new(),
         };
         let ambiguous = matches!(error, TerminalTargetError::Ambiguous { .. });
         MessageTargetError {
-            code: if ambiguous {
+            code: if matches!(error, TerminalTargetError::RuntimeUnsupported { .. }) {
+                crate::api::error_code::ErrorCode::RuntimeUnsupported
+            } else if ambiguous {
                 crate::api::error_code::ErrorCode::MsgTargetAmbiguous
             } else {
                 crate::api::error_code::ErrorCode::MsgTargetNotFound
@@ -1573,7 +1678,7 @@ impl App {
                                 .terminals
                                 .get(&pane_state.attached_terminal_id)
                                 .is_some_and(|terminal| {
-                                    terminal.agent_name.as_deref() == Some(pane.as_str())
+                                    terminal.agent_name() == Some(pane.as_str())
                                         || terminal.effective_agent_label() == Some(pane.as_str())
                                 });
                             if public_matches || agent_matches {
@@ -1619,6 +1724,7 @@ impl App {
             return;
         }
         let now = now_ms();
+        self.sweep_native_inboxes();
         let mut dropped_any = false;
         for expired in self.mailboxes.expire(now) {
             if let Some(key) = &expired.message_key {
@@ -1834,7 +1940,7 @@ mod tests {
             assert_eq!(value["result"]["messages"].as_array().unwrap().len(), 0);
         }
         app.expire_undeliverable_messages();
-        let events = app.event_hub.events_after(0);
+        let events = app.event_hub.ring_snapshot_after(0);
         assert_eq!(
             events
                 .iter()
@@ -1902,6 +2008,7 @@ mod tests {
         let response = basic_send(&mut app, "c-1", "hello beta");
         let success: SuccessResponse = serde_json::from_str(&response).unwrap();
         let ResponseResult::MsgQueued {
+            item_id: None,
             correlation_id,
             state,
             ..
@@ -1912,7 +2019,7 @@ mod tests {
         assert_eq!(correlation_id, "c-1");
         assert_eq!(state, "queued");
         let queued_events = hub
-            .events_after(0)
+            .ring_snapshot_after(0)
             .into_iter()
             .filter(|(_, envelope)| matches!(envelope.data, EventData::MessageQueued { .. }))
             .count();
@@ -1926,7 +2033,7 @@ mod tests {
         };
         assert_eq!(state, "duplicate");
         let queued_events = hub
-            .events_after(0)
+            .ring_snapshot_after(0)
             .into_iter()
             .filter(|(_, envelope)| matches!(envelope.data, EventData::MessageQueued { .. }))
             .count();
@@ -2097,6 +2204,7 @@ mod tests {
         let recovery = hold_recovery(&mut replacement);
         let (respond_to, responses) = std::sync::mpsc::channel();
         replacement.handle_api_request_message(crate::api::ApiRequestMessage {
+            scope: None,
             request: Request {
                 id: "reply".into(),
                 method: Method::MsgReply(MsgReplyParams {
@@ -2129,6 +2237,7 @@ mod tests {
     fn park(app: &mut crate::app::App, method: Method) -> std::sync::mpsc::Receiver<String> {
         let (respond_to, responses) = std::sync::mpsc::channel();
         app.handle_api_request_message(crate::api::ApiRequestMessage {
+            scope: None,
             request: Request {
                 id: "parked".into(),
                 method,
@@ -2283,6 +2392,7 @@ mod tests {
             .unwrap();
         let (respond_to, responses) = std::sync::mpsc::channel();
         app.handle_api_request_message(crate::api::ApiRequestMessage {
+            scope: None,
             request: Request {
                 id: "completed".into(),
                 method: fyi_send(&app, "after-recovery"),
@@ -2788,7 +2898,7 @@ mod tests {
         assert_eq!(value["result"]["state"], "queued", "{value}");
         assert!(value["result"]["message_key"].is_object());
         let relayed = hub
-            .events_after(0)
+            .ring_snapshot_after(0)
             .iter()
             .filter(|(_, event)| matches!(event.data, EventData::MessageRelayed { .. }))
             .count();
@@ -2971,7 +3081,7 @@ mod tests {
         basic_send(&mut app, "c-read", "body");
 
         let delivered = |hub: &crate::api::EventHub| {
-            hub.events_after(0)
+            hub.ring_snapshot_after(0)
                 .iter()
                 .filter(|(_, event)| {
                     matches!(
@@ -3011,7 +3121,7 @@ mod tests {
         let _ = basic_send(&mut app, "c-pause", "hi during pause");
 
         let dropped = |hub: &crate::api::EventHub| {
-            hub.events_after(0)
+            hub.ring_snapshot_after(0)
                 .iter()
                 .filter(|(_, event)| {
                     matches!(
@@ -3334,7 +3444,10 @@ mod tests {
             app.handle_msg_relay_completed(crate::app::message_relay::RelayCompletion {
                 send: attempts.pop().unwrap(),
                 result: if succeeds {
-                    Ok(true)
+                    Ok(crate::mesh::delivery::Acknowledged {
+                        delivered: true,
+                        item_id: None,
+                    })
                 } else {
                     Err(crate::peers::PeerMessageFailure::Unreachable(
                         "timeout".into(),
@@ -3389,10 +3502,12 @@ mod tests {
         );
         assert_eq!(app.mailboxes.queued_len(&answerer), 1, "still unread");
         assert!(
-            !hub.events_after(0).into_iter().any(|(_, e)| matches!(
-                &e.data,
-                EventData::MessageDelivered { correlation_id, .. } if correlation_id == "c-anon"
-            )),
+            !hub.ring_snapshot_after(0)
+                .into_iter()
+                .any(|(_, e)| matches!(
+                    &e.data,
+                    EventData::MessageDelivered { correlation_id, .. } if correlation_id == "c-anon"
+                )),
             "no durable settle for a reply that never went out"
         );
     }
@@ -3745,7 +3860,7 @@ mod tests {
         // the way a restart does has to bring the kind and the pane back.
         // Otherwise the operator reads it correctly until they reboot.
         let events: Vec<EventEnvelope> = hub
-            .events_after(0)
+            .ring_snapshot_after(0)
             .into_iter()
             .map(|(_, envelope)| envelope)
             .collect();
@@ -4066,7 +4181,7 @@ mod tests {
     }
 
     fn deferred_events(hub: &crate::api::EventHub) -> Vec<EventData> {
-        hub.events_after(0)
+        hub.ring_snapshot_after(0)
             .into_iter()
             .map(|(_, envelope)| envelope.data)
             .filter(|data| matches!(data, EventData::MessageDeferred { .. }))

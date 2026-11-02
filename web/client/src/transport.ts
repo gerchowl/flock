@@ -22,8 +22,9 @@
  * - `reset` (wire only) means the server lost the stream's state
  *   (`cursor_ahead`): the caller drops every entry it holds, and entries
  *   restart from the stream's first retained seq.
- * - `synced` is called at most once, after the entries that existed when the
- *   subscription was made; later entries may follow it.
+ * - `synced` is called at most once per epoch, after the entries that existed
+ *   when the epoch began; later entries may follow it. A subscription's first
+ *   epoch begins when it is made, and each `reset` begins a new one (#2234).
  * - `failed` ends the subscription: no callback follows it.
  * - After `close()`, no callback runs.
  *
@@ -44,11 +45,12 @@ export type Cursor = number | null;
 /**
  * One delivered entry of a session stream (client-side; not a wire frame).
  * A `gap` entry marks seqs `from`–`to` as no longer stored (ADR-0038 §3); its
- * `seq` is `to`, and the stream continues after it.
+ * `seq` is `to`, and the stream continues after it. `tsMs` is the `ev` frame's
+ * server timestamp, where the adapter has one (the wire does; a recording does not).
  */
 export type SessionEntry =
-  | { readonly seq: number; readonly kind: "known"; readonly event: KnownSessionEvent }
-  | { readonly seq: number; readonly kind: "unknown"; readonly unknown: UnknownInput }
+  | { readonly seq: number; readonly tsMs?: number; readonly kind: "known"; readonly event: KnownSessionEvent }
+  | { readonly seq: number; readonly tsMs?: number; readonly kind: "unknown"; readonly unknown: UnknownInput }
   | { readonly seq: number; readonly kind: "gap"; readonly from: number; readonly to: number };
 
 /** Why a subscription ended; shown to the user as-is. */

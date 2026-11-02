@@ -34,6 +34,7 @@ struct Invocation {
     target: Option<PathBuf>,
     server: Option<ServerVersion>,
     probed: bool,
+    timeout_started: Option<std::time::Instant>,
     // Refuse state-changing requests to an older server (#868).
     gate: bool,
     warn: Option<fn(&ServerVersion)>,
@@ -193,13 +194,27 @@ fn server_version_result(
     client: &ApiClient,
 ) -> Result<Option<ServerVersion>, super::client::ApiClientError> {
     let path = client.socket_path();
+    let timeout = INVOCATION.with_borrow(|state| {
+        (state.target.as_ref() == Some(&path))
+            .then_some(state.timeout_started)
+            .flatten()
+    });
+    if let Some(started) = timeout {
+        return Err(super::deadline::DeadlineStream::timeout_at(&path, started).into());
+    }
     if let Some(server) = cached(&path) {
         return Ok(server);
     }
+    let started = std::time::Instant::now();
     let server = match probe(client) {
         Err(super::client::ApiClientError::Io(error))
             if error.kind() == std::io::ErrorKind::TimedOut =>
         {
+            INVOCATION.with_borrow_mut(|state| {
+                if state.target.as_ref() == Some(&path) {
+                    state.timeout_started = Some(started);
+                }
+            });
             return Err(error.into());
         }
         // Optional version diagnosis keeps the original error without evidence
@@ -213,4 +228,33 @@ fn server_version_result(
         }
     });
     Ok(server)
+}
+
+/// An absent or malformed capability never permits a structured selector.
+pub(crate) fn advertises_structured(pong: &Value) -> bool {
+    pong.pointer("/result/capabilities/structured_agents")
+        .and_then(Value::as_bool)
+        == Some(true)
+}
+
+#[cfg(test)]
+mod structured_tests {
+    #[test]
+    fn structured_capability_is_explicit_and_defaults_to_refusal() {
+        for caps in [
+            serde_json::json!({}),
+            serde_json::json!({"structured_agents":false}),
+            serde_json::json!({"structured_agents":"true"}),
+        ] {
+            assert!(!super::advertises_structured(
+                &serde_json::json!({"result":{"capabilities":caps}})
+            ));
+        }
+        assert!(super::advertises_structured(
+            &serde_json::json!({"result":{"capabilities":{"structured_agents":true}}})
+        ));
+        let legacy: crate::api::schema::ServerCapabilities =
+            serde_json::from_value(serde_json::json!({"live_handoff":false})).unwrap();
+        assert!(!legacy.structured_agents);
+    }
 }

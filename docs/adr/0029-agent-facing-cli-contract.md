@@ -170,8 +170,9 @@ client patience, not a server execution or cancellation guarantee. Explicit
 caller deadlines may be shorter. After dispatch, expiry is outcome unknown,
 exit 14, and must not trigger an automatic retry. Server-side bounds require
 cancellation and partial-state cleanup semantics, tracked separately in #2209.
-Input writes instead reserve their server write budget, confirmation window
-and transport margin. Live handoff reserves its synchronous phase bounds.
+Completed input writes retain their capability-bound allowance and reply
+margin, with unknown effects reported as `input_write_unknown` (exit 8).
+Live handoff reserves its synchronous phase bounds.
 
 ### 3. Output: the result on stdout, selectable; diagnostics on stderr
 

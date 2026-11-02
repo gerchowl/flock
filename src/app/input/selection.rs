@@ -6,6 +6,34 @@ use crate::{
 };
 
 impl AppState {
+    fn selection_runtime<'a>(
+        &'a self,
+        runtimes: &'a TerminalRuntimeRegistry,
+        pane_id: crate::layout::PaneId,
+    ) -> Option<&'a crate::terminal::TerminalRuntime> {
+        if let Some(float) = self
+            .visible_float_for_active_workspace()
+            .filter(|float| float.pane_id == pane_id)
+        {
+            runtimes.get(&float.terminal_id)
+        } else {
+            self.runtime_for_pane_in_workspace(runtimes, self.active?, pane_id)
+        }
+    }
+
+    pub(super) fn pin_selection_content(&mut self, runtimes: &TerminalRuntimeRegistry) {
+        if let Some(mut selection) = self.selection.take() {
+            if selection.source == crate::selection::SelectionSource::Pane {
+                if let Some(rt) = self.selection_runtime(runtimes, selection.pane_id) {
+                    rt.pin_selection(&mut selection, None);
+                } else {
+                    selection.content_revision = Some(0);
+                }
+            }
+            self.selection = Some(selection);
+        }
+    }
+
     pub(crate) fn update_selection_cursor(
         &mut self,
         terminal_runtimes: &TerminalRuntimeRegistry,
@@ -17,8 +45,16 @@ impl AppState {
             return;
         };
         let metrics = self.pane_scroll_metrics(terminal_runtimes, pane_id);
-        if let Some(selection) = self.selection.as_mut() {
-            selection.drag(screen_col, screen_row, info.inner_rect, metrics);
+        if let Some(mut selection) = self.selection.take() {
+            if let Some(runtime) = self.selection_runtime(terminal_runtimes, pane_id) {
+                runtime.pin_selection(
+                    &mut selection,
+                    Some((screen_col, screen_row, info.inner_rect)),
+                );
+            } else {
+                selection.drag(screen_col, screen_row, info.inner_rect, metrics);
+            }
+            self.selection = Some(selection);
         }
     }
 
@@ -329,3 +365,6 @@ mod autoscroll_tests {
         assert!(state.selection_autoscroll.is_none());
     }
 }
+
+#[cfg(test)]
+mod content_tests;

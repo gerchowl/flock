@@ -58,6 +58,8 @@
           flock-web = pkgs.callPackage ./nix/package.nix {
             buildCommit = self.rev or self.dirtyRev or null;
             withWeb = true;
+            # Until #1731 lands, missing assets receive the typed HTTP 503.
+            guiDist = self.packages.${system}.flock-client or null;
           };
           # The web client's production bundle (web/client/dist), built offline
           # from a fixed-output fetch of bun.lock (#1731). Only the bundle:
@@ -67,6 +69,9 @@
         {
           inherit flock flock-web flock-client;
           default = flock;
+        }
+        // lib.optionalAttrs pkgs.stdenv.hostPlatform.isDarwin {
+          flock-desktop = pkgs.callPackage ./nix/desktop.nix { inherit flock-client; };
         }
       );
 
@@ -141,6 +146,7 @@
           default = self.checks.${system}.flock;
         }
         // lib.optionalAttrs pkgs.stdenv.hostPlatform.isDarwin {
+          flock-desktop = self.packages.${system}.flock-desktop;
           macos-process-facts = pkgs.runCommand "flock-process-c-toolchain-check" {
             nativeBuildInputs = self.packages.${system}.default.nativeBuildInputs;
             SDKROOT = self.packages.${system}.default.SDKROOT;
