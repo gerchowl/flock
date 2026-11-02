@@ -73,6 +73,14 @@ _STRING_LITERAL = re.compile(r'"([^"\\]*)"')
 _PROSE_USER_AT_HOST = re.compile(
     r"(?<![/\w.-])[A-Za-z0-9._-]+@([A-Za-z0-9][A-Za-z0-9.-]{3,})\b"
 )
+# `name@latest`, `name@v1.2.3`, `name@1.0.0-rc.1`, `name@next`: a package-version
+# specifier (npm, uv, GitHub Actions refs), not `user@host`. Dependabot release
+# notes are full of them. Only a version-shaped or dist-tag-shaped part after the
+# `@` is excluded; `alice@buildhost` is still a login on a machine.
+_VERSION_SPEC = re.compile(
+    r"(?:v?\d[\w.+-]*|latest|next|canary|nightly|stable|beta|alpha|main|master|rc\d*)\Z",
+    re.IGNORECASE,
+)
 # Shapes that appear in documentation ABOUT this syntax rather than as a machine.
 # This is a vocabulary of placeholders, not a list of anything private.
 _PLACEHOLDER_HOSTS = {"host", "hostname", "machine", "example", "your-host", "yourhost"}
@@ -236,6 +244,8 @@ def check_free_text(
         # `user@host` is a host however it is spelled, so the bare form is fine
         # here — unlike a keyed field.
         for match in _PROSE_USER_AT_HOST.finditer(line):
+            if _VERSION_SPEC.match(match.group(1)):
+                continue
             if match.group(1).lower() not in _PLACEHOLDER_HOSTS:
                 seen.add(match.group(1))
         for match in _PROSE_TAILNET.finditer(line):
