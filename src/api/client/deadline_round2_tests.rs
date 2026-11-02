@@ -1,7 +1,7 @@
 //! Regression coverage for the server-work budgets and pre-dispatch refusal.
 use super::*;
 use crate::{
-    api::deadline::{DeadlineStream, SocketTimeout, OPERATION_MARGIN, REQUEST_TIMEOUT},
+    api::deadline::{SocketTimeout, OPERATION_MARGIN, REQUEST_TIMEOUT},
     test_support::TempDir,
 };
 use tokio::{
@@ -121,12 +121,18 @@ async fn full_backlog_mutation_is_pre_dispatch_timeout_exit_124() {
         method: Method::ServerStop(Default::default()),
     };
     // No invocation gate or request bytes: exercise the default mutating class.
+    let budget = Duration::from_millis(250);
     let mut worker = tokio::task::spawn_blocking(move || {
-        client.request_value_with_timeout(&request, Duration::ZERO)
+        let started = Instant::now();
+        let result = client.request_value_with_timeout(&request, budget);
+        (started.elapsed(), result)
     });
     let completion = tokio::time::timeout(CEILING, &mut worker).await;
-    let error = match completion {
-        Ok(result) => result.unwrap().unwrap_err(),
+    let (elapsed, error) = match completion {
+        Ok(result) => {
+            let (elapsed, result) = result.unwrap();
+            (elapsed, result.unwrap_err())
+        }
         Err(_) => {
             drop(_holders);
             drop(listener);
@@ -137,15 +143,11 @@ async fn full_backlog_mutation_is_pre_dispatch_timeout_exit_124() {
     let ApiClientError::Io(error) = error else {
         panic!("unexpected connect failure: {error}")
     };
+    assert!(
+        elapsed >= budget,
+        "connect failed before exhausting its budget: {elapsed:?}"
+    );
     assert_pre_dispatch(&error);
-    // An exhausted budget wins before connecting, including Darwin's immediate
-    // ECONNREFUSED on a full backlog. Linux EAGAIN must also be typed when
-    // observed with time remaining, independently of the host's native result.
-    assert_pre_dispatch(&DeadlineStream::connect_error(
-        &path,
-        Instant::now(),
-        io::ErrorKind::WouldBlock.into(),
-    ));
 }
 
 #[test]
@@ -159,20 +161,27 @@ fn completed_input_connect_uses_its_existing_absolute_deadline() {
         "id":"input-connect", "method":"pane.write_text", "params":{"pane_id":"w1:p1", "text":"brief"}
     })).unwrap();
     let (send, receive) = std::sync::mpsc::channel();
+    let budget = Duration::from_millis(250);
     let worker = std::thread::spawn(move || {
-        let _ = send.send(client.exchange_until(&request, Instant::now()));
+        let started = Instant::now();
+        let result = client.exchange_until(&request, started + budget);
+        let _ = send.send((started.elapsed(), result));
     });
     let completion = receive.recv_timeout(OPERATION_MARGIN);
     let on_time = completion.is_ok();
     drop(_holders);
     drop(listener);
-    let result = completion.unwrap_or_else(|_| {
+    let (elapsed, result) = completion.unwrap_or_else(|_| {
         receive
             .recv_timeout(OPERATION_MARGIN)
             .expect("closing the owned backlog must release connect")
     });
     worker.join().unwrap();
     assert!(on_time, "input connect exceeded its absolute deadline");
+    assert!(
+        elapsed >= budget,
+        "input connect failed before exhausting its budget: {elapsed:?}"
+    );
     let error = result.unwrap_err().into_error();
     let ApiClientError::Io(error) = error else {
         panic!("unexpected failure: {error}")

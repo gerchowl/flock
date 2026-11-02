@@ -134,12 +134,10 @@ impl DeadlineStream {
             dispatched: false,
         })
     }
-    /// A full listener backlog is a pre-dispatch timeout, including Linux EAGAIN.
+    /// Only an exhausted connect budget is a typed pre-dispatch timeout.
     pub(crate) fn connect_error(socket: &Path, started: Instant, error: io::Error) -> io::Error {
         match error.kind() {
-            io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock => {
-                Self::timeout_at(socket, started)
-            }
+            io::ErrorKind::TimedOut => Self::timeout_at(socket, started),
             _ => error,
         }
     }
