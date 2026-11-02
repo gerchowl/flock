@@ -740,7 +740,17 @@ class CheckedInManifestTests(unittest.TestCase):
         version = manifest["version"]
         self.assertNotEqual(version, NO_STABLE_RELEASE_VERSION)
         self.assertTrue(manifest["assets"])
-        for name, url in manifest["assets"].items():
+        for name, asset in manifest["assets"].items():
+            # A string is a bare URL; an object is {url, sha256} (#2081).
+            if isinstance(asset, str):
+                url = asset
+            else:
+                self.assertIsInstance(asset, dict, name)
+                url = asset.get("url")
+                self.assertIsInstance(url, str, name)
+                digest = asset.get("sha256")
+                self.assertIsInstance(digest, str, name)
+                self.assertRegex(digest, r"^[0-9a-f]{64}$", name)
             self.assertIn(f"/releases/download/v{version}/", url, name)
 
 
