@@ -346,7 +346,13 @@ impl App {
 
 /// Collect the peer's ancestor chain (bounded; refreshes one pid at a time).
 pub(super) fn peer_ancestor_chain(peer: u32) -> Vec<u32> {
-    let mut system = sysinfo::System::new();
+    let mut system = match sysinfo::System::new() {
+        Ok(system) => system,
+        Err(error) => {
+            crate::logging::system_information_unavailable("peer_ancestry", &error);
+            return vec![peer];
+        }
+    };
     let mut ancestors = Vec::with_capacity(16);
     let mut current = peer;
     for _ in 0..16 {

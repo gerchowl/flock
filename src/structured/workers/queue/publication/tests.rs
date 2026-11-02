@@ -433,17 +433,20 @@ struct Witness(parking_lot::RawMutex);
 // SAFETY: exclusion and guard semantics are delegated unchanged to RawMutex.
 unsafe impl parking_lot::lock_api::RawMutex for Witness {
     const INIT: Self = Self(<parking_lot::RawMutex as parking_lot::lock_api::RawMutex>::INIT);
-    type GuardMarker = <parking_lot::RawMutex as parking_lot::lock_api::RawMutex>::GuardMarker;
-    fn lock(&self) {
-        parking_lot::lock_api::RawMutex::lock(&self.0);
+    type Guard = <parking_lot::RawMutex as parking_lot::lock_api::RawMutex>::Guard;
+    fn lock(&self) -> Self::Guard {
+        parking_lot::lock_api::RawMutex::lock(&self.0)
     }
-    fn try_lock(&self) -> bool {
+    fn try_lock(&self) -> Option<Self::Guard> {
         parking_lot::lock_api::RawMutex::try_lock(&self.0)
     }
-    unsafe fn unlock(&self) {
+    fn is_locked(&self) -> bool {
+        parking_lot::lock_api::RawMutex::is_locked(&self.0)
+    }
+    unsafe fn unlock(&self, guard: Self::Guard) {
         // SAFETY: the lock_api guard guarantees its paired successful lock.
         unsafe {
-            parking_lot::lock_api::RawMutex::unlock(&self.0);
+            parking_lot::lock_api::RawMutex::unlock(&self.0, guard);
         }
         REGISTRATION_WITNESS.with(|w| {
             let observe = w.borrow_mut().take();
