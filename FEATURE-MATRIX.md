@@ -52,6 +52,7 @@ the full archive.
 | Test reliability | Producer liveness and condition evidence first, measured nextest hang ceilings across default and CI profiles, reproducible CI timing report | Accepted | ADR-0037 | #1317, #1314, #1334, #1342, #1349 |
 | Content-anchored selections | Runtime-owned terminal references follow scrolling and reflow; copy re-reads retained rows and visibly refuses invalid anchors | In review | ADR-0040 | #475, #2127 |
 | Durable work supervision | Stable work records, durable wake custody, bounded healthy-source waits and enrolled Tauri notification endpoints. Accepted design; no implementation claimed | Not implemented | ADR-0045 | #2718, #2733, #2734 |
+| State storage engine | Keep SQLite and local fsync; SlateDB not adopted now, with revisit triggers | Decided; no change | ADR-0046 | #2845 |
 
 **Multi-node GUI access (ADR-0043).** Accepted design; not implemented.
 The TLS home gateway supplies node status, destination grants without credential
