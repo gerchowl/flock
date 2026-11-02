@@ -56,7 +56,7 @@ enum Phase {
 #[derive(Default)]
 pub(crate) struct RestartRuntime {
     shutdowns: HashMap<TerminalId, tokio::sync::oneshot::Receiver<bool>>,
-    system: sysinfo::System,
+    system: Option<sysinfo::System>,
     samples: HashMap<TerminalId, Vitals>,
     sampled_at: Option<Instant>,
     ticked_at: Option<Instant>,
@@ -342,9 +342,12 @@ impl App {
             if !policy.enabled {
                 continue;
             }
+            let Some(system) = self.restarts.system.as_ref() else {
+                continue;
+            };
             let reason = policy.hard_reason(
                 v.rss,
-                self.restarts.system.available_memory(),
+                system.available_memory(),
                 !stopping && heaviest.as_ref() == Some(id),
                 v.spin_since
                     .map(|t| now.saturating_duration_since(t))
@@ -455,7 +458,21 @@ impl App {
     }
 
     fn sample_restart_vitals(&mut self, now: Instant) {
-        self.restarts.system.refresh_processes_specifics(
+        if self.restarts.system.is_none() {
+            match sysinfo::System::new() {
+                Ok(system) => self.restarts.system = Some(system),
+                Err(error) => {
+                    crate::logging::system_information_unavailable("restart_vitals", &error);
+                    self.restarts.samples.clear();
+                    self.restarts.sampled_at = Some(now);
+                    return;
+                }
+            }
+        }
+        let Some(system) = self.restarts.system.as_mut() else {
+            return;
+        };
+        system.refresh_processes_specifics(
             sysinfo::ProcessesToUpdate::All,
             true,
             sysinfo::ProcessRefreshKind::nothing()
@@ -463,7 +480,10 @@ impl App {
                 .with_cpu()
                 .with_cmd(sysinfo::UpdateKind::OnlyIfNotSet),
         );
-        self.restarts.system.refresh_memory();
+        system.refresh_memory();
+        let Some(system) = self.restarts.system.as_ref() else {
+            return;
+        };
         let mut samples = HashMap::new();
         for (id, terminal) in &self.state.terminals {
             if terminal.persisted_agent_session.is_none() {
@@ -479,7 +499,7 @@ impl App {
             // Walk the parent graph, including detached-session descendants.
             loop {
                 let before = pids.len();
-                for (pid, process) in self.restarts.system.processes() {
+                for (pid, process) in system.processes() {
                     let pid = pid.as_u32();
                     if !pids.contains(&pid)
                         && process.parent().is_some_and(|p| pids.contains(&p.as_u32()))
@@ -498,7 +518,7 @@ impl App {
             let mut cpu = 0.0;
             let mut processes = Vec::new();
             for pid in &pids {
-                if let Some(process) = self.restarts.system.process(sysinfo::Pid::from_u32(*pid)) {
+                if let Some(process) = system.process(sysinfo::Pid::from_u32(*pid)) {
                     rss = rss.saturating_add(process.memory());
                     cpu += process.cpu_usage();
                     let mut ancestor = Some(*pid);
@@ -507,9 +527,7 @@ impl App {
                         if parent == root {
                             break;
                         }
-                        let Some(node) =
-                            self.restarts.system.process(sysinfo::Pid::from_u32(parent))
-                        else {
+                        let Some(node) = system.process(sysinfo::Pid::from_u32(parent)) else {
                             break;
                         };
                         let args = node

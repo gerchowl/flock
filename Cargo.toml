@@ -79,7 +79,7 @@ unicode-width = "0.2"
 unicode-segmentation = "1.13.3"
 # Reuse termwiz's locked Unicode 17 categories for identity-format validation.
 finl_unicode = "1.4"
-sysinfo = "0.39.3"
+sysinfo = "0.40.0"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 toml_edit = "0.25.15"
 

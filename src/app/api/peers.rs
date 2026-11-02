@@ -957,9 +957,13 @@ fn compute_short_host_name() -> String {
     if let Some(name) = macos_local_host_name() {
         return name;
     }
-    sysinfo::System::host_name()
-        .map(|h| h.split('.').next().unwrap_or(&h).to_string())
-        .unwrap_or_else(|| "unknown".to_string())
+    match sysinfo::System::host_name() {
+        Ok(host) => host.split('.').next().unwrap_or(&host).to_string(),
+        Err(error) => {
+            crate::logging::system_information_unavailable("short_host_name", &error);
+            "unknown".to_string()
+        }
+    }
 }
 
 /// The `name` from config.toml, if set — the node's friendly self-label (#42).
