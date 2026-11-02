@@ -2,6 +2,53 @@
 
 ## Unreleased
 
+## [3.3.0] - 2026-11-02
+
+### Changed
+- Own native subscription tasks in App, sharing immutable generation-fenced frames with pure presentation state; detach releases readers without stopping the worker.
+- Buffer an incomplete queue replacement without copying the published frame; renderer and input dispatch remain separate slices.
+- Age node rows by the frame's envelope time instead of the browser's wall clock: each snapshot line now reaches the fleet stream's handler with its own `ts_ms`, and the fleet store stamps a node row with that time and a monotonic receipt time, so a node's age is `(ts_ms - last_ok)` plus the dwell since receipt (ADR-0043 `last_ok`, ADR-0038 §3, part of #1596).
+
+### Added
+- Render structured native placements from their immutable controller frames and S10c geometry; reject stale generations and display typed source failures without PTY fallback. Input routing follows separately.
+- Native structured panes route painted controls through generation-fenced typed intents. Tab/Shift-Tab and Enter activate controls, PageUp/PageDown and End navigate the transcript, and Ctrl-W detaches the pane without stopping its agent. Text and paste editing remain in the following composer slice.
+- Native controls preserve active sidebar and split drags through release, keep following the tail on PageDown, and highlight the whole selected control. Collapse and scroll state belong to the shared view driver.
+- Native structured panes submit the current composer with Enter or the painted Send control through the durable queue owner. Duplicate pending sends are refused; only the acknowledged draft is cleared, while refused or uncertain drafts are retained. Card Details expands the exact card and anchors its source cursor. Text and paste editing remain in the following composer slice.
+- Native structured permission cards accept Allow once and Deny from an authenticated local TUI attach with Operate authority, using process-bound app-session credentials revoked by detach, client exit or the existing 12-hour expiry.
+- Type Unicode directly into a native structured composer, edit by grapheme with Backspace and Left/Right, and press Enter to queue the current draft. Enter events marked as repeats never submit or activate a control. Click the composer to leave control selection; native paste explicitly refuses without changing the draft or queue until paste insertion ships (#2696, #1424).
+- Project authenticated peer observations and signed mesh routes into fleet node
+  status, using opaque NodeId aliases and the real chosen next hop. Metadata-only
+  changes and classified failures update the stream without disclosing SSH text.
+  Bind relay source proof at ingestion, reject relays from mismatched polls,
+  and prevent alias rebinding from authenticating old claims. Share one poll
+  instant across direct and relayed observations. Ignore third-party claims,
+  omit host-authored thermal labels, and leave unavailable home health unknown.
+  A healthy proven relay keeps a node online even when the direct link fails;
+  retain that link's classified failure separately in `link_diagnostics`.
+  Node rows always include this array, using `[]` when there are no diagnostics.
+  Retain last-known facts offline, and isolate retained owner facts across identity
+  changes (ADR-0043 N1b1, part of #2750 and #2721).
+  Expiry wakeups and proven inventory/unbound-peer counts follow in #2761; counts
+  remain unknown in this slice.
+- Add a macOS `flock-desktop` Nix flake package containing the client bundle in an ad-hoc signed `flock.app`, with hardened runtime and release hardening tests.
+
+### Maintenance
+- Exercise all five native structured-pane acceptance steps through an isolated TUI with a scripted model: streaming/tool rendering, composer and shell-pane sends, in-turn Allow once/Deny outcomes, and process/config cleanup including an MCP descendant that survives stdin EOF.
+- Give native structured composers an App-owned text revision and coherent driver projection. Send and durable acknowledgement clearing use that text identity: cursor movement preserves it, while editing away and back creates a new identity. Raw text entry follows in the next slice (#2696, #1424).
+
+### Fixed
+- Report a structured launch admitted without its native placement as a typed partial result (exit 1), preserving its agent ID for inspection, focus or stop.
+- Bind cached relay rows to the sender identity proven by their poll or enrolled
+  inbound edge. Refuse owner proof from mismatched poll identities, and prevent
+  alias rebinding from lending a new owner identity to old cached rows. A new
+  sender evicts rows from the previous sender. Share one poll observation instant
+  with its direct and relayed readings, so freshness ordering has no clock skew.
+- Revoke cached relay proof when its current binding disappears, including when
+  a failed pin-store read leaves no binding. Deliveries without a validated
+  sender retain only unproven observations and evict that alias's previously
+  proven relay rows.
+- Accept checksum asset objects (`{url, sha256}`) in the website-manifest tests so release manifest PRs stay green.
+
 ## [3.2.0] - 2026-10-30
 
 ### Maintenance

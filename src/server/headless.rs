@@ -1327,8 +1327,10 @@ impl HeadlessServer {
             let Some(runtime) = self.app.terminal_runtimes.get(terminal_id) else {
                 continue;
             };
-            let pending =
-                runtime.start_handoff_pause(Duration::from_secs(2), params.skip_undrained);
+            let pending = runtime.start_handoff_pause(
+                crate::server::handoff::PANE_DRAIN_TIMEOUT,
+                params.skip_undrained,
+            );
             started.push((terminal_id.clone(), *raw_pane_id, pending));
         }
         let mut paused_terminal_ids = Vec::new();
@@ -1676,7 +1678,7 @@ impl HeadlessServer {
 
     #[cfg(unix)]
     fn wait_then_restore_public_sockets_after_failed_handoff(&mut self) -> io::Result<()> {
-        let timeout = crate::server::handoff::COMMIT_TIMEOUT + Duration::from_secs(2);
+        let timeout = crate::server::handoff::ROLLBACK_SOCKET_TIMEOUT;
         wait_for_old_public_sockets_to_close(timeout)?;
         self.restore_public_sockets_after_failed_handoff()
     }
@@ -4312,6 +4314,9 @@ pub fn run_server(args: &[String], handoff_socket: Option<PathBuf>) -> io::Resul
             .or_else(|_| args.get(1).cloned().ok_or(std::env::VarError::NotPresent))
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "missing handoff token"))?;
         // Consume before starting threads or children, so panes cannot inherit it.
+        // Removal cannot scrub the kernel's startup-environment copy: process
+        // inspection can expose it for the server lifetime. The token is single-use
+        // and is dead after the handoff consumes it.
         std::env::remove_var(crate::server::handoff::HANDOFF_TOKEN_ENV);
         let token = zeroize::Zeroizing::new(token);
         return run_handoff_import_server(&socket_path, &token);

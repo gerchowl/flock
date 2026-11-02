@@ -219,6 +219,16 @@ fn secret_token_re() -> &'static Regex {
     })
 }
 
+/// API-key spelling shared by secret labels and long argument flags.
+pub(crate) const API_KEY_LABEL_PATTERN: &str = r"api[-_]?key";
+
+/// Share label suffixes while callers choose identifier and value boundaries.
+pub(crate) fn secret_label_pattern(prefix: &str) -> String {
+    format!(
+        r"{prefix}(?:authorization|bearer|token|password|passwd|secret|credentials?|cookie|session|{API_KEY_LABEL_PATTERN})"
+    )
+}
+
 fn labeled_secret_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
@@ -231,9 +241,10 @@ fn labeled_secret_re() -> &'static Regex {
         // at the first space, so `authorization: Bearer ab12…` masked only
         // "Bearer" and emitted the credential itself in the clear. Consume the
         // scheme and the token that follows it as one value.
-        Regex::new(
-            r"(?i)(?:^|[^A-Za-z0-9])(\w*(?:authorization|bearer|token|password|passwd|secret|credentials?|cookie|session|api[-_]?key))\s*[=:]\s*(?:(?:bearer|basic|digest|token)\s+)?\S+",
-        )
+        Regex::new(&format!(
+            r"(?i)(?:^|[^A-Za-z0-9])({})\s*[=:]\s*(?:(?:bearer|basic|digest|token)\s+)?\S+",
+            secret_label_pattern(r"\w*"),
+        ))
         .expect("static labeled-secret pattern")
     })
 }

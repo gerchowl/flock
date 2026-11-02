@@ -89,6 +89,16 @@ pub(crate) fn open_owner(path: &std::path::Path) -> io::Result<std::fs::File> {
     }
 }
 
+/// Inspect an existing ownership file without creating or changing it.
+/// Nonblocking open also prevents a malformed FIFO from stalling a client.
+pub(crate) fn read_owner(path: &std::path::Path) -> io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+}
+
 /// Nonblocking exclusive ownership, shared across duplicated handoff descriptors.
 /// Close the last descriptor to release it: explicit LOCK_UN would unlock successors.
 pub(crate) fn lock_owner(file: &std::fs::File) -> io::Result<()> {

@@ -1424,6 +1424,14 @@ without starting another worker. `StructuredAgentInfo.view` is the real
 stop its runtime. A resumed generation rebinds the same placement. Explicit
 workspace/tab/split selectors, `here`, labels and dry runs remain unsupported
 for structured starts. Native views allocate no PTY or terminal identity.
+A launch admitted before placement fails returns the typed result
+`structured_agent_started_unplaced {agent_id, generation, placement_error}`.
+The registered cause is in `placement_error.code`. CLI/MCP report exit 1 while
+preserving this result, since the launch remains owned and discoverable.
+Inspect `agent.get`, then focus or stop that ID; do not repeat start blindly.
+Duplicate native placements or invalid layout membership make `agent.get` and
+`agent.focus` refuse with `internal_error` without changing the layout.
+
 
 ### Queue item lifecycle facts
 

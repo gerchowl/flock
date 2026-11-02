@@ -13,6 +13,7 @@ pub(crate) mod peer;
 pub(crate) mod process_exit;
 pub(crate) mod received_fd;
 pub(crate) mod socket;
+pub(crate) mod socket_deadline;
 pub(crate) mod structured;
 pub(crate) mod suspend_clock;
 pub(crate) mod terminal_geometry;
