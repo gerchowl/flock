@@ -27,6 +27,8 @@
 //! That is a deliberate, tested deviation from "drop anything free-text"; the
 //! composed block is always previewed before it can be sent.
 
+pub(crate) mod argv;
+
 use std::sync::OnceLock;
 
 use regex::Regex;
@@ -222,51 +224,57 @@ fn secret_token_re() -> &'static Regex {
 /// API-key spelling shared by secret labels and long argument flags.
 pub(crate) const API_KEY_LABEL_PATTERN: &str = r"api[-_]?key";
 
-/// Share label suffixes while callers choose identifier and value boundaries.
+const QUALIFIED_KEY_PREFIXES: &[&str] = &["api", "access", "private", "secret"];
+
+const SECRET_LABEL_WORDS: &str =
+    "authorization|authentication|bearer|token|password|passwd|passphrase|secret|credentials?|cookie|session|signature";
+
+/// Argument labels and headers allow broad key/auth words. Report text uses
+/// qualified key labels, so ordinary key/auth diagnostic prose survives.
 pub(crate) fn secret_label_pattern(prefix: &str) -> String {
+    format!(r"{prefix}(?:{SECRET_LABEL_WORDS}|auth|key|{API_KEY_LABEL_PATTERN})")
+}
+
+fn report_label_pattern(prefix: &str) -> String {
     format!(
-        r"{prefix}(?:authorization|authentication|bearer|token|password|passwd|passphrase|secret|credentials?|cookie|session|auth|key|{API_KEY_LABEL_PATTERN})"
+        r"{prefix}(?:{SECRET_LABEL_WORDS}|(?:{})[-_]?key)",
+        QUALIFIED_KEY_PREFIXES.join("|")
     )
 }
 
-const CURL_SHORT_SECRET_OPTIONS: &str = "-[ub]";
-
-/// Credential option spellings shared by argv elements and embedded shell text.
-pub(crate) fn secret_option_pattern() -> String {
-    format!(
-        r"(?:--?[\w-]*{}[\w-]*|--user|{CURL_SHORT_SECRET_OPTIONS})",
-        secret_label_pattern("")
-    )
-}
-
-/// Apply assignment and option rules inside each argument, including shell text.
-/// Colon labels are handled by the header classifier to retain refspec boundaries.
+/// Apply shared option and assignment rules to explicit shell command text.
 pub(crate) fn mask_argv_text(value: &str) -> String {
+    mask_argv_assignments(&argv::mask_options(value))
+}
+
+/// Every argument uses assignment rules. Colon labels remain with the header
+/// classifier so refspec boundaries stay readable.
+pub(crate) fn mask_argv_assignments(value: &str) -> String {
     static ASSIGNMENT: OnceLock<Regex> = OnceLock::new();
-    static OPTION: OnceLock<Regex> = OnceLock::new();
-    let option = OPTION.get_or_init(|| {
-        Regex::new(&format!(
-            r#"(?i)(^|[\s;|&])({}(?:=|[ \t]+)|{CURL_SHORT_SECRET_OPTIONS})(?:"[^"]*"|'[^']*'|[^\s;|&<>]+)"#,
-            secret_option_pattern()
-        ))
-        .expect("static credential option pattern")
-    });
-    let masked = option.replace_all(value, "${1}${2}<redacted>");
     ASSIGNMENT
         .get_or_init(|| {
-            Regex::new(&labeled_secret_pattern("=", r"[^\s&;]+"))
-                .expect("static argv assignment pattern")
+            Regex::new(&labeled_secret_pattern(
+                &secret_label_pattern(r"[\w-]*"),
+                "=",
+                r"(?:\\[\s\S]|[^\s&;\\])+",
+            ))
+            .expect("static argv assignment pattern")
         })
-        .replace_all(&masked, "${1}${2}=<redacted>")
+        .replace_all(value, |captures: &regex::Captures<'_>| {
+            let label = &captures[2];
+            if label.starts_with('-') && !argv::named_secret_flag(label) {
+                captures[0].to_owned()
+            } else {
+                format!("{}{}=<redacted>", &captures[1], label)
+            }
+        })
         .into_owned()
 }
 
-fn labeled_secret_pattern(delimiters: &str, unquoted_value: &str) -> String {
+fn labeled_secret_pattern(labels: &str, delimiters: &str, unquoted_value: &str) -> String {
     format!(
         r#"(?i)(^|[^A-Za-z0-9])({})\\?["']?\s*[{}]\s*(?:\\?"[^"\n]*"|\\?'[^'\n]*'|(?:(?:bearer|basic|digest|token)\s+)?{})"#,
-        secret_label_pattern(r"[\w-]*"),
-        delimiters,
-        unquoted_value,
+        labels, delimiters, unquoted_value,
     )
 }
 
@@ -282,7 +290,12 @@ fn labeled_secret_re() -> &'static Regex {
         // at the first space, so `authorization: Bearer ab12…` masked only
         // "Bearer" and emitted the credential itself in the clear. Consume the
         // scheme and the token that follows it as one value.
-        Regex::new(&labeled_secret_pattern("=:", r"\S+")).expect("static labeled-secret pattern")
+        Regex::new(&labeled_secret_pattern(
+            &report_label_pattern(r"[\w-]*"),
+            "=:",
+            r"(?:\\[\s\S]|\S)+",
+        ))
+        .expect("static labeled-secret pattern")
     })
 }
 
@@ -585,9 +598,21 @@ mod tests {
     }
 
     #[test]
-    fn credential_vocabulary_is_shared_by_labels_and_option_patterns() {
+    fn review_2868_report_scope_preserves_ordinary_key_and_auth_labels() {
+        for value in [
+            "primary key: id",
+            "hotkey: ctrl-a",
+            "monkey=banana",
+            "auth: ok",
+        ] {
+            assert_eq!(mask_credentials(value), value);
+            assert_eq!(Scrubber::new(None, None).scrub(value), value);
+        }
+    }
+
+    #[test]
+    fn credential_vocabulary_respects_surface_scope() {
         let secret = ["fixture2868", "credential"].join("-");
-        let options = Regex::new(&format!("(?i)^{}$", secret_option_pattern())).unwrap();
         for word in [
             "auth",
             "authentication",
@@ -607,14 +632,24 @@ mod tests {
             "api_key",
         ] {
             for dash in ["-", "--"] {
-                assert!(options.is_match(&format!("{dash}{word}")), "{word}");
+                let program = if dash == "-" { "tool" } else { "curl" };
+                assert!(
+                    argv::option_value(&format!("{dash}{word}"), program == "curl").is_some(),
+                    "{word}"
+                );
                 for delimiter in ['=', ' '] {
-                    let masked = mask_argv_text(&format!("curl {dash}{word}{delimiter}{secret}"));
+                    let masked =
+                        mask_argv_text(&format!("{program} {dash}{word}{delimiter}{secret}"));
                     assert!(!masked.contains(&secret), "{masked}");
                 }
             }
-            let masked = mask_credentials(&format!("{word}: {secret}"));
-            assert!(!masked.contains(&secret), "{masked}");
+            let labelled = format!("{word}: {secret}");
+            let masked = mask_credentials(&labelled);
+            if matches!(word, "auth" | "key") {
+                assert_eq!(masked, labelled);
+            } else {
+                assert!(!masked.contains(&secret), "{masked}");
+            }
         }
     }
 
@@ -644,6 +679,7 @@ mod tests {
             format!(r#"{{"Authorization": "Bearer {first}"}}"#),
             format!("token={first};{second}"),
             format!("token={first}<{second}>"),
+            format!("token={first}\\ {second}"),
         ] {
             let masked = mask_credentials(&text);
             assert!(!masked.contains(&first), "{masked}");

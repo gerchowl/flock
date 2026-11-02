@@ -1556,7 +1556,7 @@ are deferred to S6 (#1429); this types slice names the contracts only.
   these characters can leave a password prefix visible. This backstop cannot
   replace keeping credentials in stdin or the environment.
   Query, fragment and semicolon parameter names containing a full credential
-  label (shared with the report scrubber), or `code`, `key`, `auth`, `pwd`,
+  argument/header label, or `code`, `key`, `auth`, `pwd`,
   `jwt` or `signature`, have their values masked
   even when the label is mid-name, such as `api_key_v2` or `token_type`.
   This intentionally also masks false positives such as `keyboard`, `monkey`,
@@ -1564,7 +1564,8 @@ are deferred to S6 (#1429); this types slice names the contracts only.
   matches only the complete name, preserving ordinary `design` parameters.
   Credential header names include `Authentication`, standard credential headers,
   API-key names and any hyphenated name with a credential-label segment
-  (for example `X-Access-Key` or `Ocp-Apim-Subscription-Key`). These names
+  (for example `X-Access-Key`, `Ocp-Apim-Subscription-Key`, `X-Signature`
+  or `X-Hub-Signature-256`). These names
   allow horizontal whitespace before `:` and mask values even without space
   after it, including names glued to curl's `-H` option or a short-flag
   cluster ending in uppercase `H`, such as `-sSLH`, `-4H`, `-0sH`, `-#H`
@@ -1589,11 +1590,32 @@ are deferred to S6 (#1429); this types slice names the contracts only.
   promote earlier values into a retained label.
   JSON-quoted header names allow a closing quote before the colon. Labels
   followed by `=` are scrubbed in every argument, including shell command text.
-  Flags share the label vocabulary (`passwd`, `passphrase`, `authorization`,
-  `bearer`, `auth`, `key` and the other credential words), including single-dash
-  Go-style options. Curl `-u`/`--user`, `--oauth2-bearer` and `-b`/`--cookie`
-  consume credential values, also within shell command text. Glued non-option
-  prefixes such as `SECRET-HAuthorization` are conservatively masked as labels.
+  A backslash-escaped space belongs to the value and cannot expose its suffix.
+  Named flags match whole hyphen/underscore segments of the shared credential
+  vocabulary, including single-dash Go-style options. Key labels in compound
+  flags require a credential qualifier (`api`, `access`, `private` or `secret`),
+  so `--ssh-key-path`, `--hotkey`, `--keys`, `--keyring` and `--author` retain
+  their diagnostic values. Negated and known boolean prefixes (`no-`,
+  `disable-`, `enable-`, `show-`) never consume a following value.
+  Curl credential aliases (`-u`, `-b`, `-U`, `--user`, `--cookie`,
+  `--proxy-user`, `--oauth2-bearer`) apply only when the program's basename is
+  `curl`. The same classifier handles curl commands inside shell text. This
+  program rule avoids guessing from value contents: `git worktree add -b`,
+  `git push -u`, `git add -u` and `sort -u` remain readable even when their
+  values resemble credentials. Labelled assignments and token-shaped secrets
+  are still scrubbed independently. Short options are case-sensitive and
+  clusters follow the [curl option rules](https://curl.se/docs/manpage.html#options):
+  the first argument-taking letter owns the remainder, or the next argument.
+  A public option such as `-A` therefore prevents a later `u` in its value from
+  being interpreted as a credential switch. Quote and escape handling retains
+  raw value spans for masking; executed command text is never reconstructed.
+  The report/stderr scrubber uses the shared strong credential vocabulary
+  (`authorization`, `token`, `password`, `signature`, and the other credential
+  words), plus qualified `api_key`, `access_key`, `secret_key` and `private_key`
+  names. Bare `auth` and `key` are specific to argument/header labels and are
+  excluded from report prose: `primary key: id`, `hotkey: ctrl-a`,
+  `monkey=banana` and `auth: ok` stay visible. Glued non-option prefixes such
+  as `SECRET-HAuthorization` remain conservatively masked as header labels.
   These rules shape diagnostic logs only; executed argv is never rewritten.
   The token then travels in the unchanged normal `hello` frame.
   The served client derives its server and transport from its own location
