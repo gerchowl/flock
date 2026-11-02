@@ -56,7 +56,7 @@ libc = "0.2"
 # OS entropy for mesh node keys, server-minted ULIDs and collection capabilities.
 getrandom = "0.4"
 # Timed lease-table reads: short contention must not deny all API callers.
-parking_lot = "0.12"
+parking_lot = "0.13"
 portable-pty = "0.9"
 # Debug builds must exercise the same embedded bytes as release builds.
 rust-embed = { version = "8", optional = true, features = ["debug-embed", "deterministic-timestamps"] }
