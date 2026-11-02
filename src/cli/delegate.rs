@@ -266,11 +266,6 @@ impl fmt::Display for BoundedError {
 /// - 2 s: every poll, get, and list.
 fn cap_for(method: &Method) -> Duration {
     match method {
-        Method::WorktreeCreate(_)
-        | Method::WorktreeKill(_)
-        | Method::WorkspaceCreate(_)
-        | Method::WorkspaceClose(_)
-        | Method::AgentStart(_) => Duration::from_secs(60),
         Method::PaneSubmit(_) => crate::api::client::SUBMIT_CAP,
         Method::PaneResolveCodexLock(_)
         | Method::PaneSendInput(_)
@@ -279,7 +274,7 @@ fn cap_for(method: &Method) -> Duration {
         | Method::PaneWriteInput(_)
         | Method::PaneWriteKeys(_)
         | Method::PaneWriteText(_) => Duration::from_secs(10),
-        _ => REQUEST_TIMEOUT,
+        _ => crate::api::deadline::operation_timeout(method, REQUEST_TIMEOUT),
     }
 }
 
@@ -329,7 +324,9 @@ fn bounded(method: Method, deadline: Option<Instant>) -> Result<serde_json::Valu
     // Retried with backoff on a transient socket error, reads only, and never
     // past the deadline (#910): under load a 2 s poll times out as EAGAIN while
     // the server is alive, and one of those used to fail the whole verb.
-    let client = ApiClient::local();
+    let client = ApiClient::local().with_class(crate::api::client::RequestClass::for_method(
+        &request.method,
+    ));
     let response = if RETRIES.get() {
         client.request_value_retrying(&request, timeout, deadline)
     } else {
@@ -1756,6 +1753,9 @@ fn place(name: &str, flags: &StartFlags, mode: Mode) -> Result<Placement, i32> {
             ))
         }
         Err(BoundedError::Transport(e)) => {
+            if let Some(code) = super::outcome_unknown(&e) {
+                return Err(code);
+            }
             return Err(teardown_after_place_failure(
                 name,
                 worktrees_before.as_deref(),
@@ -1763,7 +1763,7 @@ fn place(name: &str, flags: &StartFlags, mode: Mode) -> Result<Placement, i32> {
                 flags,
                 &repo,
                 CreateFailure::Transport(e.kind()),
-            ))
+            ));
         }
     };
 
