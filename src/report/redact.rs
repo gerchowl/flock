@@ -50,6 +50,8 @@ const ALLOWED_FIELDS: &[&str] = &[
     "pid",
     "attempt",
     "count",
+    "byte_count",
+    "failure_code",
     "lines",
     "kind",
     "state",

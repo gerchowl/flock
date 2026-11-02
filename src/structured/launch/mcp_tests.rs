@@ -24,7 +24,7 @@ fn lease(fixture: &Fixture) -> super::super::lease::Lease {
 }
 
 #[test]
-fn session_1441_registration_is_exact_pinned_and_credential_free() {
+fn session_1734_registration_is_pinned_and_carries_only_the_lease_credential() {
     let fixture = Fixture::new();
     let profile = fixture.profile("mcp-config", "2.1.296");
     let lease = lease(&fixture);
@@ -35,7 +35,7 @@ fn session_1441_registration_is_exact_pinned_and_credential_free() {
         registration(&profile),
         serde_json::json!({"mcpServers":{"flock":{
             "type":"stdio", "command":fixture.root.path().join("claude").canonicalize().unwrap(),
-            "args":["mcp","serve"], "env":{"FLOCK_SOCKET_PATH":fixture.root.path().join("api.sock")}
+            "args":["mcp","serve","--structured"], "env":{"FLOCK_SOCKET_PATH":fixture.root.path().join("api.sock"),"FLOCK_MCP_LEASE_CREDENTIAL":lease.credential()}
         }}})
     );
     let raw = fs::read_to_string(mcp_path(&profile)).unwrap();

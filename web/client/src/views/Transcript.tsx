@@ -2,7 +2,9 @@
  * The transcript view: one session stream rendered as a list of events
  * (G1; ADR-0038 §4).
  *
- * It subscribes through a {@link Transport}, so the same view runs on the
+ * It reads the stream from the session store (`store/sessions.ts`, ADR-0038
+ * §3), which subscribes through a {@link Transport} and owns the entries; the
+ * view keeps no copy and opens no subscription. So the same view runs on the
  * fixture replay now and on G3's wire adapter later. It derives presentation
  * only (ADR-0038 §3): labels, collapse and layout, never agent state.
  *
@@ -14,19 +16,27 @@
  * expands on demand, and all but the last {@link VISIBLE_TURNS} turns fold
  * into one "N earlier turns" control.
  *
+ * Canonical permission facts present each request once; native control twins
+ * with the same request_id fold away (ADR-0038 §4, #2559). Raw event counts and
+ * cursor callbacks still include both facts. Uncorrelated natives remain visible.
+ *
+ * Replay is linear (#1782): the store folds each entry into the last turn as it
+ * arrives (`foldEntry`), and only the unfolded turns are read to
+ * render, so a long history costs O(1) per entry, not a regroup of it all.
+ *
  * Known limits, left to ADR-0036's S9a and S18 (tracked in #1307): no
  * virtualisation, no in-flight streaming block; stream deltas are listed as
  * their own rows.
  *
  * @module
  */
-import { ErrorBoundary, For, Match, Show, Switch, createMemo, createSignal, onCleanup, type JSX } from "solid-js";
-import { createStore } from "solid-js/store";
+import { ErrorBoundary, For, Match, Show, Switch, createSignal, onCleanup, type JSX } from "solid-js";
 
 import type { JsonValue } from "../gen/serde_json/JsonValue";
 import type { KnownSessionEvent } from "../gen/KnownSessionEvent";
 import type { SessionEntry, SessionStream, Transport, TransportFailure } from "../transport";
-import { groupTurns, type ToolRun, type Turns } from "./turns";
+import { sessionStore } from "../store/sessions";
+import { type ToolRun, type TurnFold } from "./turns";
 import { UnknownBlock } from "./UnknownBlock";
 
 /**
@@ -67,8 +77,6 @@ const WORDING = {
   live: { loading: "Loading history…", synced: () => "Up to date", failed: "Couldn't load this agent's history" },
 } as const;
 
-type Progress = { readonly phase: "replaying" | "synced" } | { readonly phase: "failed"; readonly failure: TransportFailure };
-
 function json(value: JsonValue | undefined): string {
   return JSON.stringify(value, null, 2) ?? "";
 }
@@ -76,6 +84,8 @@ function json(value: JsonValue | undefined): string {
 /** A one-line label from the catalogue discriminators. */
 function label(event: KnownSessionEvent): string {
   switch (event.type) {
+    case "flk_permission_request":
+      return event.state === "open" ? `Permission request · ${event.request.tool_name}` : "Permission request closed";
     case "assistant":
       return "Assistant";
     case "user":
@@ -126,7 +136,7 @@ function ToolRunLine(props: { readonly run: ToolRun }): JSX.Element {
 }
 
 /** One content block of an API message. */
-function ContentBlock(props: { readonly block: JsonValue; readonly turns: Turns }): JSX.Element {
+function ContentBlock(props: { readonly block: JsonValue; readonly turns: TurnFold }): JSX.Element {
   const block = props.block;
   if (typeof block !== "object" || block === null || Array.isArray(block)) {
     throw new Error("content block is not an object");
@@ -136,15 +146,15 @@ function ContentBlock(props: { readonly block: JsonValue; readonly turns: Turns 
       return <p class="text">{String(block["text"] ?? "")}</p>;
     case "tool_use": {
       const id = block["id"];
-      const run = typeof id === "string" ? props.turns.runs.get(id) : undefined;
-      if (typeof id === "string" && run !== undefined) return <ToolRunLine run={props.turns.runs.get(id) ?? run} />;
+      const run = typeof id === "string" ? props.turns.runs[id] : undefined;
+      if (typeof id === "string" && run !== undefined) return <ToolRunLine run={props.turns.runs[id] ?? run} />;
       return <Collapsed title={`Tool · ${String(block["name"] ?? "?")}`} body={json(block["input"])} />;
     }
     case "tool_result": {
       const content = block["content"];
       const title = block["is_error"] === true ? "Tool result · error" : "Tool result";
       return (
-        <Show when={!props.turns.absorbed.has(String(block["tool_use_id"]))}>
+        <Show when={props.turns.absorbed[String(block["tool_use_id"])] !== true}>
           <Collapsed title={title} body={typeof content === "string" ? content : json(content)} />
         </Show>
       );
@@ -157,14 +167,14 @@ function ContentBlock(props: { readonly block: JsonValue; readonly turns: Turns 
 }
 
 /** An API message's content: a string or an array of blocks. */
-function MessageContent(props: { readonly message: { readonly [key: string]: JsonValue }; readonly turns: Turns }): JSX.Element {
+function MessageContent(props: { readonly message: { readonly [key: string]: JsonValue }; readonly turns: TurnFold }): JSX.Element {
   const content = props.message["content"];
   if (typeof content === "string") return <p class="text">{content}</p>;
   if (!Array.isArray(content)) throw new Error("message content is neither text nor blocks");
   return <For each={content}>{(block) => <ContentBlock block={block} turns={props.turns} />}</For>;
 }
 
-function KnownEvent(props: { readonly event: KnownSessionEvent; readonly turns: Turns }): JSX.Element {
+function KnownEvent(props: { readonly event: KnownSessionEvent; readonly turns: TurnFold }): JSX.Element {
   const event = props.event;
   return (
     <article class={`event event--${event.type}`} data-testid="known-event">
@@ -180,7 +190,7 @@ function KnownEvent(props: { readonly event: KnownSessionEvent; readonly turns: 
   );
 }
 
-function Entry(props: { readonly entry: SessionEntry; readonly turns: Turns }): JSX.Element {
+function Entry(props: { readonly entry: SessionEntry; readonly turns: TurnFold }): JSX.Element {
   const entry = props.entry;
   if (entry.kind === "unknown") return <UnknownBlock input={entry.unknown} />;
   if (entry.kind === "gap") {
@@ -199,31 +209,19 @@ function Entry(props: { readonly entry: SessionEntry; readonly turns: Turns }): 
 
 /** Renders a session stream from its first entry, as the transport delivers it. */
 export function Transcript(props: TranscriptProps): JSX.Element {
-  const [entries, setEntries] = createStore<SessionEntry[]>([]);
-  const [progress, setProgress] = createSignal<Progress>({ phase: "replaying" });
-  props.onCurrent?.(false);
-  const subscription = props.transport.subscribe(props.stream, null, {
-    entry: (entry) => {
-      setEntries(entries.length, entry);
-      props.onEntry?.(entry.seq, userText(entry));
-    },
-    reset: () => setEntries([]),
-    synced: () => {
-      setProgress({ phase: "synced" });
-      props.onCurrent?.(true);
-    },
-    failed: (failure) => setProgress({ phase: "failed", failure }),
+  // The store owns the entries, the turn fold and the progress; this view reads them (ADR-0038 §3).
+  const stream = sessionStore(props.transport).read(props.stream, {
+    entry: (entry) => props.onEntry?.(entry.seq, userText(entry)),
+    current: (current) => props.onCurrent?.(current),
   });
-  onCleanup(subscription.close);
+  onCleanup(stream.release);
+  const { turns, count, progress } = stream;
   const failure = (): TransportFailure | undefined => {
     const current = progress();
     return current.phase === "failed" ? current.failure : undefined;
   };
-  const turns = createMemo(() => groupTurns(entries));
   const [unfolded, setUnfolded] = createSignal(false);
-  const folded = (): number => (unfolded() ? 0 : Math.max(0, turns().turns.length - VISIBLE_TURNS));
-  // Keyed by each turn's first seq, so appends keep mounted turns (and an open tool run) as they are.
-  const keys = createMemo(() => turns().turns.map((turn) => turn.key));
+  const folded = (): number => (unfolded() ? 0 : Math.max(0, turns.turns.length - VISIBLE_TURNS));
   return (
     <section class="transcript" aria-label="Transcript">
       <Show when={folded() > 0}>
@@ -231,10 +229,11 @@ export function Transcript(props: TranscriptProps): JSX.Element {
           {folded()} earlier {folded() === 1 ? "turn" : "turns"}
         </button>
       </Show>
-      <For each={keys().slice(folded())}>
-        {(key) => (
+      {/* Only the unfolded turns are read. A turn keeps its identity as it grows, so appends keep it (and an open tool run) mounted. */}
+      <For each={turns.turns.slice(folded())}>
+        {(turn) => (
           <div class="turn" data-testid="turn">
-            <For each={turns().byKey.get(key)?.entries ?? []}>{(entry) => <Entry entry={entry} turns={turns()} />}</For>
+            <For each={turn.entries}>{(entry) => <Show when={entry}>{(shown) => <Entry entry={shown()} turns={turns} />}</Show>}</For>
           </div>
         )}
       </For>
@@ -244,7 +243,7 @@ export function Transcript(props: TranscriptProps): JSX.Element {
         </Match>
         <Match when={progress().phase === "synced"}>
           <p class="transcript__status" data-testid="transcript-synced">
-            {WORDING[props.source].synced(entries.length)}
+            {WORDING[props.source].synced(count())}
           </p>
         </Match>
       </Switch>

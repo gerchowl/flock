@@ -1,0 +1,1 @@
+default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self' ws://LISTENER/v1/ws; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'

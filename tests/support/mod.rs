@@ -14,8 +14,10 @@ pub mod composer;
 pub mod fleet;
 pub mod json_api;
 pub mod paths;
+pub mod process_lifetime;
 pub mod process_table;
 pub mod readiness;
+pub mod sandboxes;
 pub mod scripted;
 pub mod server_startup;
 pub mod socket_dir;
@@ -255,7 +257,7 @@ pub fn frame_message(payload: &[u8]) -> Vec<u8> {
 /// means a protocol bump touches one line rather than the dozen call sites
 /// that used to hardcode the number — which is how a bump used to fail a
 /// terminal-size test for reasons that had nothing to do with terminal sizes.
-pub const PROTOCOL_VERSION: u32 = 31;
+pub const PROTOCOL_VERSION: u32 = 32;
 
 /// The live-handoff refusal notice a server sends a connecting client while a
 /// live update is in flight (#38). A client that reads it opens its retry
