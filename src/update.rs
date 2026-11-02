@@ -3412,6 +3412,19 @@ mod tests {
         assert_eq!(release.sha256.as_deref(), Some("deadbeef"));
     }
 
+    /// Checksummed (object-form) assets must carry a 64-lowercase-hex digest.
+    fn assert_sha256_if_present(label: &str, sha256: Option<&str>) {
+        if let Some(digest) = sha256 {
+            assert!(
+                digest.len() == 64
+                    && digest
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+                "bad sha256 for {label}: {digest}"
+            );
+        }
+    }
+
     #[test]
     fn checked_in_website_manifest_matches_update_schema() {
         let manifest: UpdateManifest = serde_json::from_str(include_str!("../website/latest.json"))
@@ -3435,11 +3448,12 @@ mod tests {
             "macos-x86_64",
             "macos-aarch64",
         ] {
-            let url = &manifest
+            let asset = manifest
                 .assets
                 .get(target)
-                .unwrap_or_else(|| panic!("missing asset URL for {target}"))
-                .url;
+                .unwrap_or_else(|| panic!("missing asset URL for {target}"));
+            assert_sha256_if_present(target, asset.sha256());
+            let url = asset.url();
             assert!(
                 url.contains(&format!("/releases/download/v{}/", manifest.version)),
                 "unexpected release URL for {target}: {url}"
@@ -3461,10 +3475,16 @@ mod tests {
                 "macos-x86_64",
                 "macos-aarch64",
             ] {
-                let url = assets
-                    .get(target)
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or_else(|| panic!("missing asset URL for {version} {target}"));
+                // Same string-or-object parse path the updater uses.
+                let asset: AssetRef = serde_json::from_value(
+                    assets
+                        .get(target)
+                        .unwrap_or_else(|| panic!("missing asset for {version} {target}"))
+                        .clone(),
+                )
+                .unwrap_or_else(|e| panic!("bad asset for {version} {target}: {e}"));
+                assert_sha256_if_present(&format!("{version} {target}"), asset.sha256());
+                let url = asset.url();
                 assert!(
                     url.contains(&format!("/releases/download/v{version}/")),
                     "unexpected release URL for {version} {target}: {url}"
