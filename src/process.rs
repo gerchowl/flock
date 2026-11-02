@@ -748,7 +748,7 @@ fn shape_args(command: &Command) -> String {
     let shell = crate::report::redact::argv::is_shell(&program);
     let mut script_next = false;
     let mut script_seen = false;
-    let mut pending = None;
+    let mut pending: Option<crate::report::redact::argv::OptionValue> = None;
     let mut options = true;
     for arg in command.get_args() {
         if !buf.is_empty() {
@@ -761,35 +761,37 @@ fn shape_args(command: &Command) -> String {
             && arg.starts_with('-')
             && !arg.starts_with("--")
             && arg[1..].contains('c');
-        let option = options
-            .then(|| crate::report::redact::argv::option_value(&arg, curl))
-            .flatten();
+        let option = crate::report::redact::argv::option_value(&arg, curl && options);
         if script {
             script_seen = true;
             script_next = false;
             buf.push_str(&redact_arg(&crate::report::redact::mask_argv_text(&arg)));
-        } else if let Some(secret) = pending.take() {
-            if secret {
+        } else if let Some(previous) = pending.take() {
+            if previous.masks(&arg) {
                 buf.push_str("<redacted>");
-                pending = option
-                    .filter(|value| value.attached.is_none())
-                    .map(|value| value.secret);
+                pending = option.filter(|value| value.attached.is_none());
             } else {
-                buf.push_str(&redact_arg(&arg));
+                buf.push_str(&redact_arg(
+                    &crate::report::redact::argv::mask_nested_options(&arg),
+                ));
             }
         } else if let Some(option) = option {
-            if let Some(start) = option.attached.filter(|_| option.secret) {
+            if let Some(start) = option.attached.filter(|start| option.masks(&arg[*start..])) {
                 buf.push_str(&arg[..start]);
                 buf.push_str("<redacted>");
             } else {
-                pending = option.attached.is_none().then_some(option.secret);
-                buf.push_str(&redact_arg(&arg));
+                pending = option.attached.is_none().then_some(option);
+                buf.push_str(&redact_arg(
+                    &crate::report::redact::argv::mask_nested_options(&arg),
+                ));
             }
         } else {
             if arg == "--" {
                 options = false;
             }
-            buf.push_str(&redact_arg(&arg));
+            buf.push_str(&redact_arg(
+                &crate::report::redact::argv::mask_nested_options(&arg),
+            ));
         }
         if buf.len() >= MAX_ARG_LOG_CHARS {
             break;
@@ -976,6 +978,64 @@ mod tests {
         logged_program_fixture_args("curl", args)
     }
 
+    // Each case runs through the real process.exec emitter with an inert fixture.
+    macro_rules! value_shape_regression {
+        ($name:ident, $prefix:expr, $suffix:expr) => {
+            #[test]
+            fn $name() {
+                let secret = ["round3", "fixture", "credential"].join("-");
+                let credentials = format!("a:{secret}");
+                let script = [$prefix, credentials.as_str(), $suffix].join("");
+                let logged = logged_program_fixture_args("sh", &["-c".to_owned(), script]);
+                assert!(!logged.contains(&secret), "{logged}");
+            }
+        };
+    }
+
+    value_shape_regression!(shape_2868_env, "env curl -u ", "");
+    value_shape_regression!(shape_2868_sudo, "sudo curl -u ", "");
+    value_shape_regression!(shape_2868_nice, "nice curl -u ", "");
+    value_shape_regression!(shape_2868_xcrun, "xcrun curl -u ", "");
+    value_shape_regression!(shape_2868_timeout, "timeout 5 curl -u ", "");
+    value_shape_regression!(shape_2868_command, "command curl -u ", "");
+    value_shape_regression!(shape_2868_exec, "exec curl -u ", "");
+    value_shape_regression!(shape_2868_noglob, "noglob curl -u ", "");
+    value_shape_regression!(shape_2868_exe, "curl.exe -u ", "");
+    value_shape_regression!(shape_2868_variable, "$CURL -u ", "");
+    value_shape_regression!(shape_2868_docker, "docker exec c curl -u ", "");
+    value_shape_regression!(shape_2868_ssh, "ssh example.com \"curl -u ", "\"");
+    value_shape_regression!(shape_2868_if, "if true; then curl -u ", "; fi");
+    value_shape_regression!(shape_2868_group, "{ curl -u ", "; }");
+    value_shape_regression!(shape_2868_backticks, "echo `curl -u ", "`");
+    value_shape_regression!(shape_2868_bash_separator, "bash -c -- 'curl -u ", "'");
+    value_shape_regression!(shape_2868_user_equals, "tool --user=", "");
+    value_shape_regression!(shape_2868_proxy_equals, "tool --proxy-user=", "");
+    value_shape_regression!(shape_2868_short_equals, "tool -u=", "");
+    value_shape_regression!(shape_2868_proxy_short, "tool -U ", "");
+    value_shape_regression!(shape_2868_cluster, "tool -sSu ", "");
+    value_shape_regression!(shape_2868_cluster_equals, "tool -ku=", "");
+
+    macro_rules! option_shape_regression {
+        ($name:ident, $flag:expr, $prefix:expr) => {
+            #[test]
+            fn $name() {
+                let secret = ["round3", "fixture", "credential"].join("-");
+                let value = format!("{}{}", $prefix, secret);
+                let logged = logged_fixture_args(&[$flag.to_owned(), value.clone()]);
+                assert!(!logged.contains(&secret), "{logged}");
+                let logged = logged_fixture_args(&[format!("{}={value}", $flag)]);
+                assert!(!logged.contains(&secret), "{logged}");
+            }
+        };
+    }
+
+    option_shape_regression!(shape_2868_user_file, "-u", "@");
+    option_shape_regression!(shape_2868_proxy_file, "--proxy-user", "@");
+    option_shape_regression!(shape_2868_cookie_short, "-b", "sid=");
+    option_shape_regression!(shape_2868_cookie_file, "--cookie", "@");
+    option_shape_regression!(shape_2868_cookie_cluster, "-sSb", "sid=");
+    option_shape_regression!(shape_2868_bearer, "--oauth2-bearer", "");
+
     #[test]
     fn review_2868_curl_clusters_mask_values() {
         let secret = ["review2868", "credential"].join("-");
@@ -1076,7 +1136,13 @@ mod tests {
             for value in ["ordinary", "user:ordinary", "token=ordinary"] {
                 let masked = shaped_for("git", &[alias, value]);
                 // Labelled assignments are still independently scrubbed.
-                let expected = if value == "token=ordinary" {
+                let credential = alias == "--oauth2-bearer"
+                    || (matches!(alias, "-b" | "--cookie") && value.contains('='))
+                    || (matches!(alias, "-u" | "-U" | "--user" | "--proxy-user")
+                        && value.contains(':'));
+                let expected = if credential {
+                    "<redacted>"
+                } else if value == "token=ordinary" {
                     "token=<redacted>"
                 } else {
                     value

@@ -1597,25 +1597,31 @@ are deferred to S6 (#1429); this types slice names the contracts only.
   so `--ssh-key-path`, `--hotkey`, `--keys`, `--keyring` and `--author` retain
   their diagnostic values. Negated and known boolean prefixes (`no-`,
   `disable-`, `enable-`, `show-`) never consume a following value.
-  Curl credential aliases (`-u`, `-b`, `-U`, `--user`, `--cookie`,
-  `--proxy-user`, `--oauth2-bearer`) apply only when the program's basename is
-  `curl`. The same classifier handles curl commands inside shell text. This
-  program rule avoids guessing from value contents: `git worktree add -b`,
-  `git push -u`, `git add -u` and `sort -u` remain readable even when their
-  values resemble credentials. Labelled assignments and token-shaped secrets
-  are still scrubbed independently. Short options are case-sensitive and
-  clusters follow the [curl option rules](https://curl.se/docs/manpage.html#options):
-  the first argument-taking letter owns the remainder, or the next argument.
-  A public option such as `-A` therefore prevents a later `u` in its value from
-  being interpreted as a credential switch. Quote and escape handling retains
-  raw value spans for masking; executed command text is never reconstructed.
-  The report/stderr scrubber uses the shared strong credential vocabulary
-  (`authorization`, `token`, `password`, `signature`, and the other credential
-  words), plus qualified `api_key`, `access_key`, `secret_key` and `private_key`
-  names. Bare `auth` and `key` are specific to argument/header labels and are
-  excluded from report prose: `primary key: id`, `hotkey: ctrl-a`,
-  `monkey=banana` and `auth: ok` stay visible. Glued non-option prefixes such
-  as `SECRET-HAuthorization` remain conservatively masked as header labels.
+  Credential aliases (`-u`, `-b`, `-U`, `--user`, `--cookie`,
+  `--proxy-user`, `--oauth2-bearer`) use the value's shape independently of the
+  program: user/proxy values contain `:` or start with `@`; cookie values contain
+  `=` or start with `@`; OAuth bearer values are always secret. This also covers
+  wrappers, executable aliases, remote command strings and nested shell text.
+  Recognizing curl adds masking of its unshaped credential values, but never
+  gates the value-shape rule. Thus `git worktree add -b fix-1`,
+  `git push -u origin main`, `git add -u src` and `sort -u x` retain their
+  diagnostic values.
+  Labelled assignments and token-shaped secrets are scrubbed independently.
+  Short options are case-sensitive and clusters follow the
+  [curl option rules](https://curl.se/docs/manpage.html#options): the first
+  argument-taking letter owns the remainder, or the next argument. A public
+  option such as `-A` prevents a later `u` in its value from becoming a credential
+  switch. Both attached and `=` forms use the same value classifier. Quote and
+  escape handling retains value spans for masking; executed commands are unchanged.
+  The report/stderr scrubber splits labels on `_`, `-` and camelCase boundaries.
+  Compound labels ending in `key`, `auth`, `token`, `secret`, `password` or
+  `credential` mask with either delimiter, including `DEPLOY_KEY`, `ssh_key`,
+  `authKey` and the AWS `access_key_id` spelling. Strong credential words such as
+  `authorization`, `signature` and `password` also mask as bare labels. Bare
+  `key` and `auth` require `=` or a quoted JSON key. Consequently
+  `primary key: id`, `hotkey: ctrl-a`, `monkey=banana` and `auth: ok` stay visible.
+  Glued non-option prefixes such as `SECRET-HAuthorization` remain
+  conservatively masked as header labels.
   These rules shape diagnostic logs only; executed argv is never rewritten.
   The token then travels in the unchanged normal `hello` frame.
   The served client derives its server and transport from its own location

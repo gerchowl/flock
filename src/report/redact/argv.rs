@@ -13,7 +13,28 @@ const CURL_SECRET_SHORT_OPTIONS: &str = "uUb";
 #[derive(Clone, Copy)]
 pub(crate) struct OptionValue {
     pub(crate) attached: Option<usize>,
-    pub(crate) secret: bool,
+    rule: ValueRule,
+}
+
+#[derive(Clone, Copy)]
+enum ValueRule {
+    Always,
+    User,
+    Cookie,
+    Public,
+}
+
+impl OptionValue {
+    /// Ambiguous aliases carry secrets only when their value has credential
+    /// syntax. This works through wrappers and aliases without naming a program.
+    pub(crate) fn masks(self, value: &str) -> bool {
+        match self.rule {
+            ValueRule::Always => true,
+            ValueRule::User => value.contains(':') || value.starts_with('@'),
+            ValueRule::Cookie => value.contains('=') || value.starts_with('@'),
+            ValueRule::Public => false,
+        }
+    }
 }
 
 pub(crate) fn is_curl(program: &str) -> bool {
@@ -72,27 +93,57 @@ pub(crate) fn option_value(arg: &str, curl: bool) -> Option<OptionValue> {
     let (flag, attached) = arg
         .split_once('=')
         .map_or((arg, None), |(flag, _)| (flag, Some(flag.len() + 1)));
-    if CURL_SECRET_LONG_OPTIONS.contains(&flag) {
-        return curl.then_some(OptionValue {
+    let rule = match flag {
+        "--user" | "--proxy-user" => Some(ValueRule::User),
+        "--cookie" => Some(ValueRule::Cookie),
+        "--oauth2-bearer" => Some(ValueRule::Always),
+        _ => None,
+    };
+    if let Some(rule) = rule {
+        return Some(OptionValue {
             attached,
-            secret: true,
+            rule: if curl { ValueRule::Always } else { rule },
         });
     }
-    if !curl || !arg.starts_with('-') || arg.starts_with("--") {
-        return named_secret_flag(flag).then_some(OptionValue {
+    if named_secret_flag(flag) {
+        return Some(OptionValue {
             attached,
-            secret: true,
+            rule: ValueRule::Always,
         });
+    }
+    if !arg.starts_with('-') || arg.starts_with("--") {
+        return None;
     }
     // Non-value switches may precede an argument-taking switch in one word.
     const NO_VALUE: &str = "012346aBfgGiIjJklLMnNOpqRsSvVZ#:";
     const PUBLIC_VALUE: &str = "AcCdDeEFHhKmoPQrTtwXxYyz";
     for (offset, letter) in arg[1..].char_indices() {
         if PUBLIC_VALUE.contains(letter) || CURL_SECRET_SHORT_OPTIONS.contains(letter) {
-            let start = 1 + offset + letter.len_utf8();
+            let mut start = 1 + offset + letter.len_utf8();
+            // Accept both attached spellings: -uuser:pass and -u=user:pass.
+            if arg[start..].starts_with('=') {
+                start += 1;
+            }
+            let rule = match letter {
+                'u' | 'U' => {
+                    if curl {
+                        ValueRule::Always
+                    } else {
+                        ValueRule::User
+                    }
+                }
+                'b' => {
+                    if curl {
+                        ValueRule::Always
+                    } else {
+                        ValueRule::Cookie
+                    }
+                }
+                _ => ValueRule::Public,
+            };
             return Some(OptionValue {
                 attached: (start < arg.len()).then_some(start),
-                secret: CURL_SECRET_SHORT_OPTIONS.contains(letter),
+                rule,
             });
         }
         if !NO_VALUE.contains(letter) {
@@ -154,14 +205,24 @@ fn words(text: &str) -> Vec<Word> {
     words
 }
 
-/// Only curl's command words enable its credential aliases. Other programs keep
-/// their -u/-b/-U diagnostics, including when they occur in shell command text.
+/// Apply credential value shapes to every command word, independently of the
+/// executable. Curl recognition only adds coverage for its unambiguous options.
 pub(crate) fn mask_options(text: &str) -> String {
+    mask_options_inner(text, true)
+}
+
+/// Quoted remote commands and nested shell scripts need the same shape rules.
+/// Do not infer an executable's semantics from arbitrary diagnostic text.
+pub(crate) fn mask_nested_options(text: &str) -> String {
+    mask_options_inner(text, false)
+}
+
+fn mask_options_inner(text: &str, curl_coverage: bool) -> String {
     let mut output = String::new();
     let mut copied = 0;
     let mut command_start = true;
     let mut curl = false;
-    let mut pending = None;
+    let mut pending: Option<OptionValue> = None;
     let mut options = true;
     for word in words(text) {
         if word.boundary {
@@ -170,13 +231,11 @@ pub(crate) fn mask_options(text: &str) -> String {
             pending = None;
             options = true;
         }
-        let option = options.then(|| option_value(&word.value, curl)).flatten();
-        let replacement = if let Some(secret) = pending.take() {
-            if secret {
+        let option = option_value(&word.value, curl && options);
+        let replacement = if let Some(previous) = pending.take() {
+            if previous.masks(&word.value) {
                 // Preserve masking through a chain of named secret switches.
-                pending = option
-                    .filter(|value| value.attached.is_none())
-                    .map(|value| value.secret);
+                pending = option.filter(|value| value.attached.is_none());
                 Some("<redacted>".to_owned())
             } else {
                 None
@@ -184,15 +243,15 @@ pub(crate) fn mask_options(text: &str) -> String {
         } else if let Some(option) = option {
             if let Some(start) = option.attached {
                 option
-                    .secret
+                    .masks(&word.value[start..])
                     .then(|| format!("{}<redacted>", &word.value[..start]))
             } else {
-                pending = Some(option.secret);
+                pending = Some(option);
                 None
             }
         } else {
             if command_start && !word.value.starts_with('-') && !word.value.contains('=') {
-                curl = is_curl(&word.value);
+                curl = curl_coverage && is_curl(&word.value);
                 command_start = false;
             }
             if word.value == "--" {
@@ -200,6 +259,14 @@ pub(crate) fn mask_options(text: &str) -> String {
             }
             None
         };
+        let replacement = replacement.or_else(|| {
+            if word.value.chars().any(char::is_whitespace) {
+                let nested = mask_nested_options(&word.value);
+                (nested != word.value).then_some(nested)
+            } else {
+                None
+            }
+        });
         if let Some(replacement) = replacement {
             output.push_str(&text[copied..word.span.start]);
             output.push_str(&replacement);
