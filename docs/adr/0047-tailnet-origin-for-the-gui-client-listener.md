@@ -8,9 +8,10 @@
   Tailscale) and [#2293](https://github.com/gerchowl/flock/issues/2293)
   (remote code exchange, multi-node GUI).
 - Decision owner: repository owner. The owner asked for this ADR on 2026-11-02
-  and accepted it the same day ("Accept ADR-0047 with the reviewers'
-  recommendations"). That decides R1–R4 and every recommended answer in
-  "Owner decisions" below. Acceptance claims a decision, not code.
+  and answered "y" to accepting it with the recommended answers on the same
+  day. That accepts R1–R4 as recommended, along with the answers to Q1–Q6
+  recorded as D1–D6 in "Owner decisions" below. Acceptance claims a decision,
+  not code.
 - Builds on: ADR-0036 §5 (client wire, tokens, one-time codes), ADR-0038 §6
   (browser shell, shell origins, identity), ADR-0043 §3 and §8 (remote ingress
   and its threat model).
