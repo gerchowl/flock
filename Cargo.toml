@@ -80,7 +80,7 @@ unicode-segmentation = "1.13.3"
 # Reuse termwiz's locked Unicode 17 categories for identity-format validation.
 finl_unicode = "1.4"
 sysinfo = "0.40.0"
-rusqlite = { version = "0.40.2", features = ["bundled"] }
+rusqlite = { version = "0.41.1", features = ["bundled"] }
 toml_edit = "0.25.15"
 
 # Wipe node-key seeds and serialized private-key buffers after use.
@@ -92,7 +92,7 @@ pulldown-cmark = { version = "=0.13.6", default-features = false }
 # Await fixture FIFO reports and bound scripted CLI subprocess lifetimes.
 tokio = { version = "1", features = ["net", "io-util", "process"] }
 # Count SQLite VM operations in store complexity regression tests.
-rusqlite = { version = "0.40.2", features = ["hooks"] }
+rusqlite = { version = "0.41.1", features = ["hooks"] }
 
 # Parse adapter declarations and CLI match patterns for coverage drift tests.
 syn = { version = "3", features = ["full", "visit"] }
