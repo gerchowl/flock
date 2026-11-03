@@ -213,6 +213,31 @@ describe("fix round 1 source gates", () => {
   });
 });
 
+describe("reserved token writes everywhere", () => {
+  const primitive = "src/layout/primitives/Seeded.tsx";
+  test.each(["color", "space", "font", "size", "radius", "border", "layer"])("inline %s token", async (prefix) => {
+    const result = await eslint(primitive, `<div style={{"--${prefix}-seed":"13px"}} />`);
+    expect(result.code).toBe(1);
+    expect(result.output).toContain("Reserved design tokens");
+  });
+  test.each([
+    ["setProperty", 'el.style.setProperty("--color-label-primary", "red")'],
+    ["style map", 'el.attributeStyleMap.set("--space-1", value)'],
+    ["assignment", 'el.style["--font-body"] = "13px"'],
+    ["computed object", 'const style = {["--radius-small"]:"13px"}'],
+    ["concatenated property", 'el.style.setProperty("--space-" + "1", "13px")'],
+    ["template property", 'el.style.setProperty(`--border-thin`, "13px")'],
+    ["outside layout", 'const values = {"--layer-dialog":1}'],
+  ])("%s", async (label, code) => {
+    const result = await eslint(label === "outside layout" ? "src/probe.ts" : primitive, code);
+    expect(result.code).toBe(1);
+    expect(result.output).toContain("Reserved design tokens");
+  });
+  test("primitive local properties remain available", async () => {
+    expect((await eslint(primitive, '<div style={{"--l-space":"var(--space-1)"}} />')).code).toBe(0);
+  });
+});
+
 describe("fix round 1 typed capabilities", () => {
   test.each([
     ["computed generic assign", 'const k = "style"; Object.assign(el[k], {margin:"13px"})'],

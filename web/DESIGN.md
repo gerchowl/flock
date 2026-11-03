@@ -172,7 +172,13 @@ type. Reflection and JSON boundaries return `unknown`, including `Reflect.get`,
 `JSON.parse`, `Body.json`, array narrowing, object construction/assignment/enumeration and property descriptors. Values must be
 validated before they become design props. JSX style attributes remain available
 only inside `src/layout/primitives/`; the restricted DOM pass allows no direct
-CSSOM mutation even there.
+CSSOM mutation even there. Reserved token properties (`--color-*`, `--space-*`,
+`--font-*`, `--size-*`, `--radius-*`, `--border-*`, `--layer-*`) cannot be written
+from TS/TSX anywhere, including primitives. ESLint rejects reserved object keys,
+style directives, member assignments and property/map mutation calls, including
+literal concatenations and expression-free templates. Primitive inline styles
+may set local properties such as `--l-space` and reference tokens with `var()`;
+token declarations belong exclusively to `tokens.css`.
 
 The Vite transform also lints every application TS/JS module it loads, including
 imports from outside `src/`, from otherwise test-only directories or outside the

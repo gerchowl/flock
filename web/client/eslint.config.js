@@ -19,6 +19,16 @@ const design = {
       if (node.type === "TSParenthesizedType") return forbiddenType(node.typeAnnotation);
       return (node.type === "TSUnionType" || node.type === "TSIntersectionType") && node.types.some(forbiddenType);
     }
+    function staticKey(node) {
+      if (node?.type === "BinaryExpression" && node.operator === "+") return staticKey(node.left) + staticKey(node.right);
+      if (node?.type === "TemplateLiteral" && !node.expressions.length) return node.quasis[0].value.cooked;
+      return name(node);
+    }
+    function tokenWrite(node, key) {
+      if (/^--(?:color|space|font|size|radius|border|layer)-/.test(staticKey(key))) {
+        context.report({ node, message: "Reserved design tokens may only be declared in tokens.css; primitives may only set local properties." });
+      }
+    }
     const report = (node, message = NO_STYLE) => context.report({ node, message });
     return {
       Program(node) {
@@ -60,9 +70,16 @@ const design = {
       },
       JSXSpreadAttribute(node) { designValues.push(node.argument); },
       JSXAttribute(node) {
+        if (node.name.type === "JSXNamespacedName" && name(node.name.namespace) === "style") tokenWrite(node, node.name.name);
         if (designProps.has(name(node.name))) designValues.push(node.value);
         if (!layout && name(node.name) === "style") report(node);
         if (!layout && node.name.type === "JSXNamespacedName" && name(node.name.name) === "style") report(node);
+      },
+      AssignmentExpression(node) {
+        if (node.left.type === "MemberExpression") tokenWrite(node, node.left.property);
+      },
+      CallExpression(node) {
+        if (["setProperty", "removeProperty", "set", "delete"].includes(name(node.callee.property))) tokenWrite(node, node.arguments[0]);
       },
       MemberExpression(node) {
         if (!layout && runtime.has(name(node.property))) report(node);
@@ -71,6 +88,7 @@ const design = {
         if (!layout && name(node.callee.property ?? node.callee) === "CSSStyleSheet") report(node);
       },
       Property(node) {
+        tokenWrite(node, node.key);
         if (!layout && name(node.key) === "style") report(node);
       },
       TSAnyKeyword(node) { report(node, "Explicit any bypasses design types; use unknown and validate."); },
