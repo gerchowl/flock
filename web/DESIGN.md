@@ -111,10 +111,13 @@ so the required `client` CI check runs it on every change. One test per rule:
    ([WCAG 2.2 SC 1.4.3](https://www.w3.org/TR/WCAG22/#contrast-minimum);
    [Accessibility](https://developer.apple.com/design/human-interface-guidelines/accessibility).)
 4. **Hit size.** Every control is at least 28×28 px on desktop and 44×44 px
-   on a phone; 20×20 px inside `[data-control-size="small"]`. Neighbouring
-   controls keep 4 px apart, except rows of a list and segments of a group,
-   which may touch. Links in running text are exempt, as are controls
-   scrolled out from under the pointer.
+   on a phone; 20×20 px inside `[data-control-size="small"]`. Every control
+   is measured, below the fold too; only links in running text are exempt.
+   Neighbouring controls keep 4 px apart, except rows of one list (`ul`,
+   `ol`, `role="list"`, `listbox`, `tree`, `menu`) and segments of one
+   `tablist` or `group`, which may touch. A control covered by another even
+   when scrolled into view, or partly scrolled out of its scroller, has no
+   defined neighbour and is skipped for spacing only.
    ([Buttons](https://developer.apple.com/design/human-interface-guidelines/buttons);
    [WCAG 2.2 SC 2.5.8](https://www.w3.org/TR/WCAG22/#target-size-minimum).)
 5. **Spacing grid.** Every computed margin, padding and gap in px is a
@@ -129,30 +132,38 @@ so the required `client` CI check runs it on every change. One test per rule:
    ([Motion](https://developer.apple.com/design/human-interface-guidelines/motion);
    [WCAG 2.2 SC 2.3.3](https://www.w3.org/TR/WCAG22/#animation-from-interactions).)
 8. **Keyboard.** Tab reaches every enabled control (a list's rows are reached
-   with the arrow keys instead) and each shows a focus ring; every control
-   has an accessible name with a letter or digit, so an icon alone is not
-   one; ArrowDown moves the selection of every list widget; ⌘K opens the
-   palette and Esc returns focus where it was.
+   with the arrow keys instead), and each shows a focus ring: an outline
+   drawn only on focus, or a box-shadow that differs from its resting one.
+   Every control has an accessible name with a letter or digit, so an icon
+   alone is not one. ArrowDown moves the selection of every list widget,
+   the palette's included, and a list with nothing to focus fails. ⌘K opens
+   the palette from wherever focus is, and Esc closes it and returns focus
+   there.
    ([Keyboards](https://developer.apple.com/design/human-interface-guidelines/keyboards);
    [WCAG 2.2 SC 2.1.1, 2.4.7, 4.1.2](https://www.w3.org/TR/WCAG22/).)
-9. **Structure.** A sidebar's disclosure groups nest at most two deep; every
-   enabled toolbar action is also a ⌘K command; no control switches the
-   app's light or dark appearance, which follows the system.
+9. **Structure.** A sidebar's disclosure groups nest at most two deep. On
+   every screen with a toolbar (a `header` or `role="toolbar"`), each
+   toolbar has actions and every one of them, disabled ones included, is a
+   ⌘K command: the palette lists an unavailable action dimmed. No control
+   switches the app's light or dark appearance, which follows the system.
    ([Sidebars](https://developer.apple.com/design/human-interface-guidelines/sidebars);
    [Toolbars](https://developer.apple.com/design/human-interface-guidelines/toolbars);
    [Dark Mode](https://developer.apple.com/design/human-interface-guidelines/dark-mode).)
 
-Each rule has a seeded violation in the test's `SEEDS`, and a test that the
-rule's check catches it. `CONFORMANCE_SEED=<rule> bun test
-./e2e/conformance.test.ts` injects that seed into the page instead, and the
-rule's own test fails.
+Every check, and each part of rules 4, 8 and 9, has a seeded violation in
+the test's `SEEDS` (18 in all, one of them below the fold). A test runs
+each check on its page with and without its seed and fails unless the seed
+adds a finding. `CONFORMANCE_SEED=<seed> bun test ./e2e/conformance.test.ts`
+injects one seed for the whole run instead, and its rule's test fails.
 
-Known violations live in one list, `e2e/conformance-allow.ts`: the rule, a
-selector for the elements, the pages and the issue that removes each one.
-The test fails on an entry that no longer matches anything and on any entry
-missing from its frozen list, so the list only shrinks. Today it holds the
-legacy stylesheets' body size, count badge and rem spacing (#2913) and the
-sidebar's third level.
+Known violations live in one list, `e2e/conformance-allow.ts`. Each entry
+names one rule, one element selector (no `*` and no selector list), the
+pages and the filed issue that removes it. The test fails on an entry that
+no longer matches anything, and on an entry, or a page of one, that
+`origin/dev`'s copy does not have, so the list only shrinks; CI fetches
+`dev` for that comparison. Today it holds the legacy stylesheets' body
+size, count badge, rem spacing and touching sidebar and tab-bar rows
+(#2913), and the sidebar's third level.
 
 ## Layout
 

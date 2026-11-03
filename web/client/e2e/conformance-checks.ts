@@ -12,8 +12,11 @@
 /** The nine rules of web/DESIGN.md "Conformance". */
 export type Rule = "palette" | "typography" | "contrast" | "hit-size" | "grid" | "materials" | "motion" | "keyboard" | "structure";
 
-/** One violation: the rule, a CSS path to the element, and what was measured. */
-export type Finding = { readonly rule: Rule; readonly where: string; readonly detail: string };
+/**
+ * One violation: the rule, a CSS path to the element, what was measured, and
+ * the narrowest selector naming the element (what an allow-list entry uses).
+ */
+export type Finding = { readonly rule: Rule; readonly where: string; readonly detail: string; readonly selector: string };
 
 /** What a page check needs to know about the page. */
 export type CheckOptions = {
@@ -29,7 +32,9 @@ export function installChecks(): void {
   const INTERACTIVE =
     'a[href], button, input:not([type="hidden"]), select, textarea, summary, [role="button"], [role="link"], [role="tab"], [role="checkbox"], [role="switch"], [role="option"], [role="menuitem"], [tabindex]:not([tabindex="-1"])';
   const CHROME = 'header, nav, aside, [role="banner"], [role="navigation"], [role="toolbar"], [role="dialog"], [role="menu"], [role="listbox"], [popover]';
-  const ROWS = 'nav, [role="listbox"], [role="tablist"], [role="group"], [role="menu"], [role="tree"]';
+  // Containers whose rows or segments may touch: lists, tab bars, segmented groups and menus.
+  const ROWS = 'ul, ol, [role="list"], [role="listbox"], [role="tablist"], [role="group"], [role="menu"], [role="tree"]';
+  const LISTS = '[role="listbox"], [role="tree"], [role="menu"], [role="grid"], [role="tablist"]';
   const css = (el: Element): CSSStyleDeclaration => getComputedStyle(el);
   const shown = (el: Element): boolean => el.checkVisibility({ visibilityProperty: true });
   const elements = (): Element[] => [...document.body.querySelectorAll("*")].filter(shown);
@@ -42,6 +47,29 @@ export function installChecks(): void {
       parts.unshift(node.tagName.toLowerCase() + (id ? `[data-testid="${id}"]` : node.classList.length ? `.${[...node.classList].join(".")}` : ""));
     }
     return parts.join(" > ") || el.tagName.toLowerCase();
+  };
+  // The element's own selector: its test id, else its classes, else its tag under its parent's.
+  const selectorOf = (el: Element): string => {
+    const id = el.getAttribute("data-testid");
+    if (id) return `[data-testid="${id}"]`;
+    if (el.classList.length > 0) return `.${[...el.classList].join(".")}`;
+    const tag = el.tagName.toLowerCase();
+    return el.parentElement === null || el.parentElement === document.body || tag === "body" ? tag : `${selectorOf(el.parentElement)} > ${tag}`;
+  };
+  // Element identities for the keyboard probes: a path can name two elements, an id cannot.
+  const ids = new WeakMap<Element, number>();
+  let nextId = 0;
+  const idOf = (el: Element): number => {
+    if (!ids.has(el)) ids.set(el, nextId++);
+    return ids.get(el)!;
+  };
+  // An element's outline (when one is drawn) and box-shadow, at rest and when focused.
+  type Ring = { readonly outline: string | null; readonly shadow: string };
+  const resting = new Map<number, Ring>();
+  const ringOf = (el: Element): Ring => {
+    const style = css(el);
+    const drawn = style.outlineStyle !== "none" && parseFloat(style.outlineWidth) > 0;
+    return { outline: drawn ? `${style.outlineStyle} ${style.outlineWidth} ${style.outlineColor} ${style.outlineOffset}` : null, shadow: style.boxShadow };
   };
   // A probe element resolves token values to the form getComputedStyle reports.
   const probe = document.createElement("span");
@@ -153,16 +181,23 @@ export function installChecks(): void {
     },
     "hit-size": (options) => {
       const hits: Hit[] = [];
-      // Inline links in running text are exempt (WCAG 2.5.8), and so is a control scrolled out from under the pointer.
-      const onTop = (el: Element): boolean => {
+      // Every control is measured, on screen or not; only links in running text are exempt (WCAG 2.5.8).
+      const controls = interactive().filter((el) => css(el).display !== "inline");
+      // A control covered by another (under a sticky bar) or partly scrolled out of its scroller has no
+      // defined neighbour spacing. Occlusion is read with each control scrolled into view, then every
+      // scroll position is restored so all boxes are measured in one state.
+      const scrollers = [document.scrollingElement!, ...elements().filter((el) => el.scrollHeight > el.clientHeight || el.scrollWidth > el.clientWidth)];
+      const saved = scrollers.map((el) => [el.scrollTop, el.scrollLeft] as const);
+      const covered = controls.map((el) => {
+        el.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
         const box = el.getBoundingClientRect();
         const hit = document.elementFromPoint(box.left + box.width / 2, box.top + box.height / 2);
-        return hit !== null && (el.contains(hit) || hit.contains(el));
-      };
-      const controls = interactive().filter((el) => css(el).display !== "inline" && onTop(el));
+        return hit === null || !(el.contains(hit) || hit.contains(el));
+      });
+      scrollers.forEach((el, i) => el.scrollTo({ top: saved[i]![0], left: saved[i]![1], behavior: "instant" }));
       const boxes = controls.map((el) => el.getBoundingClientRect());
-      // A control partly scrolled out of its scroller has no defined neighbour spacing.
       const clipped = controls.map((el, i) => {
+        if (covered[i]) return true;
         for (let node = el.parentElement; node !== null; node = node.parentElement) {
           if (!/(auto|scroll|hidden)/.test(css(node).overflow)) continue;
           const view = node.getBoundingClientRect();
@@ -252,39 +287,61 @@ export function installChecks(): void {
           if (index >= 0) used.add(index);
           return index < 0;
         });
-        return { findings: open.map(({ el: _el, ...rest }) => rest), used: [...used] };
+        return { findings: open.map(({ el, ...rest }) => ({ ...rest, selector: selectorOf(el) })), used: [...used] };
       },
-      // Tab order and focus rings: every reachable control in `seen`, each without a ring in `ringless`.
-      // A list's rows are reached with the arrow keys, not Tab (WAI-ARIA APG, "Keyboard navigation inside components").
-      interactive: () => interactive().filter((el) => !el.matches(':disabled, [role="option"], [role="treeitem"], [role="menuitem"]') && !el.closest("[inert]")).map(where),
-      focusRing: () => {
+      // Tab targets: every enabled control except a list's rows, which the arrow keys reach
+      // (WAI-ARIA APG, "Keyboard navigation inside components"). Their resting ring style is
+      // recorded with nothing focused, so a focus ring must differ from it.
+      tabTargets: () => {
+        (document.activeElement as HTMLElement | null)?.blur();
+        return interactive()
+          .filter((el) => !el.matches(':disabled, [role="option"], [role="treeitem"], [role="menuitem"]') && !el.closest("[inert]"))
+          .map((el) => {
+            resting.set(idOf(el), ringOf(el));
+            return { id: idOf(el), where: where(el) };
+          });
+      },
+      // A focus ring is an outline drawn only on focus, or a box-shadow that differs from the resting one.
+      focused: () => {
         const el = document.activeElement;
         if (el === null || el === document.body) return null;
-        const style = css(el);
-        const ring = (style.outlineStyle !== "none" && parseFloat(style.outlineWidth) > 0) || style.boxShadow !== "none";
-        return { where: where(el), ring };
+        const now = ringOf(el);
+        const before = resting.get(idOf(el)) ?? { outline: null, shadow: "none" };
+        const ring = (now.outline !== null && now.outline !== before.outline) || (now.shadow !== "none" && now.shadow !== before.shadow);
+        return { id: idOf(el), where: where(el), ring };
       },
-      // The listbox-like widgets on screen and a signature of their selection.
-      lists: () => [...document.querySelectorAll('[role="listbox"], [role="tree"], [role="menu"], [role="grid"], [role="tablist"]')].filter(shown).map(where),
+      lists: () => [...document.querySelectorAll(LISTS)].filter(shown).map((el) => ({ id: idOf(el), where: where(el) })),
       selection: () => {
         const focused = document.activeElement;
-        const selected = [...document.querySelectorAll('[aria-selected="true"]')].map((el) => `${where(el)}#${[...(el.parentElement?.children ?? [])].indexOf(el)}`).join("|");
-        return `${focused?.getAttribute("aria-activedescendant") ?? ""}/${selected}/${focused ? where(focused) : ""}`;
+        const selected = [...document.querySelectorAll('[aria-selected="true"]')].map((el) => idOf(el)).join("|");
+        return `${focused?.getAttribute("aria-activedescendant") ?? ""}/${selected}/${focused ? idOf(focused) : ""}`;
       },
-      focusList: (path: string) => {
-        const list = [...document.querySelectorAll('[role="listbox"], [role="tree"], [role="menu"], [role="grid"], [role="tablist"]')].find((el) => where(el) === path);
+      // Focuses the list's controller (a combobox), the list itself, or its selected or focusable row.
+      focusList: (id: number) => {
+        const list = [...document.querySelectorAll(LISTS)].find((el) => ids.get(el) === id);
         if (list === undefined) return false;
         const controller = list.id ? document.querySelector(`[aria-controls="${list.id}"]`) : null;
-        const target = (controller ?? (list.matches("[tabindex]") ? list : list.querySelector('[aria-selected="true"], [tabindex]'))) as HTMLElement | null;
+        const target = (controller ?? (list.matches("[tabindex]") ? list : list.querySelector('[aria-selected="true"][tabindex], [tabindex]'))) as HTMLElement | null;
         target?.focus();
-        return target !== null;
+        return target !== null && document.activeElement === target;
       },
-      where: () => (document.activeElement ? where(document.activeElement) : ""),
-      toolbarActions: () =>
-        [...document.querySelectorAll('header button, [role="toolbar"] button')]
-          .filter((el) => shown(el) && !el.matches(`:disabled, [aria-disabled="true"], [aria-haspopup], [data-testid="palette-trigger"]`))
-          .map(name),
+      focusFirst: () => {
+        const first = interactive().find((el) => !el.matches(':disabled, [role="option"]') && el.closest('[role="dialog"]') === null) as HTMLElement | undefined;
+        first?.focus();
+        return first !== undefined && document.activeElement === first ? idOf(first) : null;
+      },
+      focusedId: () => (document.activeElement && document.activeElement !== document.body ? idOf(document.activeElement) : null),
+      // Toolbars: every `[role="toolbar"]` and `header` on screen, with the names of all their
+      // buttons, disabled ones included (an unavailable action still needs its command).
+      toolbars: () =>
+        [...document.querySelectorAll('[role="toolbar"], header')]
+          .filter((el) => shown(el) && el.closest('[role="dialog"]') === null && !(el.matches("header") && el.closest('[role="toolbar"]') !== null))
+          .map((bar) => ({
+            where: where(bar),
+            actions: [...bar.querySelectorAll("button")].filter((el) => shown(el) && !el.matches('[data-testid="palette-trigger"]')).map(name),
+          })),
       commands: () => [...document.querySelectorAll('[role="dialog"] [role="option"]')].map((el) => el.textContent ?? ""),
+      dialogOpen: () => [...document.querySelectorAll('[role="dialog"]')].some(shown) && document.activeElement?.closest('[role="dialog"]') !== null,
     },
   });
 }

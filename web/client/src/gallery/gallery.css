@@ -31,19 +31,14 @@ h2 {
   font-weight: var(--font-weight-semibold);
 }
 
-.g-toolbar {
+/* The sidebar is chrome: the one place the gallery uses a material (rule 6). */
+.g-sidebar {
   position: sticky;
   top: 0;
   z-index: var(--layer-sticky);
-  padding: var(--space-2) var(--space-4);
-  background-color: var(--color-background-sidebar);
-  border-bottom: var(--border-width-thin) solid var(--color-separator);
-  backdrop-filter: blur(var(--space-5));
-}
-
-.g-sidebar {
   padding: var(--space-2);
   background-color: var(--color-background-sidebar);
+  backdrop-filter: blur(var(--space-5));
 }
 
 .g-panel {

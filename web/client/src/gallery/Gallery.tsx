@@ -3,6 +3,8 @@
  * one page, styled from tokens only, so the design-conformance suite can
  * check the rules of web/DESIGN.md on each of them in every colour mode.
  * The workbench screens are checked separately, from the fixture build.
+ * It has no toolbar, so it needs no command palette: rule 9's parity check
+ * applies to the workbench's toolbars.
  *
  * @module
  */
@@ -53,17 +55,6 @@ export function Gallery(): JSX.Element {
   const [pressed, setPressed] = createSignal(false);
   return (
     <div>
-      <header class="g-toolbar">
-        <Cluster space="2" role="toolbar" aria-label="Gallery actions">
-          <h1>Gallery</h1>
-          <button type="button" class="g-button" aria-pressed={pressed()} onClick={() => setPressed(!pressed())}>
-            Pin
-          </button>
-          <button type="button" class="g-button" aria-label="Add">
-            +
-          </button>
-        </Cluster>
-      </header>
       <Sidebar side="left" sideWidth="240px" contentMin="50%" space="4">
         <nav class="g-sidebar" aria-label="Projects">
           <Group title="flock">
@@ -76,6 +67,7 @@ export function Gallery(): JSX.Element {
         </nav>
         <Center as="main" max="960px" gutters="4">
           <Stack space="6">
+            <h1>Gallery</h1>
             <Stack as="section" space="2" aria-label="Text">
               <h2>Text</h2>
               <p>
@@ -97,6 +89,12 @@ export function Gallery(): JSX.Element {
               <Cluster space="2">
                 <button type="button" class="g-button">
                   Default
+                </button>
+                <button type="button" class="g-button" aria-pressed={pressed()} onClick={() => setPressed(!pressed())}>
+                  Pin
+                </button>
+                <button type="button" class="g-button" aria-label="Add">
+                  +
                 </button>
                 <button type="button" class="g-button g-button--primary">
                   Primary

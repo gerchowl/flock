@@ -7,9 +7,11 @@
  * holds the in-page checks and `e2e/conformance-allow.ts` the known
  * violations.
  *
- * Each rule also has a seeded violation (`SEEDS`) that its check must catch.
- * `CONFORMANCE_SEED=<rule> bun test ./e2e/conformance.test.ts` injects that
- * seed into every page instead, so the rule's own test fails.
+ * Every check, and every part of a multi-part rule (rules 4, 8 and 9), has
+ * a seeded violation (`SEEDS`): a test runs each check on its page with and
+ * without the seed and fails unless the seed adds a finding.
+ * `CONFORMANCE_SEED=<seed> bun test ./e2e/conformance.test.ts` injects that
+ * seed into its page for the whole run instead, so the rule's own test fails.
  *
  * Needs Playwright's Chromium: `just client-browsers`. Runs in
  * `just client-check` (`bun test ./e2e`).
@@ -31,7 +33,7 @@ const DESKTOP = { width: 1280, height: 800 } as const;
 const PHONE = { width: 390, height: 844 } as const;
 const LIMIT = 60_000;
 const AXE_LIMIT = 3_000;
-const SEED_LIMIT = 5_000;
+const SEED_LIMIT = 10_000;
 
 type PageSpec = CheckOptions & { readonly url: () => string; readonly viewport: { width: number; height: number }; readonly palette: boolean };
 
@@ -50,29 +52,75 @@ const MODES = {
 } as const;
 type ModeName = keyof typeof MODES;
 
-/** A violation the check must catch: markup appended to `into` on `page`. */
-type Seed = { readonly page: PageName; readonly into: string; readonly html: string };
+/** The keyboard and structure checks that drive the page from the test, beside the in-page rules. */
+type Driven = "tab-reach" | "focus-ring" | "arrows" | "shortcut" | "parity";
+type Check = Rule | Driven;
 
-const SEEDS: Readonly<Record<Rule, Seed>> = {
-  palette: { page: "gallery", into: "main", html: '<div data-testid=\"seed\" style="color: rgb(1, 2, 3)">Off-palette text</div>' },
-  typography: { page: "gallery", into: "main", html: '<div data-testid=\"seed\" style="font-size: 9px">Tiny text</div>' },
-  contrast: { page: "gallery", into: "main", html: '<div data-testid=\"seed\" style="color: var(--color-label-tertiary)">Faint text</div>' },
-  "hit-size": { page: "gallery", into: "main", html: '<button data-testid="seed" class="g-button" style="block-size: 16px">Small</button>' },
-  grid: { page: "gallery", into: "main", html: '<div data-testid="seed" style="padding: 6px">Off the grid</div>' },
-  materials: { page: "gallery", into: "main", html: '<div data-testid="seed" style="backdrop-filter: blur(8px)">Blurred content</div>' },
-  motion: { page: "gallery", into: "main", html: '<div data-testid="seed" style="transition: transform 1s">Moving</div>' },
-  keyboard: { page: "gallery", into: "main", html: '<button data-testid="seed" class="g-button">×</button>' },
-  structure: { page: "gallery", into: "nav section section", html: '<section data-testid="seed"><button class="g-button" aria-expanded="true">Level three</button></section>' },
+/** A violation `check` must catch: markup appended to `into` on `page`, and a script run there. */
+type Seed = { readonly check: Check; readonly page: PageName; readonly into: string; readonly html: string; readonly script?: string };
+
+const SEEDS: Readonly<Record<string, Seed>> = {
+  palette: { check: "palette", page: "gallery", into: "main", html: '<div data-testid="seed" style="color: rgb(1, 2, 3)">Off-palette text</div>' },
+  typography: { check: "typography", page: "gallery", into: "main", html: '<div data-testid="seed" style="font-size: 9px">Tiny text</div>' },
+  contrast: { check: "contrast", page: "gallery", into: "main", html: '<div data-testid="seed" style="color: var(--color-label-tertiary)">Faint text</div>' },
+  "hit-size": { check: "hit-size", page: "gallery", into: "main", html: '<button data-testid="seed" class="g-button" style="block-size: 16px">Small</button>' },
+  "hit-size-below-fold": {
+    check: "hit-size",
+    page: "gallery",
+    into: "main",
+    html: '<div style="block-size: 2400px"></div><button data-testid="seed" class="g-button" style="block-size: 16px">Below the fold</button>',
+  },
+  grid: { check: "grid", page: "gallery", into: "main", html: '<div data-testid="seed" style="padding: 6px">Off the grid</div>' },
+  materials: { check: "materials", page: "gallery", into: "main", html: '<div data-testid="seed" style="backdrop-filter: blur(8px)">Blurred content</div>' },
+  motion: { check: "motion", page: "gallery", into: "main", html: '<div data-testid="seed" style="transition: transform 1s">Moving</div>' },
+  names: { check: "keyboard", page: "gallery", into: "main", html: '<button data-testid="seed" class="g-button">×</button>' },
+  "tab-reach": { check: "tab-reach", page: "gallery", into: "main", html: '<span data-testid="seed" class="g-button" role="button">Unreachable</span>' },
+  "focus-ring": { check: "focus-ring", page: "gallery", into: "main", html: '<button data-testid="seed" class="g-button" style="outline: none">Ringless</button>' },
+  "focus-ring-resting-shadow": {
+    check: "focus-ring",
+    page: "gallery",
+    into: "main",
+    html: '<button data-testid="seed" class="g-button" style="outline: none; box-shadow: 0 0 0 1px var(--color-separator)">Always shadowed</button>',
+  },
+  arrows: {
+    check: "arrows",
+    page: "gallery",
+    into: "main",
+    html: '<div data-testid="seed" role="listbox" tabindex="0" aria-label="Inert list"><div role="option" aria-selected="true">One</div><div role="option">Two</div></div>',
+  },
+  "arrows-no-target": {
+    check: "arrows",
+    page: "gallery",
+    into: "main",
+    html: '<div data-testid="seed" role="listbox" aria-label="Unfocusable list"><div role="option">One</div><div role="option">Two</div></div>',
+  },
+  shortcut: {
+    check: "shortcut",
+    page: "workbench",
+    into: "body",
+    html: "",
+    // Swallows Esc before the palette sees it: the palette stays open and focus never returns.
+    script: 'window.addEventListener("keydown", (event) => { if (event.key === "Escape") event.stopImmediatePropagation(); }, true)',
+  },
+  depth: {
+    check: "structure",
+    page: "gallery",
+    into: "nav section section",
+    html: '<section data-testid="seed"><button class="g-button" aria-expanded="true">Level three</button></section>',
+  },
+  appearance: { check: "structure", page: "gallery", into: "main", html: '<button data-testid="seed" class="g-button">Dark mode</button>' },
+  parity: { check: "parity", page: "workbench", into: "header.topbar", html: '<button data-testid="seed" type="button" class="action">Archive</button>' },
 };
 
-const SEEDED = process.env.CONFORMANCE_SEED as Rule | undefined;
-if (SEEDED !== undefined && !(SEEDED in SEEDS)) throw new Error(`CONFORMANCE_SEED=${SEEDED} names no rule`);
+const SEEDED = process.env.CONFORMANCE_SEED;
+if (SEEDED !== undefined && !(SEEDED in SEEDS)) throw new Error(`CONFORMANCE_SEED=${SEEDED} names no seed`);
 
 let browser: Browser;
 const usedAllowances = new Set<number>();
 
 async function inject(page: Page, seed: Seed): Promise<void> {
   await page.evaluate(({ into, html }) => document.querySelector(into)!.insertAdjacentHTML("beforeend", html), seed);
+  if (seed.script !== undefined) await page.evaluate(seed.script);
 }
 
 let tab: Page | undefined;
@@ -92,13 +140,13 @@ async function open(name: PageName, mode: ModeName): Promise<Page> {
   // The desktop workbench replays its transcript first: check it once the replay has settled.
   const ready = name === "gallery" ? "main" : name === "workbench" ? "[data-testid=transcript-synced]" : "[data-testid=phone]";
   await page.locator(ready).first().waitFor({ timeout: 10_000 });
-  if (SEEDED !== undefined && SEEDS[SEEDED].page === name) await inject(page, SEEDS[SEEDED]);
+  if (SEEDED !== undefined && SEEDS[SEEDED]!.page === name) await inject(page, SEEDS[SEEDED]!);
   await page.evaluate(installChecks);
   return page;
 }
 
 /** Runs `rule`'s check on `page`, returning findings the allow-list does not cover. */
-async function check(page: Page, name: PageName, rule: Rule): Promise<Finding[]> {
+async function check_(page: Page, name: PageName, rule: Rule): Promise<Finding[]> {
   const entries = ALLOWED.map((entry) => (entry.pages.includes(name) ? entry : { rule: "none", selector: "*" }));
   const result = await page.evaluate(
     ([rule, options, entries]) => (globalThis as unknown as { __hig: { run: Function } }).__hig.run(rule, options, entries),
@@ -125,7 +173,8 @@ async function surveyAll(): Promise<void> {
         const lines = survey.get(rule)!;
         lines.set(line, (lines.get(line) ?? new Set()).add(`${name}/${mode}`));
       };
-      for (const rule of RULES) for (const finding of await check(page, name, rule)) add(rule, `${finding.where}: ${finding.detail}`);
+      // Each finding names the selector an allow-list entry would use.
+      for (const rule of RULES) for (const finding of await check_(page, name, rule)) add(rule, `${finding.where}: ${finding.detail} (${finding.selector})`);
       for (const line of await axe(page, name, mode)) add("contrast", line);
     }
   }
@@ -144,77 +193,124 @@ function everywhere(rule: Rule): string[] {
 
 let axeSource = "";
 
-/** axe-core's WCAG 2.x A and AA rules on `page`, bounded: a stalled run is a finding naming its stage. */
+const STALLED = Symbol("stalled");
+
+/**
+ * Runs `work` for at most `ms`. On a stall the tab is discarded (the next
+ * `open` makes a new one), and the losing promise's rejection is swallowed,
+ * so it can never surface in a later navigation.
+ */
+async function bounded<T>(ms: number, work: () => Promise<T>): Promise<T | typeof STALLED> {
+  const running = work();
+  running.catch(() => undefined);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const stalled = new Promise<typeof STALLED>((resolve) => {
+    timer = setTimeout(() => resolve(STALLED), ms);
+  });
+  const outcome = await Promise.race([running, stalled]);
+  clearTimeout(timer);
+  if (outcome === STALLED) {
+    const old = tab;
+    tab = undefined;
+    void old?.close().catch(() => undefined);
+  }
+  return outcome;
+}
+
+/** axe-core's WCAG 2.x A and AA rules on `page`; a stalled run is a finding. */
 async function axe(page: Page, name: PageName, mode: ModeName): Promise<string[]> {
-  let stage = "inject";
-  const run = async (): Promise<string[]> => {
+  const outcome = await bounded(AXE_LIMIT, async () => {
     await page.evaluate(axeSource);
-    stage = "run";
     return page.evaluate(async () => {
       const { axe } = globalThis as unknown as { axe: { run: (o: object) => Promise<{ violations: { id: string; nodes: { target: string[] }[] }[] }> } };
       const result = await axe.run({ runOnly: { type: "tag", values: ["wcag2a", "wcag2aa", "wcag21a", "wcag21aa", "wcag22aa"] } });
       return result.violations.flatMap((v) => v.nodes.map((node) => `axe ${v.id}: ${node.target.join(" ")}`));
     });
-  };
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const stalled = new Promise<string[]>((resolve) => {
-    timer = setTimeout(() => resolve([`axe did not finish (${stage}) within ${AXE_LIMIT} ms [${name}/${mode}]`]), AXE_LIMIT);
   });
-  try {
-    return await Promise.race([run(), stalled]);
-  } finally {
-    clearTimeout(timer);
-  }
+  return outcome === STALLED ? [`axe did not finish within ${AXE_LIMIT} ms [${name}/${mode}]`] : outcome;
 }
 
 type Hig = { __hig: Record<string, (...args: never[]) => unknown> };
 const hig = <T,>(page: Page, fn: string, arg?: unknown): Promise<T> =>
   page.evaluate(([fn, arg]) => ((globalThis as unknown as Hig).__hig[fn as string] as (a: unknown) => T)(arg), [fn, arg] as const);
 
-/** Tab through `page`: every enabled control is reached, and each shows a focus ring. */
-async function tabWalk(page: Page): Promise<string[]> {
-  const controls = await hig<string[]>(page, "interactive");
-  const seen = new Set<string>();
-  const out: string[] = [];
-  for (let step = 0; step < controls.length * 2 + 4; step++) {
+type Target = { readonly id: number; readonly where: string };
+
+/** Tab through `page`: the controls never reached, and the ones focused without a ring. */
+async function tabWalk(page: Page): Promise<{ unreached: string[]; ringless: string[] }> {
+  const targets = await hig<Target[]>(page, "tabTargets");
+  const seen = new Set<number>();
+  const ringless: string[] = [];
+  for (let step = 0; step < targets.length * 2 + 4; step++) {
     await page.keyboard.press("Tab");
-    const focus = await hig<{ where: string; ring: boolean } | null>(page, "focusRing");
+    const focus = await hig<(Target & { ring: boolean }) | null>(page, "focused");
     if (focus === null) continue;
-    if (!focus.ring && !seen.has(focus.where)) out.push(`${focus.where}: focused with no visible focus ring`);
-    seen.add(focus.where);
+    if (!focus.ring && !seen.has(focus.id)) ringless.push(`${focus.where}: focused with no visible focus ring`);
+    seen.add(focus.id);
   }
-  for (const control of controls) if (!seen.has(control)) out.push(`${control}: not reachable with Tab`);
-  return out;
+  return { unreached: targets.filter((target) => !seen.has(target.id)).map((target) => `${target.where}: not reachable with Tab`), ringless };
 }
 
-/** Arrow keys move the selection of every list widget on screen. */
-async function arrows(page: Page): Promise<string[]> {
+/** ArrowDown moves the selection of every list widget on screen; one with no focusable target fails. */
+async function listArrows(page: Page): Promise<string[]> {
   const out: string[] = [];
-  for (const list of await hig<string[]>(page, "lists")) {
-    if (!(await hig<boolean>(page, "focusList", list))) continue;
+  for (const list of await hig<Target[]>(page, "lists")) {
+    if (!(await hig<boolean>(page, "focusList", list.id))) {
+      out.push(`${list.where}: no focusable target for the arrow keys`);
+      continue;
+    }
     const before = await hig<string>(page, "selection");
     await page.keyboard.press("ArrowDown");
-    if ((await hig<string>(page, "selection")) === before) out.push(`${list}: ArrowDown does not move the selection`);
+    if ((await hig<string>(page, "selection")) === before) out.push(`${list.where}: ArrowDown does not move the selection`);
   }
   return out;
 }
 
-/** ⌘K opens the palette (its arrows work, it lists every toolbar action) and Esc restores focus. */
-async function palette(page: Page): Promise<string[]> {
-  const out: string[] = [];
-  const actions = await hig<string[]>(page, "toolbarActions");
-  await page.locator("[data-testid=agent-row]").first().focus();
-  const before = await hig<string>(page, "where");
+/** Opens the palette with ⌘K; false when no dialog took focus. */
+async function openPalette(page: Page): Promise<boolean> {
   await page.keyboard.press("ControlOrMeta+k");
-  const dialog = page.getByRole("dialog");
-  if (!(await dialog.isVisible())) return ["⌘K does not open the palette"];
-  out.push(...(await arrows(page)));
-  const commands = await hig<string[]>(page, "commands");
-  for (const action of actions) if (!commands.some((command) => command.includes(action))) out.push(`toolbar action "${action}" has no ⌘K command`);
-  await page.keyboard.press("Escape");
-  const after = await hig<string>(page, "where");
-  if (after !== before) out.push(`Esc moves focus to ${after}, not back to ${before}`);
-  return out;
+  return hig<boolean>(page, "dialogOpen");
+}
+
+/** The checks that drive the page, each on a fresh document. */
+const DRIVEN: Readonly<Record<Driven, (page: Page, name: PageName) => Promise<string[]>>> = {
+  "tab-reach": async (page) => (await tabWalk(page)).unreached,
+  "focus-ring": async (page) => (await tabWalk(page)).ringless,
+  // The lists on screen, and the palette's once ⌘K opens it.
+  arrows: async (page, name) => {
+    const out = await listArrows(page);
+    if (PAGES[name].palette && (await openPalette(page))) out.push(...(await listArrows(page)));
+    return out;
+  },
+  // ⌘K opens the palette from wherever focus is, and Esc returns focus there.
+  shortcut: async (page, name) => {
+    if (!PAGES[name].palette) return [];
+    const before = await hig<number | null>(page, "focusFirst");
+    if (before === null) return ["no control to focus before ⌘K"];
+    if (!(await openPalette(page))) return ["⌘K does not open the palette"];
+    await page.keyboard.press("Escape");
+    if (await hig<boolean>(page, "dialogOpen")) return ["Esc does not close the palette"];
+    return (await hig<number | null>(page, "focusedId")) === before ? [] : ["Esc does not return focus to the control that had it"];
+  },
+  // Every toolbar has actions, and each one, disabled or not, is a ⌘K command.
+  parity: async (page) => {
+    const bars = await hig<{ where: string; actions: string[] }[]>(page, "toolbars");
+    if (bars.length === 0) return [];
+    const out = bars.filter((bar) => bar.actions.length === 0).map((bar) => `${bar.where}: a toolbar with no actions`);
+    const actions = [...new Set(bars.flatMap((bar) => bar.actions))];
+    if (!(await openPalette(page))) return [...out, ...actions.map((action) => `toolbar action "${action}": no ⌘K palette on this screen`)];
+    const commands = await hig<string[]>(page, "commands");
+    for (const action of actions) if (!commands.some((command) => command.startsWith(action))) out.push(`toolbar action "${action}" has no ⌘K command`);
+    return out;
+  },
+};
+
+/** `check` on a fresh document at `name` in light mode, with `seed` injected if given. */
+async function probe(check: Check, name: PageName, seed?: Seed): Promise<string[]> {
+  const page = await open(name, "light");
+  if (seed !== undefined) await inject(page, seed);
+  if (check in DRIVEN) return DRIVEN[check as Driven](page, name);
+  return (await check_(page, name, check as Rule)).map((finding) => `${finding.where}: ${finding.detail}`);
 }
 
 beforeAll(async () => {
@@ -257,54 +353,60 @@ describe("design conformance", () => {
     expect(everywhere("motion")).toEqual([]);
   }, LIMIT);
 
-  test("8. keyboard: Tab reaches every control with a ring, controls are named, arrows and ⌘K work", async () => {
-    const out = everywhere("keyboard");
+  /** `checks` on every page, each on a fresh light-mode document, labelled with the page. */
+  const driven = async (checks: readonly Driven[]): Promise<string[]> => {
+    const out: string[] = [];
     for (const name of Object.keys(PAGES) as PageName[]) {
-      const page = await open(name, "light");
-      for (const line of [...(await tabWalk(page)), ...(await arrows(page)), ...(PAGES[name].palette ? await palette(page) : [])]) out.push(`${name}/light: ${line}`);
+      for (const each of checks) for (const line of await probe(each, name)) out.push(`${each} ${name}/light: ${line}`);
     }
-    expect(out).toEqual([]);
+    return out;
+  };
+
+  test("8. keyboard: Tab reaches every control with a ring, controls are named, arrows and ⌘K work", async () => {
+    expect([...everywhere("keyboard"), ...(await driven(["tab-reach", "focus-ring", "arrows", "shortcut"]))]).toEqual([]);
   }, LIMIT);
 
   test("9. structure: a sidebar two levels deep, toolbar actions in ⌘K, no appearance switch", async () => {
-    expect(everywhere("structure")).toEqual([]);
+    expect([...everywhere("structure"), ...(await driven(["parity"]))]).toEqual([]);
   }, LIMIT);
 
-  test("each rule catches its seeded violation", async () => {
+  test("every check catches its seeded violation", async () => {
     const missed: string[] = [];
-    for (const [rule, seed] of Object.entries(SEEDS) as [Rule, Seed][]) {
-      // Each seed is bounded and names the stage it stalled at, so one wedged page fails the test instead of hanging it.
-      let stage = "open";
-      const started = performance.now();
-      const caught = async (): Promise<boolean> => {
-        const page = await open(seed.page, "light");
-        stage = "inject";
-        await inject(page, seed);
-        stage = "check";
-        const findings = await check(page, seed.page, rule);
-        return findings.some((finding) => finding.where.includes('[data-testid="seed"]'));
-      };
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      const stalled = new Promise<string>((resolve) => {
-        timer = setTimeout(() => resolve(`${rule}: stalled at ${stage} after ${SEED_LIMIT} ms`), SEED_LIMIT);
+    for (const [label, seed] of Object.entries(SEEDS)) {
+      // Bounded: a wedged page fails this seed and discards the tab instead of hanging the suite.
+      const outcome = await bounded(SEED_LIMIT, async () => {
+        const clean = new Set(await probe(seed.check, seed.page));
+        return (await probe(seed.check, seed.page, seed)).filter((line) => !clean.has(line));
       });
-      const outcome = await Promise.race([caught().then((ok) => (ok ? null : `${rule}: not caught`)), stalled]);
-      clearTimeout(timer);
-      console.error(`seed ${rule}: ${Math.round(performance.now() - started)} ms`);
-      if (outcome !== null) missed.push(outcome);
+      if (outcome === STALLED) missed.push(`${label}: stalled after ${SEED_LIMIT} ms`);
+      else if (outcome.length === 0) missed.push(`${label}: ${seed.check} found nothing new`);
     }
     expect(missed).toEqual([]);
-  }, LIMIT);
+  }, LIMIT * 2);
 
-  test("the allow-list only shrinks: every entry is frozen and still matches", () => {
-    // Remove a key when its entry goes; never add one.
-    const FROZEN: readonly string[] = [
-      "typography body",
-      "typography .mark__count",
-      "grid #root, #root *",
-      'structure [data-testid="group-project"] > .group__head',
-    ];
-    expect(ALLOWED.map((entry) => `${entry.rule} ${entry.selector}`).filter((key) => !FROZEN.includes(key))).toEqual([]);
+  test("the allow-list names one element selector per entry", () => {
+    expect(ALLOWED.filter((entry) => /[*,]/.test(entry.selector) || /^(html|:root|#root)$/.test(entry.selector.trim())).map((entry) => entry.selector)).toEqual([]);
+  });
+
+  test("the allow-list only shrinks: nothing beyond origin/dev's copy, and every entry still matches", async () => {
+    // The base is origin/dev; CONFORMANCE_ALLOW_BASE names another commit to prove the guard against.
+    const ref = process.env.CONFORMANCE_ALLOW_BASE ?? "origin/dev";
+    const base = Bun.spawnSync(["git", "show", `${ref}:web/client/e2e/conformance-allow.ts`], { cwd: CLIENT_ROOT });
+    const stderr = base.stderr.toString();
+    if (base.exitCode !== 0 && !/exists on disk, but not in|does not exist in/.test(stderr)) {
+      // CI fetches origin/dev for this; a local checkout without it skips the comparison only.
+      if (process.env.CI) throw new Error(`cannot read ${ref}'s allow-list: ${stderr.trim()}`);
+      console.warn(`conformance: no ${ref} ref, the allow-list is not compared`);
+    } else if (base.exitCode === 0) {
+      const path = `${CLIENT_ROOT}/artifacts/conformance-allow-dev.ts`;
+      await Bun.write(path, base.stdout);
+      const { ALLOWED: before } = (await import(path)) as { ALLOWED: typeof ALLOWED };
+      const grown = ALLOWED.filter((entry) => {
+        const old = before.find((each) => each.rule === entry.rule && each.selector === entry.selector);
+        return old === undefined || entry.pages.some((page) => !old.pages.includes(page));
+      });
+      expect(grown.map((entry) => `${entry.rule} ${entry.selector} [${entry.pages.join(", ")}]`)).toEqual([]);
+    }
     if (SEEDED === undefined) expect(ALLOWED.filter((_, index) => !usedAllowances.has(index)).map((entry) => `${entry.rule} ${entry.selector}`)).toEqual([]);
   });
 });

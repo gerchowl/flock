@@ -384,6 +384,11 @@ describe("command palette", () => {
     key(document, { key: "k", metaKey: true });
     const input = $(root, "palette")?.querySelector("input") as HTMLInputElement;
     expect($$(root, "palette-item").length).toBe(4);
+    // After the agents, the top bar's waiting action, dimmed: every toolbar action has its command.
+    const waiting = $(root, "palette-command") as HTMLElement;
+    expect([waiting.textContent, waiting.getAttribute("aria-disabled")]).toEqual(["New agentWaits for the harness picker (ADR-0036 S17)", "true"]);
+    waiting.click();
+    expect($(root, "palette")).not.toBeNull();
     input.value = "wr";
     input.dispatchEvent(new InputEvent("input", { bubbles: true }));
     expect($$(root, "palette-item").map((item) => item.textContent)).toEqual(["wrenTurn finished"]);
