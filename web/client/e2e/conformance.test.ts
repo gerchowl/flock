@@ -80,7 +80,9 @@ async function open(name: PageName, mode: ModeName): Promise<Page> {
   const page = await browser.newPage({ viewport: spec.viewport });
   await page.emulateMedia({ ...MODES[mode], reducedMotion: "reduce" });
   await page.goto(spec.url());
-  await page.locator(name === "gallery" ? "main" : "[data-testid=workbench], [data-testid=phone]").first().waitFor({ timeout: 10_000 });
+  // The desktop workbench replays its transcript first: check it once the replay has settled.
+  const ready = name === "gallery" ? "main" : name === "workbench" ? "[data-testid=transcript-synced]" : "[data-testid=phone]";
+  await page.locator(ready).first().waitFor({ timeout: 10_000 });
   if (SEEDED !== undefined && SEEDS[SEEDED].page === name) await inject(page, SEEDS[SEEDED]);
   await page.evaluate(installChecks);
   return page;
