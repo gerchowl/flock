@@ -9,6 +9,10 @@
  * 2. Layout fencing: flex and grid display, gap, margins, absolute
  *    positioning and `@media` belong to the primitives in `src/layout/`.
  *    Everything else composes those primitives.
+ * 5. Reserved token names: only the generated `src/tokens.css` declares a
+ *    custom property in a token category (`--color-*`, `--space-*`, …), so
+ *    no component can rebind a token (`flock/no-token-redeclaration`,
+ *    scripts/stylelint-reserved-tokens.js). It holds in LEGACY files too.
  *
  * LEGACY is the temporary ignore list: files written before the tokens.
  * They are still held to strict colours, but not yet to the other strict
@@ -80,9 +84,10 @@ const ALIAS = {
 };
 
 export default {
-  plugins: ["stylelint-declaration-strict-value"],
+  plugins: ["stylelint-declaration-strict-value", "./scripts/stylelint-reserved-tokens.js"],
   rules: {
     "scale-unlimited/declaration-strict-value": strict(STRICT),
+    "flock/no-token-redeclaration": true,
     ...ALIAS,
     ...FENCE,
   },
@@ -91,7 +96,12 @@ export default {
     { files: ["src/layout/**/*.css"], rules: UNFENCED },
     {
       files: ["src/tokens.css"],
-      rules: { "scale-unlimited/declaration-strict-value": null, "declaration-property-value-allowed-list": null, ...UNFENCED },
+      rules: {
+        "scale-unlimited/declaration-strict-value": null,
+        "declaration-property-value-allowed-list": null,
+        "flock/no-token-redeclaration": null,
+        ...UNFENCED,
+      },
     },
   ],
 };

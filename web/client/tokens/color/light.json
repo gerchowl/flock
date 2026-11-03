@@ -25,6 +25,22 @@
           "hex": "#8e8e93"
         },
         "$description": "Disabled text only (WCAG 1.4.3 exempts inactive controls). HIG tertiaryLabelColor."
+      },
+      "on-selection": {
+        "$value": {
+          "colorSpace": "srgb",
+          "components": [1.0, 1.0, 1.0],
+          "hex": "#ffffff"
+        },
+        "$description": "Text and glyphs in an emphasised selected row (selection.active), in place of every other content colour, status colours included. HIG alternateSelectedControlTextColor: https://developer.apple.com/documentation/appkit/nscolor/alternateselectedcontroltextcolor"
+      },
+      "on-selection-secondary": {
+        "$value": {
+          "colorSpace": "srgb",
+          "components": [1.0, 1.0, 1.0],
+          "alpha": 0.93
+        },
+        "$description": "Secondary text in an emphasised selected row, in place of label.secondary. The emphasized background style dims secondary labels (https://developer.apple.com/documentation/appkit/nsview/backgroundstyle/emphasized); 4.5:1 on selection.active allows only a slight dimming."
       }
     },
     "separator": {
@@ -68,16 +84,16 @@
           "components": [1.0, 1.0, 1.0],
           "hex": "#ffffff"
         },
-        "$description": "Text and icons on an accent fill or an active selection. HIG alternateSelectedControlTextColor."
+        "$description": "Text and icons on an accent fill: the one primary action. A selected row uses label.on-selection."
       }
     },
     "link": {
       "$value": {
         "colorSpace": "srgb",
-        "components": [0.039216, 0.423529, 0.862745],
-        "hex": "#0a6cdc"
+        "components": [0.007843, 0.384314, 0.803922],
+        "hex": "#0262cd"
       },
-      "$description": "Link and accent-coloured text on window or sidebar backgrounds. HIG linkColor."
+      "$description": "Link and accent-coloured text on window, sidebar and unemphasised selection backgrounds; a shade darker than the accent so it reaches 4.5:1 on all three. HIG linkColor."
     },
     "selection": {
       "active": {
@@ -86,7 +102,7 @@
           "components": [0.039216, 0.423529, 0.862745],
           "hex": "#0a6cdc"
         },
-        "$description": "Selected row in the focused window. HIG selectedContentBackgroundColor."
+        "$description": "Emphasised selected row: its content uses label.on-selection and label.on-selection-secondary. HIG selectedContentBackgroundColor."
       },
       "inactive": {
         "$value": {
@@ -108,33 +124,33 @@
     "destructive": {
       "$value": {
         "colorSpace": "srgb",
-        "components": [0.843137, 0.0, 0.082353],
-        "hex": "#d70015"
+        "components": [0.807843, 0.0, 0.078431],
+        "hex": "#ce0014"
       },
-      "$description": "Destructive actions, never the default button. HIG systemRed; Buttons."
+      "$description": "Destructive actions, never the default button. HIG systemRed; Buttons. Darkened until it reaches 4.5:1 on every plain surface (#2933)."
     },
     "status": {
       "green": {
         "$value": {
           "colorSpace": "srgb",
-          "components": [0.101961, 0.498039, 0.215686],
-          "hex": "#1a7f37"
+          "components": [0.035294, 0.462745, 0.184314],
+          "hex": "#09762f"
         },
         "$description": "Healthy, done. HIG systemGreen."
       },
       "orange": {
         "$value": {
           "colorSpace": "srgb",
-          "components": [0.698039, 0.313725, 0.0],
-          "hex": "#b25000"
+          "components": [0.650980, 0.290196, 0.003922],
+          "hex": "#a64a01"
         },
         "$description": "Needs attention, waiting. HIG systemOrange."
       },
       "red": {
         "$value": {
           "colorSpace": "srgb",
-          "components": [0.843137, 0.0, 0.082353],
-          "hex": "#d70015"
+          "components": [0.807843, 0.0, 0.078431],
+          "hex": "#ce0014"
         },
         "$description": "Failed, offline. HIG systemRed."
       }
