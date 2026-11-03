@@ -149,9 +149,33 @@ async function launch(): Promise<void> {
   // Diagnosis only (#2931): with the debugger on, a stall can ask the renderer where it is.
   debug = await tab.context().newCDPSession(tab);
   await debug.send("Debugger.enable");
+  host = await browser.newBrowserCDPSession();
 }
 
 let debug: CDPSession | undefined;
+let host: CDPSession | undefined;
+
+/**
+ * After a stall, asks the browser process (its own CDP session) for its
+ * targets and each process's CPU time, twice a second apart: an answer means
+ * the browser and the pipe to it are alive, and the deltas show which
+ * process is busy or blocked.
+ */
+async function processes(): Promise<string> {
+  const session = host;
+  if (session === undefined) return "no browser session";
+  type Info = { processInfo: { type: string; id: number; cpuTime: number }[] };
+  const sample = async (): Promise<Info> => (await session.send("SystemInfo.getProcessInfo")) as unknown as Info;
+  const first = await sample();
+  await new Promise((resolve) => setTimeout(resolve, 1_000));
+  const second = await sample();
+  const { targetInfos } = (await session.send("Target.getTargets")) as unknown as { targetInfos: { type: string; url: string; attached: boolean }[] };
+  const cpu = second.processInfo.map((now) => {
+    const before = first.processInfo.find((each) => each.id === now.id);
+    return `${now.type}#${now.id} +${before === undefined ? "new" : (now.cpuTime - before.cpuTime).toFixed(2)}s`;
+  });
+  return `processes ${cpu.join(", ")}; targets ${targetInfos.map((t) => `${t.type} ${t.url.split("/").pop()}${t.attached ? "" : " (detached)"}`).join(", ")}`;
+}
 
 type Paused = { callFrames: { functionName: string; url: string; location: { scriptId: string; lineNumber: number; columnNumber: number } }[] };
 
@@ -186,6 +210,12 @@ async function diagnose(): Promise<void> {
   const found = await Promise.race([report.catch((error: Error) => `the pause failed: ${error.message}`), silent]);
   clearTimeout(timer);
   console.error(`conformance: stalled during ${stage}; renderer: ${found}`);
+  const browserSide = processes().catch((error: Error) => `the browser query failed: ${error.message}`);
+  const quiet = new Promise<string>((resolve) => {
+    timer = setTimeout(() => resolve("no answer from the browser process within 5 s"), 5_000);
+  });
+  console.error(`conformance: browser: ${await Promise.race([browserSide, quiet])}`);
+  clearTimeout(timer);
 }
 
 /** A fresh document at `name` in `mode`, with the checks installed (and the env seed, if any). */
