@@ -14,18 +14,18 @@ try {
     if (!pattern.test(dom)) throw new Error(`design types: DOM library shape changed: ${pattern}`);
     dom = dom.replace(pattern, replacement);
   }
-  replace(/get style\(\): CSSStyleDeclaration;/g, "readonly style: never;");
+  replace(/get style\(\): CSSStyleDeclaration;/g, "readonly style: unknown;");
   replace(/set style\(cssText: string\);/g, "");
-  replace(/readonly attributeStyleMap: StylePropertyMap;/g, "readonly attributeStyleMap: never;");
-  replace(/readonly styleMap: StylePropertyMap;/g, "readonly styleMap: never;");
-  replace(/adoptedStyleSheets: CSSStyleSheet\[\];/g, "readonly adoptedStyleSheets: never;");
-  replace(/readonly styleSheets: StyleSheetList;/g, "readonly styleSheets: never;");
-  replace(/animate\(keyframes:[^\n]+;/g, "readonly animate: never;");
-  replace(/declare var CSSStyleSheet: \{[\s\S]*?\n\};/, "declare const CSSStyleSheet: never;");
+  replace(/readonly attributeStyleMap: StylePropertyMap;/g, "readonly attributeStyleMap: unknown;");
+  replace(/readonly styleMap: StylePropertyMap;/g, "readonly styleMap: unknown;");
+  replace(/adoptedStyleSheets: CSSStyleSheet\[\];/g, "readonly adoptedStyleSheets: unknown;");
+  replace(/readonly styleSheets: StyleSheetList;/g, "readonly styleSheets: unknown;");
+  replace(/animate\(keyframes:[^\n]+;/g, "readonly animate: unknown;");
+  replace(/declare var CSSStyleSheet: \{[\s\S]*?\n\};/, "declare const CSSStyleSheet: unknown;");
   replace(/interface (CSSStyleSheet|CSSGroupingRule|CSSKeyframesRule) extends [\s\S]*?\n\}/g, "$&");
   dom = dom.replace(/interface (CSSStyleSheet|CSSGroupingRule|CSSKeyframesRule) extends [\s\S]*?\n\}/g, (block) =>
     block.replace(/(?:insertRule|deleteRule|addRule|removeRule|replace|replaceSync|appendRule)\([^\n]+;/g,
-      (method) => `readonly ${method.slice(0, method.indexOf("("))}: never;`));
+      (method) => `readonly ${method.slice(0, method.indexOf("("))}: unknown;`));
   const lib = join(root, "lib.dom.d.ts");
   await writeFile(lib, dom);
   const seed = process.argv[2];

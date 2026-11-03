@@ -215,6 +215,10 @@ describe("fix round 1 source gates", () => {
 
 describe("fix round 1 typed capabilities", () => {
   test.each([
+    ["computed generic assign", 'const k = "style"; Object.assign(el[k], {margin:"13px"})'],
+    ["Object create any", 'const space: SpaceStep = Object.create(null).space'],
+    ["Object values any", 'const space: SpaceStep = Object.values({} as object)[0]'],
+    ["Object entries any", 'const space: SpaceStep = Object.entries({} as object)[0]![1]'],
     ["computed key", 'const k = "style"; el[k].margin = "13px"'],
     ["typed style map", 'el.attributeStyleMap.set("margin", CSS.px(13))'],
     ["sheet insertion", 'document.styleSheets[0]!.insertRule(".a{margin:13px}")'],

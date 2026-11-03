@@ -132,9 +132,12 @@ export type TurnFold = {
   readonly permissionLocations: Record<number, PermissionLocation>;
 };
 
+/** An empty dictionary has no inherited keys or unvalidated values. */
+const dictionary = <T>(): Record<string, T> => Object.create(null) as Record<string, T>;
+
 /** A fold of no entries. */
 export function emptyFold(): TurnFold {
-  return { turns: [], runs: Object.create(null), absorbed: Object.create(null), unpaired: Object.create(null), permissionFacts: Object.create(null), permissionLocations: Object.create(null) };
+  return { turns: [], runs: dictionary(), absorbed: dictionary(), unpaired: dictionary(), permissionFacts: dictionary(), permissionLocations: dictionary() };
 }
 
 /** Only known permission facts with nonempty shared ids can correlate. */

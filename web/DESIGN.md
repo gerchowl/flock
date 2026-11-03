@@ -155,18 +155,21 @@ Name-based ESLint checks are a useful first error, but computed keys and aliases
 require a type-level boundary. `bun run types:design`, included in `lint`, checks
 application source and its imports with a restricted copy of the pinned compiler's
 DOM library. It removes the normal DOM library from this pass, replaces styling
-capabilities with readonly `never`, and fails if the unrestricted DOM library is
+capabilities with readonly `unknown`, and fails if the unrestricted DOM library is
 loaded or a declaration's expected shape changes. Standard type checking still
 runs separately. This avoids declaration-merging precedence and covers concrete
 HTML, SVG and inline-style interfaces without guessing which variable is a DOM
 object.
 
+`unknown` also prevents passing an unavailable capability directly to generic
+object-mutating helpers; `never` would remain assignable there.
+
 The unavailable capabilities are inline style getters/setters, typed style maps,
 stylesheet lists/adoption, stylesheet construction, rule mutation and animation.
-A constant computed key resolves to `never`; a nonconstant string cannot index a
+A constant computed key resolves to `unknown`; a nonconstant string cannot index a
 DOM element under strict checking. Aliasing `CSSStyleSheet` preserves its unusable
 type. Reflection and JSON boundaries return `unknown`, including `Reflect.get`,
-`JSON.parse`, `Body.json`, array narrowing and property descriptors. Values must be
+`JSON.parse`, `Body.json`, array narrowing, object construction/assignment/enumeration and property descriptors. Values must be
 validated before they become design props. JSX style attributes remain available
 only inside `src/layout/primitives/`; the restricted DOM pass allows no direct
 CSSOM mutation even there.
