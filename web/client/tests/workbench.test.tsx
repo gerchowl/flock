@@ -384,6 +384,11 @@ describe("command palette", () => {
     key(document, { key: "k", metaKey: true });
     const input = $(root, "palette")?.querySelector("input") as HTMLInputElement;
     expect($$(root, "palette-item").length).toBe(4);
+    // After the agents, the top bar's waiting action, dimmed: every toolbar action has its command.
+    const waiting = $(root, "palette-command") as HTMLElement;
+    expect([waiting.textContent, waiting.getAttribute("aria-disabled")]).toEqual(["New agentWaits for the harness picker (ADR-0036 S17)", "true"]);
+    waiting.click();
+    expect($(root, "palette")).not.toBeNull();
     input.value = "wr";
     input.dispatchEvent(new InputEvent("input", { bubbles: true }));
     expect($$(root, "palette-item").map((item) => item.textContent)).toEqual(["wrenTurn finished"]);
@@ -403,6 +408,18 @@ describe("command palette", () => {
     expect(active()).toBe("atlasRunning the wire script suite");
     key(input, { key: "Escape" });
     expect(document.activeElement).toBe(trigger);
+  });
+
+  test("Esc after ⌘K returns focus to the control that had it", async () => {
+    const root = await workbench(createFixtureFleet(SAMPLE_AGENTS));
+    const row = $(root, "agent-row") as HTMLButtonElement;
+    row.focus();
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "k", metaKey: true, bubbles: true }));
+    await tick();
+    const input = $(root, "palette")?.querySelector("input") as HTMLInputElement;
+    expect(document.activeElement).toBe(input);
+    key(input, { key: "Escape" });
+    expect(document.activeElement).toBe(row);
   });
 
   test("Tab and Shift+Tab stay in the dialog, and options hold no nested controls", async () => {

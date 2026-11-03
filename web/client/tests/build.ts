@@ -10,7 +10,7 @@ import { readdir } from "node:fs/promises";
 export const CLIENT_ROOT = `${import.meta.dir}/..`;
 
 /** Builds the client in `mode` into `outDir` and lists the emitted files. */
-export async function buildClient(mode: "production" | "fixture", outDir: string): Promise<string[]> {
+export async function buildClient(mode: "production" | "fixture" | "gallery", outDir: string): Promise<string[]> {
   const child = Bun.spawn(
     [process.execPath, "x", "vite", "build", "--mode", mode, "--outDir", outDir, "--emptyOutDir", "--logLevel", "error"],
     { cwd: CLIENT_ROOT, stdout: "pipe", stderr: "pipe" },

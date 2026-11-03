@@ -12,7 +12,7 @@
  *
  * @module
  */
-import { Show, createEffect, createMemo, createSignal, onCleanup, type JSX } from "solid-js";
+import { For, Show, createEffect, createMemo, createSignal, onCleanup, type JSX } from "solid-js";
 
 import type { FleetSource } from "../fleet";
 import { createManager, type Layout } from "../layout/model";
@@ -23,13 +23,21 @@ import type { Transport } from "../transport";
 import { Transcript, type TranscriptSource } from "../views/Transcript";
 import type { InboxCard } from "./inbox";
 import { Composer, createComposerState, type Sender } from "./Composer";
-import { Palette } from "./Palette";
+import { Palette, type WaitingAction } from "./Palette";
 import { createPermissionInbox } from "./permissions";
 import { AgentTitle, InboxCards, Waits, createClosedIds } from "./parts";
 import { PhoneWorkbench } from "./Phone";
 import { HOME_UNKNOWN, SidebarTrees } from "./Sidebar";
 import { buildTrees, homeNodeId, inScope } from "./trees";
 import "./workbench.css";
+
+/** The toolbars' waiting actions; each is a button and, dimmed, a palette command. */
+const NEW_AGENT: WaitingAction = { label: "New agent", waitsFor: "the harness picker (ADR-0036 S17)" };
+const PANE_ACTIONS: readonly WaitingAction[] = [
+  { label: "Terminal", waitsFor: "the terminal tile" },
+  { label: "Diff", waitsFor: "the diff tile" },
+  { label: "Fork", waitsFor: "forks (ADR-0036 S12)" },
+];
 
 /** Where the workbench's data comes from, and how its layout persists. */
 export type WorkbenchProps = {
@@ -130,12 +138,12 @@ export function Workbench(props: WorkbenchProps): JSX.Element {
     <div class="workbench" data-testid="workbench">
       <header class="topbar">
         <span class="topbar__mark">flock</span>
-        <Palette rows={scoped} onOpen={openAgent} />
+        <Palette rows={scoped} onOpen={openAgent} waiting={[NEW_AGENT, ...(focusedAgent() === null ? [] : PANE_ACTIONS)]} />
         <span class="topbar__summary" data-testid="agent-summary">
           {scoped().length} agents · {working()} working
         </span>
         <Show when={props.status?.()}>{(status) => <span class="topbar__status" role="status">{status()}</span>}</Show>
-        <Waits label="New agent" waitsFor="the harness picker (ADR-0036 S17)" />
+        <Waits label={NEW_AGENT.label} waitsFor={NEW_AGENT.waitsFor} />
       </header>
       <nav class="sidebar" aria-label="Agents" data-testid="sidebar">
         <Show when={fleetNote()}>{(note) => <p class="sidebar__note">{note()}</p>}</Show>
@@ -150,9 +158,7 @@ export function Workbench(props: WorkbenchProps): JSX.Element {
               <header class="focus__header">
                 <AgentTitle agent={agent} row={focusedRow()} />
                 <span class="focus__actions">
-                  <Waits label="Terminal" waitsFor="the terminal tile" />
-                  <Waits label="Diff" waitsFor="the diff tile" />
-                  <Waits label="Fork" waitsFor="forks (ADR-0036 S12)" />
+                  <For each={PANE_ACTIONS}>{(action) => <Waits label={action.label} waitsFor={action.waitsFor} />}</For>
                 </span>
               </header>
               <div class="focus__body">
