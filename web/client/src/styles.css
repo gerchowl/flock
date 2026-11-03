@@ -18,6 +18,11 @@ body {
   overflow-wrap: anywhere;
 }
 
+/* A shortcut label (the palette's ⌘K) is in the system font, like a menu's. */
+kbd {
+  font-family: inherit;
+}
+
 /* One visible focus ring for every control, keyboard focus only. */
 :focus-visible {
   outline: 2px solid var(--color-legacy-working);
