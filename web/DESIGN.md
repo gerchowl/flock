@@ -64,11 +64,43 @@ the scale is a design question, not a missing token.
    `display: flex` or `grid` (inline forms included), `gap`, margins,
    `position: absolute` or `@media`. Compose the primitives instead.
    (stylelint overrides.)
-3. **No inline styles.** TSX outside `src/layout/` may not set `style=` (or
+3. **No inline styles.** Source outside `src/layout/` may not set `style=` (or
    `attr:style`/`prop:style`): an inline style escapes both rules above.
-   (ESLint.)
+   Runtime access to `style` (including computed string members),
+   `Object.assign(el.style, ...)`, objects with a `style` key (including
+   JSX spreads), `CSSStyleSheet` construction and `adoptedStyleSheets` are
+   fenced too. Only layout code owns styles. (ESLint.)
 4. **Spacing is typed.** A primitive's `space` prop is a `SpaceStep`, so
-   `<Stack space="14">` is a type error. (tsc.)
+   `<Stack space="14">` is a type error. (tsc.) ESLint rejects casts inside
+   design props and their local variable or spread initializers, and casts
+   to `any`, `SpaceStep` or `Token`. Type suppression comments
+   (`@ts-expect-error`, `@ts-ignore`, `@ts-nocheck`) are forbidden.
+5. **Lint what ships.** Source CSS and PCSS anywhere in the client are
+   scanned, excluding dependency and build output directories. ESLint scans
+   JS, JSX, TS, TSX, MTS, MJS, CTS and CJS in `src/`; JavaScript source is
+   rejected because typed design props require TypeScript. Raw and inline
+   query imports are forbidden in source and in the production module graph.
+   The fixture recording uses a dedicated JSONL loader which validates every
+   line as JSON before exporting data.
+6. **Suppressions cannot disable gates.** Stylelint runs with
+   `--ignore-disables`, including its build API equivalent; ESLint sets
+   `noInlineConfig: true`. The legacy filename list is pinned by a test and
+   can only shrink.
+
+`bun run build` (and `build:fixture`) runs the same strict and fence rules
+inside Vite's PostCSS pipeline after CSS imports expand. This sees CSS and
+PCSS imported from JavaScript, HTML or another stylesheet, including files
+outside `src/`. CSS identifiers are decoded and property/at-rule names and
+layout values are normalized for case on a clone before linting. The emitted
+CSS is unchanged. Imports left unresolved by Vite are rejected.
+
+We choose the Vite graph over a single minified `dist` stylesheet because
+source locations preserve the existing authority of generated tokens, layout
+primitives and legacy files. A concatenated output loses those boundaries:
+exempting it would exempt new violations, while linting it strictly would
+reject the generated tokens themselves. The graph check runs in both builds
+and `bun run lint`, so `just client-lint`, `just client-build-lint`,
+`just client-check`, and CI's existing `just lint` all exercise it.
 
 `tests/design-rules.test.ts` seeds a violation of each rule and expects it to
 fail, and expects the tree to pass.

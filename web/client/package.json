@@ -4,12 +4,12 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "vite build",
-    "build:fixture": "vite build --mode fixture",
+    "build": "bun scripts/lint-build.ts",
+    "build:fixture": "bun scripts/lint-build.ts --fixture",
     "preview": "vite preview",
     "tokens": "bun scripts/tokens.ts",
     "tokens:check": "bun scripts/tokens.ts --check",
-    "lint": "bun scripts/tokens.ts --check && stylelint \"src/**/*.css\" && eslint src"
+    "lint": "bun scripts/tokens.ts --check && stylelint \"**/*.{css,pcss}\" --ignore-disables --ignore-path .gitignore && eslint src && bun run build"
   },
   "dependencies": {
     "solid-js": "1.9.15"

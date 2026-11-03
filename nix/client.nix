@@ -120,6 +120,8 @@ stdenv.mkDerivation {
       lock
       (root + "/index.html")
       (root + "/vite.config.ts")
+      (root + "/scripts/lint-build.ts")
+      (root + "/stylelint.config.js")
       (root + "/tsconfig.json")
       (root + "/src")
     ];
