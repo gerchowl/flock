@@ -1,1 +1,2 @@
 - Audit CSS through the client build graph, expand source lint coverage, and reject runtime style and design gate suppression bypasses (#2933).
+- Reject ignored dependency stylesheets and indirect DOM styling through a restricted design type check; validate imported application modules and pin linter configuration (#2933).

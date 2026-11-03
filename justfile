@@ -116,10 +116,6 @@ website-build:
 client-check:
     cd web/client && bun install --frozen-lockfile && bun test && bun test ./e2e && bun x tsc --noEmit -p tsconfig.json && bun run lint
 
-# Audit every stylesheet in the production Vite graph, including CSS imports.
-client-build-lint:
-    cd web/client && bun install --frozen-lockfile && bun run build
-
 # Recompute nix/client-deps.json, the pinned hash of the client's
 # dependencies for `nix build .#flock-client` (#1731), after web/client/bun.lock
 # or Bun changes: it records the lock's sha256 and Bun version, fetches with an

@@ -64,20 +64,22 @@ the scale is a design question, not a missing token.
    `display: flex` or `grid` (inline forms included), `gap`, margins,
    `position: absolute` or `@media`. Compose the primitives instead.
    (stylelint overrides.)
-3. **No inline styles.** Source outside `src/layout/` may not set `style=` (or
+3. **No inline styles.** Source outside `src/layout/primitives/` may not set `style=` (or
    `attr:style`/`prop:style`): an inline style escapes both rules above.
    Runtime access to `style` (including computed string members),
    `Object.assign(el.style, ...)`, objects with a `style` key (including
    JSX spreads), `CSSStyleSheet` construction and `adoptedStyleSheets` are
-   fenced too. Only layout code owns styles. (ESLint.)
+   fenced too. Only primitives own inline styles. (ESLint.)
 4. **Spacing is typed.** A primitive's `space` prop is a `SpaceStep`, so
    `<Stack space="14">` is a type error. (tsc.) ESLint rejects casts inside
-   design props and their local variable or spread initializers, and casts
-   to `any`, `SpaceStep` or `Token`. Type suppression comments
+   design props and their local variable or spread initializers. Explicit
+   `any` is forbidden throughout application source. String-literal and
+   design-token assertions are forbidden everywhere, including local type
+   aliases and renamed imports. Type suppression comments
    (`@ts-expect-error`, `@ts-ignore`, `@ts-nocheck`) are forbidden.
 5. **Lint what ships.** Source CSS and PCSS anywhere in the client are
    scanned, excluding dependency and build output directories. ESLint scans
-   JS, JSX, TS, TSX, MTS, MJS, CTS and CJS in `src/`; JavaScript source is
+   JS, JSX, TS, TSX, MTS, MJS, CTS and CJS throughout the client application; JavaScript source is
    rejected because typed design props require TypeScript. Raw and inline
    query imports are forbidden in source and in the production module graph.
    The fixture recording uses a dedicated JSONL loader which validates every
@@ -99,8 +101,7 @@ source locations preserve the existing authority of generated tokens, layout
 primitives and legacy files. A concatenated output loses those boundaries:
 exempting it would exempt new violations, while linting it strictly would
 reject the generated tokens themselves. The graph check runs in both builds
-and `bun run lint`, so `just client-lint`, `just client-build-lint`,
-`just client-check`, and CI's existing `just lint` all exercise it.
+and `bun run lint`, so `just client-lint`, `just client-check`, and CI's existing `just lint` all exercise it.
 
 `tests/design-rules.test.ts` seeds a violation of each rule and expects it to
 fail, and expects the tree to pass.
@@ -146,3 +147,46 @@ queries.
   28 px regular controls; a destructive action is red and never the default.
 - [Accessibility](https://developer.apple.com/design/human-interface-guidelines/accessibility):
   contrast, 44 px touch targets, visible keyboard focus.
+
+
+### Indirect styling and untrusted types
+
+Name-based ESLint checks are a useful first error, but computed keys and aliases
+require a type-level boundary. `bun run types:design`, included in `lint`, checks
+application source and its imports with a restricted copy of the pinned compiler's
+DOM library. It removes the normal DOM library from this pass, replaces styling
+capabilities with readonly `never`, and fails if the unrestricted DOM library is
+loaded or a declaration's expected shape changes. Standard type checking still
+runs separately. This avoids declaration-merging precedence and covers concrete
+HTML, SVG and inline-style interfaces without guessing which variable is a DOM
+object.
+
+The unavailable capabilities are inline style getters/setters, typed style maps,
+stylesheet lists/adoption, stylesheet construction, rule mutation and animation.
+A constant computed key resolves to `never`; a nonconstant string cannot index a
+DOM element under strict checking. Aliasing `CSSStyleSheet` preserves its unusable
+type. Reflection and JSON boundaries return `unknown`, including `Reflect.get`,
+`JSON.parse`, `Body.json`, array narrowing and property descriptors. Values must be
+validated before they become design props. JSX style attributes remain available
+only inside `src/layout/primitives/`; the restricted DOM pass allows no direct
+CSSOM mutation even there.
+
+The Vite transform also lints every application TS/JS module it loads, including
+imports from outside `src/`, from otherwise test-only directories or outside the
+client root. CLI and graph ESLint configurations are pinned. Bundler virtual
+modules and dependency JavaScript are trusted build/runtime inputs. Dependency
+CSS is different: it is browser styling and must pass the full CSS rules. Default
+stylelint exclusions are disabled, the graph uses an empty ignore file, and any
+ignored result is a hard failure. `VENDOR_CSS` is an empty typed allowlist; future
+exceptions require an exact package stylesheet path and an issue number. Source
+stylelint also pins `--config` and `--config-basedir` so nested configuration cannot
+weaken it.
+
+This is a static application gate, not a JavaScript sandbox. It trusts dependency
+implementations and declarations, and existing validated structural assertions
+remain possible. A deliberately forged structural DOM type or dynamically executed
+JavaScript can defeat static types. Detecting arbitrary behavior in those cases
+requires runtime conformance coverage; that remains the separate #2896 suite.
+No runtime guard is claimed here. The seeded tests cover each reported indirect
+access and unsafe-prop path, including the concatenated-key case that strict
+TypeScript already rejected when its receiver had a concrete DOM type.

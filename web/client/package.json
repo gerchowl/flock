@@ -9,7 +9,8 @@
     "preview": "vite preview",
     "tokens": "bun scripts/tokens.ts",
     "tokens:check": "bun scripts/tokens.ts --check",
-    "lint": "bun scripts/tokens.ts --check && stylelint \"**/*.{css,pcss}\" --ignore-disables --ignore-path .gitignore && eslint src && bun run build"
+    "lint": "bun scripts/tokens.ts --check && stylelint \"**/*.{css,pcss}\" --config stylelint.config.js --config-basedir . --ignore-disables --ignore-path .gitignore && eslint . --config eslint.config.js && bun run types:design && bun run build",
+    "types:design": "bun scripts/check-design-types.ts"
   },
   "dependencies": {
     "solid-js": "1.9.15"

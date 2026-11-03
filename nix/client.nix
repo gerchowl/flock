@@ -122,6 +122,7 @@ stdenv.mkDerivation {
       (root + "/vite.config.ts")
       (root + "/scripts/lint-build.ts")
       (root + "/stylelint.config.js")
+      (root + "/eslint.config.js")
       (root + "/tsconfig.json")
       (root + "/src")
     ];

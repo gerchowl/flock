@@ -4,16 +4,33 @@ import babelParser from "@babel/eslint-parser";
 const NO_STYLE = "Inline style bypasses the design tokens: use a class, or a primitive from src/layout/ (web/DESIGN.md).";
 const name = (node) => node?.name ?? node?.value;
 const designProps = new Set(["space", "gutters", "justify", "align", "side", "sideWidth", "contentMin", "threshold", "max", "min", "intrinsic", "as"]);
-const runtime = new Set(["style", "adoptedStyleSheets"]);
+const runtime = new Set(["style", "adoptedStyleSheets", "attributeStyleMap", "styleSheets", "animate", "insertRule"]);
 
 const design = {
   meta: { schema: [] },
   create(context) {
-    const layout = /[/\\]src[/\\]layout[/\\]/.test(context.filename);
+    const layout = /[/\\]src[/\\]layout[/\\]primitives[/\\]/.test(context.filename);
     const designValues = [];
+    const designTypes = new Set(["SpaceStep", "Token"]);
+    function forbiddenType(node) {
+      if (!node) return false;
+      if (node.type === "TSLiteralType") return typeof node.literal.value === "string" || node.literal.type === "TemplateLiteral";
+      if (node.type === "TSTypeReference") return designTypes.has(name(node.typeName.right ?? node.typeName));
+      if (node.type === "TSParenthesizedType") return forbiddenType(node.typeAnnotation);
+      return (node.type === "TSUnionType" || node.type === "TSIntersectionType") && node.types.some(forbiddenType);
+    }
     const report = (node, message = NO_STYLE) => context.report({ node, message });
     return {
       Program(node) {
+        for (const item of node.body) if (item.type === "ImportDeclaration") {
+          for (const specifier of item.specifiers) if (designTypes.has(name(specifier.imported))) designTypes.add(specifier.local.name);
+        }
+        for (let pass = 0; pass < node.body.length; pass++) {
+          for (const item of node.body) {
+            const alias = item.declaration ?? item;
+            if (alias.type === "TSTypeAliasDeclaration" && forbiddenType(alias.typeAnnotation)) designTypes.add(alias.id.name);
+          }
+        }
         if (/\.[cm]?jsx?$/.test(context.filename)) report(node, "Client source must use TypeScript so design props are type checked.");
         for (const comment of context.sourceCode.getAllComments()) {
           if (/@ts-(?:expect-error|ignore|nocheck)\b/.test(comment.value)) report(node, "Type suppression bypasses typed design props.");
@@ -56,8 +73,9 @@ const design = {
       Property(node) {
         if (!layout && name(node.key) === "style") report(node);
       },
+      TSAnyKeyword(node) { report(node, "Explicit any bypasses design types; use unknown and validate."); },
       TSAsExpression(node) {
-        if (/^(?:any|SpaceStep|Token)$/.test(context.sourceCode.getText(node.typeAnnotation))) {
+        if (forbiddenType(node.typeAnnotation)) {
           report(node, "Value casts bypass typed design props; keep the original type.");
         }
       },
@@ -72,8 +90,9 @@ const design = {
 };
 
 export default [
+  { ignores: ["node_modules/**", "dist/**", "artifacts/**", "tests/**", "e2e/**", "scripts/**", "test/**", "vite.config.ts", "eslint.config.js", "stylelint.config.js"] },
   {
-    files: ["src/**/*.{js,jsx,ts,tsx,mts,mjs,cts,cjs}"],
+    files: ["**/*.{js,jsx,ts,tsx,mts,mjs,cts,cjs}"],
     linterOptions: { noInlineConfig: true },
     languageOptions: {
       parser: babelParser,
