@@ -35,7 +35,6 @@ const LIMIT = 60_000;
 const AXE_LIMIT = 3_000;
 const SEED_LIMIT = 10_000;
 const PROBE_LIMIT = 10_000;
-const DOCUMENTS_PER_BROWSER = 8;
 
 type PageSpec = CheckOptions & { readonly url: () => string; readonly viewport: { width: number; height: number }; readonly palette: boolean };
 
@@ -126,45 +125,32 @@ async function inject(page: Page, seed: Seed): Promise<void> {
 }
 
 let tab: Page | undefined;
-let documents = 0;
 
 /**
- * Chromium on the Linux CI runner wedges after a few dozen documents in one
- * browser (pages or navigations alike), so the suite starts a fresh browser
- * every `DOCUMENTS_PER_BROWSER` documents and after any stall. The old one is
- * closed without waiting: a wedged browser may never answer.
+ * What the suite is doing now, and why the tab became unusable, if it did.
+ * There is one tab for the whole run (Chromium on the Linux CI runner wedged
+ * when pages were opened and closed, #2931). A stall, a crash or a lost
+ * connection is a failure naming the check and stage; nothing relaunches or
+ * retries, and every later check fails at once with the same reason.
  */
-async function relaunch(): Promise<void> {
-  const old = browser;
-  const fresh = await chromium.launch();
-  fresh.on("disconnected", () => fresh === browser && console.error("conformance: the browser disconnected"));
-  browser = fresh;
-  tab = await fresh.newPage();
-  tab.on("crash", () => console.error("conformance: the page crashed"));
-  void old?.close().catch(() => undefined);
-}
+let stage = "launch";
+let broken: string | null = null;
+const at = (now: string): void => void (stage = now);
 
-/** A browser lost under a check (a crashed page or a dropped connection): infrastructure, not a finding. */
-const lost = (error: unknown): boolean => error instanceof Error && /has been closed|crash/i.test(error.message);
-
-/** Runs `work`; if the browser is lost under it, relaunches once and runs it again. */
-async function retryLost<T>(label: string, work: () => Promise<T>): Promise<T> {
-  try {
-    return await work();
-  } catch (error) {
-    if (!lost(error)) throw error;
-    console.error(`conformance: browser lost during ${label}, retrying once on a fresh one`);
-    tab = undefined;
-    return work();
-  }
+async function launch(): Promise<void> {
+  browser = await chromium.launch();
+  browser.on("disconnected", () => (broken ??= `the browser disconnected during ${stage}`));
+  tab = await browser.newPage();
+  tab.on("crash", () => (broken ??= `the page crashed during ${stage}`));
+  tab.on("close", () => (broken ??= `the tab closed during ${stage}`));
 }
 
 /** A fresh document at `name` in `mode`, with the checks installed (and the env seed, if any). */
 async function open(name: PageName, mode: ModeName): Promise<Page> {
   const spec = PAGES[name];
-  if (tab === undefined || tab.isClosed() || !browser?.isConnected() || documents % DOCUMENTS_PER_BROWSER === 0) await relaunch();
-  documents += 1;
+  if (broken !== null) throw new Error(`the tab is unusable: ${broken}`);
   const page = tab!;
+  at(`opening ${name}/${mode}`);
   await page.setViewportSize(spec.viewport);
   await page.emulateMedia({ ...MODES[mode], reducedMotion: "reduce" });
   await page.goto(spec.url());
@@ -205,7 +191,7 @@ async function surveyAll(): Promise<void> {
         lines.set(line, (lines.get(line) ?? new Set()).add(`${name}/${mode}`));
       };
       // Each finding names the selector an allow-list entry would use.
-      for (const rule of RULES) for (const finding of await check_(page, name, rule)) add(rule, `${finding.where}: ${finding.detail} (${finding.selector})`);
+      for (const rule of RULES) for (const finding of (at(`${rule} on ${name}/${mode}`), await check_(page, name, rule))) add(rule, `${finding.where}: ${finding.detail} (${finding.selector})`);
       for (const line of await axe(page, name, mode)) add("contrast", line);
     }
   }
@@ -227,9 +213,9 @@ let axeSource = "";
 const STALLED = Symbol("stalled");
 
 /**
- * Runs `work` for at most `ms`. On a stall the browser is discarded (the
- * next `open` launches a new one), and the losing promise's rejection is
- * swallowed, so it can never surface in a later navigation.
+ * Runs `work` for at most `ms`. A stall marks the tab unusable (every later
+ * check then fails at once with the stage it stalled at), and the losing
+ * promise's rejection is swallowed, so it can never surface later.
  */
 async function bounded<T>(ms: number, work: () => Promise<T>): Promise<T | typeof STALLED> {
   const running = work();
@@ -240,15 +226,13 @@ async function bounded<T>(ms: number, work: () => Promise<T>): Promise<T | typeo
   });
   const outcome = await Promise.race([running, stalled]);
   clearTimeout(timer);
-  if (outcome === STALLED) {
-    // The next `open` starts a fresh browser.
-    tab = undefined;
-  }
+  if (outcome === STALLED) broken ??= `stalled after ${ms} ms during ${stage}`;
   return outcome;
 }
 
 /** axe-core's WCAG 2.x A and AA rules on `page`; a stalled run is a finding. */
 async function axe(page: Page, name: PageName, mode: ModeName): Promise<string[]> {
+  at(`axe on ${name}/${mode}`);
   const outcome = await bounded(AXE_LIMIT, async () => {
     await page.evaluate(axeSource);
     return page.evaluate(async () => {
@@ -339,12 +323,14 @@ const DRIVEN: Readonly<Record<Driven, (page: Page, name: PageName) => Promise<st
 async function probe(check: Check, name: PageName, seed?: Seed): Promise<string[]> {
   const page = await open(name, "light");
   if (seed !== undefined) await inject(page, seed);
+  at(`${check} on ${name}${seed === undefined ? "" : " (seeded)"}`);
   if (check in DRIVEN) return DRIVEN[check as Driven](page, name);
   return (await check_(page, name, check as Rule)).map((finding) => `${finding.where}: ${finding.detail}`);
 }
 
 beforeAll(async () => {
   await Promise.all([buildClient("fixture", FIXTURE), buildClient("gallery", GALLERY)]);
+  await launch();
   axeSource = await Bun.file(AXE).text();
   await surveyAll();
 }, LIMIT * 2);
@@ -385,15 +371,16 @@ describe("design conformance", () => {
   }, LIMIT);
 
   /** `checks` on every page, each on a fresh light-mode document, labelled with the page. */
-  // Each bounded: a stall is a finding naming the check and page, and the next check gets a fresh browser.
+  // Each bounded: a stall, a crash or an error is a finding naming the check, page and stage.
   const driven = async (checks: readonly Driven[]): Promise<string[]> => {
     const out: string[] = [];
     for (const name of Object.keys(PAGES) as PageName[]) {
       for (const each of checks) {
         const started = performance.now();
-        const outcome = await bounded(PROBE_LIMIT, () => retryLost(`${each} on ${name}`, () => probe(each, name)));
+        const outcome = await bounded(PROBE_LIMIT, () => probe(each, name)).catch((error: Error) => new Error(`${error.message} (during ${stage})`));
         console.error(`conformance: ${each} on ${name} took ${Math.round(performance.now() - started)} ms`);
-        if (outcome === STALLED) out.push(`${each} ${name}/light: stalled after ${PROBE_LIMIT} ms`);
+        if (outcome === STALLED) out.push(`${each} ${name}/light: stalled after ${PROBE_LIMIT} ms during ${stage}`);
+        else if (outcome instanceof Error) out.push(`${each} ${name}/light: ${outcome.message}`);
         else for (const line of outcome) out.push(`${each} ${name}/light: ${line}`);
       }
     }
@@ -412,14 +399,13 @@ describe("design conformance", () => {
     const missed: string[] = [];
     for (const [label, seed] of Object.entries(SEEDS)) {
       // Bounded: a wedged page fails this seed and discards the tab instead of hanging the suite.
-      const outcome = await bounded(SEED_LIMIT, () =>
-        retryLost(`seed ${label}`, async () => {
-          const clean = new Set(await probe(seed.check, seed.page));
-          return (await probe(seed.check, seed.page, seed)).filter((line) => !clean.has(line));
-        }),
-      );
+      const outcome = await bounded(SEED_LIMIT, async () => {
+        const clean = new Set(await probe(seed.check, seed.page));
+        return (await probe(seed.check, seed.page, seed)).filter((line) => !clean.has(line));
+      }).catch((error: Error) => new Error(`${error.message} (during ${stage})`));
       console.error(`conformance: seed ${label} done`);
-      if (outcome === STALLED) missed.push(`${label}: stalled after ${SEED_LIMIT} ms`);
+      if (outcome === STALLED) missed.push(`${label}: stalled after ${SEED_LIMIT} ms during ${stage}`);
+      else if (outcome instanceof Error) missed.push(`${label}: ${outcome.message}`);
       else if (outcome.length === 0) missed.push(`${label}: ${seed.check} found nothing new`);
     }
     expect(missed).toEqual([]);

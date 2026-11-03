@@ -322,8 +322,7 @@ export const ALLOWED: readonly Allowance[] = [
     rule: "structure",
     selector: '[data-testid="group-project"] > .group__head',
     pages: ["workbench"],
-    // Unfiled: tsc refuses this until the issue drafted in the PR body has a number.
-    issue: "UNFILED: GUI sidebar: flatten the Fleet tree to two disclosure levels",
+    issue: 2930,
     why: "the Fleet tree nests node, then project: three disclosure levels",
   },
 ];
