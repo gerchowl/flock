@@ -136,15 +136,33 @@ let documents = 0;
  */
 async function relaunch(): Promise<void> {
   const old = browser;
-  browser = await chromium.launch();
-  tab = await browser.newPage();
+  const fresh = await chromium.launch();
+  fresh.on("disconnected", () => fresh === browser && console.error("conformance: the browser disconnected"));
+  browser = fresh;
+  tab = await fresh.newPage();
+  tab.on("crash", () => console.error("conformance: the page crashed"));
   void old?.close().catch(() => undefined);
+}
+
+/** A browser lost under a check (a crashed page or a dropped connection): infrastructure, not a finding. */
+const lost = (error: unknown): boolean => error instanceof Error && /has been closed|crash/i.test(error.message);
+
+/** Runs `work`; if the browser is lost under it, relaunches once and runs it again. */
+async function retryLost<T>(label: string, work: () => Promise<T>): Promise<T> {
+  try {
+    return await work();
+  } catch (error) {
+    if (!lost(error)) throw error;
+    console.error(`conformance: browser lost during ${label}, retrying once on a fresh one`);
+    tab = undefined;
+    return work();
+  }
 }
 
 /** A fresh document at `name` in `mode`, with the checks installed (and the env seed, if any). */
 async function open(name: PageName, mode: ModeName): Promise<Page> {
   const spec = PAGES[name];
-  if (tab === undefined || documents % DOCUMENTS_PER_BROWSER === 0) await relaunch();
+  if (tab === undefined || tab.isClosed() || !browser?.isConnected() || documents % DOCUMENTS_PER_BROWSER === 0) await relaunch();
   documents += 1;
   const page = tab!;
   await page.setViewportSize(spec.viewport);
@@ -332,7 +350,9 @@ beforeAll(async () => {
 }, LIMIT * 2);
 
 afterAll(async () => {
-  await bounded(AXE_LIMIT, async () => browser?.close());
+  const last = browser;
+  browser = undefined;
+  await bounded(AXE_LIMIT, async () => last?.close());
 });
 
 describe("design conformance", () => {
@@ -371,7 +391,7 @@ describe("design conformance", () => {
     for (const name of Object.keys(PAGES) as PageName[]) {
       for (const each of checks) {
         const started = performance.now();
-        const outcome = await bounded(PROBE_LIMIT, () => probe(each, name));
+        const outcome = await bounded(PROBE_LIMIT, () => retryLost(`${each} on ${name}`, () => probe(each, name)));
         console.error(`conformance: ${each} on ${name} took ${Math.round(performance.now() - started)} ms`);
         if (outcome === STALLED) out.push(`${each} ${name}/light: stalled after ${PROBE_LIMIT} ms`);
         else for (const line of outcome) out.push(`${each} ${name}/light: ${line}`);
@@ -392,10 +412,12 @@ describe("design conformance", () => {
     const missed: string[] = [];
     for (const [label, seed] of Object.entries(SEEDS)) {
       // Bounded: a wedged page fails this seed and discards the tab instead of hanging the suite.
-      const outcome = await bounded(SEED_LIMIT, async () => {
-        const clean = new Set(await probe(seed.check, seed.page));
-        return (await probe(seed.check, seed.page, seed)).filter((line) => !clean.has(line));
-      });
+      const outcome = await bounded(SEED_LIMIT, () =>
+        retryLost(`seed ${label}`, async () => {
+          const clean = new Set(await probe(seed.check, seed.page));
+          return (await probe(seed.check, seed.page, seed)).filter((line) => !clean.has(line));
+        }),
+      );
       console.error(`conformance: seed ${label} done`);
       if (outcome === STALLED) missed.push(`${label}: stalled after ${SEED_LIMIT} ms`);
       else if (outcome.length === 0) missed.push(`${label}: ${seed.check} found nothing new`);
