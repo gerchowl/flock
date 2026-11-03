@@ -30,6 +30,7 @@ const AXE = createRequire(import.meta.url).resolve("axe-core/axe.min.js");
 const DESKTOP = { width: 1280, height: 800 } as const;
 const PHONE = { width: 390, height: 844 } as const;
 const LIMIT = 60_000;
+const AXE_LIMIT = 3_000;
 
 type PageSpec = CheckOptions & { readonly url: () => string; readonly viewport: { width: number; height: number }; readonly palette: boolean };
 
@@ -194,14 +195,25 @@ describe("design conformance", () => {
   }, LIMIT);
 
   test("3. contrast: 4.5:1 for text, 3:1 for large text, and axe-core agrees", async () => {
-    const axe = async (page: Page): Promise<string[]> => {
-      await page.addScriptTag({ path: AXE });
-      const violations = await page.evaluate(async () => {
-        const run = (globalThis as unknown as { axe: { run: (o: object) => Promise<{ violations: { id: string; nodes: { target: string[] }[] }[] }> } }).axe.run;
-        const result = await run({ runOnly: { type: "tag", values: ["wcag2a", "wcag2aa", "wcag21a", "wcag21aa", "wcag22aa"] } });
-        return result.violations.flatMap((v) => v.nodes.map((node) => `axe ${v.id}: ${node.target.join(" ")}`));
-      });
-      return violations;
+    const source = await Bun.file(AXE).text();
+    // Each axe run is bounded: a stalled run is a finding naming the stage, never a hung suite.
+    const axe = async (page: Page, name: PageName, mode: ModeName): Promise<string[]> => {
+      let stage = "inject";
+      const run = async (): Promise<string[]> => {
+        await page.bringToFront();
+        await page.evaluate(source);
+        stage = "run";
+        return page.evaluate(async () => {
+          const { axe } = globalThis as unknown as { axe: { run: (o: object) => Promise<{ violations: { id: string; nodes: { target: string[] }[] }[] }> } };
+          const result = await axe.run({ runOnly: { type: "tag", values: ["wcag2a", "wcag2aa", "wcag21a", "wcag21aa", "wcag22aa"] } });
+          return result.violations.flatMap((v) => v.nodes.map((node) => `axe ${v.id}: ${node.target.join(" ")}`));
+        });
+      };
+      const started = performance.now();
+      const stalled = new Promise<string[]>((resolve) => setTimeout(() => resolve([`axe did not finish (${stage}) within ${AXE_LIMIT} ms`]), AXE_LIMIT));
+      const out = await Promise.race([run(), stalled]);
+      console.error(`axe ${name}/${mode}: ${Math.round(performance.now() - started)} ms`);
+      return out;
     };
     expect(await everywhere("contrast", axe)).toEqual([]);
   }, LIMIT);
