@@ -68,7 +68,6 @@ const SEEDED = process.env.CONFORMANCE_SEED as Rule | undefined;
 if (SEEDED !== undefined && !(SEEDED in SEEDS)) throw new Error(`CONFORMANCE_SEED=${SEEDED} names no rule`);
 
 let browser: Browser;
-const pages = new Map<string, Page>();
 const usedAllowances = new Set<number>();
 
 async function inject(page: Page, seed: Seed): Promise<void> {
@@ -89,13 +88,6 @@ async function open(name: PageName, mode: ModeName): Promise<Page> {
   return page;
 }
 
-/** The shared, untouched page for `name` in `mode`. */
-async function shared(name: PageName, mode: ModeName): Promise<Page> {
-  const key = `${name}/${mode}`;
-  if (!pages.has(key)) pages.set(key, await open(name, mode));
-  return pages.get(key)!;
-}
-
 /** Runs `rule`'s check on `page`, returning findings the allow-list does not cover. */
 async function check(page: Page, name: PageName, rule: Rule): Promise<Finding[]> {
   const entries = ALLOWED.map((entry) => (entry.pages.includes(name) ? entry : { rule: "none", selector: "*" }));
@@ -107,23 +99,64 @@ async function check(page: Page, name: PageName, rule: Rule): Promise<Finding[]>
   return result.findings as Finding[];
 }
 
-/** `rule` on every page in every mode: one line per finding, naming where it was seen (a page alone: in every mode). */
-async function everywhere(rule: Rule, extra?: (page: Page, name: PageName, mode: ModeName) => Promise<string[]>): Promise<string[]> {
-  const seen = new Map<string, string[]>();
-  const add = (line: string, at: string): void => void seen.set(line, [...new Set([...(seen.get(line) ?? []), at])]);
+const RULES: readonly Rule[] = ["palette", "typography", "contrast", "hit-size", "grid", "materials", "motion", "keyboard", "structure"];
+
+/** Each rule's findings on every page in every mode, as `line` -> where it was seen. */
+const survey = new Map<Rule, Map<string, Set<string>>>(RULES.map((rule) => [rule, new Map()]));
+
+/**
+ * Opens one page at a time, runs every rule's check (and axe-core, under
+ * contrast) on it, and closes it: a CI runner wedged with sixteen live pages.
+ */
+async function surveyAll(): Promise<void> {
   for (const name of Object.keys(PAGES) as PageName[]) {
     for (const mode of Object.keys(MODES) as ModeName[]) {
-      const page = await shared(name, mode);
-      for (const finding of await check(page, name, rule)) add(`${finding.where}: ${finding.detail}`, `${name}/${mode}`);
-      if (extra) for (const line of await extra(page, name, mode)) add(line, `${name}/${mode}`);
+      const page = await open(name, mode);
+      const add = (rule: Rule, line: string): void => {
+        const lines = survey.get(rule)!;
+        lines.set(line, (lines.get(line) ?? new Set()).add(`${name}/${mode}`));
+      };
+      for (const rule of RULES) for (const finding of await check(page, name, rule)) add(rule, `${finding.where}: ${finding.detail}`);
+      for (const line of await axe(page, name, mode)) add("contrast", line);
+      await page.close();
     }
   }
+}
+
+/** `rule`'s findings: one line each, naming where it was seen (a page alone: in every mode). */
+function everywhere(rule: Rule): string[] {
   const modes = Object.keys(MODES).length;
-  return [...seen].map(([line, at]) => {
+  return [...survey.get(rule)!].map(([line, seen]) => {
+    const at = [...seen];
     const names = [...new Set(at.map((each) => each.split("/")[0]!))];
     const short = names.flatMap((name) => (at.filter((each) => each.startsWith(`${name}/`)).length === modes ? [name] : at.filter((each) => each.startsWith(`${name}/`))));
-    return `${line} [${[...new Set(short)].join(", ")}]`;
+    return `${line} [${short.join(", ")}]`;
   });
+}
+
+let axeSource = "";
+
+/** axe-core's WCAG 2.x A and AA rules on `page`, bounded: a stalled run is a finding naming its stage. */
+async function axe(page: Page, name: PageName, mode: ModeName): Promise<string[]> {
+  let stage = "inject";
+  const run = async (): Promise<string[]> => {
+    await page.evaluate(axeSource);
+    stage = "run";
+    return page.evaluate(async () => {
+      const { axe } = globalThis as unknown as { axe: { run: (o: object) => Promise<{ violations: { id: string; nodes: { target: string[] }[] }[] }> } };
+      const result = await axe.run({ runOnly: { type: "tag", values: ["wcag2a", "wcag2aa", "wcag21a", "wcag21aa", "wcag22aa"] } });
+      return result.violations.flatMap((v) => v.nodes.map((node) => `axe ${v.id}: ${node.target.join(" ")}`));
+    });
+  };
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const stalled = new Promise<string[]>((resolve) => {
+    timer = setTimeout(() => resolve([`axe did not finish (${stage}) within ${AXE_LIMIT} ms [${name}/${mode}]`]), AXE_LIMIT);
+  });
+  try {
+    return await Promise.race([run(), stalled]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 type Hig = { __hig: Record<string, (...args: never[]) => unknown> };
@@ -179,7 +212,9 @@ async function palette(page: Page): Promise<string[]> {
 beforeAll(async () => {
   await Promise.all([buildClient("fixture", FIXTURE), buildClient("gallery", GALLERY)]);
   browser = await chromium.launch();
-}, LIMIT);
+  axeSource = await Bun.file(AXE).text();
+  await surveyAll();
+}, LIMIT * 2);
 
 afterAll(async () => {
   await browser?.close();
@@ -187,55 +222,35 @@ afterAll(async () => {
 
 describe("design conformance", () => {
   test("1. palette: every colour is a token of the active mode", async () => {
-    expect(await everywhere("palette")).toEqual([]);
+    expect(everywhere("palette")).toEqual([]);
   }, LIMIT);
 
   test("2. typography: 13 px body, nothing under 10 px, no thin small text, the system font", async () => {
-    expect(await everywhere("typography")).toEqual([]);
+    expect(everywhere("typography")).toEqual([]);
   }, LIMIT);
 
   test("3. contrast: 4.5:1 for text, 3:1 for large text, and axe-core agrees", async () => {
-    const source = await Bun.file(AXE).text();
-    // Each axe run is bounded: a stalled run is a finding naming the stage, never a hung suite.
-    const axe = async (page: Page, name: PageName, mode: ModeName): Promise<string[]> => {
-      let stage = "inject";
-      const run = async (): Promise<string[]> => {
-        await page.bringToFront();
-        await page.evaluate(source);
-        stage = "run";
-        return page.evaluate(async () => {
-          const { axe } = globalThis as unknown as { axe: { run: (o: object) => Promise<{ violations: { id: string; nodes: { target: string[] }[] }[] }> } };
-          const result = await axe.run({ runOnly: { type: "tag", values: ["wcag2a", "wcag2aa", "wcag21a", "wcag21aa", "wcag22aa"] } });
-          return result.violations.flatMap((v) => v.nodes.map((node) => `axe ${v.id}: ${node.target.join(" ")}`));
-        });
-      };
-      const started = performance.now();
-      const stalled = new Promise<string[]>((resolve) => setTimeout(() => resolve([`axe did not finish (${stage}) within ${AXE_LIMIT} ms`]), AXE_LIMIT));
-      const out = await Promise.race([run(), stalled]);
-      console.error(`axe ${name}/${mode}: ${Math.round(performance.now() - started)} ms`);
-      return out;
-    };
-    expect(await everywhere("contrast", axe)).toEqual([]);
+    expect(everywhere("contrast")).toEqual([]);
   }, LIMIT);
 
   test("4. hit size: 28 px controls on desktop, 44 px on a phone, 4 px apart", async () => {
-    expect(await everywhere("hit-size")).toEqual([]);
+    expect(everywhere("hit-size")).toEqual([]);
   }, LIMIT);
 
   test("5. spacing grid: margins, padding and gaps on the 4 px grid", async () => {
-    expect(await everywhere("grid")).toEqual([]);
+    expect(everywhere("grid")).toEqual([]);
   }, LIMIT);
 
   test("6. materials: blur only in a toolbar, sidebar or popover", async () => {
-    expect(await everywhere("materials")).toEqual([]);
+    expect(everywhere("materials")).toEqual([]);
   }, LIMIT);
 
   test("7. motion: nothing but opacity moves under reduced motion", async () => {
-    expect(await everywhere("motion")).toEqual([]);
+    expect(everywhere("motion")).toEqual([]);
   }, LIMIT);
 
   test("8. keyboard: Tab reaches every control with a ring, controls are named, arrows and ⌘K work", async () => {
-    const out = await everywhere("keyboard");
+    const out = everywhere("keyboard");
     for (const name of Object.keys(PAGES) as PageName[]) {
       const page = await open(name, "light");
       for (const line of [...(await tabWalk(page)), ...(await arrows(page)), ...(PAGES[name].palette ? await palette(page) : [])]) out.push(`${name}/light: ${line}`);
@@ -245,7 +260,7 @@ describe("design conformance", () => {
   }, LIMIT);
 
   test("9. structure: a sidebar two levels deep, toolbar actions in ⌘K, no appearance switch", async () => {
-    expect(await everywhere("structure")).toEqual([]);
+    expect(everywhere("structure")).toEqual([]);
   }, LIMIT);
 
   test("each rule catches its seeded violation", async () => {

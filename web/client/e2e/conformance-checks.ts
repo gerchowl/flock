@@ -161,12 +161,22 @@ export function installChecks(): void {
       };
       const controls = interactive().filter((el) => css(el).display !== "inline" && onTop(el));
       const boxes = controls.map((el) => el.getBoundingClientRect());
+      // A control partly scrolled out of its scroller has no defined neighbour spacing.
+      const clipped = controls.map((el, i) => {
+        for (let node = el.parentElement; node !== null; node = node.parentElement) {
+          if (!/(auto|scroll|hidden)/.test(css(node).overflow)) continue;
+          const view = node.getBoundingClientRect();
+          const box = boxes[i]!;
+          if (box.top < view.top - 0.5 || box.bottom > view.bottom + 0.5 || box.left < view.left - 0.5 || box.right > view.right + 0.5) return true;
+        }
+        return false;
+      });
       controls.forEach((el, i) => {
         const box = boxes[i]!;
         const min = el.closest('[data-control-size="small"]') ? 20 : options.controlMin;
         if (box.width < min - 0.5 || box.height < min - 0.5) hits.push({ el, detail: `${box.width.toFixed(1)}x${box.height.toFixed(1)} is under ${min}x${min}` });
         controls.forEach((other, j) => {
-          if (j <= i || el.contains(other) || other.contains(el)) return;
+          if (j <= i || el.contains(other) || other.contains(el) || clipped[i] || clipped[j]) return;
           const b = boxes[j]!;
           const gap = Math.max(b.left - box.right, box.left - b.right, b.top - box.bottom, box.top - b.bottom);
           // Rows of a list and segments of a group may touch; other neighbours keep one grid step apart.
