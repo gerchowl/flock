@@ -34,6 +34,8 @@ const PHONE = { width: 390, height: 844 } as const;
 const LIMIT = 60_000;
 const AXE_LIMIT = 3_000;
 const SEED_LIMIT = 10_000;
+const PROBE_LIMIT = 10_000;
+const DOCUMENTS_PER_BROWSER = 8;
 
 type PageSpec = CheckOptions & { readonly url: () => string; readonly viewport: { width: number; height: number }; readonly palette: boolean };
 
@@ -115,7 +117,7 @@ const SEEDS: Readonly<Record<string, Seed>> = {
 const SEEDED = process.env.CONFORMANCE_SEED;
 if (SEEDED !== undefined && !(SEEDED in SEEDS)) throw new Error(`CONFORMANCE_SEED=${SEEDED} names no seed`);
 
-let browser: Browser;
+let browser: Browser | undefined;
 const usedAllowances = new Set<number>();
 
 async function inject(page: Page, seed: Seed): Promise<void> {
@@ -124,16 +126,27 @@ async function inject(page: Page, seed: Seed): Promise<void> {
 }
 
 let tab: Page | undefined;
+let documents = 0;
 
 /**
- * A fresh document at `name` in `mode`, with the checks installed (and the
- * env seed, if any). Every page is a navigation of one tab: on the Linux CI
- * runner Chromium wedged after a few dozen pages were opened and closed.
+ * Chromium on the Linux CI runner wedges after a few dozen documents in one
+ * browser (pages or navigations alike), so the suite starts a fresh browser
+ * every `DOCUMENTS_PER_BROWSER` documents and after any stall. The old one is
+ * closed without waiting: a wedged browser may never answer.
  */
+async function relaunch(): Promise<void> {
+  const old = browser;
+  browser = await chromium.launch();
+  tab = await browser.newPage();
+  void old?.close().catch(() => undefined);
+}
+
+/** A fresh document at `name` in `mode`, with the checks installed (and the env seed, if any). */
 async function open(name: PageName, mode: ModeName): Promise<Page> {
   const spec = PAGES[name];
-  tab ??= await browser.newPage();
-  const page = tab;
+  if (tab === undefined || documents % DOCUMENTS_PER_BROWSER === 0) await relaunch();
+  documents += 1;
+  const page = tab!;
   await page.setViewportSize(spec.viewport);
   await page.emulateMedia({ ...MODES[mode], reducedMotion: "reduce" });
   await page.goto(spec.url());
@@ -196,9 +209,9 @@ let axeSource = "";
 const STALLED = Symbol("stalled");
 
 /**
- * Runs `work` for at most `ms`. On a stall the tab is discarded (the next
- * `open` makes a new one), and the losing promise's rejection is swallowed,
- * so it can never surface in a later navigation.
+ * Runs `work` for at most `ms`. On a stall the browser is discarded (the
+ * next `open` launches a new one), and the losing promise's rejection is
+ * swallowed, so it can never surface in a later navigation.
  */
 async function bounded<T>(ms: number, work: () => Promise<T>): Promise<T | typeof STALLED> {
   const running = work();
@@ -210,9 +223,8 @@ async function bounded<T>(ms: number, work: () => Promise<T>): Promise<T | typeo
   const outcome = await Promise.race([running, stalled]);
   clearTimeout(timer);
   if (outcome === STALLED) {
-    const old = tab;
+    // The next `open` starts a fresh browser.
     tab = undefined;
-    void old?.close().catch(() => undefined);
   }
   return outcome;
 }
@@ -315,13 +327,12 @@ async function probe(check: Check, name: PageName, seed?: Seed): Promise<string[
 
 beforeAll(async () => {
   await Promise.all([buildClient("fixture", FIXTURE), buildClient("gallery", GALLERY)]);
-  browser = await chromium.launch();
   axeSource = await Bun.file(AXE).text();
   await surveyAll();
 }, LIMIT * 2);
 
 afterAll(async () => {
-  await browser?.close();
+  await bounded(AXE_LIMIT, async () => browser?.close());
 });
 
 describe("design conformance", () => {
@@ -354,10 +365,17 @@ describe("design conformance", () => {
   }, LIMIT);
 
   /** `checks` on every page, each on a fresh light-mode document, labelled with the page. */
+  // Each bounded: a stall is a finding naming the check and page, and the next check gets a fresh browser.
   const driven = async (checks: readonly Driven[]): Promise<string[]> => {
     const out: string[] = [];
     for (const name of Object.keys(PAGES) as PageName[]) {
-      for (const each of checks) for (const line of await probe(each, name)) out.push(`${each} ${name}/light: ${line}`);
+      for (const each of checks) {
+        const started = performance.now();
+        const outcome = await bounded(PROBE_LIMIT, () => probe(each, name));
+        console.error(`conformance: ${each} on ${name} took ${Math.round(performance.now() - started)} ms`);
+        if (outcome === STALLED) out.push(`${each} ${name}/light: stalled after ${PROBE_LIMIT} ms`);
+        else for (const line of outcome) out.push(`${each} ${name}/light: ${line}`);
+      }
     }
     return out;
   };
@@ -378,6 +396,7 @@ describe("design conformance", () => {
         const clean = new Set(await probe(seed.check, seed.page));
         return (await probe(seed.check, seed.page, seed)).filter((line) => !clean.has(line));
       });
+      console.error(`conformance: seed ${label} done`);
       if (outcome === STALLED) missed.push(`${label}: stalled after ${SEED_LIMIT} ms`);
       else if (outcome.length === 0) missed.push(`${label}: ${seed.check} found nothing new`);
     }
