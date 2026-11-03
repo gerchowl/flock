@@ -20,7 +20,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
 
-import { chromium, type Browser, type Page } from "playwright";
+import { chromium, type Browser, type CDPSession, type Page } from "playwright";
 
 import { CLIENT_ROOT, buildClient } from "../tests/build";
 import { ALLOWED, type PageName } from "./conformance-allow";
@@ -146,6 +146,46 @@ async function launch(): Promise<void> {
   await tab.addInitScript({ content: `${axeSource}\n;globalThis.__installHig = ${installChecks.toString()};` });
   tab.on("crash", () => (broken ??= `the page crashed during ${stage}`));
   tab.on("close", () => (broken ??= `the tab closed during ${stage}`));
+  // Diagnosis only (#2931): with the debugger on, a stall can ask the renderer where it is.
+  debug = await tab.context().newCDPSession(tab);
+  await debug.send("Debugger.enable");
+}
+
+let debug: CDPSession | undefined;
+
+type Paused = { callFrames: { functionName: string; url: string; location: { scriptId: string; lineNumber: number; columnNumber: number } }[] };
+
+/**
+ * After a stall, pauses the renderer and logs where its main thread is: the
+ * top frames and the code around the innermost one (the bundle is minified).
+ * No answer within 5 s means the renderer, or the pipe to it, is not the one
+ * looping in script. It only reports; the run has already failed.
+ */
+async function diagnose(): Promise<void> {
+  const session = debug;
+  if (session === undefined) return;
+  const report = (async (): Promise<string> => {
+    const paused = new Promise<Paused>((resolve) => session.once("Debugger.paused", (event) => resolve(event as unknown as Paused)));
+    await session.send("Debugger.pause");
+    const { callFrames } = await paused;
+    const top = callFrames[0];
+    let around = "";
+    if (top !== undefined) {
+      const { scriptSource } = (await session.send("Debugger.getScriptSource", { scriptId: top.location.scriptId })) as { scriptSource: string };
+      const line = scriptSource.split("\n")[top.location.lineNumber] ?? "";
+      around = line.slice(Math.max(0, top.location.columnNumber - 160), top.location.columnNumber + 160);
+    }
+    const frames = callFrames.slice(0, 10).map((frame) => `${frame.functionName || "(anonymous)"}@${frame.location.lineNumber + 1}:${frame.location.columnNumber}`);
+    return `stack ${frames.join(" <- ")}; code: ${around}`;
+  })();
+  report.catch(() => undefined);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const silent = new Promise<string>((resolve) => {
+    timer = setTimeout(() => resolve("no answer from the renderer within 5 s"), 5_000);
+  });
+  const found = await Promise.race([report.catch((error: Error) => `the pause failed: ${error.message}`), silent]);
+  clearTimeout(timer);
+  console.error(`conformance: stalled during ${stage}; renderer: ${found}`);
 }
 
 /** A fresh document at `name` in `mode`, with the checks installed (and the env seed, if any). */
@@ -232,7 +272,10 @@ async function bounded<T>(ms: number, work: () => Promise<T>): Promise<T | typeo
   });
   const outcome = await Promise.race([running, stalled]);
   clearTimeout(timer);
-  if (outcome === STALLED) broken ??= `stalled after ${ms} ms during ${stage}`;
+  if (outcome === STALLED && broken === null) {
+    broken = `stalled after ${ms} ms during ${stage}`;
+    await diagnose();
+  }
   return outcome;
 }
 
@@ -260,10 +303,14 @@ async function tabWalk(page: Page): Promise<{ unreached: string[]; ringless: str
   const targets = await hig<Target[]>(page, "tabTargets");
   const seen = new Set<number>();
   const ringless: string[] = [];
+  const base = stage;
+  let last = "the page";
   for (let step = 0; step < targets.length * 2 + 4; step++) {
+    at(`${base}: Tab ${step + 1} from ${last}`);
     await page.keyboard.press("Tab");
     const focus = await hig<(Target & { ring: boolean }) | null>(page, "focused");
     if (focus === null) continue;
+    last = focus.where;
     if (!focus.ring && !seen.has(focus.id)) ringless.push(`${focus.where}: focused with no visible focus ring`);
     seen.add(focus.id);
   }
