@@ -216,6 +216,20 @@ async function diagnose(): Promise<void> {
   });
   console.error(`conformance: browser: ${await Promise.race([browserSide, quiet])}`);
   clearTimeout(timer);
+  // The OS view: each Chromium and Bun process's state and the kernel call it waits in
+  // (a browser parked in pipe_write would mean this side stopped reading the pipe).
+  if (process.platform === "linux") {
+    const ps = Bun.spawnSync(["ps", "-eo", "pid,ppid,stat,pcpu,wchan:24,args"], { stdout: "pipe" }).stdout.toString();
+    const rows = ps.split("\n").filter((row, index) => index === 0 || /chrom|bun/.test(row)).map((row) => row.slice(0, 160));
+    // The browser process is the Chromium child of this test process.
+    const browserPid = ps.split("\n").map((row) => row.trim().split(/\s+/)).find((cols) => cols[1] === String(process.pid) && /chrom/.test(cols.slice(5).join(" ")))?.[0];
+    console.error(`conformance: processes (test pid ${process.pid}, browser pid ${browserPid ?? "?"}):\n${rows.join("\n")}`);
+    for (const pid of [String(process.pid), browserPid]) {
+      if (pid === undefined) continue;
+      const fds = Bun.spawnSync(["sh", "-c", `for f in /proc/${pid}/fd/*; do printf '%s -> %s\n' "$f" "$(readlink "$f")"; done | grep -E '/fd/[0-4] |pipe|socket'`], { stdout: "pipe" }).stdout.toString();
+      console.error(`conformance: stdio, pipes and sockets of ${pid}:\n${fds}`);
+    }
+  }
 }
 
 /** A fresh document at `name` in `mode`, with the checks installed (and the env seed, if any). */
