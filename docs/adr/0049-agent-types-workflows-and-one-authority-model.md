@@ -56,8 +56,9 @@ policy conflict that must be fixed before the GUI exposes delegated approvals:
   permission (`allow once` / `deny`), and lets it answer widening permissions
   whose class the operator lists in `[questions] architect_may_grant`.
 - ADR-0036 §10b (S6) says `agent.decide` accepts a decision "only from an
-  authenticated, `operate`-scoped token principal"; "an agent message, or a
-  structured harness's MCP lease never authorizes a decision". The S6e
+  authenticated, `operate`-scoped token principal"; "a local UID alone, pane
+  input, an agent message or a structured harness's MCP lease never
+  authorizes a decision". The S6e
   "Authorization and proposals" table repeats it: `agent.decide` needs
   "`operate` or the existing specific operator authority, unchanged", and
   "MCP is not an operator credential".
