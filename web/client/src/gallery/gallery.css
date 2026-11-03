@@ -1,0 +1,110 @@
+/*
+ * The gallery's styles (#2896): every value is a token, and the layout comes
+ * from the primitives, so the gallery shows the rules of web/DESIGN.md
+ * holding. The design-conformance suite (e2e/conformance.test.ts) walks it.
+ */
+:root {
+  color-scheme: light dark;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+body {
+  background-color: var(--color-background-window);
+  color: var(--color-label-primary);
+  font-family: var(--font-family-system);
+  font-size: var(--font-size-13);
+  line-height: var(--font-size-17);
+}
+
+h1 {
+  font-size: var(--font-size-22);
+  font-weight: var(--font-weight-semibold);
+}
+
+h2 {
+  font-size: var(--font-size-17);
+  font-weight: var(--font-weight-semibold);
+}
+
+.g-toolbar {
+  position: sticky;
+  top: 0;
+  z-index: var(--layer-sticky);
+  padding: var(--space-2) var(--space-4);
+  background-color: var(--color-background-sidebar);
+  border-bottom: var(--border-width-thin) solid var(--color-separator);
+  backdrop-filter: blur(var(--space-5));
+}
+
+.g-sidebar {
+  padding: var(--space-2);
+  background-color: var(--color-background-sidebar);
+}
+
+.g-panel {
+  padding: var(--space-4);
+  border: var(--border-width-thin) solid var(--color-separator);
+  border-radius: var(--radius-medium);
+}
+
+.g-secondary {
+  color: var(--color-label-secondary);
+  font-size: var(--font-size-11);
+}
+
+.g-green { color: var(--color-status-green); }
+.g-orange { color: var(--color-status-orange); }
+.g-red { color: var(--color-status-red); }
+.g-link { color: var(--color-link); }
+
+.g-button {
+  min-inline-size: var(--size-control);
+  block-size: var(--size-control);
+  padding: 0 var(--space-3);
+  border: var(--border-width-thin) solid var(--color-separator);
+  border-radius: var(--radius-small);
+  background-color: var(--color-background-window);
+  color: var(--color-label-primary);
+  font-family: inherit;
+  font-size: var(--font-size-13);
+  transition: opacity 0.2s;
+}
+
+.g-button[aria-pressed="true"],
+.g-option[aria-selected="true"] {
+  background-color: var(--color-selection-inactive);
+}
+
+.g-button--primary {
+  background-color: var(--color-accent-fill);
+  color: var(--color-accent-on);
+}
+
+.g-button--destructive {
+  color: var(--color-destructive);
+}
+
+.g-button:disabled {
+  color: var(--color-label-tertiary);
+}
+
+.g-option {
+  min-block-size: var(--size-control);
+  padding: var(--space-1) var(--space-2);
+  border-radius: var(--radius-small);
+}
+
+.g-list:focus-within .g-option[aria-selected="true"] {
+  background-color: var(--color-selection-active);
+  color: var(--color-accent-on);
+}
+
+:focus-visible {
+  outline: calc(var(--border-width-thin) * 2) solid var(--color-focus-ring);
+  outline-offset: var(--border-width-thin);
+}

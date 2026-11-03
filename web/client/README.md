@@ -11,6 +11,9 @@ primitives in `src/layout/primitives/`, and the lint rules that enforce them
 
 - `just client-check`: unit and DOM tests, the browser tests in `e2e/`, the
   type check, the design rules and the production build.
+- `bun x vite` then `/gallery.html`: every layout primitive and control
+  state on one page, which the design-conformance suite checks
+  (`web/DESIGN.md` "Conformance").
 - `just client-preview`: a fixture-mode build (a replayed session, no server
   needed) served on the loopback address.
 - `just desktop-dev` / `just desktop-build`: the same bundle in the Tauri

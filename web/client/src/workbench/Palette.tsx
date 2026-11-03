@@ -32,6 +32,8 @@ export function Palette(props: PaletteProps): JSX.Element {
   const [selected, setSelected] = createSignal(0);
   let input: HTMLInputElement | undefined;
   let trigger: HTMLButtonElement | undefined;
+  // Where focus was when the palette opened: Esc returns it there (HIG: a dismissed popover restores focus).
+  let opener: HTMLElement | null = null;
   const listId = createUniqueId();
   const optionId = (index: number): string => `${listId}-${index}`;
   const items = createMemo<Item[]>(() => {
@@ -45,19 +47,21 @@ export function Palette(props: PaletteProps): JSX.Element {
     return matches;
   });
   const show = (): void => {
+    if (!open()) opener = document.activeElement instanceof HTMLElement && document.activeElement !== document.body ? document.activeElement : null;
     setOpen(true);
     setSelected(0);
     queueMicrotask(() => input?.focus());
   };
-  const hide = (): void => {
+  /** Closes the palette; a dismissal returns focus where it was, a choice to the trigger. */
+  const hide = (dismissed = true): void => {
     setOpen(false);
     setQuery("");
-    trigger?.focus();
+    (dismissed && opener?.isConnected ? opener : trigger)?.focus();
   };
   const choose = (item: Item | undefined): void => {
     if (item === undefined) return;
     props.onOpen(item.id);
-    hide();
+    hide(false);
   };
   const onGlobalKey = (event: KeyboardEvent): void => {
     if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {

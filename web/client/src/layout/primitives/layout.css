@@ -75,3 +75,10 @@
   grid-template-columns: repeat(auto-fit, minmax(min(var(--l-min), 100%), 1fr));
   gap: var(--l-space);
 }
+
+/* A primitive's gap is the only space between its children: their own block
+   margins (a heading's or a paragraph's default) are reset, at zero
+   specificity so a primitive's own margins still apply. */
+:where(.l-stack, .l-cluster, .l-sidebar, .l-switcher, .l-grid) > * {
+  margin-block: 0;
+}

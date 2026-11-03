@@ -405,6 +405,18 @@ describe("command palette", () => {
     expect(document.activeElement).toBe(trigger);
   });
 
+  test("Esc after ⌘K returns focus to the control that had it", async () => {
+    const root = await workbench(createFixtureFleet(SAMPLE_AGENTS));
+    const row = $(root, "agent-row") as HTMLButtonElement;
+    row.focus();
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "k", metaKey: true, bubbles: true }));
+    await tick();
+    const input = $(root, "palette")?.querySelector("input") as HTMLInputElement;
+    expect(document.activeElement).toBe(input);
+    key(input, { key: "Escape" });
+    expect(document.activeElement).toBe(row);
+  });
+
   test("Tab and Shift+Tab stay in the dialog, and options hold no nested controls", async () => {
     const root = await workbench(createFixtureFleet(SAMPLE_AGENTS));
     ($(root, "palette-trigger") as HTMLButtonElement).click();
