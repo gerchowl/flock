@@ -51,7 +51,7 @@ log-budget seconds='60':
     guardrails-log-budget
 
 # Run fast local lint checks
-lint: ts-check
+lint: ts-check client-lint
     cargo fmt --check
     cargo clippy --all-targets --locked -- -D warnings
     cargo clippy --all-targets --locked --features ts -- -D warnings
@@ -111,10 +111,10 @@ website-build:
 
 # Check the web client (ADR-0038 G1) from its lockfile: the unit and DOM
 # tests, the fixture-preview screenshot test (needs `just client-browsers`;
-# writes web/client/artifacts/screenshots/), the strict type check and the
-# Vite build.
+# writes web/client/artifacts/screenshots/), the strict type check, the design
+# rules (`client-lint`) and the Vite build.
 client-check:
-    cd web/client && bun install --frozen-lockfile && bun test && bun test ./e2e && bun x tsc --noEmit -p tsconfig.json && bun run build
+    cd web/client && bun install --frozen-lockfile && bun test && bun test ./e2e && bun x tsc --noEmit -p tsconfig.json && bun run lint && bun run build
 
 # Recompute nix/client-deps.json, the pinned hash of the client's
 # dependencies for `nix build .#flock-client` (#1731), after web/client/bun.lock
@@ -291,3 +291,9 @@ gen-ts:
 # with the TypeScript compiler pinned in web/client/bun.lock.
 ts-check:
     cd web/client && bun install --frozen-lockfile && bun x tsc --noEmit -p tsconfig.json
+
+# The client's design rules (#2895, web/DESIGN.md): the generated tokens are
+# current, CSS uses tokens and the layout primitives (stylelint), and no TSX
+# outside web/client/src/layout/ sets an inline style (ESLint).
+client-lint:
+    cd web/client && bun install --frozen-lockfile && bun run lint
