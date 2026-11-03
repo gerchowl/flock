@@ -15,6 +15,7 @@ import { render } from "solid-js/web";
 
 import { App } from "./App";
 import { readShellConfig } from "./config";
+import "./tokens.css";
 import "./styles.css";
 
 const root = document.getElementById("root");

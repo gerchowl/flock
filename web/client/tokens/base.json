@@ -1,0 +1,70 @@
+{
+  "font": {
+    "family": {
+      "$type": "fontFamily",
+      "system": {
+        "$value": ["system-ui", "-apple-system", "Segoe UI", "Roboto", "sans-serif"],
+        "$description": "The platform's own UI font, never a web font: the bundle makes no network requests. Apple HIG, Typography: https://developer.apple.com/design/human-interface-guidelines/typography"
+      },
+      "mono": {
+        "$value": ["ui-monospace", "SF Mono", "Menlo", "Consolas", "monospace"],
+        "$description": "Code, commands and JSON."
+      }
+    },
+    "size": {
+      "$type": "dimension",
+      "$description": "The macOS type scale in points (HIG Typography, macOS built-in text styles). 13 is body; 10 is the minimum.",
+      "10": { "$value": { "value": 10, "unit": "px" }, "$description": "Caption, footnote." },
+      "11": { "$value": { "value": 11, "unit": "px" }, "$description": "Subheadline." },
+      "12": { "$value": { "value": 12, "unit": "px" }, "$description": "Callout." },
+      "13": { "$value": { "value": 13, "unit": "px" }, "$description": "Body and headline." },
+      "15": { "$value": { "value": 15, "unit": "px" }, "$description": "Title 3." },
+      "17": { "$value": { "value": 17, "unit": "px" }, "$description": "Title 2." },
+      "22": { "$value": { "value": 22, "unit": "px" }, "$description": "Title 1." }
+    },
+    "weight": {
+      "$type": "fontWeight",
+      "regular": { "$value": 400 },
+      "medium": { "$value": 510, "$description": "SF Pro's medium cut; other system fonts round to their nearest weight." },
+      "semibold": { "$value": 600, "$description": "Headlines and emphasis." }
+    }
+  },
+  "space": {
+    "$type": "dimension",
+    "$description": "The 4 px spacing grid (HIG Layout: https://developer.apple.com/design/human-interface-guidelines/layout). The step is the multiple of 4 px.",
+    "1": { "$value": { "value": 4, "unit": "px" } },
+    "2": { "$value": { "value": 8, "unit": "px" } },
+    "3": { "$value": { "value": 12, "unit": "px" } },
+    "4": { "$value": { "value": 16, "unit": "px" } },
+    "5": { "$value": { "value": 20, "unit": "px" } },
+    "6": { "$value": { "value": 24, "unit": "px" } },
+    "8": { "$value": { "value": 32, "unit": "px" } },
+    "10": { "$value": { "value": 40, "unit": "px" } },
+    "12": { "$value": { "value": 48, "unit": "px" } }
+  },
+  "radius": {
+    "$type": "dimension",
+    "small": { "$value": { "value": 6, "unit": "px" }, "$description": "Controls: buttons, fields, rows." },
+    "medium": { "$value": { "value": 8, "unit": "px" }, "$description": "Cards and grouped content." },
+    "large": { "$value": { "value": 10, "unit": "px" }, "$description": "Popovers, sheets and the palette." }
+  },
+  "size": {
+    "$type": "dimension",
+    "control": {
+      "$value": { "value": 28, "unit": "px" },
+      "$description": "Height of a regular control on desktop (HIG Buttons: https://developer.apple.com/design/human-interface-guidelines/buttons). phone.json raises it to the 44 px touch target."
+    }
+  },
+  "border": {
+    "width": {
+      "$type": "dimension",
+      "thin": { "$value": { "value": 1, "unit": "px" }, "$description": "Separators and control outlines." }
+    }
+  },
+  "layer": {
+    "$type": "number",
+    "$description": "z-index layers, lowest first.",
+    "sticky": { "$value": 1, "$description": "Bars that stick while their region scrolls." },
+    "overlay": { "$value": 10, "$description": "Notices, the palette and its backdrop." }
+  }
+}
