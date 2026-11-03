@@ -194,6 +194,12 @@ jobs:
         with:
           name: nextest-archive-${{ inputs.leg }}
 
+      - name: Diagnose structured view source failure (#2840)
+        if: inputs.leg == 'ubuntu-latest' && matrix.shard.name == 'unit-1'
+        env:
+          TMPDIR: /tmp
+        run: nix develop -c cargo nextest run --archive-file nextest-archive.tar.zst --workspace-remap . --extract-to . --extract-overwrite -j 2 -E 'binary(=flk) & (test(/public_placement_owns_one_driver/) | test(/public_structured_start_and_focus/))' --retries 0 --stress-count 1000 --status-level fail --final-status-level fail
+
       - name: Run shard
         # The Nix installer sets TMPDIR under HOME on the Linux runner.
         # Test state must stay outside HOME, including fallback CLI sandboxes.

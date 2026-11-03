@@ -123,6 +123,8 @@ impl Driver {
                     match result {
                         Ok(alive) => ended = !alive,
                         Err(err) => {
+                            #[cfg(test)]
+                            eprintln!("2840 source error: {err:?}"); // guardrails-ok: test-only diagnostic for the Linux reproduction of #2840.
                             let code = err
                                 .get_ref()
                                 .and_then(|e| e.downcast_ref::<ErrorCode>())
