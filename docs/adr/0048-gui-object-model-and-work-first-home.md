@@ -2,18 +2,19 @@
 
 - Status: Proposed
 - Date: 2026-11-03
-- Issues: P0 [#2895](https://github.com/gerchowl/flock/issues/2895),
+- Issues: GUI-P0 [#2895](https://github.com/gerchowl/flock/issues/2895),
   [#2896](https://github.com/gerchowl/flock/issues/2896),
   [#2899](https://github.com/gerchowl/flock/issues/2899),
   [#2900](https://github.com/gerchowl/flock/issues/2900)–[#2906](https://github.com/gerchowl/flock/issues/2906),
   [#2871](https://github.com/gerchowl/flock/issues/2871),
-  [#2872](https://github.com/gerchowl/flock/issues/2872); P1 depends on
+  [#2872](https://github.com/gerchowl/flock/issues/2872); GUI-P1 depends on
   [#1597](https://github.com/gerchowl/flock/issues/1597) (G5 inbox stream),
   [#1600](https://github.com/gerchowl/flock/issues/1600) (work projection),
   [#1603](https://github.com/gerchowl/flock/issues/1603) (work records),
-  [#2726](https://github.com/gerchowl/flock/issues/2726) (fork progress); P2
-  depends on [#2293](https://github.com/gerchowl/flock/issues/2293) (multi-node)
-  and [#2733](https://github.com/gerchowl/flock/issues/2733) (mobile delivery).
+  [#2726](https://github.com/gerchowl/flock/issues/2726) (fork progress);
+  GUI-P2 depends on [#2293](https://github.com/gerchowl/flock/issues/2293)
+  (multi-node) and [#2733](https://github.com/gerchowl/flock/issues/2733)
+  (mobile delivery).
 - Decision owner: repository owner. The owner asked for this ADR on 2026-11-03
   ("go for all"), after two independent GUI-vision reviews (a product review
   and a systems review, 2026-11-02) agreed on its thesis. The owner answered
@@ -38,10 +39,12 @@
   13's consequence ("the sidebar folds ended threads"). The amended text lives
   here; ADR-0038 itself is not edited (README: decided ADRs are immutable).
 - Forward reference: ADR-0049 (agent types, workflows and one authority
-  model) is proposed in parallel (#2908). This ADR defines the GUI objects it
-  uses (Run, and the workflow definition as a facet; D2) and the GUI side of
-  its decide delegation (D4); it decides nothing about the Run runtime or the
-  resolver's semantics, which are ADR-0049's.
+  model) is proposed in parallel (#2908). ADR-0049 owns workflow definitions
+  (W2 "Workflow definitions"), the run runtime (W4 "Runs") and the authority
+  model, including authority loss and rerouting (W5 "One authority model",
+  "Authority loss: expiry, revocation and orphaning"). This ADR owns only
+  their GUI projection: Run as a GUI object, the workflow definition as a
+  facet (D2), and how the inbox renders delegated and rerouted items (D4).
 - Implemented: none. The baseline below describes `origin/dev` at
   `c70c23c383ec`.
 
@@ -125,12 +128,13 @@ bottom bar is *Inbox* (band 1) and *Activity* (bands 2 and 3). An Agent is
 reached by drilling into the Work it serves or the card that names it, as on
 the desktop.
 
-**The P0 badge is provisional.** Until the `inbox` stream (G5, #1597) sends a
-`needs_you` count, P0 shows the `fleet` stream's
+**The GUI-P0 badge is provisional.** Until the `inbox` stream (G5, #1597) sends a
+`needs_you` count, GUI-P0 shows the `fleet` stream's
 `FleetAgentCounts.waiting_on_human` (agents with open non-automatic
 requests). That counts agents, not attention items: one agent with two open
 prompts counts once, a supervision gap counts not at all, and a `null` (unknown,
-as it is for remote nodes today) renders as unknown, not zero. The P0 badge is labelled and tested as a phase count; A1.3's exact
+as it is for remote nodes today) renders as unknown, not zero. The GUI-P0 badge
+is labelled and tested as an agent count; A1.3's exact
 `needs_you` assertion applies only once the server field exists.
 
 Five principles bind every later surface:
@@ -158,7 +162,7 @@ Five principles bind every later surface:
   over band 3 returns zero rows for it).
 - A1.3: `document.title` and the toolbar badge equal the server's
   `needs_you` count, and change only on a server frame (no client timer).
-  Gated on G5 (#1597). Until then A1.3-P0 asserts the provisional badge equals
+  Gated on G5 (#1597). Until then A1.3-GUI-P0 asserts the provisional badge equals
   the `fleet` snapshot's `waiting_on_human`, shows unknown for `null`, and
   changes only on a `fleet` frame.
 - A1.4: the phone layout's bottom bar has exactly the *Inbox* and *Activity*
@@ -172,11 +176,11 @@ a route, a detail view and a row in search (⌘K).
 | Object | Identity and source of truth | Relations (all server-owned edges) |
 | --- | --- | --- |
 | **Project** | Registered repository identity (ADR-0042 C2 project scope). Today's `FleetProjectRow` is a per-node checkout, not this identity; see "Project identity migration" below | contains → Work; owned_by → the resident owner Agent (ADR-0035); has → checkouts (node, path); spans nodes |
-| **Work** | `WorkId` (ADR-0045 D1). A **goal is the root Work** of a DAG, not a separate entity. Phase 1 rows carry projection view ids (ADR-0045 D7), which are not mutation targets | parent/child and blocks (DAG); assigned_to → Agent (assignment generation); supervised_by → Agent; evidence → typed descriptors (D5); about ← Question, Artifact; implements → issue; delivered_by → PR |
-| **Agent** | `AgentId` (ADR-0008); structured only (D3) | delegated_by → Agent (ADR-0027 edge, carrying role); works_on → Work; forked_from → Agent (lineage, ADR-0036 §9) |
+| **Work** | `WorkId` (ADR-0045 D1). A **goal is the root Work** of a DAG, not a separate entity. Rows in ADR-0045 D7's projection phase carry projection view ids, which are not mutation targets | parent/child and blocks (DAG); assigned_to → Agent (assignment generation); supervised_by → Agent; evidence → typed descriptors (D5); about ← Question, Artifact; implements → issue; delivered_by → PR |
+| **Agent** | `AgentId` (ADR-0008); structured only (D3) | delegated_by → Agent (ADR-0027 §1 edge; role from a server role field, D3); works_on → Work; forked_from → Agent (lineage, ADR-0036 §9) |
 | **Question** | `question_id` + revision (ADR-0036 S6e `QuestionRecord`) | asked_by → Agent; addressed_to → Agent or operator; about → Work or Artifact; threads → fork Agents; proposals |
 | **Artifact** | `artifact_id` + version (ADR-0038 §7) | published_by → Agent; about → Work; annotated_by → comments, Questions |
-| **Run** | Phase 1: a run projection view id; phase 2: a durable server-minted `RunId` (ADR-0049 W4). See "Run projections and RunIds" below | instantiates → workflow definition (pinned `def_hash`); drives → Work (linked WorkIds); launched_by → principal. Not rendered until ADR-0049 is accepted and its stream exists |
+| **Run** | Before ADR-0049 P2: a run projection view id; from ADR-0049 P2: a durable server-minted `RunId` (ADR-0049 W4 "Runs"). See "Run projections and RunIds" below | instantiates → workflow definition (pinned `def_hash`); drives → Work (linked WorkIds); launched_by → principal. Not rendered until ADR-0049 is accepted and its stream exists |
 
 Everything else is an **attribute or facet** of one of those, shown inside
 its owner's view and never as a top-level navigation root:
@@ -184,8 +188,8 @@ its owner's view and never as a top-level navigation root:
 | Facet | Of | Shown as |
 | --- | --- | --- |
 | Node | Agent, Project | a badge (name, health dot, freshness) with a popover; ADR-0043 §5 classifications rendered as sent |
-| Role and tier | the delegation edge | an edge label on the server-recorded ADR-0027 §1 delegation edge (owner, segment architect, implementer, reviewer, judge), with the segment role from ADR-0035 §1a's `SegmentAssigned`; the client never infers a tier from names or depth |
-| Workflow definition | Project (adopted definitions), Run (its pinned definition) | ADR-0049's "Workflow object": a definition view keyed by `(project, workflow id, def_hash)`, reached from the Project's adopted-definitions list and from every Run; not a navigation root and not in search as a seventh kind |
+| Role and tier | the delegation edge | an edge label (owner, segment architect, implementer, reviewer, judge) from a server role field. ADR-0027 §1's `AgentDelegated` has no role (its `label` is free caller text, never a role); the owner comes from ADR-0035's binding and the segment architect from ADR-0035 §1a's `SegmentAssigned`. The fleet row carries no role field yet: it is a D3 prerequisite, and until it exists no tier label is shown. The client never infers a tier from names, labels or depth |
+| Workflow definition | Project (adopted definitions), Run (its pinned definition) | ADR-0049 W2 "Workflow definitions" owns the definition (file, schema, validation, adoption by hash); this ADR owns only its GUI facet: a read-only definition view identified as W2 identifies it (its `id` and adopted `def_hash`), reached from the Project's adopted-definitions list and from every Run; not a navigation root and not in search as a seventh kind |
 | Transcript and input queue | Agent | the Agent's conversation view (D6) |
 | Evidence | Work | the evidence panel (D5) |
 | Rules and context | Project, Agent | a context inspector with ADR-0032 §1's five layers and each layer's provenance |
@@ -222,18 +226,18 @@ transition is server-owned and explicit:
    Per-project policy (D4) and settings (D8) are keyed by `project_id` and are
    unavailable for an unregistered checkout.
 
-**Run projections and RunIds.** ADR-0049 W8 P1 shows existing loops, delegate
-edges, queued start intents and armed goals as implicit runs before any run
-record exists. Those rows follow ADR-0045 D7's phase-1 rule: their ids are
-**projection view ids** derived from the existing source key (loop id, edge,
-start intent or goal key, prefixed by source kind), they may be reused on
-legacy re-arm, and they are not durable and not mutation targets; the Run view
-offers no verb on them. When ADR-0049 P2 mints `RunId`s (W4), entering that
-phase is a complete snapshot reset of the run stream with a committed
-projection-id → `RunId` mapping, exactly as ADR-0045 D7 specifies for
-legacy-ID → `WorkId`. The client drops every projection id at the reset and
-never maps one to a `RunId` itself. The same rule holds for Work rows (phase-1
-view ids, phase-2 `WorkId`s).
+**Run projections and RunIds.** ADR-0049 P1 (W8 "Phasing and acceptance")
+shows existing loops, delegate edges, queued start intents and armed goals as
+implicit runs before any run record exists. Those rows follow ADR-0045 D7's
+projection-phase rule: their ids are **projection view ids** derived from the
+existing source key (loop id, edge, start intent or goal key, prefixed by
+source kind), they may be reused on legacy re-arm, and they are not durable
+and not mutation targets; the Run view offers no verb on them. When ADR-0049
+P2 mints `RunId`s (W4), entering that phase is a complete snapshot reset of
+the run stream with a committed projection-id → `RunId` mapping, exactly as
+ADR-0045 D7 specifies for legacy-ID → `WorkId`. The client drops every
+projection id at the reset and never maps one to a `RunId` itself. The same
+rule holds for Work rows (projection-phase view ids, record-phase `WorkId`s).
 
 **The client invents no state.** This restates ADR-0038 §3 and extends it to
 the new objects. The client may group, sort, filter, count server-sent
@@ -257,8 +261,8 @@ made through a verb, shown as such. Dragging is allowed only for layout
   stores, and the systems review repeats it.
 - *Node as a navigation root* (ADR-0038 §1's *Fleet* tree; the UX review's
   "one Node→agents tree"; dropped by owner decision 5, 2026-11-03): nodes are
-  where work runs, not what the person is supervising. A node outage still surfaces, as a supervision-gap card (D4)
-  and as stale badges.
+  where work runs, not what the person is supervising. A node outage still
+  surfaces, as a supervision-gap card (D4) and as stale badges.
 - *Client-side optimistic work state* (move a card, reconcile later): the
   first restart shows a board the server cannot restore. This is the
   "object-model drift" failure in the pre-mortem.
@@ -310,7 +314,11 @@ design of ADR-0035 §1a and #1167). Where a project has no segment
 architects, the owner's implementers are the first level. The tree is built
 from `delegate.list` edges (ADR-0027 §2) through the `fleet` and (later)
 `work` streams. Each row shows the agent's name, the Work it is assigned to,
-its phase mark, its node badge, and its count of open attention items. Above
+its phase mark, its node badge, its count of open attention items, and its tier
+label. **Prerequisite:** the tier label needs a server role field on the
+delegation row, which does not exist yet (ADR-0027 §1's edge has none; D2's
+"Role and tier" facet). Until it ships the tree shows structure from edges and
+no tier label. Above
 the sections sits a *Needs you* row with the D4 count. Unattached root agents
 (started by the operator with no Project binding) form an *Unassigned*
 section.
@@ -409,14 +417,16 @@ that off (a per-project toggle, below).
   by `project_id` (ADR-0042 C2 scope, stored outside the checkout, never in a
   committed `.flk.toml`): for each kind, *badge and notify*, *badge only* or
   *list only*; the ranking preset; the per-agent visible-item cap; and the
-  non-blocking-questions-on-badge toggle (default on). It defaults the question policy of new root agents in that
-  project (ADR-0034 §2) and the D8 notification level. Protected kinds cannot
-  be lowered below *badge and notify*: permissions, blocking questions,
-  operator-stage escalations and root completion approvals. Repository content
-  cannot change what reaches the operator.
+  non-blocking-questions-on-badge toggle (default on). It defaults the
+  question policy of new root agents in that project (ADR-0034 §2) and the D8
+  notification level. Protected kinds cannot be lowered below *badge and
+  notify*: permissions, blocking questions, operator-stage escalations and
+  root completion approvals. Repository content cannot change what reaches the
+  operator.
 - **Permission authority: operator, or a decide delegation** (owner
   decision 1, 2026-11-03). An architect may answer a structured delegate's
-  permission prompt **only through ADR-0049 W5's `DecideDelegation`**:
+  permission prompt, or a delegable `request-decision` question (ADR-0049
+  W3), **only through ADR-0049 W5's `DecideDelegation`**:
   operator-issued, scoped, finite, revocable and audited, checked by the one
   `decide_authority` resolver. Every other permission decision needs
   `operate`: `agent.decide` requires `operate` or the existing specific
@@ -425,28 +435,35 @@ that off (a per-project toggle, below).
   `answer` or `operate` (the same table). The two handlers stay separate even
   when rendered side by side; a principal without the authority sees the
   action disabled with the authority it needs.
-- **Every pending permission has a server-owned recipient.** Each permission
-  item carries `recipient: operator | delegated { architect: (AgentId,
-  generation), delegation_id, delegation_revision }`, set by the resolver,
-  never by the client. A `delegated` item is shown as an evidence row on the
-  Work naming the architect and the delegation, not as an operator card, and
-  the operator can still decide it there under `operate` (a delegation never
-  removes operator authority).
-- **Recipient transitions are server-owned and visible.** The server
-  re-resolves every outstanding `delegated` item when its delegation expires,
-  is revoked (`DelegationRevoked`), or no longer matches its architect: the
-  architect's edges become orphaned (ADR-0027 §1a), its generation changes, or
-  it ends. In one committed transition the item's recipient becomes
-  `operator`, with a typed cause (`delegation_expired`,
-  `delegation_revoked`, `architect_orphaned`, `architect_replaced`); the
-  `inbox` stream emits the item as an operator card and the new `needs_you`
-  count in the same frame sequence; and the Work's evidence row keeps the
-  history ("rerouted to operator: *cause*"). The resolver's recheck at the
-  mutation fence (ADR-0049 W5) refuses an architect decision that arrives
-  after the transition. At no point is a pending prompt in neither place: it
-  is always an operator card or a delegated evidence row, and a transition
-  never drops, hides or silently re-delegates it. A prompt is never rerouted
-  back to an architect without a new delegation that matches it.
+- **Every pending decision item has a server-owned addressee.** This covers
+  permission prompts and ADR-0049 `request-decision` questions (W3) alike.
+  Each carries `addressee: operator | delegated { delegate, delegation_id,
+  delegation_revision }`, set by the `decide_authority` resolver, never by the
+  client. `delegate` is ADR-0049 W5's `DecideDelegation.delegate` type
+  (`Agent(AgentId, generation) | ParentArchitect | Owner(repo)`), generated
+  from it, with `ParentArchitect` shown as the agent it resolved to, as the
+  server sends it. A delegated item is an evidence row on its Work (or Run)
+  naming the delegate and the delegation, not an operator card; the operator
+  can still decide it there under `operate`, since a delegation never removes
+  operator authority.
+- **Authority loss is ADR-0049's transition; the inbox only projects it.**
+  ADR-0049 W5 "Authority loss: expiry, revocation and orphaning" owns when a
+  pending item is rerouted to the operator and why. This ADR defines no
+  trigger and no cause list of its own. The `inbox` stream projects each
+  committed `PermissionRerouted` record: the item keeps its id, becomes an
+  operator item showing the record's `reason`, and arrives in the same frame
+  sequence as the new `needs_you` count. ADR-0045 D8 escalation for it starts
+  at the reroute, as W5 specifies. The Work's evidence row keeps the history
+  ("rerouted to operator: *reason*"). The GUI's reason type is a closed union
+  generated from the reasons ADR-0049 W5 defines and rendered through an
+  exhaustive switch, so a reason added there fails the client build until it
+  has copy; the GUI never maps or collapses reasons. A late answer from the
+  former delegate is refused at the mutation fence with `delegation_lapsed`
+  (W5), and the evidence row shows the refused late answer. A reroute is not
+  reversed when a later delegation appears (W5); the GUI offers no hand-back
+  verb while ADR-0049's owner question 6 is open. At no point is a pending
+  item in neither place: it is always an operator item or a delegated
+  evidence row.
 - **The inbox is not the escalation guarantee.** It projects ADR-0045 D8's
   attention record. Reading or dismissing a card does not acknowledge an
   escalation or suppress reminders; only `work.escalation.ack` does, and only
@@ -489,15 +506,22 @@ that off (a per-project toggle, below).
 - A4.6: through the **real** `decide_authority` resolver and the server's
   `inbox` projection (an isolated server and the public fake model, not a
   scripted fake): a structured delegate raises a `worktree_tool` prompt under
-  a live `ParentArchitect` delegation; the item has `recipient: delegated`,
-  appears as an evidence row and not in the operator inbox, and `needs_you`
-  excludes it. Then, in three separate runs, the delegation expires, is
-  revoked, and the architect is orphaned. In each run the same item, with the
-  same id, arrives as an operator card with the matching cause, `needs_you`
-  rises by one in the next frame, the evidence row records the reroute, a
-  subsequent architect decide is refused, and an `operate` decide succeeds with
-  an audit record naming no delegation. A snapshot taken at any point of the
-  transition contains the item exactly once.
+  a live `ParentArchitect` delegation, and a run step raises a delegable
+  `request-decision` question; each item has `addressee: delegated`, appears
+  as an evidence row and not in the operator inbox, and `needs_you` excludes
+  it. Then one run per reason in ADR-0049 W5's reason set, iterated from the
+  generated type so a new reason adds a case: today that drives expiry,
+  revocation, narrowing below the item's class or ceiling, orphaning, a
+  generation change and a handoff that does not carry the delegate. In each
+  run the server commits one `PermissionRerouted` with that reason; the same
+  item, with the same id, arrives as an operator item showing it;
+  `needs_you` rises by one in the next frame; an ADR-0045 D8 escalation
+  exists from the reroute's timestamp; the evidence row records the reroute;
+  the former delegate's late answer is refused with `delegation_lapsed` and
+  audited; and an `operate` decide succeeds with an audit record naming no
+  delegation. A snapshot taken at any point of the transition contains the
+  item exactly once. A client type test fails if the GUI's reason union and
+  ADR-0049's reason set differ in either direction.
 - A4.7: the grouping fixture: four items for one agent with the default cap
   show three cards and a "+1 more" row, the badge counts four, and every card
   headline begins with its effect.
@@ -615,8 +639,8 @@ composer (send control inside the field, ⌘↩ to send).
   the inspector for the selected subject (its node's health and freshness,
   the agent's provider-limit and context state, as the server sends them); a
   collapsible bottom **Diagnostics drawer** holding `trace`, `logs`, `audit`
-  and `node` views; and a link out to the operator's metrics dashboard
-  (Grafana) for history. There is no separate Diagnostics window. The transcript
+  and `node` views; and a link out to vigil's view (vig-os/vigil, ADR-0038
+  owner decision 5) for history. There is no separate Diagnostics window. The transcript
   shows turns and tool runs, never raw event type names; an unknown event
   shows ADR-0036 §8's generic card.
 - **No free canvas.** No infinite canvas, no user-assembled dashboards, no
@@ -670,8 +694,13 @@ composer (send control inside the field, ⌘↩ to send).
 - A7.2: a static check over the client's **static copy strings** only (the
   copy catalog and literal text in components, as bundled for production):
   none matches `ADR-\d{4}`, a slice id `\bS\d+[a-z]?\b` or an issue
-  reference `#\d{3,}`, and none mentions PTY or terminal agents (D3).
-  Server-sent data (Work titles, issue and PR numbers, labels, transcript
+  reference `#\d{3,}`. For D3, none matches, case-insensitively, `\bPTY\b` or
+  `\bterminal[- ](agent|session|pane)s?\b`, and no copy template interpolates a
+  count into a string matching those (a template such as `{n} terminal agents`
+  fails). Other uses of "terminal" (for example a shell command shown in a tool
+  run) do not trip it. Because a real count could only arrive as server data,
+  A3.3 and a generated-types check that no wire field names PTY or terminal
+  agents close that path. Server-sent data (Work titles, issue and PR numbers, labels, transcript
   text) is outside the check by construction, since D2 has the GUI render
   issue and PR numbers it receives (part of #2896).
 - A7.3: the production build cannot open a `terminal` tile (the open
@@ -724,16 +753,16 @@ belong to configuration, with no overlap.
 
 **Consequences.**
 - The GUI's home depends on server projections that do not exist yet: the
-  `inbox` stream (G5, #1597) with rank, `waiting`, `unblocks`, `recipient`
+  `inbox` stream (G5, #1597) with rank, `waiting`, `unblocks`, `addressee`
   and `needs_you`, the `work` stream (G8, #1600), `queue/<agent>`,
   `artifacts` and the run stream. These are proposed server objects; today's
-  dispatcher refuses every stream but `fleet` and `agent/*`. P0 ships what the
-  `fleet` stream supports, with the provisional badge (D1).
+  dispatcher refuses every stream but `fleet` and `agent/*`. GUI-P0 ships what
+  the `fleet` stream supports, with the provisional badge (D1).
 - Project rows gain a registered `project_id` beside today's per-node
   checkout key, through a snapshot reset with a committed mapping (D2).
-- The inbox projection re-resolves delegated permission items on every
-  delegation or architect change (D4), so it depends on ADR-0049 W5's
-  resolver and `DelegationSet`/`DelegationRevoked` events.
+- The inbox projects ADR-0049 W5's delegated items and `PermissionRerouted`
+  records (D4) and defines no reroute of its own, so delegated items wait for
+  ADR-0049 P2's resolver and delegation verbs.
 - The `fleet` contract gains a structured-only guarantee (D3), a server-side
   change.
 - ADR-0038 loses three sidebar trees, the `terminal` tile and the
@@ -753,18 +782,18 @@ belong to configuration, with no overlap.
 - **Object-model drift.** Attractive cards invent state the server cannot
   restore. Mitigated by D2's "client invents no state" with A2.2's readonly
   types and reducer-only writes as a compile-time gate, and by refusing
-  mutations on phase-1 projection rows (A2.5).
+  mutations on projection-phase rows (A2.5).
 - **Definition sprawl.** Agent types, workflows, skills and config overlap.
   Mitigated by D8's one-line split, settled in ADR-0049.
 - **Silent calm.** The home looks quiet while supervision is degraded.
   Mitigated by the supervision-gap card (D4) and *unknown* rendering (D2).
-- **Stranded delegated prompt.** An architect's delegation lapses while a
-  prompt waits on it, and nobody sees it. Mitigated by D4's server-owned
-  recipient transition, tested by A4.6.
+- **Stranded delegated prompt.** A delegate's authority ends while a prompt
+  waits on it, and nobody sees it. Mitigated by ADR-0049 W5's reroute, which
+  the inbox projects (D4), tested by A4.6.
 
 **Pre-mortem: it is 2027 and the GUI failed. Why?**
 1. *The work stream never shipped*, so the home stayed agent-first and D1 was
-   never true. Guard: P1 starts with the read-only projection (#1600), which
+   never true. Guard: GUI-P1 starts with the read-only projection (#1600), which
    needs no new storage.
 2. *Cards showed state the server could not restore after a restart.* Guard:
    A2.2 and the fake-server restart tests (G3).
@@ -784,11 +813,13 @@ belong to configuration, with no overlap.
 
 | Phase | Scope | Issues | Decisions delivered |
 | --- | --- | --- | --- |
-| **P0** (now) | Design foundation: tokens, strict values, typed layout primitives; DOM-wide HIG conformance suite; exemplar baseline. Quick wins: hide deferred controls and drop *Terminal* and the phone *Agents* tab (the §2a amendments, item 2–4), unified toolbar with connection popover, plain-language refusal copy, desktop density with integrated composer and icon set, keyboard model, provisional needs-you badge in toolbar/title/sidebar (`waiting_on_human` until G5; D1), resizable and collapsible sidebar and inspector. Remove the phantom agent path; empty state. Server: structured-only fleet counts. | #2895, #2896, #2899, #2900, #2901, #2902, #2903, #2904, #2905, #2906, #2871, #2872; the structured-only fleet guarantee is to be filed on acceptance | D1 band 1–2 (fleet-backed), D3 (structured-only, node badge), D7 amendments 2–6, A1.3-P0, A1.4, A2.4, A3.3, A7.2–A7.4 |
-| **P1** | Work stream home: the read-only projection of ADR-0045 first (G8, #1600), then records (#1603) with the work verbs. Typed inbox stream with rank, `waiting`, `unblocks` and the six kinds (G5, #1597). Evidence panel and completion approval. Artifacts on Work (G6/G7, `about` → Work). Forks as proposals (S12/S13, G14/G15, #2726 progress). Composer as queue (`queue/<agent>` stream). Context inspector. Project "what reaches me" policy (ranking preset, cap, non-blocking toggle). Registered `project_id` on project rows. Delegation tree from edges. Delegated permission items and their recipient transitions, once ADR-0049 W5's resolver exists. | #1600, #1603, #1597, #2726; G6, G7, G8, G14, G15 (ADR-0038 §10); ADR-0049 W5 | D1 band 3 and A1.3, D2, D3 tree, D4 (A4.6 with ADR-0049 P2), D5, D6, D7 subject arrangement |
-| **P2** | Declarative workflows, agent types and the Run view (ADR-0049); configuration inspector writes; multi-node GUI through the home server (ADR-0043, #2293); mobile with remote push (#2733, G10). | ADR-0049 (proposed, #2908), #2293, #2733 | D2 `Run` (projection ids in ADR-0049 P1, `RunId`s in P2) and the workflow-definition facet, D8 writes |
+| **GUI-P0** (now) | Design foundation: tokens, strict values, typed layout primitives; DOM-wide HIG conformance suite; exemplar baseline. Quick wins: hide deferred controls and drop *Terminal* and the phone *Agents* tab (the §2a amendments, item 2–4), unified toolbar with connection popover, plain-language refusal copy, desktop density with integrated composer and icon set, keyboard model, provisional needs-you badge in toolbar/title/sidebar (`waiting_on_human` until G5; D1), resizable and collapsible sidebar and inspector. Remove the phantom agent path; empty state. Server: structured-only fleet counts. | #2895, #2896, #2899, #2900, #2901, #2902, #2903, #2904, #2905, #2906, #2871, #2872; the structured-only fleet guarantee is to be filed on acceptance | D1 band 1–2 (fleet-backed), D3 (structured-only, node badge), D7 amendments 2–6, A1.3-GUI-P0, A1.4, A2.4, A3.3, A7.2–A7.4 |
+| **GUI-P1** | Work stream home: the read-only projection of ADR-0045 first (G8, #1600), then records (#1603) with the work verbs. Typed inbox stream with rank, `waiting`, `unblocks` and the six kinds (G5, #1597). Evidence panel and completion approval. Artifacts on Work (G6/G7, `about` → Work). Forks as proposals (S12/S13, G14/G15, #2726 progress). Composer as queue (`queue/<agent>` stream). Context inspector. Project "what reaches me" policy (ranking preset, cap, non-blocking toggle). Registered `project_id` on project rows. Delegation tree from edges; the server role field on delegation rows (D3 prerequisite, to be filed on acceptance). | #1600, #1603, #1597, #2726; G6, G7, G8, G14, G15 (ADR-0038 §10) | D1 band 3 and A1.3, D2, D3 tree, D4 except delegated items (A4.1–A4.5, A4.7), D5, D6, D7 subject arrangement |
+| **GUI-P2** | Delegated permission and `request-decision` items and the `PermissionRerouted` projection, after ADR-0049 P2 ships the W5 resolver and delegation verbs. Declarative workflows, agent types and the Run view (ADR-0049); configuration inspector writes; multi-node GUI through the home server (ADR-0043, #2293); mobile with remote push (#2733, G10). | ADR-0049 (proposed, #2908), #2293, #2733 | D4 delegated items and A4.6, D2 `Run` (projection ids from ADR-0049 P1, `RunId`s from ADR-0049 P2) and the workflow-definition facet, D8 writes |
 
-Each P1 and P2 issue carries the acceptance tests of the decisions it
+The phases are named GUI-P0 to GUI-P2 to keep them apart from ADR-0049's P0 to P3 and
+from ADR-0045 D7's projection and record phases; a cross-reference always names its ADR.
+Each GUI-P1 and GUI-P2 issue carries the acceptance tests of the decisions it
 delivers, written to fail first.
 
 ## Deferred (named here, not decided)
@@ -804,17 +835,18 @@ delivers, written to fail first.
 
 ## Owner decisions (2026-11-03)
 
-The owner answered five questions; each is recorded where it applies.
+The owner answered five questions: four are decided and recorded where they apply; telemetry
+placement (3) is pending owner confirmation.
 
 1. **Architects may answer structured delegates' permission prompts, only
    through ADR-0049's `DecideDelegation`** (operator-issued, scoped,
-   revocable, audited). D4 "Permission authority" and "Recipient
-   transitions"; A4.6.
+   revocable, audited). D4 "Permission authority", "addressee" and
+   "Authority loss"; A4.6.
 2. **Attention ranking is configurable as a typed per-project policy with
    named presets**; the default preset is lexicographic: blocking >
    parked-behind > age. No free-form weights. D4 "Ranking"; A4.4.
-3. **Telemetry placement is not decided.** The recommendation stands in D7
-   and open question 1.
+3. **Telemetry placement: pending owner confirmation, not decided.** The
+   recommendation stands in D7 and open question 1.
 4. **Non-blocking questions count on the badge by default**, with a
    per-project toggle. D4; A4.4.
 5. **No node tree; the sidebar is project → delegation.** D2 rejected list,
@@ -824,11 +856,9 @@ The owner answered five questions; each is recorded where it applies.
 
 1. **Telemetry placement (pending owner confirmation).** Recommended
    default (D7): an inspector vitals strip, a collapsible bottom Diagnostics
-   drawer for `trace`, `logs`, `audit` and `node`, and a link out to Grafana
-   for history; no separate window. Note for the decision: ADR-0038 owner
-   decision 5 (2026-10-29) routes telemetry through vig-os/vigil's output,
-   "not Grafana"; a Grafana link-out needs that decision revisited or the link
-   pointed at vigil's view instead.
+   drawer for `trace`, `logs`, `audit` and `node`, and a link out to vigil's
+   view for history (ADR-0038 owner decision 5 routes telemetry through
+   vig-os/vigil, not Grafana); no separate window.
 2. **Ranking presets.** Which named presets ship beside the default
    `blocking_parked_age` (for example, one that orders by age within blocking
    items without the parked-behind term)? Each must be a fixed lexicographic
