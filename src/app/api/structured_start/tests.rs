@@ -252,6 +252,34 @@ impl AdmissionFixture {
         );
         (id, generation)
     }
+    async fn native_initialized(&mut self, id: &str, generation: u64) {
+        let wake = self.app.render_notify.clone();
+        crate::structured::workers::tests::wait(&wake, || {
+            self.app.service_structured_workers(Instant::now());
+            assert!(
+                self.app.structured_workers.report(id, generation).is_none(),
+                "placement producer exited before post-init readiness"
+            );
+            let frame = self.app.state.native_frames[id]
+                .as_ref()
+                .expect("native source failure");
+            // The status follows init through the runtime inspector. An input
+            // audit can be published before the runtime refuses a forbidden init.
+            frame.reported_model.as_deref() == Some("claude-haiku-5-5")
+                && self
+                    .app
+                    .state
+                    .structured_agents
+                    .get(id)
+                    .unwrap()
+                    .1
+                    .update
+                    .state
+                    .turn
+                    == crate::api::agent_state::Turn::Working
+        })
+        .await;
+    }
     fn submit(&self, id: &str, generation: u64) {
         use crate::structured::{
             queue::{
@@ -819,27 +847,20 @@ async fn public_structured_start_and_focus_reuse_native_placement() {
 #[tokio::test]
 async fn public_placement_owns_one_driver_and_detach_keeps_the_worker() {
     let _guard = crate::config::test_config_env_guard();
-    let mut fixture = AdmissionFixture::new("init-socket-null", 5000);
+    let mut fixture = AdmissionFixture::new("init-restricted", 5000);
     let (id, generation) = fixture.start().await;
+    fixture.app.service_structured_workers(Instant::now());
     assert!(
         fixture.app.state.native_frames.contains_key(&id),
         "public start must register its native controller"
     );
+    let task = fixture.app.structured_views[&id].id();
     fixture.submit(&id, generation);
-    let wake = fixture.app.render_notify.clone();
-    crate::structured::workers::tests::wait(&wake, || {
-        fixture.app.service_structured_workers(Instant::now());
-        let frame = fixture.app.state.native_frames[&id]
-            .as_ref()
-            .expect("native source failure");
-        frame.applied_cursor > 0
-    })
-    .await;
+    fixture.native_initialized(&id, generation).await;
     let held = fixture.app.state.native_frames[&id]
         .as_ref()
         .unwrap()
         .clone();
-    let task = fixture.app.structured_views[&id].id();
     let reply = fixture
         .request(Method::AgentFocus(crate::api::schema::AgentTarget {
             target: id.clone(),
@@ -861,14 +882,7 @@ async fn public_placement_owns_one_driver_and_detach_keeps_the_worker() {
             target: id.clone(),
         }))
         .await;
-    crate::structured::workers::tests::wait(&wake, || {
-        fixture.app.service_structured_workers(Instant::now());
-        let frame = fixture.app.state.native_frames[&id]
-            .as_ref()
-            .expect("native source failure");
-        frame.applied_cursor > 0
-    })
-    .await;
+    fixture.native_initialized(&id, generation).await;
     assert_ne!(fixture.app.structured_views[&id].id(), task);
     fixture
         .app
@@ -953,7 +967,7 @@ async fn admitted_start_returns_typed_unplaced_result_and_can_focus_later() {
 async fn public_native_placement_renders_its_frame_and_fences_a_stale_cut() {
     use ratatui::{backend::TestBackend, Terminal};
     let _guard = crate::config::test_config_env_guard();
-    let mut fixture = AdmissionFixture::new("init-socket-null", 5000);
+    let mut fixture = AdmissionFixture::new("init-restricted", 5000);
     let (id, generation) = fixture.start().await;
     fixture.submit(&id, generation);
     let wake = fixture.app.render_notify.clone();
@@ -1064,7 +1078,7 @@ async fn public_native_placement_renders_its_frame_and_fences_a_stale_cut() {
 async fn public_native_keyboard_close_detaches_without_stopping() {
     use crossterm::event::{KeyCode, KeyModifiers};
     let _guard = crate::config::test_config_env_guard();
-    let mut fixture = AdmissionFixture::new("init-socket-null", 5000);
+    let mut fixture = AdmissionFixture::new("init-restricted", 5000);
     let (id, generation) = fixture.start().await;
     fixture.app.state.mode = crate::app::Mode::Terminal;
     fixture
@@ -1098,7 +1112,7 @@ async fn public_native_keyboard_close_detaches_without_stopping() {
 async fn public_native_enter_submits_current_draft_once_without_terminal_bytes() {
     use crossterm::event::{KeyCode, KeyModifiers};
     let _guard = crate::config::test_config_env_guard();
-    let mut fixture = AdmissionFixture::new("init-socket-null", 5000);
+    let mut fixture = AdmissionFixture::new("init-restricted", 5000);
     let (id, generation) = fixture.start().await;
     let text = "MVP 中文 e\u{301}\nnext";
     seed_native_draft(&mut fixture, &id, generation, text, text.len());
@@ -1152,7 +1166,7 @@ async fn regression_public_native_mouse_uses_painted_fold_and_rejects_stale_hits
     use crate::structured::view::contracts::Action;
     use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     let _guard = crate::config::test_config_env_guard();
-    let mut fixture = AdmissionFixture::new("init-socket-null", 5000);
+    let mut fixture = AdmissionFixture::new("init-restricted", 5000);
     let (id, generation) = fixture.start().await;
     fixture.submit(&id, generation);
     fixture.app.state.mode = crate::app::Mode::Terminal;
@@ -1287,7 +1301,7 @@ fn native_enter(fixture: &mut AdmissionFixture) {
 async fn public_native_unknown_admission_keeps_draft_and_refuses_next_enter() {
     use crate::{api::error_code::ErrorCode, structured::view::contracts::Admission};
     let _guard = crate::config::test_config_env_guard();
-    let mut fixture = AdmissionFixture::new("init-socket-null", 5000);
+    let mut fixture = AdmissionFixture::new("init-restricted", 5000);
     let (id, generation) = fixture.start().await;
     let text = "uncertain draft";
     seed_native_draft(&mut fixture, &id, generation, text, text.len());
@@ -1324,7 +1338,7 @@ async fn public_native_unknown_admission_keeps_draft_and_refuses_next_enter() {
 async fn public_native_changed_draft_survives_clear(text_changed: bool) {
     use crate::structured::view::contracts::Admission;
     let _guard = crate::config::test_config_env_guard();
-    let mut fixture = AdmissionFixture::new("init-socket-null", 5000);
+    let mut fixture = AdmissionFixture::new("init-restricted", 5000);
     let (id, generation) = fixture.start().await;
     let original = "submitted draft";
     seed_native_draft(&mut fixture, &id, generation, original, original.len());
@@ -1369,7 +1383,7 @@ async fn public_native_aba_text_is_not_cleared_after_admission() {
 async fn d3a1_cursor_preserves_revision_and_painted_send() {
     use crate::structured::view::{editor::Edit, Target};
     let _guard = crate::config::test_config_env_guard();
-    let mut fixture = AdmissionFixture::new("init-socket-null", 5000);
+    let mut fixture = AdmissionFixture::new("init-restricted", 5000);
     let (id, generation) = fixture.start().await;
     seed_native_draft(&mut fixture, &id, generation, "hello", 5);
     let target = Target {
@@ -1395,7 +1409,7 @@ async fn d3a1_cursor_preserves_revision_and_painted_send() {
 async fn d3a1_ack_clears_after_cursor_move() {
     use crate::structured::view::{editor::Edit, Target};
     let _guard = crate::config::test_config_env_guard();
-    let mut fixture = AdmissionFixture::new("init-socket-null", 5000);
+    let mut fixture = AdmissionFixture::new("init-restricted", 5000);
     let (id, generation) = fixture.start().await;
     seed_native_draft(&mut fixture, &id, generation, "hello", 5);
     native_enter(&mut fixture);
@@ -1431,7 +1445,7 @@ async fn d3a1_ack_clears_after_cursor_move() {
 async fn d3a1_aba_revision_survives_ack() {
     use crate::structured::view::{editor::Edit, Target};
     let _guard = crate::config::test_config_env_guard();
-    let mut fixture = AdmissionFixture::new("init-socket-null", 5000);
+    let mut fixture = AdmissionFixture::new("init-restricted", 5000);
     let (id, generation) = fixture.start().await;
     seed_native_draft(&mut fixture, &id, generation, "hello", 5);
     let before = fixture.app.state.native_editors[&id]
@@ -1480,7 +1494,7 @@ async fn d3a1_aba_revision_survives_ack() {
 async fn d3a1_stale_painted_send_refuses_aba() {
     use crate::structured::view::{editor::Edit, Target};
     let _guard = crate::config::test_config_env_guard();
-    let mut fixture = AdmissionFixture::new("init-socket-null", 5000);
+    let mut fixture = AdmissionFixture::new("init-restricted", 5000);
     let (id, generation) = fixture.start().await;
     seed_native_draft(&mut fixture, &id, generation, "hello", 5);
     let wake = fixture.app.render_notify.clone();

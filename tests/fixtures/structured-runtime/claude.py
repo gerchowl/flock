@@ -218,6 +218,12 @@ if mode.startswith("init-socket"):
     else:
         init["messaging_socket_path"] = 42 if mode.endswith("wrong-type") else None
 emit(init)
+if mode == "init-restricted":
+    # Positive placement tests need a compliant init and a persistent producer.
+    # A post-init status proves the runtime inspector accepted the preceding init.
+    emit(find("system", "status"))
+    sys.stdin.read()
+    sys.exit(0)
 if mode == "mcp-lease-calls":
     # Execute precisely the registration received via --mcp-config.
     env = dict(os.environ)
