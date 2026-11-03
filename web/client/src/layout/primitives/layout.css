@@ -1,0 +1,77 @@
+/*
+ * The layout primitives (Every Layout semantics; web/DESIGN.md "Layout").
+ * Each reads its per-instance values from custom properties its component
+ * sets on the element: --l-space, --l-justify, --l-align, --l-side,
+ * --l-content-min, --l-threshold, --l-max and --l-min.
+ */
+
+/* Stack: children in a column, evenly spaced. */
+.l-stack {
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-start;
+  gap: var(--l-space);
+}
+
+/* Cluster: children in a row that wraps, evenly spaced. */
+.l-cluster {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: var(--l-justify);
+  align-items: var(--l-align);
+  gap: var(--l-space);
+}
+
+/* Sidebar: a side of its own width beside content that takes the rest, until
+   the content would fall below --l-content-min; then the two stack. */
+.l-sidebar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--l-space);
+}
+
+.l-sidebar > * {
+  flex-grow: 1;
+  flex-basis: var(--l-side);
+}
+
+.l-sidebar[data-side="left"] > :last-child,
+.l-sidebar[data-side="right"] > :first-child {
+  flex-grow: 999;
+  flex-basis: 0;
+  min-inline-size: var(--l-content-min);
+}
+
+/* Switcher: one row while the container is wider than --l-threshold,
+   one column below it. */
+.l-switcher {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--l-space);
+}
+
+.l-switcher > * {
+  flex-grow: 1;
+  flex-basis: calc((var(--l-threshold) - 100%) * 999);
+}
+
+/* Center: a column no wider than --l-max, centred, with side gutters. */
+.l-center {
+  box-sizing: content-box;
+  max-inline-size: var(--l-max);
+  margin-inline: auto;
+  padding-inline: var(--l-space);
+}
+
+.l-center[data-intrinsic] {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+/* Grid: as many columns of at least --l-min as fit. */
+.l-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(var(--l-min), 100%), 1fr));
+  gap: var(--l-space);
+}

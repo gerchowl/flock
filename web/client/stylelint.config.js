@@ -1,0 +1,97 @@
+/**
+ * The client's CSS rules (#2895; web/DESIGN.md "Rules").
+ *
+ * 1. Strict values: the properties in STRICT take a design token
+ *    (`var(--…)`) or a CSS keyword, never a raw value. Raw values live only
+ *    in the generated `src/tokens.css`. Custom properties may only alias
+ *    tokens, so a raw value cannot hide in a local `--x: 13px` (the plugin
+ *    skips custom properties, so a core rule covers them).
+ * 2. Layout fencing: flex and grid display, gap, margins, absolute
+ *    positioning and `@media` belong to the primitives in `src/layout/`.
+ *    Everything else composes those primitives.
+ *
+ * LEGACY is the temporary ignore list: files written before the tokens.
+ * They are still held to strict colours, but not yet to the other strict
+ * values or the layout fence. Shrink it file by file; never add to it.
+ */
+
+/** Temporary ignore list (#2895 follow-up): remove a file once it passes the full rules. */
+const LEGACY = ["src/styles.css", "src/workbench/workbench.css"];
+
+const STRICT = [
+  "/color$/",
+  "/^background/",
+  "/^border/",
+  "/^font/",
+  "line-height",
+  "box-shadow",
+  "z-index",
+  "/gap$/",
+  "/^margin/",
+  "/^padding/",
+];
+
+/** Colour properties, enforced in LEGACY files too. */
+const COLOR = ["/color$/", "background-color", "fill", "stroke"];
+
+/** Keywords a strict property may take instead of a token. */
+const KEYWORDS = [
+  "0",
+  "auto",
+  "currentColor",
+  "currentcolor",
+  "inherit",
+  "initial",
+  "none",
+  "normal",
+  "revert",
+  "transparent",
+  "unset",
+  "solid",
+  "dashed",
+  "italic",
+  "underline",
+];
+
+const strict = (properties) => [
+  properties,
+  {
+    ignoreFunctions: false,
+    ignoreValues: KEYWORDS,
+    expandShorthand: true,
+    recurseLonghand: true,
+    disableFix: true,
+  },
+];
+
+const FENCE = {
+  "declaration-property-value-disallowed-list": {
+    display: ["/flex/", "/grid/"],
+    position: ["absolute"],
+  },
+  "property-disallowed-list": ["/gap$/", "/^margin/"],
+  "at-rule-disallowed-list": ["media"],
+};
+const UNFENCED = Object.fromEntries(Object.keys(FENCE).map((rule) => [rule, null]));
+
+/** A custom property holds one or more `var(--token)` references, or a keyword. */
+const ALIAS = {
+  "declaration-property-value-allowed-list": { "/^--/": ["/^(?:var\\(--[a-z0-9-]+\\)\\s*)+$/", ...KEYWORDS] },
+};
+
+export default {
+  plugins: ["stylelint-declaration-strict-value"],
+  rules: {
+    "scale-unlimited/declaration-strict-value": strict(STRICT),
+    ...ALIAS,
+    ...FENCE,
+  },
+  overrides: [
+    { files: LEGACY, rules: { "scale-unlimited/declaration-strict-value": strict(COLOR), ...UNFENCED } },
+    { files: ["src/layout/**/*.css"], rules: UNFENCED },
+    {
+      files: ["src/tokens.css"],
+      rules: { "scale-unlimited/declaration-strict-value": null, "declaration-property-value-allowed-list": null, ...UNFENCED },
+    },
+  ],
+};
