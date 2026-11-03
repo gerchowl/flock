@@ -33,6 +33,8 @@ export const TOKENS = [
   "color-label-primary",
   "color-label-secondary",
   "color-label-tertiary",
+  "color-label-on-selection",
+  "color-label-on-selection-secondary",
   "color-separator",
   "color-background-window",
   "color-background-sidebar",
