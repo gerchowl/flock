@@ -73,8 +73,8 @@
     "destructive": {
       "$value": {
         "colorSpace": "srgb",
-        "components": [1.0, 0.411765, 0.380392],
-        "hex": "#ff6961"
+        "components": [1.0, 0.611765, 0.572549],
+        "hex": "#ff9c92"
       }
     },
     "status": {
@@ -95,8 +95,8 @@
       "red": {
         "$value": {
           "colorSpace": "srgb",
-          "components": [1.0, 0.411765, 0.380392],
-          "hex": "#ff6961"
+          "components": [1.0, 0.611765, 0.572549],
+          "hex": "#ff9c92"
         }
       }
     }

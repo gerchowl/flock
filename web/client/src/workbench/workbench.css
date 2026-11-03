@@ -78,9 +78,15 @@
   cursor: pointer;
 }
 
-.agent-row:hover,
-.agent-row[aria-current="true"] {
+.agent-row:hover {
   background: var(--color-legacy-bg);
+}
+
+/* The selected agent is an emphasised selection: its content takes the
+   alternate colours, status marks included (HIG; web/DESIGN.md "Colour"). */
+.agent-row[aria-current="true"] {
+  background: var(--color-selection-active);
+  color: var(--color-label-on-selection);
 }
 
 .agent-row__text {
@@ -100,6 +106,10 @@
   white-space: nowrap;
 }
 
+.agent-row[aria-current="true"] .agent-row__activity {
+  color: var(--color-label-on-selection-secondary);
+}
+
 .mark {
   position: relative;
   display: inline-flex;
@@ -116,6 +126,7 @@
 .mark--idle { color: var(--color-legacy-idle); }
 .mark--done { color: var(--color-legacy-done); }
 .mark--failed { color: var(--color-legacy-failed); }
+.agent-row[aria-current="true"] .mark { color: var(--color-label-on-selection); }
 
 .mark__count {
   position: absolute;
@@ -314,9 +325,14 @@
   cursor: pointer;
 }
 
-.palette__item[aria-selected="true"],
 .palette__item:hover {
   background: var(--color-legacy-surface);
+}
+
+/* The highlighted item is an emphasised selection, like a menu's. */
+.palette__item[aria-selected="true"] {
+  background: var(--color-selection-active);
+  color: var(--color-label-on-selection);
 }
 
 .palette__hint {
@@ -324,6 +340,10 @@
   color: var(--color-legacy-muted);
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.palette__item[aria-selected="true"] .palette__hint {
+  color: var(--color-label-on-selection-secondary);
 }
 
 /* Phone (ADR-0038 §2a): inbox first, one screen at a time, tabs at the bottom. */
