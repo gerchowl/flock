@@ -244,6 +244,13 @@ ci    = { rerun_failed = 1 }        # owner decision 2026-10-11
    than substitution of typed inputs into the few fields that accept them
    (branch names, titles). A predicate kind ADR-0045 does not support yet is
    refused at validation, never "watched" (ADR-0045 "Boundaries").
+   Step outcomes have their own predicate: `step.<id>.outcome == <state>` or
+   `step.<id>.outcome in [<state>, …]` over `succeeded | failed | skipped`,
+   and `<group>.outcome` over `passed | exhausted` (rule 2a). A step whose
+   `when` reads `step.<id>.outcome` for a `failed` value is that step's
+   **failure handler**; it must list `<id>` in `needs`, and the validator
+   refuses one that does not. When a step instance fails and its handler is
+   admitted, the failed instance is recorded `handled` (W4 "Success").
 2. **Structure is a DAG** of steps and groups (`needs`). Cycles and dangling
    `needs` refuse. The only repetition is a group's bounded `rounds` and a
    step's bounded `attempts`; fan-out (`for_each` over a typed input list) has
@@ -262,7 +269,8 @@ ci    = { rerun_failed = 1 }        # owner decision 2026-10-11
    shape, so the exhaustion handler cannot run early or on a passed group.
    On `passed` it is `skipped`; on `exhausted` every step whose `when`
    requires a passing verdict (here `land`) is `skipped`. A run that ends
-   through the exhaustion step never reaches `succeeded` (W4 "Success"); the
+   through the exhaustion step never reaches `succeeded` (W4 "Success needs
+   approved Work"); the
    decision is its recorded output, and acting on `split` is a new launch,
    not an automatic one.
 3. **Static validation** before adoption and again at launch: schema, DAG,
@@ -304,7 +312,7 @@ ci    = { rerun_failed = 1 }        # owner decision 2026-10-11
 
 ### Workflow definition identity
 
-This is the identity ADR-0048's Workflow object projects; it is defined
+This is the identity ADR-0048's Workflow facet projects; it is defined
 here and only here.
 
 - **`WorkflowDefinitionId { project, workflow_id, def_hash }`.** `project`
@@ -400,7 +408,7 @@ protocol, built on ADR-0045's acknowledged write (slice 1) and its
 
 | Op | Server owner | Authority check | Durable transitions | Identity and retry | Recovery after crash, restart or handoff | External-effect safety |
 | --- | --- | --- | --- | --- | --- | --- |
-| **assign** | work service (ADR-0045 D1/D2) and the target's queue (ADR-0036 §3) | run principal holds supervisor authority over the WorkId; target is a live agent the run spawned or the launcher's attested delegate (ADR-0027 §1) | two ordered sub-effects that are not one transaction: `work_assign` (`work.updated`, assignment generation +1 at an expected revision, the record carrying `assignment_effect = effect_id`), then `queue_item` (queue `message` item bound to that generation) | `work_assign` is a compare-and-set on the expected revision; `queue_item`'s ItemId = its `effect_id`, same ID and body observes the prior result, different body refuses (ADR-0045 "Durable subscription and delivery protocol", step 4) | crash between the two commits: read the WorkId. Current generation with `assignment_effect` equal to this `work_assign` ID → applied (an already-applied assignment revision is recognised, never re-applied); still at the expected revision → absent and guarded, retry the same ID; moved on → search the WorkId's assignment history (the retained `work.updated` events for that WorkId): this ID at an earlier generation → applied and since superseded; absent from a complete history → refused, the dispatcher re-plans; history rotated out so neither is provable → `uncertain`, operator decision. The `queue_item` lookup by ItemId always runs next: a current generation admits that same ID if missing, never a replacement; for a superseded generation an existing item stays and is fenced at delivery (ADR-0045 step 6), and a missing one is recorded `refused`, never admitted. A committed item is not re-sent to stdin; an unhandled one stays owed and escalates at its deadline (ADR-0045 D4) | internal only |
+| **assign** | work service (ADR-0045 D1/D2) and the target's queue (ADR-0036 §3) | the run principal exercises the launcher's assignment authority over the WorkId (the launcher stays the supervisor and the approver, W4); target is a live agent the run spawned or the launcher's attested delegate (ADR-0027 §1) | two ordered sub-effects that are not one transaction: `work_assign` (`work.updated`, assignment generation +1 at an expected revision, the record carrying `assignment_effect = effect_id`), then `queue_item` (queue `message` item bound to that generation) | `work_assign` is a compare-and-set on the expected revision; `queue_item`'s ItemId = its `effect_id`, same ID and body observes the prior result, different body refuses (ADR-0045 "Durable subscription and delivery protocol", step 4) | crash between the two commits: read the WorkId. Current generation with `assignment_effect` equal to this `work_assign` ID → applied (an already-applied assignment revision is recognised, never re-applied); still at the expected revision → absent and guarded, retry the same ID; moved on → search the WorkId's assignment history (the retained `work.updated` events for that WorkId): this ID at an earlier generation → applied and since superseded; absent from a complete history → refused, the dispatcher re-plans; history rotated out so neither is provable → `uncertain`, operator decision. The `queue_item` lookup by ItemId always runs next: a current generation admits that same ID if missing, never a replacement; for a superseded generation an existing item stays and is fenced at delivery (ADR-0045 step 6), and a missing one is recorded `refused`, never admitted. A committed item is not re-sent to stdin; an unhandled one stays owed and escalates at its deadline (ADR-0045 D4) | internal only |
 | **spawn** | server-side start composition (moves ADR-0027 §6's client-side `delegate start` into the server; a prerequisite slice) | effective capabilities (W1/W5), host cap (#822), depth (ADR-0014 §5), `blocked_while` gates | intended → spawn record (ADR-0036 "Uncertain spawn records") → edge recorded (ADR-0027 §1) → step `in_flight` | spawn request ID = `effect_id`; agent name derived from run and step | look up the spawn record by `effect_id`; an uncertain spawn reconciles per that amendment; never a second agent for one ID | the worktree is a recorded cleanup obligation, released by ADR-0027 §5 reap on merge or by an explicit run cleanup |
 | **await** | ADR-0045 loop service (LoopId); the run dispatcher is the wake recipient | source-read grants at registration and every firing (ADR-0045 "Subscription authority") | loop registered with a source cut; occurrence → step `ready`; healthy waits per ADR-0045 D4 | the occurrence key (same protocol, step 2) | the loop survives; the run refolds and consumes owed occurrences once | none; deadlines and the D8 chain apply |
 | **collect-evidence** | `work.evidence.attach` and the D11 check runner | assigned agent or run on its behalf; `check.run` for checks | evidence committed with typed identity (receipt/revision/hash, CI run/attempt, check invocation) | dedupe by evidence identity | re-verify; a claim (`DONE:` line, link) stays a claim until verified (ADR-0045 "Record and authority model") | reads only; checks sandboxed |
@@ -441,9 +449,18 @@ Notes on the table:
      to the release commit), or `release-follow-up.yml` refuses to move
      `main` unless the landed release commit's parent is X and its tree is
      the prepared one. Either form refuses a release that would include
-     anything after X.
-  3. **The `release` op holds the (repo, `dev`) landing slot** from the
-     operator decision until the tag is observed (or the effect is resolved
+     anything after X. **On refusal** the `dispatch` effect is observed
+     `refused`, the step fails and the run ends `failed` (terminal), and the
+     slot is released. With the merge guard, nothing lands on `dev`: the
+     release PR and `release/vX` stay open and the run's record names them.
+     With the follow-up refusal, `dev` carries an untagged `release: vX`
+     commit and `main` has not moved. In both cases vX is not tagged, so it
+     is cut again by a new run with a new operator decision bound to the
+     then-current `dev` head; the operator first closes a leftover release
+     PR, and the adapter must accept re-cutting vX on a `dev` that already
+     carries an untagged `release: vX` commit (#2909).
+  3. **The `release` op holds the (repo, `dev`) landing slot** from before
+     the operator decision is raised until the tag is observed (or the effect is resolved
      by the operator), so no flk `land` is admitted onto `dev` meanwhile;
      waiting `land` steps stay `waiting` with the slot holder named. A
      held slot has an ADR-0045 D4 deadline and D8 escalation, never a
@@ -453,7 +470,13 @@ Notes on the table:
      the run name, so reconcile finds the run by `effect_id`.
   5. **Duplicate-dispatch handling:** a second dispatch with the same
      `effect_id`, or for a version whose release branch or tag already
-     exists, exits without effect and reports the earlier run.
+     exists, exits without effect and reports the earlier run. Today
+     `promote.yml` instead reuses an existing release PR (`gh pr view`
+     finds it) and force-pushes `release/vX`, so a second dispatch silently
+     replaces the first one's commit under the same PR. The adapter must
+     drop that path: an existing `release/vX` branch or open release PR,
+     whatever its `effect_id`, refuses the dispatch instead of being
+     overwritten or reused.
   "Never auto-retry" remains, but on its own it cannot prevent releasing a
   different commit than the one approved; items 1–3 together do.
 - **No LLM in the dispatcher.** The run dispatcher is a deterministic reducer
@@ -472,26 +495,45 @@ response.
 ## W4. Runs
 
 - **Record.** `RunId` is server-minted. A run holds its pins (W2), launcher
-  principal, run ceiling (W5), mode (`live` or `shadow`), state, a step
+  principal, run principal, run ceiling (W5), mode (`live` or `shadow`), state, a step
   instance table, linked WorkIds (a run that creates work creates ADR-0045
   work nodes, it does not shadow them) and pending decisions. Run states:
   `admitted`, `running`, `waiting`, `blocked`, `uncertain`,
   `awaiting_approval`, `succeeded`, `failed`, `cancelled`. Step instance
   states: `pending`, `ready`, `in_flight`, `waiting`, `succeeded`, `failed`,
+  `handled` (failed, and its failure handler, W2 rule 1, was admitted),
   `uncertain`, `skipped`, `cancelled`; each instance has a server-minted
   `step_instance_id` (W3 rule 1) and carries attempts, and each attempt its
   effects.
+- **Two principals.** The **launcher principal** is whoever launched the
+  run (the operator, an architect or a resident owner). The **run
+  principal** is the server-side identity `Run(RunId)` under which the
+  dispatcher acts; it is minted with the run, is not an agent, holds no
+  credential outside the server and is never the launcher. The run principal
+  exercises only the authority W5 gives the run (ceiling and effects).
 - **Success needs approved Work, not finished steps.** A run whose every
-  step instance is terminal and none failed enters `awaiting_approval`, not
-  `succeeded`. Finishing steps never implies verified completion. A run
+  step instance is terminal and none is `failed` (`handled` and `skipped`
+  do not count as failed) enters `awaiting_approval`, not `succeeded`,
+  except a run that ended through an exhaustion step (W2 rule 2a), which
+  ends `failed` with its decision as output. A `failed` instance without an
+  admitted handler makes the run `failed`. Finishing steps never implies
+  verified completion. A run
   reaches `succeeded` only when each WorkId it links as a deliverable has an
   approved completion under ADR-0045 D2 (`work.complete.approve` naming the
   frozen check revision and the verified evidence, by the supervisor or, for
-  a root, the operator). The run principal never approves its own Work:
-  `work.complete.approve` for a run's deliverable is accepted only from a
-  human principal or an attested agent other than the run principal and
-  other than any agent the run spawned, and is refused
-  (`self_approval`) otherwise.
+  a root, the operator).
+- **Who approves: ADR-0045 D2, unchanged.** D2 says the assigned agent
+  proposes completion and "its supervisor/operator approves"; root
+  completion stays operator-approved. This ADR adds no approver and removes
+  none, so it does **not** amend D2. Concretely: the supervisor of that Work,
+  including a launching architect, may approve; the operator may approve.
+  The run principal never approves any Work (it is not a supervisor in D2's
+  sense; it only exercises the launcher's assignment authority, W3
+  `assign`). No agent that worked on that Work may approve it: every
+  assignee in its assignment history, every agent the run or anyone else
+  assigned or spawned for it, and the agent that proposed its completion;
+  this exclusion applies to a supervisor too, if it worked on that Work.
+  Such a call is refused with `self_approval`.
 - **Runs with no deliverable WorkId** (for example a release run) do not
   skip approval. All steps terminal moves them to `awaiting_approval` with
   the observed evidence (for a release: the dispatch run, the landed release
@@ -499,9 +541,7 @@ response.
   `run.close { run, expected_run_revision, verdict: accept | reject, note }`
   (`operate`, not delegable, refused for attested agent callers, exit 13):
   `accept` → `succeeded`, `reject` → `failed`. Nothing else makes such a run
-  `succeeded`. A
-  run that ended through an exhaustion step (W2 rule 2a) ends `failed` with
-  its decision as output. Approval later invalidated by a new acceptance
+  `succeeded`. Approval later invalidated by a new acceptance
   revision (ADR-0045 D2) moves a `succeeded` run back to
   `awaiting_approval`.
 - **Storage.** The same acknowledged log, record-carrying checkpoints and
@@ -539,8 +579,9 @@ response.
   abandoned, fails that **attempt** (not the step) and starts a new attempt
   with a new key if the step has attempts left, otherwise the step fails;
   `abandon_and_fail` closes the effect and fails the step. A failed step
-  fails the run unless a `when` routes around it, and run `failed` is
-  terminal: nothing reopens it, and continuing means a new launch.
+  fails the run unless a failure handler reads it (W2 rule 1), which records
+  it `handled`; run `failed` is terminal: nothing reopens it, and continuing
+  means a new launch.
   `abandon_and_retry` is refused for `release` (a new release is a new run
   with a new decision). No timer, epoch change or restart resolves
   uncertainty on its own.
@@ -588,12 +629,18 @@ exercise part of it only as an explicit, operator-issued decide delegation.**
 DecideDelegation {
   id, revision, grantor: operator principal,
   delegate: Agent(AgentId, generation) | ParentArchitect | Owner(repo),
-            # ParentArchitect resolves at decision time to the asker's
-            # attested ADR-0027 parent; it is still one finite grant
+            # ParentArchitect resolves when the item is raised
+            # ("Addressee assignment" below)
   scope:   { repo, subtree: attested ADR-0027 edges of the delegate, depth <= 2 },
-  classes: [worktree_tool | plan_approval | form_elicitation
-            | widen_directory | widen_network | widen_sandbox],
-  decisions: [allow_once, deny],          # allow_always is never delegable
+  classes: [ # permission classes
+              worktree_tool | plan_approval | form_elicitation
+            | widen_directory | widen_network | widen_sandbox
+              # request-decision classes
+            | scope ],
+  decisions: [allow_once, deny],          # permission classes; allow_always
+                                          # is never delegable. A decision
+                                          # class answers with the item's
+                                          # declared options
   expires_at | standing,                  # ad hoc: finite, default 8 h, at most 7 d
                                           # standing: adopted defaults only (owner Q1/Q2)
   by, created_at }
@@ -603,14 +650,16 @@ DecideDelegation {
   Delegated(id, revision) | Refused(reason)` is called by `hook.decide`
   (PTY, ADR-0034 §1) and `agent.decide` (structured, ADR-0036 §10b) alike.
   The structured `Principal` gains a delegated variant: the architect's
-  verified agent identity (ADR-0036 §1a) **plus** a live matching delegation,
+  verified agent identity (ADR-0036 §1a) **plus** being the item's stored
+  addressee under a still-valid delegation ("Addressee assignment"),
   rechecked at the mutation fence. An MCP lease's scopes alone still
   authorise nothing (S6e).
 - **Binding state, operator verbs.** `flk authority delegate|revoke|show`;
   durable `DelegationSet` and `DelegationRevoked` events; refused for an
   attested agent caller (exit 13); loud like ADR-0035 §6.2 (notification,
-  channel, standup). Revocation takes effect at the next decision; a
-  decision already committed stands.
+  channel, standup). Revocation takes effect at the next decision, and
+  every pending item addressed under the revoked delegation reroutes to the
+  operator ("Authority loss"); a decision already committed stands.
 - **Audit.** Every permission close records `principal`, `delegation_id` and
   `delegation_revision` beside the existing S6 audit fields, so "who allowed
   this" always names a human grant.
@@ -619,8 +668,12 @@ DecideDelegation {
   question-policy widening (ADR-0034 §2), model-tier changes (ADR-0021 §2),
   resume (ADR-0036 §1a), the merge, release and protection gates
   (ADR-0035 §6.6), and resolving run uncertainty (`run.resolve_effect`,
-  `run.resolve_foreign`, W4). A `request-decision` step declares its class; `release`,
-  `deploy` and `outside_merge` are non-delegable classes.
+  `run.resolve_foreign`, W4). A `request-decision` step declares its
+  class. The delegable decision class is `scope` (for example W2's
+  `decide-split`). The non-delegable decision classes are `release`,
+  `deploy`, `outside_merge` and `effect_uncertain` (W3 rule 4); no
+  `DecideDelegation` may list them, and adding a class needs an amendment
+  here.
 - **Every delegation is explicit and operator-issued; defaults are a
   template, never live authority.** The node-scoped operator setting
   `authority.delegation.defaults` (ADR-0042 registry, `G/N` only, so a repo
@@ -657,7 +710,7 @@ DecideDelegation {
 ### Inheritance and ceilings
 
 - A delegation is bound to `(AgentId, generation)` or resolved through an
-  attested role at decision time. It is **never inherited**: not by a fork
+  attested role when an item is raised ("Addressee assignment"). It is **never inherited**: not by a fork
   (ADR-0036 §9 creates a new AgentId; lineage grants nothing, as S6e says for
   transcripts), not by a spawned child, a reviewer or a run.
 - Capabilities only shrink down the tree: `effective(child) = requested(type)
@@ -700,13 +753,56 @@ DecideDelegation {
   after launch takes effect at the run's next check, at the mutation fence;
   a widening after launch does not reach the running run, which needs a new
   launch to use it. A decision under a delegation names `(id, revision)` and
-  is valid only while that revision is the current, unrevoked, unexpired one. Runs never hold decide
+  is valid only while that delegation is live (unrevoked, unexpired) and no
+  revision since the named one has narrowed it; a renewal or widening
+  revision keeps it valid, a narrowing one reroutes (`narrowed`). Runs never hold decide
   authority; a permission prompt inside a run-spawned agent goes to the same
   resolver as any other, along the spawned agent's edge: the launching
   architect's edge, or, for an operator launch, `ask_operator` as a
   server-started root (ADR-0034 §2).
 - **Resident owner.** An owner's limits are already binding state (ADR-0035
   §6.2); its delegations are just more of it, and a shadow owner holds none.
+
+### Addressee assignment
+
+`decide_authority` is checked when someone decides; the addressee is fixed
+when the item is raised. ADR-0048's inbox renders this stored value.
+
+- **Stored at raise.** When a permission prompt or a `request-decision`
+  item is raised, the server computes its addressee once and stores
+  `addressee: Operator | Delegated { delegate, delegation_id,
+  delegation_revision }` in the same acknowledged write that raises the
+  item. `delegate` is a concrete `Agent(AgentId, generation)` or
+  `Owner(repo)`, never the unresolved `ParentArchitect`.
+- **`ParentArchitect` at raise time.** It resolves to the asker's current
+  attested ADR-0027 parent, as `(AgentId, generation)` at that moment,
+  provided that parent is live and holds an architect role. With no such
+  parent the delegation does not match.
+- **Candidates.** A delegation matches when it is live, lists the item's
+  class (and, for a permission, the decision kinds the prompt offers), its
+  scope covers the asker, the request is within the ceilings of
+  "Inheritance and ceilings", and its delegate resolves to a live
+  principal. No match → `Operator`.
+- **One winner, deterministically.** Among matches: (1) the delegate
+  nearest the asker on the attested edge chain (parent before
+  grandparent; `Owner(repo)` ranks after every edge delegate); (2) then
+  `Agent(...)` before `ParentArchitect` before `Owner(repo)` delegations;
+  (3) then the lowest `delegation_id`. The rule uses only stored state, so
+  replay after restart picks the same winner.
+- **Only the addressee decides.** At decision time `decide_authority`
+  accepts the operator or the stored addressee (that identity and
+  generation, under the stored delegation still valid per "Pinned revisions
+  and current revocation"). Any other principal, including another agent
+  that holds a matching delegation, is refused `not_addressee`; the stored
+  delegate after its delegation lapsed is refused `delegation_lapsed`. An
+  operator answer to a delegated item is allowed and audited as the
+  operator's.
+- **Changes reroute, never re-resolve.** A change to the asker's parent
+  edge (`orphaned`), to the delegate's generation (`generation_changed`), to
+  the stored delegation (`expired`, `revoked`, `narrowed`) or a handoff that
+  does not carry the delegate (`handoff`) produces a `PermissionRerouted`
+  with that reason (below). The item goes to the operator; it is never
+  reassigned to another matching delegate.
 
 ### Authority loss: expiry, revocation and orphaning
 
@@ -812,8 +908,9 @@ made outside GitHub.
 
 ## W8. Phasing and acceptance
 
-- **P0: none.** The GUI run view needs ADR-0048's phase 1 shell to render in;
-  the runtime depends on ADR-0045 slices 1–12 (acknowledged writes through
+- **P0: none.** ADR-0048 renders the Run view and the workflow-definition
+  facet in its GUI-P2 phase; nothing here waits on GUI-P0 or GUI-P1. The
+  runtime depends on ADR-0045 slices 1–12 (acknowledged writes through
   the CI adapter).
 - **P1: read-only run view of existing loops.** Project ADR-0045 loops,
   structured delegate edges (never PTY agents, W1) and queued start intents (ADR-0027 §6), and armed goals as
@@ -835,16 +932,16 @@ model, as ADR-0045 requires.
 | --- | --- |
 | W1 | A type requesting `merge` or `ask_human` fails adoption. A type requesting `branch.push` without a grant refuses spawn with `capability_ceiling` listing it. An attested agent calling `flk grant type` gets exit 13. |
 | W2 | A cyclic `needs`, an unknown op, a timing literal for a registry key, an unknown field or an unsupported predicate each refuse validation. A definition edited on a feature branch is not what a run on that branch loads. An unadopted blob cannot launch. A run's pins survive restart and a later adoption. The form editor round-trips a commented file byte-identically when nothing changed. |
-| W3 | Inject a crash after `effect_intended` and before the call, and after the call before `effect_observed`, for land, file-issue and release against a fake GitHub: exactly one merge and at most one dispatch; an unproven issue create and an uncertain dispatch each raise an operator decision rather than retrying, and a fake that completes the first create after an empty search still yields one issue. Two fan-out instances, two review rounds, and a rerun, an update-branch and a member close at the same head and attempt each get distinct effect keys. The same `effect_id` with a different payload refuses `effect_payload_mismatch`. A crash between the `assign` commits recovers an already-applied assignment revision without a second generation or a second queue item. A moved head refuses landing. A rerun failure at the same SHA is observed. With the release adapter absent, `release` refuses live mode. While a `release` holds the (repo, `dev`) slot, a `land` onto `dev` waits; a fake merge onto `dev` made outside flk while the release PR waits makes the release refuse to move `main`. |
-| W4 | Restart between every pair of ledger events: the refolded run has the same step states, and uncertain effects reconcile before any new step is admitted. An effect still uncertain after handoff keeps the run `uncertain` until a proof or `run.resolve_effect`, which an attested agent gets exit 13 for. A shadow run issues no effect verb (`run_in_shadow`) and reports divergence against a scripted fake driver. A live run observing a foreign merge blocks with `foreign_effect`, and `accept` refuses a foreign merge at a different head. A run whose steps all finish sits in `awaiting_approval` until `work.complete.approve`, which refuses `self_approval` from the run principal or an agent it spawned; a run with no deliverable WorkId reaches `succeeded` only through `run.close accept`. `abandon_and_retry` starts a new attempt key and `abandon_and_fail` leaves the run terminal `failed`. A review group whose last round has blockers skips that round's fix. A crash between the `assign` commits after the generation moved on proves the earlier assignment from history. |
-| W5 | The same in-worktree prompt, on a legacy PTY and a structured fake delegate, gets the same answer path. Without an adopted delegation, the architect's decide refuses on both; editing or reloading the defaults template creates none, and a revoked adopted delegation stays revoked across reload and restart. A widening prompt is architect-answerable only with a matching live delegation and within the child's and run's ceilings; beyond either it goes to the operator. It refuses after expiry or revocation, and the audit names the delegation. A run pinned to a grant revision loses an effect revoked after launch. An architect-launched run without `land` on its `workflow.launch` grant cannot merge. Expiring, revoking or stopping the architect while a prompt is pending reroutes it to the operator with `PermissionRerouted`, and the old architect's late answer refuses `delegation_lapsed`; the same reroute happens when the delegation is narrowed below the prompt's class, when the architect's generation changes (restart or resume), and when the architect is not carried by a handoff. A fork of the architect cannot decide. A run-spawned child cannot exceed its launcher's preset rank. No run view or count includes a PTY agent. |
+| W3 | Inject a crash after `effect_intended` and before the call, and after the call before `effect_observed`, for land, file-issue and release against a fake GitHub: exactly one merge and at most one dispatch; an unproven issue create and an uncertain dispatch each raise an operator decision rather than retrying, and a fake that completes the first create after an empty search still yields one issue. Two fan-out instances, two review rounds, and a rerun, an update-branch and a member close at the same head and attempt each get distinct effect keys. The same `effect_id` with a different payload refuses `effect_payload_mismatch`. A crash between the `assign` commits recovers an already-applied assignment revision without a second generation or a second queue item. A moved head refuses landing. A rerun failure at the same SHA is observed. With the release adapter absent, `release` refuses live mode. While a `release` holds the (repo, `dev`) slot, a `land` onto `dev` waits; a fake merge onto `dev` made outside flk while the release PR waits is refused in both item 2 forms: with the merge guard the release PR does not merge and stays open; with the follow-up refusal `main` does not move and `dev` keeps an untagged release commit; either way the run ends `failed`, the slot is released, and a new run can cut vX again. The slot is held before the release decision is raised. A second dispatch while `release/vX` exists refuses instead of force-pushing it. |
+| W4 | A step that fails with a failure handler (`step.<id>.outcome == failed`) is recorded `handled` and the run still reaches `awaiting_approval`; the same failure without a handler makes the run `failed`; a handler that does not `needs` the failed step refuses validation. The launching architect, as supervisor, may approve a run's Work; the run principal, the Work's assignee and the agent that proposed completion each get `self_approval`. Restart between every pair of ledger events: the refolded run has the same step states, and uncertain effects reconcile before any new step is admitted. An effect still uncertain after handoff keeps the run `uncertain` until a proof or `run.resolve_effect`, which an attested agent gets exit 13 for. A shadow run issues no effect verb (`run_in_shadow`) and reports divergence against a scripted fake driver. A live run observing a foreign merge blocks with `foreign_effect`, and `accept` refuses a foreign merge at a different head. A run whose steps all finish sits in `awaiting_approval` until `work.complete.approve`, which refuses `self_approval` from the run principal or any agent that worked on that Work; a run with no deliverable WorkId reaches `succeeded` only through `run.close accept`. `abandon_and_retry` starts a new attempt key and `abandon_and_fail` leaves the run terminal `failed`. A review group whose last round has blockers skips that round's fix. A crash between the `assign` commits after the generation moved on proves the earlier assignment from history. |
+| W5 | The same in-worktree prompt, on a legacy PTY and a structured fake delegate, gets the same answer path. Without an adopted delegation, the architect's decide refuses on both; editing or reloading the defaults template creates none, and a revoked adopted delegation stays revoked across reload and restart. A widening prompt is architect-answerable only with a matching live delegation and within the child's and run's ceilings; beyond either it goes to the operator. It refuses after expiry or revocation, and the audit names the delegation. A run pinned to a grant revision loses an effect revoked after launch. An architect-launched run without `land` on its `workflow.launch` grant cannot merge. Expiring, revoking or stopping the architect while a prompt is pending reroutes it to the operator with `PermissionRerouted`, and the old architect's late answer refuses `delegation_lapsed`; the same reroute happens when the delegation is narrowed below the prompt's class, when the architect's generation changes (restart or resume), and when the architect is not carried by a handoff. Addressee assignment: a prompt raised with two matching delegations stores the nearer delegate, and restart keeps the same addressee; another agent holding a matching delegation is refused `not_addressee`; `ParentArchitect` stores the concrete parent and generation at raise; reparenting the asker reroutes with `orphaned`; a renewal revision does not reroute. A `scope` decision is answerable under a `scope` delegation; a delegation listing `effect_uncertain` or `release` refuses creation. A fork of the architect cannot decide. A run-spawned child cannot exceed its launcher's preset rank. No run view or count includes a PTY agent. |
 | W6 | The validator refuses a workflow carrying a registry-owned duration. The skill lint flags a landing command in a role text whose workflow is live. |
 | W7 | Every pre-mortem row above maps to at least one W1–W6 test. |
 
 ## Owner questions
 
 Recommendations below are recommendations, not decisions. Where the
-independent review (astra, fix round 1) recommends differently from this
+independent review (a reviewer, fix round 1) recommends differently from this
 ADR's author, both are given.
 
 1. **Default delegation row (W5).** Should the operator adopt the
