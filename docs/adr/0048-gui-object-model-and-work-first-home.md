@@ -18,9 +18,11 @@
 - Decision owner: repository owner. The owner asked for this ADR on 2026-11-03
   ("go for all"), after two independent GUI-vision reviews (a product review
   and a systems review, 2026-11-02) agreed on its thesis. The owner answered
-  five questions on 2026-11-03; they are recorded as decided in "Owner
-  decisions" below and in the sections they touch. Everything else in D1–D8
-  is a recommendation awaiting the owner's decision.
+  five questions on 2026-11-03: four are decided (OD-48.1, OD-48.2, OD-48.4,
+  OD-48.5) and recorded in "Owner decisions" below and in the sections they
+  touch; telemetry placement (OD-48.3) is pending owner confirmation.
+  Everything else in D1–D8 is a recommendation awaiting the owner's
+  decision.
 - Builds on: ADR-0027 §1, §1a and §2 (delegation edges, orphaned edges,
   `delegate.list`), ADR-0028 §1
   and §8a (state axes, open questions), ADR-0030 §1–§3 and ADR-0031 (goal
@@ -180,7 +182,7 @@ a route, a detail view and a row in search (⌘K).
 | **Agent** | `AgentId` (ADR-0008); structured only (D3) | delegated_by → Agent (ADR-0027 §1 edge; role from a server role field, D3); works_on → Work; forked_from → Agent (lineage, ADR-0036 §9) |
 | **Question** | `question_id` + revision (ADR-0036 S6e `QuestionRecord`) | asked_by → Agent; addressed_to → Agent or operator; about → Work or Artifact; threads → fork Agents; proposals |
 | **Artifact** | `artifact_id` + version (ADR-0038 §7) | published_by → Agent; about → Work; annotated_by → comments, Questions |
-| **Run** | Before ADR-0049 P2: a run projection view id; from ADR-0049 P2: a durable server-minted `RunId` (ADR-0049 W4 "Runs"). See "Run projections and RunIds" below | instantiates → workflow definition (pinned `def_hash`); drives → Work (linked WorkIds); launched_by → principal. Not rendered until ADR-0049 is accepted and its stream exists |
+| **Run** | Before ADR-0049 P2: a run projection view id; from ADR-0049 P2: a durable server-minted `RunId` (ADR-0049 W4 "Runs"). See "Run projections and RunIds" below | instantiates → exactly one `WorkflowDefinitionId { project, workflow_id, def_hash }` (ADR-0049 W2 "Workflow definition identity"); drives → Work (linked WorkIds); launched_by → launcher principal; acts as → run principal `Run(RunId)` (W4 "Two principals"). Not rendered until ADR-0049 is accepted and its stream exists |
 
 Everything else is an **attribute or facet** of one of those, shown inside
 its owner's view and never as a top-level navigation root:
@@ -189,7 +191,7 @@ its owner's view and never as a top-level navigation root:
 | --- | --- | --- |
 | Node | Agent, Project | a badge (name, health dot, freshness) with a popover; ADR-0043 §5 classifications rendered as sent |
 | Role and tier | the delegation edge | an edge label (owner, segment architect, implementer, reviewer, judge) from a server role field. ADR-0027 §1's `AgentDelegated` has no role (its `label` is free caller text, never a role); the owner comes from ADR-0035's binding and the segment architect from ADR-0035 §1a's `SegmentAssigned`. The fleet row carries no role field yet: it is a D3 prerequisite, and until it exists no tier label is shown. The client never infers a tier from names, labels or depth |
-| Workflow definition | Project (adopted definitions), Run (its pinned definition) | ADR-0049 W2 "Workflow definitions" owns the definition (file, schema, validation, adoption by hash); this ADR owns only its GUI facet: a read-only definition view identified as W2 identifies it (its `id` and adopted `def_hash`), reached from the Project's adopted-definitions list and from every Run; not a navigation root and not in search as a seventh kind |
+| Workflow definition | Project (adopted definitions), Run (its pinned definition) | ADR-0049 W2 "Workflow definitions" owns the definition (file, schema, validation, adoption by hash); this ADR owns only its GUI facet: a read-only definition view keyed by `WorkflowDefinitionId { project, workflow_id, def_hash }` as W2 "Workflow definition identity" defines it, reached from the Project's adopted-definitions list and from every Run; not a navigation root and not in search as a seventh kind |
 | Transcript and input queue | Agent | the Agent's conversation view (D6) |
 | Evidence | Work | the evidence panel (D5) |
 | Rules and context | Project, Agent | a context inspector with ADR-0032 §1's five layers and each layer's provenance |
@@ -239,6 +241,15 @@ ADR-0045 D7 specifies for legacy-ID → `WorkId`. The client drops every
 projection id at the reset and never maps one to a `RunId` itself. The same
 rule holds for Work rows (projection-phase view ids, record-phase `WorkId`s).
 
+**Run and step states are rendered as sent** (ADR-0049 W4 "Runs"). A Run in
+`awaiting_approval` has finished its steps but is not done: it shows as
+awaiting completion approval of its Work (a D5 claim, in band 1 or 2, never
+band 3), and only `succeeded` counts as finished. A step instance in
+`handled` is a failure whose failure handler was admitted: it shows as failed
+with its handler, never as success and never hidden, even though the run can
+still reach `awaiting_approval`. A refused approval shows the server's
+`self_approval` refusal in plain language (D5).
+
 **The client invents no state.** This restates ADR-0038 §3 and extends it to
 the new objects. The client may group, sort, filter, count server-sent
 items, format times and lay out tiles. It must never derive: Work status,
@@ -260,7 +271,7 @@ made through a verb, shown as such. Dragging is allowed only for layout
   and duplicate ownership; ADR-0045 D7 already rejected independent goal/task
   stores, and the systems review repeats it.
 - *Node as a navigation root* (ADR-0038 §1's *Fleet* tree; the UX review's
-  "one Node→agents tree"; dropped by owner decision 5, 2026-11-03): nodes are
+  "one Node→agents tree"; dropped by OD-48.5, 2026-11-03): nodes are
   where work runs, not what the person is supervising. A node outage still
   surfaces, as a supervision-gap card (D4) and as stale badges.
 - *Client-side optimistic work state* (move a card, reconcile later): the
@@ -303,7 +314,7 @@ made through a verb, shown as such. Dragging is allowed only for layout
 
 ### D3. Sidebar: project → delegation tree, structured agents only, node as a badge
 
-**Decided (owner decision 5, 2026-11-03): the sidebar is project →
+**Decided (OD-48.5, 2026-11-03): the sidebar is project →
 delegation, and there is no node tree.** Each **Project is a section
 header**, not a tree level: the header carries the project name and its
 resident owner (name, phase mark, attention count), and selecting it opens
@@ -383,23 +394,23 @@ typed items addressed to the operator. Six kinds:
 Unarmed coverage on unprotected Work is normal and is not an attention item;
 the Work view shows its coverage state as sent.
 
-**Non-blocking questions count on the badge by default** (owner decision 4,
+**Non-blocking questions count on the badge by default** (OD-48.4,
 2026-11-03). They are listed below the blocking items, as ADR-0036 S6e orders
 them, and count toward the toolbar badge unless the project's policy turns
 that off (a per-project toggle, below).
 
-- **Ranking is server-side and configurable by typed preset** (owner
-  decision 2, 2026-11-03). The ranking is a per-project policy value (the
-  project policy below) naming one of a closed set of **named presets**; each
-  preset is a fixed lexicographic key over server fields. There are no
-  free-form weights and no client-side ranking. The default preset,
-  `blocking_parked_age`, orders blocking items first; then by the number of
-  agents parked behind the item (the asker plus every agent whose registered
-  wait, ADR-0028 §5, or delegation edge resolves to it); then by age. This
-  refines ADR-0038 §1 and S6e's "blocking, urgency, age" by inserting *parked
-  behind*. The server computes the order under the project's preset and ships
-  `rank` and the preset name with each item; the client never re-ranks. Which
-  presets beyond the default ship is open question 2.
+- **Ranking is server-side and configurable by typed preset** (OD-48.2,
+  2026-11-03). The ranking is a per-project policy value (the project policy
+  below) naming one of a closed set of **named presets**; each preset is a
+  fixed lexicographic key over server fields. There are no free-form weights
+  and no client-side ranking. The default preset, `blocking_parked_age`,
+  orders blocking items first; then by the number of agents parked behind the
+  item (the asker plus every agent whose registered wait, ADR-0028 §5, or
+  delegation edge resolves to it); then by age. This refines ADR-0038 §1 and
+  S6e's "blocking, urgency, age" by inserting *parked behind*. The server
+  computes the order under the project's preset and ships `rank` and the
+  preset name with each item; the client never re-ranks. Which presets beyond
+  the default ship is open question 2.
 - **Grouping, cap and copy.** The inbox groups items by the Work they unblock
   (items with no Work group by asker), groups ordered by their best-ranked
   item and items by server `rank` within a group; grouping is presentation
@@ -423,13 +434,13 @@ that off (a per-project toggle, below).
   notify*: permissions, blocking questions, operator-stage escalations and
   root completion approvals. Repository content cannot change what reaches the
   operator.
-- **Permission authority: operator, or a decide delegation** (owner
-  decision 1, 2026-11-03). An architect may answer a structured delegate's
-  permission prompt, or a delegable `request-decision` question (ADR-0049
-  W3), **only through ADR-0049 W5's `DecideDelegation`**:
-  operator-issued, scoped, finite, revocable and audited, checked by the one
-  `decide_authority` resolver. Every other permission decision needs
-  `operate`: `agent.decide` requires `operate` or the existing specific
+- **Permission authority: operator, or a decide delegation** (OD-48.1,
+  2026-11-03). An architect may answer a structured delegate's permission
+  prompt, or a delegable `request-decision` question (ADR-0049 W3), **only
+  through ADR-0049 W5's `DecideDelegation`**: operator-issued, scoped,
+  revocable and audited; ad-hoc delegations are finite and only adopted
+  defaults may be standing (ADR-0049 W5). Every other permission decision
+  needs `operate`: `agent.decide` requires `operate` or the existing specific
   operator authority (ADR-0036 S6e "Authorization and proposals", #2585,
   restating §10b's S6 rule). A question card calls `question.answer` under
   `answer` or `operate` (the same table). The two handlers stay separate even
@@ -437,12 +448,12 @@ that off (a per-project toggle, below).
   action disabled with the authority it needs.
 - **Every pending decision item has a server-owned addressee.** This covers
   permission prompts and ADR-0049 `request-decision` questions (W3) alike.
-  Each carries `addressee: operator | delegated { delegate, delegation_id,
-  delegation_revision }`, set by the `decide_authority` resolver, never by the
-  client. `delegate` is ADR-0049 W5's `DecideDelegation.delegate` type
-  (`Agent(AgentId, generation) | ParentArchitect | Owner(repo)`), generated
-  from it, with `ParentArchitect` shown as the agent it resolved to, as the
-  server sends it. A delegated item is an evidence row on its Work (or Run)
+  The server stores each item's addressee when it is raised, as ADR-0049 W5
+  "Addressee assignment" specifies; the inbox projects that stored value and
+  never computes, re-resolves or guesses one. The GUI's addressee type is
+  generated from W5's stored shape. A decision from anyone other than the
+  operator or the stored addressee is refused `not_addressee`, and the GUI
+  renders that refusal in plain language. A delegated item is an evidence row on its Work (or Run)
   naming the delegate and the delegation, not an operator card; the operator
   can still decide it there under `operate`, since a delegation never removes
   operator authority.
@@ -451,8 +462,8 @@ that off (a per-project toggle, below).
   pending item is rerouted to the operator and why. This ADR defines no
   trigger and no cause list of its own. The `inbox` stream projects each
   committed `PermissionRerouted` record: the item keeps its id, becomes an
-  operator item showing the record's `reason`, and arrives in the same frame
-  sequence as the new `needs_you` count. ADR-0045 D8 escalation for it starts
+  operator item showing the record's `reason`, and the new `needs_you` count
+  arrives in the same frame sequence as the rerouted item. ADR-0045 D8 escalation for it starts
   at the reroute, as W5 specifies. The Work's evidence row keeps the history
   ("rerouted to operator: *reason*"). The GUI's reason type is a closed union
   generated from the reasons ADR-0049 W5 defines and rendered through an
@@ -477,12 +488,11 @@ that off (a per-project toggle, below).
 - *A weighted product (blocking × parked × age), or operator-tuned free-form
   weights*: harder to explain on the card and to test, and every project
   becomes a different ranking nobody can reason about; named lexicographic
-  presets keep the intent with a stated order (owner decision 2).
+  presets keep the intent with a stated order (OD-48.2).
 - *Operator-only for every structured permission*: strands unattended trees
-  on routine in-worktree prompts (ADR-0049 W5's argument); rejected by owner
-  decision 1.
+  on routine in-worktree prompts (ADR-0049 W5's argument); rejected by OD-48.1.
 - *Architect authority from the delegation edge alone*: invisible and
-  unrevocable; rejected by ADR-0049 W5 and owner decision 1.
+  unrevocable; rejected by ADR-0049 W5 and OD-48.1.
 - *Letting a project file lower protected kinds*: a repository could silence
   the operator's permission prompts.
 
@@ -503,19 +513,23 @@ that off (a per-project toggle, below).
   typed error.
 - A4.5: opening and closing an escalation card leaves the server's reminder
   schedule unchanged (scripted server asserts no `work.escalation.ack`).
-- A4.6: through the **real** `decide_authority` resolver and the server's
-  `inbox` projection (an isolated server and the public fake model, not a
-  scripted fake): a structured delegate raises a `worktree_tool` prompt under
-  a live `ParentArchitect` delegation, and a run step raises a delegable
-  `request-decision` question; each item has `addressee: delegated`, appears
-  as an evidence row and not in the operator inbox, and `needs_you` excludes
-  it. Then one run per reason in ADR-0049 W5's reason set, iterated from the
+- A4.6: through a real isolated server and its `inbox` projection (the
+  public fake model, not a scripted fake), testing what the GUI receives, not
+  resolver internals: a structured delegate raises a `worktree_tool` prompt
+  under a live delegation, and a run step raises a delegable
+  `request-decision` question; each projected item carries the addressee the
+  server stored at raise (ADR-0049 W5 "Addressee assignment"), unchanged
+  across a server restart, appears as an evidence row and not in the
+  operator inbox, and `needs_you` excludes it. A decide from an agent other
+  than the stored addressee is refused `not_addressee` and the GUI shows that
+  refusal. Then one run per reason in ADR-0049 W5's reason set, iterated from the
   generated type so a new reason adds a case: today that drives expiry,
   revocation, narrowing below the item's class or ceiling, orphaning, a
   generation change and a handoff that does not carry the delegate. In each
   run the server commits one `PermissionRerouted` with that reason; the same
   item, with the same id, arrives as an operator item showing it;
-  `needs_you` rises by one in the next frame; an ADR-0045 D8 escalation
+  the new `needs_you` count, one higher, arrives in the same frame sequence
+  as the rerouted item; an ADR-0045 D8 escalation
   exists from the reroute's timestamp; the evidence row records the reroute;
   the former delegate's late answer is refused with `delegation_lapsed` and
   audited; and an `operate` decide succeeds with an audit record naming no
@@ -835,21 +849,22 @@ delivers, written to fail first.
 
 ## Owner decisions (2026-11-03)
 
-The owner answered five questions: four are decided and recorded where they apply; telemetry
-placement (3) is pending owner confirmation.
+The owner answered five questions: four are decided and recorded where they apply;
+telemetry placement (OD-48.3) is pending owner confirmation. The `OD-48.n` ids
+keep them apart from ADR-0049's owner questions.
 
-1. **Architects may answer structured delegates' permission prompts, only
+1. **OD-48.1.** **Architects may answer structured delegates' permission prompts, only
    through ADR-0049's `DecideDelegation`** (operator-issued, scoped,
    revocable, audited). D4 "Permission authority", "addressee" and
    "Authority loss"; A4.6.
-2. **Attention ranking is configurable as a typed per-project policy with
+2. **OD-48.2.** **Attention ranking is configurable as a typed per-project policy with
    named presets**; the default preset is lexicographic: blocking >
    parked-behind > age. No free-form weights. D4 "Ranking"; A4.4.
-3. **Telemetry placement: pending owner confirmation, not decided.** The
+3. **OD-48.3.** **Telemetry placement: pending owner confirmation, not decided.** The
    recommendation stands in D7 and open question 1.
-4. **Non-blocking questions count on the badge by default**, with a
+4. **OD-48.4.** **Non-blocking questions count on the badge by default**, with a
    per-project toggle. D4; A4.4.
-5. **No node tree; the sidebar is project → delegation.** D2 rejected list,
+5. **OD-48.5.** **No node tree; the sidebar is project → delegation.** D2 rejected list,
    D3.
 
 ## Open questions for the owner
