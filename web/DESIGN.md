@@ -195,20 +195,36 @@ so the required `client` CI check runs it on every change. One test per rule:
    [Toolbars](https://developer.apple.com/design/human-interface-guidelines/toolbars);
    [Dark Mode](https://developer.apple.com/design/human-interface-guidelines/dark-mode).)
 
+The keyboard and structure checks that drive the page (Tab, arrows, ⌘K and
+Esc, toolbar parity) run in every mode too. Nothing passes by running less:
+a coverage test fails unless every page ran in every mode, as the page's own
+media queries report it, and each walk covered the page's minimum of
+elements and controls. Closing the browser is bounded too: a cleanup that
+times out fails the run, and the browser's processes are killed and reaped
+either way.
+
 Every check, and each part of rules 4, 8 and 9, has a seeded violation in
-the test's `SEEDS` (18 in all, one of them below the fold). A test runs
-each check on its page with and without its seed and fails unless the seed
-adds a finding. `CONFORMANCE_SEED=<seed> bun test ./e2e/conformance.test.ts`
-injects one seed for the whole run instead, and its rule's test fails.
+the test's `SEEDS` (20 in all: one below the fold, one only in dark mode,
+one hiding the page). A test runs each check on its page with and without
+its seed and fails unless the seed adds a finding.
+`CONFORMANCE_SEED=<seed> bun test ./e2e/conformance.test.ts` injects one
+seed for the whole run instead, and its rule's test fails. The suite's own
+seeds (`SUITE_SEEDS`: a broad or unbaselined allow-list entry, a dropped
+mode, a cleanup that never settles) fail the run the same way.
 
 Known violations live in one list, `e2e/conformance-allow.ts`. Each entry
-names one rule, one element selector (no `*` and no selector list), the
-pages and the filed issue that removes it. The test fails on an entry that
-no longer matches anything, and on an entry, or a page of one, that
-`origin/dev`'s copy does not have, so the list only shrinks; CI fetches
-`dev` for that comparison. Today it holds the legacy stylesheets' body
-size, count badge, rem spacing and touching sidebar and tab-bar rows
-(#2913), and the sidebar's third level.
+names one rule, one simple selector, the pages and the filed issue that
+removes it. A selector is a tag, classes, ids or an exact test id, with at
+most two more such compounds down a descendant chain: no `*`, no selector
+list, no pseudo-class such as `:is`, `:not` or `:where`, no other attribute
+match, and no chain rooted at `html`, `body` or `#root` (`body` alone names
+the body element). The test fails on an entry that no longer matches
+anything, and on an entry, or a page of one, that is not in the bootstrap
+baseline (`e2e/conformance-allow-baseline.ts`, the list as first merged) or,
+once `dev` has the list, in `origin/dev`'s copy, so the list only shrinks;
+CI fetches `dev` for that comparison. Today it holds the legacy
+stylesheets' body size, count badge, rem spacing and touching sidebar and
+tab-bar rows (#2913), and the sidebar's third level (#2930).
 
 ## Layout
 

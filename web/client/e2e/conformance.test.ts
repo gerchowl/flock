@@ -12,6 +12,14 @@
  * without the seed and fails unless the seed adds a finding.
  * `CONFORMANCE_SEED=<seed> bun test ./e2e/conformance.test.ts` injects that
  * seed into its page for the whole run instead, so the rule's own test fails.
+ * `SUITE_SEEDS` break the suite itself (a broad or unbaselined allow-list
+ * entry, a dropped mode, a cleanup that never settles), and each fails the run.
+ *
+ * Nothing passes by running less: the coverage test fails unless every page
+ * ran in every required mode, as the page's own media queries report it, and
+ * each walk covered the page's minimum of elements and controls. The driven
+ * keyboard and structure checks run in every mode too. A cleanup that times
+ * out fails, and the browser is killed and reaped either way.
  *
  * Needs Playwright's Chromium: `just client-browsers`. Runs in
  * `just client-check` (`bun test ./e2e`).
@@ -23,7 +31,8 @@ import { pathToFileURL } from "node:url";
 import { chromium, type Browser, type CDPSession, type Page } from "playwright";
 
 import { CLIENT_ROOT, buildClient } from "../tests/build";
-import { ALLOWED, type PageName } from "./conformance-allow";
+import { ALLOWED as LISTED, type Allowance, type PageName } from "./conformance-allow";
+import { BASELINE } from "./conformance-allow-baseline";
 import { installChecks, type CheckOptions, type Finding, type Rule } from "./conformance-checks";
 
 const FIXTURE = `${CLIENT_ROOT}/artifacts/conformance-fixture`;
@@ -35,6 +44,7 @@ const LIMIT = 60_000;
 const AXE_LIMIT = 3_000;
 const SEED_LIMIT = 10_000;
 const PROBE_LIMIT = 10_000;
+const CLOSE_LIMIT = 5_000;
 
 type PageSpec = CheckOptions & { readonly url: () => string; readonly viewport: { width: number; height: number }; readonly palette: boolean };
 
@@ -53,12 +63,35 @@ const MODES = {
 } as const;
 type ModeName = keyof typeof MODES;
 
+/**
+ * The page × mode matrix that must have run, stated apart from `PAGES` and
+ * `MODES` and compared against the media each page itself reports, so a
+ * dropped page or mode fails instead of shrinking the run.
+ */
+const REQUIRED_PAGES: readonly PageName[] = ["gallery", "workbench", "workbench-phone", "workbench-forced-phone"];
+const REQUIRED_MEDIA: readonly string[] = ["light/no-preference/reduce", "dark/no-preference/reduce", "light/more/reduce", "dark/more/reduce"];
+
+/**
+ * The fewest rendered elements and controls a page's walk may cover in any
+ * mode: about nine tenths of what each renders today (43 and 14, 330 and
+ * 68, 41 and 10), so hiding part of a page fails. Raise them as pages grow.
+ */
+const MIN_COVERAGE: Readonly<Record<PageName, { elements: number; controls: number }>> = {
+  gallery: { elements: 39, controls: 12 },
+  workbench: { elements: 300, controls: 60 },
+  "workbench-phone": { elements: 37, controls: 9 },
+  "workbench-forced-phone": { elements: 37, controls: 9 },
+};
+
 /** The keyboard and structure checks that drive the page from the test, beside the in-page rules. */
-type Driven = "tab-reach" | "focus-ring" | "arrows" | "shortcut" | "parity";
+type Driven = "tab-reach" | "focus-ring" | "arrows" | "shortcut" | "parity" | "coverage";
 type Check = Rule | Driven;
 
-/** A violation `check` must catch: markup appended to `into` on `page`, and a script run there. */
-type Seed = { readonly check: Check; readonly page: PageName; readonly into: string; readonly html: string; readonly script?: string };
+/**
+ * A violation `check` must catch: markup appended to `into` on `page`, and a
+ * script run there, in `mode` (light when not given).
+ */
+type Seed = { readonly check: Check; readonly page: PageName; readonly into: string; readonly html: string; readonly script?: string; readonly mode?: ModeName };
 
 const SEEDS: Readonly<Record<string, Seed>> = {
   palette: { check: "palette", page: "gallery", into: "main", html: '<div data-testid="seed" style="color: rgb(1, 2, 3)">Off-palette text</div>' },
@@ -111,10 +144,61 @@ const SEEDS: Readonly<Record<string, Seed>> = {
   },
   appearance: { check: "structure", page: "gallery", into: "main", html: '<button data-testid="seed" class="g-button">Dark mode</button>' },
   parity: { check: "parity", page: "workbench", into: "header.topbar", html: '<button data-testid="seed" type="button" class="action">Archive</button>' },
+  "focus-ring-dark": {
+    check: "focus-ring",
+    page: "gallery",
+    mode: "dark",
+    into: "main",
+    html: '<style data-testid="seed">@media (prefers-color-scheme: dark) { :focus { outline: none !important; box-shadow: none !important; } }</style>',
+  },
+  "coverage-hidden": {
+    check: "coverage",
+    page: "gallery",
+    into: "body",
+    html: "",
+    script: 'for (const child of document.body.children) child.style.display = "none"',
+  },
 };
 
+/**
+ * Violations of the suite itself rather than of a page, proven only through
+ * `CONFORMANCE_SEED`: each makes the run fail.
+ */
+const SUITE_SEEDS = {
+  // A grid entry whose selector exempts every element of its pages.
+  "allow-broad": "the selector guard refuses it",
+  // An entry gains a page while origin/dev has no allow-list to compare against.
+  "allow-unbaselined": "the shrink guard compares against the bootstrap baseline",
+  // Dark mode emulates light, so the dark half of the matrix never runs.
+  "mode-dropped": "the coverage test misses the dark media",
+  // Closing the browser never settles.
+  "teardown-stall": "the cleanup fails and the browser is killed and reaped",
+} as const;
+
 const SEEDED = process.env.CONFORMANCE_SEED;
-if (SEEDED !== undefined && !(SEEDED in SEEDS)) throw new Error(`CONFORMANCE_SEED=${SEEDED} names no seed`);
+if (SEEDED !== undefined && !(SEEDED in SEEDS) && !(SEEDED in SUITE_SEEDS)) throw new Error(`CONFORMANCE_SEED=${SEEDED} names no seed`);
+
+/** The allow-list this run applies: `conformance-allow.ts`, unless a suite seed alters it. */
+const ALLOWED: readonly Allowance[] = LISTED.map((entry, index) => {
+  if (SEEDED === "allow-broad" && index === LISTED.findIndex((each) => each.rule === "grid")) return { ...entry, selector: ":is(body) :not(nonexistent-review-tag)" };
+  if (SEEDED === "allow-unbaselined" && index === 0) return { ...entry, pages: [...entry.pages, "gallery"] };
+  return entry;
+});
+
+// One compound (a tag, classes, ids or an exact test id) and at most two more down a descendant chain.
+const COMPOUND = String.raw`(?:[a-z][a-z0-9-]*)?(?:\.[A-Za-z_][\w-]*|#[A-Za-z_][\w-]*|\[data-testid="[\w-]+"\])*`;
+const SIMPLE = new RegExp(`^${COMPOUND}(?:(?: > | )${COMPOUND}){0,2}$`);
+
+/** Why an allow-list selector is refused, or null when it names specific elements. */
+function refusal(selector: string): string | null {
+  if (!SIMPLE.test(selector)) return "not one simple compound and a short descendant chain";
+  const parts = selector.split(/ > | /);
+  if (parts.some((part) => part === "")) return "an empty compound";
+  // `body` alone names the one body element (the body text size); as a root it would name every element.
+  if (parts.some((part) => /^(html|:root)\b|#root\b/.test(part))) return "rooted at html or #root";
+  if (parts.some((part) => /^body\b/.test(part)) && selector !== "body") return "rooted at body";
+  return null;
+}
 
 let browser: Browser | undefined;
 const usedAllowances = new Set<number>();
@@ -239,7 +323,7 @@ async function open(name: PageName, mode: ModeName): Promise<Page> {
   const page = tab!;
   at(`opening ${name}/${mode}: viewport and media`);
   await page.setViewportSize(spec.viewport);
-  await page.emulateMedia({ ...MODES[mode], reducedMotion: "reduce" });
+  await page.emulateMedia({ ...MODES[SEEDED === "mode-dropped" && mode === "dark" ? "light" : mode], reducedMotion: "reduce" });
   at(`opening ${name}/${mode}: navigating`);
   await page.goto(spec.url());
   at(`opening ${name}/${mode}: waiting for the page`);
@@ -247,7 +331,8 @@ async function open(name: PageName, mode: ModeName): Promise<Page> {
   const ready = name === "gallery" ? "main" : name === "workbench" ? "[data-testid=transcript-synced]" : "[data-testid=phone]";
   await page.locator(ready).first().waitFor({ timeout: 10_000 });
   at(`opening ${name}/${mode}: installing the checks`);
-  if (SEEDED !== undefined && SEEDS[SEEDED]!.page === name) await inject(page, SEEDS[SEEDED]!);
+  const seed = SEEDED === undefined ? undefined : SEEDS[SEEDED];
+  if (seed !== undefined && seed.page === name) await inject(page, seed);
   await page.evaluate(() => (globalThis as unknown as { __installHig: () => void }).__installHig());
   return page;
 }
@@ -268,6 +353,22 @@ const RULES: readonly Rule[] = ["palette", "typography", "contrast", "hit-size",
 /** Each rule's findings on every page in every mode, as `line` -> where it was seen. */
 const survey = new Map<Rule, Map<string, Set<string>>>(RULES.map((rule) => [rule, new Map()]));
 
+type Coverage = { elements: number; controls: number; scheme: string; contrast: string; reduced: boolean };
+
+/** What each page's walk covered in each mode, and the media the page reported. */
+const walked: { name: PageName; mode: ModeName; coverage: Coverage }[] = [];
+
+const mediaOf = (seen: Coverage): string => `${seen.scheme}/${seen.contrast}/${seen.reduced ? "reduce" : "no-preference"}`;
+
+/** Where a walk of `name` covered fewer elements or controls than the page has. */
+function shortfall(name: PageName, seen: Coverage): string[] {
+  const min = MIN_COVERAGE[name];
+  const out: string[] = [];
+  if (seen.elements < min.elements) out.push(`walked ${seen.elements} elements, under ${min.elements}`);
+  if (seen.controls < min.controls) out.push(`walked ${seen.controls} controls, under ${min.controls}`);
+  return out;
+}
+
 /**
  * Opens each page in each mode in turn and runs every rule's check (and
  * axe-core, under contrast) on it.
@@ -276,6 +377,9 @@ async function surveyAll(): Promise<void> {
   for (const name of Object.keys(PAGES) as PageName[]) {
     for (const mode of Object.keys(MODES) as ModeName[]) {
       const page = await open(name, mode);
+      const coverage = await hig<Coverage>(page, "coverage");
+      walked.push({ name, mode, coverage });
+      console.error(`conformance: ${name}/${mode} (${mediaOf(coverage)}) walks ${coverage.elements} elements, ${coverage.controls} controls`);
       const add = (rule: Rule, line: string): void => {
         const lines = survey.get(rule)!;
         lines.set(line, (lines.get(line) ?? new Set()).add(`${name}/${mode}`));
@@ -413,13 +517,15 @@ const DRIVEN: Readonly<Record<Driven, (page: Page, name: PageName) => Promise<st
     for (const action of actions) if (!commands.some((command) => command.startsWith(action))) out.push(`toolbar action "${action}" has no ⌘K command`);
     return out;
   },
+  // The walk covers the page: it renders at least its minimum of elements and controls.
+  coverage: async (page, name) => shortfall(name, await hig<Coverage>(page, "coverage")),
 };
 
-/** `check` on a fresh document at `name` in light mode, with `seed` injected if given. */
-async function probe(check: Check, name: PageName, seed?: Seed): Promise<string[]> {
-  const page = await open(name, "light");
+/** `check` on a fresh document at `name` in `mode`, with `seed` injected if given. */
+async function probe(check: Check, name: PageName, mode: ModeName, seed?: Seed): Promise<string[]> {
+  const page = await open(name, mode);
   if (seed !== undefined) await inject(page, seed);
-  at(`${check} on ${name}${seed === undefined ? "" : " (seeded)"}`);
+  at(`${check} on ${name}/${mode}${seed === undefined ? "" : " (seeded)"}`);
   if (check in DRIVEN) return DRIVEN[check as Driven](page, name);
   return (await check_(page, name, check as Rule)).map((finding) => `${finding.where}: ${finding.detail}`);
 }
@@ -431,11 +537,59 @@ beforeAll(async () => {
   await surveyAll();
 }, LIMIT * 2);
 
+/**
+ * Kills every process this test process started that is still alive (the
+ * browser and its helpers) and waits until each is gone, reaped by its
+ * parent. Returns what it had to kill; throws if a process outlives it.
+ */
+async function reap(): Promise<string[]> {
+  const tree = (): { pid: number; ppid: number; state: string; args: string }[] =>
+    Bun.spawnSync(["ps", "-A", "-o", "pid=,ppid=,stat=,args="], { stdout: "pipe" })
+      .stdout.toString()
+      .split("\n")
+      .map((row) => row.trim().match(/^(\d+)\s+(\d+)\s+(\S+)\s+(.*)$/))
+      .flatMap((cols) => (cols === null ? [] : [{ pid: Number(cols[1]), ppid: Number(cols[2]), state: cols[3]!, args: cols[4]! }]));
+  // The browsers this process launched, and everything under them.
+  const ours = (): { pid: number; state: string; args: string }[] => {
+    const rows = tree();
+    const mine = new Set(rows.filter((row) => row.ppid === process.pid && /chrom|headless_shell/i.test(row.args)).map((row) => row.pid));
+    // Parents precede children only by chance, so repeat until the set stops growing.
+    for (let size = 0; size !== mine.size; ) {
+      size = mine.size;
+      for (const row of rows) if (mine.has(row.ppid)) mine.add(row.pid);
+    }
+    return rows.filter((row) => mine.has(row.pid));
+  };
+  const found = ours();
+  for (const row of found) {
+    try {
+      process.kill(row.pid, "SIGKILL");
+    } catch {
+      // It exited between the listing and the kill.
+    }
+  }
+  // Gone means reaped: a zombie still has its row until its parent collects it.
+  const pids = new Set(found.map((row) => row.pid));
+  const alive = (): { pid: number; state: string }[] => tree().filter((row) => pids.has(row.pid));
+  for (const started = performance.now(); alive().length > 0; ) {
+    if (performance.now() - started > CLOSE_LIMIT) throw new Error(`processes outlived the run: ${alive().map((row) => `${row.pid} (${row.state})`).join(", ")}`);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  return found.map((row) => `${row.pid} ${row.args.slice(0, 60)}`);
+}
+
 afterAll(async () => {
   const last = browser;
   browser = undefined;
-  await bounded(AXE_LIMIT, async () => last?.close());
-});
+  at("closing the browser");
+  // A cleanup that never settles fails the run, and nothing the run started outlives it.
+  const closing = SEEDED === "teardown-stall" ? new Promise<void>(() => undefined) : last?.close();
+  const outcome = await bounded(CLOSE_LIMIT, async () => closing);
+  const killed = await reap();
+  if (outcome === STALLED) throw new Error(`closing the browser stalled after ${CLOSE_LIMIT} ms; killed and reaped ${killed.length} processes: ${killed.join("; ")}`);
+  if (killed.length > 0) console.error(`conformance: killed ${killed.length} processes left after the browser closed: ${killed.join("; ")}`);
+  // Room for the close, the stall diagnosis and the reaping, so the hook's own timeout never preempts them.
+}, LIMIT);
 
 describe("design conformance", () => {
   test("1. palette: every colour is a token of the active mode", async () => {
@@ -466,18 +620,20 @@ describe("design conformance", () => {
     expect(everywhere("motion")).toEqual([]);
   }, LIMIT);
 
-  /** `checks` on every page, each on a fresh light-mode document, labelled with the page. */
+  /** `checks` on every page in every mode, each on a fresh document, labelled with the page and mode. */
   // Each bounded: a stall, a crash or an error is a finding naming the check, page and stage.
   const driven = async (checks: readonly Driven[]): Promise<string[]> => {
     const out: string[] = [];
     for (const name of Object.keys(PAGES) as PageName[]) {
-      for (const each of checks) {
-        const started = performance.now();
-        const outcome = await bounded(PROBE_LIMIT, () => probe(each, name)).catch((error: Error) => new Error(`${error.message} (during ${stage})`));
-        console.error(`conformance: ${each} on ${name} took ${Math.round(performance.now() - started)} ms`);
-        if (outcome === STALLED) out.push(`${each} ${name}/light: stalled after ${PROBE_LIMIT} ms during ${stage}`);
-        else if (outcome instanceof Error) out.push(`${each} ${name}/light: ${outcome.message}`);
-        else for (const line of outcome) out.push(`${each} ${name}/light: ${line}`);
+      for (const mode of Object.keys(MODES) as ModeName[]) {
+        for (const each of checks) {
+          const started = performance.now();
+          const outcome = await bounded(PROBE_LIMIT, () => probe(each, name, mode)).catch((error: Error) => new Error(`${error.message} (during ${stage})`));
+          console.error(`conformance: ${each} on ${name}/${mode} took ${Math.round(performance.now() - started)} ms`);
+          if (outcome === STALLED) out.push(`${each} ${name}/${mode}: stalled after ${PROBE_LIMIT} ms during ${stage}`);
+          else if (outcome instanceof Error) out.push(`${each} ${name}/${mode}: ${outcome.message}`);
+          else for (const line of outcome) out.push(`${each} ${name}/${mode}: ${line}`);
+        }
       }
     }
     return out;
@@ -485,19 +641,27 @@ describe("design conformance", () => {
 
   test("8. keyboard: Tab reaches every control with a ring, controls are named, arrows and ⌘K work", async () => {
     expect([...everywhere("keyboard"), ...(await driven(["tab-reach", "focus-ring", "arrows", "shortcut"]))]).toEqual([]);
-  }, LIMIT);
+  }, LIMIT * 4);
 
   test("9. structure: a sidebar two levels deep, toolbar actions in ⌘K, no appearance switch", async () => {
     expect([...everywhere("structure"), ...(await driven(["parity"]))]).toEqual([]);
-  }, LIMIT);
+  }, LIMIT * 2);
+
+  test("coverage: every page ran in every mode, and each walk covered its page", () => {
+    const ran = new Set(walked.map((each) => `${each.name} ${mediaOf(each.coverage)}`));
+    const missing = REQUIRED_PAGES.flatMap((name) => REQUIRED_MEDIA.filter((media) => !ran.has(`${name} ${media}`)).map((media) => `${name} ${media}: never ran`));
+    const thin = walked.flatMap((each) => shortfall(each.name, each.coverage).map((line) => `${each.name}/${each.mode}: ${line}`));
+    expect([...missing, ...thin]).toEqual([]);
+  });
 
   test("every check catches its seeded violation", async () => {
     const missed: string[] = [];
     for (const [label, seed] of Object.entries(SEEDS)) {
+      const mode = seed.mode ?? "light";
       // Bounded: a wedged page fails this seed and discards the tab instead of hanging the suite.
       const outcome = await bounded(SEED_LIMIT, async () => {
-        const clean = new Set(await probe(seed.check, seed.page));
-        return (await probe(seed.check, seed.page, seed)).filter((line) => !clean.has(line));
+        const clean = new Set(await probe(seed.check, seed.page, mode));
+        return (await probe(seed.check, seed.page, mode, seed)).filter((line) => !clean.has(line));
       }).catch((error: Error) => new Error(`${error.message} (during ${stage})`));
       console.error(`conformance: seed ${label} done`);
       if (outcome === STALLED) missed.push(`${label}: stalled after ${SEED_LIMIT} ms during ${stage}`);
@@ -507,29 +671,39 @@ describe("design conformance", () => {
     expect(missed).toEqual([]);
   }, LIMIT * 2);
 
-  test("the allow-list names one element selector per entry", () => {
-    expect(ALLOWED.filter((entry) => /[*,]/.test(entry.selector) || /^(html|:root|#root)$/.test(entry.selector.trim())).map((entry) => entry.selector)).toEqual([]);
+  test("the allow-list names specific elements: one simple selector per entry", () => {
+    expect(ALLOWED.flatMap((entry) => (refusal(entry.selector) === null ? [] : [`${entry.rule} ${entry.selector}: ${refusal(entry.selector)}`]))).toEqual([]);
   });
 
-  test("the allow-list only shrinks: nothing beyond origin/dev's copy, and every entry still matches", async () => {
+  test("the selector guard refuses broad selectors", () => {
+    const broad = [":is(body) :not(nonexistent-review-tag)", "*", "div *", ".a, .b", ':where(.a)', ".a:not(.b)", "[class]", '[class*="a"]', '[data-testid^="a"]', "body .a", "body > .a", "html", ":root", "#root", "#root .a", ".a .b .c .d"];
+    expect(broad.filter((selector) => refusal(selector) === null)).toEqual([]);
+    expect(["body", ".a", '[data-testid="a"] > .b', "header .a .b", "li.a#b"].filter((selector) => refusal(selector) !== null)).toEqual([]);
+  });
+
+  test("the allow-list only shrinks: nothing beyond origin/dev's copy or the bootstrap baseline, and every entry still matches", async () => {
+    const key = (entry: { rule: string; selector: string }): string => `${entry.rule} ${entry.selector}`;
+    const grownFrom = (before: readonly { rule: string; selector: string; pages: readonly string[] }[]): string[] =>
+      ALLOWED.filter((entry) => {
+        const old = before.find((each) => key(each) === key(entry));
+        return old === undefined || entry.pages.some((page) => !old.pages.includes(page));
+      }).map((entry) => `${key(entry)} [${entry.pages.join(", ")}]`);
+    // The checked-in baseline always applies, so the guard compares even before dev has an allow-list.
+    expect(grownFrom(BASELINE).map((line) => `beyond the bootstrap baseline: ${line}`)).toEqual([]);
     // The base is origin/dev; CONFORMANCE_ALLOW_BASE names another commit to prove the guard against.
     const ref = process.env.CONFORMANCE_ALLOW_BASE ?? "origin/dev";
     const base = Bun.spawnSync(["git", "show", `${ref}:web/client/e2e/conformance-allow.ts`], { cwd: CLIENT_ROOT });
     const stderr = base.stderr.toString();
-    if (base.exitCode !== 0 && !/exists on disk, but not in|does not exist in/.test(stderr)) {
-      // CI fetches origin/dev for this; a local checkout without it skips the comparison only.
-      if (process.env.CI) throw new Error(`cannot read ${ref}'s allow-list: ${stderr.trim()}`);
-      console.warn(`conformance: no ${ref} ref, the allow-list is not compared`);
-    } else if (base.exitCode === 0) {
+    if (base.exitCode === 0) {
       const path = `${CLIENT_ROOT}/artifacts/conformance-allow-dev.ts`;
       await Bun.write(path, base.stdout);
       const { ALLOWED: before } = (await import(path)) as { ALLOWED: typeof ALLOWED };
-      const grown = ALLOWED.filter((entry) => {
-        const old = before.find((each) => each.rule === entry.rule && each.selector === entry.selector);
-        return old === undefined || entry.pages.some((page) => !old.pages.includes(page));
-      });
-      expect(grown.map((entry) => `${entry.rule} ${entry.selector} [${entry.pages.join(", ")}]`)).toEqual([]);
+      expect(grownFrom(before).map((line) => `beyond ${ref}: ${line}`)).toEqual([]);
+    } else if (!/exists on disk, but not in|does not exist in/.test(stderr)) {
+      // CI fetches origin/dev for this; a local checkout without it compares with the baseline only.
+      if (process.env.CI) throw new Error(`cannot read ${ref}'s allow-list: ${stderr.trim()}`);
+      console.warn(`conformance: no ${ref} ref, the allow-list is compared with the bootstrap baseline only`);
     }
-    if (SEEDED === undefined) expect(ALLOWED.filter((_, index) => !usedAllowances.has(index)).map((entry) => `${entry.rule} ${entry.selector}`)).toEqual([]);
+    if (SEEDED === undefined) expect(ALLOWED.filter((_, index) => !usedAllowances.has(index)).map(key)).toEqual([]);
   });
 });

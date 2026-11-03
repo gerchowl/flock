@@ -340,6 +340,14 @@ export function installChecks(): void {
             where: where(bar),
             actions: [...bar.querySelectorAll("button")].filter((el) => shown(el) && !el.matches('[data-testid="palette-trigger"]')).map(name),
           })),
+      // What a walk covers, and the media the page itself sees, so a hidden page or a dropped mode shows.
+      coverage: () => ({
+        elements: elements().length,
+        controls: interactive().length,
+        scheme: matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light",
+        contrast: matchMedia("(prefers-contrast: more)").matches ? "more" : "no-preference",
+        reduced: matchMedia("(prefers-reduced-motion: reduce)").matches,
+      }),
       commands: () => [...document.querySelectorAll('[role="dialog"] [role="option"]')].map((el) => el.textContent ?? ""),
       dialogOpen: () => [...document.querySelectorAll('[role="dialog"]')].some(shown) && document.activeElement?.closest('[role="dialog"]') !== null,
     },

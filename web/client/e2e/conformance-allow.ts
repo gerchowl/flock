@@ -2,10 +2,14 @@
  * The design-conformance suite's one allow-list (#2896): known violations,
  * each with the rule, the elements it covers (`selector`, matched against
  * the element itself), the pages it applies to and the issue that removes
- * it. One entry names one selector for one rule: `e2e/conformance.test.ts`
- * refuses wildcards and selector lists, fails on an entry that no longer
- * matches anything, and fails on an entry (or a page of one) that
- * `origin/dev`'s copy of this file does not have, so the list only shrinks.
+ * it. One entry names one simple selector for one rule: a tag, classes, ids
+ * or an exact test id, and at most two more such compounds down a
+ * descendant chain. `e2e/conformance.test.ts` refuses anything broader
+ * (wildcards, selector lists, pseudo-classes, other attribute matches, and
+ * chains rooted at html, body or #root), fails on an entry that no longer
+ * matches anything, and fails on an entry (or a page of one) that the
+ * bootstrap baseline (`e2e/conformance-allow-baseline.ts`) or `origin/dev`'s
+ * copy of this file does not have, so the list only shrinks.
  */
 import type { Rule } from "./conformance-checks";
 
