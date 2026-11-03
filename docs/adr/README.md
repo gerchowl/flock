@@ -58,6 +58,7 @@ can be exempted in `guardrails-adr-exempt.txt`.
 | [0046](0046-slatedb-not-now.md) | Do not adopt SlateDB now: per-store verdicts and revisit triggers | Accepted |
 | [0047](0047-tailnet-origin-for-the-gui-client-listener.md) | The GUI client listener may admit one opt-in tailnet origin behind a verified `tailscale serve` HTTPS proxy, with a required identity allow-list, audience-bound one-time codes and a separately revocable bearer; VM-guest fronting is unsupported | Accepted |
 | [0048](0048-gui-object-model-and-work-first-home.md) | The GUI is mission control for delegated work: six server-projected objects (Project, Work, Agent, Question, Artifact, Run), a work-first home, one ranked attention queue, claim versus verified, the composer as the input queue, and a subject-anchored workbench | Accepted |
+| [0049](0049-agent-types-workflows-and-one-authority-model.md) | Agent types and workflows are versioned declarative definitions adopted by hash, run by a closed executable vocabulary with durable, reconciled effects; permission decisions are operator authority, delegated to architects only by scoped, revocable, audited grants | Accepted |
 
 ADR-0026 supersedes the affected transport, reply, deferral and deduplication
 contracts in ADR-0006, ADR-0008, ADR-0009, ADR-0018 and ADR-0019. Their other
