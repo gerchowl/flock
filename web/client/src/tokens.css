@@ -32,19 +32,21 @@
   --color-label-primary: #1d1d1f;
   --color-label-secondary: #636366;
   --color-label-tertiary: #8e8e93;
+  --color-label-on-selection: #ffffff;
+  --color-label-on-selection-secondary: rgba(255, 255, 255, 0.93);
   --color-separator: rgba(0, 0, 0, 0.1);
   --color-background-window: #ffffff;
   --color-background-sidebar: #f5f5f7;
   --color-accent-fill: #0a6cdc;
   --color-accent-on: #ffffff;
-  --color-link: #0a6cdc;
+  --color-link: #0262cd;
   --color-selection-active: #0a6cdc;
   --color-selection-inactive: #e3e3e8;
   --color-focus-ring: #0a6cdc;
-  --color-destructive: #d70015;
-  --color-status-green: #1a7f37;
-  --color-status-orange: #b25000;
-  --color-status-red: #d70015;
+  --color-destructive: #ce0014;
+  --color-status-green: #09762f;
+  --color-status-orange: #a64a01;
+  --color-status-red: #ce0014;
   --color-legacy-bg: #fbfbfa;
   --color-legacy-fg: #1d1d1f;
   --color-legacy-muted: #5f6368;
@@ -66,19 +68,21 @@
     --color-label-primary: #f5f5f7;
     --color-label-secondary: #aeaeb2;
     --color-label-tertiary: #6e6e73;
+    --color-label-on-selection: #ffffff;
+    --color-label-on-selection-secondary: rgba(255, 255, 255, 0.93);
     --color-separator: rgba(255, 255, 255, 0.1);
     --color-background-window: #1e1e1e;
     --color-background-sidebar: #2a2a2c;
     --color-accent-fill: #0a6cdc;
     --color-accent-on: #ffffff;
-    --color-link: #4da3ff;
+    --color-link: #55a7ff;
     --color-selection-active: #0a6cdc;
     --color-selection-inactive: #3a3a3c;
     --color-focus-ring: #4da3ff;
-    --color-destructive: #ff453a;
+    --color-destructive: #fe7d6e;
     --color-status-green: #32d74b;
     --color-status-orange: #ff9f0a;
-    --color-status-red: #ff453a;
+    --color-status-red: #fe7d6e;
     --color-legacy-bg: #161618;
     --color-legacy-fg: #ececec;
     --color-legacy-muted: #a0a0a5;
@@ -125,10 +129,10 @@
     --color-selection-active: #0050b5;
     --color-selection-inactive: #48484a;
     --color-focus-ring: #7cbcff;
-    --color-destructive: #ff6961;
+    --color-destructive: #ff9c92;
     --color-status-green: #5de07a;
     --color-status-orange: #ffb340;
-    --color-status-red: #ff6961;
+    --color-status-red: #ff9c92;
   }
 }
 
