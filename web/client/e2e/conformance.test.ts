@@ -141,6 +141,9 @@ async function launch(): Promise<void> {
   browser = await chromium.launch();
   browser.on("disconnected", () => (broken ??= `the browser disconnected during ${stage}`));
   tab = await browser.newPage();
+  // axe-core and the checks reach the browser once, as init scripts every document runs, instead
+  // of half a megabyte through the pipe per document (the #2931 stalls followed that traffic).
+  await tab.addInitScript({ content: `${axeSource}\n;globalThis.__installHig = ${installChecks.toString()};` });
   tab.on("crash", () => (broken ??= `the page crashed during ${stage}`));
   tab.on("close", () => (broken ??= `the tab closed during ${stage}`));
 }
@@ -150,15 +153,18 @@ async function open(name: PageName, mode: ModeName): Promise<Page> {
   const spec = PAGES[name];
   if (broken !== null) throw new Error(`the tab is unusable: ${broken}`);
   const page = tab!;
-  at(`opening ${name}/${mode}`);
+  at(`opening ${name}/${mode}: viewport and media`);
   await page.setViewportSize(spec.viewport);
   await page.emulateMedia({ ...MODES[mode], reducedMotion: "reduce" });
+  at(`opening ${name}/${mode}: navigating`);
   await page.goto(spec.url());
+  at(`opening ${name}/${mode}: waiting for the page`);
   // The desktop workbench replays its transcript first: check it once the replay has settled.
   const ready = name === "gallery" ? "main" : name === "workbench" ? "[data-testid=transcript-synced]" : "[data-testid=phone]";
   await page.locator(ready).first().waitFor({ timeout: 10_000 });
+  at(`opening ${name}/${mode}: installing the checks`);
   if (SEEDED !== undefined && SEEDS[SEEDED]!.page === name) await inject(page, SEEDS[SEEDED]!);
-  await page.evaluate(installChecks);
+  await page.evaluate(() => (globalThis as unknown as { __installHig: () => void }).__installHig());
   return page;
 }
 
@@ -234,7 +240,6 @@ async function bounded<T>(ms: number, work: () => Promise<T>): Promise<T | typeo
 async function axe(page: Page, name: PageName, mode: ModeName): Promise<string[]> {
   at(`axe on ${name}/${mode}`);
   const outcome = await bounded(AXE_LIMIT, async () => {
-    await page.evaluate(axeSource);
     return page.evaluate(async () => {
       const { axe } = globalThis as unknown as { axe: { run: (o: object) => Promise<{ violations: { id: string; nodes: { target: string[] }[] }[] }> } };
       const result = await axe.run({ runOnly: { type: "tag", values: ["wcag2a", "wcag2aa", "wcag21a", "wcag21aa", "wcag22aa"] } });
@@ -330,8 +335,8 @@ async function probe(check: Check, name: PageName, seed?: Seed): Promise<string[
 
 beforeAll(async () => {
   await Promise.all([buildClient("fixture", FIXTURE), buildClient("gallery", GALLERY)]);
-  await launch();
   axeSource = await Bun.file(AXE).text();
+  await launch();
   await surveyAll();
 }, LIMIT * 2);
 
