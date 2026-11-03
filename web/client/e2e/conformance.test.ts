@@ -31,6 +31,7 @@ const DESKTOP = { width: 1280, height: 800 } as const;
 const PHONE = { width: 390, height: 844 } as const;
 const LIMIT = 60_000;
 const AXE_LIMIT = 3_000;
+const SEED_LIMIT = 5_000;
 
 type PageSpec = CheckOptions & { readonly url: () => string; readonly viewport: { width: number; height: number }; readonly palette: boolean };
 
@@ -266,11 +267,30 @@ describe("design conformance", () => {
   test("each rule catches its seeded violation", async () => {
     const missed: string[] = [];
     for (const [rule, seed] of Object.entries(SEEDS) as [Rule, Seed][]) {
-      const page = await open(seed.page, "light");
-      await inject(page, seed);
-      const findings = await check(page, seed.page, rule);
-      if (!findings.some((finding) => finding.where.includes('[data-testid="seed"]'))) missed.push(rule);
-      await page.close();
+      // Each seed is bounded and names the stage it stalled at, so one wedged page fails the test instead of hanging it.
+      let stage = "open";
+      const started = performance.now();
+      const caught = async (): Promise<boolean> => {
+        const page = await open(seed.page, "light");
+        try {
+          stage = "inject";
+          await inject(page, seed);
+          stage = "check";
+          const findings = await check(page, seed.page, rule);
+          return findings.some((finding) => finding.where.includes('[data-testid="seed"]'));
+        } finally {
+          stage = "close";
+          await page.close();
+        }
+      };
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const stalled = new Promise<string>((resolve) => {
+        timer = setTimeout(() => resolve(`${rule}: stalled at ${stage} after ${SEED_LIMIT} ms`), SEED_LIMIT);
+      });
+      const outcome = await Promise.race([caught().then((ok) => (ok ? null : `${rule}: not caught`)), stalled]);
+      clearTimeout(timer);
+      console.error(`seed ${rule}: ${Math.round(performance.now() - started)} ms`);
+      if (outcome !== null) missed.push(outcome);
     }
     expect(missed).toEqual([]);
   }, LIMIT);
