@@ -46,7 +46,7 @@ jobs:
           persist-credentials: false
 
       - name: Install Nix
-        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+        uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31.11.3
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
@@ -90,7 +90,7 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: Install Rust tools
-        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2
+        uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2
         with:
           tool: just,cargo-nextest@${{ steps.nextest-version.outputs.version }}
 
@@ -107,7 +107,7 @@ jobs:
       # dev entries, but save only one key per compiler/source generation.
       - name: Restore Zig build cache
         id: zig-cache
-        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ github.workspace }}/.zig-cache
           key: setup-zig-cache-v2-${{ github.job }}-zig-${{ runner.arch == 'X64' && 'x86_64' || 'aarch64' }}-${{ runner.os == 'Linux' && 'linux' || 'macos' }}-0.15.2--dev-${{ hashFiles('vendor/libghostty-vt/**', 'build.rs') }}
@@ -118,7 +118,7 @@ jobs:
         run: brew install cmake ninja
 
       - name: Restore cargo cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/dev' }}
           cache-bin: false
@@ -140,7 +140,7 @@ jobs:
 
       - name: Save Zig build cache from dev
         if: github.ref == 'refs/heads/dev' && steps.zig-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ github.workspace }}/.zig-cache
           key: ${{ steps.zig-cache.outputs.cache-primary-key }}
@@ -174,7 +174,7 @@ jobs:
       # Archived binaries still spawn dev-shell tools (including Bun for the
       # real client wire fixture). Use the same runtime on every platform.
       - name: Install Nix
-        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+        uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31.11.3
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
