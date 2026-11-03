@@ -75,10 +75,18 @@ async function inject(page: Page, seed: Seed): Promise<void> {
   await page.evaluate(({ into, html }) => document.querySelector(into)!.insertAdjacentHTML("beforeend", html), seed);
 }
 
-/** A fresh page at `name` in `mode`, with the checks installed (and the env seed, if any). */
+let tab: Page | undefined;
+
+/**
+ * A fresh document at `name` in `mode`, with the checks installed (and the
+ * env seed, if any). Every page is a navigation of one tab: on the Linux CI
+ * runner Chromium wedged after a few dozen pages were opened and closed.
+ */
 async function open(name: PageName, mode: ModeName): Promise<Page> {
   const spec = PAGES[name];
-  const page = await browser.newPage({ viewport: spec.viewport });
+  tab ??= await browser.newPage();
+  const page = tab;
+  await page.setViewportSize(spec.viewport);
   await page.emulateMedia({ ...MODES[mode], reducedMotion: "reduce" });
   await page.goto(spec.url());
   // The desktop workbench replays its transcript first: check it once the replay has settled.
@@ -106,8 +114,8 @@ const RULES: readonly Rule[] = ["palette", "typography", "contrast", "hit-size",
 const survey = new Map<Rule, Map<string, Set<string>>>(RULES.map((rule) => [rule, new Map()]));
 
 /**
- * Opens one page at a time, runs every rule's check (and axe-core, under
- * contrast) on it, and closes it: a CI runner wedged with sixteen live pages.
+ * Opens each page in each mode in turn and runs every rule's check (and
+ * axe-core, under contrast) on it.
  */
 async function surveyAll(): Promise<void> {
   for (const name of Object.keys(PAGES) as PageName[]) {
@@ -119,7 +127,6 @@ async function surveyAll(): Promise<void> {
       };
       for (const rule of RULES) for (const finding of await check(page, name, rule)) add(rule, `${finding.where}: ${finding.detail}`);
       for (const line of await axe(page, name, mode)) add("contrast", line);
-      await page.close();
     }
   }
 }
@@ -255,7 +262,6 @@ describe("design conformance", () => {
     for (const name of Object.keys(PAGES) as PageName[]) {
       const page = await open(name, "light");
       for (const line of [...(await tabWalk(page)), ...(await arrows(page)), ...(PAGES[name].palette ? await palette(page) : [])]) out.push(`${name}/light: ${line}`);
-      await page.close();
     }
     expect(out).toEqual([]);
   }, LIMIT);
@@ -272,16 +278,11 @@ describe("design conformance", () => {
       const started = performance.now();
       const caught = async (): Promise<boolean> => {
         const page = await open(seed.page, "light");
-        try {
-          stage = "inject";
-          await inject(page, seed);
-          stage = "check";
-          const findings = await check(page, seed.page, rule);
-          return findings.some((finding) => finding.where.includes('[data-testid="seed"]'));
-        } finally {
-          stage = "close";
-          await page.close();
-        }
+        stage = "inject";
+        await inject(page, seed);
+        stage = "check";
+        const findings = await check(page, seed.page, rule);
+        return findings.some((finding) => finding.where.includes('[data-testid="seed"]'));
       };
       let timer: ReturnType<typeof setTimeout> | undefined;
       const stalled = new Promise<string>((resolve) => {
