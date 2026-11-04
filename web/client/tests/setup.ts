@@ -9,13 +9,18 @@
  * conditions, and runtime plugins cannot redirect bare specifiers, so each
  * of Solid's non-browser builds loads its `browser` build's code instead,
  * as `bun test --conditions browser` would.
+ *
+ * It also creates `node_modules/.cache`, where tests make their scratch
+ * directories, so none of them depends on another having run first.
  */
 import { GlobalRegistrator } from "@happy-dom/global-registrator";
 import { transformAsync } from "@babel/core";
 import { plugin } from "bun";
+import { mkdir } from "node:fs/promises";
 import { resolve } from "node:path";
 
 GlobalRegistrator.register();
+await mkdir(`${import.meta.dir}/../node_modules/.cache`, { recursive: true });
 
 type ExportConditions = { readonly [condition: string]: { readonly import?: string } | string };
 

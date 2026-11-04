@@ -5,7 +5,7 @@
 import { afterEach, expect, test } from "bun:test";
 import { render } from "solid-js/web";
 
-import { Center, Cluster, Grid, Sidebar, Stack, Switcher } from "../src/layout/primitives";
+import { Anchor, AnchorPanel, Center, Cluster, Grid, Sidebar, Stack, Switcher } from "../src/layout/primitives";
 
 import { SPACE } from "../src/tokens";
 
@@ -60,6 +60,23 @@ test("Switcher, Center and Grid pass their measures", () => {
   expect(center.hasAttribute("data-intrinsic")).toBe(true);
   dispose?.();
   expect(prop(mount(() => <Grid min="12rem" />), "--l-min")).toBe("12rem");
+});
+
+test("Anchor holds a trigger and its panel; the panel passes its gap and the edge it lines up with", () => {
+  const anchor = mount(() => (
+    <Anchor class="x">
+      <button type="button">open</button>
+      <AnchorPanel as="section" align="end" space={SPACE[2]} hidden>
+        panel
+      </AnchorPanel>
+    </Anchor>
+  ));
+  const panel = anchor.querySelector("section") as HTMLElement;
+  expect([anchor.className, panel.className, panel.dataset["align"], panel.hidden]).toEqual(["l-anchor x", "l-anchor__panel", "end", true]);
+  expect(prop(panel, "--l-space")).toBe("var(--space-2)");
+  dispose?.();
+  const plain = mount(() => <AnchorPanel />);
+  expect([plain.dataset["align"], prop(plain, "--l-space")]).toEqual(["start", "var(--space-1)"]);
 });
 
 test("space accepts only steps of the scale", () => {

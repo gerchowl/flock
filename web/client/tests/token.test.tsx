@@ -93,7 +93,8 @@ function mountApp(options: { code?: string | null; session?: () => SessionLike |
   return { h, root };
 }
 
-const status = (root: HTMLElement): string => root.querySelector(".topbar__status")?.textContent ?? "";
+/** The connection's state line, in the toolbar's popover. */
+const status = (root: HTMLElement): string => root.querySelector('[data-testid="host-detail"]')?.textContent ?? "";
 const hello = (h: Harness): { token?: string } | undefined => sentFrames(h).find((frame) => (frame as { t: string }).t === "hello") as { token?: string } | undefined;
 
 describe("the fragment code", () => {
