@@ -2,15 +2,18 @@
  * The exemplar baseline's measurements (#2899, `web/baseline/`): `collect`
  * and `summarise` read a page whose every value is known, and the committed
  * results keep counts only, never a colour. The crawl itself runs by hand
- * (`web/baseline/crawl.ts`), never here.
+ * (`web/baseline/crawl.ts`), never here. The report's tables are rendered
+ * from the committed results, so its numbers cannot drift from them.
  */
 import { afterAll, beforeAll, expect, test } from "bun:test";
 
 import { chromium, type Browser, type Page } from "playwright";
 
 import { collect, focusStyle, summarise, type Summary } from "../../baseline/collect";
+import { fill, render } from "../../baseline/report";
 
 const RESULTS = `${import.meta.dir}/../../baseline/results/baseline.json`;
+const README = `${import.meta.dir}/../../baseline/README.md`;
 const VIEWPORT = { width: 640, height: 400 } as const;
 
 // Every value is chosen: two 13 px texts and one 17 px, 8 and 6 px padding,
@@ -89,4 +92,13 @@ test("the committed results keep counts, never a colour", async () => {
   for (const site of ["flock", "icloud", "linear", "vercel", "github", "primer", "stripe"]) {
     expect(results.filter((result) => result.site === site).map((result) => result.mode)).toContain("dark");
   }
+});
+
+test("the report's tables match the committed results", async () => {
+  const { results } = JSON.parse(await Bun.file(RESULTS).text()) as { results: Parameters<typeof render>[0] };
+  const readme = await Bun.file(README).text();
+  const tables = render(results);
+  // Every table is in the report, and each region holds exactly its rendering (`bun report.ts` rewrites them).
+  for (const name of Object.keys(tables)) expect(readme).toContain(`<!-- table:${name} -->\n`);
+  expect(readme).toBe(fill(readme, tables));
 });
