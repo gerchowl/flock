@@ -13,7 +13,11 @@ import { For, createSignal, type JSX } from "solid-js";
 import { Center, Cluster, Grid, Sidebar, Stack, Switcher } from "../layout/primitives";
 import { SPACE } from "../tokens";
 import { HEALTH_LABELS, HostStatus, type Health } from "../workbench/HostStatus";
+import { ErrorState, RefusalDetails, explain } from "../workbench/refusals";
 import "./gallery.css";
+
+/** A refusal the server sends, worded in the shared map's plain words, its code behind Details. */
+const BUSY = { code: "session_busy", message: "command refused: session_busy" } as const;
 
 const OPTIONS = ["Review the pull request", "Run the test suite", "Summarise the log"] as const;
 
@@ -55,7 +59,7 @@ function Group(props: { readonly title: string; readonly children: JSX.Element }
 /** The toolbar's connection control in one health, its popover open or closed. */
 function Host(props: { readonly health: Health; readonly open?: true }): JSX.Element {
   const [open, setOpen] = createSignal(props.open === true);
-  const view = { name: "node-a", health: () => props.health, detail: () => HEALTH_LABELS[props.health], connected: () => props.health !== "off", connect: () => undefined, disconnect: () => undefined };
+  const view = { name: "node-a", health: () => props.health, detail: () => HEALTH_LABELS[props.health], diagnosis: () => null, connected: () => props.health !== "off", connect: () => undefined, disconnect: () => undefined };
   return <HostStatus view={view} name={`node-a (${HEALTH_LABELS[props.health]})`} open={open} setOpen={setOpen} />;
 }
 
@@ -137,6 +141,12 @@ export function Gallery(): JSX.Element {
                 <Host health="off" />
                 <Host health="live" open />
               </Cluster>
+            </Stack>
+            <Stack as="section" space={SPACE[2]} aria-label="Refusals">
+              <h2>Refusals</h2>
+              <ErrorState title="Couldn't load this agent's history." line={explain(BUSY).line} code={BUSY.code} message={BUSY.message} retry={() => undefined} />
+              <span>{explain(BUSY).line}</span>
+              <RefusalDetails code={BUSY.code} message={BUSY.message} open />
             </Stack>
           </Stack>
         </Center>

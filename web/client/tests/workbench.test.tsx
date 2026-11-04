@@ -141,7 +141,7 @@ describe("wire mode", () => {
     h.step(step({ step: "send", frame: { t: "ev", sub_id: sub.sub_id, stream: "fleet", seq: 1, ts_ms: 0, ev: { type: "fleet.upsert", row } } }));
     expect($$(root, "agent-row").map((agent) => agent.textContent)).toEqual(["atlasReading the ADR"]);
     h.net.current().drop();
-    expect($(root, "banner-detail")?.textContent).toContain("Reconnecting · Connection lost");
+    expect($(root, "banner-detail")?.textContent).toBe("Connection lost. Reconnecting…");
     expect(root.textContent).not.toContain("secret");
   });
 
@@ -207,7 +207,31 @@ describe("wire mode", () => {
     ($$(root, "agent-row")[1] as HTMLButtonElement).click();
     const sub = sentFrames(h).at(-1) as { sub_id: string };
     h.step(step({ step: "send", frame: { t: "subfail", sub_id: sub.sub_id, code: "scope", message: "not for this token" } }));
-    expect($(root, "focus-pane")?.querySelector('[role="alert"]')?.textContent).toBe("Couldn't load this agent's history: not for this token");
+    const alert = $(root, "focus-pane")?.querySelector('[role="alert"]');
+    expect(alert?.querySelector("strong")?.textContent).toBe("Couldn't load this agent's history.");
+    expect(alert?.textContent).toContain("This client's token does not cover that. Connect with a token that allows it.");
+    expect(alert?.querySelector('[data-testid="details"]')?.textContent).toBe("Detailsscope not for this token");
+  });
+  test("Retry on a refused history opens a fresh subscription, and the empty state leaves once it syncs", async () => {
+    const h = new Harness();
+    live(h);
+    const root = mount(() => (
+      <Workbench fleet={createFixtureFleet(SAMPLE_AGENTS)} transport={createWireTransport(h.connection)} inbox={[]} sender={null} layout={emptyLayout()} saveLayout={() => undefined} source="live" />
+    ));
+    await tick();
+    ($$(root, "agent-row")[1] as HTMLButtonElement).click();
+    const refused = sentFrames(h).at(-1) as { sub_id: string; stream: string };
+    h.step(step({ step: "send", frame: { t: "subfail", sub_id: refused.sub_id, code: "session_busy", message: "busy" } }));
+    // session_busy retries on its own three times; the person's Retry is a fresh sub either way.
+    const before = sentFrames(h).filter((frame) => (frame as { t: string }).t === "sub").length;
+    ($(root, "retry") as HTMLButtonElement).click();
+    const subs = sentFrames(h).filter((frame) => (frame as { t: string }).t === "sub") as { sub_id: string; stream: string }[];
+    expect(subs.length).toBe(before + 1);
+    const fresh = subs.at(-1)!;
+    expect([fresh.stream, fresh.sub_id === refused.sub_id]).toEqual([refused.stream, false]);
+    expect($(root, "error-state")).toBeNull();
+    h.step(step({ step: "send", frame: { t: "synced", sub_id: fresh.sub_id, seq: 0 } }));
+    expect($(root, "transcript-synced")?.textContent).toBe("Up to date");
   });
 });
 
@@ -544,7 +568,9 @@ describe("composer", () => {
     expect($$(root, "sent-message").map((item) => item.getAttribute("data-status"))).toEqual(["sent"]);
     expect(box.value).toBe("");
     h.net.current().deliver({ t: "ack", cmd_id: cmd.cmd_id, ok: false, error: { code: "agent_busy", message: "try later", exit: 3, retry: "later" } });
-    expect($(root, "sent-message")?.textContent).toBe("please rebaserefused by the server: try later");
+    const sent = $(root, "sent-message");
+    expect(sent?.querySelector(".sent__status")?.textContent).toBe("The server refused this. Try again later.");
+    expect(sent?.querySelector('[data-testid="details"]')?.textContent).toBe("Detailsagent_busy try later");
   });
 
   test("an accepted message is never in the transcript before the server's event, and shows once after it", async () => {
@@ -850,14 +876,15 @@ describe("wire mode, one transport per connection", () => {
     h.step(step({ step: "open" }));
     h.step(step({ step: "token_refused", code: 4401 }));
     expect($(root, "layout-notice")?.textContent).toContain("Saved layout could not be loaded");
-    expect($(root, "banner-detail")?.textContent).toBe(`NeedsToken · The server refused the token. ${RUN_CLIENT_OPEN}`);
+    expect($(root, "banner-detail")?.textContent).toBe(`Sign-in needed. The server refused the token. ${RUN_CLIENT_OPEN}`);
   });
 
   test("ReadOnly shows the version-gap banner, and the composer is held with the same message", () => {
     const { h, root } = liveApp({ ...WELCOME, protocol: WIRE_PROTOCOL - 1 } as ServerFrame);
-    const gap = `Read-only: this server runs an older version (wire protocol ${WIRE_PROTOCOL - 1}; this client speaks ${WIRE_PROTOCOL}), so commands wait until it is updated.`;
-    expect([health(root), $(root, "banner-detail")?.textContent]).toEqual(["problem", "ReadOnly"]);
+    const gap = "This server runs an older version, so sending waits until it is updated.";
+    expect([health(root), $(root, "banner-detail")?.textContent]).toEqual(["problem", "Connected, read-only."]);
     expect($(root, "read-only")?.textContent).toBe(gap);
+    expect($(root, "connection-banner")?.querySelector('[data-testid="details"]')?.textContent).toBe(`Details The server speaks wire protocol ${WIRE_PROTOCOL - 1}; this client speaks ${WIRE_PROTOCOL}.`);
     // The fleet still renders, and the open agent's composer is held.
     ($$(root, "agent-row")[0] as HTMLButtonElement).click();
     expect($(root, "agent-phase")?.textContent).toBe(gap);

@@ -1,9 +1,10 @@
 /**
- * The live connection's banner (ADR-0038 §3, ADR-0048 D7 amendment 5):
+ * The live connection's banner (ADR-0038 §3, ADR-0048 D7 amendment 5),
+ * worded from the shared plain-language map (`refusals.tsx`, #2902):
  * shown under the toolbar only while something needs the person, and empty
  * otherwise. It holds the state line while the connection has a problem
- * (reconnecting with the latest failure, read-only with the version gap, a
- * token needed), *Connect* when it stopped on a failure, in NeedsToken a field for a new
+ * (reconnecting, read-only, a token needed; the latest failure or the version
+ * gap behind Details), *Connect* when it stopped on a failure, in NeedsToken a field for a new
  * token (or, when the shell provides tokens, a *Connect* that asks it
  * again), what restoring the stored outbox had to drop, if anything, and
  * what a changed principal dropped, until dismissed or the next acked
@@ -19,6 +20,7 @@ import { Cluster } from "../layout/primitives";
 import { SPACE } from "../tokens";
 import type { WireConnection } from "../wire/connection";
 import type { HostView } from "./HostStatus";
+import { RefusalDetails } from "./refusals";
 
 /** Props of {@link ConnectionBanner}; `revision` changes with every connection change. */
 export type ConnectionBannerProps = {
@@ -44,6 +46,7 @@ export function ConnectionBanner(props: ConnectionBannerProps): JSX.Element {
         <Cluster class="banner" space={SPACE[3]}>
           <Show when={problem()}>
             <span data-testid="banner-detail">{props.host.detail()}</span>
+            <Show when={props.host.diagnosis()}>{(diagnosis) => <RefusalDetails message={diagnosis()} />}</Show>
           </Show>
           <Show when={readOnly()}>
             {(message) => (

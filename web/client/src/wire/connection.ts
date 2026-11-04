@@ -305,8 +305,13 @@ export class WireConnection {
    * composer and answer controls (ADR-0038 §3). Null in every other state.
    */
   get readOnly(): string | null {
+    return this.versionGap === null ? null : "This server runs an older version, so sending waits until it is updated.";
+  }
+
+  /** In ReadOnly, the version gap itself, for Details; null in every other state. */
+  get versionGap(): string | null {
     if (this.#state !== "ReadOnly" || this.#welcome === null) return null;
-    return `Read-only: this server runs an older version (wire protocol ${this.#welcome.protocol}; this client speaks ${this.#protocol()}), so commands wait until it is updated.`;
+    return `The server speaks wire protocol ${this.#welcome.protocol}; this client speaks ${this.#protocol()}.`;
   }
 
   /** The principal of the last `welcome`, or of the restored outbox. */

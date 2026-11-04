@@ -7,11 +7,12 @@
  *
  * @module
  */
-import { createEffect, createUniqueId, on, onCleanup, type JSX } from "solid-js";
+import { Show, createEffect, createUniqueId, on, onCleanup, type JSX } from "solid-js";
 
 import { Anchor, AnchorPanel, Stack } from "../layout/primitives";
 import { SPACE } from "../tokens";
 import type { ConnectionState } from "../wire/connection";
+import { RefusalDetails } from "./refusals";
 import "./toolbar.css";
 
 /**
@@ -40,8 +41,10 @@ export type HostView = {
   /** What to call the server while the fleet names no home node: its address, or the shell's machine. */
   readonly name: string;
   readonly health: () => Health;
-  /** The state line: the state, then its latest failure or what it asks for. */
+  /** The state line in plain words (`refusals.tsx`), then what it asks for. */
   readonly detail: () => string;
+  /** The raw diagnosis behind the state line's Details, or null. */
+  readonly diagnosis: () => string | null;
   /** Whether there is a connection to drop (any state but Disconnected); otherwise *Connect* is offered. */
   readonly connected: () => boolean;
   readonly connect: () => void;
@@ -115,6 +118,7 @@ export function HostStatus(props: HostStatusProps): JSX.Element {
           <span id={detailId} class="host__detail" data-testid="host-detail">
             {props.view.detail()}
           </span>
+          <Show when={props.view.diagnosis()}>{(diagnosis) => <RefusalDetails message={diagnosis()} />}</Show>
           <button
             ref={toggle}
             type="button"
