@@ -21,6 +21,12 @@ try {
   replace(/adoptedStyleSheets: CSSStyleSheet\[\];/g, "readonly adoptedStyleSheets: unknown;");
   replace(/readonly styleSheets: StyleSheetList;/g, "readonly styleSheets: unknown;");
   replace(/animate\(keyframes:[^\n]+;/g, "readonly animate: unknown;");
+  replace(/\b(innerHTML|outerHTML): string;/g, "readonly $1: unknown;");
+  for (const method of ["insertAdjacentHTML", "parseFromString", "createContextualFragment", "setHTMLUnsafe", "parseHTMLUnsafe"]) {
+    replace(new RegExp(`\\b${method}\\([^\\n]+;`, "g"), `readonly ${method}: unknown;`);
+  }
+  // Only Document's string-writing signatures; ordinary stream writers remain usable.
+  replace(/\b(write|writeln)\(\.\.\.text: string\[\]\): void;/g, "readonly $1: unknown;");
   replace(/declare var CSSStyleSheet: \{[\s\S]*?\n\};/, "declare const CSSStyleSheet: unknown;");
   replace(/interface (CSSStyleSheet|CSSGroupingRule|CSSKeyframesRule) extends [\s\S]*?\n\}/g, "$&");
   dom = dom.replace(/interface (CSSStyleSheet|CSSGroupingRule|CSSKeyframesRule) extends [\s\S]*?\n\}/g, (block) =>
@@ -31,7 +37,10 @@ try {
   // JSX intrinsic attributes must keep this constraint through imported spreads.
   // Keep the pinned library intact; the compiler sees a restricted declaration copy.
   const solid = dirname(fileURLToPath(import.meta.resolve("solid-js/package.json")));
-  const jsx = await readFile(join(solid, "types/jsx.d.ts"), "utf8");
+  let jsx = await readFile(join(solid, "types/jsx.d.ts"), "utf8");
+  if (!jsx.includes("innerHTML?: string;")) throw new Error("design types: Solid markup declaration shape changed");
+  jsx = jsx.replace("innerHTML?: string;",
+    'innerHTML?: never;\n    outerHTML?: never;\n    "prop:innerHTML"?: never;\n    "prop:outerHTML"?: never;');
   const paint = /\b(color|fill|stroke)\?: string \| undefined;/g;
   if (!["color", "fill", "stroke"].every((key) => jsx.includes(`${key}?: string | undefined;`))) {
     throw new Error("design types: Solid paint declaration shape changed");

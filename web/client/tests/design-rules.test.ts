@@ -36,10 +36,10 @@ async function run(args: string[], stdin?: string): Promise<Run> {
 const stylelint = (path: string, css: string): Promise<Run> => run(["x", "stylelint", "--config", "stylelint.config.js", "--config-basedir", ".", "--ignore-disables", "--stdin-filename", path], css);
 const eslint = (path: string, tsx: string): Promise<Run> => run(["x", "eslint", "--config", "eslint.config.js", "--stdin", "--stdin-filename", path], tsx);
 
-async function designTypes(source: string): Promise<Run> {
+async function designTypes(source: string, extension = "ts"): Promise<Run> {
   const root = await mkdtemp(join(CLIENT_ROOT, "node_modules/.cache/source-types-"));
   try {
-    const file = join(root, "probe.ts");
+    const file = join(root, `probe.${extension}`);
     await writeFile(file, `declare const el: HTMLElement;\n${source}`);
     return await run(["scripts/check-design-types.ts", file]);
   } finally { await rm(root, { recursive: true, force: true }); }
@@ -73,6 +73,60 @@ describe("stylelint strict values", () => {
   test("allows raw values in tokens.css only", async () => {
     expect((await stylelint("src/tokens.css", ":root { --space-1: 4px; }")).code).toBe(0);
     expect((await stylelint("src/layout/primitives/seeded.css", ":root { --space-1: 4px; }")).code).toBe(2);
+  });
+});
+
+describe("HTML injection is unavailable (#2937)", () => {
+  const svg = '<svg xmlns="http://www.w3.org/2000/svg"><rect fill="#b31739" width="12" height="12"/></svg>';
+  const probe = `const svg = ${JSON.stringify(svg)}; document.body.appendChild(<div innerHTML={svg}/> as Node);`;
+  test.each([
+    ["exact SVG probe", probe],
+    ["JSX outerHTML", '<div outerHTML="<svg/>"/>'],
+    ["innerHTML assignment", 'el.innerHTML = "<svg/>"'],
+    ["outerHTML assignment", 'el.outerHTML = "<svg/>"'],
+    ["insertAdjacentHTML", 'el.insertAdjacentHTML("beforeend", "<svg/>")'],
+    ["DOMParser", 'new DOMParser().parseFromString("<svg/>", "image/svg+xml")'],
+    ["Range", 'document.createRange().createContextualFragment("<svg/>")'],
+    ["document.write", 'document.write("<svg/>")'],
+    ["document.writeln", 'document.writeln("<svg/>")'],
+    ["modern element parser", 'el.setHTMLUnsafe("<svg/>")'],
+    ["modern document parser", 'Document.parseHTMLUnsafe("<svg/>")'],
+    ["JSX spread", 'const props = {innerHTML: "<svg/>"}; <div {...props}/>'],
+    ["JSX property directive", '<div prop:innerHTML="<svg/>"/>'],
+    ["JSX property directive spread", 'const props = {id: "probe", "prop:innerHTML": "<svg/>"}; <div {...props}/>'],
+    ["computed assignment", 'el["inner" + "HTML"] = "<svg/>"'],
+    ["aliased parser", 'const parse = new DOMParser().parseFromString; parse("<svg/>", "image/svg+xml")'],
+  ])("rejects %s through lint and types", async (_name, source) => {
+    const lint = await eslint("src/Probe.tsx", source);
+    const types = await designTypes(source, "tsx");
+    expect({ lint: lint.code, types: types.code }).toEqual({ lint: 1, types: 1 });
+  });
+
+  test.each([false, true])("rejects markup in the shipped graph (imported spread=%s)", async (spread) => {
+    const root = await mkdtemp(join(tmpdir(), "design-markup-"));
+    try {
+      await mkdir(join(root, "src"));
+      await symlink(join(CLIENT_ROOT, "node_modules"), join(root, "node_modules"), "dir");
+      await writeFile(join(root, "vite.config.ts"), `export { default } from ${JSON.stringify(join(CLIENT_ROOT, "vite.config.ts"))}`);
+      await writeFile(join(root, "index.html"), '<script type="module" src="/src/main.tsx"></script>');
+      await writeFile(join(root, "src/props.ts"), `export const props = {innerHTML: ${JSON.stringify(svg)}}`);
+      await writeFile(join(root, "src/main.tsx"), spread
+        ? 'import { props } from "./props"; document.body.appendChild(<div {...props}/> as Node)'
+        : probe);
+      const result = await run(["run", "build", root]);
+      expect({ code: result.code, output: result.output }).toMatchObject({ code: 1 });
+      expect(result.output).toContain("HTML markup injection is disallowed");
+    } finally { await rm(root, { recursive: true, force: true }); }
+  }, 30_000);
+
+  test("rejects markup payloads passed to Object.assign", async () => {
+    expect((await eslint("src/Probe.tsx", 'Object.assign(document.body, {innerHTML: "<svg/>"})')).code).toBe(1);
+  });
+
+  test("allows text and node construction and ordinary writers", async () => {
+    const source = 'el.textContent = "<svg/>"; el.appendChild(document.createElement("div")); const log = {write(text: string) { return text }}; log.write("text")';
+    expect((await eslint("src/Probe.tsx", source)).code).toBe(0);
+    expect((await designTypes(source)).code).toBe(0);
   });
 });
 
@@ -442,7 +496,7 @@ describe("review paint and calc boundaries (#2937)", () => {
     try {
       await mkdir(join(root, "src"));
       await writeFile(join(root, "index.html"), '<script type="module" src="/src/main.ts"></script>');
-      await writeFile(join(root, "src/main.ts"), 'import image from "./probe.svg"; document.body.innerHTML = `<img src="${image}">`');
+      await writeFile(join(root, "src/main.ts"), 'import image from "./probe.svg"; const img = document.createElement("img"); img.src = image; document.body.appendChild(img)');
       await writeFile(join(root, "src/probe.svg"), `<svg xmlns="http://www.w3.org/2000/svg">${content}</svg>`);
       const result = await run(["run", "build", root]);
       expect({ code: result.code, output: result.output }).toMatchObject({ code: 1 });

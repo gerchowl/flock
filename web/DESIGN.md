@@ -359,6 +359,18 @@ queries.
 
 ### Indirect styling and untrusted types
 
+HTML markup injection is forbidden in all linted client source, including
+primitives and the complete shipped source graph. No existing client consumer
+needs it, and there is no sanctioned markup module. Use `textContent` and
+node construction instead. JSX `innerHTML`/`outerHTML`, assignments and object
+payloads with those keys, `insertAdjacentHTML`, `DOMParser.parseFromString`,
+`Range.createContextualFragment`, `document.write`/`writeln`, `setHTMLUnsafe`
+and `Document.parseHTMLUnsafe` are rejected. ESLint checks static names,
+including computed literals; restricted DOM and JSX declarations cover aliases
+and imported props. Ordinary stream writers remain available. CSP alone cannot
+enforce this rule: it permits SVG presentation attributes in injected markup.
+Artifact documents in the ADR-0038 sandbox iframe keep their separate boundary.
+
 JSX checks describe actual style attributes; ordinary property names are not
 style APIs. Computed DOM keys and aliases require a type-level boundary. `bun run types:design`, included in `lint`, checks
 application source and its imports with a restricted copy of the pinned compiler's
