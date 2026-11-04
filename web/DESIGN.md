@@ -168,6 +168,104 @@ have no exact token, and replacing them changes how the GUI looks. That is
 the redesign's work, one file at a time. When a file passes every rule,
 remove it from the list. Never add one.
 
+## Conformance
+
+The lint rules above check the source. `e2e/conformance.test.ts` checks what
+the browser renders: it walks every element with `getComputedStyle` on the
+gallery (`gallery.html`, every primitive and control state; `vite` serves it
+in development, `vite build --mode gallery` builds it, and no production
+build includes it) and on the fixture workbench at desktop and phone sizes,
+including `?layout=phone`. It runs in light, dark and both
+increased-contrast modes, all under reduced motion, in `just client-check`,
+so the required `client` CI check runs it on every change. One test per rule:
+
+1. **Palette.** Every computed `color`, `background-color`, drawn
+   `border-*-color` and `outline-color`, and SVG `fill` and `stroke` equals a
+   `--color-*` token as the active mode resolves it (read from the generated
+   `tokens.css` in the page), or is transparent.
+   ([Color](https://developer.apple.com/design/human-interface-guidelines/color):
+   system and semantic colours, adapting to the mode.)
+2. **Typography.** Desktop body text is 13 px; no text is under 10 px; no
+   weight under 300 below 15 px; every font is the system or monospaced stack.
+   ([Typography](https://developer.apple.com/design/human-interface-guidelines/typography):
+   macOS body 13 pt, minimum 10 pt, avoid thin weights at small sizes.)
+3. **Contrast.** Text has 4.5:1 against its background with every ancestor's
+   background composited beneath it, 3:1 when large (24 px, or 18.66 px
+   bold), in every mode. Disabled controls are exempt. axe-core's WCAG 2.2 A
+   and AA rules run beside it.
+   ([WCAG 2.2 SC 1.4.3](https://www.w3.org/TR/WCAG22/#contrast-minimum);
+   [Accessibility](https://developer.apple.com/design/human-interface-guidelines/accessibility).)
+4. **Hit size.** Every control is at least 28×28 px on desktop and 44×44 px
+   on a phone; 20×20 px inside `[data-control-size="small"]`. Every control
+   is measured, below the fold too; only links in running text are exempt.
+   Neighbouring controls keep 4 px apart, except rows of one list (`ul`,
+   `ol`, `role="list"`, `listbox`, `tree`, `menu`) and segments of one
+   `tablist` or `group`, which may touch. A control covered by another even
+   when scrolled into view, or partly scrolled out of its scroller, has no
+   defined neighbour and is skipped for spacing only.
+   ([Buttons](https://developer.apple.com/design/human-interface-guidelines/buttons);
+   [WCAG 2.2 SC 2.5.8](https://www.w3.org/TR/WCAG22/#target-size-minimum).)
+5. **Spacing grid.** Every computed margin, padding and gap in px is a
+   multiple of 4, or the 1 px hairline. `auto` and percentages are skipped.
+   ([Layout](https://developer.apple.com/design/human-interface-guidelines/layout).)
+6. **Materials.** `backdrop-filter` or a blur appears only inside chrome (a
+   header, toolbar, sidebar, dialog or popover), never inside `main`.
+   ([Materials](https://developer.apple.com/design/human-interface-guidelines/materials):
+   materials belong to the controls layer, not the content.)
+7. **Motion.** Under reduced motion nothing transitions or animates except
+   `opacity`.
+   ([Motion](https://developer.apple.com/design/human-interface-guidelines/motion);
+   [WCAG 2.2 SC 2.3.3](https://www.w3.org/TR/WCAG22/#animation-from-interactions).)
+8. **Keyboard.** Tab reaches every enabled control (a list's rows are reached
+   with the arrow keys instead), and each shows a focus ring: an outline
+   drawn only on focus, or a box-shadow that differs from its resting one.
+   Every control has an accessible name with a letter or digit, so an icon
+   alone is not one. ArrowDown moves the selection of every list widget,
+   the palette's included, and a list with nothing to focus fails. ⌘K opens
+   the palette from wherever focus is, and Esc closes it and returns focus
+   there.
+   ([Keyboards](https://developer.apple.com/design/human-interface-guidelines/keyboards);
+   [WCAG 2.2 SC 2.1.1, 2.4.7, 4.1.2](https://www.w3.org/TR/WCAG22/).)
+9. **Structure.** A sidebar's disclosure groups nest at most two deep. On
+   every screen with a toolbar (a `header` or `role="toolbar"`), each
+   toolbar has actions and every one of them, disabled ones included, is a
+   ⌘K command: the palette lists an unavailable action dimmed. No control
+   switches the app's light or dark appearance, which follows the system.
+   ([Sidebars](https://developer.apple.com/design/human-interface-guidelines/sidebars);
+   [Toolbars](https://developer.apple.com/design/human-interface-guidelines/toolbars);
+   [Dark Mode](https://developer.apple.com/design/human-interface-guidelines/dark-mode).)
+
+The keyboard and structure checks that drive the page (Tab, arrows, ⌘K and
+Esc, toolbar parity) run in every mode too. Nothing passes by running less:
+a coverage test fails unless every page ran in every mode, as the page's own
+media queries report it, and each walk covered the page's minimum of
+elements and controls. Closing the browser is bounded too: a cleanup that
+times out fails the run, and the browser's processes are killed and reaped
+either way.
+
+Every check, and each part of rules 4, 8 and 9, has a seeded violation in
+the test's `SEEDS` (20 in all: one below the fold, one only in dark mode,
+one hiding the page). A test runs each check on its page with and without
+its seed and fails unless the seed adds a finding.
+`CONFORMANCE_SEED=<seed> bun test ./e2e/conformance.test.ts` injects one
+seed for the whole run instead, and its rule's test fails. The suite's own
+seeds (`SUITE_SEEDS`: a broad or unbaselined allow-list entry, a dropped
+mode, a cleanup that never settles) fail the run the same way.
+
+Known violations live in one list, `e2e/conformance-allow.ts`. Each entry
+names one rule, one simple selector, the pages and the filed issue that
+removes it. A selector is a tag, classes, ids or an exact test id, with at
+most two more such compounds down a descendant chain: no `*`, no selector
+list, no pseudo-class such as `:is`, `:not` or `:where`, no other attribute
+match, and no chain rooted at `html`, `body` or `#root` (`body` alone names
+the body element). The test fails on an entry that no longer matches
+anything, and on an entry, or a page of one, that is not in the bootstrap
+baseline (`e2e/conformance-allow-baseline.ts`, the list as first merged) or,
+once `dev` has the list, in `origin/dev`'s copy, so the list only shrinks;
+CI fetches `dev` for that comparison. Today it holds the legacy
+stylesheets' body size, count badge, rem spacing and touching sidebar and
+tab-bar rows (#2913), and the sidebar's third level (#2930).
+
 ## Layout
 
 The primitives in `src/layout/primitives/` follow

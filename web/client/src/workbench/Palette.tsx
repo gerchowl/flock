@@ -16,9 +16,18 @@ import type { AgentRow } from "../fleet";
 export type PaletteProps = {
   readonly rows: () => readonly AgentRow[];
   readonly onOpen: (agentId: string) => void;
+  /**
+   * The toolbars' actions that wait for a later slice: listed after the
+   * agents, dimmed, so every toolbar action has its command (HIG: a menu
+   * shows an unavailable command disabled rather than hiding it).
+   */
+  readonly waiting?: readonly WaitingAction[];
 };
 
-type Item = { readonly id: string; readonly label: string; readonly hint: string };
+/** A toolbar action that is shown but not yet available, and what it waits for. */
+export type WaitingAction = { readonly label: string; readonly waitsFor: string };
+
+type Item = { readonly id: string; readonly label: string; readonly hint: string; readonly disabled?: true };
 
 /** The shortcut as this platform writes it: ⌘K on Apple devices, Ctrl K elsewhere. */
 export function shortcutLabel(platform: string): string {
@@ -32,6 +41,8 @@ export function Palette(props: PaletteProps): JSX.Element {
   const [selected, setSelected] = createSignal(0);
   let input: HTMLInputElement | undefined;
   let trigger: HTMLButtonElement | undefined;
+  // Where focus was when the palette opened: Esc returns it there (HIG: a dismissed popover restores focus).
+  let opener: HTMLElement | null = null;
   const listId = createUniqueId();
   const optionId = (index: number): string => `${listId}-${index}`;
   const items = createMemo<Item[]>(() => {
@@ -39,25 +50,30 @@ export function Palette(props: PaletteProps): JSX.Element {
     const matches = props.rows()
       .filter((row) => text === "" || row.label.toLowerCase().includes(text) || row.id.toLowerCase().includes(text))
       .map((row) => ({ id: row.id, label: row.label, hint: row.activity }));
+    const waiting = (props.waiting ?? [])
+      .filter((action) => text === "" || action.label.toLowerCase().includes(text))
+      .map((action): Item => ({ id: `waits:${action.label}`, label: action.label, hint: `Waits for ${action.waitsFor}`, disabled: true }));
     if (matches.length === 0 && /^[\w.-]+$/.test(query().trim())) {
-      return [{ id: query().trim(), label: `Open agent ${query().trim()}`, hint: "by id" }];
+      return [{ id: query().trim(), label: `Open agent ${query().trim()}`, hint: "by id" }, ...waiting];
     }
-    return matches;
+    return [...matches, ...waiting];
   });
   const show = (): void => {
+    if (!open()) opener = document.activeElement instanceof HTMLElement && document.activeElement !== document.body ? document.activeElement : null;
     setOpen(true);
     setSelected(0);
     queueMicrotask(() => input?.focus());
   };
-  const hide = (): void => {
+  /** Closes the palette; a dismissal returns focus where it was, a choice to the trigger. */
+  const hide = (dismissed = true): void => {
     setOpen(false);
     setQuery("");
-    trigger?.focus();
+    (dismissed && opener?.isConnected ? opener : trigger)?.focus();
   };
   const choose = (item: Item | undefined): void => {
-    if (item === undefined) return;
+    if (item === undefined || item.disabled) return;
     props.onOpen(item.id);
-    hide();
+    hide(false);
   };
   const onGlobalKey = (event: KeyboardEvent): void => {
     if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
@@ -120,8 +136,9 @@ export function Palette(props: PaletteProps): JSX.Element {
                     role="option"
                     class="palette__item"
                     aria-selected={index() === selected()}
+                    aria-disabled={item.disabled}
                     onClick={() => choose(item)}
-                    data-testid="palette-item"
+                    data-testid={item.disabled ? "palette-command" : "palette-item"}
                   >
                     <span>{item.label}</span>
                     <span class="palette__hint">{item.hint}</span>

@@ -112,9 +112,12 @@ website-build:
 # Check the web client (ADR-0038 G1) from its lockfile: the unit and DOM
 # tests, the fixture-preview screenshot test (needs `just client-browsers`;
 # writes web/client/artifacts/screenshots/), the strict type check, the design
-# rules (`client-lint`) and the Vite build.
+# rules (`client-lint`) and the Vite build. Each browser test file runs in a
+# process of its own: on Linux a Chromium launched by a later file of the same
+# `bun test` process lost its DevTools transport after an earlier file's
+# browser had run (#2931).
 client-check:
-    cd web/client && bun install --frozen-lockfile && bun test && bun test ./e2e && bun x tsc --noEmit -p tsconfig.json && bun run lint
+    cd web/client && bun install --frozen-lockfile && bun test && for f in e2e/*.test.ts; do bun test "./$f" || exit 1; done && bun x tsc --noEmit -p tsconfig.json && bun run lint
 
 # Recompute nix/client-deps.json, the pinned hash of the client's
 # dependencies for `nix build .#flock-client` (#1731), after web/client/bun.lock
