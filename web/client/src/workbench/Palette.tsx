@@ -1,7 +1,9 @@
 /**
  * The command palette (ADR-0038 §2a): ⌘K or Ctrl+K, or the top bar's search
- * field. It is the only way to open a subject by name. The MVP searches
- * agents only; issues and PRs wait for a PR/issue source.
+ * field. It is the only way to open a subject by name, and it runs
+ * commands: the toolbar's, and every shortcut the keyboard layer marks as
+ * one (`keys.ts`, #2904). The MVP searches agents only; issues and PRs wait
+ * for a PR/issue source.
  *
  * fleet-lite lists structured agents only (S7-min, #1746), so a query that
  * matches no row is offered as an agent id to open.
@@ -12,6 +14,7 @@ import { For, Show, createMemo, createSignal, createUniqueId, onCleanup, type JS
 
 import { Icon } from "../components/Icon";
 import type { AgentRow } from "../fleet";
+import { bindKeys, formatCombo, isApple, shortcut } from "./keys";
 
 /** Props of {@link Palette}. */
 export type PaletteProps = {
@@ -35,9 +38,9 @@ export type PaletteCommand = { readonly label: string; readonly hint: string; re
 
 type Item = { readonly id: string; readonly label: string; readonly hint: string; readonly disabled?: true; readonly run?: () => void };
 
-/** The shortcut as this platform writes it: ⌘K on Apple devices, Ctrl K elsewhere. */
+/** The shortcut as this platform writes it: ⌘K on Apple devices, Ctrl+K elsewhere. */
 export function shortcutLabel(platform: string): string {
-  return /Mac|iPhone|iPad|iPod/.test(platform) ? "⌘K" : "Ctrl K";
+  return formatCombo(shortcut("palette.open").combo, isApple(platform));
 }
 
 /** The top bar's search field and the palette it opens. */
@@ -90,14 +93,7 @@ export function Palette(props: PaletteProps): JSX.Element {
     props.onOpen(item.id);
     hide(false);
   };
-  const onGlobalKey = (event: KeyboardEvent): void => {
-    if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
-      event.preventDefault();
-      show();
-    }
-  };
-  document.addEventListener("keydown", onGlobalKey);
-  onCleanup(() => document.removeEventListener("keydown", onGlobalKey));
+  onCleanup(bindKeys(document.body, { "palette.open": show }));
   const onKey = (event: KeyboardEvent): void => {
     const count = items().length;
     if (event.key === "Escape") hide();
@@ -110,7 +106,7 @@ export function Palette(props: PaletteProps): JSX.Element {
   return (
     <>
       <button ref={trigger} type="button" class="palette-trigger" onClick={show} data-testid="palette-trigger">
-        <Icon name="search" size={14} /> Search agents… <kbd>{shortcutLabel(navigator.platform || navigator.userAgent)}</kbd>
+        <Icon name="search" size={14} /> Search or run… <kbd>{shortcutLabel(navigator.platform || navigator.userAgent)}</kbd>
       </button>
       <Show when={open()}>
         <div class="palette-backdrop" onClick={(event) => event.target === event.currentTarget && hide()}>
@@ -132,7 +128,7 @@ export function Palette(props: PaletteProps): JSX.Element {
               class="palette__input"
               type="search"
               role="combobox"
-              aria-label="Search agents"
+              aria-label="Search agents or run a command"
               aria-expanded="true"
               aria-controls={listId}
               aria-activedescendant={items().length > 0 ? optionId(selected()) : undefined}

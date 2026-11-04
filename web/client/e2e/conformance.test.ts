@@ -178,6 +178,14 @@ const SEEDS: Readonly<Record<string, Seed>> = {
     // Swallows Esc before the palette sees it: the palette stays open and focus never returns.
     script: 'window.addEventListener("keydown", (event) => { if (event.key === "Escape") event.stopImmediatePropagation(); }, true)',
   },
+  // Swallows Tab before the dialogs see it: focus walks out of the palette into the page.
+  "shortcut-trap": {
+    check: "shortcut",
+    page: "workbench",
+    into: "body",
+    html: "",
+    script: 'window.addEventListener("keydown", (event) => { if (event.key === "Tab") event.stopImmediatePropagation(); }, true)',
+  },
   depth: {
     check: "structure",
     page: "gallery",
@@ -554,15 +562,24 @@ const DRIVEN: Readonly<Record<Driven, (page: Page, name: PageName) => Promise<st
     if (PAGES[name].palette && (await openPalette(page))) out.push(...(await listArrows(page)));
     return out;
   },
-  // ⌘K opens the palette from wherever focus is, and Esc returns focus there.
+  // ⌘K opens the palette and ? the shortcut sheet from wherever focus is; Tab and Shift+Tab stay in
+  // each, and Esc closes it and returns focus there.
   shortcut: async (page, name) => {
     if (!PAGES[name].palette) return [];
-    const before = await hig<number | null>(page, "focusFirst");
-    if (before === null) return ["no control to focus before ⌘K"];
-    if (!(await openPalette(page))) return ["⌘K does not open the palette"];
-    await page.keyboard.press("Escape");
-    if (await hig<boolean>(page, "dialogOpen")) return ["Esc does not close the palette"];
-    return (await hig<number | null>(page, "focusedId")) === before ? [] : ["Esc does not return focus to the control that had it"];
+    for (const [what, key] of [["the palette", "ControlOrMeta+k"], ["the shortcut sheet", "?"]] as const) {
+      const before = await hig<number | null>(page, "focusFirst");
+      if (before === null) return [`no control to focus before ${key}`];
+      await page.keyboard.press(key);
+      if (!(await hig<boolean>(page, "dialogOpen"))) return [`${key} does not open ${what}`];
+      for (const tab of ["Tab", "Tab", "Shift+Tab", "Shift+Tab"]) {
+        await page.keyboard.press(tab);
+        if (!(await hig<boolean>(page, "dialogOpen"))) return [`${tab} leaves ${what}`];
+      }
+      await page.keyboard.press("Escape");
+      if (await hig<boolean>(page, "dialogOpen")) return [`Esc does not close ${what}`];
+      if ((await hig<number | null>(page, "focusedId")) !== before) return [`Esc does not return focus from ${what} to the control that had it`];
+    }
+    return [];
   },
   // Every toolbar action, disabled or not, is a ⌘K command. A toolbar with no actions passes, but
   // the walk must have looked: it saw every toolbar and every rendered button in each.

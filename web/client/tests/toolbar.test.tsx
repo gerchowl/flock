@@ -16,6 +16,7 @@ import { WIRE_PROTOCOL, type ConnectionState } from "../src/wire/connection";
 import { healthOf, type Health, type HostView } from "../src/workbench/HostStatus";
 import { CONNECTION_COPY } from "../src/workbench/refusals";
 import { SAMPLE_AGENTS } from "../src/workbench/samples";
+import { COMMAND, LAYER_COMMANDS } from "./keys-command";
 import { Workbench } from "../src/workbench/Workbench";
 import { readFixture } from "./fixture-replay";
 import { Harness, WELCOME, sentFrames, step } from "./wire/harness";
@@ -160,14 +161,14 @@ describe("the connection popover", () => {
 
   test("⌘K lists the connection actions as commands, and choosing Disconnect disconnects", async () => {
     const { root } = wireApp();
-    key(document, { key: "k", metaKey: true });
+    key(document, { key: "k", ...COMMAND });
     const commands = [...root.querySelectorAll('[data-testid="palette-command"]')] as HTMLElement[];
-    expect(commands.map((command) => command.firstElementChild?.textContent)).toEqual(["Connection to fixture.invalid", "Disconnect"]);
+    expect(commands.map((command) => command.firstElementChild?.textContent)).toEqual(["Connection to fixture.invalid", "Disconnect", ...LAYER_COMMANDS]);
     commands[1]?.click();
     expect([state(root), $(root, "palette")]).toEqual(["Disconnected", null]);
-    key(document, { key: "k", metaKey: true });
+    key(document, { key: "k", ...COMMAND });
     const reopen = [...root.querySelectorAll('[data-testid="palette-command"]')] as HTMLElement[];
-    expect(reopen.map((command) => command.firstElementChild?.textContent)).toEqual(["Connection to fixture.invalid", "Connect"]);
+    expect(reopen.map((command) => command.firstElementChild?.textContent)).toEqual(["Connection to fixture.invalid", "Connect", ...LAYER_COMMANDS]);
     reopen[0]?.click();
     await tick();
     expect($(root, "host-panel")?.hidden).toBe(false);

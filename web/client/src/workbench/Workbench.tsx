@@ -14,6 +14,11 @@
  * default placement, and the layout persists per server. No subject, kind
  * or placement field appears on screen.
  *
+ * The keyboard layer (`keys.ts`, #2904): ↑/↓ move through the sidebar's
+ * agents in the order it shows them, when focus is in the sidebar or on
+ * nothing; `?` opens the shortcut sheet; the palette lists the layer's
+ * commands beside the toolbar's.
+ *
  * Parts that are not built yet are hidden (§2a as amended by #2900). With
  * the `preview` prop (a development build, `preview.ts`) they show disabled, naming what they wait
  * for, never as buttons that do nothing. There is no *Terminal* action:
@@ -35,10 +40,12 @@ import { Transcript, type TranscriptSource } from "../views/Transcript";
 import type { InboxCard } from "./inbox";
 import { Composer, createComposerState, type Sender } from "./Composer";
 import { HEALTH_LABELS, HostStatus, type HostView } from "./HostStatus";
+import { SHORTCUTS, bindKeys, formatCombo, runPageShortcut } from "./keys";
 import { Palette, type PaletteCommand, type WaitingAction } from "./Palette";
 import { createPermissionInbox } from "./permissions";
 import { AgentTitle, InboxCards, Waits, createClosedIds } from "./parts";
 import { PhoneWorkbench } from "./Phone";
+import { ShortcutSheet } from "./ShortcutSheet";
 import { HOME_UNKNOWN, SidebarTrees } from "./Sidebar";
 import { buildTrees, homeNodeId, inScope } from "./trees";
 import { createWindowActive } from "./window-focus";
@@ -157,6 +164,30 @@ export function Workbench(props: WorkbenchProps): JSX.Element {
     manager.back();
     publish();
   };
+  /**
+   * Opens the agent `step` rows from the reference in the sidebar's order: the focused sidebar
+   * control, whose focus then follows; else the open agent's first row, counting each agent once
+   * (the two trees list it twice). With neither, ↓ opens the first and ↑ the last. It stops at the ends.
+   */
+  let nav: HTMLElement | undefined;
+  const stepAgent = (step: 1 | -1): void => {
+    if (nav === undefined) return;
+    const all = [...nav.querySelectorAll<HTMLElement>("[data-agent-id]")];
+    const active = document.activeElement;
+    const inside = active instanceof HTMLElement && nav.contains(active);
+    const rows = inside ? all : all.filter((row, index) => all.findIndex((other) => other.dataset["agentId"] === row.dataset["agentId"]) === index);
+    const from = inside ? active : rows.find((row) => row.dataset["agentId"] === focusedAgent());
+    const ahead = (row: HTMLElement): boolean => from === undefined || (from.compareDocumentPosition(row) & (step > 0 ? Node.DOCUMENT_POSITION_FOLLOWING : Node.DOCUMENT_POSITION_PRECEDING)) !== 0;
+    const next = step > 0 ? rows.find(ahead) : rows.filter(ahead).at(-1);
+    const id = next?.dataset["agentId"];
+    if (next === undefined || id === undefined) return;
+    openAgent(id);
+    if (inside) next.focus();
+  };
+  const moves = { "agent.previous": () => stepAgent(-1), "agent.next": () => stepAgent(1) };
+  onCleanup(bindKeys(document.body, moves));
+  /** The layer's commands, each run as its shortcut would be from the page. */
+  const keyCommands: PaletteCommand[] = SHORTCUTS.filter((entry) => entry.command).map((entry) => ({ label: entry.label, hint: formatCombo(entry.combo), run: () => void runPageShortcut(entry.id) }));
   const preview = (): boolean => props.preview === true;
   // The server's name: the home node's as the fleet sends it, else the connection's own.
   const hostName = (host: HostView): string => fleet.nodes.items().find((node) => node.node_id === home())?.name ?? host.name;
@@ -190,7 +221,7 @@ export function Workbench(props: WorkbenchProps): JSX.Element {
         <Palette
           rows={scoped}
           onOpen={openAgent}
-          commands={props.host === undefined ? [] : hostCommands(props.host)}
+          commands={[...(props.host === undefined ? [] : hostCommands(props.host)), ...keyCommands]}
           waiting={preview() ? [...TOOLBAR_WAITING, ...(focusedAgent() === null ? [] : PANE_ACTIONS)] : []}
         />
         <Cluster space={SPACE[2]}>
@@ -200,7 +231,7 @@ export function Workbench(props: WorkbenchProps): JSX.Element {
         </Cluster>
       </Cluster>
       {banners()}
-      <nav class="sidebar" aria-label="Agents" data-testid="sidebar">
+      <nav ref={(element) => ((nav = element), onCleanup(bindKeys(element, moves)))} class="sidebar" aria-label="Agents" data-testid="sidebar">
         <Show when={fleetNote()}>{(note) => <p class="sidebar__note">{note()}</p>}</Show>
         <Show when={rows().length > 0 || fleet.nodes.items().length > 0 || fleet.projects.items().length > 0}>
           <SidebarTrees trees={trees} home={home} prefs={prefs} setPrefs={setPrefs} stamp={fleet.nodes.stamp} now={now} focused={focusedAgent} open={openAgent} />
@@ -236,6 +267,7 @@ export function Workbench(props: WorkbenchProps): JSX.Element {
         <h2 class="inbox__title">Inbox</h2>
         <InboxCards cards={cards()} closed={closed} source={props.source} sender={props.sender} preview={preview()} />
       </aside>
+      <ShortcutSheet />
     </div>
   );
   return (

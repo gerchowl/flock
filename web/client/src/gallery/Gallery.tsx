@@ -15,6 +15,7 @@ import { Center, Cluster, Grid, Sidebar, Stack, Sticky, Switcher } from "../layo
 import { SPACE } from "../tokens";
 import { HEALTH_LABELS, HostStatus, type Health } from "../workbench/HostStatus";
 import { ErrorState, RefusalDetails, explain } from "../workbench/refusals";
+import { ShortcutList } from "../workbench/ShortcutSheet";
 import "./gallery.css";
 
 /** A refusal the server sends, worded in the shared map's plain words, its code behind Details. */
@@ -152,6 +153,10 @@ export function Gallery(): JSX.Element {
                 <Host health="off" />
                 <Host health="live" open />
               </Cluster>
+            </Stack>
+            <Stack as="section" space={SPACE[2]} aria-label="Shortcuts">
+              <h2>Shortcuts</h2>
+              <ShortcutList />
             </Stack>
             <Stack as="section" space={SPACE[2]} aria-label="Refusals">
               <h2>Refusals</h2>

@@ -274,8 +274,9 @@ so the required `client` CI check runs it on every change. One test per rule:
    equal the name in Chromium's accessibility tree, so the two cannot drift.
    ArrowDown moves the selection of every list widget,
    the palette's included, and a list with nothing to focus fails. ⌘K opens
-   the palette from wherever focus is, and Esc closes it and returns focus
-   there.
+   the palette and `?` the shortcut sheet from wherever focus is (`?` from
+   any but a text field); Tab and Shift+Tab stay inside each, and Esc closes
+   it and returns focus there.
    ([Keyboards](https://developer.apple.com/design/human-interface-guidelines/keyboards);
    [WCAG 2.2 SC 2.1.1, 2.4.7, 4.1.2](https://www.w3.org/TR/WCAG22/).)
 9. **Structure.** A sidebar's disclosure groups nest at most two deep. On
@@ -301,7 +302,7 @@ times out fails the run, and the browser's processes are killed and reaped
 either way.
 
 Every check, and each part of rules 4, 8 and 9, has a seeded violation in
-the test's `SEEDS` (28 in all: one below the fold, one only in dark mode,
+the test's `SEEDS` (29 in all: one below the fold, one only in dark mode, one swallowing Tab so focus walks out of a dialog,
 one hiding the page, one where the parity walk misses a toolbar's
 buttons, four icon buttons named only by a tooltip or a hidden icon's `<title>`, two label references whose text is hidden, one name walk that drifts from Chromium's). A test runs each check on its page with and without
 its seed and fails unless the seed adds a finding.
@@ -354,6 +355,14 @@ These follow the accepted redesign (#2903).
 - **Composer.** One field: the text area with the send icon button inside
   it at the trailing edge, then the agent's phase and the shortcut hint
   (⌘↩) under it. There is no Send button below.
+- **Keyboard** (#2904). `workbench/keys.ts` is the one registry of
+  shortcuts; the `?` sheet and the ⌘K palette list it, and its one listener
+  dispatches them. A screen binds what a shortcut does on an element
+  (`bindKeys`), never a key listener of its own. Labels write modifiers in
+  ⌃⌥⇧⌘ order; ⌘ is Ctrl off Apple platforms. A standard shortcut keeps its
+  meaning: in a text field the keys edit text, and ⌘↩/⌘⌫ answer a request
+  only on its focused card. Nothing fires while an input method is
+  composing (#2967).
 
 ## Layout
 
