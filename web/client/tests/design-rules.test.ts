@@ -13,7 +13,7 @@
  * test process carries happy-dom's globals (tests/setup.ts).
  */
 import { describe, expect, test } from "bun:test";
-import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, writeFile, rm, copyFile, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -36,10 +36,10 @@ async function run(args: string[], stdin?: string): Promise<Run> {
 const stylelint = (path: string, css: string): Promise<Run> => run(["x", "stylelint", "--config", "stylelint.config.js", "--config-basedir", ".", "--ignore-disables", "--stdin-filename", path], css);
 const eslint = (path: string, tsx: string): Promise<Run> => run(["x", "eslint", "--config", "eslint.config.js", "--stdin", "--stdin-filename", path], tsx);
 
-async function designTypes(source: string): Promise<Run> {
+async function designTypes(source: string, extension = "ts"): Promise<Run> {
   const root = await mkdtemp(join(CLIENT_ROOT, "node_modules/.cache/source-types-"));
   try {
-    const file = join(root, "probe.ts");
+    const file = join(root, `probe.${extension}`);
     await writeFile(file, `declare const el: HTMLElement;\n${source}`);
     return await run(["scripts/check-design-types.ts", file]);
   } finally { await rm(root, { recursive: true, force: true }); }
@@ -73,6 +73,60 @@ describe("stylelint strict values", () => {
   test("allows raw values in tokens.css only", async () => {
     expect((await stylelint("src/tokens.css", ":root { --space-1: 4px; }")).code).toBe(0);
     expect((await stylelint("src/layout/primitives/seeded.css", ":root { --space-1: 4px; }")).code).toBe(2);
+  });
+});
+
+describe("HTML injection is unavailable (#2937)", () => {
+  const svg = '<svg xmlns="http://www.w3.org/2000/svg"><rect fill="#b31739" width="12" height="12"/></svg>';
+  const probe = `const svg = ${JSON.stringify(svg)}; document.body.appendChild(<div innerHTML={svg}/> as Node);`;
+  test.each([
+    ["exact SVG probe", probe],
+    ["JSX outerHTML", '<div outerHTML="<svg/>"/>'],
+    ["innerHTML assignment", 'el.innerHTML = "<svg/>"'],
+    ["outerHTML assignment", 'el.outerHTML = "<svg/>"'],
+    ["insertAdjacentHTML", 'el.insertAdjacentHTML("beforeend", "<svg/>")'],
+    ["DOMParser", 'new DOMParser().parseFromString("<svg/>", "image/svg+xml")'],
+    ["Range", 'document.createRange().createContextualFragment("<svg/>")'],
+    ["document.write", 'document.write("<svg/>")'],
+    ["document.writeln", 'document.writeln("<svg/>")'],
+    ["modern element parser", 'el.setHTMLUnsafe("<svg/>")'],
+    ["modern document parser", 'Document.parseHTMLUnsafe("<svg/>")'],
+    ["JSX spread", 'const props = {innerHTML: "<svg/>"}; <div {...props}/>'],
+    ["JSX property directive", '<div prop:innerHTML="<svg/>"/>'],
+    ["JSX property directive spread", 'const props = {id: "probe", "prop:innerHTML": "<svg/>"}; <div {...props}/>'],
+    ["computed assignment", 'el["inner" + "HTML"] = "<svg/>"'],
+    ["aliased parser", 'const parse = new DOMParser().parseFromString; parse("<svg/>", "image/svg+xml")'],
+  ])("rejects %s through lint and types", async (_name, source) => {
+    const lint = await eslint("src/Probe.tsx", source);
+    const types = await designTypes(source, "tsx");
+    expect({ lint: lint.code, types: types.code }).toEqual({ lint: 1, types: 1 });
+  });
+
+  test.each([false, true])("rejects markup in the shipped graph (imported spread=%s)", async (spread) => {
+    const root = await mkdtemp(join(tmpdir(), "design-markup-"));
+    try {
+      await mkdir(join(root, "src"));
+      await symlink(join(CLIENT_ROOT, "node_modules"), join(root, "node_modules"), "dir");
+      await writeFile(join(root, "vite.config.ts"), `export { default } from ${JSON.stringify(join(CLIENT_ROOT, "vite.config.ts"))}`);
+      await writeFile(join(root, "index.html"), '<script type="module" src="/src/main.tsx"></script>');
+      await writeFile(join(root, "src/props.ts"), `export const props = {innerHTML: ${JSON.stringify(svg)}}`);
+      await writeFile(join(root, "src/main.tsx"), spread
+        ? 'import { props } from "./props"; document.body.appendChild(<div {...props}/> as Node)'
+        : probe);
+      const result = await run(["run", "build", root]);
+      expect({ code: result.code, output: result.output }).toMatchObject({ code: 1 });
+      expect(result.output).toContain("HTML markup injection is disallowed");
+    } finally { await rm(root, { recursive: true, force: true }); }
+  }, 30_000);
+
+  test("rejects markup payloads passed to Object.assign", async () => {
+    expect((await eslint("src/Probe.tsx", 'Object.assign(document.body, {innerHTML: "<svg/>"})')).code).toBe(1);
+  });
+
+  test("allows text and node construction and ordinary writers", async () => {
+    const source = 'el.textContent = "<svg/>"; el.appendChild(document.createElement("div")); const log = {write(text: string) { return text }}; log.write("text")';
+    expect((await eslint("src/Probe.tsx", source)).code).toBe(0);
+    expect((await designTypes(source)).code).toBe(0);
   });
 });
 
@@ -151,6 +205,10 @@ describe("lint what ships (#2933)", () => {
 describe("shipped CSS graph (#2933)", () => {
   test.each([
     ["pcss", "src/probe.pcss", ".a { color: red; }", false],
+    ["paint declaration", "vendor/probe.css", ".a { fill: red; }", false],
+    ["registered property", "vendor/probe.css", '@property --p { syntax: "*"; inherits: false; initial-value: flex; } .a { display: var(--p); }', false],
+    ["resolved fence", "vendor/probe.css", ".a { --p: var(--font-family-system); display: var(--p); }", false],
+    ["transitive category", "vendor/probe.css", ".a { --x: var(--y); --y: var(--font-size-13); padding: var(--x); }", false],
     ["raw graph import", "src/probe.txt?raw", ".a { color: inherit; }", false],
     ["inline graph import", "src/probe.css?inline", ".a { color: inherit; }", false],
     ["dependency CSS", "node_modules/evilpkg/style.css", ".nm{color:red;margin:13px;display:flex;position:absolute}", false],
@@ -279,6 +337,224 @@ describe("fix round 1 typed capabilities", () => {
       expect(result.code).toBe(1);
       expect(result.output).toMatch(/error TS/);
       expect(result.output).toContain("probe.ts");
+    } finally { await rm(root, { recursive: true, force: true }); }
+  }, 30_000);
+});
+
+
+describe("declaration and fence seeds (#2937)", () => {
+  test.each([
+    ["5 fill", ".a { fill: #ff0000; }"],
+    ["5 stroke", ".a { stroke: red; }"],
+    ["5 text shadow", ".a { text-shadow: 1px 2px red; }"],
+    ["5 filter", ".a { filter: drop-shadow(1px 2px red); }"],
+    ["5 text stroke", ".a { -webkit-text-stroke: 1px red; }"],
+    ["6 font", ".a { font: 14px/1.3 Comic Sans MS; }"],
+    ["7 fallback", ".a { padding: var(--space-1, 13px); }"],
+    ["7 undefined", ".a { color: var(--nope); }"],
+    ["7 undefined token", ".a { padding: var(--space-999); }"],
+    ["8 inherited display", ".a { display: inherit; }"],
+    ["8 inherited position", ".a { position: inherit; }"],
+    ["8 reverted display", ".a { display: revert-layer; }"],
+    ["8 fixed", ".a { position: fixed; }"],
+    ["8 sticky", ".a { position: sticky; }"],
+    ["8 table", ".a { display: table; }"],
+    ["8 contents", ".a { display: contents; }"],
+    ["8 vendor box", ".a { display: -webkit-box; }"],
+    ["8 float", ".a { float: left; }"],
+    ["8 columns", ".a { columns: 2; }"],
+    ["8 inset", ".a { inset: 0; }"],
+    ["8 top", ".a { top: 0; }"],
+    ["8 translate", ".a { translate: 1px; }"],
+    ["8 container", "@container (width > 1px) { .a { color: inherit; } }"],
+    ["8 supports", "@supports (display: grid) { .a { color: inherit; } }"],
+    ["8 import", '@import "other.css" screen and (max-width: 10px);'],
+    ["12 property", '@property --p { syntax: "<length>"; inherits: false; initial-value: 13px; } .a { padding: var(--p); }'],
+    ["12 resolved display", ".a { --d: var(--font-family-system); display: var(--d); }"],
+    ["12 keyword display", ".a { --d: auto; display: var(--d); }"],
+    ["14 padding", ".a { padding: var(--font-size-13); }"],
+    ["14 font size", ".a { font-size: var(--space-2); }"],
+    ["14 transitive", ".a { --a: var(--b); --b: var(--font-size-13); padding: var(--a); }"],
+    ["14 colour", ".a { color: var(--space-2); }"],
+    ["14 radius", ".a { border-radius: var(--space-2); }"],
+    ["14 layer", ".a { z-index: var(--space-2); }"],
+    ["legacy colour", ".a { color: var(--color-legacy-fg); }"],
+    ["legacy alias", ".a { --x: var(--color-legacy-fg); color: var(--x); }"],
+  ])("rejects bypass %s", async (_name, css) => {
+    const result = await stylelint("src/probe.css", css);
+    expect({ code: result.code, output: result.output }).toMatchObject({ code: 2 });
+  });
+
+  test.each([
+    ["cyclic aliases", ".a { --a: var(--b); --b: var(--a); padding: var(--a); }"],
+    ["alternative alias category", ".a { --x: var(--space-2); padding: var(--x); } .b { --x: var(--font-size-13); }"],
+    ["logical spacing", ".a { padding-inline-start: var(--font-size-13); }"],
+    ["font family category", ".a { font-family: var(--color-label-primary); }"],
+    ["font weight category", ".a { font-weight: var(--space-2); }"],
+    ["border width category", ".a { border-width: var(--space-2); }"],
+    ["border colour category", ".a { border-color: var(--border-width-thin); }"],
+    ["shadow colour category", ".a { text-shadow: var(--font-size-13); }"],
+    ["filter fallback", ".a { filter: drop-shadow(var(--space-1, 13px) 0 red); }"],
+    ["resolved fixed", ".a { --p: var(--x); --x: auto; position: var(--p); }"],
+    ["case normalized", ".a { DISPLAY: TABLE; }"],
+    ["escaped display", String.raw`.a { displa\79: table; }`],
+  ])("rejects %s", async (_name, css) => {
+    expect((await stylelint("src/probe.css", css)).code).toBe(2);
+  });
+  test("validates references inside LEGACY and layout files too", async () => {
+    for (const file of ["src/styles.css", "src/layout/primitives/seeded.css"]) {
+      expect((await stylelint(file, ".a { color: var(--missing); }")).code).toBe(2);
+      expect((await stylelint(file, '@property --x { syntax: "*"; initial-value: flex; }')).code).toBe(2);
+    }
+    expect((await stylelint("src/styles.css", ".a { color: var(--color-legacy-fg); }")).code).toBe(0);
+    expect((await stylelint("src/layout/primitives/seeded.css", ".a { gap: var(--font-size-13); }")).code).toBe(2);
+  });
+
+  test.each(["fill", "stroke", "color"])("rejects JSX %s", async (prop) => {
+    expect((await eslint("src/Probe.tsx", `<svg><rect ${prop}="#ff0000" /></svg>`)).code).toBe(1);
+  });
+
+  test.each([
+    '<rect fill={"red"} />',
+    '<rect attr:fill="red" />',
+    'const paint = "red"; <rect stroke={paint} />',
+    '<rect {...{color: "red"}} />',
+    'const props = {["fi" + "ll"]: "red"}; <rect {...props} />',
+  ])("rejects indirect JSX paint %s", async (source) => {
+    expect((await eslint("src/Probe.tsx", source)).code).toBe(1);
+  });
+  test.each([
+    '<rect fill="none" stroke="currentColor" />',
+    '<rect fill={"currentColor"} />',
+    '<rect {...{fill: "none"}} />',
+    'const data = {color: "red"}; export {data}',
+  ])("accepts paint keywords and ordinary data %s", async (source) => {
+    expect((await eslint("src/Probe.tsx", source)).code).toBe(0);
+  });
+  test.each(["gap", "margin", "padding"])("checks %s category inside layout", async (prop) => {
+    expect((await stylelint("src/layout/primitives/seeded.css", `.a { ${prop}: var(--font-size-13); }`)).code).toBe(2);
+    expect((await stylelint("src/layout/primitives/seeded.css", `.a { ${prop}: var(--space-2); }`)).code).toBe(0);
+  });
+
+  test.each([
+    ".a { --a: var(--b); --b: var(--space-2); padding: var(--a); }",
+    ".a { display: block; position: relative; }",
+    ".a { --d: none; display: var(--d); }",
+    ".a { backdrop-filter: blur(var(--space-5)); filter: drop-shadow(var(--space-1) 0 var(--color-label-primary)); }",
+    ".a { fill: currentColor; stroke: var(--color-label-primary); text-shadow: none; filter: none; }",
+  ])("accepts valid declaration %s", async (css) => {
+    expect(await stylelint("src/probe.css", css)).toEqual({ code: 0, output: "" });
+  });
+});
+
+
+test("fenced token values are checked in every generated mode", async () => {
+  const root = await mkdtemp(join(CLIENT_ROOT, "node_modules/.cache/token-modes-"));
+  try {
+    await mkdir(join(root, "scripts"));
+    await mkdir(join(root, "src"));
+    await copyFile(join(CLIENT_ROOT, "scripts/stylelint-reserved-tokens.js"), join(root, "scripts/stylelint-reserved-tokens.js"));
+    await writeFile(join(root, "config.json"), JSON.stringify({
+      plugins: ["./scripts/stylelint-reserved-tokens.js"], rules: { "flock/design-values": true },
+    }));
+    for (const [prop, safe, forbidden] of [["display", "block", "flex"], ["position", "relative", "fixed"]]) {
+      const lint = () => run(["x", "stylelint", "--config", join(root, "config.json"), "--config-basedir", root,
+        "--stdin-filename", "src/probe.css"], `.a { ${prop}: var(--layout-value); }`);
+      await writeFile(join(root, "src/tokens.css"), `:root {\n  --layout-value: ${safe};\n}
+@media (prefers-color-scheme: dark) { :root {\n  --layout-value: ${forbidden};\n} }
+@media (prefers-contrast: more) { :root {\n  --layout-value: ${safe};\n} }`);
+      const rejected = await lint();
+      expect(rejected.code).toBe(2);
+      expect(rejected.output).toContain(`Resolved ${prop} is disallowed`);
+      await writeFile(join(root, "src/tokens.css"), `:root {\n  --layout-value: ${safe};\n}`);
+      expect((await lint()).code).toBe(0);
+    }
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+
+describe("review paint and calc boundaries (#2937)", () => {
+  test.each([false, true])("checks imported JSX paint through types (keyword=%s)", async (keyword) => {
+    const root = await mkdtemp(join(CLIENT_ROOT, "node_modules/.cache/paint-types-"));
+    try {
+      await writeFile(join(root, "paint.ts"), keyword
+        ? 'export const paints = { fill: "none", stroke: "currentColor" } as const'
+        : 'export const paints = { fill: "#ac1234", stroke: "#321abc" }');
+      const entry = join(root, "probe.tsx");
+      await writeFile(entry, 'import { paints } from "./paint"; export const Probe = () => <svg><rect {...paints} /></svg>');
+      const result = await run(["scripts/check-design-types.ts", entry]);
+      expect({ code: result.code, output: result.code === 0 ? "" : result.output }).toMatchObject({ code: keyword ? 0 : 1 });
+      if (!keyword) expect(result.output).toContain("fill");
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
+  test.each([
+    ["embedded style", '<style>rect { color:#ac1234; fill:currentColor; stroke:#321abc }</style><rect width="10" height="10"/>'],
+    ["presentation attribute", '<rect fill="#ac1234" width="10" height="10"/>'],
+  ])("rejects imported SVG %s in the build", async (_name, content) => {
+    const root = await mkdtemp(join(tmpdir(), "design-svg-"));
+    try {
+      await mkdir(join(root, "src"));
+      await writeFile(join(root, "index.html"), '<script type="module" src="/src/main.ts"></script>');
+      await writeFile(join(root, "src/main.ts"), 'import image from "./probe.svg"; const img = document.createElement("img"); img.src = image; document.body.appendChild(img)');
+      await writeFile(join(root, "src/probe.svg"), `<svg xmlns="http://www.w3.org/2000/svg">${content}</svg>`);
+      const result = await run(["run", "build", root]);
+      expect({ code: result.code, output: result.output }).toMatchObject({ code: 1 });
+      expect(result.output).toContain("design SVG");
+    } finally { await rm(root, { recursive: true, force: true }); }
+  }, 30_000);
+
+  test("accepts a resolvable same-category calc", async () => {
+    expect(await stylelint("src/probe.css", ".a { padding: calc(var(--space-2) + var(--space-3)); }")).toEqual({ code: 0, output: "" });
+  });
+
+  test.each([
+    ".a { padding: calc(var(--space-2) + 3px); }",
+    ".a { padding: calc(var(--space-2) + var(--font-size-13)); }",
+    ".a { padding: calc(var(--space-2) / 3); }",
+    ".a { padding: calc(var(--space-2) + var(--missing)); }",
+    ".a { padding: calc(var(--space-2, 3px) + var(--space-3)); }",
+    ".a { padding: calc(var(--space-2) + var(--space-3)) red; }",
+    ".a { padding: calc(var(--space-2) + var(--space-3); }",
+  ])("rejects an unprovable calc: %s", async (css) => {
+    expect((await stylelint("src/probe.css", css)).code).toBe(2);
+  });
+
+  test("accepts nested sums and local aliases", async () => {
+    expect((await stylelint("src/probe.css", ".a { --p: var(--space-2); padding: calc((var(--p) + var(--space-3)) - var(--space-1)); }")).code).toBe(0);
+  });
+
+  test.each([false, true])("checks cross-file JSX paint in a real build (raw=%s)", async (raw) => {
+    const root = await mkdtemp(join(tmpdir(), "design-paint-"));
+    try {
+      await mkdir(join(root, "src"));
+      await symlink(join(CLIENT_ROOT, "node_modules"), join(root, "node_modules"), "dir");
+      await writeFile(join(root, "vite.config.ts"), `export { default } from ${JSON.stringify(join(CLIENT_ROOT, "vite.config.ts"))}`);
+      await writeFile(join(root, "index.html"), '<script type="module" src="/src/main.tsx"></script>');
+      await writeFile(join(root, "src/paint.ts"), raw
+        ? 'export const paints = { fill: "#ac1234", stroke: "#321abc" }'
+        : 'export const paints = { fill: "none", stroke: "currentColor" } as const');
+      await writeFile(join(root, "src/main.tsx"), 'import { paints } from "./paint"; export const Probe = () => <svg><rect {...paints}/></svg>; console.log(Probe)');
+      const result = await run(["run", "build", root]);
+      expect({ code: result.code, output: result.code === 0 ? "" : result.output }).toMatchObject({ code: raw ? 1 : 0 });
+      if (raw) expect(result.output).toContain("design source types");
+    } finally { await rm(root, { recursive: true, force: true }); }
+  }, 30_000);
+
+  test.each(["public", "new URL", "mutated brand"])("rejects SVG via %s", async (kind) => {
+    const root = await mkdtemp(join(tmpdir(), "design-svg-"));
+    try {
+      await mkdir(join(root, "src"));
+      await mkdir(join(root, "public"));
+      await writeFile(join(root, "index.html"), '<script type="module" src="/src/main.ts"></script>');
+      await writeFile(join(root, "src/main.ts"), kind === "public" ? 'console.log("probe")' :
+        'console.log(new URL("./favicon.svg", import.meta.url).href)');
+      const logo = await Bun.file(join(CLIENT_ROOT, "src/favicon.svg")).text();
+      await writeFile(join(root, kind === "public" ? "public/probe.svg" : "src/favicon.svg"),
+        kind === "mutated brand" ? logo.replace("#d9dad8", "#ac1234") : '<svg xmlns="http://www.w3.org/2000/svg"><style>rect { fill: red }</style></svg>');
+      const result = await run(["run", "build", root]);
+      expect({ code: result.code, output: result.output }).toMatchObject({ code: 1 });
+      expect(result.output).toContain("design SVG");
     } finally { await rm(root, { recursive: true, force: true }); }
   }, 30_000);
 });

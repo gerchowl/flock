@@ -1,5 +1,6 @@
 /** Lint the CSS Vite actually loads, preserving each stylesheet's authority. */
-import { mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { basename, isAbsolute, relative, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -10,6 +11,15 @@ import { build } from "vite";
 
 type VendorCSS = { readonly path: `node_modules/${string}.css`; readonly issue: `#${number}` };
 const VENDOR_CSS: readonly VendorCSS[] = [];
+
+// Icons belong to the checked JSX catalogue, not independently styled images.
+// The existing standalone brand mark is immutable here, including its paints.
+const BRAND_SVG_SHA256 = "5bb51f73c83259ae8ca12a66390b70e125656d4ed77b61c15219a88718f1fec5";
+function lintSVG(source: string | Uint8Array): void {
+  if (createHash("sha256").update(source).digest("hex") !== BRAND_SVG_SHA256) {
+    throw new Error("design SVG: use the checked JSX icon catalogue; only the reviewed brand asset may ship as SVG");
+  }
+}
 
 const client = fileURLToPath(new URL("..", import.meta.url));
 const eslint = new ESLint({ cwd: client, overrideConfigFile: resolve(client, "eslint.config.js") });
@@ -77,15 +87,25 @@ async function lintGraph(root: Root): Promise<void> {
 }
 
 const modules = new Set<string>();
+const svgAssets: Uint8Array[] = [];
+let publicDir: string | false = false;
 try {
 await build({
   root: rootDir,
   mode: process.argv.includes("--fixture") ? "fixture" : "production",
+  build: { assetsInlineLimit(file, content) {
+    // Vite catches errors thrown while resolving new URL() and leaves the URL
+    // for runtime. Retain the bytes and reject in generateBundle instead.
+    if (/\.svg$/i.test(file)) svgAssets.push(content);
+    return false; // Preserve the production CSP's same-origin asset policy.
+  } },
   plugins: [{
     name: "flock-design-source",
     enforce: "pre",
+    configResolved(config) { publicDir = config.publicDir; },
     async transform(_code, id) {
       const file = id.split("?")[0]!;
+      if (isAbsolute(file) && /\.svg$/i.test(file)) lintSVG(await readFile(file));
       if (!isAbsolute(file) || !/\.[cm]?[jt]sx?$/.test(file) || file.includes("/node_modules/")) return;
       modules.add(file);
       const path = relative(rootDir, file);
@@ -95,7 +115,18 @@ await build({
         throw new Error(`design source: ${file}\n${results.flatMap((result) => result.messages.map((message) => message.message)).join("\n")}`);
       }
     },
-    async generateBundle() {
+    async generateBundle(_options, bundle) {
+      for (const source of svgAssets) lintSVG(source);
+      for (const asset of Object.values(bundle)) {
+        if (asset.type === "asset" && /\.svg$/i.test(asset.fileName)) lintSVG(asset.source);
+      }
+      // Vite copies public files without adding them to its module/asset graph.
+      if (publicDir) for (const file of await readdir(publicDir, { recursive: true }).catch((error: NodeJS.ErrnoException) => {
+        if (error.code === "ENOENT") return [];
+        throw error;
+      })) {
+        if (/\.svg$/i.test(file)) lintSVG(await readFile(resolve(publicDir, file)));
+      }
       if (modules.size) {
         const child = Bun.spawn([process.execPath, resolve(client, "scripts/check-design-types.ts"), ...modules], { cwd: client, stdout: "pipe", stderr: "pipe" });
         const output = await new Response(child.stdout).text() + await new Response(child.stderr).text();
