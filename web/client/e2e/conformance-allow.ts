@@ -30,13 +30,6 @@ export type Allowance = {
 export const ALLOWED: readonly Allowance[] = [
   {
     rule: "typography",
-    selector: "body",
-    pages: ["workbench"],
-    issue: 2913,
-    why: "the legacy styles.css sets 14 px body text on desktop",
-  },
-  {
-    rule: "typography",
     selector: ".mark__count",
     pages: ["workbench"],
     issue: 2913,
@@ -45,13 +38,6 @@ export const ALLOWED: readonly Allowance[] = [
   {
     rule: "hit-size",
     selector: ".group__head",
-    pages: ["workbench"],
-    issue: 2913,
-    why: "the legacy workbench.css stacks these rows with no gap (0.0 px from a neighbour)",
-  },
-  {
-    rule: "hit-size",
-    selector: '[data-testid="agent-row"]',
     pages: ["workbench"],
     issue: 2913,
     why: "the legacy workbench.css stacks these rows with no gap (0.0 px from a neighbour)",
@@ -195,34 +181,6 @@ export const ALLOWED: readonly Allowance[] = [
     pages: ["workbench"],
     issue: 2913,
     why: "the legacy styles.css spaces it in rem on a 14 px root (margin-top 7 px)",
-  },
-  {
-    rule: "grid",
-    selector: '[data-testid="composer"]',
-    pages: ["workbench"],
-    issue: 2913,
-    why: "the legacy workbench.css spaces it in rem on a 14 px root (padding-top 7 px)",
-  },
-  {
-    rule: "grid",
-    selector: ".composer__sent",
-    pages: ["workbench"],
-    issue: 2913,
-    why: "the legacy workbench.css spaces it in rem on a 14 px root (row-gap 3.5 px)",
-  },
-  {
-    rule: "grid",
-    selector: ".composer__input",
-    pages: ["workbench"],
-    issue: 2913,
-    why: "the legacy workbench.css spaces it in rem on a 14 px root (padding-top 7 px)",
-  },
-  {
-    rule: "grid",
-    selector: ".composer__footer",
-    pages: ["workbench"],
-    issue: 2913,
-    why: "the legacy workbench.css spaces it in rem on a 14 px root (row-gap 14 px)",
   },
   {
     rule: "grid",

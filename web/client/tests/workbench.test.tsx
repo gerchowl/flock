@@ -817,8 +817,37 @@ describe("composer", () => {
     expect(textarea(root).value).toBe("");
     ($$(root, "agent-row")[0] as HTMLButtonElement).click();
     expect(textarea(root).value).toBe("half a thought");
-    expect($(root, "send-hint")?.textContent).toMatch(/^(⌘|Ctrl) \+ Enter to send$/);
-    expect(["MacIntel", "Win32"].map(sendHint)).toEqual(["⌘ + Enter to send", "Ctrl + Enter to send"]);
+    expect($(root, "send-hint")?.textContent).toMatch(/^(⌘↩|Ctrl\+Enter) to send$/);
+    expect(["MacIntel", "Win32"].map(sendHint)).toEqual(["⌘↩ to send", "Ctrl+Enter to send"]);
+  });
+
+  test("it is one field: the send button is a named icon inside it, and ⌘↩ sends", async () => {
+    const sent: string[] = [];
+    const root = mount(() => (
+      <Workbench
+        fleet={createFixtureFleet(rows)}
+        transport={createFixtureTransport("")}
+        inbox={[]}
+        sender={{ ...sender, send: (_agent, text) => (sent.push(text), "c1") }}
+        layout={emptyLayout()}
+        saveLayout={() => undefined}
+        source="live"
+      />
+    ));
+    await tick();
+    ($$(root, "agent-row")[0] as HTMLButtonElement).click();
+    const field = $(root, "composer-field");
+    const buttons = [...($(root, "composer")?.querySelectorAll("button") ?? [])];
+    // The only button is the send icon, inside the field beside the text area: no Send button below it.
+    expect(buttons.map((button) => button.getAttribute("data-testid"))).toEqual(["send"]);
+    expect(field?.contains(textarea(root)) && field.contains(buttons[0]!)).toBe(true);
+    expect(buttons[0]?.getAttribute("aria-label")).toBe("Send");
+    expect(buttons[0]?.textContent).toBe("");
+    expect(buttons[0]?.querySelector('svg[aria-hidden="true"]')?.getAttribute("data-icon")).toBe("send");
+    textarea(root).value = "ship it";
+    textarea(root).dispatchEvent(new InputEvent("input", { bubbles: true }));
+    textarea(root).dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", metaKey: true, bubbles: true }));
+    expect(sent).toEqual(["ship it"]);
   });
 });
 

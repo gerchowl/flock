@@ -121,14 +121,65 @@ export function installChecks(): void {
     const [hi, lo] = [luminance(a), luminance(b)].sort((x, y) => y - x);
     return (hi! + 0.05) / (lo! + 0.05);
   };
+  /**
+   * A subtree's text as the accessibility tree has it, at any depth (accname
+   * 1.2, name from content). Nothing under `aria-hidden` or unrendered counts,
+   * an SVG `<title>` in a hidden icon included. For a name, an element's
+   * `aria-label` stands in for its content and a shown SVG gives its `<title>`;
+   * for `words`, only text a sighted reader sees counts, so labels and titles
+   * do not. As in Chromium, an element that is not inline is set off by
+   * spaces, and CSS `::before` and `::after` text counts.
+   */
+  /** An element's CSS-generated text before or after it (a quoted `content` string, set off by spaces when not inline), else nothing. */
+  const generated = (el: Element, pseudo: "::before" | "::after"): string => {
+    const style = getComputedStyle(el, pseudo);
+    if (!/^".*"$/s.test(style.content)) return "";
+    const text = style.content.slice(1, -1);
+    return style.display.startsWith("inline") ? text : ` ${text} `;
+  };
+  const contentText = (node: Node, words: boolean): string => {
+    if (node.nodeType === Node.TEXT_NODE) return node.textContent ?? "";
+    if (!(node instanceof Element) || node.getAttribute("aria-hidden") === "true") return "";
+    if ((node instanceof HTMLElement || node instanceof SVGSVGElement) && !node.checkVisibility({ visibilityProperty: true })) return "";
+    const tag = node.tagName.toLowerCase();
+    if (node instanceof SVGElement && (tag === "title" || tag === "desc")) return "";
+    const text = ((): string => {
+      const label = node.getAttribute("aria-label")?.trim();
+      if (!words && label) return label;
+      if (!words && node instanceof SVGSVGElement) {
+        const title = [...node.children].find((child) => child.tagName.toLowerCase() === "title");
+        if (title?.textContent?.trim()) return title.textContent;
+      }
+      if (node instanceof HTMLImageElement) return words ? "" : node.alt;
+      const inner = [...node.childNodes].map((child) => contentText(child, words)).join("");
+      return node instanceof HTMLElement ? `${generated(node, "::before")}${inner}${generated(node, "::after")}` : inner;
+    })();
+    const display = css(node).display;
+    return display.startsWith("inline") || display === "contents" ? text : ` ${text} `;
+  };
+  /** The words a control shows, without its hidden decoration (an icon's glyph). */
+  const ownText = (el: Element): string => contentText(el, true).trim();
+  /** Whether an element is out of the accessibility tree: under `aria-hidden`, or not rendered. */
+  const hiddenFromTree = (el: Element): boolean => el.closest('[aria-hidden="true"]') !== null || !shown(el);
+  /**
+   * The text of the elements `aria-labelledby` names, or null when it names
+   * none. Each reference is read through the same walk as content, so its
+   * hidden descendants add nothing; a reference that is itself hidden still
+   * gives all its text (accname 1.2 step 2A).
+   */
+  const labelledBy = (el: Element): string | null => {
+    const ids = el.getAttribute("aria-labelledby")?.split(/\s+/).filter(Boolean) ?? [];
+    const refs = ids.flatMap((id) => document.getElementById(id) ?? []);
+    const text = refs.map((ref) => (hiddenFromTree(ref) ? ref.textContent ?? "" : contentText(ref, false))).join(" ").trim();
+    return refs.length > 0 && text !== "" ? text : null;
+  };
+  /** The accessible name: aria-labelledby, aria-label, a label, the content, then the tooltip. */
   const name = (el: Element): string => {
-    const labelled = el.getAttribute("aria-labelledby");
-    const label = el.getAttribute("aria-label") ?? (labelled ? document.getElementById(labelled)?.textContent : null);
+    const label = labelledBy(el) ?? (el.getAttribute("aria-label")?.trim() || null);
     if (label) return label;
     const labels = (el as HTMLInputElement).labels;
     if (labels && labels.length > 0) return [...labels].map((each) => each.textContent).join(" ");
-    const visible = [...el.childNodes].filter((node) => !(node instanceof Element && node.closest('[aria-hidden="true"]')));
-    return visible.map((node) => node.textContent ?? "").join("").trim() || (el.getAttribute("title") ?? "");
+    return contentText(el, false).trim() || (el.getAttribute("title") ?? "");
   };
   const report = (rule: string, hits: Hit[]): { rule: string; where: string; detail: string; el: Element }[] =>
     hits.map((hit) => ({ rule, where: where(hit.el), detail: hit.detail, el: hit.el }));
@@ -258,10 +309,17 @@ export function installChecks(): void {
       }
       return hits;
     },
-    keyboard: () =>
-      interactive()
-        .filter((el) => !/[\p{L}\p{N}]/u.test(name(el)))
-        .map((el) => ({ el, detail: `control has no accessible name (${JSON.stringify(name(el))})` })),
+    keyboard: () => {
+      const named = /[\p{L}\p{N}]/u;
+      const hits: Hit[] = [];
+      for (const el of interactive()) {
+        if (!named.test(name(el))) hits.push({ el, detail: `control has no accessible name (${JSON.stringify(name(el))})` });
+        // An icon-only control (#2903) shows no words, so an aria-label names it: a tooltip (`title`) is not a name.
+        else if (!named.test(ownText(el)) && !named.test(labelledBy(el) ?? "") && !named.test(el.getAttribute("aria-label") ?? "") && !(el as HTMLInputElement).labels?.length)
+          hits.push({ el, detail: "icon-only control without an aria-label" });
+      }
+      return hits;
+    },
     structure: () => {
       const hits: Hit[] = [];
       for (const head of document.querySelectorAll('nav [aria-expanded], [role="navigation"] [aria-expanded]')) {
@@ -355,6 +413,13 @@ export function installChecks(): void {
         reduced: matchMedia("(prefers-reduced-motion: reduce)").matches,
       }),
       commands: () => [...document.querySelectorAll('[role="dialog"] [role="option"]')].map((el) => el.textContent ?? ""),
+      // Every control the walk visits, with the name it computes, tagged so the test can find each
+      // in Chromium's accessibility tree and compare the two names.
+      names: () =>
+        interactive().map((el) => {
+          el.setAttribute("data-hig-name", String(idOf(el)));
+          return { id: idOf(el), where: where(el), name: name(el) };
+        }),
       dialogOpen: () => [...document.querySelectorAll('[role="dialog"]')].some(shown) && document.activeElement?.closest('[role="dialog"]') !== null,
     },
   });

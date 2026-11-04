@@ -9,6 +9,7 @@
  */
 import { Show, createEffect, createUniqueId, on, onCleanup, type JSX } from "solid-js";
 
+import { Icon } from "../components/Icon";
 import { Anchor, AnchorPanel, Stack } from "../layout/primitives";
 import { SPACE } from "../tokens";
 import type { ConnectionState } from "../wire/connection";
@@ -108,8 +109,8 @@ export function HostStatus(props: HostStatusProps): JSX.Element {
           <circle cx="5" cy="5" r="4" />
         </svg>
         <span class="host__name">{props.name}</span>
-        <span class="host__chevron" aria-hidden="true">
-          ▾
+        <span class="host__chevron">
+          <Icon name="chevron-down" size={12} />
         </span>
       </button>
       <AnchorPanel ref={panel} as="section" id={panelId} class="host__panel" aria-label={`Connection to ${props.name}`} hidden={!props.open()} data-testid="host-panel">

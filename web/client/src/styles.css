@@ -18,6 +18,13 @@ body {
   overflow-wrap: anywhere;
 }
 
+/* 13 px body text on desktop (HIG Typography; #2903). The root stays 14 px:
+   it is the rem the legacy spacing is written in, until #2913 replaces it
+   with tokens. */
+body {
+  font-size: var(--font-size-13);
+}
+
 /* A shortcut label (the palette's ⌘K) is in the system font, like a menu's. */
 kbd {
   font-family: inherit;
@@ -29,7 +36,7 @@ kbd {
   outline-offset: 2px;
 }
 
-/* ADR-0038 §2a: 14 px body text on desktop, 15 px below the phone breakpoint. */
+/* ADR-0038 §2a: 15 px body text below the phone breakpoint. */
 @media (max-width: 767.98px) {
   html,
   body {
@@ -100,11 +107,11 @@ kbd {
   white-space: pre-wrap;
 }
 
-/* Collapsed blocks: the summary is the touch target (at least 44 px). */
+/* Collapsed blocks: the summary is a regular control (44 px on a phone, workbench.css). */
 details > summary {
   display: flex;
   align-items: center;
-  min-height: 44px;
+  min-height: var(--size-control);
   cursor: pointer;
   list-style: none;
 }
@@ -169,7 +176,7 @@ details > summary::-webkit-details-marker {
 }
 
 .transcript__fold {
-  min-height: 44px;
+  min-height: var(--size-control);
   border: var(--border-width-thin) dashed var(--color-legacy-border);
   border-radius: var(--radius-small);
   background: none;

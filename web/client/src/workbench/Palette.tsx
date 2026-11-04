@@ -10,6 +10,7 @@
  */
 import { For, Show, createMemo, createSignal, createUniqueId, onCleanup, type JSX } from "solid-js";
 
+import { Icon } from "../components/Icon";
 import type { AgentRow } from "../fleet";
 
 /** Props of {@link Palette}. */
@@ -109,7 +110,7 @@ export function Palette(props: PaletteProps): JSX.Element {
   return (
     <>
       <button ref={trigger} type="button" class="palette-trigger" onClick={show} data-testid="palette-trigger">
-        Search agents… <kbd>{shortcutLabel(navigator.platform || navigator.userAgent)}</kbd>
+        <Icon name="search" size={14} /> Search agents… <kbd>{shortcutLabel(navigator.platform || navigator.userAgent)}</kbd>
       </button>
       <Show when={open()}>
         <div class="palette-backdrop" onClick={(event) => event.target === event.currentTarget && hide()}>
