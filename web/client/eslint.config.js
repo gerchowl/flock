@@ -145,31 +145,67 @@ const design = {
   },
 };
 
-const KEY_EVENT = /^(?:on(?:capture)?:)?(?:on)?key(?:down|up|press)$/i;
+/** An event name that is a key event, or starts as one (Solid reads `onKeyDownCapture` as "keydowncapture"). */
+const KEY_EVENT = /^key(?:down|up|press)/i;
+/** A handler name for a key event: a JSX prop, an object key or a DOM property, capture variants included. */
+const KEY_PROP = /^(?:on(?:capture)?:)?(?:on)?key(?:down|up|press)(?:capture)?$/i;
 const NO_KEYS = "Keys go through the keyboard layer (src/workbench/keys.ts, web/DESIGN.md \"Keyboard\"): bind a shortcut or push a layer, never a key listener of your own.";
 
 /**
- * One keyboard layer (#2904): outside `src/workbench/keys.ts`, no key listener (`addEventListener`
- * or an `onkey*` property on any target) and no JSX key handler. The gallery's demo list widget is
- * the one exception (web/DESIGN.md "Keyboard").
+ * One keyboard layer (#2904): no key listener of your own. This rule is the early warning only;
+ * the authority is the browser tests' runtime key guard (`e2e/key-guard.ts`), which records every
+ * key listener however it is spelled. The rule catches the spellings it can see statically:
+ * `addEventListener` (also through a `const` alias, `.bind`, `.call` or `.apply`) with a key
+ * event named by a literal or a `const`; an `onkey*` property; a JSX key prop (capture variants
+ * included); an object literal with such a key, which a spread would hand to JSX; and a forged
+ * layer brand. The layer itself (`src/workbench/keys.ts`) is exempt by an override below.
  */
 const keys = {
   meta: { schema: [] },
   create(context) {
-    const path = relative(client, context.filename).replaceAll("\\", "/");
-    if (path === "src/workbench/keys.ts") return {};
     const report = (node) => context.report({ node, message: NO_KEYS });
-    const text = (node) => (node?.type === "Literal" ? String(node.value) : node?.type === "TemplateLiteral" && !node.expressions.length ? node.quasis[0].value.cooked : null);
+    /** The `const` declaration `node` names, if any. */
+    const constInit = (node) => {
+      let scope = context.sourceCode.getScope(node);
+      while (scope && !scope.set.has(node.name)) scope = scope.upper;
+      const def = scope?.set.get(node.name)?.defs[0];
+      return def?.type === "Variable" && def.parent.kind === "const" ? def.node.init : null;
+    };
+    /** The string `node` always evaluates to: a literal, a static template, or a `const` bound to one. */
+    const constant = (node, depth = 0) => {
+      if (node?.type === "Literal") return typeof node.value === "string" ? node.value : null;
+      if (node?.type === "TemplateLiteral") return node.expressions.length ? null : node.quasis[0].value.cooked;
+      if (node?.type === "Identifier" && depth < 8) return constant(constInit(node), depth + 1);
+      return null;
+    };
+    /** `addEventListener` itself, or a `const` alias of it, bound or not. */
+    const isAdd = (node, depth = 0) => {
+      if (!node || depth > 8) return false;
+      if ((node.type === "MemberExpression" ? name(node.property) : node.type === "Identifier" ? node.name : null) === "addEventListener") return true;
+      if (node.type === "CallExpression" && node.callee.type === "MemberExpression" && name(node.callee.property) === "bind") return isAdd(node.callee.object, depth + 1);
+      return node.type === "Identifier" && isAdd(constInit(node), depth + 1);
+    };
+    const keyName = (node, computed) => (computed ? constant(node) : name(node)) ?? "";
     return {
       CallExpression(node) {
-        if (name(node.callee.property ?? node.callee) === "addEventListener" && KEY_EVENT.test(text(node.arguments[0]) ?? "")) report(node);
+        const callee = node.callee;
+        if (isAdd(callee) && KEY_EVENT.test(constant(node.arguments[0]) ?? "")) report(node);
+        else if (callee.type === "MemberExpression" && isAdd(callee.object)) {
+          const via = name(callee.property);
+          const type = via === "call" ? node.arguments[1] : via === "apply" ? node.arguments[1]?.elements?.[0] : null;
+          if (KEY_EVENT.test(constant(type) ?? "")) report(node);
+        }
+        if (callee.type === "MemberExpression" && name(callee.object) === "Symbol" && name(callee.property) === "for" && constant(node.arguments[0]) === "flock.keyboard-layer") report(node);
       },
       AssignmentExpression(node) {
-        if (node.left.type === "MemberExpression" && KEY_EVENT.test(name(node.left.property) ?? "")) report(node);
+        if (node.left.type === "MemberExpression" && KEY_PROP.test(keyName(node.left.property, node.left.computed))) report(node);
       },
       JSXAttribute(node) {
         const key = node.name.type === "JSXNamespacedName" ? `${name(node.name.namespace)}:${name(node.name.name)}` : name(node.name);
-        if (KEY_EVENT.test(key ?? "") && !path.startsWith("src/gallery/")) report(node);
+        if (KEY_PROP.test(key ?? "")) report(node);
+      },
+      Property(node) {
+        if (node.parent.type === "ObjectExpression" && KEY_PROP.test(keyName(node.key, node.computed))) report(node);
       },
     };
   },
@@ -190,4 +226,6 @@ export default [
     plugins: { design: { rules: { fence: design, keys } } },
     rules: { "design/fence": "error", "design/keys": "error", "no-eval": "error", "no-new-func": "error" },
   },
+  // The keyboard layer is the one module that listens for keys (#2904).
+  { files: ["src/workbench/keys.ts"], rules: { "design/keys": "off" } },
 ];

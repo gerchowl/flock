@@ -16,10 +16,13 @@ import { chromium, type Browser, type Page } from "playwright";
 
 import { SHORTCUTS } from "../src/workbench/keys";
 import { CLIENT_ROOT } from "../tests/build";
+import { expectNoKeyListeners, guardKeys, keyListeners } from "./key-guard";
 
 const OUT = `${CLIENT_ROOT}/artifacts/keys-harness`;
 const ORIGIN = "http://keys.test";
 const LIMIT = 30_000;
+/** `KEYS_SEED=<seed>` loads that harness seed into every page, so every test's key guard fails (`e2e/keys/harness.tsx`). */
+const RUN_SEED = process.env["KEYS_SEED"];
 
 type Sent = { readonly verb: string; readonly [field: string]: unknown };
 
@@ -41,22 +44,29 @@ afterAll(async () => {
   await browser?.close();
 });
 
-/** The harness page, served from the build by Playwright itself; no request leaves it. */
-async function open(): Promise<Page> {
+/** The harness page (with `seed`, if given), served from the build by Playwright itself; no request leaves it. */
+async function open(seed: string | null = RUN_SEED ?? null): Promise<Page> {
   const page = await browser.newPage({ viewport: { width: 1280, height: 800 } });
+  await guardKeys(page);
   // A missing element fails its test well inside the test's limit, never the shared browser.
   page.setDefaultTimeout(5_000);
   await page.route("**/*", (route) => {
     const url = new URL(route.request().url());
     return url.origin === ORIGIN ? route.fulfill({ path: `${OUT}${url.pathname}` }) : route.abort();
   });
-  await page.goto(`${ORIGIN}/e2e/keys/index.html`);
+  await page.goto(`${ORIGIN}/e2e/keys/index.html${seed === null ? "" : `?seed=${seed}`}`);
   await page.getByTestId("agent-row").first().waitFor();
   return page;
 }
 
 /** Opens the first agent with the pointer, for the tests that are not about ↑/↓. */
 const pickFirst = (page: Page): Promise<void> => page.getByTestId("agent-row").first().click();
+
+/** Closes a test's page once its key guard recorded nothing: every test fails on a key listener outside the layer. */
+async function done(page: Page): Promise<void> {
+  await expectNoKeyListeners(page);
+  await page.close();
+}
 
 const sent = (page: Page): Promise<Sent[]> => page.evaluate(() => [...Reflect.get(globalThis, "__sent")]);
 /** The open agent's name in the focus pane, or null. */
@@ -99,7 +109,7 @@ describe("↑/↓ move through the agents", () => {
     await page.keyboard.press("ArrowUp");
     expect(await openAgent(page)).toBe(order.at(-2) ?? null);
     expect(await activeTestId(page)).toBe("body");
-    await page.close();
+    await done(page);
   }, LIMIT);
 
   test("in the sidebar: focus moves to the next row and opens its agent", async () => {
@@ -111,7 +121,7 @@ describe("↑/↓ move through the agents", () => {
     expect(await openAgent(page)).toBe(await rows.nth(1).getAttribute("data-agent-id"));
     await page.keyboard.press("ArrowUp");
     expect(await rows.nth(0).evaluate((row) => row === document.activeElement)).toBe(true);
-    await page.close();
+    await done(page);
   }, LIMIT);
 
   test("keep their meaning in a text field and on a card", async () => {
@@ -125,7 +135,7 @@ describe("↑/↓ move through the agents", () => {
     await page.getByTestId("inbox-card").focus();
     await page.keyboard.press("ArrowDown");
     expect(await openAgent(page)).toBe(first);
-    await page.close();
+    await done(page);
   }, LIMIT);
 });
 
@@ -143,7 +153,7 @@ describe("⌘K palette", () => {
     await page.keyboard.press("Enter");
     expect(await palette(page).count()).toBe(0);
     expect(await openAgent(page)).toBe(order[1] ?? null);
-    await page.close();
+    await done(page);
   }, LIMIT);
 
   test("the other platform's modifier (⌃K on a Mac) does not open it", async () => {
@@ -151,7 +161,7 @@ describe("⌘K palette", () => {
     const apple = await page.evaluate(() => /Mac|iPhone|iPad|iPod/.test(navigator.platform));
     await page.keyboard.press(apple ? "Control+k" : "Meta+k");
     expect(await palette(page).count()).toBe(0);
-    await page.close();
+    await done(page);
   }, LIMIT);
 });
 
@@ -171,7 +181,7 @@ describe("? shortcut sheet", () => {
     await page.keyboard.press("Escape");
     expect(await sheet(page).isVisible()).toBe(false);
     expect(await row.evaluate((element) => element === document.activeElement)).toBe(true);
-    await page.close();
+    await done(page);
   }, LIMIT);
 
   test("opens from the palette, and ? typed in a text field is a question mark", async () => {
@@ -187,7 +197,7 @@ describe("? shortcut sheet", () => {
     expect(await sheet(page).isVisible()).toBe(true);
     await sheet(page).getByRole("button", { name: "Done" }).click();
     expect(await sheet(page).isVisible()).toBe(false);
-    await page.close();
+    await done(page);
   }, LIMIT);
 });
 
@@ -206,7 +216,7 @@ describe("⌘↩ allows and ⌘⌫ denies the focused card, and nothing else", (
     await message.press("ControlOrMeta+Backspace");
     expect(await message.inputValue()).not.toBe("not this");
     expect(await sent(page)).toEqual([]);
-    await page.close();
+    await done(page);
   }, LIMIT);
 
   test("on the focused card: ⌘↩ allows once and ⌘⌫ denies that request", async () => {
@@ -220,7 +230,7 @@ describe("⌘↩ allows and ⌘⌫ denies the focused card, and nothing else", (
       { verb: "agent.decide", agent: "fixture", request_id: "request-1", request_seq: 7, decision: "allow_once" },
       { verb: "agent.decide", agent: "fixture", request_id: "request-1", request_seq: 7, decision: "deny" },
     ]);
-    await page.close();
+    await done(page);
   }, LIMIT);
 
   test("in the composer ⌘↩ sends the message, never a decision", async () => {
@@ -229,7 +239,7 @@ describe("⌘↩ allows and ⌘⌫ denies the focused card, and nothing else", (
     await composer(page).fill("hello");
     await composer(page).press("ControlOrMeta+Enter");
     expect(await sent(page)).toEqual([{ verb: "agent.send", agent: (await openAgent(page)) ?? "", text: "hello" }]);
-    await page.close();
+    await done(page);
   }, LIMIT);
 });
 
@@ -244,7 +254,7 @@ describe("Esc", () => {
     await message.focus();
     await page.keyboard.press("Escape");
     expect(await message.evaluate((field) => field === document.activeElement)).toBe(true);
-    await page.close();
+    await done(page);
   }, LIMIT);
 });
 
@@ -261,7 +271,7 @@ describe("a modal owns the keyboard: nothing behind the palette or the sheet act
     expect(await palette(page).isVisible()).toBe(true);
     await page.keyboard.press("Escape");
     expect(await palette(page).count()).toBe(0);
-    await page.close();
+    await done(page);
   }, LIMIT);
 
   test("sheet: a card's ⌘↩ and the page's ↓ dispatched behind it do nothing; its own Esc still closes it", async () => {
@@ -276,7 +286,7 @@ describe("a modal owns the keyboard: nothing behind the palette or the sheet act
     expect(await sheet(page).isVisible()).toBe(true);
     await page.keyboard.press("Escape");
     expect(await sheet(page).isVisible()).toBe(false);
-    await page.close();
+    await done(page);
   }, LIMIT);
 });
 
@@ -294,7 +304,7 @@ describe("an input method's composition (#2967)", () => {
     await page.keyboard.press("Enter");
     expect(await palette(page).count()).toBe(0);
     expect(await openAgent(page)).not.toBe(before);
-    await page.close();
+    await done(page);
   }, LIMIT);
 
   test("no shortcut fires while composing; ⌘↩ sends once the composition ends", async () => {
@@ -321,6 +331,22 @@ describe("an input method's composition (#2967)", () => {
     expect(await palette(page).count()).toBe(0);
     await composer(page).press("ControlOrMeta+Enter");
     expect((await sent(page)).map((each) => each["text"])).toEqual(["unfinished"]);
+    await done(page);
+  }, LIMIT);
+});
+
+describe("the key guard catches each bypass of the keyboard layer", () => {
+  test.each([
+    ["const", 'a "keydown" listener on document'],
+    ["bind", 'a "keydown" listener on document'],
+    ["spread", 'a JSX keydown handler on <input>'],
+    ["capture", 'a "keydown" listener on <div> (capture)'],
+  ])("seed %s: %s", async (seed, finding) => {
+    const clean = await open(null);
+    expect(await keyListeners(clean)).toEqual([]);
+    await clean.close();
+    const page = await open(seed);
+    expect(await keyListeners(page)).toContain(finding);
     await page.close();
   }, LIMIT);
 });

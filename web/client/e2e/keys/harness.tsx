@@ -4,8 +4,13 @@
  * for real and a sender that records every command it is given in
  * `globalThis.__sent` instead of queueing it.
  *
+ * `?seed=<name>` also renders one of {@link SEEDS}: real, compiled code that
+ * registers a key listener outside the keyboard layer in a way ESLint's
+ * `design/keys` rule once missed, for the key guard (`e2e/key-guard.ts`) to catch.
+ *
  * @module
  */
+import type { JSX } from "solid-js";
 import { render } from "solid-js/web";
 
 import { createFixtureFleet } from "../../src/fleet";
@@ -43,10 +48,39 @@ const CARD: InboxCard = {
   requestSeq: 7,
 };
 
+const ignore = (): void => undefined;
+
+/** Each bypass the key guard must catch, as the code a component might contain. */
+export const SEEDS: Readonly<Record<string, () => JSX.Element>> = {
+  // The event name through a const.
+  const: () => {
+    const type = "keydown";
+    document.addEventListener(type, ignore);
+    return null;
+  },
+  // A bound alias of addEventListener.
+  bind: () => {
+    const on = document.addEventListener.bind(document);
+    on("keydown", ignore);
+    return null;
+  },
+  // A JSX key prop arriving through a spread.
+  spread: () => {
+    const props = { onKeyDown: ignore };
+    return <input aria-label="Seed" {...props} />;
+  },
+  // A capture listener: Solid's capture syntax.
+  capture: () => <div oncapture:keydown={ignore}>Seed</div>,
+};
+
+const seed = new URLSearchParams(location.search).get("seed");
+
 const root = document.getElementById("root");
 if (root === null) throw new Error("no #root");
 render(
   () => (
+    <>
+    {seed === null ? null : (SEEDS[seed] ?? (() => { throw new Error(`no seed ${seed}`); }))()}
     <Workbench
       fleet={createFixtureFleet(SAMPLE_AGENTS)}
       transport={createFixtureTransport("")}
@@ -57,6 +91,7 @@ render(
       mode="desktop"
       source="replay"
     />
+    </>
   ),
   root,
 );

@@ -34,6 +34,7 @@ import { CLIENT_ROOT, buildClient } from "../tests/build";
 import { ALLOWED as LISTED, type Allowance, type PageName } from "./conformance-allow";
 import { BASELINE } from "./conformance-allow-baseline";
 import { installChecks, type CheckOptions, type Finding, type Rule } from "./conformance-checks";
+import { installKeyGuard, keyListeners } from "./key-guard";
 
 const FIXTURE = `${CLIENT_ROOT}/artifacts/conformance-fixture`;
 const GALLERY = `${CLIENT_ROOT}/artifacts/conformance-gallery`;
@@ -87,14 +88,15 @@ const MIN_COVERAGE: Readonly<Record<PageName, { elements: number; controls: numb
 };
 
 /** The keyboard and structure checks that drive the page from the test, beside the in-page rules. */
-type Driven = "tab-reach" | "focus-ring" | "arrows" | "shortcut" | "parity" | "coverage" | "names";
+type Driven = "tab-reach" | "focus-ring" | "arrows" | "shortcut" | "parity" | "coverage" | "names" | "keys";
 type Check = Rule | Driven;
 
 /**
  * A violation `check` must catch: markup appended to `into` on `page`, and a
- * script run there, in `mode` (light when not given).
+ * script run there, in `mode` (light when not given). With `finding`, one of
+ * the seed's new findings must contain it.
  */
-type Seed = { readonly check: Check; readonly page: PageName; readonly into: string; readonly html: string; readonly script?: string; readonly mode?: ModeName };
+type Seed = { readonly check: Check; readonly page: PageName; readonly into: string; readonly html: string; readonly script?: string; readonly mode?: ModeName; readonly finding?: string };
 
 const SEEDS: Readonly<Record<string, Seed>> = {
   palette: { check: "palette", page: "gallery", into: "main", html: '<div data-testid="seed" style="color: rgb(1, 2, 3)">Off-palette text</div>' },
@@ -217,6 +219,13 @@ const SEEDS: Readonly<Record<string, Seed>> = {
     html: "",
     script: '{ const hig = globalThis.__hig; const walk = hig.names; hig.names = () => walk().map((each, index) => (index === 0 ? { ...each, name: each.name + " drift" } : each)); }',
   },
+  // Key listeners outside the keyboard layer (#2904): the key guard records each, however it is spelled.
+  "keys-const": { check: "keys", page: "workbench", into: "body", html: "", script: '{ const type = "keydown"; document.addEventListener(type, () => undefined); }', finding: 'a "keydown" listener on document' },
+  "keys-bind": { check: "keys", page: "gallery", into: "body", html: "", script: '{ const on = window.addEventListener.bind(window); on("keyup", () => undefined); }', finding: 'a "keyup" listener on window' },
+  // What Solid compiles a spread JSX onKeyDown to: a delegated handler on the element.
+  "keys-spread": { check: "keys", page: "workbench", into: "body", html: "", script: 'document.querySelector("main").$$keydown = () => undefined', finding: 'a JSX keydown handler on <main data-testid="focus-pane">' },
+  "keys-capture": { check: "keys", page: "workbench", into: "body", html: "", script: 'document.body.addEventListener("keydown", () => undefined, { capture: true })', finding: 'a "keydown" listener on <body> (capture)' },
+  "keys-property": { check: "keys", page: "gallery", into: "body", html: "", script: "document.onkeydown = () => undefined", finding: "an onkeydown property on document" },
   "coverage-hidden": {
     check: "coverage",
     page: "gallery",
@@ -293,7 +302,8 @@ async function launch(): Promise<void> {
   tab = await browser.newPage();
   // axe-core and the checks reach the browser once, as init scripts every document runs, instead
   // of half a megabyte through the pipe per document (the #2931 stalls followed that traffic).
-  await tab.addInitScript({ content: `${axeSource}\n;globalThis.__installHig = ${installChecks.toString()};` });
+  // The key guard (#2904) runs first in every document, before any page code can register a listener.
+  await tab.addInitScript({ content: `(${installKeyGuard.toString()})();\n${axeSource}\n;globalThis.__installHig = ${installChecks.toString()};` });
   tab.on("crash", () => (broken ??= `the page crashed during ${stage}`));
   tab.on("close", () => (broken ??= `the tab closed during ${stage}`));
   // Diagnosis only (#2931): with the debugger on, a stall can ask the renderer where it is.
@@ -627,6 +637,8 @@ const DRIVEN: Readonly<Record<Driven, (page: Page, name: PageName) => Promise<st
       await cdp.detach();
     }
   },
+  // No key listener outside the keyboard layer: the key guard's record of this document (#2904).
+  keys: async (page) => keyListeners(page),
   // The walk covers the page: it renders at least its minimum of elements and controls.
   coverage: async (page, name) => shortfall(name, await hig<Coverage>(page, "coverage")),
 };
@@ -750,7 +762,7 @@ describe("design conformance", () => {
   };
 
   test("8. keyboard: Tab reaches every control with a ring, controls are named as Chromium names them, arrows and ⌘K work", async () => {
-    expect([...everywhere("keyboard"), ...(await driven(["tab-reach", "focus-ring", "arrows", "shortcut", "names"]))]).toEqual([]);
+    expect([...everywhere("keyboard"), ...(await driven(["tab-reach", "focus-ring", "arrows", "shortcut", "names", "keys"]))]).toEqual([]);
   }, LIMIT * 4);
 
   test("9. structure: a sidebar two levels deep, toolbar actions in ⌘K, no appearance switch", async () => {
@@ -777,6 +789,7 @@ describe("design conformance", () => {
       if (outcome === STALLED) missed.push(`${label}: stalled after ${SEED_LIMIT} ms during ${stage}`);
       else if (outcome instanceof Error) missed.push(`${label}: ${outcome.message}`);
       else if (outcome.length === 0) missed.push(`${label}: ${seed.check} found nothing new`);
+      else if (seed.finding !== undefined && !outcome.some((line) => line.includes(seed.finding ?? ""))) missed.push(`${label}: no finding names ${seed.finding}; found ${outcome.join("; ")}`);
     }
     expect(missed).toEqual([]);
   }, LIMIT * 2);

@@ -2,8 +2,7 @@
  * The workbench's keyboard layer (#2904): one registry of shortcuts
  * ({@link SHORTCUTS}), which the shortcut sheet (`?`) and the ⌘K palette
  * both read, and one document listener that dispatches every key the client
- * handles. Components never listen for keys themselves (ESLint's
- * `design/keys` rule): they bind what a shortcut does on an element
+ * handles. Components never listen for keys themselves: they bind what a shortcut does on an element
  * ({@link bindKeys}), and the listener decides from the shortcut's
  * {@link Scope} and the focus whether it runs.
  *
@@ -11,6 +10,11 @@
  * The top layer's keys (Esc, Tab, a list's arrows and Enter) win; a modal
  * layer is exclusive, so nothing behind it acts, even when focus is forced
  * behind it.
+ *
+ * The one listener carries {@link LAYER_BRAND}. In every browser test a
+ * guard (`e2e/key-guard.ts`) records any other key listener, `onkey*`
+ * property or JSX key handler, and the run fails: that guard is the
+ * authority, ESLint's `design/keys` rule the early warning.
  *
  * Standard shortcuts keep their meaning. In a text field, ↑/↓, Esc, ⌘⌫ and
  * ⌃K edit text as the platform does; the composer's Esc (leave the field)
@@ -62,7 +66,9 @@ export type ShortcutId =
   | "layer.previous"
   | "list.next"
   | "list.previous"
-  | "list.choose";
+  | "list.choose"
+  | "listbox.next"
+  | "listbox.previous";
 
 /**
  * One shortcut: what it does, its keys, and where it acts. A `command` is
@@ -73,6 +79,9 @@ export type Shortcut = { readonly id: ShortcutId; readonly label: string; readon
 
 /** The registry, in the order the shortcut sheet lists it. */
 export const SHORTCUTS: readonly Shortcut[] = [
+  // A focused list widget's own arrows; before the page's ↑/↓, so the focused list wins.
+  { id: "listbox.next", label: "Next item in a list", combo: { key: "ArrowDown" }, scope: "focused", unlisted: true },
+  { id: "listbox.previous", label: "Previous item in a list", combo: { key: "ArrowUp" }, scope: "focused", unlisted: true },
   { id: "palette.open", label: "Search or run a command", combo: { key: "k", mod: true }, scope: "anywhere" },
   { id: "agent.previous", label: "Previous agent", combo: { key: "ArrowUp" }, scope: "within", command: true },
   { id: "agent.next", label: "Next agent", combo: { key: "ArrowDown" }, scope: "within", command: true },
@@ -188,6 +197,9 @@ function resolve(entry: Shortcut, target: Element | null): (() => void) | undefi
   return undefined;
 }
 
+/** The brand on the keyboard layer's one listener, which the browser tests' key guard accepts. */
+export const LAYER_BRAND: unique symbol = Symbol.for("flock.keyboard-layer");
+
 /** The one composition guard (#2967): no key the client handles acts while an input method is composing. */
 function onKey(event: KeyboardEvent): void {
   if (event.defaultPrevented || composing(event)) return;
@@ -209,6 +221,8 @@ function onKey(event: KeyboardEvent): void {
     if (handler !== undefined) return run(handler);
   }
 }
+
+Object.defineProperty(onKey, LAYER_BRAND, { value: true });
 
 /**
  * Binds what shortcuts do on `element` (`document.body` for the page's own);

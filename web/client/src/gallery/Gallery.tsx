@@ -8,12 +8,13 @@
  *
  * @module
  */
-import { For, createSignal, type JSX } from "solid-js";
+import { For, createSignal, onCleanup, type JSX } from "solid-js";
 
 import { ICON_NAMES, Icon, IconButton } from "../components/Icon";
 import { Center, Cluster, Grid, Sidebar, Stack, Sticky, Switcher } from "../layout/primitives";
 import { SPACE } from "../tokens";
 import { HEALTH_LABELS, HostStatus, type Health } from "../workbench/HostStatus";
+import { bindKeys } from "../workbench/keys";
 import { ErrorState, RefusalDetails, explain } from "../workbench/refusals";
 import { ShortcutList } from "../workbench/ShortcutSheet";
 import "./gallery.css";
@@ -23,17 +24,17 @@ const BUSY = { code: "session_busy", message: "command refused: session_busy" } 
 
 const OPTIONS = ["Review the pull request", "Run the test suite", "Summarise the log"] as const;
 
-/** A list with one selected option that the arrow keys move (HIG: lists and tables). */
+/** A list with one selected option that the arrow keys move (HIG: lists and tables), through the keyboard layer. */
 function SelectionList(): JSX.Element {
   const [selected, setSelected] = createSignal(0);
-  const onKey = (event: KeyboardEvent): void => {
-    const step = event.key === "ArrowDown" ? 1 : event.key === "ArrowUp" ? -1 : 0;
-    if (step === 0) return;
-    event.preventDefault();
-    setSelected((selected() + step + OPTIONS.length) % OPTIONS.length);
+  const step = (by: 1 | -1): void => {
+    setSelected((selected() + by + OPTIONS.length) % OPTIONS.length);
+  };
+  const bind = (list: HTMLElement): void => {
+    onCleanup(bindKeys(list, { "listbox.next": () => step(1), "listbox.previous": () => step(-1) }));
   };
   return (
-    <Stack as="div" space={SPACE[1]} class="g-list" role="listbox" aria-label="Tasks" tabindex="0" onKeyDown={onKey}>
+    <Stack ref={bind} as="div" space={SPACE[1]} class="g-list" role="listbox" aria-label="Tasks" tabindex="0">
       <For each={OPTIONS}>
         {(label, index) => (
           <div class="g-option" role="option" aria-selected={index() === selected()} onClick={() => setSelected(index())}>

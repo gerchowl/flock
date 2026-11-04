@@ -19,13 +19,14 @@ describe("labels", () => {
     expect(formatCombo({ key: "?" }, true)).toBe("?");
   });
 
-  test("ids are unique; a page combo serves two shortcuts only on different focused elements; a layer's combos are its own", () => {
+  test("ids are unique; a page combo is shared only by focused shortcuts, listed before its one wider shortcut; a layer's combos are its own", () => {
     expect(new Set(SHORTCUTS.map((entry) => entry.id)).size).toBe(SHORTCUTS.length);
     const layer = SHORTCUTS.filter((entry) => entry.scope === "layer").map((entry) => formatCombo(entry.combo, true));
     expect(new Set(layer).size).toBe(layer.length);
     const combos = new Map<string, string[]>();
     for (const entry of SHORTCUTS.filter((each) => each.scope !== "layer")) combos.set(formatCombo(entry.combo, true), [...(combos.get(formatCombo(entry.combo, true)) ?? []), entry.scope]);
-    for (const scopes of combos.values()) if (scopes.length > 1) expect(scopes.every((scope) => scope === "focused")).toBe(true);
+    // The dispatcher takes the first match, so a focused element's own binding must come first.
+    for (const scopes of combos.values()) expect(scopes.slice(0, -1).every((scope) => scope === "focused")).toBe(true);
   });
 });
 
