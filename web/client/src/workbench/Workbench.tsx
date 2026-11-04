@@ -41,6 +41,7 @@ import { AgentTitle, InboxCards, Waits, createClosedIds } from "./parts";
 import { PhoneWorkbench } from "./Phone";
 import { HOME_UNKNOWN, SidebarTrees } from "./Sidebar";
 import { buildTrees, homeNodeId, inScope } from "./trees";
+import { createWindowActive } from "./window-focus";
 import "./workbench.css";
 
 /** The toolbars' unbuilt actions, shown only in preview; each is a button and, dimmed, a palette command. */
@@ -97,6 +98,7 @@ export function Workbench(props: WorkbenchProps): JSX.Element {
   window.addEventListener("resize", onResize);
   onCleanup(() => window.removeEventListener("resize", onResize));
   const phone = createMemo(() => isPhone(props.mode ?? "auto", width()));
+  const windowActive = createWindowActive();
   const composer = createComposerState();
   // The fleet store owns the agents (ADR-0038 §3): the sidebar, palette and permission tracker read its one record.
   const permissions = props.source === "live" ? createPermissionInbox(props.transport) : null;
@@ -179,7 +181,7 @@ export function Workbench(props: WorkbenchProps): JSX.Element {
   );
   const waits = (action: WaitingAction): JSX.Element => <Waits label={action.label} waitsFor={action.waitsFor} />;
   const desktop = (): JSX.Element => (
-    <div class="workbench" data-testid="workbench">
+    <div class="workbench" data-testid="workbench" data-window={windowActive() ? "active" : "inactive"}>
       <Cluster as="header" class="topbar" justify="space-between" space={SPACE[4]}>
         <Cluster space={SPACE[2]}>
           <Show when={preview()}>{waits(SIDEBAR_TOGGLE)}</Show>

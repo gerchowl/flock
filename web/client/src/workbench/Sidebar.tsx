@@ -13,6 +13,7 @@
  */
 import { For, Show, type Accessor, type JSX } from "solid-js";
 
+import { Icon } from "../components/Icon";
 import type { AgentRow } from "../fleet";
 import type { FleetNodeRow } from "../gen/FleetNodeRow";
 import { nodeAgeMs, type NodeStamp } from "../store/fleet";
@@ -78,7 +79,7 @@ function Group(props: { readonly id: string; readonly level: "tree" | "node" | "
   return (
     <section class={`group group--${props.level}`} data-testid={`group-${props.level}`}>
       <button type="button" class="group__head" aria-expanded={!props.collapse.is(props.id)} onClick={() => props.collapse.toggle(props.id)}>
-        <span aria-hidden="true">{props.collapse.is(props.id) ? "▸" : "▾"}</span>
+        <Icon name={props.collapse.is(props.id) ? "chevron-right" : "chevron-down"} size={12} />
         {props.title}
       </button>
       <Show when={!props.collapse.is(props.id)}>
@@ -92,9 +93,21 @@ type Stamps = (nodeId: string) => NodeStamp | undefined;
 
 type Opener = { readonly focused: Accessor<string | null>; readonly open: (id: string) => void };
 
-/** The Projects tree's rows carry their own test id, so the Fleet tree's rows stay "every agent, once". */
+/**
+ * One group's agent rows, as a list: a source list's rows touch (HIG
+ * Sidebars). The Projects tree's rows carry their own test id, so the Fleet
+ * tree's rows stay "every agent, once".
+ */
 const Agents = (props: { readonly rows: readonly AgentRow[]; readonly testid?: string | undefined } & Opener): JSX.Element => (
-  <For each={props.rows}>{(row) => <AgentRowButton row={row} focused={row.id === props.focused()} onFocus={() => props.open(row.id)} testid={props.testid} />}</For>
+  <ul class="agent-list">
+    <For each={props.rows}>
+      {(row) => (
+        <li>
+          <AgentRowButton row={row} focused={row.id === props.focused()} onFocus={() => props.open(row.id)} testid={props.testid} />
+        </li>
+      )}
+    </For>
+  </ul>
 );
 
 function ProjectGroup(props: { readonly entry: ProjectEntry; readonly title: string; readonly tree: "fleet" | "projects"; readonly collapse: Collapse } & Opener): JSX.Element {

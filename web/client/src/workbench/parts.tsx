@@ -34,14 +34,32 @@ export function Waits(props: { readonly label: string } & ({ readonly waitsFor: 
   );
 }
 
-/** One sidebar row: status mark, name, activity, and the open-item count. */
+/**
+ * One sidebar row: status mark, name, activity, and the open-item count, on
+ * one line. The name is the row's accessible name; the phase and the full
+ * activity, which the line may cut short, are its description, so keyboard
+ * and screen-reader users get them without hovering.
+ */
 export function AgentRowButton(props: { readonly row: AgentRow; readonly focused: boolean; readonly onFocus: () => void; readonly testid?: string | undefined }): JSX.Element {
+  const [mark, name, activity] = [createUniqueId(), createUniqueId(), createUniqueId()];
   return (
-    <button type="button" class="agent-row" aria-current={props.focused ? "true" : undefined} onClick={props.onFocus} data-testid={props.testid ?? "agent-row"}>
-      <StatusMark mark={markFor(props.row)} label={PHASE_LABELS[props.row.state]} count={props.row.waitingOnHuman.length} />
+    <button
+      type="button"
+      class="agent-row"
+      aria-current={props.focused ? "true" : undefined}
+      aria-labelledby={name}
+      aria-describedby={`${mark} ${activity}`}
+      onClick={props.onFocus}
+      data-testid={props.testid ?? "agent-row"}
+    >
+      <StatusMark id={mark} mark={markFor(props.row)} label={PHASE_LABELS[props.row.state]} count={props.row.waitingOnHuman.length} />
       <span class="agent-row__text">
-        <span class="agent-row__name">{props.row.label}</span>
-        <span class="agent-row__activity">{props.row.activity}</span>
+        <span id={name} class="agent-row__name">
+          {props.row.label}
+        </span>
+        <span id={activity} class="agent-row__activity" title={props.row.activity}>
+          {props.row.activity}
+        </span>
       </span>
     </button>
   );

@@ -10,6 +10,7 @@
  */
 import { For, createSignal, type JSX } from "solid-js";
 
+import { ICON_NAMES, Icon, IconButton } from "../components/Icon";
 import { Center, Cluster, Grid, Sidebar, Stack, Sticky, Switcher } from "../layout/primitives";
 import { SPACE } from "../tokens";
 import { HEALTH_LABELS, HostStatus, type Health } from "../workbench/HostStatus";
@@ -120,6 +121,16 @@ export function Gallery(): JSX.Element {
                 </button>
               </Cluster>
               <SelectionList />
+            </Stack>
+            <Stack as="section" space={SPACE[2]} aria-label="Icons">
+              <h2>Icons</h2>
+              <Cluster space={SPACE[2]}>
+                <For each={ICON_NAMES}>{(name) => <IconButton icon={name} label={`Icon ${name}`} />}</For>
+                <IconButton icon="send" label="Send, disabled" disabled />
+                <button type="button" class="g-button">
+                  <Icon name="search" size={14} /> With a label
+                </button>
+              </Cluster>
             </Stack>
             <Stack as="section" space={SPACE[2]} aria-label="Layout">
               <h2>Layout</h2>

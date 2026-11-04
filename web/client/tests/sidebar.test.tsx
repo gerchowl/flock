@@ -92,13 +92,13 @@ describe("the Fleet tree", () => {
     const root = await mount();
     expect(rowIds(root).sort()).toEqual(["a1", "a2", "a3", "a4", "a5", "a6"]);
     const where = Object.fromEntries($$(root, "agent-row").map((row) => [row.querySelector(".agent-row__name")?.textContent, place(row)]));
-    expect(where["a1"]).toEqual(["node-a", "▾one"]);
-    expect(where["a2"]).toEqual(["node-a", "▾two"]);
-    expect(where["a3"]).toEqual(["node-b", "▾one"]);
+    expect(where["a1"]).toEqual(["node-a", "one"]);
+    expect(where["a2"]).toEqual(["node-a", "two"]);
+    expect(where["a3"]).toEqual(["node-b", "one"]);
     // An unknown project and an absent one are never matched by label or basename.
-    expect(where["a5"]).toEqual(["node-a", "▾No project"]);
-    expect(where["a6"]).toEqual(["node-a", "▾No project"]);
-    expect(where["a4"]![0]).toBe("▾Not bound to a node");
+    expect(where["a5"]).toEqual(["node-a", "No project"]);
+    expect(where["a6"]).toEqual(["node-a", "No project"]);
+    expect(where["a4"]![0]).toBe("Not bound to a node");
   });
 
   test("an agent on a node with no row is listed under that id, not dropped", async () => {
@@ -112,7 +112,7 @@ describe("the Fleet tree", () => {
     expect(rowIds(root, "project-agent-row").sort()).toEqual(["a1", "a2", "a3", "a4", "a5", "a6"]);
     const projects = $$(root, "group-tree")[1]!;
     const labels = [...projects.querySelectorAll('[data-testid="group-project"] > .group__head')].map((head) => head.textContent);
-    expect(labels).toEqual(["▾one · node-a", "▾two · node-a", "▾one · node-b", "▾No project"]);
+    expect(labels).toEqual(["one · node-a", "two · node-a", "one · node-b", "No project"]);
   });
 
   test("two nodes with one name are told apart by node_id", () => {
