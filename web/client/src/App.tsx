@@ -41,6 +41,7 @@ import { createWireTransport } from "./wire/transport";
 import { ConnectionBar } from "./workbench/ConnectionBar";
 import { createWireSender } from "./workbench/sender";
 import { SAMPLE_INBOX } from "./workbench/inbox";
+import { previewControls } from "./workbench/preview";
 import { SAMPLE_AGENTS, SAMPLE_ENTITIES } from "./workbench/samples";
 import { Workbench } from "./workbench/Workbench";
 
@@ -99,6 +100,7 @@ function FixtureApp(props: { readonly config: FixtureShellConfig }): JSX.Element
         saveSidebar={sidebar.save}
         status={() => notice}
         mode={previewMode(pageSearch(globalThis))}
+        preview={previewControls(pageSearch(globalThis))}
         source="replay"
       />
     </>
@@ -282,6 +284,7 @@ function WireApp(props: { readonly config: WireShellConfig | BridgeShellConfig; 
         saveSidebar={sidebar.save}
         status={() => [notice, status()].filter((part) => part !== null).join(" · ")}
         mode={previewMode(pageSearch(globalThis))}
+        preview={previewControls(pageSearch(globalThis))}
         source="live"
       />
     </>

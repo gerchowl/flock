@@ -7,8 +7,10 @@
  * default placement, and the layout persists per server. No subject, kind
  * or placement field appears on screen.
  *
- * Post-MVP parts are shown disabled, naming what they wait for (§2a's
- * table), never as buttons that do nothing.
+ * Parts that are not built yet are hidden (§2a as amended by #2900). With
+ * the `preview` prop (a development build, `preview.ts`) they show disabled, naming what they wait
+ * for, never as buttons that do nothing. There is no *Terminal* action:
+ * structured agents replace terminal agents.
  *
  * @module
  */
@@ -31,12 +33,11 @@ import { HOME_UNKNOWN, SidebarTrees } from "./Sidebar";
 import { buildTrees, homeNodeId, inScope } from "./trees";
 import "./workbench.css";
 
-/** The toolbars' waiting actions; each is a button and, dimmed, a palette command. */
-const NEW_AGENT: WaitingAction = { label: "New agent", waitsFor: "the harness picker (ADR-0036 S17)" };
+/** The toolbars' unbuilt actions, shown only in preview; each is a button and, dimmed, a palette command. */
+const NEW_AGENT: WaitingAction = { label: "New agent", waitsFor: "the harness picker" };
 const PANE_ACTIONS: readonly WaitingAction[] = [
-  { label: "Terminal", waitsFor: "the terminal tile" },
   { label: "Diff", waitsFor: "the diff tile" },
-  { label: "Fork", waitsFor: "forks (ADR-0036 S12)" },
+  { label: "Fork", waitsFor: "forks" },
 ];
 
 /** Where the workbench's data comes from, and how its layout persists. */
@@ -61,6 +62,8 @@ export type WorkbenchProps = {
   readonly source: TranscriptSource;
   /** Phone or desktop; `auto` (the default) follows the viewport width. */
   readonly mode?: Mode;
+  /** Shows the unbuilt controls, disabled, with what they wait for  (development builds only, `preview.ts`); hidden by default. */
+  readonly preview?: boolean | undefined;
 };
 
 /** The agent id of a tile subject (`agent/<id>`), or null. */
@@ -133,17 +136,20 @@ export function Workbench(props: WorkbenchProps): JSX.Element {
     manager.back();
     publish();
   };
+  const preview = (): boolean => props.preview === true;
   const working = createMemo(() => scoped().filter((row) => row.state === "working").length);
   const desktop = (): JSX.Element => (
     <div class="workbench" data-testid="workbench">
       <header class="topbar">
         <span class="topbar__mark">flock</span>
-        <Palette rows={scoped} onOpen={openAgent} waiting={[NEW_AGENT, ...(focusedAgent() === null ? [] : PANE_ACTIONS)]} />
+        <Palette rows={scoped} onOpen={openAgent} waiting={preview() ? [NEW_AGENT, ...(focusedAgent() === null ? [] : PANE_ACTIONS)] : []} />
         <span class="topbar__summary" data-testid="agent-summary">
           {scoped().length} agents · {working()} working
         </span>
         <Show when={props.status?.()}>{(status) => <span class="topbar__status" role="status">{status()}</span>}</Show>
-        <Waits label={NEW_AGENT.label} waitsFor={NEW_AGENT.waitsFor} />
+        <Show when={preview()}>
+          <Waits label={NEW_AGENT.label} waitsFor={NEW_AGENT.waitsFor} />
+        </Show>
       </header>
       <nav class="sidebar" aria-label="Agents" data-testid="sidebar">
         <Show when={fleetNote()}>{(note) => <p class="sidebar__note">{note()}</p>}</Show>
@@ -157,9 +163,11 @@ export function Workbench(props: WorkbenchProps): JSX.Element {
             <>
               <header class="focus__header">
                 <AgentTitle agent={agent} row={focusedRow()} />
-                <span class="focus__actions">
-                  <For each={PANE_ACTIONS}>{(action) => <Waits label={action.label} waitsFor={action.waitsFor} />}</For>
-                </span>
+                <Show when={preview()}>
+                  <span class="focus__actions">
+                    <For each={PANE_ACTIONS}>{(action) => <Waits label={action.label} waitsFor={action.waitsFor} />}</For>
+                  </span>
+                </Show>
               </header>
               <div class="focus__body">
                 <Transcript
@@ -177,7 +185,7 @@ export function Workbench(props: WorkbenchProps): JSX.Element {
       </main>
       <aside class="inbox" aria-label="Inbox" data-testid="inbox">
         <h2 class="inbox__title">Inbox</h2>
-        <InboxCards cards={cards()} closed={closed} source={props.source} sender={props.sender} />
+        <InboxCards cards={cards()} closed={closed} source={props.source} sender={props.sender} preview={preview()} />
       </aside>
     </div>
   );
@@ -197,6 +205,7 @@ export function Workbench(props: WorkbenchProps): JSX.Element {
         closed={closed}
         sender={props.sender}
         composer={composer}
+        preview={preview()}
       />
     </Show>
   );

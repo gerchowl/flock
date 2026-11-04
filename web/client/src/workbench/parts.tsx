@@ -12,7 +12,7 @@ import { sortInbox, type InboxCard } from "./inbox";
 import { PHASE_LABELS, StatusMark, markFor } from "./marks";
 
 /**
- * A post-MVP action, shown but inert. What it waits for is visible text,
+ * An unbuilt action, shown only in preview (`workbench/preview.ts`) and inert. What it waits for is visible text,
  * which the control names through `aria-describedby`, so phones and
  * keyboards reach it too. `reasonId` points at a reason shared with other
  * actions instead of a caption of its own.
@@ -69,15 +69,22 @@ export function createClosedIds(cards: () => readonly InboxCard[]): ClosedIds {
 }
 
 /** The inbox's cards, blocking first. */
-export function InboxCards(props: { readonly cards: readonly InboxCard[]; readonly closed: ClosedIds; readonly source: "replay" | "live"; readonly sender: Sender | null }): JSX.Element {
+export function InboxCards(props: {
+  readonly cards: readonly InboxCard[];
+  readonly closed: ClosedIds;
+  readonly source: "replay" | "live";
+  readonly sender: Sender | null;
+  /** Shows a sample card's unbuilt answers, disabled, with what they wait for. */
+  readonly preview: boolean;
+}): JSX.Element {
   const note = (): string | null =>
     props.source === "live"
       ? props.cards.length === 0
         ? "No open permission prompts."
         : null
       : props.cards.length === 0
-        ? "The live inbox arrives with G5 (#1597)."
-        : "Sample cards: the live inbox arrives with G5 (#1597).";
+        ? "No sample cards in this recording."
+        : "Sample cards: answering them is not available in a recording.";
   // A card is rebuilt on every record, so what the person typed lives here, by request.
   const uis = new Map<string, DecideUi>();
   const uiFor = (card: InboxCard): DecideUi => {
@@ -114,7 +121,7 @@ export function InboxCards(props: { readonly cards: readonly InboxCard[]; readon
                 This agent's history has a gap; this may be out of date.
               </p>
             </Show>
-            <Show when={card.choices.length > 0}>
+            <Show when={card.choices.length > 0 && (card.waitsFor === undefined || props.preview)}>
               <Show
                 when={card.waitsFor === undefined}
                 fallback={

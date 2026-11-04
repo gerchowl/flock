@@ -20,6 +20,7 @@ import type { AgentState } from "../src/gen/AgentState";
 import type { Phase } from "../src/gen/Phase";
 import { SAMPLE_INBOX } from "../src/workbench/inbox";
 import { markFor } from "../src/workbench/marks";
+import { previewControls } from "../src/workbench/preview";
 import { SAMPLE_AGENTS } from "../src/workbench/samples";
 import { shortcutLabel } from "../src/workbench/Palette";
 import { Workbench } from "../src/workbench/Workbench";
@@ -47,6 +48,9 @@ const workingState: AgentState = { turn: "working", background: "none", attentio
 const $ = (root: ParentNode, id: string): Element | null => root.querySelector(`[data-testid="${id}"]`);
 const $$ = (root: ParentNode, id: string): Element[] => [...root.querySelectorAll(`[data-testid="${id}"]`)];
 const tick = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
+/** The labels of the unbuilt actions §2a drew, Terminal included. */
+const UNBUILT = ["New agent", "Terminal", "Diff", "Fork", "Summary", "PR", "Activity"];
+const buttonLabels = (root: ParentNode): string[] => [...root.querySelectorAll("button")].map((button) => button.textContent?.trim() ?? "");
 /** The fleet stream's sub id: the connection allocates every id. */
 const fleetSub = (h: Harness): string => (sentFrames(h).find((frame) => (frame as { t: string; stream?: string }).t === "sub" && (frame as { stream?: string }).stream === "fleet") as { sub_id: string }).sub_id;
 /** The sub id of the latest `sub` for `agent`: ids are unique per connection, not per view. */
@@ -79,7 +83,22 @@ describe("fixture mode", () => {
     expect(localStorage.getItem("flock.layout:fixture")).toContain("agent/atlas");
   });
 
-  test("post-MVP actions are inert and show what they wait for as text", async () => {
+  test("unbuilt actions are hidden by default: no New agent, Diff, Fork or Terminal, and sample cards offer no answers", async () => {
+    const config = { transport: "fixture", fixtureJsonl: "", source: "x" } as const;
+    const root = mount(() => <App config={{ ok: true, config }} />);
+    await tick();
+    expect($(root, "focus-pane")?.querySelector("h1")?.textContent).toBe("fixture");
+    expect(root.querySelectorAll(".waits, [aria-disabled]").length).toBe(0);
+    expect(buttonLabels(root).filter((label) => UNBUILT.includes(label))).toEqual([]);
+    expect($$(root, "inbox-card").every((card) => card.querySelector("button") === null)).toBe(true);
+    expect($(root, "inbox")?.querySelector(".inbox__note")?.textContent).toBe("Sample cards: answering them is not available in a recording.");
+  });
+
+  test("with ?preview, unbuilt actions are inert and show what they wait for as text; Terminal stays gone", async () => {
+    // The test DOM starts at about:blank, where history cannot add a query string.
+    const dom = (globalThis as unknown as { happyDOM: { setURL: (url: string) => void } }).happyDOM;
+    dom.setURL("https://fixture.invalid/?preview");
+    onTestFinished(() => dom.setURL("about:blank"));
     const config = { transport: "fixture", fixtureJsonl: "", source: "x" } as const;
     const root = mount(() => <App config={{ ok: true, config }} />);
     await tick();
@@ -87,17 +106,18 @@ describe("fixture mode", () => {
       const id = button?.getAttribute("aria-describedby");
       return id ? document.getElementById(id)?.textContent : undefined;
     };
+    expect(buttonLabels(root).filter((label) => UNBUILT.includes(label))).toEqual(["New agent", "Diff", "Fork"]);
     const fork = [...root.querySelectorAll("button")].find((button) => button.textContent === "Fork");
     expect(fork?.getAttribute("aria-disabled")).toBe("true");
     expect(fork?.disabled).toBe(false);
-    expect(reason(fork)).toBe("Waits for forks (ADR-0036 S12)");
-    expect(fork?.parentElement?.textContent).toBe("ForkWaits for forks (ADR-0036 S12)");
+    expect(reason(fork)).toBe("Waits for forks");
+    expect(fork?.parentElement?.textContent).toBe("ForkWaits for forks");
     const before = root.innerHTML;
     fork?.click();
     expect(root.innerHTML).toBe(before);
     const allow = [...root.querySelectorAll("button")].find((button) => button.textContent === "Allow once");
-    expect(reason(allow)).toBe("Answering waits for the inbox stream (G5 #1597).");
-    expect(allow?.closest("article")?.textContent).toContain("Answering waits for the inbox stream (G5 #1597).");
+    expect(reason(allow)).toBe("Answering waits for the inbox stream.");
+    expect(allow?.closest("article")?.textContent).toContain("Answering waits for the inbox stream.");
   });
 });
 
@@ -191,9 +211,9 @@ describe("wire mode", () => {
 });
 
 describe("phone", () => {
-  async function phone(source: "replay" | "live" = "replay"): Promise<HTMLElement> {
+  async function phone(source: "replay" | "live" = "replay", preview = false): Promise<HTMLElement> {
     const root = mount(() => (
-      <Workbench fleet={createFixtureFleet(SAMPLE_AGENTS)} transport={createFixtureTransport("")} inbox={SAMPLE_INBOX} layout={emptyLayout()} sender={null} saveLayout={() => undefined} mode="phone" source={source} />
+      <Workbench fleet={createFixtureFleet(SAMPLE_AGENTS)} transport={createFixtureTransport("")} inbox={SAMPLE_INBOX} layout={emptyLayout()} sender={null} saveLayout={() => undefined} mode="phone" source={source} preview={preview} />
     ));
     await tick();
     return root;
@@ -207,9 +227,29 @@ describe("phone", () => {
     expect(tab(root, "Inbox")?.getAttribute("aria-current")).toBe("page");
     expect($(root, "inbox-headline")?.textContent).toBe("1 blocked on you.");
     expect($$(root, "inbox-card").length).toBe(2);
+    expect([...root.querySelectorAll(".tabbar button")].map((button) => button.textContent)).toEqual(["Inbox", "Agents"]);
+  });
+
+  test("with preview, the Activity tab shows disabled with what it waits for", async () => {
+    const root = await phone("replay", true);
     const activity = [...root.querySelectorAll<HTMLButtonElement>(".tabbar button")].find((button) => button.textContent === "Activity");
     expect(activity?.getAttribute("aria-disabled")).toBe("true");
-    expect(document.getElementById(activity?.getAttribute("aria-describedby") ?? "")?.textContent).toBe("Waits for the events stream (S7-rest)");
+    expect(document.getElementById(activity?.getAttribute("aria-describedby") ?? "")?.textContent).toBe("Waits for the events stream");
+  });
+
+  test("with preview, the agent screen's view switcher shows Summary and PR disabled, and no Terminal", async () => {
+    const root = await phone("replay", true);
+    tab(root, "Agents")?.click();
+    ($$(root, "agent-row")[0] as HTMLButtonElement).click();
+    await tick();
+    expect([...root.querySelectorAll(".segmented button")].map((button) => [button.textContent?.trim(), button.getAttribute("aria-disabled") === "true"])).toEqual([
+      ["Summary", true],
+      ["Transcript", false],
+      ["PR", true],
+    ]);
+    const summary = [...root.querySelectorAll(".segmented button")].find((button) => button.textContent === "Summary");
+    expect(document.getElementById(summary?.getAttribute("aria-describedby") ?? "")?.textContent).toBe("Summary waits for goal and step records.");
+    expect($(root, "segmented-reasons")?.textContent).toBe("Summary waits for goal and step records. PR waits for a PR source.");
   });
 
   test("live, with no open prompts, the inbox shows no sample cards and nothing is blocked", async () => {
@@ -288,15 +328,9 @@ describe("phone", () => {
     ($$(root, "agent-row")[0] as HTMLButtonElement).click();
     await tick();
     expect($(root, "phone-agent")?.querySelector("h1")?.textContent).toBe("fixture");
-    expect([...root.querySelectorAll(".segmented button")].map((button) => [button.textContent?.trim(), button.getAttribute("aria-disabled") === "true"])).toEqual([
-      ["Summary", true],
-      ["Transcript", false],
-      ["PR", true],
-      ["Terminal", true],
-    ]);
-    const terminal = [...root.querySelectorAll(".segmented button")].find((button) => button.textContent === "Terminal");
-    expect(document.getElementById(terminal?.getAttribute("aria-describedby") ?? "")?.textContent).toBe("Terminal waits for the terminal tile.");
-    expect($(root, "segmented-reasons")?.textContent).toContain("PR waits for a PR source.");
+    // Its only built view is the transcript, so there is no view switcher.
+    expect(root.querySelector(".segmented")).toBeNull();
+    expect($(root, "segmented-reasons")).toBeNull();
     expect($(root, "transcript-synced")).not.toBeNull();
     [...root.querySelectorAll<HTMLButtonElement>("button")].find((button) => button.textContent?.includes("Back"))?.click();
     await tick();
@@ -378,17 +412,25 @@ describe("command palette", () => {
   }
   const key = (target: EventTarget, init: KeyboardEventInit): boolean => target.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, ...init }));
 
+  test("with preview, the top bar's unbuilt action follows the agents, dimmed: every toolbar action has its command", async () => {
+    const root = mount(() => <Workbench fleet={createFixtureFleet(SAMPLE_AGENTS)} transport={createFixtureTransport("")} inbox={[]} layout={emptyLayout()} sender={null} saveLayout={() => undefined} source="replay" preview />);
+    await tick();
+    key(document, { key: "k", metaKey: true });
+    expect($$(root, "palette-item").length).toBe(4);
+    const waiting = $(root, "palette-command") as HTMLElement;
+    expect([waiting.textContent, waiting.getAttribute("aria-disabled")]).toEqual(["New agentWaits for the harness picker", "true"]);
+    waiting.click();
+    expect($(root, "palette")).not.toBeNull();
+  });
+
   test("⌘K opens it; typing filters agents; Enter focuses the match", async () => {
     const root = await workbench(createFixtureFleet(SAMPLE_AGENTS));
     expect($(root, "palette")).toBeNull();
     key(document, { key: "k", metaKey: true });
     const input = $(root, "palette")?.querySelector("input") as HTMLInputElement;
     expect($$(root, "palette-item").length).toBe(4);
-    // After the agents, the top bar's waiting action, dimmed: every toolbar action has its command.
-    const waiting = $(root, "palette-command") as HTMLElement;
-    expect([waiting.textContent, waiting.getAttribute("aria-disabled")]).toEqual(["New agentWaits for the harness picker (ADR-0036 S17)", "true"]);
-    waiting.click();
-    expect($(root, "palette")).not.toBeNull();
+    // Unbuilt actions are hidden, so the palette lists only the agents.
+    expect($(root, "palette-command")).toBeNull();
     input.value = "wr";
     input.dispatchEvent(new InputEvent("input", { bubbles: true }));
     expect($$(root, "palette-item").map((item) => item.textContent)).toEqual(["wrenTurn finished"]);
@@ -857,4 +899,56 @@ describe("status marks", () => {
     expect($(root, "focus-pane")?.querySelector(".chip svg > *")?.tagName.toLowerCase()).toBe("circle");
     expect($$(root, "agent-row")[0]?.querySelector("svg > *")).not.toBeNull();
   });
+});
+
+test("unbuilt controls: always in a development build, with ?preview in a test build, never in a production build", () => {
+  const searches = ["?preview", "?preview=1", "?layout=phone&preview", "", "?previews", "?layout=preview"];
+  const test = { dev: false, production: false };
+  expect(searches.map((search) => previewControls(search, test))).toEqual([true, true, true, false, false, false]);
+  expect(searches.map((search) => previewControls(search))).toEqual([true, true, true, false, false, false]);
+  expect(searches.map((search) => previewControls(search, { dev: true, production: false }))).toEqual(searches.map(() => true));
+  expect(searches.map((search) => previewControls(search, { dev: false, production: true }))).toEqual(searches.map(() => false));
+});
+
+describe("rendered copy", () => {
+  /** ADR-0048 A7.2's patterns: ADR, slice and issue ids, and any mention of PTY or terminal agents. */
+  const FORBIDDEN = /ADR-\d{4}|\bS\d+[a-z]?\b|#\d{3,}|\bPTY\b|\bterminal[- ](agent|session|pane)s?\b/i;
+  /** Everything a person reads or hears: text, and the attributes assistive technology announces. */
+  const copyOf = (root: Element): string[] => [
+    root.textContent ?? "",
+    ...[...root.querySelectorAll("*")].flatMap((element) => ["aria-label", "title", "placeholder", "alt", "aria-description"].map((name) => element.getAttribute(name) ?? "")),
+  ];
+
+  for (const preview of [false, true])
+    for (const source of ["replay", "live"] as const) {
+      const label = `${source}${preview ? ", with preview" : ""}`;
+
+      test(`desktop, ${label}: no id or terminal agent in any copy, and no Terminal control`, async () => {
+        const root = mount(() => <Workbench fleet={createFixtureFleet(SAMPLE_AGENTS)} transport={createFixtureTransport("")} inbox={SAMPLE_INBOX} layout={emptyLayout()} sender={null} saveLayout={() => undefined} mode="desktop" source={source} preview={preview} />);
+        await tick();
+        const seen = copyOf(root);
+        ($$(root, "agent-row")[0] as HTMLButtonElement).click();
+        await tick();
+        seen.push(...copyOf(root));
+        document.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, key: "k", metaKey: true }));
+        expect($(root, "palette")).not.toBeNull();
+        seen.push(...copyOf(root));
+        expect(seen.filter((copy) => FORBIDDEN.test(copy))).toEqual([]);
+        expect(buttonLabels(root)).not.toContain("Terminal");
+      });
+
+      test(`phone, ${label}: no id or terminal agent in any copy, and no Terminal control`, async () => {
+        const root = mount(() => <Workbench fleet={createFixtureFleet(SAMPLE_AGENTS)} transport={createFixtureTransport("")} inbox={SAMPLE_INBOX} layout={emptyLayout()} sender={null} saveLayout={() => undefined} mode="phone" source={source} preview={preview} />);
+        await tick();
+        const seen = copyOf(root);
+        [...root.querySelectorAll<HTMLButtonElement>(".tabbar > button")].find((button) => button.textContent === "Agents")?.click();
+        seen.push(...copyOf(root));
+        ($$(root, "agent-row")[0] as HTMLButtonElement).click();
+        await tick();
+        expect($(root, "phone-agent")).not.toBeNull();
+        seen.push(...copyOf(root));
+        expect(seen.filter((copy) => FORBIDDEN.test(copy))).toEqual([]);
+        expect(buttonLabels(root)).not.toContain("Terminal");
+      });
+    }
 });

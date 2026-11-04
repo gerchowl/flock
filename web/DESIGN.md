@@ -187,9 +187,11 @@ so the required `client` CI check runs it on every change. One test per rule:
    ([Keyboards](https://developer.apple.com/design/human-interface-guidelines/keyboards);
    [WCAG 2.2 SC 2.1.1, 2.4.7, 4.1.2](https://www.w3.org/TR/WCAG22/).)
 9. **Structure.** A sidebar's disclosure groups nest at most two deep. On
-   every screen with a toolbar (a `header` or `role="toolbar"`), each
-   toolbar has actions and every one of them, disabled ones included, is a
-   ⌘K command: the palette lists an unavailable action dimmed. No control
+   every screen with a toolbar (a `header` or `role="toolbar"`), every
+   action in it, disabled ones included, is a ⌘K command: the palette lists
+   an unavailable action dimmed. A toolbar with no actions passes, but the
+   walk must have looked: the buttons it saw in each toolbar must equal the
+   toolbar's rendered buttons, counted separately. No control
    switches the app's light or dark appearance, which follows the system.
    ([Sidebars](https://developer.apple.com/design/human-interface-guidelines/sidebars);
    [Toolbars](https://developer.apple.com/design/human-interface-guidelines/toolbars);
@@ -199,13 +201,17 @@ The keyboard and structure checks that drive the page (Tab, arrows, ⌘K and
 Esc, toolbar parity) run in every mode too. Nothing passes by running less:
 a coverage test fails unless every page ran in every mode, as the page's own
 media queries report it, and each walk covered the page's minimum of
-elements and controls. Closing the browser is bounded too: a cleanup that
+elements and controls. That minimum (10 elements and 1 control per page)
+only detects an empty page, such as one that rendered nothing or a single
+error line. It does not freeze the page's size, so hiding or removing
+controls passes. Closing the browser is bounded too: a cleanup that
 times out fails the run, and the browser's processes are killed and reaped
 either way.
 
 Every check, and each part of rules 4, 8 and 9, has a seeded violation in
-the test's `SEEDS` (20 in all: one below the fold, one only in dark mode,
-one hiding the page). A test runs each check on its page with and without
+the test's `SEEDS` (21 in all: one below the fold, one only in dark mode,
+one hiding the page, one where the parity walk misses a toolbar's
+buttons). A test runs each check on its page with and without
 its seed and fails unless the seed adds a finding.
 `CONFORMANCE_SEED=<seed> bun test ./e2e/conformance.test.ts` injects one
 seed for the whole run instead, and its rule's test fails. The suite's own
