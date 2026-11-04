@@ -10,6 +10,7 @@ import type { Sender } from "./Composer";
 import { PermissionActions, createDecideUi, type DecideUi } from "./decide";
 import { sortInbox, type InboxCard } from "./inbox";
 import { PHASE_LABELS, StatusMark, markFor } from "./marks";
+import { RefusalDetails } from "./refusals";
 
 /**
  * An unbuilt action, shown only in preview (`workbench/preview.ts`) and inert. What it waits for is visible text,
@@ -116,6 +117,7 @@ export function InboxCards(props: {
             </p>
             <h3 class="card__title">{card.title}</h3>
             <p class="card__detail">{card.detail}</p>
+            <Show when={card.diagnosis}>{(raw) => <RefusalDetails code={raw().code} message={raw().message} />}</Show>
             <Show when={card.stale}>
               <p class="card__stale" data-testid="inbox-stale">
                 This agent's history has a gap; this may be out of date.

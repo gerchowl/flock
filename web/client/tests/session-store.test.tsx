@@ -161,8 +161,11 @@ test("a double release is harmless and never closes a stream another reader hold
 test("after a failure a new transcript opens a fresh subscription while the inbox still holds the dead one", () => {
   const wire = counting();
   const { inbox } = mount(wire.transport);
-  wire.observer(0).failed({ message: "boom" });
-  expect(inbox.cards()[0]?.detail).toBe("Details unavailable: boom");
+  wire.observer(0).failed({ code: "session_busy", message: "command refused: session_busy" });
+  expect(inbox.cards()[0]).toMatchObject({
+    detail: "This request's details could not load. The server is busy. Try again in a moment.",
+    diagnosis: { code: "session_busy", message: "command refused: session_busy" },
+  });
   const root = document.createElement("div");
   document.body.append(root);
   disposers.push(render(() => <Transcript transport={wire.transport} stream="agent/atlas" source="live" />, root));
@@ -172,7 +175,7 @@ test("after a failure a new transcript opens a fresh subscription while the inbo
   expect(root.querySelectorAll('[data-testid="known-event"]')).toHaveLength(1);
   expect(root.textContent).not.toContain("Couldn't load");
   // The inbox's reader keeps the failure it saw.
-  expect(inbox.cards()[0]?.detail).toBe("Details unavailable: boom");
+  expect(inbox.cards()[0]?.diagnosis).toEqual({ code: "session_busy", message: "command refused: session_busy" });
 });
 
 test("releasing a failed record leaves the newer record for the stream and its subscription open", () => {

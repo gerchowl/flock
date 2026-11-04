@@ -30,6 +30,8 @@ export type InboxCard = {
   readonly requestSeq?: number;
   /** The agent's stream had a history gap that nothing has followed yet: the card may be out of date. */
   readonly stale?: boolean;
+  /** Why the card has no usable request, raw, for its Details; `detail` words it plainly (`refusals.tsx`). */
+  readonly diagnosis?: { readonly code?: string; readonly message: string };
 };
 
 const SAMPLE_WAITS_FOR = "the inbox stream";

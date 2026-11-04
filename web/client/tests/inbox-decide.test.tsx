@@ -104,7 +104,7 @@ describe("answering a prompt", () => {
     const app = prompt();
     button(app, "Deny").click();
     ack(app, { cmd_id: cmds(app)[0]?.cmd_id ?? "", ok: false, error: refusal("invalid_params") });
-    expect(status(app)).toBe(`The server could not accept what was sent. Keep the message to ${MESSAGE_MAX_BYTES} bytes, with no control characters other than newlines and tabs.`);
+    expect(status(app)).toBe("The message is too long, or holds characters the server refuses. Shorten it and remove any control characters, then send it again.");
     expect(details(app)).toBe("Detailsinvalid_params server said invalid_params");
     expect(button(app, "Deny").hasAttribute("disabled")).toBe(true);
     expect(cmds(app)).toHaveLength(1);
@@ -280,7 +280,7 @@ describe("answering a prompt", () => {
     expect(button(app, "Confirm always allow").hasAttribute("disabled")).toBe(true);
     button(app, "Confirm always allow").click();
     expect(cmds(app)).toHaveLength(0);
-    expect(status(app)).toContain("over the 2048-byte limit");
+    expect(status(app)).toBe("The message is too long. Shorten it to send your answer.");
   });
 
   test("a send error for one request never shows on the next", () => {
@@ -321,12 +321,12 @@ describe("answering a prompt", () => {
     const fits = "€".repeat(Math.floor(MESSAGE_MAX_BYTES / 3));
     type(app, `  ${fits}  `);
     expect(button(app, "Allow once").hasAttribute("disabled")).toBe(false);
-    expect($$(app.root, "decide-count")[0]?.textContent).toBe(`${MESSAGE_MAX_BYTES - (fits.length * 3)} bytes left`);
+    expect($$(app.root, "decide-count")[0]?.textContent).toBe(`About ${MESSAGE_MAX_BYTES - (fits.length * 3)} characters left`);
     type(app, `${fits}😀`);
     expect(fits.length + 2).toBeLessThan(MESSAGE_MAX_BYTES);
     expect(button(app, "Allow once").hasAttribute("disabled")).toBe(true);
-    expect($$(app.root, "decide-count")[0]?.textContent).toBe(`${fits.length * 3 + 4 - MESSAGE_MAX_BYTES} bytes over the limit`);
-    expect(status(app)).toBe(`The message is ${fits.length * 3 + 4 - MESSAGE_MAX_BYTES} bytes over the ${MESSAGE_MAX_BYTES}-byte limit.`);
+    expect($$(app.root, "decide-count")[0]?.textContent).toBe("The message is too long");
+    expect(status(app)).toBe("The message is too long. Shorten it to send your answer.");
     button(app, "Allow once").click();
     expect(cmds(app)).toHaveLength(0);
     type(app, fits);

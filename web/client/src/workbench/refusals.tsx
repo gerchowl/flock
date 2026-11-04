@@ -11,11 +11,16 @@
  * The table is typed exhaustively over the generated refusal vocabularies
  * (`AgentDecideErrorCode`, `SubfailCode`), so a code added there fails `tsc`
  * here until it has copy. An ack's `WireError.code` is an open string on the
- * wire; {@link CommandCode} lists the codes the `agent.send` and
- * `agent.decide` paths return today (`src/web/wire/commands.rs`,
- * `src/app/api/structured_queue.rs`, `src/structured/`). A code outside the
- * table falls back to copy chosen by the error's retry class, never to the
- * raw message.
+ * wire; {@link CommandCode} lists every code the web wire's `agent.send` and
+ * `agent.decide` paths can return today, audited against
+ * `src/web/wire.rs`, `src/web/wire/commands.rs`,
+ * `src/app/api/structured_queue.rs`, `src/structured/queue/`,
+ * `src/structured/workers/queue.rs`, `src/structured/transport/mod.rs` and
+ * `src/structured/permissions.rs`. Codes of other verbs never reach this
+ * client, which sends only those two: for example `structured_recovery_required`
+ * (agent start), `msg_not_allowed` (mail) and `at_agent_capacity` (spawn).
+ * Should one arrive anyway, or a code added later, it falls back to copy
+ * chosen by the error's retry class, never to the raw message.
  *
  * @module
  */
@@ -39,6 +44,7 @@ export const MESSAGE_MAX_BYTES = 2048;
 /** Command refusals the send and decide paths return besides the decide vocabulary; the wire types none of them. */
 export type CommandCode =
   | "agent_not_found"
+  | "agent_target_ambiguous"
   | "unsupported_for_agent"
   | "structured_submit_required"
   | "self_message_forbidden"
@@ -75,17 +81,14 @@ const AGAIN = "Send it again.";
 const CHECK = "Check the transcript before sending it again.";
 const LOG = "Try again; if it keeps happening, check the server's log.";
 const TOKEN = "Connect with a token that allows it.";
-const LISTED = "Nothing to answer: the card follows the agent's list.";
+const LISTED = "There is nothing left to answer; this card goes away by itself.";
 
 /** The copy for every typed refusal. */
 export const REFUSALS: { readonly [C in RefusalCode]: Copy } = {
   permission_request_unknown: { effect: "The server no longer has this request.", next: LISTED },
   permission_request_closed: { effect: "This request was already answered or withdrawn.", next: LISTED },
   not_authorized: { effect: "This client is not allowed to do that.", next: TOKEN },
-  invalid_params: {
-    effect: "The server could not accept what was sent.",
-    next: `Keep the message to ${MESSAGE_MAX_BYTES} bytes, with no control characters other than newlines and tabs.`,
-  },
+  invalid_params: { effect: "The message is too long, or holds characters the server refuses.", next: "Shorten it and remove any control characters, then send it again." },
   invalid_agent: { effect: "The server does not know this agent.", next: PICK },
   cursor_ahead: { effect: "The history could not resume where it stopped.", next: "Retry to load it from the start." },
   operator_only: { effect: "Only the operator can do that.", next: "Connect with the operator's token." },
@@ -94,6 +97,7 @@ export const REFUSALS: { readonly [C in RefusalCode]: Copy } = {
   session_busy: { effect: "The server is busy.", next: "Try again in a moment." },
   sub_id_reused: { effect: "The server would not reopen this view on this connection.", next: "Reconnect, then retry." },
   agent_not_found: { effect: "The server no longer knows this agent.", next: PICK },
+  agent_target_ambiguous: { effect: "More than one agent goes by this name.", next: PICK },
   unsupported_for_agent: { effect: "This agent does not take messages from here.", next: PICK },
   structured_submit_required: { effect: "Nothing was sent.", next: AGAIN },
   self_message_forbidden: { effect: "An agent cannot message itself.", next: "Choose another agent." },
@@ -103,7 +107,7 @@ export const REFUSALS: { readonly [C in RefusalCode]: Copy } = {
   internal_error: { effect: "The server hit an internal error.", next: LOG },
   server_version_gap: { effect: "This server runs an older version that cannot do this.", next: "Update the server." },
   serialization_error: { effect: "The server could not write its reply.", next: LOG },
-  input_write_unknown: { effect: "It is unknown whether the agent received this.", next: CHECK },
+  input_write_unknown: { effect: "The agent may not have received this.", next: CHECK },
   input_write_failed: { effect: "The agent did not receive this.", next: AGAIN },
   agent_start_failed: { effect: "The agent could not be started.", next: "Check the agent's state, then try again." },
   queue_item_too_large: { effect: "The message is too long for the agent's queue.", next: "Shorten it, then send it again." },

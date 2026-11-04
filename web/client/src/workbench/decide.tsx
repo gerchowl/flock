@@ -83,6 +83,7 @@ const CHOICES: readonly { readonly label: string; readonly decision: PermissionD
   { label: "Deny", decision: "deny" },
 ];
 
+/** The server's limit is in UTF-8 bytes; the count calls them characters, exact for plain text and approximate otherwise. */
 const utf8Bytes = (text: string): number => new TextEncoder().encode(text).length;
 
 /** The request a decision is bound to: the one the person was shown and acknowledged. */
@@ -163,7 +164,7 @@ export function PermissionActions(props: { readonly card: InboxCard; readonly se
     const now = state();
     if (now.kind === "answered") return "Answered; waiting for the agent";
     if (now.kind === "inflight" || now.kind === "refused") return now.line;
-    if (bytes() > MESSAGE_MAX_BYTES) return `The message is ${bytes() - MESSAGE_MAX_BYTES} bytes over the ${MESSAGE_MAX_BYTES}-byte limit.`;
+    if (bytes() > MESSAGE_MAX_BYTES) return "The message is too long. Shorten it to send your answer.";
     return null;
   };
   const fail = (text: string, at: Target): void => void setError({ text, seq: at.seq, attempt: attempts(), under: blocked() });
@@ -213,7 +214,7 @@ export function PermissionActions(props: { readonly card: InboxCard; readonly se
       />
       <Show when={message().trim() !== ""}>
         <p class="decide__count" data-testid="decide-count">
-          {bytes() > MESSAGE_MAX_BYTES ? `${bytes() - MESSAGE_MAX_BYTES} bytes over the limit` : `${MESSAGE_MAX_BYTES - bytes()} bytes left`}
+          {bytes() > MESSAGE_MAX_BYTES ? "The message is too long" : `About ${MESSAGE_MAX_BYTES - bytes()} characters left`}
         </p>
       </Show>
       <Show when={changed()}>
