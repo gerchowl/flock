@@ -79,13 +79,6 @@ export const ALLOWED: readonly Allowance[] = [
   },
   {
     rule: "grid",
-    selector: ".waits",
-    pages: ["workbench", "workbench-phone", "workbench-forced-phone"],
-    issue: 2913,
-    why: "the legacy workbench.css spaces it in rem on a 14 px root (row-gap 1.75 px)",
-  },
-  {
-    rule: "grid",
     selector: ".action",
     pages: ["workbench", "workbench-phone", "workbench-forced-phone"],
     issue: 2913,
@@ -160,13 +153,6 @@ export const ALLOWED: readonly Allowance[] = [
     pages: ["workbench"],
     issue: 2913,
     why: "the legacy workbench.css spaces it in rem on a 14 px root (padding-top 1.75 px)",
-  },
-  {
-    rule: "grid",
-    selector: ".focus__actions",
-    pages: ["workbench"],
-    issue: 2913,
-    why: "the legacy workbench.css spaces it in rem on a 14 px root (row-gap 7 px)",
   },
   {
     rule: "grid",
@@ -279,13 +265,6 @@ export const ALLOWED: readonly Allowance[] = [
     pages: ["workbench", "workbench-phone", "workbench-forced-phone"],
     issue: 2913,
     why: "the legacy workbench.css spaces it in rem on a 14 px root (margin-top 3.5 px)",
-  },
-  {
-    rule: "grid",
-    selector: ".card__choices",
-    pages: ["workbench", "workbench-phone", "workbench-forced-phone"],
-    issue: 2913,
-    why: "the legacy workbench.css spaces it in rem on a 14 px root (margin-top 7 px)",
   },
   {
     rule: "hit-size",

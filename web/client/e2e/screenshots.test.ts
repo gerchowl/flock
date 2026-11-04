@@ -106,9 +106,8 @@ describe("fixture preview", () => {
     await expectNoHorizontalScroll(page);
     await expectTouchTargets(page);
     expect(await bodyTextSize(page)).toBe(15);
-    const choice = await page.getByTestId("inbox-card").first().locator("button").first().boundingBox();
-    expect(choice?.height).toBeGreaterThanOrEqual(48);
-    expect(choice?.width).toBeGreaterThan(PHONE.width / 2);
+    // A sample card's answers are not built, so they show only with ?preview.
+    await expect(page.getByTestId("inbox-card").locator("button").count()).resolves.toBe(0);
     await capture(page, "workbench-phone-inbox-390x844");
 
     await page.getByRole("button", { name: "Agents" }).click();
@@ -120,6 +119,13 @@ describe("fixture preview", () => {
     expect(await page.evaluate(() => document.documentElement.scrollHeight)).toBeLessThanOrEqual(PHONE.height);
     expect(await page.getByRole("button", { name: "‹ Back" }).isVisible()).toBe(true);
     await capture(page, "workbench-phone-agent-390x844");
+
+    // A production build ignores ?preview: unbuilt controls are only for development builds (ADR-0048 D7).
+    await page.goto(`${pathToFileURL(`${DIST}/index.html`).href}?preview`);
+    await page.getByTestId("inbox-headline").waitFor({ timeout: 10_000 });
+    await expect(page.getByTestId("inbox-card").locator("button").count()).resolves.toBe(0);
+    await expect(page.locator(".waits, [aria-disabled]").count()).resolves.toBe(0);
+    await expect(page.getByRole("button", { name: "Activity" }).count()).resolves.toBe(0);
 
     expect(seen.requests.filter((url) => !url.startsWith("file:") && !url.startsWith("data:"))).toEqual([]);
     expect(seen.errors).toEqual([]);
