@@ -6,8 +6,10 @@
  *    in the generated `src/tokens.css`. Custom properties may only alias
  *    tokens, so a raw value cannot hide in a local `--x: 13px` (the plugin
  *    skips custom properties, so a core rule covers them).
- * 2. Layout fencing: flex and grid display, gap, margins, absolute
- *    positioning and `@media` belong to the primitives in `src/layout/`.
+ * 2. Layout fencing: display/position allowlists and structural properties
+ *    keep layout in src/layout/. The design-values rule resolves aliases,
+ *    validates categories, and rejects fallbacks, unknown names, legacy
+ *    colours in new CSS and @property outside generated tokens.
  *    Everything else composes those primitives.
  * 5. Reserved token names: only the generated `src/tokens.css` declares a
  *    custom property in a token category (`--color-*`, `--space-*`, …), so
@@ -29,6 +31,10 @@ const STRICT = [
   "/^font/",
   "line-height",
   "box-shadow",
+  "text-shadow",
+  "fill",
+  "stroke",
+  "/^-webkit-text-(stroke|fill)/",
   "z-index",
   "/gap$/",
   "/^margin/",
@@ -61,7 +67,8 @@ const strict = (properties) => [
   properties,
   {
     ignoreFunctions: false,
-    ignoreValues: KEYWORDS,
+    // Whole-value calc() is validated, including its resolved units, by design-values.
+    ignoreValues: [...KEYWORDS, "/^calc\\([\\s\\S]*\\)$/"],
     expandShorthand: true,
     recurseLonghand: true,
     disableFix: true,
@@ -69,12 +76,7 @@ const strict = (properties) => [
 ];
 
 const FENCE = {
-  "declaration-property-value-disallowed-list": {
-    display: ["/flex/", "/grid/"],
-    position: ["absolute"],
-  },
   "property-disallowed-list": ["/gap$/", "/^margin/"],
-  "at-rule-disallowed-list": ["media"],
 };
 const UNFENCED = Object.fromEntries(Object.keys(FENCE).map((rule) => [rule, null]));
 
@@ -88,18 +90,20 @@ export default {
   rules: {
     "scale-unlimited/declaration-strict-value": strict(STRICT),
     "flock/no-token-redeclaration": true,
+    "flock/design-values": true,
     ...ALIAS,
     ...FENCE,
   },
   overrides: [
-    { files: LEGACY, rules: { "scale-unlimited/declaration-strict-value": strict(COLOR), ...UNFENCED } },
-    { files: ["src/layout/**/*.css"], rules: UNFENCED },
+    { files: LEGACY, rules: { "scale-unlimited/declaration-strict-value": strict(COLOR), "flock/design-values": { legacy: true }, ...UNFENCED } },
+    { files: ["src/layout/**/*.css"], rules: { ...UNFENCED, "flock/design-values": { layout: true } } },
     {
       files: ["src/tokens.css"],
       rules: {
         "scale-unlimited/declaration-strict-value": null,
         "declaration-property-value-allowed-list": null,
         "flock/no-token-redeclaration": null,
+        "flock/design-values": null,
         ...UNFENCED,
       },
     },

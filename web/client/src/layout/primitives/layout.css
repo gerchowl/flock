@@ -103,3 +103,10 @@
 :where(.l-stack, .l-cluster, .l-sidebar, .l-switcher, .l-grid) > * {
   margin-block: 0;
 }
+
+/* Sticky: keep chrome at the top of its scrolling container. */
+.l-sticky {
+  position: sticky;
+  top: 0;
+  z-index: var(--layer-sticky);
+}
