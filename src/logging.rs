@@ -190,6 +190,15 @@ pub(crate) fn structured_queue_record_skipped(sequence: Option<u64>, reason: &'s
     );
 }
 
+/// Report an OS unlock failure without exposing journal paths or contents.
+pub(crate) fn structured_queue_unlock_failed(error: &std::io::Error) {
+    tracing::error!(
+        event = "structured.queue.unlock_failed",
+        errno = error.raw_os_error(),
+        "queue journal unlock failed"
+    );
+}
+
 /// Report startup settlement failure without logging input; reopen fences the item.
 pub(crate) fn structured_queue_opening_settlement_failed(code: crate::api::error_code::ErrorCode) {
     tracing::error!(
