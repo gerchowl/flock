@@ -106,9 +106,8 @@ describe("fixture preview", () => {
     await expectNoHorizontalScroll(page);
     await expectTouchTargets(page);
     expect(await bodyTextSize(page)).toBe(15);
-    const choice = await page.getByTestId("inbox-card").first().locator("button").first().boundingBox();
-    expect(choice?.height).toBeGreaterThanOrEqual(48);
-    expect(choice?.width).toBeGreaterThan(PHONE.width / 2);
+    // A sample card's answers are not built, so they show only with ?preview.
+    await expect(page.getByTestId("inbox-card").locator("button").count()).resolves.toBe(0);
     await capture(page, "workbench-phone-inbox-390x844");
 
     await page.getByRole("button", { name: "Agents" }).click();
@@ -120,6 +119,13 @@ describe("fixture preview", () => {
     expect(await page.evaluate(() => document.documentElement.scrollHeight)).toBeLessThanOrEqual(PHONE.height);
     expect(await page.getByRole("button", { name: "‹ Back" }).isVisible()).toBe(true);
     await capture(page, "workbench-phone-agent-390x844");
+
+    // With ?preview, a card's answers are the phone's full-width 48 px buttons.
+    await page.goto(`${pathToFileURL(`${DIST}/index.html`).href}?preview`);
+    await page.getByTestId("inbox-headline").waitFor({ timeout: 10_000 });
+    const choice = await page.getByTestId("inbox-card").first().locator("button").first().boundingBox();
+    expect(choice?.height).toBeGreaterThanOrEqual(48);
+    expect(choice?.width).toBeGreaterThan(PHONE.width / 2);
 
     expect(seen.requests.filter((url) => !url.startsWith("file:") && !url.startsWith("data:"))).toEqual([]);
     expect(seen.errors).toEqual([]);

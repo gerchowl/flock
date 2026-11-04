@@ -224,7 +224,7 @@ or placement field appears in the product.
 | Region | Content | Behaviour |
 |---|---|---|
 | **Sidebar** (left, fixed width, collapsible) | §1's trees. A *Projects / Nodes* toggle, then groups (a project's agents, *Architects*, other projects folded to one row each with a count such as "3 idle" or "2 blocked"). | Each agent row: a status mark, the agent name and its task, one line of current activity, and a count of its open inbox items. A click focuses the agent in the centre. |
-| **Focus pane** (centre) | The focused agent's tile (§2), by default one `transcript` tile. | A header line: agent, task and goal, PR, branch, model, a state chip with its age, and the actions *Terminal*, *Diff* and *Fork*. The transcript reads as turns. A tool run is one line (command, exit code, duration) that expands on demand. Older turns fold to "N earlier turns". A composer sits at the bottom. Next to it, it shows the agent's reported phase (for example working, idle or offline), and under each message that message's outbox state (§3). It never predicts when or whether a message will be delivered (§3, "queue order or delivery"). Delivery is shown only when the server reports it: the message's own user turn in the transcript, or, after the MVP, the agent's `queue/<agent>` stream (ADR-0036). |
+| **Focus pane** (centre) | The focused agent's tile (§2), by default one `transcript` tile. | A header line: agent, task and goal, PR, branch, model, a state chip with its age, and the agent's real actions in a ⋯ menu (#2900: no *Terminal*, since structured agents replace terminal agents). The transcript reads as turns. A tool run is one line (command, exit code, duration) that expands on demand. Older turns fold to "N earlier turns". A composer sits at the bottom. Next to it, it shows the agent's reported phase (for example working, idle or offline), and under each message that message's outbox state (§3). It never predicts when or whether a message will be delivered (§3, "queue order or delivery"). Delivery is shown only when the server reports it: the message's own user turn in the transcript, or, after the MVP, the agent's `queue/<agent>` stream (ADR-0036). |
 | **Inbox** (right, fixed width, collapsible) | §1's attention queue: questions, permission prompts, feedback requests and question threads (#1717), blocking first. | Every card answers in place: one button per choice, plus *Edit…* for free text and *Take as thread*. A thread card shows its message count and, once the fork has an answer, *Review and merge back*. Below the cards, *Recent* lists the last few landed or notable events. |
 
 - **One command palette** (⌘K, and a search field in the top bar) jumps to any
@@ -243,7 +243,7 @@ or placement field appears in the product.
 - **Inbox:** cards as on desktop, with primary actions as full-width 48 px
   buttons. A header line says whether anything is blocked on the person.
 - **Agent screen:** a back control, the agent's name and state, and a segmented
-  control *Summary · Transcript · PR · Terminal*. *Summary* shows the goal with
+  control *Summary · Transcript · PR* (no *Terminal*, #2900). *Summary* shows the goal with
   step chips (done, running, next), the latest turn, and any open thread with
   its *Merge back* action. The composer is pinned to the bottom.
 - No splits on a phone. `expand_into_second` pushes a screen, and back returns
@@ -277,15 +277,19 @@ or placement field appears in the product.
 | Focus pane transcript and composer | G3a over S7-min (`agent/<id>`, `agent.send`) | yes |
 | Inbox cards with in-place answers | G5 #1597 (inbox stream); S6-MVP for permission prompts | fixture data until G5 |
 | *Take as thread*, *Review and merge back* | #1717 (question threads) | post-MVP |
-| *Terminal* and *Diff* actions, phone *Terminal* tab | the `terminal` tile (no slice yet) and the reserved `diff` kind | post-MVP |
+| *Diff* action | the reserved `diff` kind | post-MVP |
+| *Terminal* action, phone *Terminal* tab | removed (#2900): structured agents replace terminal agents | never |
 | *Fork* | ADR-0036 S12 (forks at any boundary) | post-MVP |
 | Phone *PR* tab, palette search over issues and PRs | a PR/issue source (no slice yet) | post-MVP: the MVP palette searches agents only |
 | Phone *Activity* tab and *Recent* list | the `events` stream (S7-rest) | post-MVP |
 | *New agent* | ADR-0036 S17 (harness, model and effort picker) | post-MVP |
 | Node summary ("2 nodes live") | G4 #1596 and the mesh | post-MVP: the MVP shows this node only |
 
-A post-MVP part is either hidden in the MVP, or shown disabled with the name of
-what it waits for. It is never a button that does nothing.
+A post-MVP part is **hidden in production; visible only with `?preview`**,
+where it shows disabled with the name of what it waits for (amended by #2900).
+It is never a button that does nothing, and no caption names an ADR, slice or
+issue. A control disabled for a runtime reason the server reports is not a
+post-MVP part and shows either way.
 
 **Out of the MVP:** an *Agent board* (agents as cards in columns: needs you,
 working, idle) was the rejected alternative for the main screen. It may return
