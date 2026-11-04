@@ -65,13 +65,6 @@ export const ALLOWED: readonly Allowance[] = [
   },
   {
     rule: "grid",
-    selector: ".topbar",
-    pages: ["workbench"],
-    issue: 2913,
-    why: "the legacy workbench.css spaces it in rem on a 14 px root (padding-right 14 px)",
-  },
-  {
-    rule: "grid",
     selector: '[data-testid="palette-trigger"]',
     pages: ["workbench"],
     issue: 2913,

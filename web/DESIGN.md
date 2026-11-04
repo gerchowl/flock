@@ -285,6 +285,7 @@ The primitives in `src/layout/primitives/` follow
 | `Switcher` | One row above a width threshold, one column below. | `threshold`, `space` |
 | `Center` | A centred column with a maximum width. | `max`, `gutters`, `intrinsic` |
 | `Grid` | As many equal columns as fit. | `min`, `space` |
+| `Anchor`, `AnchorPanel` | A trigger and its popover panel, placed under it out of the flow (not one of Every Layout's). | `space`, `align` (panel) |
 
 Each takes `as` (the element), `class` and the element's other attributes.
 They respond to their container, not the viewport, so screens need no media

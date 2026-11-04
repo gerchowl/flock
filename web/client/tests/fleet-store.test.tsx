@@ -235,7 +235,7 @@ describe("views read the one record", () => {
     observer.change({ op: "upsert", kind: "agent", row: row("Atlas 2", ["r1"]) });
     expect(sidebar()).toContain("Atlas 2");
     expect(opened).toEqual(["agent/atlas"]);
-    expect(root.querySelector('[data-testid="agent-summary"]')?.textContent).toContain("1 agents");
+    expect(root.querySelectorAll('[data-testid="agent-row"]').length).toBe(1);
   });
 });
 

@@ -129,7 +129,6 @@ describe("the scope toggle", () => {
     click(button(root, "This node"));
     expect(rowIds(root).sort()).toEqual(["a1", "a2", "a5", "a6"]);
     expect(rowIds(root, "project-agent-row").sort()).toEqual(["a1", "a2", "a5", "a6"]);
-    expect($(root, "agent-summary")?.textContent).toBe("4 agents · 4 working");
   });
 
   test("with no local online row, or two, this node is unknown and nothing is guessed", async () => {
@@ -137,7 +136,6 @@ describe("the scope toggle", () => {
       const root = await mount({ nodes, prefs: { scope: "node", collapsed: [] } });
       expect($(root, "home-unknown")).not.toBeNull();
       expect($$(root, "agent-row").length).toBe(0);
-      expect($(root, "agent-summary")?.textContent).toBe("0 agents · 0 working");
       dispose?.();
       document.body.innerHTML = "";
     }
