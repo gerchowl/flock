@@ -28,12 +28,12 @@ try {
       (method) => `readonly ${method.slice(0, method.indexOf("("))}: unknown;`));
   const lib = join(root, "lib.dom.d.ts");
   await writeFile(lib, dom);
-  const seed = process.argv[2];
+  const seeds = process.argv.slice(2);
   await writeFile(join(root, "tsconfig.json"), JSON.stringify({
     extends: join(client, "tsconfig.json"),
     compilerOptions: { lib: ["es2022", "dom.iterable"] },
-    files: [lib, join(client, "scripts/design-types.d.cts"), ...(seed ? [resolve(seed)] : [])],
-    include: seed ? [] : [join(client, "src/**/*.ts"), join(client, "src/**/*.tsx")],
+    files: [lib, join(client, "scripts/design-types.d.cts"), ...seeds.map((seed) => resolve(seed))],
+    include: seeds.length ? [] : [join(client, "src/**/*.ts"), join(client, "src/**/*.tsx")],
   }));
   const child = Bun.spawn([process.execPath, "x", "tsc", "--noEmit", "--listFiles", "-p", join(root, "tsconfig.json")], {
     cwd: client, stdout: "pipe", stderr: "inherit",

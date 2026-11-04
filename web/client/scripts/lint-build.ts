@@ -76,6 +76,7 @@ async function lintGraph(root: Root): Promise<void> {
   }
 }
 
+const modules = new Set<string>();
 try {
 await build({
   root: rootDir,
@@ -86,6 +87,7 @@ await build({
     async transform(_code, id) {
       const file = id.split("?")[0]!;
       if (!isAbsolute(file) || !/\.[cm]?[jt]sx?$/.test(file) || file.includes("/node_modules/")) return;
+      modules.add(file);
       const path = relative(rootDir, file);
       const filePath = resolve(client, path.startsWith("src/") ? path : `src/__graph__/${basename(file)}`);
       const results = await eslint.lintText(await readFile(file, "utf8"), { filePath });
@@ -93,7 +95,12 @@ await build({
         throw new Error(`design source: ${file}\n${results.flatMap((result) => result.messages.map((message) => message.message)).join("\n")}`);
       }
     },
-    generateBundle() {
+    async generateBundle() {
+      if (modules.size) {
+        const child = Bun.spawn([process.execPath, resolve(client, "scripts/check-design-types.ts"), ...modules], { cwd: client, stdout: "pipe", stderr: "pipe" });
+        const output = await new Response(child.stdout).text() + await new Response(child.stderr).text();
+        if (await child.exited !== 0) throw new Error(`design source types: ${output}`);
+      }
       for (const id of this.getModuleIds()) {
         if (/\?(?:[^#]*&)?(?:raw|inline)(?:[&#]|$)/.test(id)) throw new Error(`design CSS: raw and inline imports cannot be audited: ${id}`);
       }

@@ -1,7 +1,7 @@
 import { splitProps, type JSX } from "solid-js";
 import { Dynamic } from "solid-js/web";
 
-import type { SpaceStep } from "../../tokens";
+import { SPACE, type SpaceStep } from "../../tokens";
 import { classes, space, type LayoutProps, type Measure } from "./common";
 
 export type CenterProps = LayoutProps & {
@@ -22,7 +22,7 @@ export function Center(props: CenterProps): JSX.Element {
       {...rest}
       class={classes("l-center", own.class)}
       data-intrinsic={own.intrinsic === true ? "" : undefined}
-      style={{ "--l-space": space(own.gutters ?? "4"), "--l-max": own.max ?? "60ch" }}
+      style={{ "--l-space": space(own.gutters ?? SPACE[4]), "--l-max": own.max ?? "60ch" }}
     />
   );
 }

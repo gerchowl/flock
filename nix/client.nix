@@ -75,16 +75,15 @@ let
         --linker=hoisted --backend=copyfile --os='*' --cpu='*'
       runHook postBuild
     '';
-    # Kept: what `vite build` loads on the systems below. TypeScript's own
-    # per-platform compilers (about 400 MB) are type-checking only, and so
-    # are dropped, as are other platforms' bindings. The rule depends on no
-    # system, so the hash stays the same everywhere.
+    # Keep build bindings and the compiler used by the source-graph audit on
+    # each supported system. TypeScript's Linux suffix omits `-gnu`.
+    # The rule depends on no system, so one hash covers every build.
     installPhase = ''
       runHook preInstall
-      rm -rf node_modules/.cache node_modules/@typescript/typescript-*
-      for binding in node_modules/@rolldown/binding-* node_modules/lightningcss-*; do
+      rm -rf node_modules/.cache
+      for binding in node_modules/@rolldown/binding-* node_modules/lightningcss-* node_modules/@typescript/typescript-*; do
         case "$binding" in
-          ${lib.concatMapStringsSep "|" (suffix: "*-${suffix}") (lib.attrValues suffixes)}) ;;
+          ${lib.concatMapStringsSep "|" (suffix: "*-${suffix}") (lib.unique ((lib.attrValues suffixes) ++ (map (lib.removeSuffix "-gnu") (lib.attrValues suffixes))))}) ;;
           *) rm -rf "$binding" ;;
         esac
       done
@@ -121,6 +120,8 @@ stdenv.mkDerivation {
       (root + "/index.html")
       (root + "/vite.config.ts")
       (root + "/scripts/lint-build.ts")
+      (root + "/scripts/check-design-types.ts")
+      (root + "/scripts/design-types.d.cts")
       (root + "/scripts/stylelint-reserved-tokens.js")
       (root + "/stylelint.config.js")
       (root + "/eslint.config.js")
@@ -139,9 +140,9 @@ stdenv.mkDerivation {
     runHook preConfigure
     cp -R ${deps}/node_modules node_modules
     chmod -R u+w node_modules
-    for binding in node_modules/@rolldown/binding-* node_modules/lightningcss-*; do
+    for binding in node_modules/@rolldown/binding-* node_modules/lightningcss-* node_modules/@typescript/typescript-*; do
       case "$binding" in
-        *-${hostSuffix}) ;;
+        *-${hostSuffix}|node_modules/@typescript/typescript-${lib.removeSuffix "-gnu" hostSuffix}) ;;
         *) rm -rf "$binding" ;;
       esac
     done

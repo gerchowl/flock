@@ -36,6 +36,15 @@ async function run(args: string[], stdin?: string): Promise<Run> {
 const stylelint = (path: string, css: string): Promise<Run> => run(["x", "stylelint", "--config", "stylelint.config.js", "--config-basedir", ".", "--ignore-disables", "--stdin-filename", path], css);
 const eslint = (path: string, tsx: string): Promise<Run> => run(["x", "eslint", "--config", "eslint.config.js", "--stdin", "--stdin-filename", path], tsx);
 
+async function designTypes(source: string): Promise<Run> {
+  const root = await mkdtemp(join(CLIENT_ROOT, "node_modules/.cache/source-types-"));
+  try {
+    const file = join(root, "probe.ts");
+    await writeFile(file, `declare const el: HTMLElement;\n${source}`);
+    return await run(["scripts/check-design-types.ts", file]);
+  } finally { await rm(root, { recursive: true, force: true }); }
+}
+
 describe("stylelint strict values", () => {
   test.each([
     ["color", ".a { color: #fff; }"],
@@ -129,7 +138,8 @@ describe("lint what ships (#2933)", () => {
     ["typed cast", "src/probe.tsx", 'export const A = () => <Stack space={"14" as SpaceStep} />'],
     ["type suppression", "src/probe.tsx", '// @ts-expect-error\nexport const A = () => <Stack space="14" />'],
   ])("rejects %s", async (_name, file, source) => {
-    const result = await eslint(file, source);
+    const typed = ["runtime member", "runtime assign", "sheet", "adoption", "computed style"].includes(_name);
+    const result = typed ? await designTypes(source) : await eslint(file, source);
     expect(result.code).toBe(1);
   });
   test("CSS disables cannot suppress strict values", async () => {
@@ -202,7 +212,8 @@ describe("fix round 1 source gates", () => {
     ["outside source", "lib/outside.ts", 'document.body.style.margin = "13px"'],
     ["layout runtime exemption", "src/layout/probe.ts", 'document.body.style.margin = "13px"'],
   ])("rejects %s", async (_name, file, source) => {
-    expect((await eslint(file, source)).code).toBe(1);
+    const typed = ["outside source", "layout runtime exemption"].includes(_name);
+    expect((await (typed ? designTypes(source) : eslint(file, source))).code).toBe(1);
   });
   test("pins source stylelint configuration", async () => {
     const root = await mkdtemp(join(CLIENT_ROOT, "style-seed-"));

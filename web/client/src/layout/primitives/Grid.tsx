@@ -1,7 +1,7 @@
 import { splitProps, type JSX } from "solid-js";
 import { Dynamic } from "solid-js/web";
 
-import type { SpaceStep } from "../../tokens";
+import { SPACE, type SpaceStep } from "../../tokens";
 import { classes, space, type LayoutProps, type Measure } from "./common";
 
 export type GridProps = LayoutProps & {
@@ -19,7 +19,7 @@ export function Grid(props: GridProps): JSX.Element {
       component={own.as ?? "div"}
       {...rest}
       class={classes("l-grid", own.class)}
-      style={{ "--l-space": space(own.space ?? "4"), "--l-min": own.min ?? "16rem" }}
+      style={{ "--l-space": space(own.space ?? SPACE[4]), "--l-min": own.min ?? "16rem" }}
     />
   );
 }

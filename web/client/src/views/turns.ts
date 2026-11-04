@@ -133,7 +133,11 @@ export type TurnFold = {
 };
 
 /** An empty dictionary has no inherited keys or unvalidated values. */
-const dictionary = <T>(): Record<string, T> => Object.create(null) as Record<string, T>;
+const dictionary = <T>(): Record<string, T> => {
+  const values: Record<string, T> = {};
+  Object.setPrototypeOf(values, null);
+  return values;
+};
 
 /** A fold of no entries. */
 export function emptyFold(): TurnFold {

@@ -17,6 +17,8 @@ declare global {
 
   interface ObjectConstructor {
     create(prototype: object | null, properties?: PropertyDescriptorMap): unknown;
+    assign<T extends object, U>(target: T, source: U): T & U;
+    assign<T extends object, U, V>(target: T, first: U, second: V): T & U & V;
     assign(target: object, ...sources: unknown[]): unknown;
     values<T>(target: { [key: string]: T } | ArrayLike<T>): T[];
     values(target: {}): unknown[];

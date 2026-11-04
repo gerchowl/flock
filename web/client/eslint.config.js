@@ -1,23 +1,41 @@
 /** Source and runtime design fences (#2933, web/DESIGN.md). */
 import babelParser from "@babel/eslint-parser";
+import { dirname, relative } from "node:path";
+import { fileURLToPath } from "node:url";
+const client = dirname(fileURLToPath(import.meta.url));
 
 const NO_STYLE = "Inline style bypasses the design tokens: use a class, or a primitive from src/layout/ (web/DESIGN.md).";
 const name = (node) => node?.name ?? node?.value;
 const designProps = new Set(["space", "gutters", "justify", "align", "side", "sideWidth", "contentMin", "threshold", "max", "min", "intrinsic", "as"]);
-const runtime = new Set(["style", "adoptedStyleSheets", "attributeStyleMap", "styleSheets", "animate", "insertRule"]);
 
 const design = {
   meta: { schema: [] },
   create(context) {
-    const layout = /[/\\]src[/\\]layout[/\\]primitives[/\\]/.test(context.filename);
+    const path = relative(client, context.filename).replaceAll("\\", "/");
+    const layout = path.startsWith("src/layout/primitives/");
+    const generated = path === "src/tokens.ts";
+    const typeParameters = new Set();
     const designValues = [];
     const designTypes = new Set(["SpaceStep", "Token"]);
-    function forbiddenType(node) {
+    function designReference(node) {
       if (!node) return false;
-      if (node.type === "TSLiteralType") return typeof node.literal.value === "string" || node.literal.type === "TemplateLiteral";
-      if (node.type === "TSTypeReference") return designTypes.has(name(node.typeName.right ?? node.typeName));
-      if (node.type === "TSParenthesizedType") return forbiddenType(node.typeAnnotation);
-      return (node.type === "TSUnionType" || node.type === "TSIntersectionType") && node.types.some(forbiddenType);
+      if (node.type === "TSTypeReference" && designTypes.has(name(node.typeName.right ?? node.typeName))) return true;
+      if (node.type === "TSIndexedAccessType" && designProps.has(name(node.indexType.literal))) return true;
+      return (context.sourceCode.visitorKeys[node.type] ?? []).some((key) => {
+        const child = node[key];
+        return Array.isArray(child) ? child.some(designReference) : designReference(child);
+      });
+    }
+    function forbiddenType(node, root = true) {
+      if (!node) return false;
+      if (node.type === "TSParenthesizedType") return forbiddenType(node.typeAnnotation, root);
+      if (node.type === "TSLiteralType") return root && (typeof node.literal.value === "string" || node.literal.type === "TemplateLiteral");
+      if (node.type === "TSTypeQuery") return true;
+      if (node.type === "TSTypeReference" && typeParameters.has(name(node.typeName))) return true;
+      return designReference(node) || (context.sourceCode.visitorKeys[node.type] ?? []).some((key) => {
+        const child = node[key];
+        return Array.isArray(child) ? child.some((node) => forbiddenType(node, false)) : forbiddenType(child, false);
+      });
     }
     function staticKey(node) {
       if (node?.type === "BinaryExpression" && node.operator === "+") return staticKey(node.left) + staticKey(node.right);
@@ -38,7 +56,7 @@ const design = {
         for (let pass = 0; pass < node.body.length; pass++) {
           for (const item of node.body) {
             const alias = item.declaration ?? item;
-            if (alias.type === "TSTypeAliasDeclaration" && forbiddenType(alias.typeAnnotation)) designTypes.add(alias.id.name);
+            if (alias.type === "TSTypeAliasDeclaration" && (designReference(alias.typeAnnotation) || alias.typeAnnotation.type === "TSLiteralType")) designTypes.add(alias.id.name);
           }
         }
         if (/\.[cm]?jsx?$/.test(context.filename)) report(node, "Client source must use TypeScript so design props are type checked.");
@@ -51,7 +69,8 @@ const design = {
         function check(node) {
           if (!node || seen.has(node)) return;
           seen.add(node);
-          if (node.type === "TSAsExpression" || node.type === "TSTypeAssertion") report(node, "Value casts bypass typed design props; keep the original type.");
+          if ((node.type === "TSAsExpression" || node.type === "TSTypeAssertion") && name(node.typeAnnotation.typeName) !== "const") report(node, "Value casts bypass typed design props; keep the original type.");
+          if (node.type === "Property" && name(node.key) === "style") report(node);
           if (node.type === "Identifier") {
             let scope = context.sourceCode.getScope(node);
             while (scope && !scope.set.has(node.name)) scope = scope.upper;
@@ -81,21 +100,20 @@ const design = {
       CallExpression(node) {
         if (["setProperty", "removeProperty", "set", "delete"].includes(name(node.callee.property))) tokenWrite(node, node.arguments[0]);
       },
-      MemberExpression(node) {
-        if (!layout && runtime.has(name(node.property))) report(node);
-      },
-      NewExpression(node) {
-        if (!layout && name(node.callee.property ?? node.callee) === "CSSStyleSheet") report(node);
-      },
       Property(node) {
         tokenWrite(node, node.key);
-        if (!layout && name(node.key) === "style") report(node);
       },
       TSAnyKeyword(node) { report(node, "Explicit any bypasses design types; use unknown and validate."); },
+      TSTypeParameter(node) { typeParameters.add(node.name); },
+      TSTypePredicate(node) { if (designReference(node.typeAnnotation)) report(node, "Design type predicates can forge branded tokens."); },
+      TSDeclareFunction(node) { if (designReference(node.returnType)) report(node, "Design overloads can forge branded tokens."); },
       TSAsExpression(node) {
-        if (forbiddenType(node.typeAnnotation)) {
+        if (!generated && (forbiddenType(node.typeAnnotation) || node.expression.type === "TSAsExpression" || node.expression.type === "TSTypeAssertion")) {
           report(node, "Value casts bypass typed design props; keep the original type.");
         }
+      },
+      TSTypeAssertion(node) {
+        if (!generated && (forbiddenType(node.typeAnnotation) || node.expression.type === "TSAsExpression" || node.expression.type === "TSTypeAssertion")) report(node);
       },
       ImportDeclaration(node) {
         if (/\?(?:[^#]*&)?(?:raw|inline)(?:[&#]|$)/.test(node.source.value)) report(node, "Raw and inline imports bypass the shipped CSS gate.");
@@ -120,6 +138,6 @@ export default [
       },
     },
     plugins: { design: { rules: { fence: design } } },
-    rules: { "design/fence": "error" },
+    rules: { "design/fence": "error", "no-eval": "error", "no-new-func": "error" },
   },
 ];

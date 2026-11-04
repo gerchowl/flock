@@ -7,6 +7,8 @@ import { render } from "solid-js/web";
 
 import { Center, Cluster, Grid, Sidebar, Stack, Switcher } from "../src/layout/primitives";
 
+import { SPACE } from "../src/tokens";
+
 let dispose: (() => void) | undefined;
 afterEach(() => {
   dispose?.();
@@ -34,7 +36,7 @@ test("Stack spaces its children on the token scale, by default 16 px", () => {
 });
 
 test("Cluster passes its space, justification and alignment", () => {
-  const cluster = mount(() => <Cluster space="1" justify="space-between" align="baseline" />);
+  const cluster = mount(() => <Cluster space={SPACE[1]} justify="space-between" align="baseline" />);
   expect(cluster.className).toBe("l-cluster");
   expect(prop(cluster, "--l-space")).toBe("var(--space-1)");
   expect(prop(cluster, "--l-justify")).toBe("space-between");
@@ -42,7 +44,7 @@ test("Cluster passes its space, justification and alignment", () => {
 });
 
 test("Sidebar marks its side and passes its widths", () => {
-  const sidebar = mount(() => <Sidebar side="right" sideWidth="16rem" contentMin="60%" space="6" />);
+  const sidebar = mount(() => <Sidebar side="right" sideWidth="16rem" contentMin="60%" space={SPACE[6]} />);
   expect(sidebar.dataset["side"]).toBe("right");
   expect(prop(sidebar, "--l-side")).toBe("16rem");
   expect(prop(sidebar, "--l-content-min")).toBe("60%");
@@ -52,7 +54,7 @@ test("Sidebar marks its side and passes its widths", () => {
 test("Switcher, Center and Grid pass their measures", () => {
   expect(prop(mount(() => <Switcher threshold="40rem" />), "--l-threshold")).toBe("40rem");
   dispose?.();
-  const center = mount(() => <Center max="40ch" gutters="2" intrinsic />);
+  const center = mount(() => <Center max="40ch" gutters={SPACE[2]} intrinsic />);
   expect(prop(center, "--l-max")).toBe("40ch");
   expect(prop(center, "--l-space")).toBe("var(--space-2)");
   expect(center.hasAttribute("data-intrinsic")).toBe(true);

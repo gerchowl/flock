@@ -1,3 +1,4 @@
 - Audit CSS through the client build graph, expand source lint coverage, and reject runtime style and design gate suppression bypasses (#2933).
 - Reject ignored dependency stylesheets and indirect DOM styling through a restricted design type check; validate imported application modules and pin linter configuration (#2933).
 - Reject reserved design token writes from client source, including layout primitives (#2933).
+- Brand generated design-token values, preserve ordinary object APIs, and verify runtime injection with CSP and a CSSOM test guard (#2933).

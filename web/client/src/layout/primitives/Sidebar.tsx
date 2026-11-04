@@ -1,7 +1,7 @@
 import { splitProps, type JSX } from "solid-js";
 import { Dynamic } from "solid-js/web";
 
-import type { SpaceStep } from "../../tokens";
+import { SPACE, type SpaceStep } from "../../tokens";
 import { classes, space, type LayoutProps, type Measure } from "./common";
 
 export type SidebarProps = LayoutProps & {
@@ -29,7 +29,7 @@ export function Sidebar(props: SidebarProps): JSX.Element {
       class={classes("l-sidebar", own.class)}
       data-side={own.side ?? "left"}
       style={{
-        "--l-space": space(own.space ?? "4"),
+        "--l-space": space(own.space ?? SPACE[4]),
         "--l-side": own.sideWidth ?? "auto",
         "--l-content-min": own.contentMin ?? "50%",
       }}

@@ -1,7 +1,7 @@
 import { splitProps, type JSX } from "solid-js";
 import { Dynamic } from "solid-js/web";
 
-import type { SpaceStep } from "../../tokens";
+import { SPACE, type SpaceStep } from "../../tokens";
 import { classes, space, type LayoutProps, type Measure } from "./common";
 
 export type SwitcherProps = LayoutProps & {
@@ -22,7 +22,7 @@ export function Switcher(props: SwitcherProps): JSX.Element {
       component={own.as ?? "div"}
       {...rest}
       class={classes("l-switcher", own.class)}
-      style={{ "--l-space": space(own.space ?? "4"), "--l-threshold": own.threshold ?? "30rem" }}
+      style={{ "--l-space": space(own.space ?? SPACE[4]), "--l-threshold": own.threshold ?? "30rem" }}
     />
   );
 }
