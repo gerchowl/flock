@@ -17,10 +17,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { generate } from "../scripts/tokens";
-import { TOKENS, type Token } from "../src/tokens";
+import { TOKENS, type TokenName } from "../src/tokens";
 import { CLIENT_ROOT } from "./build";
 
-type Colour = Extract<Token, `color-${string}`>;
+type Colour = Extract<TokenName, `color-${string}`>;
 type Rgba = readonly [number, number, number, number];
 type Palette = Map<string, Rgba>;
 
@@ -233,7 +233,7 @@ describe("the spacing scale", () => {
 
   test("accepts an on-scale step and adds it to SpaceStep", async () => {
     const { ts } = await generateWith({ "16": px(64) });
-    expect(ts).toContain('export type SpaceStep = "1" | "2" | "3" | "4" | "5" | "6" | "8" | "10" | "12" | "16";');
+    expect(ts).toContain('type SpaceName = "1" | "2" | "3" | "4" | "5" | "6" | "8" | "10" | "12" | "16";');
   });
 });
 

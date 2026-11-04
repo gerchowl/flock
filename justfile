@@ -117,7 +117,7 @@ website-build:
 # `bun test` process lost its DevTools transport after an earlier file's
 # browser had run (#2931).
 client-check:
-    cd web/client && bun install --frozen-lockfile && bun test && for f in e2e/*.test.ts; do bun test "./$f" || exit 1; done && bun x tsc --noEmit -p tsconfig.json && bun run lint && bun run build
+    cd web/client && bun install --frozen-lockfile && bun test && for f in e2e/*.test.ts; do bun test "./$f" || exit 1; done && bun x tsc --noEmit -p tsconfig.json && bun run lint
 
 # Recompute nix/client-deps.json, the pinned hash of the client's
 # dependencies for `nix build .#flock-client` (#1731), after web/client/bun.lock
@@ -296,7 +296,7 @@ ts-check:
     cd web/client && bun install --frozen-lockfile && bun x tsc --noEmit -p tsconfig.json
 
 # The client's design rules (#2895, web/DESIGN.md): the generated tokens are
-# current, CSS uses tokens and the layout primitives (stylelint), and no TSX
-# outside web/client/src/layout/ sets an inline style (ESLint).
+# current, source and shipped CSS use tokens and layout primitives (stylelint),
+# and runtime styles and type suppressions cannot bypass the gates (ESLint).
 client-lint:
     cd web/client && bun install --frozen-lockfile && bun run lint

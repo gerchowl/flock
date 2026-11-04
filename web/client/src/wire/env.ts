@@ -22,12 +22,18 @@ export interface Clock {
   clearTimeout(handle: TimerHandle): void;
 }
 
+const browserTimers = new Map<TimerHandle, ReturnType<typeof globalThis.setTimeout>>();
+
 /** The browser's clock: `performance.now()` and the global timers. */
 export const browserClock: Clock = {
   now: () => performance.now(),
   wallNow: () => Date.now(),
-  setTimeout: (callback, ms) => globalThis.setTimeout(callback, ms) as unknown as TimerHandle,
-  clearTimeout: (handle) => globalThis.clearTimeout(handle as unknown as ReturnType<typeof globalThis.setTimeout>),
+  setTimeout: (callback, ms) => {
+    const handle = {} as TimerHandle;
+    browserTimers.set(handle, globalThis.setTimeout(() => { browserTimers.delete(handle); callback(); }, ms));
+    return handle;
+  },
+  clearTimeout: (handle) => { globalThis.clearTimeout(browserTimers.get(handle)); browserTimers.delete(handle); },
 };
 
 /**
@@ -51,7 +57,18 @@ export type SocketFactory = (url: string) => SocketLike;
  * the server declines it on upgrade (ADR-0036 §5a), so the `hello` carrying
  * the token is never compressed.
  */
-export const browserSockets: SocketFactory = (url) => new WebSocket(url) as unknown as SocketLike;
+export const browserSockets: SocketFactory = (url) => {
+  const socket = new WebSocket(url);
+  const like: SocketLike = {
+    send: (text) => socket.send(text), close: (code, reason) => socket.close(code, reason),
+    onopen: null, onmessage: null, onclose: null, onerror: null,
+  };
+  socket.onopen = () => like.onopen?.();
+  socket.onmessage = (event) => like.onmessage?.({ data: event.data });
+  socket.onclose = (event) => like.onclose?.({ code: event.code, reason: event.reason });
+  socket.onerror = () => like.onerror?.();
+  return like;
+};
 
 /**
  * A shell's bridged socket as a {@link SocketLike} (ADR-0038 §6): frames and
