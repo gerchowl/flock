@@ -22,14 +22,14 @@ Style Dictionary v5 compiles them into two committed files:
 | Weight | `--font-weight-regular` (400), `-medium` (510), `-semibold` (600) | |
 | Spacing | `--space-1` … `--space-12` | The step times 4 px: 4, 8, 12, 16, 20, 24, 32, 40, 48. The generator rejects any other value or name. |
 | Radius | `--radius-small` (6), `-medium` (8), `-large` (10) | Controls, cards, popovers and sheets. |
-| Control | `--size-control` | 28 px on desktop, 44 px below the phone breakpoint. |
+| Control | `--size-control`, `--size-touch` | A regular control: 28 px on desktop, 44 px below the phone breakpoint. Touch: 44 px at any width, for the phone layout's controls (`?layout=phone` too). |
 | Border | `--border-width-thin` | 1 px separators and outlines. |
 | Layer | `--layer-sticky`, `--layer-overlay` | z-index, lowest first. |
 | Text | `--color-label-primary`, `-secondary`, `-tertiary` | Tertiary is for disabled text only. |
 | Selected text | `--color-label-on-selection`, `-on-selection-secondary` | Content of an emphasised selected row. |
 | Surfaces | `--color-background-window`, `--color-background-sidebar`, `--color-separator` | |
 | Accent | `--color-accent-fill`, `--color-accent-on`, `--color-link` | Accent #0a6cdc; the link is a shade darker (#0262cd in light mode). |
-| Selection | `--color-selection-active`, `--color-selection-inactive`, `--color-focus-ring` | Inactive: an unfocused window or pane. |
+| Selection | `--color-selection-active`, `--color-selection-inactive`, `--color-focus-ring` | Inactive: an unfocused window or pane (see "Selection"). |
 | Meaning | `--color-destructive`, `--color-status-green`, `-orange`, `-red` | |
 | Legacy | `--color-legacy-*` | The pre-redesign palette. Do not use in new code. |
 
@@ -163,8 +163,8 @@ rule 5, the spacing check and the contrast matrix.
 `LEGACY` in `web/client/stylelint.config.js` lists the stylesheets written
 before the tokens. They are held to rule 1 for colours only and are exempt
 from rule 2. Their colours use `--color-legacy-*`; their other literals
-(rem-based spacing on a 14 px root, 14 px body text, 44 px desktop controls)
-have no exact token, and replacing them changes how the GUI looks. That is
+(rem-based spacing on a 14 px root, which is why the root stays 14 px under
+13 px body text) have no exact token, and replacing them changes how the GUI looks. That is
 the redesign's work, one file at a time. When a file passes every rule,
 remove it from the list. Never add one.
 
@@ -220,7 +220,9 @@ so the required `client` CI check runs it on every change. One test per rule:
    with the arrow keys instead), and each shows a focus ring: an outline
    drawn only on focus, or a box-shadow that differs from its resting one.
    Every control has an accessible name with a letter or digit, so an icon
-   alone is not one. ArrowDown moves the selection of every list widget,
+   alone is not one, and a control that shows no letter or digit of its own
+   (an icon button) takes it from `aria-label` or `aria-labelledby`: a
+   `title` is a tooltip, not a name. ArrowDown moves the selection of every list widget,
    the palette's included, and a list with nothing to focus fails. ⌘K opens
    the palette from wherever focus is, and Esc closes it and returns focus
    there.
@@ -249,9 +251,9 @@ times out fails the run, and the browser's processes are killed and reaped
 either way.
 
 Every check, and each part of rules 4, 8 and 9, has a seeded violation in
-the test's `SEEDS` (21 in all: one below the fold, one only in dark mode,
+the test's `SEEDS` (22 in all: one below the fold, one only in dark mode,
 one hiding the page, one where the parity walk misses a toolbar's
-buttons). A test runs each check on its page with and without
+buttons, one icon button named only by its tooltip). A test runs each check on its page with and without
 its seed and fails unless the seed adds a finding.
 `CONFORMANCE_SEED=<seed> bun test ./e2e/conformance.test.ts` injects one
 seed for the whole run instead, and its rule's test fails. The suite's own
@@ -269,12 +271,36 @@ anything, and on an entry, or a page of one, that is not in the bootstrap
 baseline (`e2e/conformance-allow-baseline.ts`, the list as first merged) or,
 once `dev` has the list, in `origin/dev`'s copy, so the list only shrinks;
 CI fetches `dev` for that comparison. Today it holds the legacy
-stylesheets' body size, count badge, rem spacing and touching sidebar and
-tab-bar rows (#2913), and the sidebar's third level (#2930).
+stylesheets' count badge, rem spacing and touching sidebar group headings
+and tab-bar rows (#2913), and the sidebar's third level (#2930).
 
 `web/baseline/` measures these rules' numbers against public pages of
 well-designed productivity apps and proposes the budgets the suite should
 add next (#2899).
+
+## Density, selection and icons
+
+These follow the accepted redesign (#2903).
+
+- **Density.** Desktop body text is 13 px and a regular control 28 px
+  (`--size-control`); single-line controls and rows stay within 28 to
+  32 px. The phone layout's controls keep `--size-touch`, 44 px, at any
+  window width.
+- **Selection.** The workbench marks its window `data-window="active"` or
+  `"inactive"` from the window's focus (`workbench/window-focus.ts`). A
+  selected row or palette item is the accent (`selection.active`, the
+  alternate labels) only in the active window; in an inactive one it is
+  `selection.inactive` with the ordinary labels, as macOS draws an
+  unemphasised selection.
+- **Icons.** `src/components/Icon.tsx` is the one icon set:
+  SF-Symbols-style line glyphs on a 16-unit grid, stroked in
+  `currentColor`, always `aria-hidden`. `IconButton` is the only icon-only
+  control and requires a `label`, its `aria-label`. Add a glyph there, not
+  inline in a screen. Status marks (`workbench/marks.tsx`) are separate:
+  they carry state, shape and a label of their own.
+- **Composer.** One field: the text area with the send icon button inside
+  it at the trailing edge, then the agent's phase and the shortcut hint
+  (⌘↩) under it. There is no Send button below.
 
 ## Layout
 

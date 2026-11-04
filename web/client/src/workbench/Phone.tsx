@@ -9,6 +9,7 @@
  */
 import { For, Match, Show, Switch, createSignal, createUniqueId, onCleanup, type JSX } from "solid-js";
 
+import { Icon } from "../components/Icon";
 import type { AgentRow } from "../fleet";
 import { Cluster } from "../layout/primitives";
 import { SPACE } from "../tokens";
@@ -123,7 +124,7 @@ export function PhoneWorkbench(props: PhoneProps): JSX.Element {
           <main class="phone__screen phone__screen--agent" data-testid="phone-agent">
             <header class="phone__agent-header">
               <button type="button" class="action" onClick={back}>
-                ‹ Back
+                <Icon name="chevron-left" size={14} /> Back
               </button>
               <AgentTitle agent={agent} row={props.row()} />
             </header>

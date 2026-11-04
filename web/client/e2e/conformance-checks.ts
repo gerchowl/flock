@@ -121,14 +121,20 @@ export function installChecks(): void {
     const [hi, lo] = [luminance(a), luminance(b)].sort((x, y) => y - x);
     return (hi! + 0.05) / (lo! + 0.05);
   };
+  /** The text a control shows, without its hidden decoration (an icon's glyph). */
+  const ownText = (el: Element): string =>
+    [...el.childNodes]
+      .filter((node) => !(node instanceof Element && node.closest('[aria-hidden="true"]')))
+      .map((node) => node.textContent ?? "")
+      .join("")
+      .trim();
   const name = (el: Element): string => {
     const labelled = el.getAttribute("aria-labelledby");
     const label = el.getAttribute("aria-label") ?? (labelled ? document.getElementById(labelled)?.textContent : null);
     if (label) return label;
     const labels = (el as HTMLInputElement).labels;
     if (labels && labels.length > 0) return [...labels].map((each) => each.textContent).join(" ");
-    const visible = [...el.childNodes].filter((node) => !(node instanceof Element && node.closest('[aria-hidden="true"]')));
-    return visible.map((node) => node.textContent ?? "").join("").trim() || (el.getAttribute("title") ?? "");
+    return ownText(el) || (el.getAttribute("title") ?? "");
   };
   const report = (rule: string, hits: Hit[]): { rule: string; where: string; detail: string; el: Element }[] =>
     hits.map((hit) => ({ rule, where: where(hit.el), detail: hit.detail, el: hit.el }));
@@ -258,10 +264,17 @@ export function installChecks(): void {
       }
       return hits;
     },
-    keyboard: () =>
-      interactive()
-        .filter((el) => !/[\p{L}\p{N}]/u.test(name(el)))
-        .map((el) => ({ el, detail: `control has no accessible name (${JSON.stringify(name(el))})` })),
+    keyboard: () => {
+      const named = /[\p{L}\p{N}]/u;
+      const hits: Hit[] = [];
+      for (const el of interactive()) {
+        if (!named.test(name(el))) hits.push({ el, detail: `control has no accessible name (${JSON.stringify(name(el))})` });
+        // An icon-only control (#2903) shows no words, so an aria-label names it: a tooltip (`title`) is not a name.
+        else if (!named.test(ownText(el)) && !el.hasAttribute("aria-labelledby") && !named.test(el.getAttribute("aria-label") ?? "") && !(el as HTMLInputElement).labels?.length)
+          hits.push({ el, detail: "icon-only control without an aria-label" });
+      }
+      return hits;
+    },
     structure: () => {
       const hits: Hit[] = [];
       for (const head of document.querySelectorAll('nav [aria-expanded], [role="navigation"] [aria-expanded]')) {

@@ -118,7 +118,7 @@ describe("one toolbar", () => {
       const fleet = createFixtureFleet(SAMPLE_AGENTS, nodes.map((row) => ({ op: "upsert", kind: "node", row, tsMs: 0 })));
       const root = mount(() => <Workbench fleet={fleet} transport={createFixtureTransport("")} inbox={[]} layout={emptyLayout()} sender={null} saveLayout={() => undefined} source="live" host={view} />);
       await tick();
-      expect($(root, "host-status")?.textContent).toBe(`${name}▾`);
+      expect($(root, "host-status")?.textContent).toBe(name);
       dispose?.();
       document.body.innerHTML = "";
     }

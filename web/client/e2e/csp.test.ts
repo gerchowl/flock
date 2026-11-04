@@ -160,8 +160,8 @@ describe("served document policy", () => {
     const { page, errors } = await open({ transport: "fixture", fixtureJsonl, source: "csp-probe" });
     await page.goto(`http://127.0.0.1:${site}/`);
     await page.getByTestId("transcript-synced").waitFor({ timeout: READY_MS });
-    // The external stylesheet applied under style-src 'self'.
-    expect(await page.evaluate(() => parseFloat(getComputedStyle(document.body).fontSize))).toBe(14);
+    // The external stylesheet applied under style-src 'self': desktop body text is 13 px, the browser default 16.
+    expect(await page.evaluate(() => parseFloat(getComputedStyle(document.body).fontSize))).toBe(13);
     expect(await violations(page)).toEqual([]);
     expect(errors).toEqual([]);
     await page.close();

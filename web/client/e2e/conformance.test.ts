@@ -111,6 +111,13 @@ const SEEDS: Readonly<Record<string, Seed>> = {
   materials: { check: "materials", page: "gallery", into: "main", html: '<div data-testid="seed" style="backdrop-filter: blur(8px)">Blurred content</div>' },
   motion: { check: "motion", page: "gallery", into: "main", html: '<div data-testid="seed" style="transition: transform 1s">Moving</div>' },
   names: { check: "keyboard", page: "gallery", into: "main", html: '<button data-testid="seed" class="g-button">×</button>' },
+  // Named only by its tooltip: an icon-only button needs an aria-label.
+  "icon-label": {
+    check: "keyboard",
+    page: "gallery",
+    into: "main",
+    html: '<button data-testid="seed" class="icon-button" title="Send"><svg class="icon" aria-hidden="true" viewBox="0 0 16 16" width="16" height="16"><path d="M8 13V3.5"></path></svg></button>',
+  },
   "tab-reach": { check: "tab-reach", page: "gallery", into: "main", html: '<span data-testid="seed" class="g-button" role="button">Unreachable</span>' },
   "focus-ring": { check: "focus-ring", page: "gallery", into: "main", html: '<button data-testid="seed" class="g-button" style="outline: none">Ringless</button>' },
   "focus-ring-resting-shadow": {
