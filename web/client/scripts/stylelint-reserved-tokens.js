@@ -53,7 +53,8 @@ for (const match of TOKENS_CSS
   .matchAll(/^\s*(--[\w-]+):\s*([^;]+);/gm)) {
   tokens.set(match[1], [...new Set([...(tokens.get(match[1]) ?? []), match[2]])]);
 }
-const globals = ["inherit", "initial", "unset", "revert", "revert-layer"];
+// Inheritance and reversion can restore a layout value outside these allowlists.
+const globals = ["initial", "unset"];
 const display = new Set(["none", "block", "inline", "inline-block", ...globals]);
 const position = new Set(["static", "relative", ...globals]);
 // These are supplied by the branded primitive props, never by arbitrary CSS.

@@ -125,9 +125,10 @@ the scale is a design question, not a missing token.
    `--color-legacy-*` references are allowed only in the existing LEGACY
    stylesheets and generated tokens, including through aliases.
 2. **Layout lives in `src/layout/`.** Outside it, CSS may not use
-   any `display` except `none`, `block`, `inline`, `inline-block` and CSS
-   global keywords, or any `position` except `static`, `relative` and global
-   keywords. The same allowlists apply after resolving every local alias
+   any `display` except `none`, `block`, `inline`, `inline-block`, `initial`
+   and `unset`, or any `position` except `static`, `relative`, `initial` and
+   `unset`. Inheritance and reversion can restore fenced layout values and
+   are rejected. The same allowlists apply after resolving every local alias
    and every generated token mode.
    Gap, margins, float/clear, columns and their count/width/span/fill,
    inset (including logical forms), top/right/bottom/left and translate
