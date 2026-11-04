@@ -20,6 +20,7 @@ import { pathToFileURL } from "node:url";
 import { chromium, type Browser, type Page } from "playwright";
 
 import { CLIENT_ROOT, buildClient } from "../tests/build";
+import { expectNoKeyListeners, guardKeys } from "./key-guard";
 import { capturePreview } from "./capture";
 
 const DIST = `${CLIENT_ROOT}/artifacts/fixture-dist`;
@@ -108,6 +109,7 @@ async function capture(page: Page, name: string): Promise<void> {
 describe("fixture preview", () => {
   test("desktop 1280x800: top bar, sidebar, focus pane and inbox side by side", async () => {
     const page = await browser.newPage({ viewport: DESKTOP });
+    await guardKeys(page);
     const seen = watch(page);
     await page.goto(pathToFileURL(`${DIST}/index.html`).href);
     await page.getByTestId("transcript-synced").waitFor({ timeout: 10_000 });
@@ -125,11 +127,13 @@ describe("fixture preview", () => {
 
     expect(seen.requests.filter((url) => !url.startsWith("file:") && !url.startsWith("data:"))).toEqual([]);
     expect(seen.errors).toEqual([]);
+    await expectNoKeyListeners(page);
     await page.close();
   });
 
   test("desktop: the selected agent is the accent in the active window, unemphasised in an inactive one", async () => {
     const page = await browser.newPage({ viewport: DESKTOP });
+    await guardKeys(page);
     await page.goto(pathToFileURL(`${DIST}/index.html`).href);
     await page.getByTestId("transcript-synced").waitFor({ timeout: 10_000 });
     const selected = page.locator('[data-testid="agent-row"][aria-current="true"]');
@@ -139,11 +143,13 @@ describe("fixture preview", () => {
     expect(await colours()).toEqual({ background: await tokenColour(page, "--color-selection-active"), color: await tokenColour(page, "--color-label-on-selection") });
     await page.evaluate(() => window.dispatchEvent(new FocusEvent("blur")));
     expect(await colours()).toEqual({ background: await tokenColour(page, "--color-selection-inactive"), color: await tokenColour(page, "--color-label-primary") });
+    await expectNoKeyListeners(page);
     await page.close();
   });
 
   test("desktop: the composer is one field, the send icon inside it at the trailing edge, and no button below it", async () => {
     const page = await browser.newPage({ viewport: DESKTOP });
+    await guardKeys(page);
     await page.goto(pathToFileURL(`${DIST}/index.html`).href);
     await page.getByTestId("transcript-synced").waitFor({ timeout: 10_000 });
     const [field, input, send] = await Promise.all(["composer-field", "composer", "send"].map((id) => page.getByTestId(id).boundingBox()));
@@ -156,11 +162,13 @@ describe("fixture preview", () => {
     expect(send!.y).toBeGreaterThanOrEqual(field!.y);
     await expect(page.getByTestId("composer").locator("button").count()).resolves.toBe(1);
     await expect(page.getByRole("button", { name: "Send" }).count()).resolves.toBe(1);
+    await expectNoKeyListeners(page);
     await page.close();
   });
 
   test("desktop: an agent row keeps its name and activity visible, however long either is, and describes the full activity", async () => {
     const page = await browser.newPage({ viewport: DESKTOP });
+    await guardKeys(page);
     await page.goto(pathToFileURL(`${DIST}/index.html`).href);
     await page.getByTestId("transcript-synced").waitFor({ timeout: 10_000 });
     const row = page.getByTestId("agent-row").first();
@@ -188,11 +196,13 @@ describe("fixture preview", () => {
     await activity.evaluate((el, text) => void (el.textContent = text), long);
     const longActivity = await widths();
     expect([longActivity.name > 0, longActivity.activity > 0, longActivity.row <= 32]).toEqual([true, true, true]);
+    await expectNoKeyListeners(page);
     await page.close();
   });
 
   test("?layout=phone on a wide window keeps 44 px touch targets on the agent screen", async () => {
     const page = await browser.newPage({ viewport: DESKTOP });
+    await guardKeys(page);
     await page.goto(`${pathToFileURL(`${DIST}/index.html`).href}?layout=phone`);
     await page.getByTestId("inbox-headline").waitFor({ timeout: 10_000 });
     await page.getByRole("button", { name: "Agents" }).click();
@@ -200,11 +210,13 @@ describe("fixture preview", () => {
     await page.getByTestId("agent-row").first().click();
     await page.getByTestId("transcript-synced").waitFor({ timeout: 10_000 });
     await expectTouchTargets(page);
+    await expectNoKeyListeners(page);
     await page.close();
   });
 
   test("phone 390x844: the Inbox tab first, then an agent's screen", async () => {
     const page = await browser.newPage({ viewport: PHONE });
+    await guardKeys(page);
     const seen = watch(page);
     await page.goto(pathToFileURL(`${DIST}/index.html`).href);
     await page.getByTestId("inbox-headline").waitFor({ timeout: 10_000 });
@@ -235,6 +247,7 @@ describe("fixture preview", () => {
 
     expect(seen.requests.filter((url) => !url.startsWith("file:") && !url.startsWith("data:"))).toEqual([]);
     expect(seen.errors).toEqual([]);
+    await expectNoKeyListeners(page);
     await page.close();
   });
 });

@@ -4,6 +4,8 @@
  * shows each message's outbox state. It is one field (#2903): the send
  * button is an icon inside it at the trailing edge, ⌘↩ sends too, and the
  * phase and the shortcut sit under it. There is no Send button below.
+ * ⌘↩ and Esc (leave the field) are bound through the keyboard layer
+ * (`keys.ts`), so neither acts while an input method is composing (#2967).
  *
  * The client never derives queue order or delivery (§3), so nothing here
  * predicts what will happen: the phase line is the server's last report,
@@ -41,7 +43,7 @@
  *
  * @module
  */
-import { For, Show, createSignal, type JSX } from "solid-js";
+import { For, Show, createSignal, onCleanup, type JSX } from "solid-js";
 
 import { IconButton } from "../components/Icon";
 import type { AgentDecide } from "../gen/AgentDecide";
@@ -51,6 +53,7 @@ import type { AgentRow } from "../fleet";
 import { Cluster, Sidebar, Stack } from "../layout/primitives";
 import { SPACE } from "../tokens";
 import type { OutboxEntry } from "../wire/outbox";
+import { bindKeys, formatCombo, isApple, shortcut } from "./keys";
 import { RefusalDetails, explain, type Explained } from "./refusals";
 import "./composer.css";
 
@@ -130,7 +133,7 @@ export function rowLine(row: AgentRow | undefined): PhaseLine {
 
 /** The send shortcut as this platform writes it: the HIG's ⌘↩ on Apple platforms. */
 export function sendShortcut(platform: string): string {
-  return /Mac|iPhone|iPad|iPod/.test(platform) ? "⌘↩" : "Ctrl+Enter";
+  return formatCombo(shortcut("composer.send").combo, isApple(platform));
 }
 
 /** The hint under the field. */
@@ -272,18 +275,13 @@ export function Composer(props: {
       </Stack>
       <Sidebar side="right" space={SPACE[2]} class="composer__field" data-testid="composer-field">
         <textarea
+          ref={(field) => onCleanup(bindKeys(field, { "composer.send": submit, "composer.leave": () => field.blur() }))}
           class="composer__input"
           aria-label={`Message ${props.row?.label ?? props.agent}`}
           rows="2"
           value={text()}
           disabled={blocked() !== null}
           onInput={(event) => setText(event.currentTarget.value)}
-          onKeyDown={(event) => {
-            if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
-              event.preventDefault();
-              submit();
-            }
-          }}
         />
         <IconButton type="submit" icon="send" label="Send" title={`Send ${sendShortcut(platform)}`} class="composer__send" disabled={blocked() !== null} data-testid="send" />
       </Sidebar>

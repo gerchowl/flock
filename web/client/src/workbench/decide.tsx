@@ -125,8 +125,11 @@ export function createDecideUi(reopened = false): DecideUi {
   };
 }
 
-/** The message box, choices and status line of one live permission card. */
-export function PermissionActions(props: { readonly card: InboxCard; readonly sender: Sender | null; readonly ui: DecideUi }): JSX.Element {
+/** What the card's shortcuts do (#2904): ⌘↩ allows once and ⌘⌫ denies, exactly as the buttons would. */
+export type CardKeys = { readonly allow: () => void; readonly deny: () => void };
+
+/** The message box, choices and status line of one live permission card; `keys` receives the card's shortcut actions. */
+export function PermissionActions(props: { readonly card: InboxCard; readonly sender: Sender | null; readonly ui: DecideUi; readonly keys?: (keys: CardKeys) => void }): JSX.Element {
   const [message, setMessage] = props.ui.message;
   const [confirming, setConfirming] = props.ui.confirming;
   const [bound, setBound] = props.ui.bound;
@@ -182,6 +185,7 @@ export function PermissionActions(props: { readonly card: InboxCard; readonly se
     }
     setConfirming(null);
   };
+  props.keys?.({ allow: () => send("allow_once", bound() ?? UNBOUND), deny: () => send("deny", bound() ?? UNBOUND) });
   // A changed request cancels an open confirm; the card says why.
   createEffect(() => {
     if (changed() && confirming() !== null) setConfirming(null);

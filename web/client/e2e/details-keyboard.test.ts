@@ -10,6 +10,7 @@ import { pathToFileURL } from "node:url";
 import { chromium, type Browser } from "playwright";
 
 import { CLIENT_ROOT, buildClient } from "../tests/build";
+import { expectNoKeyListeners, guardKeys } from "./key-guard";
 
 const OUT = `${CLIENT_ROOT}/artifacts/details-gallery`;
 
@@ -26,6 +27,7 @@ afterAll(async () => {
 
 test("Tab reaches the error state's Details after Retry; Enter opens it and Space closes it", async () => {
   const page = await browser.newPage();
+  await guardKeys(page);
   await page.goto(pathToFileURL(`${OUT}/gallery.html`).href);
   const state = page.getByTestId("error-state");
   const details = state.getByTestId("details");
@@ -39,5 +41,6 @@ test("Tab reaches the error state's Details after Retry; Enter opens it and Spac
   expect(await details.locator(".details__body").isVisible()).toBe(true);
   await page.keyboard.press("Space");
   expect(await open()).toBe(false);
+  await expectNoKeyListeners(page);
   await page.close();
 }, 30_000);

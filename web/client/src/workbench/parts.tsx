@@ -3,12 +3,13 @@
  *
  * @module
  */
-import { For, Show, createEffect, createUniqueId, type JSX } from "solid-js";
+import { For, Show, createEffect, createUniqueId, onCleanup, type JSX } from "solid-js";
 
 import type { AgentRow } from "../fleet";
 import type { Sender } from "./Composer";
-import { PermissionActions, createDecideUi, type DecideUi } from "./decide";
+import { PermissionActions, createDecideUi, type CardKeys, type DecideUi } from "./decide";
 import { sortInbox, type InboxCard } from "./inbox";
+import { ariaKeys, bindKeys, shortcut } from "./keys";
 import { PHASE_LABELS, StatusMark, markFor } from "./marks";
 import { RefusalDetails } from "./refusals";
 
@@ -50,6 +51,7 @@ export function AgentRowButton(props: { readonly row: AgentRow; readonly focused
       aria-labelledby={name}
       aria-describedby={`${mark} ${activity}`}
       onClick={props.onFocus}
+      data-agent-id={props.row.id}
       data-testid={props.testid ?? "agent-row"}
     >
       <StatusMark id={mark} mark={markFor(props.row)} label={PHASE_LABELS[props.row.state]} count={props.row.waitingOnHuman.length} />
@@ -127,13 +129,28 @@ export function InboxCards(props: {
       <Show when={note()}>{(text) => <p class="inbox__note">{text()}</p>}</Show>
       <For each={sortInbox(props.cards)}>
         {(card) => {
-          const reason = createUniqueId();
+          const [reason, title] = [createUniqueId(), createUniqueId()];
+          // A card that answers for real is focusable, and only the focused card takes ⌘↩ and ⌘⌫ (#2904).
+          const answers = card.choices.length > 0 && card.waitsFor === undefined;
+          let keys: CardKeys | undefined;
+          const bind = (article: HTMLElement): void => {
+            if (answers) onCleanup(bindKeys(article, { "card.allow": () => keys?.allow(), "card.deny": () => keys?.deny() }));
+          };
           return (
-          <article class="card" classList={{ "card--blocking": card.blocking }} data-testid="inbox-card" data-request-seq={card.requestSeq}>
+          <article
+            ref={bind}
+            class="card"
+            classList={{ "card--blocking": card.blocking }}
+            data-testid="inbox-card"
+            data-request-seq={card.requestSeq}
+            tabindex={answers ? 0 : undefined}
+            aria-labelledby={answers ? title : undefined}
+            aria-keyshortcuts={answers ? `${ariaKeys(shortcut("card.allow").combo)} ${ariaKeys(shortcut("card.deny").combo)}` : undefined}
+          >
             <p class="card__meta">
               {card.kind === "permission" ? "Permission" : "Question"} · {card.agentLabel}
             </p>
-            <h3 class="card__title">{card.title}</h3>
+            <h3 id={title} class="card__title">{card.title}</h3>
             <p class="card__detail">{card.detail}</p>
             <Show when={card.diagnosis}>{(raw) => <RefusalDetails code={raw().code} message={raw().message} />}</Show>
             <Show when={card.stale}>
@@ -156,7 +173,7 @@ export function InboxCards(props: {
                   </>
                 }
               >
-                <PermissionActions card={card} sender={props.sender} ui={uiFor(card)} />
+                <PermissionActions card={card} sender={props.sender} ui={uiFor(card)} keys={(actions) => (keys = actions)} />
               </Show>
             </Show>
           </article>
