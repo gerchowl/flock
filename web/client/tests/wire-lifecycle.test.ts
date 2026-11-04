@@ -123,7 +123,8 @@ describe("ReadOnly: a client newer than the server (ADR-0038 §3)", () => {
     const h = readOnly();
     expect(h.connection.state).toBe("ReadOnly");
     expect(h.connection.error).toBeNull();
-    expect(h.connection.readOnly).toBe(`Read-only: this server runs an older version (wire protocol ${WIRE_PROTOCOL}; this client speaks ${NEWER}), so commands wait until it is updated.`);
+    expect(h.connection.readOnly).toBe("This server runs an older version, so sending waits until it is updated.");
+    expect(h.connection.versionGap).toBe(`The server speaks wire protocol ${WIRE_PROTOCOL}; this client speaks ${NEWER}.`);
   });
 
   test("streams render and settle, and the connection stays ReadOnly", () => {

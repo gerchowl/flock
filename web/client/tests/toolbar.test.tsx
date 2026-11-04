@@ -14,6 +14,7 @@ import { emptyLayout } from "../src/layout/model";
 import { createFixtureTransport } from "../src/transport/fixture";
 import { WIRE_PROTOCOL, type ConnectionState } from "../src/wire/connection";
 import { healthOf, type Health, type HostView } from "../src/workbench/HostStatus";
+import { CONNECTION_COPY } from "../src/workbench/refusals";
 import { SAMPLE_AGENTS } from "../src/workbench/samples";
 import { Workbench } from "../src/workbench/Workbench";
 import { readFixture } from "./fixture-replay";
@@ -60,7 +61,11 @@ function wireApp(welcome: ServerFrame | null = WELCOME): { h: Harness; root: HTM
 }
 
 /** The App's connection state, as the popover's state line starts. */
-const state = (root: ParentNode): string => ($(root, "host-detail")?.textContent ?? "").split(" · ")[0] ?? "";
+/** The connection state the popover's plain line words (Hello reads as Connecting). */
+const state = (root: ParentNode): string => {
+  const line = $(root, "host-detail")?.textContent ?? "";
+  return (Object.keys(CONNECTION_COPY) as (keyof typeof CONNECTION_COPY)[]).find((name) => line.startsWith(CONNECTION_COPY[name])) ?? line;
+};
 
 const health = (root: ParentNode): string | null | undefined => $(root, "host-status")?.getAttribute("data-health");
 /** What the banner says; empty while nothing needs the person. */
@@ -77,8 +82,9 @@ describe("one toolbar", () => {
     expect(toolbar.contains($(root, "palette-trigger"))).toBe(true);
     expect($(root, "host-status")?.getAttribute("aria-label")).toBe("Connection to fixture.invalid");
     expect(health(root)).toBe("live");
-    expect(occurrences(root.textContent ?? "", "Live")).toBe(1);
-    expect($(root, "host-detail")?.textContent).toBe("Live");
+    expect(occurrences(root.textContent ?? "", "Connected.")).toBe(1);
+    expect($(root, "host-detail")?.textContent).toBe("Connected.");
+    expect(root.textContent).not.toContain("Live");
     expect(banner(root)).toBe("");
   });
 
@@ -107,7 +113,7 @@ describe("one toolbar", () => {
       link_diagnostics: [],
       counts: { total: 0, by_phase: {}, waiting_on_human: 0 },
     };
-    const view: HostView = { name: BRIDGE_HOST, health: () => "live", detail: () => "Live", connected: () => true, connect: () => undefined, disconnect: () => undefined };
+    const view: HostView = { name: BRIDGE_HOST, health: () => "live", detail: () => "Live", diagnosis: () => null, connected: () => true, connect: () => undefined, disconnect: () => undefined };
     for (const [nodes, name] of [[[], BRIDGE_HOST], [[node], "node-a"]] as const) {
       const fleet = createFixtureFleet(SAMPLE_AGENTS, nodes.map((row) => ({ op: "upsert", kind: "node", row, tsMs: 0 })));
       const root = mount(() => <Workbench fleet={fleet} transport={createFixtureTransport("")} inbox={[]} layout={emptyLayout()} sender={null} saveLayout={() => undefined} source="live" host={view} />);
@@ -132,7 +138,7 @@ describe("the connection popover", () => {
     expect($(root, "host-toggle")?.textContent).toBe("Disconnect");
     $(root, "host-toggle")?.click();
     expect(state(root)).toBe("Disconnected");
-    expect([health(root), $(root, "host-detail")?.textContent, $(root, "host-toggle")?.textContent]).toEqual(["off", "Disconnected", "Connect"]);
+    expect([health(root), $(root, "host-detail")?.textContent, $(root, "host-toggle")?.textContent]).toEqual(["off", "Not connected.", "Connect"]);
     // A chosen disconnect is no problem: no banner.
     expect(banner(root)).toBe("");
     $(root, "host-toggle")?.click();
@@ -177,7 +183,8 @@ describe("the banner", () => {
     expect([health(root), banner(root)]).toEqual(["live", ""]);
     h.net.current().drop();
     expect(health(root)).toBe("problem");
-    expect($(root, "banner-detail")?.textContent).toMatch(/^Reconnecting · Connection lost/);
+    expect($(root, "banner-detail")?.textContent).toBe("Connection lost. Reconnecting…");
+    expect($(root, "connection-banner")?.querySelector('[data-testid="details"]')?.textContent).toMatch(/^Details Connection lost: /);
     // The retry's Connecting still carries the failure: the banner stays instead of flickering.
     h.clock.advanceTo(h.clock.now() + 1_000);
     expect([state(root), health(root)]).toEqual(["Connecting", "problem"]);
@@ -195,7 +202,8 @@ describe("the banner", () => {
   test("read-only names the version gap in the banner", () => {
     const { root } = wireApp({ ...WELCOME, protocol: WIRE_PROTOCOL - 1 } as ServerFrame);
     expect(health(root)).toBe("problem");
-    expect($(root, "read-only")?.textContent).toContain("Read-only: this server runs an older version");
+    expect($(root, "read-only")?.textContent).toBe("This server runs an older version, so sending waits until it is updated.");
+    expect($(root, "connection-banner")?.querySelector('[data-testid="details"]')?.textContent).toBe(`Details The server speaks wire protocol ${WIRE_PROTOCOL - 1}; this client speaks ${WIRE_PROTOCOL}.`);
   });
 
   test("a disconnect that stopped on a failure offers Connect in the banner", () => {

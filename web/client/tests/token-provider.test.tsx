@@ -200,6 +200,8 @@ function mount(shell: Shell | undefined, options: { outbox?: readonly (typeof PE
 
 /** The connection's state line, in the toolbar's popover. */
 const status = (root: HTMLElement): string => root.querySelector('[data-testid="host-detail"]')?.textContent ?? "";
+/** The raw diagnosis behind the popover's Details. */
+const diagnosis = (root: HTMLElement): string => root.querySelector('[data-testid="host-panel"] .details__body')?.textContent?.trim() ?? "";
 const prompt = (root: HTMLElement): Element | null => root.querySelector('input[aria-label="New client token"]');
 const click = (root: HTMLElement, selector: string): void => (root.querySelector(selector) as HTMLButtonElement).click();
 const frames = (h: Harness, t: string): Record<string, unknown>[] => sentFrames(h).filter((frame) => (frame as { t: string }).t === t) as Record<string, unknown>[];
@@ -223,7 +225,7 @@ for (const mode of MODES) {
     const first = provider(mode, "t1");
     const { h, root, entries } = mount(first);
     // A bridged attempt waits for its session in Connecting; a provider's token is asked for in NeedsToken.
-    expect(status(root)).toBe(mode === "bridge" ? "Connecting" : "Signing in…");
+    expect(status(root)).toBe(mode === "bridge" ? "Connecting…" : "Signing in…");
     expect(prompt(root)).toBeNull();
     await tick();
     expect([first.calls, started(h, mode)]).toEqual([1, 1]);
@@ -231,7 +233,7 @@ for (const mode of MODES) {
     expect(frames(h, "hello").map((frame) => frame["token"])).toEqual(["t1"]);
     // The client's own `hello` on a bridge carries no token key at all: the native side adds its bearer.
     expect(first.hellos.map((frame) => "token" in frame)).toEqual(mode === "bridge" ? [false] : []);
-    expect(status(root)).toBe("Live");
+    expect(status(root)).toBe("Connected.");
     expect(entries.size).toBe(0);
     dispose?.();
     const reloaded = provider(mode, "t2");
@@ -260,7 +262,7 @@ for (const mode of MODES) {
     expect(frames(h, "hello").map((frame) => frame["token"])).toEqual(["t1", "t2"]);
     expect(fleetSubs(h).map((frame) => frame["after"])).toEqual([undefined, 7]);
     send(h, { t: "synced", sub_id: fleetSubs(h)[1]?.["sub_id"], seq: 7 });
-    expect(status(root)).toBe("Live");
+    expect(status(root)).toBe("Connected.");
     expect(frames(h, "cmd").map((frame) => frame["cmd_id"])).toEqual(["c0"]);
     expect(root.querySelector('[data-testid="outbox-problem"]')).toBeNull();
   });
@@ -275,7 +277,7 @@ for (const mode of MODES) {
     h.step(step({ step: "token_refused", code: 4403 }));
     await tick();
     welcome(h, 0, "another-principal");
-    expect(status(root)).toBe("Live");
+    expect(status(root)).toBe("Connected.");
     expect(frames(h, "cmd")).toEqual([]);
     const dropped = root.querySelector('[data-testid="outbox-dropped"]');
     expect(dropped?.textContent).toContain("Dropped 1 unsent command: the server now names another identity, and commands never run under another.");
@@ -294,7 +296,7 @@ for (const mode of MODES) {
       const tokens = provider(mode, reply);
       const { h, root } = mount(tokens);
       await tick();
-      expect(status(root)).toBe(`NeedsToken · ${PANE}`);
+      expect(status(root)).toBe(`Sign-in needed. ${PANE}`);
       expect(prompt(root)).toBeNull();
       h.clock.advanceTo(h.clock.now() + 120_000);
       await tick();
@@ -305,7 +307,7 @@ for (const mode of MODES) {
   test("a provider that returns no promise lands in NeedsToken, never a crash", async () => {
     const { h, root } = mount(provider(mode, { value: undefined }));
     await tick();
-    expect(status(root)).toBe(`NeedsToken · ${mode === "bridge" ? "The shell gave no bridge session." : "The shell gave no token."}`);
+    expect(status(root)).toBe(`Sign-in needed. ${mode === "bridge" ? "The shell gave no bridge session." : "The shell gave no token."}`);
     expect(started(h, mode)).toBe(0);
   });
 
@@ -338,7 +340,7 @@ for (const mode of MODES) {
     expect(tokens.calls).toBe(2);
     welcome(h, 0);
     expect(frames(h, "hello").map((frame) => frame["token"])).toEqual(["t1", "t1", "t2"]);
-    expect(status(root)).toBe("Live");
+    expect(status(root)).toBe("Connected.");
     expect(frames(h, "cmd").map((frame) => frame["cmd_id"])).toEqual(["c0"]);
   });
 
@@ -354,7 +356,7 @@ for (const mode of MODES) {
       await tick();
     }
     expect(tokens.calls).toBe(MAX_REMINTS + 1);
-    expect(status(root)).toBe(`NeedsToken · The server refused the token. ${REMINTS_SPENT}`);
+    expect(status(root)).toBe(`Sign-in needed. The server refused the token. ${REMINTS_SPENT}`);
   });
 
   test(`a server that revokes every token at once is asked ${MAX_REMINTS} times on §3's backoff, then NeedsToken says why`, async () => {
@@ -376,7 +378,7 @@ for (const mode of MODES) {
       }
       expect(tokens.calls).toBe(Math.min(remint, MAX_REMINTS) + 1);
     }
-    expect(status(root)).toBe(`NeedsToken · The token was revoked. ${REMINTS_SPENT}`);
+    expect(status(root)).toBe(`Sign-in needed. The token was revoked. ${REMINTS_SPENT}`);
     h.clock.advanceTo(h.clock.now() + 600_000);
     await tick();
     expect(tokens.calls).toBe(MAX_REMINTS + 1);
@@ -418,7 +420,7 @@ for (const mode of MODES) {
       h.clock.advanceTo(h.clock.now() + 30_000);
       send(h, { t: "ping", nonce: `n${revoked}` });
       h.clock.advanceTo(h.clock.now() + 30_000);
-      expect(status(root)).toBe("Live");
+      expect(status(root)).toBe("Connected.");
       h.step(step({ step: "token_refused", code: 4403 }));
       await tick();
       expect(tokens.calls).toBe(revoked + 1);
@@ -435,7 +437,7 @@ for (const mode of MODES) {
       h.clock.advanceTo(h.clock.now() + 30_000);
       send(h, { t: "ping", nonce: `n${revoked}` });
       h.clock.advanceTo(h.clock.now() + 30_000);
-      expect(status(root)).toBe("ReadOnly");
+      expect(status(root)).toBe("Connected, read-only.");
       h.step(step({ step: "token_refused", code: 4403 }));
       await tick();
       expect(tokens.calls).toBe(revoked + 1);
@@ -481,7 +483,7 @@ for (const mode of MODES) {
     expect(started(h, mode)).toBe(2);
     welcome(h, 0);
     expect(frames(h, "hello").map((frame) => frame["token"])).toEqual(["t1", "t2"]);
-    expect(status(root)).toBe("Live");
+    expect(status(root)).toBe("Connected.");
     expect(frames(h, "cmd").map((frame) => frame["cmd_id"])).toEqual(["c0"]);
     // t2 carries no expiresInMs, so nothing renews it.
     h.clock.advanceTo(h.clock.now() + 600_000);
@@ -497,7 +499,7 @@ for (const mode of MODES) {
     h.clock.advanceTo(h.clock.now() + 20_000 * RENEW_AT);
     await tick();
     expect(tokens.calls).toBe(2);
-    expect(status(root)).toBe("Live");
+    expect(status(root)).toBe("Connected.");
     const notice = root.querySelector('[data-testid="renewal-notice"]');
     expect(notice?.textContent).toContain(PANE);
     (notice?.querySelector("button") as HTMLButtonElement).click();
@@ -544,11 +546,11 @@ for (const mode of MODES) {
       h.clock.advanceTo(h.clock.now() + 30_000);
       await tick();
     }
-    expect(status(root)).toBe(`NeedsToken · The token was revoked. ${REMINTS_SPENT}`);
+    expect(status(root)).toBe(`Sign-in needed. The token was revoked. ${REMINTS_SPENT}`);
     h.clock.advanceTo(h.clock.now() + 600_000);
     await tick();
     expect(tokens.calls).toBe(MAX_REMINTS + 1);
-    expect(status(root)).toBe(`NeedsToken · The token was revoked. ${REMINTS_SPENT}`);
+    expect(status(root)).toBe(`Sign-in needed. The token was revoked. ${REMINTS_SPENT}`);
   });
 
   for (const [name, expiresInMs] of [
@@ -561,7 +563,7 @@ for (const mode of MODES) {
     test(`an expiresInMs of ${name} is refused: NeedsToken says why, and nothing connects`, async () => {
       const { h, root } = mount(provider(mode, { token: "t1", expiresInMs }));
       await tick();
-      expect(status(root)).toBe(`NeedsToken · The shell's ${mode === "bridge" ? "bridge session" : "token"} has an invalid expiresInMs: it must be a positive, finite number of milliseconds.`);
+      expect(status(root)).toBe(`Sign-in needed. The shell's ${mode === "bridge" ? "bridge session" : "token"} has an invalid expiresInMs: it must be a positive, finite number of milliseconds.`);
       expect(started(h, mode)).toBe(0);
     });
   }
@@ -572,11 +574,11 @@ for (const mode of MODES) {
     await tick();
     expect(tokens.calls).toBe(1);
     click(root, '[data-testid="host-toggle"]');
-    expect(status(root)).toBe("Disconnected");
+    expect(status(root)).toBe("Not connected.");
     tokens.resolve("late");
     await tick();
     expect(started(h, mode)).toBe(0);
-    expect(status(root)).toBe("Disconnected");
+    expect(status(root)).toBe("Not connected.");
     click(root, '[data-testid="host-toggle"]');
     h.step(step({ step: "open" }));
     expect(frames(h, "hello").map((frame) => frame["token"])).toEqual(["late"]);
@@ -644,7 +646,7 @@ for (const mode of MODES) {
     tokens.resolve("t2");
     await tick();
     welcome(h, 0);
-    expect(status(root)).toBe("Live");
+    expect(status(root)).toBe("Connected.");
     expect(frames(h, "hello").map((frame) => frame["token"])).toEqual(["t1", "t2"]);
     expect(tokens.calls).toBe(2);
   });
@@ -681,7 +683,7 @@ for (const mode of MODES) {
 test("without a provider, NeedsToken still prompts for a token and names flk client open", () => {
   const { h, root } = mount(undefined);
   expect(h.net.attempts).toHaveLength(0);
-  expect(status(root)).toBe(`NeedsToken · ${RUN_CLIENT_OPEN}`);
+  expect(status(root)).toBe(`Sign-in needed. ${RUN_CLIENT_OPEN}`);
   expect(prompt(root)).not.toBeNull();
   expect(root.querySelector('[data-testid="shell-connect"]')).toBeNull();
 });
@@ -781,7 +783,7 @@ describe("the bridge transport", () => {
     expect(shell.renews).toEqual([false, true, false]);
     expect(shell.openedAt.at(-1)).toBe(h.clock.now());
     welcome(h, 0);
-    expect(status(root)).toBe("Live");
+    expect(status(root)).toBe("Connected.");
     expect(root.querySelector('[data-testid="renewal-notice"]')?.textContent).toContain(PANE);
   });
 
@@ -807,7 +809,7 @@ describe("the bridge transport", () => {
     welcome(h, 0);
     expect(frames(h, "hello").map((frame) => frame["token"])).toEqual(["t1", "t1", "t2"]);
     expect(shell.hellos.some((frame) => "token" in frame)).toBe(false);
-    expect(status(root)).toBe("Live");
+    expect(status(root)).toBe("Connected.");
   });
 
   for (const [end, code, welcomed] of [
@@ -844,7 +846,7 @@ describe("the bridge transport", () => {
     // §3's Socket lost retries later, never as an auth end, even past the mint cap.
     for (let attempt = 0; attempt <= MAX_REMINTS + 1; attempt++) {
       h.step(step({ step: "close", code: 1013, reason: "preauth_capacity" }));
-      expect(status(root)).toBe("Reconnecting · Connection lost: the socket closed (1013: preauth_capacity).");
+      expect([status(root), diagnosis(root)]).toEqual(["Connection lost. Reconnecting…", "Connection lost: the socket closed (1013: preauth_capacity)."]);
       const opened = shell.renews.length;
       const later = Math.min(30_000, 500 * 2 ** attempt) / 2;
       h.clock.advanceTo(h.clock.now() + later - 1);
@@ -861,7 +863,7 @@ describe("the bridge transport", () => {
     expect(shell.calls).toBe(2);
     expect(shell.openedAt.at(-1)).toBe(h.clock.now());
     welcome(h, 0);
-    expect(status(root)).toBe("Live");
+    expect(status(root)).toBe("Connected.");
   });
 
   test("a 1006 is an ordinary reconnect: Reconnecting on §3's backoff, then one openBridge that mints nothing, and the streak is untouched", async () => {
@@ -870,7 +872,7 @@ describe("the bridge transport", () => {
     await tick();
     welcome(h, 0);
     h.step(step({ step: "drop" }));
-    expect(status(root)).toBe("Reconnecting · Connection lost: the socket closed (1006).");
+    expect([status(root), diagnosis(root)]).toEqual(["Connection lost. Reconnecting…", "Connection lost: the socket closed (1006)."]);
     // Attempt 0's backoff is [250, 500] ms; random 0 takes 250.
     h.clock.advanceTo(h.clock.now() + 249);
     await tick();
@@ -879,7 +881,7 @@ describe("the bridge transport", () => {
     await tick();
     expect([shell.renews, shell.calls, started(h, "bridge")]).toEqual([[false, false], 1, 2]);
     welcome(h, 0);
-    expect(status(root)).toBe("Live");
+    expect(status(root)).toBe("Connected.");
   });
 
   test("a 1008 is a protocol close: the diagnosis is shown and the connection goes to Reconnecting, never NeedsToken", async () => {
@@ -887,7 +889,7 @@ describe("the bridge transport", () => {
     const { h, root } = mount(shell);
     await tick();
     h.step(step({ step: "close", code: 1008, reason: "the first frame was not a token-free hello" }));
-    expect(status(root)).toBe("Reconnecting · Connection lost: the socket closed (1008: the first frame was not a token-free hello).");
+    expect([status(root), diagnosis(root)]).toEqual(["Connection lost. Reconnecting…", "Connection lost: the socket closed (1008: the first frame was not a token-free hello)."]);
     h.clock.advanceTo(h.clock.now() + 250);
     await tick();
     expect([shell.renews, shell.calls, started(h, "bridge")]).toEqual([[false, false], 1, 2]);
@@ -901,7 +903,7 @@ describe("the bridge transport", () => {
     // The server ended t1, so the reconnect's open must mint, and the shell refuses.
     h.step(step({ step: "token_refused", code: 4403 }));
     await tick();
-    expect(status(root)).toBe(`NeedsToken · The token was revoked. ${PANE}`);
+    expect(status(root)).toBe(`Sign-in needed. The token was revoked. ${PANE}`);
     h.clock.advanceTo(h.clock.now() + 600_000);
     await tick();
     expect([shell.renews, shell.calls]).toEqual([[false, false], 2]);
@@ -909,7 +911,7 @@ describe("the bridge transport", () => {
     await tick();
     expect([shell.renews, shell.calls]).toEqual([[false, false, false], 3]);
     welcome(h, 0);
-    expect(status(root)).toBe("Live");
+    expect(status(root)).toBe("Connected.");
   });
 
   test("a bearer's renewal is asked once: after it fails, reconnects on the same bearer never ask again, and the notice stands", async () => {
@@ -981,7 +983,7 @@ describe("the bridge transport", () => {
   test("a fresh that is not a boolean is refused: NeedsToken says why, and its socket is closed", async () => {
     const { h, root } = mount(provider("bridge", { token: "t1", fresh: "yes" }));
     await tick();
-    expect(status(root)).toBe("NeedsToken · The shell's bridge session has an invalid fresh: it must be a boolean.");
+    expect(status(root)).toBe("Sign-in needed. The shell's bridge session has an invalid fresh: it must be a boolean.");
     expect([frames(h, "hello").length, h.net.closes.map((close) => close.code)]).toEqual([0, [1000]]);
   });
 
@@ -1050,12 +1052,12 @@ describe("the bridge transport", () => {
     // The native side's socket to the server went away while nobody used it.
     h.net.current().drop();
     click(root, '[data-testid="host-toggle"]');
-    expect(status(root)).toBe("Connecting");
+    expect(status(root)).toBe("Connecting…");
     await tick();
     expect([shell.renews, shell.calls]).toEqual([[false, false], 1]);
     welcome(h, 0);
     expect(frames(h, "hello").map((frame) => frame["token"])).toEqual(["late"]);
-    expect(status(root)).toBe("Live");
+    expect(status(root)).toBe("Connected.");
   });
 
   test("a session that resolves after the app is gone is closed, and one with an invalid lifetime is closed too", async () => {
