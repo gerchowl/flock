@@ -92,18 +92,62 @@ the scale is a design question, not a missing token.
 ## Rules
 
 1. **No raw values.** Colour, background, border, radius, `font-*`,
-   `line-height`, `box-shadow`, `z-index`, gaps, margins and padding take a
-   token or a keyword (`0`, `auto`, `inherit`, `currentColor`, `none`, …).
+   `line-height`, `box-shadow`, `text-shadow`, SVG `fill`/`stroke`,
+   `-webkit-text-stroke*`/`-webkit-text-fill*`, `z-index`, gaps, margins
+   and padding take a token or a keyword (`0`, `auto`, `inherit`, `currentColor`, `none`, …).
    Raw values appear only in the generated `tokens.css`. A custom property
    may only alias tokens: `--x: var(--space-2)`, never `--x: 8px`.
-   (stylelint, `stylelint-declaration-strict-value`.)
+   `font` shorthand is allowed only as `font: inherit`. Filters take
+   `blur()`/`drop-shadow()` with token arguments, zero and `currentColor`,
+   or a keyword; raw lengths and colours are rejected.
+   `var()` fallbacks are forbidden, even when the primary token exists.
+   Every reference must name a generated token or a local alias defined in
+   the same stylesheet. All alias definitions are checked transitively,
+   including alternatives in other selectors; unknown names and cycles
+   fail. Cross-file local aliases are deliberately rejected because their
+   cascade cannot be proven from one stylesheet. The primitive stylesheet
+   additionally accepts its explicit `--l-*` input contract, supplied by
+   typed primitive props. `@property` is forbidden outside generated tokens,
+   including in LEGACY and layout files.
+   Whole-value `calc()` sums and differences of same-category pixel tokens
+   are allowed, including parentheses and local aliases. Every referenced
+   spacing value must remain on the 4 px grid in every generated mode.
+   Raw operands, scalar multiplication/division, mixed or relative units,
+   and calculations that cannot be resolved statically are rejected.
+   Existing layout dimension and transform calculations keep their own contracts.
+   (stylelint, `stylelint-declaration-strict-value` and `flock/design-values`.)
+
+   Token categories follow aliases too: padding, margin and gap require
+   `--space-*`; font size and line height require `--font-size-*`; font
+   family and weight require their corresponding `--font-family-*` and
+   `--font-weight-*`; radius requires `--radius-*`; z-index requires
+   `--layer-*`. Colours, backgrounds and SVG paints require `--color-*`;
+   border widths require `--border-width-*`. Border/outline shorthands may
+   combine width and colour tokens; shadows and filters may combine space,
+   border-width and colour tokens. Control dimensions accept size or space
+   tokens. Other font properties and border styles accept keywords, with
+   no token category. LEGACY files retain their existing raw-value and
+   category exemptions, but unknown references and fallbacks still fail.
+   `--color-legacy-*` references are allowed only in the existing LEGACY
+   stylesheets and generated tokens, including through aliases.
 2. **Layout lives in `src/layout/`.** Outside it, CSS may not use
-   `display: flex` or `grid` (inline forms included), `gap`, margins,
-   `position: absolute` or `@media`. Compose the primitives instead.
-   (stylelint overrides.)
+   any `display` except `none`, `block`, `inline`, `inline-block`, `initial`
+   and `unset`, or any `position` except `static`, `relative`, `initial` and
+   `unset`. Inheritance and reversion can restore fenced layout values and
+   are rejected. The same allowlists apply after resolving every local alias
+   and every generated token mode.
+   Gap, margins, float/clear, columns and their count/width/span/fill,
+   inset (including logical forms), top/right/bottom/left and translate
+   are fenced, as are `@media`, `@container`, `@supports` and conditional
+   `@import`. Compose the primitives instead. Existing LEGACY files retain
+   their layout exemption. (stylelint overrides and `flock/design-values`.)
 3. **No inline styles.** Source outside `src/layout/primitives/` may not set `style=` (or
    `attr:style`/`prop:style`): an inline style escapes both rules above.
-   JSX spreads containing inline styles are fenced too. DOM styling APIs,
+   JSX spreads containing inline styles are fenced too. JSX `fill`, `stroke`
+   and `color` (including namespaced attributes and local spread objects)
+   accept only static CSS keywords such as `none` and `currentColor`.
+   Literal and expression colours belong in token-based CSS classes. DOM
+   styling APIs,
    including computed access, stylesheet construction and adoption, are
    unavailable to the design type check. Plain data with a `style` key and
    plain objects with an `animate` method remain legal. Only primitives own
@@ -278,8 +322,9 @@ add next (#2899).
 
 ## Layout
 
-The primitives in `src/layout/primitives/` follow
-[Every Layout](https://every-layout.dev/layouts/):
+The flow primitives in `src/layout/primitives/` follow
+[Every Layout](https://every-layout.dev/layouts/). `Sticky` keeps navigation
+or header chrome at the top of its scrolling container:
 
 | Primitive | Does | Props |
 | --- | --- | --- |
@@ -289,6 +334,7 @@ The primitives in `src/layout/primitives/` follow
 | `Switcher` | One row above a width threshold, one column below. | `threshold`, `space` |
 | `Center` | A centred column with a maximum width. | `max`, `gutters`, `intrinsic` |
 | `Grid` | As many equal columns as fit. | `min`, `space` |
+| `Sticky` | Chrome pinned to the top of its scrolling container. | `as`, `class` |
 | `Anchor`, `AnchorPanel` | A trigger and its popover panel, placed under it out of the flow (not one of Every Layout's). | `space`, `align` (panel) |
 
 Each takes `as` (the element), `class` and the element's other attributes.
@@ -313,6 +359,18 @@ queries.
 
 ### Indirect styling and untrusted types
 
+HTML markup injection is forbidden in all linted client source, including
+primitives and the complete shipped source graph. No existing client consumer
+needs it, and there is no sanctioned markup module. Use `textContent` and
+node construction instead. JSX `innerHTML`/`outerHTML`, assignments and object
+payloads with those keys, `insertAdjacentHTML`, `DOMParser.parseFromString`,
+`Range.createContextualFragment`, `document.write`/`writeln`, `setHTMLUnsafe`
+and `Document.parseHTMLUnsafe` are rejected. ESLint checks static names,
+including computed literals; restricted DOM and JSX declarations cover aliases
+and imported props. Ordinary stream writers remain available. CSP alone cannot
+enforce this rule: it permits SVG presentation attributes in injected markup.
+Artifact documents in the ADR-0038 sandbox iframe keep their separate boundary.
+
 JSX checks describe actual style attributes; ordinary property names are not
 style APIs. Computed DOM keys and aliases require a type-level boundary. `bun run types:design`, included in `lint`, checks
 application source and its imports with a restricted copy of the pinned compiler's
@@ -322,6 +380,21 @@ loaded or a declaration's expected shape changes. Standard type checking still
 runs separately. This avoids declaration-merging precedence and covers concrete
 HTML, SVG and inline-style interfaces without guessing which variable is a DOM
 object.
+
+The same pass loads a restricted copy of Solid's pinned JSX declarations.
+`fill`, `stroke` and `color` accept only paint keywords (`none`, `currentColor`,
+`transparent` and CSS-wide keywords); token colours belong in CSS classes.
+This constraint also checks objects imported from other files and spread onto
+an intrinsic SVG element. A keyword object may preserve its literals with
+`as const`; an arbitrary string remains a type error.
+
+Standalone SVG images are restricted to the reviewed brand mark, verified by
+its exact SHA-256 content digest. Icons belong in the JSX catalogue
+(`src/workbench/marks.tsx`), where the paint rules apply. The build checks
+imported SVG modules, emitted SVG assets (including `new URL` references),
+and SVG files copied from Vite's public directory. Embedded styles and
+presentation attributes cannot introduce a new independently styled image;
+changing even the brand mark's paint requires a deliberate policy review.
 
 `unknown` also prevents passing an unavailable capability directly to generic
 object-mutating helpers; `never` would remain assignable there.

@@ -5,6 +5,8 @@ import { fileURLToPath } from "node:url";
 const client = dirname(fileURLToPath(import.meta.url));
 
 const NO_STYLE = "Inline style bypasses the design tokens: use a class, or a primitive from src/layout/ (web/DESIGN.md).";
+const NO_MARKUP = "HTML markup injection is disallowed; construct nodes and use textContent (web/DESIGN.md).";
+const markupProp = (key) => /^(?:(?:prop|attr):)?(?:innerHTML|outerHTML)$/.test(key);
 const name = (node) => node?.name ?? node?.value;
 const designProps = new Set(["space", "gutters", "justify", "align", "side", "sideWidth", "contentMin", "threshold", "max", "min", "intrinsic", "as"]);
 
@@ -48,6 +50,12 @@ const design = {
       }
     }
     const report = (node, message = NO_STYLE) => context.report({ node, message });
+    function paint(node, key, value) {
+      if (!["fill", "stroke", "color"].includes(key)) return;
+      const literal = value?.type === "JSXExpressionContainer" ? value.expression : value;
+      if (literal?.type === "Literal" && /^(?:none|currentColor|transparent|inherit|initial|unset|revert|revert-layer)$/i.test(literal.value)) return;
+      report(node, "JSX paint attributes require a static keyword; use a CSS class for token colours.");
+    }
     return {
       Program(node) {
         for (const item of node.body) if (item.type === "ImportDeclaration") {
@@ -71,6 +79,7 @@ const design = {
           seen.add(node);
           if ((node.type === "TSAsExpression" || node.type === "TSTypeAssertion") && name(node.typeAnnotation.typeName) !== "const") report(node, "Value casts bypass typed design props; keep the original type.");
           if (node.type === "Property" && name(node.key) === "style") report(node);
+          if (node.type === "Property") paint(node, staticKey(node.key), node.value);
           if (node.type === "Identifier") {
             let scope = context.sourceCode.getScope(node);
             while (scope && !scope.set.has(node.name)) scope = scope.upper;
@@ -89,18 +98,29 @@ const design = {
       },
       JSXSpreadAttribute(node) { designValues.push(node.argument); },
       JSXAttribute(node) {
+        if (markupProp(name(node.name.type === "JSXNamespacedName" ? node.name.name : node.name))) report(node, NO_MARKUP);
+        paint(node, name(node.name.type === "JSXNamespacedName" ? node.name.name : node.name), node.value);
         if (node.name.type === "JSXNamespacedName" && name(node.name.namespace) === "style") tokenWrite(node, node.name.name);
         if (designProps.has(name(node.name))) designValues.push(node.value);
         if (!layout && name(node.name) === "style") report(node);
         if (!layout && node.name.type === "JSXNamespacedName" && name(node.name.name) === "style") report(node);
       },
       AssignmentExpression(node) {
+        if (node.left.type === "MemberExpression" && markupProp(staticKey(node.left.property))) report(node, NO_MARKUP);
         if (node.left.type === "MemberExpression") tokenWrite(node, node.left.property);
+      },
+      MemberExpression(node) {
+        const key = staticKey(node.property);
+        if (["insertAdjacentHTML", "parseFromString", "createContextualFragment", "setHTMLUnsafe", "parseHTMLUnsafe"].includes(key) ||
+          (["write", "writeln"].includes(key) && name(node.object.property ?? node.object) === "document")) report(node, NO_MARKUP);
       },
       CallExpression(node) {
         if (["setProperty", "removeProperty", "set", "delete"].includes(name(node.callee.property))) tokenWrite(node, node.arguments[0]);
       },
       Property(node) {
+        // Includes imported JSX props and Object.assign payloads, not just literals
+        // appearing directly in a JSX spread at the call site.
+        if (markupProp(staticKey(node.key))) report(node, NO_MARKUP);
         tokenWrite(node, node.key);
       },
       TSAnyKeyword(node) { report(node, "Explicit any bypasses design types; use unknown and validate."); },
