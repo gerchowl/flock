@@ -341,6 +341,7 @@ describe("the key guard catches each bypass of the keyboard layer", () => {
     ["bind", 'a "keydown" listener on document'],
     ["spread", 'a JSX keydown handler on <input>'],
     ["capture", 'a "keydown" listener on <div> (capture)'],
+    ["iframe", 'in a frame (about:srcdoc): a "keydown" listener on document'],
   ])("seed %s: %s", async (seed, finding) => {
     const clean = await open(null);
     expect(await keyListeners(clean)).toEqual([]);

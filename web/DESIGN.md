@@ -302,7 +302,7 @@ times out fails the run, and the browser's processes are killed and reaped
 either way.
 
 Every check, and each part of rules 4, 8 and 9, has a seeded violation in
-the test's `SEEDS` (34 in all: one below the fold, one only in dark mode, one swallowing Tab so focus walks out of a dialog, five key listeners outside the keyboard layer,
+the test's `SEEDS` (35 in all: one below the fold, one only in dark mode, one swallowing Tab so focus walks out of a dialog, six key listeners outside the keyboard layer,
 one hiding the page, one where the parity walk misses a toolbar's
 buttons, four icon buttons named only by a tooltip or a hidden icon's `<title>`, two label references whose text is hidden, one name walk that drifts from Chromium's). A test runs each check on its page with and without
 its seed and fails unless the seed adds a finding.
@@ -376,8 +376,9 @@ These follow the accepted redesign (#2903).
   key listener without the brand, whatever the alias (`.bind`, `.call`,
   a `const` event name) or phase (capture), and it scans the rendered
   elements for Solid's delegated `$$key*` handlers, which any JSX key
-  prop (spread or not) becomes. Any finding fails the run. Seeds prove each
-  bypass is caught: `KEYS_SEED=<const|bind|spread|capture>` runs real
+  prop (spread or not) becomes. It reads every frame of the page, child
+  frames included. Any finding fails the run. Seeds prove each
+  bypass is caught: `KEYS_SEED=<const|bind|spread|capture|iframe>` runs real
   compiled code in the keyboard harness, and the conformance `keys-*`
   seeds assert their finding. ESLint's `design/keys` rule is the early
   warning for the spellings it can see statically; the layer module is

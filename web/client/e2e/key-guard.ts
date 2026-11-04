@@ -66,12 +66,24 @@ export async function guardKeys(page: Page): Promise<void> {
   await page.addInitScript(installKeyGuard);
 }
 
-/** What the guard recorded on `page`'s document. */
+/**
+ * What the guard recorded in every frame of `page` attached now, the main
+ * frame's first; a child frame's findings name its URL. `addInitScript`
+ * installs the guard in child frames too (a frame added after load
+ * included), and a frame without it is a finding. Known limit: a frame
+ * that was attached and removed again before this call is not read.
+ */
 export async function keyListeners(page: Page): Promise<string[]> {
-  return page.evaluate(() => {
-    const read = Reflect.get(globalThis, "__keyListeners");
-    return typeof read === "function" ? read() : ["the key guard is not installed in this document"];
-  });
+  const found: string[] = [];
+  for (const frame of page.frames()) {
+    await frame.waitForLoadState();
+    const own = await frame.evaluate((): string[] => {
+      const read = Reflect.get(globalThis, "__keyListeners");
+      return typeof read === "function" ? read() : ["the key guard is not installed in this document"];
+    });
+    found.push(...own.map((line) => (frame === page.mainFrame() ? line : `in a frame (${frame.url()}): ${line}`)));
+  }
+  return found;
 }
 
 /** Fails unless the guard recorded nothing on `page`. */

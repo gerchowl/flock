@@ -159,6 +159,9 @@ const NO_KEYS = "Keys go through the keyboard layer (src/workbench/keys.ts, web/
  * event named by a literal or a `const`; an `onkey*` property; a JSX key prop (capture variants
  * included); an object literal with such a key, which a spread would hand to JSX; and a forged
  * layer brand. The layer itself (`src/workbench/keys.ts`) is exempt by an override below.
+ * Known limit: a registration through a helper (`function on(t, h) { el.addEventListener(t, h) }`
+ * called with "keydown") passes here, since the event name is a parameter; the runtime guard
+ * catches it, and no data-flow analysis is attempted.
  */
 const keys = {
   meta: { schema: [] },

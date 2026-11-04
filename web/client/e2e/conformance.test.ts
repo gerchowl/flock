@@ -225,6 +225,13 @@ const SEEDS: Readonly<Record<string, Seed>> = {
   // What Solid compiles a spread JSX onKeyDown to: a delegated handler on the element.
   "keys-spread": { check: "keys", page: "workbench", into: "body", html: "", script: 'document.querySelector("main").$$keydown = () => undefined', finding: 'a JSX keydown handler on <main data-testid="focus-pane">' },
   "keys-capture": { check: "keys", page: "workbench", into: "body", html: "", script: 'document.body.addEventListener("keydown", () => undefined, { capture: true })', finding: 'a "keydown" listener on <body> (capture)' },
+  "keys-iframe": {
+    check: "keys",
+    page: "workbench",
+    into: "body",
+    html: '<iframe title="Seed" hidden srcdoc="<script>document.addEventListener(&quot;keydown&quot;, () => undefined)</script>"></iframe>',
+    finding: 'in a frame (about:srcdoc): a "keydown" listener on document',
+  },
   "keys-property": { check: "keys", page: "gallery", into: "body", html: "", script: "document.onkeydown = () => undefined", finding: "an onkeydown property on document" },
   "coverage-hidden": {
     check: "coverage",

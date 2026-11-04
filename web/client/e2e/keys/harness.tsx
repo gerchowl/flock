@@ -71,6 +71,8 @@ export const SEEDS: Readonly<Record<string, () => JSX.Element>> = {
   },
   // A capture listener: Solid's capture syntax.
   capture: () => <div oncapture:keydown={ignore}>Seed</div>,
+  // A same-origin child frame with a listener of its own.
+  iframe: () => <iframe title="Seed" hidden srcdoc={'<script>document.addEventListener("keydown", () => undefined)</script>'} />,
 };
 
 const seed = new URLSearchParams(location.search).get("seed");
