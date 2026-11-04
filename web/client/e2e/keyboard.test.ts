@@ -68,6 +68,23 @@ const composer = (page: Page) => page.getByTestId("composer").locator("textarea"
 const sheet = (page: Page) => page.getByRole("dialog", { name: "Keyboard shortcuts" });
 const palette = (page: Page) => page.getByRole("dialog", { name: "Command palette" });
 
+/**
+ * Dispatches `key` (with the platform's ⌘ when `command`) on the element `selector` names, as if
+ * focus had been forced there; returns whether anything prevented it.
+ */
+const dispatchOn = (page: Page, selector: string, key: string, extra: { command?: boolean; isComposing?: boolean; keyCode?: number } = {}): Promise<boolean> =>
+  page.evaluate(
+    ([selector, key, extra]) => {
+      const apple = /Mac|iPhone|iPad|iPod/.test(navigator.platform);
+      const command = extra.command === true ? { metaKey: apple, ctrlKey: !apple } : {};
+      const event = new KeyboardEvent("keydown", { key, ...command, bubbles: true, cancelable: true, isComposing: extra.isComposing === true });
+      if (extra.keyCode !== undefined) Object.defineProperty(event, "keyCode", { value: extra.keyCode });
+      document.querySelector(selector)?.dispatchEvent(event);
+      return event.defaultPrevented;
+    },
+    [selector, key, extra] as const,
+  );
+
 describe("↑/↓ move through the agents", () => {
   test("from no focus: each agent once, in the sidebar's order, stopping at the ends", async () => {
     const page = await open();
@@ -146,7 +163,7 @@ describe("? shortcut sheet", () => {
     await page.keyboard.press("?");
     await sheet(page).waitFor();
     const labels = await sheet(page).locator("li > span").allTextContents();
-    expect(labels).toEqual(SHORTCUTS.map((entry) => entry.label));
+    expect(labels).toEqual(SHORTCUTS.filter((entry) => entry.unlisted !== true).map((entry) => entry.label));
     for (const key of ["Tab", "Tab", "Shift+Tab", "Shift+Tab", "Shift+Tab"]) {
       await page.keyboard.press(key);
       expect(await sheet(page).evaluate((dialog) => dialog.contains(document.activeElement))).toBe(true);
@@ -231,7 +248,55 @@ describe("Esc", () => {
   }, LIMIT);
 });
 
+describe("a modal owns the keyboard: nothing behind the palette or the sheet acts", () => {
+  test("palette: ⌘↩/⌘⌫ on a card focused behind it decide nothing; its own Esc still closes it", async () => {
+    const page = await open();
+    await page.keyboard.press("ControlOrMeta+k");
+    await palette(page).waitFor();
+    await page.getByTestId("inbox-card").evaluate((card: HTMLElement) => card.focus());
+    await page.keyboard.press("ControlOrMeta+Enter");
+    await page.keyboard.press("ControlOrMeta+Backspace");
+    await dispatchOn(page, '[data-testid="inbox-card"]', "Enter", { command: true });
+    expect(await sent(page)).toEqual([]);
+    expect(await palette(page).isVisible()).toBe(true);
+    await page.keyboard.press("Escape");
+    expect(await palette(page).count()).toBe(0);
+    await page.close();
+  }, LIMIT);
+
+  test("sheet: a card's ⌘↩ and the page's ↓ dispatched behind it do nothing; its own Esc still closes it", async () => {
+    const page = await open();
+    await page.keyboard.press("?");
+    await sheet(page).waitFor();
+    await dispatchOn(page, '[data-testid="inbox-card"]', "Enter", { command: true });
+    await dispatchOn(page, '[data-testid="inbox-card"]', "Backspace", { command: true });
+    await dispatchOn(page, "body", "ArrowDown");
+    expect(await sent(page)).toEqual([]);
+    expect(await openAgent(page)).toBe(null);
+    expect(await sheet(page).isVisible()).toBe(true);
+    await page.keyboard.press("Escape");
+    expect(await sheet(page).isVisible()).toBe(false);
+    await page.close();
+  }, LIMIT);
+});
+
 describe("an input method's composition (#2967)", () => {
+  test("the palette's Enter does not choose while composing", async () => {
+    const page = await open();
+    await pickFirst(page);
+    const before = await openAgent(page);
+    await page.keyboard.press("ControlOrMeta+k");
+    await page.keyboard.type("Next agent");
+    expect(await dispatchOn(page, '[data-testid="palette"] input', "Enter", { isComposing: true })).toBe(false);
+    expect(await dispatchOn(page, '[data-testid="palette"] input', "Enter", { keyCode: 229 })).toBe(false);
+    expect(await palette(page).isVisible()).toBe(true);
+    expect(await openAgent(page)).toBe(before);
+    await page.keyboard.press("Enter");
+    expect(await palette(page).count()).toBe(0);
+    expect(await openAgent(page)).not.toBe(before);
+    await page.close();
+  }, LIMIT);
+
   test("no shortcut fires while composing; ⌘↩ sends once the composition ends", async () => {
     const page = await open();
     await pickFirst(page);

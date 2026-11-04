@@ -19,10 +19,12 @@ describe("labels", () => {
     expect(formatCombo({ key: "?" }, true)).toBe("?");
   });
 
-  test("ids are unique, and one combo serves two shortcuts only on different focused elements", () => {
+  test("ids are unique; a page combo serves two shortcuts only on different focused elements; a layer's combos are its own", () => {
     expect(new Set(SHORTCUTS.map((entry) => entry.id)).size).toBe(SHORTCUTS.length);
+    const layer = SHORTCUTS.filter((entry) => entry.scope === "layer").map((entry) => formatCombo(entry.combo, true));
+    expect(new Set(layer).size).toBe(layer.length);
     const combos = new Map<string, string[]>();
-    for (const entry of SHORTCUTS) combos.set(formatCombo(entry.combo, true), [...(combos.get(formatCombo(entry.combo, true)) ?? []), entry.scope]);
+    for (const entry of SHORTCUTS.filter((each) => each.scope !== "layer")) combos.set(formatCombo(entry.combo, true), [...(combos.get(formatCombo(entry.combo, true)) ?? []), entry.scope]);
     for (const scopes of combos.values()) if (scopes.length > 1) expect(scopes.every((scope) => scope === "focused")).toBe(true);
   });
 });

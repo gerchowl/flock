@@ -145,6 +145,36 @@ const design = {
   },
 };
 
+const KEY_EVENT = /^(?:on(?:capture)?:)?(?:on)?key(?:down|up|press)$/i;
+const NO_KEYS = "Keys go through the keyboard layer (src/workbench/keys.ts, web/DESIGN.md \"Keyboard\"): bind a shortcut or push a layer, never a key listener of your own.";
+
+/**
+ * One keyboard layer (#2904): outside `src/workbench/keys.ts`, no key listener (`addEventListener`
+ * or an `onkey*` property on any target) and no JSX key handler. The gallery's demo list widget is
+ * the one exception (web/DESIGN.md "Keyboard").
+ */
+const keys = {
+  meta: { schema: [] },
+  create(context) {
+    const path = relative(client, context.filename).replaceAll("\\", "/");
+    if (path === "src/workbench/keys.ts") return {};
+    const report = (node) => context.report({ node, message: NO_KEYS });
+    const text = (node) => (node?.type === "Literal" ? String(node.value) : node?.type === "TemplateLiteral" && !node.expressions.length ? node.quasis[0].value.cooked : null);
+    return {
+      CallExpression(node) {
+        if (name(node.callee.property ?? node.callee) === "addEventListener" && KEY_EVENT.test(text(node.arguments[0]) ?? "")) report(node);
+      },
+      AssignmentExpression(node) {
+        if (node.left.type === "MemberExpression" && KEY_EVENT.test(name(node.left.property) ?? "")) report(node);
+      },
+      JSXAttribute(node) {
+        const key = node.name.type === "JSXNamespacedName" ? `${name(node.name.namespace)}:${name(node.name.name)}` : name(node.name);
+        if (KEY_EVENT.test(key ?? "") && !path.startsWith("src/gallery/")) report(node);
+      },
+    };
+  },
+};
+
 export default [
   { ignores: ["node_modules/**", "dist/**", "artifacts/**", "tests/**", "e2e/**", "scripts/**", "test/**", "vite.config.ts", "eslint.config.js", "stylelint.config.js"] },
   {
@@ -157,7 +187,7 @@ export default [
         babelOptions: { babelrc: false, configFile: false, presets: [["@babel/preset-typescript", { isTSX: true, allExtensions: true }]] },
       },
     },
-    plugins: { design: { rules: { fence: design } } },
-    rules: { "design/fence": "error", "no-eval": "error", "no-new-func": "error" },
+    plugins: { design: { rules: { fence: design, keys } } },
+    rules: { "design/fence": "error", "design/keys": "error", "no-eval": "error", "no-new-func": "error" },
   },
 ];

@@ -158,6 +158,28 @@ describe("ESLint style ban", () => {
   });
 });
 
+describe("ESLint key-listener ban (one keyboard layer, #2904)", () => {
+  test.each([
+    ["a document keydown listener", 'document.addEventListener("keydown", () => undefined);'],
+    ["a window keyup listener", "window.addEventListener(`keyup`, () => undefined);"],
+    ["an element keydown listener", 'document.body.addEventListener("keydown", () => undefined, true);'],
+    ["an onkeydown property", "document.onkeydown = () => undefined;"],
+    ["a JSX onKeyDown handler", "export const A = () => <div onKeyDown={() => undefined} />;"],
+    ["a JSX on:keydown handler", "export const A = () => <div on:keydown={() => undefined} />;"],
+  ])("rejects %s outside the keyboard layer", async (_name, source) => {
+    const { code, output } = await eslint("src/workbench/Seeded.tsx", source);
+    expect(code).toBe(1);
+    expect(output).toContain("Keys go through the keyboard layer");
+    expect((await eslint("src/workbench/keys.ts", source.includes("<") ? "export {};" : source)).code).toBe(0);
+  });
+
+  test("the gallery's demo list widget may handle its own arrows; no other path may", async () => {
+    const tsx = "export const A = () => <div onKeyDown={() => undefined} />;";
+    expect((await eslint("src/gallery/Seeded.tsx", tsx)).code).toBe(0);
+    expect((await eslint("src/views/Seeded.tsx", tsx)).code).toBe(1);
+  });
+});
+
 describe("typed spacing", () => {
   test("an off-scale space is a type error", async () => {
     const { code, output } = await run(["x", "tsc", "--noEmit", "-p", "test/seeded/tsconfig.json"]);

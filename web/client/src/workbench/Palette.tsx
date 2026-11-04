@@ -14,7 +14,7 @@ import { For, Show, createMemo, createSignal, createUniqueId, onCleanup, type JS
 
 import { Icon } from "../components/Icon";
 import type { AgentRow } from "../fleet";
-import { bindKeys, formatCombo, isApple, shortcut } from "./keys";
+import { bindKeys, formatCombo, isApple, pushLayer, shortcut } from "./keys";
 
 /** Props of {@link Palette}. */
 export type PaletteProps = {
@@ -70,14 +70,30 @@ export function Palette(props: PaletteProps): JSX.Element {
     }
     return [...matches, ...commands, ...waiting];
   });
+  /** The palette's modal key layer while it is open: Esc, Tab, and the list's arrows and Enter (`keys.ts`). */
+  let closeLayer: (() => void) | undefined;
+  const step = (by: 1 | -1): void => {
+    const count = items().length;
+    if (count > 0) setSelected((selected() + by + count) % count);
+  };
   const show = (): void => {
-    if (!open()) opener = document.activeElement instanceof HTMLElement && document.activeElement !== document.body ? document.activeElement : null;
+    if (!open()) {
+      opener = document.activeElement instanceof HTMLElement && document.activeElement !== document.body ? document.activeElement : null;
+      // The search field is the dialog's only focusable control: Tab and Shift+Tab stay on it.
+      const stay = (): void => input?.focus();
+      closeLayer = pushLayer(
+        { "layer.close": () => hide(), "layer.next": stay, "layer.previous": stay, "list.next": () => step(1), "list.previous": () => step(-1), "list.choose": () => choose(items()[selected()]) },
+        { modal: true },
+      );
+    }
     setOpen(true);
     setSelected(0);
     queueMicrotask(() => input?.focus());
   };
   /** Closes the palette; a dismissal returns focus where it was, a choice to the trigger. */
   const hide = (dismissed = true): void => {
+    closeLayer?.();
+    closeLayer = undefined;
     setOpen(false);
     setQuery("");
     (dismissed && opener?.isConnected ? opener : trigger)?.focus();
@@ -94,15 +110,7 @@ export function Palette(props: PaletteProps): JSX.Element {
     hide(false);
   };
   onCleanup(bindKeys(document.body, { "palette.open": show }));
-  const onKey = (event: KeyboardEvent): void => {
-    const count = items().length;
-    if (event.key === "Escape") hide();
-    else if (event.key === "ArrowDown" && count > 0) setSelected((selected() + 1) % count);
-    else if (event.key === "ArrowUp" && count > 0) setSelected((selected() + count - 1) % count);
-    else if (event.key === "Enter") choose(items()[selected()]);
-    else return;
-    event.preventDefault();
-  };
+  onCleanup(() => closeLayer?.());
   return (
     <>
       <button ref={trigger} type="button" class="palette-trigger" onClick={show} data-testid="palette-trigger">
@@ -116,12 +124,6 @@ export function Palette(props: PaletteProps): JSX.Element {
             aria-modal="true"
             aria-label="Command palette"
             data-testid="palette"
-            onKeyDown={(event) => {
-              // The search field is the dialog's only focusable control: Tab and Shift+Tab stay on it.
-              if (event.key !== "Tab") return;
-              event.preventDefault();
-              input?.focus();
-            }}
           >
             <input
               ref={input}
@@ -137,7 +139,6 @@ export function Palette(props: PaletteProps): JSX.Element {
                 setQuery(event.currentTarget.value);
                 setSelected(0);
               }}
-              onKeyDown={onKey}
             />
             <ul id={listId} class="palette__list" role="listbox">
               <For each={items()}>

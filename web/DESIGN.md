@@ -357,12 +357,19 @@ These follow the accepted redesign (#2903).
   (⌘↩) under it. There is no Send button below.
 - **Keyboard** (#2904). `workbench/keys.ts` is the one registry of
   shortcuts; the `?` sheet and the ⌘K palette list it, and its one listener
-  dispatches them. A screen binds what a shortcut does on an element
-  (`bindKeys`), never a key listener of its own. Labels write modifiers in
+  dispatches every key the client handles. A screen binds what a shortcut
+  does on an element (`bindKeys`); an open palette, sheet or popover pushes
+  a key layer (`pushLayer`) for its Esc, Tab and list keys. A modal layer
+  (the palette, the `?` sheet) is exclusive: while it is open nothing
+  behind it acts, even with focus forced behind it. Labels write modifiers in
   ⌃⌥⇧⌘ order; ⌘ is Ctrl off Apple platforms. A standard shortcut keeps its
   meaning: in a text field the keys edit text, and ⌘↩/⌘⌫ answer a request
   only on its focused card. Nothing fires while an input method is
-  composing (#2967).
+  composing (#2967): the one listener holds the one composition guard.
+  ESLint's `design/keys` rule rejects any other key listener (an
+  `addEventListener` for a key event, an `onkey*` property, a JSX key
+  handler). The one exception is the gallery's demo list widget
+  (`src/gallery/`), which is not part of the app.
 
 ## Layout
 

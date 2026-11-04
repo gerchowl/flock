@@ -13,6 +13,7 @@ import { Icon } from "../components/Icon";
 import { Anchor, AnchorPanel, Stack } from "../layout/primitives";
 import { SPACE } from "../tokens";
 import type { ConnectionState } from "../wire/connection";
+import { pushLayer } from "./keys";
 import { RefusalDetails } from "./refusals";
 import "./toolbar.css";
 
@@ -74,21 +75,17 @@ export function HostStatus(props: HostStatusProps): JSX.Element {
   };
   // Opening moves focus into the popover; Esc closes it and returns focus to the dot, and a click elsewhere closes it.
   createEffect(on(props.open, (open) => open && queueMicrotask(() => toggle?.focus()), { defer: true }));
-  const onKey = (event: KeyboardEvent): void => {
-    if (!props.open() || event.key !== "Escape" || event.defaultPrevented) return;
-    event.preventDefault();
-    close(true);
-  };
+  // While open, its Esc is a key layer (`keys.ts`); it is not modal, so the page's shortcuts still act.
+  createEffect(() => {
+    if (!props.open()) return;
+    onCleanup(pushLayer({ "layer.close": () => close(true) }, { modal: false }));
+  });
   const onPointer = (event: PointerEvent): void => {
     const target = event.target instanceof Node ? event.target : null;
     if (props.open() && !trigger?.contains(target) && !panel?.contains(target)) close(false);
   };
-  document.addEventListener("keydown", onKey);
   document.addEventListener("pointerdown", onPointer);
-  onCleanup(() => {
-    document.removeEventListener("keydown", onKey);
-    document.removeEventListener("pointerdown", onPointer);
-  });
+  onCleanup(() => document.removeEventListener("pointerdown", onPointer));
   const health = (): Health => props.view.health();
   return (
     <Anchor class="host">
