@@ -11,31 +11,8 @@
 .workbench {
   display: grid;
   flex: 1;
-  grid-template: "top top top" auto "side focus inbox" minmax(0, 1fr) / 16rem minmax(0, 1fr) 20rem;
+  grid-template: "top top top" auto "banner banner banner" auto "side focus inbox" minmax(0, 1fr) / 16rem minmax(0, 1fr) 20rem;
   min-height: 0;
-}
-
-.topbar {
-  grid-area: top;
-  display: flex;
-  align-items: center;
-  gap: 1rem;
-  min-height: 48px;
-  padding: 0 1rem;
-  border-bottom: var(--border-width-thin) solid var(--color-legacy-border);
-}
-
-.topbar__mark {
-  font-weight: 700;
-}
-
-.topbar__summary,
-.topbar__status {
-  color: var(--color-legacy-muted);
-}
-
-.topbar__status {
-  margin-left: auto;
 }
 
 .sidebar,
@@ -460,39 +437,6 @@
   color: var(--color-legacy-fg);
   font-weight: 700;
   box-shadow: inset 0 3px 0 var(--color-legacy-working);
-}
-
-.connection-bar {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 0.25rem 0.75rem;
-  padding: 0.25rem 1rem;
-  border-bottom: var(--border-width-thin) solid var(--color-legacy-border);
-  background: var(--color-legacy-surface);
-}
-
-.connection-bar__error {
-  color: var(--color-legacy-error);
-}
-
-.connection-bar__token {
-  display: flex;
-  gap: 0.5rem;
-}
-
-.connection-bar__token input {
-  min-height: 44px;
-  padding: 0 0.5rem;
-  border: var(--border-width-thin) solid var(--color-legacy-border);
-  border-radius: var(--radius-small);
-  background: var(--color-legacy-bg);
-  color: inherit;
-  font: inherit;
-}
-
-.connection-bar__toggle {
-  margin-left: auto;
 }
 
 /* The composer (ADR-0038 §2a), at the bottom of the focus pane and the phone's agent screen. */

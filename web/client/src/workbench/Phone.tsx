@@ -10,6 +10,8 @@
 import { For, Match, Show, Switch, createSignal, createUniqueId, onCleanup, type JSX } from "solid-js";
 
 import type { AgentRow } from "../fleet";
+import { Cluster } from "../layout/primitives";
+import { SPACE } from "../tokens";
 import type { Transport } from "../transport";
 import { Transcript, type TranscriptSource } from "../views/Transcript";
 import { Composer, type ComposerState, type Sender } from "./Composer";
@@ -36,6 +38,8 @@ export type PhoneProps = {
   readonly composer: ComposerState;
   /** Shows the unbuilt tabs and views, disabled, with what they wait for. */
   readonly preview: boolean;
+  /** The connection's status dot and popover, beside the Inbox title (wire mode); renders nothing in fixture mode. */
+  readonly host?: (() => JSX.Element) | undefined;
 };
 
 type Tab = "inbox" | "agents";
@@ -95,7 +99,10 @@ export function PhoneWorkbench(props: PhoneProps): JSX.Element {
           <main class="phone__screen">
             <Switch>
               <Match when={tab() === "inbox"}>
-                <h1 class="phone__title">Inbox</h1>
+                <Cluster justify="space-between" space={SPACE[2]}>
+                  <h1 class="phone__title">Inbox</h1>
+                  {props.host?.()}
+                </Cluster>
                 <p class="phone__headline" data-testid="inbox-headline">
                   {headline()}
                 </p>

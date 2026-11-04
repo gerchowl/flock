@@ -235,8 +235,15 @@ or placement field appears in the product.
   following a reference (an artifact link in a transcript opens beside it). The
   default is one tile. The rail holds collapsed tiles as chips in the focus
   pane's header strip.
-- **Top bar:** product mark, search/palette, node summary ("2 nodes live"),
-  agent summary ("9 agents · 7 working") and *New agent*.
+- **Toolbar** (one bar, ADR-0048 D7 amendment 5, #2901): the sidebar
+  toggle, the connection's status dot with the server's name (its popover
+  holds the state line and *Disconnect* or *Connect*), the search/palette,
+  the needs-you count, *New agent* and the inspector toggle. No app-name
+  title and no second connection strip: the state is named once, in the
+  popover. A banner under the toolbar appears only for a problem
+  (reconnecting, read-only, a token needed, a dropped stored command, a
+  saved layout that could not be loaded). Every toolbar action is also a
+  palette command.
 
 **Phone: inbox first.**
 - A bottom tab bar: **Inbox** (the default screen), **Agents** and **Activity**.
@@ -283,6 +290,8 @@ or placement field appears in the product.
 | Phone *PR* tab, palette search over issues and PRs | a PR/issue source (no slice yet) | post-MVP: the MVP palette searches agents only |
 | Phone *Activity* tab and *Recent* list | the `events` stream (S7-rest) | post-MVP |
 | *New agent* | ADR-0036 S17 (harness, model and effort picker) | post-MVP |
+| Sidebar and inspector toggles | resizable, collapsible panes (#2906) | post-MVP |
+| Toolbar needs-you count | the attention count (#2905) | post-MVP |
 | Node summary ("2 nodes live") | G4 #1596 and the mesh | post-MVP: the MVP shows this node only |
 
 A post-MVP part is **hidden in production builds; visible only in development

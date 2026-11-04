@@ -76,6 +76,27 @@
   gap: var(--l-space);
 }
 
+/* Anchor: a trigger, and its panel (a popover) under it, out of the flow and
+   above the content. The panel lines up with the trigger's start or end. */
+.l-anchor {
+  position: relative;
+  display: inline-block;
+}
+
+.l-anchor__panel {
+  position: absolute;
+  inset-block-start: calc(100% + var(--l-space));
+  z-index: var(--layer-overlay);
+}
+
+.l-anchor__panel[data-align="start"] {
+  inset-inline-start: 0;
+}
+
+.l-anchor__panel[data-align="end"] {
+  inset-inline-end: 0;
+}
+
 /* A primitive's gap is the only space between its children: their own block
    margins (a heading's or a paragraph's default) are reset, at zero
    specificity so a primitive's own margins still apply. */

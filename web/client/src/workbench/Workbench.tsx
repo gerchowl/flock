@@ -1,6 +1,13 @@
 /**
- * The MVP workbench (ADR-0038 §2a, "Mission control"): a top bar, the
+ * The MVP workbench (ADR-0038 §2a, "Mission control"): one toolbar, the
  * sidebar of agents, the focus pane and the inbox.
+ *
+ * The toolbar (ADR-0048 D7 amendment 5, #2901) has three groups: the
+ * connection's status dot and server name, whose popover holds
+ * *Disconnect*; the ⌘K search; and the trailing actions. It has no app-name
+ * title and names the state once. A banner under it appears only for a
+ * problem: a connection that needs the person, or a saved layout that could
+ * not be loaded.
  *
  * §2's tile manager (`layout/model.ts`) is the machinery under the focus
  * pane: picking an agent opens its `transcript` tile with the device's
@@ -18,14 +25,17 @@ import { For, Show, createEffect, createMemo, createSignal, onCleanup, type JSX 
 
 import type { FleetSource } from "../fleet";
 import { createManager, type Layout } from "../layout/model";
+import { Cluster } from "../layout/primitives";
 import { isPhone, type Mode } from "../layout/phone";
 import { DEFAULT_SIDEBAR, type SidebarPrefs } from "../layout/sidebar";
 import { fleetStore } from "../store/fleet";
+import { SPACE } from "../tokens";
 import type { Transport } from "../transport";
 import { Transcript, type TranscriptSource } from "../views/Transcript";
 import type { InboxCard } from "./inbox";
 import { Composer, createComposerState, type Sender } from "./Composer";
-import { Palette, type WaitingAction } from "./Palette";
+import { HEALTH_LABELS, HostStatus, type HostView } from "./HostStatus";
+import { Palette, type PaletteCommand, type WaitingAction } from "./Palette";
 import { createPermissionInbox } from "./permissions";
 import { AgentTitle, InboxCards, Waits, createClosedIds } from "./parts";
 import { PhoneWorkbench } from "./Phone";
@@ -35,6 +45,11 @@ import "./workbench.css";
 
 /** The toolbars' unbuilt actions, shown only in preview; each is a button and, dimmed, a palette command. */
 const NEW_AGENT: WaitingAction = { label: "New agent", waitsFor: "the harness picker" };
+const SIDEBAR_TOGGLE: WaitingAction = { label: "Hide sidebar", waitsFor: "collapsible panes" };
+const NEEDS_YOU: WaitingAction = { label: "Needs you", waitsFor: "the attention count" };
+const INSPECTOR_TOGGLE: WaitingAction = { label: "Show inspector", waitsFor: "the inspector" };
+/** In toolbar order: the leading toggle, then the trailing group. */
+const TOOLBAR_WAITING: readonly WaitingAction[] = [SIDEBAR_TOGGLE, NEEDS_YOU, NEW_AGENT, INSPECTOR_TOGGLE];
 const PANE_ACTIONS: readonly WaitingAction[] = [
   { label: "Diff", waitsFor: "the diff tile" },
   { label: "Fork", waitsFor: "forks" },
@@ -56,8 +71,12 @@ export type WorkbenchProps = {
   readonly saveSidebar?: ((prefs: SidebarPrefs) => void) | undefined;
   /** A monotonic clock in ms that node age is read against; it must be reactive. Defaults to `performance.now()`, re-read every 30 s and when a node row changes. */
   readonly now?: (() => number) | undefined;
-  /** A connection status line for the top bar, if any. */
-  readonly status?: () => string | null;
+  /** The live connection, for the toolbar's status dot and popover; none in fixture mode. */
+  readonly host?: HostView | undefined;
+  /** The connection's problem banner, shown under the toolbar (wire mode). */
+  readonly banner?: (() => JSX.Element) | undefined;
+  /** A problem with the saved layout, if any, shown as a banner. */
+  readonly notice?: string | null | undefined;
   /** A recorded session (fixture mode) or a live server (wire mode). */
   readonly source: TranscriptSource;
   /** Phone or desktop; `auto` (the default) follows the viewport width. */
@@ -137,20 +156,48 @@ export function Workbench(props: WorkbenchProps): JSX.Element {
     publish();
   };
   const preview = (): boolean => props.preview === true;
-  const working = createMemo(() => scoped().filter((row) => row.state === "working").length);
+  // The server's name: the home node's as the fleet sends it, else the connection's own.
+  const hostName = (host: HostView): string => fleet.nodes.items().find((node) => node.node_id === home())?.name ?? host.name;
+  const [hostOpen, setHostOpen] = createSignal(false);
+  /** The toolbar's connection actions as ⌘K commands: every toolbar action is one (web/DESIGN.md rule 9). */
+  const hostCommands = (host: HostView): PaletteCommand[] => [
+    { label: `Connection to ${hostName(host)}`, hint: HEALTH_LABELS[host.health()], run: () => setHostOpen(true) },
+    host.connected() ? { label: "Disconnect", hint: host.detail(), run: host.disconnect } : { label: "Connect", hint: host.detail(), run: host.connect },
+  ];
+  const hostStatus = (): JSX.Element => <Show when={props.host}>{(host) => <HostStatus view={host()} name={hostName(host())} open={hostOpen} setOpen={setHostOpen} />}</Show>;
+  const banners = (): JSX.Element => (
+    <div class="banners">
+      <Show when={props.notice}>
+        {(notice) => (
+          <p class="banner" role="status" data-testid="layout-notice">
+            {notice()}
+          </p>
+        )}
+      </Show>
+      {props.banner?.()}
+    </div>
+  );
+  const waits = (action: WaitingAction): JSX.Element => <Waits label={action.label} waitsFor={action.waitsFor} />;
   const desktop = (): JSX.Element => (
     <div class="workbench" data-testid="workbench">
-      <header class="topbar">
-        <span class="topbar__mark">flock</span>
-        <Palette rows={scoped} onOpen={openAgent} waiting={preview() ? [NEW_AGENT, ...(focusedAgent() === null ? [] : PANE_ACTIONS)] : []} />
-        <span class="topbar__summary" data-testid="agent-summary">
-          {scoped().length} agents · {working()} working
-        </span>
-        <Show when={props.status?.()}>{(status) => <span class="topbar__status" role="status">{status()}</span>}</Show>
-        <Show when={preview()}>
-          <Waits label={NEW_AGENT.label} waitsFor={NEW_AGENT.waitsFor} />
-        </Show>
-      </header>
+      <Cluster as="header" class="topbar" justify="space-between" space={SPACE[4]}>
+        <Cluster space={SPACE[2]}>
+          <Show when={preview()}>{waits(SIDEBAR_TOGGLE)}</Show>
+          {hostStatus()}
+        </Cluster>
+        <Palette
+          rows={scoped}
+          onOpen={openAgent}
+          commands={props.host === undefined ? [] : hostCommands(props.host)}
+          waiting={preview() ? [...TOOLBAR_WAITING, ...(focusedAgent() === null ? [] : PANE_ACTIONS)] : []}
+        />
+        <Cluster space={SPACE[2]}>
+          <Show when={preview()}>
+            <For each={TOOLBAR_WAITING.slice(1)}>{waits}</For>
+          </Show>
+        </Cluster>
+      </Cluster>
+      {banners()}
       <nav class="sidebar" aria-label="Agents" data-testid="sidebar">
         <Show when={fleetNote()}>{(note) => <p class="sidebar__note">{note()}</p>}</Show>
         <Show when={rows().length > 0 || fleet.nodes.items().length > 0 || fleet.projects.items().length > 0}>
@@ -191,7 +238,9 @@ export function Workbench(props: WorkbenchProps): JSX.Element {
   );
   return (
     <Show when={phone()} fallback={desktop()}>
+      {banners()}
       <PhoneWorkbench
+        host={hostStatus}
         rows={scoped}
         fleetNote={() => fleetNote() ?? (prefs().scope === "node" && home() === null ? HOME_UNKNOWN : null)}
         agent={focusedAgent}

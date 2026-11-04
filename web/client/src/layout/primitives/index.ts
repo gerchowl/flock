@@ -4,6 +4,7 @@
  *
  * @module
  */
+export { Anchor, AnchorPanel, type AnchorPanelProps, type AnchorProps } from "./Anchor";
 export { Center, type CenterProps } from "./Center";
 export { Cluster, type ClusterProps } from "./Cluster";
 export type { LayoutProps, LayoutTag, Measure } from "./common";

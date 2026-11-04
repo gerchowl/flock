@@ -198,7 +198,8 @@ function mount(shell: Shell | undefined, options: { outbox?: readonly (typeof PE
   return { h, root, entries, requests };
 }
 
-const status = (root: HTMLElement): string => root.querySelector(".topbar__status")?.textContent ?? "";
+/** The connection's state line, in the toolbar's popover. */
+const status = (root: HTMLElement): string => root.querySelector('[data-testid="host-detail"]')?.textContent ?? "";
 const prompt = (root: HTMLElement): Element | null => root.querySelector('input[aria-label="New client token"]');
 const click = (root: HTMLElement, selector: string): void => (root.querySelector(selector) as HTMLButtonElement).click();
 const frames = (h: Harness, t: string): Record<string, unknown>[] => sentFrames(h).filter((frame) => (frame as { t: string }).t === t) as Record<string, unknown>[];
@@ -518,9 +519,9 @@ for (const mode of MODES) {
       await tick();
       welcome(h, 0);
       const start = h.clock.now();
-      click(root, ".connection-bar__toggle");
+      click(root, '[data-testid="host-toggle"]');
       if (reconnectFirst) {
-        click(root, ".connection-bar__toggle");
+        click(root, '[data-testid="host-toggle"]');
         await tick();
         welcome(h, 0);
       }
@@ -570,13 +571,13 @@ for (const mode of MODES) {
     const { h, root } = mount(tokens);
     await tick();
     expect(tokens.calls).toBe(1);
-    click(root, ".connection-bar__toggle");
+    click(root, '[data-testid="host-toggle"]');
     expect(status(root)).toBe("Disconnected");
     tokens.resolve("late");
     await tick();
     expect(started(h, mode)).toBe(0);
     expect(status(root)).toBe("Disconnected");
-    click(root, ".connection-bar__toggle");
+    click(root, '[data-testid="host-toggle"]');
     h.step(step({ step: "open" }));
     expect(frames(h, "hello").map((frame) => frame["token"])).toEqual(["late"]);
     expect(tokens.calls).toBe(1);
@@ -594,14 +595,14 @@ for (const mode of MODES) {
     expect(started(h, mode)).toBe(0);
   });
 
-  test("Connect pressed again while the provider is asked makes no second call", async () => {
+  test("Connect cannot be pressed again while the provider is asked: the banner leaves until the ask fails", async () => {
     const tokens = provider(mode, { reject: PANE }, "deferred");
     const { root } = mount(tokens);
     await tick();
     click(root, '[data-testid="shell-connect"]');
-    click(root, '[data-testid="shell-connect"]');
+    expect(root.querySelector('[data-testid="shell-connect"]')).toBeNull();
     await tick();
-    expect(tokens.calls).toBe(2);
+    expect([tokens.calls, status(root)]).toEqual([2, "Signing in…"]);
   });
 
   for (const [end, code] of [
@@ -937,8 +938,8 @@ describe("the bridge transport", () => {
     await tick();
     welcome(h, 0);
     h.clock.advanceTo(20_000);
-    click(root, ".connection-bar__toggle");
-    click(root, ".connection-bar__toggle");
+    click(root, '[data-testid="host-toggle"]');
+    click(root, '[data-testid="host-toggle"]');
     await tick();
     welcome(h, 0);
     // The session on t1 reports 20 s left: due at 20 + 15 s, where the forgotten due time was 30 s.
@@ -1016,8 +1017,8 @@ describe("the bridge transport", () => {
     h.step(step({ step: "token_refused", code: 4403 }));
     await tick();
     expect(shell.calls).toBe(2);
-    click(root, ".connection-bar__toggle");
-    click(root, ".connection-bar__toggle");
+    click(root, '[data-testid="host-toggle"]');
+    click(root, '[data-testid="host-toggle"]');
     await tick();
     expect([shell.renews, shell.calls]).toEqual([[false, false, false], 3]);
     welcome(h, 0);
@@ -1030,7 +1031,7 @@ describe("the bridge transport", () => {
     const shell = provider("bridge", "deferred");
     const { h, root } = mount(shell);
     await tick();
-    click(root, ".connection-bar__toggle");
+    click(root, '[data-testid="host-toggle"]');
     shell.resolve("late");
     await tick();
     expect(h.net.closes).toEqual([]);
@@ -1043,12 +1044,12 @@ describe("the bridge transport", () => {
     const shell = provider("bridge", "deferred");
     const { h, root } = mount(shell);
     await tick();
-    click(root, ".connection-bar__toggle");
+    click(root, '[data-testid="host-toggle"]');
     shell.resolve("late");
     await tick();
     // The native side's socket to the server went away while nobody used it.
     h.net.current().drop();
-    click(root, ".connection-bar__toggle");
+    click(root, '[data-testid="host-toggle"]');
     expect(status(root)).toBe("Connecting");
     await tick();
     expect([shell.renews, shell.calls]).toEqual([[false, false], 1]);
