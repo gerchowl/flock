@@ -87,7 +87,7 @@ const MIN_COVERAGE: Readonly<Record<PageName, { elements: number; controls: numb
 };
 
 /** The keyboard and structure checks that drive the page from the test, beside the in-page rules. */
-type Driven = "tab-reach" | "focus-ring" | "arrows" | "shortcut" | "parity" | "coverage";
+type Driven = "tab-reach" | "focus-ring" | "arrows" | "shortcut" | "parity" | "coverage" | "names";
 type Check = Rule | Driven;
 
 /**
@@ -130,6 +130,19 @@ const SEEDS: Readonly<Record<string, Seed>> = {
     page: "gallery",
     into: "main",
     html: '<button data-testid="seed" class="icon-button"><span><span aria-hidden="true"><svg class="icon" viewBox="0 0 16 16" width="16" height="16"><title>Send</title><path d="M8 13V3.5"></path></svg></span></span></button>',
+  },
+  // A label reference whose text is hidden names nothing: aria-labelledby reads the reference through the same walk.
+  "labelledby-hidden-child": {
+    check: "keyboard",
+    page: "gallery",
+    into: "main",
+    html: '<span id="seed-label"><span aria-hidden="true">Send</span></span><button data-testid="seed" class="g-button" aria-labelledby="seed-label"></button>',
+  },
+  "labelledby-unrendered-child": {
+    check: "keyboard",
+    page: "gallery",
+    into: "main",
+    html: '<span id="seed-label"><span style="display: none">Send</span></span><button data-testid="seed" class="g-button" aria-labelledby="seed-label"></button>',
   },
   "icon-label-whitespace": {
     check: "keyboard",
@@ -187,6 +200,14 @@ const SEEDS: Readonly<Record<string, Seed>> = {
     mode: "dark",
     into: "main",
     html: '<style data-testid="seed">@media (prefers-color-scheme: dark) { :focus { outline: none !important; box-shadow: none !important; } }</style>',
+  },
+  // A walk whose names drift from the accessibility tree's must not pass.
+  "names-drift": {
+    check: "names",
+    page: "gallery",
+    into: "body",
+    html: "",
+    script: '{ const hig = globalThis.__hig; const walk = hig.names; hig.names = () => walk().map((each, index) => (index === 0 ? { ...each, name: each.name + " drift" } : each)); }',
   },
   "coverage-hidden": {
     check: "coverage",
@@ -561,6 +582,34 @@ const DRIVEN: Readonly<Record<Driven, (page: Page, name: PageName) => Promise<st
     for (const action of actions) if (!commands.some((command) => command.startsWith(action))) out.push(`toolbar action "${action}" has no ⌘K command`);
     return out;
   },
+  // The names the walk computes are Chromium's: each control's name equals its accessibility-tree name.
+  names: async (page) => {
+    const ours = await hig<{ id: number; where: string; name: string }[]>(page, "names");
+    const flat = (text: string): string => text.replace(/\s+/g, " ").trim();
+    const cdp = await page.context().newCDPSession(page);
+    try {
+      await cdp.send("DOM.enable");
+      await cdp.send("Accessibility.enable");
+      const { root } = await cdp.send("DOM.getDocument", { depth: 0 });
+      const { nodeIds } = await cdp.send("DOM.querySelectorAll", { nodeId: root.nodeId, selector: "[data-hig-name]" });
+      const chromium = new Map<number, string>();
+      for (const nodeId of nodeIds) {
+        const { node } = await cdp.send("DOM.describeNode", { nodeId });
+        const attributes = node.attributes ?? [];
+        const id = Number(attributes[attributes.indexOf("data-hig-name") + 1]);
+        const { nodes } = await cdp.send("Accessibility.getPartialAXTree", { nodeId, fetchRelatives: false });
+        chromium.set(id, flat(String(nodes[0]?.name?.value ?? "")));
+      }
+      const out = ours.flatMap((each) => {
+        const theirs = chromium.get(each.id);
+        if (theirs === undefined) return [`${each.where}: not found in the accessibility tree`];
+        return flat(each.name) === theirs ? [] : [`${each.where}: the walk names it ${JSON.stringify(flat(each.name))}, Chromium ${JSON.stringify(theirs)}`];
+      });
+      return ours.length === 0 ? ["the names walk visited no control"] : out;
+    } finally {
+      await cdp.detach();
+    }
+  },
   // The walk covers the page: it renders at least its minimum of elements and controls.
   coverage: async (page, name) => shortfall(name, await hig<Coverage>(page, "coverage")),
 };
@@ -683,8 +732,8 @@ describe("design conformance", () => {
     return out;
   };
 
-  test("8. keyboard: Tab reaches every control with a ring, controls are named, arrows and ⌘K work", async () => {
-    expect([...everywhere("keyboard"), ...(await driven(["tab-reach", "focus-ring", "arrows", "shortcut"]))]).toEqual([]);
+  test("8. keyboard: Tab reaches every control with a ring, controls are named as Chromium names them, arrows and ⌘K work", async () => {
+    expect([...everywhere("keyboard"), ...(await driven(["tab-reach", "focus-ring", "arrows", "shortcut", "names"]))]).toEqual([]);
   }, LIMIT * 4);
 
   test("9. structure: a sidebar two levels deep, toolbar actions in ⌘K, no appearance switch", async () => {

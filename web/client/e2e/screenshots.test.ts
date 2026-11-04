@@ -159,6 +159,38 @@ describe("fixture preview", () => {
     await page.close();
   });
 
+  test("desktop: an agent row keeps its name and activity visible, however long either is, and describes the full activity", async () => {
+    const page = await browser.newPage({ viewport: DESKTOP });
+    await page.goto(pathToFileURL(`${DIST}/index.html`).href);
+    await page.getByTestId("transcript-synced").waitFor({ timeout: 10_000 });
+    const row = page.getByTestId("agent-row").first();
+    const activity = row.locator(".agent-row__activity");
+    const full = (await activity.textContent()) ?? "";
+    expect(full.length).toBeGreaterThan(0);
+    // The row's accessible description, as Chromium's accessibility tree has it, holds the full activity.
+    const cdp = await page.context().newCDPSession(page);
+    const { root } = await cdp.send("DOM.getDocument", { depth: 0 });
+    const { nodeId } = await cdp.send("DOM.querySelector", { nodeId: root.nodeId, selector: '[data-testid="agent-row"]' });
+    const { nodes } = await cdp.send("Accessibility.getPartialAXTree", { nodeId, fetchRelatives: false });
+    expect(String(nodes[0]?.description?.value ?? "")).toContain(full);
+    await cdp.detach();
+    const widths = (): Promise<{ name: number; activity: number; row: number }> =>
+      row.evaluate((button) => ({
+        name: button.querySelector(".agent-row__name")!.getBoundingClientRect().width,
+        activity: button.querySelector(".agent-row__activity")!.getBoundingClientRect().width,
+        row: button.getBoundingClientRect().height,
+      }));
+    const long = "a-very-long-agent-name-that-never-ends-".repeat(4);
+    await row.locator(".agent-row__name").evaluate((el, text) => void (el.textContent = text), long);
+    const longName = await widths();
+    expect([longName.name > 0, longName.activity > 0, longName.row <= 32]).toEqual([true, true, true]);
+    await row.locator(".agent-row__name").evaluate((el) => void (el.textContent = "fixture"));
+    await activity.evaluate((el, text) => void (el.textContent = text), long);
+    const longActivity = await widths();
+    expect([longActivity.name > 0, longActivity.activity > 0, longActivity.row <= 32]).toEqual([true, true, true]);
+    await page.close();
+  });
+
   test("?layout=phone on a wide window keeps 44 px touch targets on the agent screen", async () => {
     const page = await browser.newPage({ viewport: DESKTOP });
     await page.goto(`${pathToFileURL(`${DIST}/index.html`).href}?layout=phone`);

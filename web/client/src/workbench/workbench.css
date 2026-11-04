@@ -80,7 +80,10 @@
   color: var(--color-label-on-selection);
 }
 
-/* One line (#2903): the name, then the activity, each cut short with an ellipsis. */
+/* One line (#2903): the name, then the activity, each cut short with an
+   ellipsis. The activity keeps at least --space-12 of the line, and the name
+   takes at most the rest, so a long name never hides the activity; the
+   activity grows only into space the name leaves, so it never hides the name. */
 .agent-row__text {
   display: flex;
   flex: 1;
@@ -92,6 +95,7 @@
 .agent-row__name {
   flex: 0 1 auto;
   min-width: 0;
+  max-width: calc(100% - var(--space-12) - var(--space-2));
   overflow: hidden;
   font-weight: var(--font-weight-semibold);
   text-overflow: ellipsis;
@@ -100,7 +104,7 @@
 
 .agent-row__activity {
   flex: 1 1 0;
-  min-width: 0;
+  min-width: var(--space-12);
   overflow: hidden;
   color: var(--color-legacy-muted);
   text-overflow: ellipsis;
