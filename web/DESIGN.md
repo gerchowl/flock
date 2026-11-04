@@ -101,11 +101,25 @@ the scale is a design question, not a missing token.
    `display: flex` or `grid` (inline forms included), `gap`, margins,
    `position: absolute` or `@media`. Compose the primitives instead.
    (stylelint overrides.)
-3. **No inline styles.** TSX outside `src/layout/` may not set `style=` (or
+3. **No inline styles.** Source outside `src/layout/primitives/` may not set `style=` (or
    `attr:style`/`prop:style`): an inline style escapes both rules above.
-   (ESLint.)
+   JSX spreads containing inline styles are fenced too. DOM styling APIs,
+   including computed access, stylesheet construction and adoption, are
+   unavailable to the design type check. Plain data with a `style` key and
+   plain objects with an `animate` method remain legal. Only primitives own
+   JSX inline styles. (ESLint and the restricted DOM type check.)
 4. **Spacing is typed.** A primitive's `space` prop is a `SpaceStep`, so
-   `<Stack space="14">` is a type error. (tsc.)
+   `<Stack space={SPACE[4]}>` uses a generated, branded constant; raw strings,
+   even `"4"`, cannot construct a `SpaceStep`. `Token` is branded separately;
+   `TOKEN["color-label-primary"]` supplies a token value, while `TokenName`
+   describes raw names for inspection. Only the generated module creates
+   branded values. ESLint rejects generic and double assertions, design type
+   predicates and overload returns, and assertions to design indexed-access
+   types or `typeof` types. It follows local aliases and renamed imports.
+   `as const` objects containing branded constants are legal, including in
+   JSX spreads; unrelated string-union assertions remain legal. Explicit
+   `any` and type suppression comments
+   (`@ts-expect-error`, `@ts-ignore`, `@ts-nocheck`) are forbidden.
 5. **Token names are reserved.** Only the generated `tokens.css` declares a
    custom property in a token category (`--color-*`, `--space-*`,
    `--font-*`, `--radius-*`, `--size-*`, `--border-*`, `--layer-*`), as a
@@ -113,6 +127,32 @@ the scale is a design question, not a missing token.
    categories come from `tokens.css`, and CSS escapes are resolved first.
    This holds in the LEGACY files too. (stylelint,
    `flock/no-token-redeclaration` in `scripts/stylelint-reserved-tokens.js`.)
+
+6. **Lint what ships.** Source CSS and PCSS anywhere in the client are
+   scanned, excluding dependency and build output directories. ESLint scans
+   JS, JSX, TS, TSX, MTS, MJS, CTS and CJS throughout the client application; JavaScript source is
+   rejected because typed design props require TypeScript. Raw and inline
+   query imports are forbidden in source and in the production module graph.
+   The fixture recording uses a dedicated JSONL loader which validates every
+   line as JSON before exporting data.
+7. **Suppressions cannot disable gates.** Stylelint runs with
+   `--ignore-disables`, including its build API equivalent; ESLint sets
+   `noInlineConfig: true`. The legacy filename list is pinned by a test and
+   can only shrink.
+
+`bun run build` (and `build:fixture`) runs the same strict and fence rules
+inside Vite's PostCSS pipeline after CSS imports expand. This sees CSS and
+PCSS imported from JavaScript, HTML or another stylesheet, including files
+outside `src/`. CSS identifiers are decoded and property/at-rule names and
+layout values are normalized for case on a clone before linting. The emitted
+CSS is unchanged. Imports left unresolved by Vite are rejected.
+
+We choose the Vite graph over a single minified `dist` stylesheet because
+source locations preserve the existing authority of generated tokens, layout
+primitives and legacy files. A concatenated output loses those boundaries:
+exempting it would exempt new violations, while linting it strictly would
+reject the generated tokens themselves. The graph check runs in both builds
+and `bun run lint`, so `just client-lint`, `just client-check`, and CI's existing `just lint` all exercise it.
 
 `tests/design-rules.test.ts` seeds a violation of each rule and expects it to
 fail, and expects the tree to pass; `tests/tokens.test.ts` does the same for
@@ -264,3 +304,93 @@ queries.
   28 px regular controls; a destructive action is red and never the default.
 - [Accessibility](https://developer.apple.com/design/human-interface-guidelines/accessibility):
   contrast, 44 px touch targets, visible keyboard focus.
+
+
+### Indirect styling and untrusted types
+
+JSX checks describe actual style attributes; ordinary property names are not
+style APIs. Computed DOM keys and aliases require a type-level boundary. `bun run types:design`, included in `lint`, checks
+application source and its imports with a restricted copy of the pinned compiler's
+DOM library. It removes the normal DOM library from this pass, replaces styling
+capabilities with readonly `unknown`, and fails if the unrestricted DOM library is
+loaded or a declaration's expected shape changes. Standard type checking still
+runs separately. This avoids declaration-merging precedence and covers concrete
+HTML, SVG and inline-style interfaces without guessing which variable is a DOM
+object.
+
+`unknown` also prevents passing an unavailable capability directly to generic
+object-mutating helpers; `never` would remain assignable there.
+
+The unavailable capabilities are inline style getters/setters, typed style maps,
+stylesheet lists/adoption, stylesheet construction, rule mutation and animation.
+A constant computed key resolves to `unknown`; a nonconstant string cannot index a
+DOM element under strict checking. Aliasing `CSSStyleSheet` preserves its unusable
+type. Reflection and JSON boundaries return `unknown`, including `Reflect.get`,
+`JSON.parse`, `Body.json`, array narrowing, object construction/enumeration and
+property descriptors. Ordinary two- and three-argument `Object.assign` retains
+its intersection result; an unavailable DOM style target still cannot be passed
+as an object. Values must be
+validated before they become design props. JSX style attributes remain available
+only inside `src/layout/primitives/`; the restricted DOM pass allows no direct
+CSSOM mutation even there. Reserved token properties (`--color-*`, `--space-*`,
+`--font-*`, `--size-*`, `--radius-*`, `--border-*`, `--layer-*`) cannot be written
+from TS/TSX anywhere, including primitives. ESLint rejects reserved object keys,
+style directives, member assignments and property/map mutation calls, including
+literal concatenations and expression-free templates. Primitive inline styles
+may set local properties such as `--l-space` and reference tokens with `var()`;
+token declarations belong exclusively to `tokens.css`.
+
+The Vite transform also lints every application TS/JS module it loads and runs
+the restricted type check over that complete source graph, including
+imports from outside `src/`, from otherwise test-only directories or outside the
+client root. CLI and graph ESLint configurations are pinned. Bundler virtual
+modules and dependency JavaScript are trusted build/runtime inputs. Dependency
+CSS is different: it is browser styling and must pass the full CSS rules. Default
+stylelint exclusions are disabled, the graph uses an empty ignore file, and any
+ignored result is a hard failure. `VENDOR_CSS` is an empty typed allowlist; future
+exceptions require an exact package stylesheet path and an issue number. Source
+stylelint also pins `--config` and `--config-basedir` so nested configuration cannot
+weaken it.
+
+### Browser enforcement and remaining limits
+
+The served document policy in `src/web/gui/document-policy.txt` already contains
+`style-src 'self'` with no inline, data-URL or hash exceptions. The browser tests
+load the built application under that exact policy. CSP violation events prove
+that it rejects direct/computed `setAttribute("style", ...)`, `innerHTML`,
+`insertAdjacentHTML`, template content when attached, JSX `innerHTML`, created
+and JSX `<style>` elements, `createAttribute`/`setAttributeNode`, and data-URL
+stylesheets. A seeded style attribute in the built `index.html` is blocked too.
+
+CSP permits CSSOM writes. `tests/design-runtime.test.ts` therefore installs a
+CSSOM guard before application scripts: element style getters return guarded
+proxies, while style setters, `cssText`, `setProperty` and `removeProperty` throw
+outside primitive styling. Seeds cover property writes, whole-style assignment,
+`Object.assign` onto a style object or an element with a computed key, and a
+computed write hidden behind a double assertion. Disabling the guard makes all
+seven CSSOM rejection tests fail; enabling it makes them pass.
+
+The test build tags JSX style objects only in the actual client-relative
+`src/layout/primitives/` directory. Solid's style helper receives a temporary
+permit only while applying those objects, restored in `finally`. This preserves
+both initial styles and later reactive updates without trusting element classes,
+function names or a matching path buried in another directory. The production
+bundle contains no instrumentation or guard. This is a test-time conformance
+check, not a browser security boundary against code that modifies the harness.
+
+Static checks still trust dependency implementations/declarations and validated
+structural assertions. `no-eval` and `no-new-func` reject direct dynamic-code
+escape hatches; CSP also forbids inline/evaluated script. Remaining limits need a
+follow-up rather than a claim of complete static isolation:
+
+- CSS emitted as an asset by `new URL("./asset.css", import.meta.url)` can bypass
+  PostCSS; it is not yet inspected as a stylesheet by this audit. Same-origin
+  CSP alone permits it. Dynamic stylesheet URLs have the same limitation.
+- TypeScript array covariance can pollute a branded array through a wider alias.
+  Brands are compile-time constraints, not runtime validation of arbitrary data.
+- Reserved-token names assembled from variable/template keys inside primitives
+  are beyond the literal-key ESLint check. Runtime observation of arbitrary
+  custom-property names remains necessary.
+
+The runtime seeds complement the DOM-wide conformance suite (#2896); they do not
+make arbitrary unseen application behavior execute in tests.

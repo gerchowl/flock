@@ -17,6 +17,7 @@
  *
  * @module
  */
+import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 
 import { defineConfig, type Plugin } from "vite";
@@ -28,6 +29,12 @@ const repoRoot = fileURLToPath(new URL("../..", import.meta.url));
 function fixtureShell(): Plugin {
   return {
     name: "flock-fixture-shell",
+    async load(id) {
+      if (!id.endsWith(".jsonl")) return;
+      const text = await readFile(id, "utf8");
+      for (const line of text.split("\n").filter((line) => line.trim())) JSON.parse(line);
+      return `export default ${JSON.stringify(text)}`;
+    },
     transformIndexHtml: {
       order: "pre",
       handler: (html) => {

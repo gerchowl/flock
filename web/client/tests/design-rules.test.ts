@@ -13,6 +13,9 @@
  * test process carries happy-dom's globals (tests/setup.ts).
  */
 import { describe, expect, test } from "bun:test";
+import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 
 import { CLIENT_ROOT } from "./build";
 
@@ -30,8 +33,17 @@ async function run(args: string[], stdin?: string): Promise<Run> {
 }
 
 /** Lints `css` as if it were the file at `path`. */
-const stylelint = (path: string, css: string): Promise<Run> => run(["x", "stylelint", "--stdin-filename", path], css);
-const eslint = (path: string, tsx: string): Promise<Run> => run(["x", "eslint", "--stdin", "--stdin-filename", path], tsx);
+const stylelint = (path: string, css: string): Promise<Run> => run(["x", "stylelint", "--config", "stylelint.config.js", "--config-basedir", ".", "--ignore-disables", "--stdin-filename", path], css);
+const eslint = (path: string, tsx: string): Promise<Run> => run(["x", "eslint", "--config", "eslint.config.js", "--stdin", "--stdin-filename", path], tsx);
+
+async function designTypes(source: string): Promise<Run> {
+  const root = await mkdtemp(join(CLIENT_ROOT, "node_modules/.cache/source-types-"));
+  try {
+    const file = join(root, "probe.ts");
+    await writeFile(file, `declare const el: HTMLElement;\n${source}`);
+    return await run(["scripts/check-design-types.ts", file]);
+  } finally { await rm(root, { recursive: true, force: true }); }
+}
 
 describe("stylelint strict values", () => {
   test.each([
@@ -105,3 +117,168 @@ test("the tree passes every rule, and the generated tokens are current", async (
   const { code, output } = await run(["run", "lint"]);
   expect({ code, output: code === 0 ? "" : output }).toEqual({ code: 0, output: "" });
 }, 60_000);
+
+
+describe("lint what ships (#2933)", () => {
+  test.each([
+    ["jsx scope", "src/probe.jsx", 'export const A = () => <div style={{color:"red"}} />'],
+    ["js scope", "src/probe.js", 'el.style.color = "red"'],
+    ["runtime member", "src/probe.ts", 'el.style.setProperty("margin", "13px")'],
+    ["runtime assign", "src/probe.ts", 'Object.assign(el.style, {color:"red"})'],
+    ["spread", "src/probe.tsx", 'export const A = () => <div {...{style:{color:"red"}}} />'],
+    ["sheet", "src/probe.ts", 'new CSSStyleSheet()'],
+    ["adoption", "src/probe.ts", 'document.adoptedStyleSheets = []'],
+    ["computed style", "src/probe.ts", 'el["style"].color = "red"'],
+    ["raw import", "src/probe.ts", 'import css from "./probe.txt?raw"'],
+    ["inline import", "src/probe.ts", 'import css from "./probe.css?inline"'],
+    ["disable", "src/probe.tsx", '// eslint-disable-next-line\nexport const A = () => <div style={{color:"red"}} />'],
+    ["cast", "src/probe.tsx", 'export const A = () => <Stack space={"14" as any} />'],
+    ["aliased cast", "src/probe.tsx", 'const value = "14" as "4"; export const A = () => <Stack space={value} />'],
+    ["spread cast", "src/probe.tsx", 'const props = {space: "14" as "4"}; export const A = () => <Stack {...props} />'],
+    ["typed cast", "src/probe.tsx", 'export const A = () => <Stack space={"14" as SpaceStep} />'],
+    ["type suppression", "src/probe.tsx", '// @ts-expect-error\nexport const A = () => <Stack space="14" />'],
+  ])("rejects %s", async (_name, file, source) => {
+    const typed = ["runtime member", "runtime assign", "sheet", "adoption", "computed style"].includes(_name);
+    const result = typed ? await designTypes(source) : await eslint(file, source);
+    expect(result.code).toBe(1);
+  });
+  test("CSS disables cannot suppress strict values", async () => {
+    expect((await stylelint("src/probe.css", "/* stylelint-disable */ .a { color: red; }")).code).toBe(2);
+  });
+});
+
+
+describe("shipped CSS graph (#2933)", () => {
+  test.each([
+    ["pcss", "src/probe.pcss", ".a { color: red; }", false],
+    ["raw graph import", "src/probe.txt?raw", ".a { color: inherit; }", false],
+    ["inline graph import", "src/probe.css?inline", ".a { color: inherit; }", false],
+    ["dependency CSS", "node_modules/evilpkg/style.css", ".nm{color:red;margin:13px;display:flex;position:absolute}", false],
+    ["outside source graph", "lib/outside.ts", 'document.body.style.margin = "13px"', false],
+    ["cross-module graph cast", "lib/outside.ts", 'export const v = "14" as "4"', false],
+    ["external CSS", "vendor/probe.css", ".a { padding: 13px; }", false],
+    ["CSS import", "vendor/probe.css", ".a { display: flex; }", true],
+    ["upper property", "src/probe.css", ".a { COLOR: red; }", false],
+    ["escaped property", "src/probe.css", String.raw`.a { colo\72: red; }`, false],
+    ["escaped layout", "src/probe.css", String.raw`.a { displa\79: FLEX; }`, false],
+    ["upper position", "src/probe.css", ".a { position: ABSOLUTE; }", false],
+    ["upper media", "src/probe.css", "@MEDIA (width: 40rem) { .a { color: inherit; } }", false],
+    ["CSS disable", "src/probe.css", "/* stylelint-disable */ .a { color: red; }", false],
+    ["layout import authority", "src/layout/probe.css", ".a { display: flex; }", true],
+    ["token authority", "src/tokens.css", ":root { --space-1: 4px; }", false],
+    ["legacy authority", "src/styles.css", ".a { padding: 13px; }", false],
+  ])("audits %s in a real Vite build", async (_name, file, css, cssImport) => {
+    const root = await mkdtemp(join(tmpdir(), "design-"));
+    try {
+      await mkdir(join(root, "src/layout"), { recursive: true });
+      await mkdir(join(root, "vendor"));
+      await writeFile(join(root, "index.html"), '<script type="module" src="/src/main.ts"></script>');
+      await writeFile(join(root, "src/main.ts"), `import "${cssImport ? "./entry.css" : `../${file}`}"`);
+      if (cssImport) await writeFile(join(root, "src/entry.css"), `@import "../${file}" layer(components);`);
+      if (_name === "dependency CSS") {
+        await mkdir(join(root, "node_modules/evilpkg"), { recursive: true });
+        await writeFile(join(root, "node_modules/evilpkg/package.json"), '{"name":"evilpkg","version":"1.0.0"}');
+        await writeFile(join(root, "src/main.ts"), 'import "evilpkg/style.css"');
+      }
+      await mkdir(dirname(join(root, file)), { recursive: true });
+      await writeFile(join(root, file.split("?")[0]!), css);
+      const result = await run(["run", "build", root]);
+      const accepted = ["layout import authority", "token authority", "legacy authority"].includes(_name);
+      expect({ code: result.code, output: result.code === 0 ? "" : result.output }).toMatchObject({ code: accepted ? 0 : 1 });
+      if (!accepted) expect(result.output).toMatch(/design (CSS|source)/);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 30_000);
+});
+
+
+test("the legacy list can only shrink (#2933)", async () => {
+  const config = await Bun.file(`${CLIENT_ROOT}/stylelint.config.js`).text();
+  const legacy = JSON.parse(config.match(/const LEGACY = (\[[^;]*\]);/)![1]!) as string[];
+  for (const file of legacy) expect(["src/styles.css", "src/workbench/workbench.css"]).toContain(file);
+});
+
+
+describe("fix round 1 source gates", () => {
+  test.each([
+    ["cross-module cast", "src/exported.ts", 'export const v = "14" as "4"'],
+    ["parenthesized cast", "src/probe.ts", 'export const v = "14" as ("4")'],
+    ["aliased design type", "src/probe.ts", 'import type { SpaceStep as S } from "./tokens"; export const v = "14" as S'],
+    ["local design alias", "src/probe.ts", 'type S = "4"; export const v = "14" as S'],
+    ["concatenated key with any", "src/probe.ts", 'declare const el: any; el["st"+"yle"].margin = "13px"'],
+    ["explicit any", "src/probe.ts", 'const w: any = "14"'],
+    ["generic any", "src/probe.ts", 'function id<T>(x: any): T { return x }'],
+    ["outside source", "lib/outside.ts", 'document.body.style.margin = "13px"'],
+    ["layout runtime exemption", "src/layout/probe.ts", 'document.body.style.margin = "13px"'],
+  ])("rejects %s", async (_name, file, source) => {
+    const typed = ["outside source", "layout runtime exemption"].includes(_name);
+    expect((await (typed ? designTypes(source) : eslint(file, source))).code).toBe(1);
+  });
+  test("pins source stylelint configuration", async () => {
+    const root = await mkdtemp(join(CLIENT_ROOT, "style-seed-"));
+    try {
+      await writeFile(join(root, ".stylelintrc.json"), JSON.stringify({ rules: { "color-named": "never" } }));
+      expect((await stylelint(join(root, "probe.css"), ".a { padding: 13px; }")).code).toBe(2);
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+});
+
+describe("reserved token writes everywhere", () => {
+  const primitive = "src/layout/primitives/Seeded.tsx";
+  test.each(["color", "space", "font", "size", "radius", "border", "layer"])("inline %s token", async (prefix) => {
+    const result = await eslint(primitive, `<div style={{"--${prefix}-seed":"13px"}} />`);
+    expect(result.code).toBe(1);
+    expect(result.output).toContain("Reserved design tokens");
+  });
+  test.each([
+    ["setProperty", 'el.style.setProperty("--color-label-primary", "red")'],
+    ["style map", 'el.attributeStyleMap.set("--space-1", value)'],
+    ["assignment", 'el.style["--font-body"] = "13px"'],
+    ["computed object", 'const style = {["--radius-small"]:"13px"}'],
+    ["concatenated property", 'el.style.setProperty("--space-" + "1", "13px")'],
+    ["template property", 'el.style.setProperty(`--border-thin`, "13px")'],
+    ["outside layout", 'const values = {"--layer-dialog":1}'],
+  ])("%s", async (label, code) => {
+    const result = await eslint(label === "outside layout" ? "src/probe.ts" : primitive, code);
+    expect(result.code).toBe(1);
+    expect(result.output).toContain("Reserved design tokens");
+  });
+  test("primitive local properties remain available", async () => {
+    expect((await eslint(primitive, '<div style={{"--l-space":"var(--space-1)"}} />')).code).toBe(0);
+  });
+});
+
+describe("fix round 1 typed capabilities", () => {
+  test.each([
+    ["computed generic assign", 'const k = "style"; Object.assign(el[k], {margin:"13px"})'],
+    ["Object create any", 'const space: SpaceStep = Object.create(null).space'],
+    ["Object values any", 'const space: SpaceStep = Object.values({} as object)[0]'],
+    ["Object entries any", 'const space: SpaceStep = Object.entries({} as object)[0]![1]'],
+    ["computed key", 'const k = "style"; el[k].margin = "13px"'],
+    ["typed style map", 'el.attributeStyleMap.set("margin", CSS.px(13))'],
+    ["sheet insertion", 'document.styleSheets[0]!.insertRule(".a{margin:13px}")'],
+    ["animation", 'el.animate([{margin:"13px"}], {fill:"forwards"})'],
+    ["constructor alias", 'const S = CSSStyleSheet; new S()'],
+    ["computed adoption", 'document["adoptedStyleSheets"] = []'],
+    ["concatenated key", 'el["st" + "yle"].margin = "13px"'],
+    ["reflection", 'Reflect.get(el,"style").margin = "13px"'],
+    ["JSON any", `const space: SpaceStep = JSON.parse('"14"')`],
+    ["response any", 'const space: SpaceStep = await new Response().json()'],
+  ])("rejects %s", async (_name, code) => {
+    await mkdir(join(CLIENT_ROOT, "node_modules/.cache"), { recursive: true });
+    const root = await mkdtemp(join(CLIENT_ROOT, "node_modules/.cache/design-seed-"));
+    try {
+      const file = join(root, "probe.ts");
+      await writeFile(file, `import type { SpaceStep } from "${CLIENT_ROOT}/src/tokens";\ndeclare const el: HTMLElement;\n${code}\nexport {};`);
+      await writeFile(join(root, "tsconfig.json"), JSON.stringify({ extends: `${CLIENT_ROOT}/tsconfig.json`, include: [file] }));
+      const args = process.env.DESIGN_SEED_BASELINE
+        ? ["x", "tsc", "--noEmit", "-p", join(root, "tsconfig.json")]
+        : ["scripts/check-design-types.ts", file];
+      const result = await run(args);
+      expect(result.code).toBe(1);
+      expect(result.output).toMatch(/error TS/);
+      expect(result.output).toContain("probe.ts");
+    } finally { await rm(root, { recursive: true, force: true }); }
+  }, 30_000);
+});

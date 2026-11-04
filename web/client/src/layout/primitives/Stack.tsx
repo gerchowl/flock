@@ -1,7 +1,7 @@
 import { splitProps, type JSX } from "solid-js";
 import { Dynamic } from "solid-js/web";
 
-import type { SpaceStep } from "../../tokens";
+import { SPACE, type SpaceStep } from "../../tokens";
 import { classes, space, type LayoutProps } from "./common";
 
 export type StackProps = LayoutProps & {
@@ -17,7 +17,7 @@ export function Stack(props: StackProps): JSX.Element {
       component={own.as ?? "div"}
       {...rest}
       class={classes("l-stack", own.class)}
-      style={{ "--l-space": space(own.space ?? "4") }}
+      style={{ "--l-space": space(own.space ?? SPACE[4]) }}
     />
   );
 }

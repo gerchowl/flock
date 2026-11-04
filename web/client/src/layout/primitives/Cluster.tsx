@@ -1,7 +1,7 @@
 import { splitProps, type JSX } from "solid-js";
 import { Dynamic } from "solid-js/web";
 
-import type { SpaceStep } from "../../tokens";
+import { SPACE, type SpaceStep } from "../../tokens";
 import { classes, space, type LayoutProps } from "./common";
 
 export type ClusterProps = LayoutProps & {
@@ -22,7 +22,7 @@ export function Cluster(props: ClusterProps): JSX.Element {
       {...rest}
       class={classes("l-cluster", own.class)}
       style={{
-        "--l-space": space(own.space ?? "2"),
+        "--l-space": space(own.space ?? SPACE[2]),
         "--l-justify": own.justify ?? "flex-start",
         "--l-align": own.align ?? "center",
       }}

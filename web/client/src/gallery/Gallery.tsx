@@ -11,6 +11,7 @@
 import { For, createSignal, type JSX } from "solid-js";
 
 import { Center, Cluster, Grid, Sidebar, Stack, Switcher } from "../layout/primitives";
+import { SPACE } from "../tokens";
 import "./gallery.css";
 
 const OPTIONS = ["Review the pull request", "Run the test suite", "Summarise the log"] as const;
@@ -25,7 +26,7 @@ function SelectionList(): JSX.Element {
     setSelected((selected() + step + OPTIONS.length) % OPTIONS.length);
   };
   return (
-    <Stack as="div" space="1" class="g-list" role="listbox" aria-label="Tasks" tabindex="0" onKeyDown={onKey}>
+    <Stack as="div" space={SPACE[1]} class="g-list" role="listbox" aria-label="Tasks" tabindex="0" onKeyDown={onKey}>
       <For each={OPTIONS}>
         {(label, index) => (
           <div class="g-option" role="option" aria-selected={index() === selected()} onClick={() => setSelected(index())}>
@@ -41,7 +42,7 @@ function SelectionList(): JSX.Element {
 function Group(props: { readonly title: string; readonly children: JSX.Element }): JSX.Element {
   const [open, setOpen] = createSignal(true);
   return (
-    <Stack as="section" space="1">
+    <Stack as="section" space={SPACE[1]}>
       <button type="button" class="g-button" aria-expanded={open()} onClick={() => setOpen(!open())}>
         {props.title}
       </button>
@@ -55,7 +56,7 @@ export function Gallery(): JSX.Element {
   const [pressed, setPressed] = createSignal(false);
   return (
     <div>
-      <Sidebar side="left" sideWidth="240px" contentMin="50%" space="4">
+      <Sidebar side="left" sideWidth="240px" contentMin="50%" space={SPACE[4]}>
         <nav class="g-sidebar" aria-label="Projects">
           <Group title="flock">
             <Group title="web client">
@@ -65,10 +66,10 @@ export function Gallery(): JSX.Element {
             </Group>
           </Group>
         </nav>
-        <Center as="main" max="960px" gutters="4">
-          <Stack space="6">
+        <Center as="main" max="960px" gutters={SPACE[4]}>
+          <Stack space={SPACE[6]}>
             <h1>Gallery</h1>
-            <Stack as="section" space="2" aria-label="Text">
+            <Stack as="section" space={SPACE[2]} aria-label="Text">
               <h2>Text</h2>
               <p>
                 Body text, the label colour, 13 px, with{" "}
@@ -78,15 +79,15 @@ export function Gallery(): JSX.Element {
                 .
               </p>
               <p class="g-secondary">Secondary text, 11 px.</p>
-              <Cluster space="3">
+              <Cluster space={SPACE[3]}>
                 <span class="g-green">Working</span>
                 <span class="g-orange">Needs you</span>
                 <span class="g-red">Failed</span>
               </Cluster>
             </Stack>
-            <Stack as="section" space="2" aria-label="Controls">
+            <Stack as="section" space={SPACE[2]} aria-label="Controls">
               <h2>Controls</h2>
-              <Cluster space="2">
+              <Cluster space={SPACE[2]}>
                 <button type="button" class="g-button">
                   Default
                 </button>
@@ -108,13 +109,13 @@ export function Gallery(): JSX.Element {
               </Cluster>
               <SelectionList />
             </Stack>
-            <Stack as="section" space="2" aria-label="Layout">
+            <Stack as="section" space={SPACE[2]} aria-label="Layout">
               <h2>Layout</h2>
-              <Switcher threshold="480px" space="2">
+              <Switcher threshold="480px" space={SPACE[2]}>
                 <div class="g-panel">Switcher</div>
                 <div class="g-panel">one row, or a column</div>
               </Switcher>
-              <Grid min="160px" space="2">
+              <Grid min="160px" space={SPACE[2]}>
                 <div class="g-panel">Grid</div>
                 <div class="g-panel">of equal</div>
                 <div class="g-panel">columns</div>
