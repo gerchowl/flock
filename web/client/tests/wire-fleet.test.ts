@@ -3,39 +3,115 @@
  * All time is virtual (ADR-0037).
  */
 import { describe, expect, test } from "bun:test";
+import { createEffect, createRoot, on } from "solid-js";
 
+import type { FleetAgentRow } from "../src/gen/FleetAgentRow";
+import type { AgentState } from "../src/gen/AgentState";
+import type { Phase } from "../src/gen/Phase";
 import type { ServerFrame } from "../src/gen/ServerFrame";
 import type { AgentRow } from "../src/fleet";
 import { fixtureExamples } from "../src/gen/FixtureExamples";
-import { createWireFleet } from "../src/wire/fleet";
+import { fleetStore } from "../src/store/fleet";
+import { createWireFleet, fleetDelta } from "../src/wire/fleet";
 import { Harness, live, sentFrames, step } from "./wire/harness";
 
 type Seen = { readonly rows: readonly string[] } | { readonly failed: string };
 
-const agentState = (phase: string): object => ({ turn: "idle", background: "none", attention: "none", waiting: "none", lifecycle: "live", phase, source: {} });
+const agentState = (phase: Phase): AgentState => ({ turn: "idle", background: "none", attention: "none", waiting: "none", lifecycle: "live", phase, source: {} });
 const row = (id: string, extra: object = {}): object => ({ id, label: id.toUpperCase(), state: agentState("working"), waiting_on_human: [], ...extra });
 const upsert = (seq: number, value: object): ServerFrame => ({ t: "ev", sub_id: "s1", stream: "fleet", seq, ts_ms: 0, ev: { type: "fleet.upsert", row: value } as never });
 const remove = (seq: number, id: string): ServerFrame => ({ t: "ev", sub_id: "s1", stream: "fleet", seq, ts_ms: 0, ev: { type: "fleet.remove", id } });
 
+/** Reads the wire fleet through the fleet store, recording what a view of its agents sees each time it changes. */
+function watch(source: ReturnType<typeof createWireFleet>): { seen: Seen[]; last: () => readonly AgentRow[]; close: () => void } {
+  const seen: Seen[] = [];
+  let reader!: ReturnType<ReturnType<typeof fleetStore>["read"]>;
+  const dispose = createRoot((dispose) => {
+    reader = fleetStore(source).read();
+    createEffect(
+      on(
+        () => [reader.agents.items(), reader.agents.progress()] as const,
+        ([items, progress]) => void seen.push(progress.phase === "failed" ? { failed: progress.message } : { rows: items.map((r) => r.id) }),
+        { defer: true },
+      ),
+    );
+    return dispose;
+  });
+  return { seen, last: () => reader.agents.items(), close: () => (reader.release(), dispose()) };
+}
+
 function subscribed(): { h: Harness; seen: Seen[]; last: () => readonly AgentRow[]; close: () => void } {
   const h = new Harness();
   live(h);
-  const seen: Seen[] = [];
-  let rows: readonly AgentRow[] = [];
-  const close = createWireFleet(h.connection).subscribe({
-    rows: (next) => {
-      rows = next;
-      seen.push({ rows: next.map((r) => r.id) });
-    },
-    failed: (message) => seen.push({ failed: message }),
-  });
+  const watched = watch(createWireFleet(h.connection));
   expect(sentFrames(h).at(-1)).toEqual({ t: "sub", sub_id: "s1", stream: "fleet" });
-  return { h, seen, last: () => rows, close };
+  return { h, ...watched };
 }
 
 const send = (h: Harness, frame: ServerFrame): void => h.step(step({ step: "send", frame }));
 
 describe("wire fleet", () => {
+  test("wire frames reach the store's node stamps, each with its own ts_ms", () => {
+    const h = new Harness();
+    live(h);
+    let monotonic = 500;
+    const reader = createRoot(() => fleetStore(createWireFleet(h.connection), () => monotonic).read());
+    const node = (id: string): object => ({ node_id: id, name: id, health: null, latency_ms: null, last_ok: null, version: null, error: null, online: true, route: null, counts: null, unbound_configured_peers: null, link_diagnostics: [] });
+    const nodeFrame = (seq: number, id: string, ts_ms: number): ServerFrame => ({ t: "ev", sub_id: "s1", stream: "fleet", seq, ts_ms, ev: { type: "fleet.node.upsert", row: node(id) } as never });
+    send(h, { t: "gap", sub_id: "s1", from: 1, to: 0, snapshot_to: 2 });
+    send(h, nodeFrame(1, "n-a", 1111));
+    send(h, nodeFrame(2, "n-b", 2222));
+    send(h, { t: "synced", sub_id: "s1", seq: 2 });
+    monotonic = 800;
+    send(h, nodeFrame(3, "n-c", 3333));
+    expect(reader.nodes.stamp("n-a")).toEqual({ tsMs: 1111, receivedAt: 500 });
+    expect(reader.nodes.stamp("n-b")).toEqual({ tsMs: 2222, receivedAt: 500 });
+    expect(reader.nodes.stamp("n-c")).toEqual({ tsMs: 3333, receivedAt: 800 });
+    reader.release();
+  });
+
+  test("a node upsert carries its frame's ts_ms; other kinds do not", () => {
+    const node = { node_id: "n", name: "n", health: null, latency_ms: null, last_ok: null, version: null, error: null, online: true, route: null, counts: null, unbound_configured_peers: null, link_diagnostics: [] };
+    expect(fleetDelta({ type: "fleet.node.upsert", row: node } as never, 42)).toEqual({ op: "upsert", kind: "node", row: node, tsMs: 42 });
+    expect(fleetDelta({ type: "fleet.remove", id: "a" } as never, 42)).toEqual({ op: "remove", kind: "agent", id: "a" });
+  });
+
+  test("unknown entity kinds keep the snapshot, live agents and resume cursor", () => {
+    const { h, seen, last, close } = subscribed();
+    const payloads = [
+      { type: "unknown", raw: "future row", shape: "fixture:future" },
+      { type: "fleet.future", id: "future" },
+    ];
+    const delta = (seq: number, ev: object): void => send(h, { t: "ev", sub_id: "s1", stream: "fleet", seq, ts_ms: 0, ev: ev as never });
+    send(h, { t: "gap", sub_id: "s1", from: 1, to: 0, snapshot_to: 3 });
+    send(h, upsert(1, row("atlas")));
+    payloads.forEach((ev, i) => delta(i + 2, ev));
+    send(h, { t: "synced", sub_id: "s1", seq: 3 });
+    expect(last().map((r) => r.id)).toEqual(["atlas"]);
+    expect(h.connection.streams().get("s1")?.cursor).toBe(3);
+    send(h, upsert(4, row("kite")));
+    payloads.forEach((ev, i) => delta(i + 5, ev));
+    expect(last().map((r) => r.id)).toEqual(["atlas", "kite"]);
+    expect(seen.every((entry) => "rows" in entry)).toBe(true);
+    expect(h.connection.streams().get("s1")?.cursor).toBe(6);
+    close();
+    watch(createWireFleet(h.connection));
+    expect(sentFrames(h).at(-1)).toEqual({ t: "sub", sub_id: "s2", stream: "fleet", after: 6 });
+  });
+
+  test("optional mesh metadata is compatible with local-only fleet presentation", () => {
+    const routed: FleetAgentRow = {
+      id: "fixture-agent", label: "Example", state: agentState("working"), waiting_on_human: [],
+      route: { node: "5f23ba66a62a6aeffca866a461c0686ae7f869c685e1ea1f69b2b84e84de5bb0", name: "origin.example", next_hop: "5f23ba66a62a6aeffca866a461c0686ae7f869c685e1ea1f69b2b84e84de5bb0", hops: 1 },
+    };
+    const { h, seen, last } = subscribed();
+    send(h, { t: "gap", sub_id: "s1", from: 1, to: 0, snapshot_to: 1 });
+    send(h, upsert(1, routed));
+    send(h, { t: "synced", sub_id: "s1", seq: 1 });
+    expect(seen).toEqual([{ rows: ["fixture-agent"] }]);
+    expect(last()[0]?.label).toBe("Example");
+  });
+
   test("a snapshot is shown whole at its end, then deltas apply one row each", () => {
     const { h, seen, last } = subscribed();
     send(h, { t: "gap", sub_id: "s1", from: 1, to: 0, snapshot_to: 2 });
@@ -97,7 +173,7 @@ describe("wire fleet", () => {
   });
 
   test("a payload that is not a fleet delta ends the list visibly", () => {
-    for (const bad of [{ type: "fleet.upsert", row: row("a", { state: agentState("dancing") }) }, { type: "fleet.upsert", row: row("a", { state: "working" }) }, { type: "fleet.upsert", row: { id: "a" } }, { type: "fleet.rename", id: "a" }, "atlas"]) {
+    for (const bad of [{ type: "fleet.upsert", row: row("a", { state: "working" }) }, { type: "fleet.upsert", row: { id: "a" } }, "atlas"]) {
       const { h, seen } = subscribed();
       send(h, { t: "gap", sub_id: "s1", from: 1, to: 0, snapshot_to: 0 });
       send(h, { t: "ev", sub_id: "s1", stream: "fleet", seq: 1, ts_ms: 0, ev: bad as never });
@@ -133,10 +209,8 @@ describe("wire fleet", () => {
 test("fleet sources on one connection never reuse a sub id, and a closed one's late frames are dropped", () => {
   const h = new Harness();
   live(h);
-  const quiet = { rows: () => undefined, failed: () => undefined };
-  createWireFleet(h.connection).subscribe(quiet)();
-  const seen: string[][] = [];
-  createWireFleet(h.connection).subscribe({ rows: (rows) => seen.push(rows.map((r) => r.id)), failed: (message) => seen.push([message]) });
+  watch(createWireFleet(h.connection)).close();
+  const second = watch(createWireFleet(h.connection));
   const subs = sentFrames(h).flatMap((frame) => ((frame as { t: string }).t === "sub" ? [(frame as { sub_id: string }).sub_id] : []));
   expect(new Set(subs).size).toBe(2);
   const current = subs[1] ?? "";
@@ -147,5 +221,19 @@ test("fleet sources on one connection never reuse a sub id, and a closed one's l
   send(h, { t: "gap", sub_id: "s1", from: 1, to: 0, snapshot_to: 1 });
   send(h, upsert(1, row("stale")));
   expect(h.connection.state).toBe("Live");
-  expect(seen).toEqual([["kite"]]);
+  expect(second.seen).toEqual([{ rows: ["kite"] }]);
+});
+
+test("generated S4 fleet state reaches presentation without discarding the row", () => {
+  const { h, last } = subscribed();
+  send(h, { t: "gap", sub_id: "s1", from: 1, to: 0, snapshot_to: 1 });
+  send(h, upsert(1, row("fixture-agent", { state: { turn: "working", background: "none", attention: "none", waiting: "none", lifecycle: "live", phase: "working", source: {} } })));
+  expect(last().map((value) => [value.id, value.state])).toEqual([["fixture-agent", "working"]]);
+});
+
+test("a newer phase keeps the fleet row and renders unknown", () => {
+  const { h, last } = subscribed();
+  send(h, { t: "gap", sub_id: "s1", from: 1, to: 0, snapshot_to: 1 });
+  send(h, upsert(1, row("fixture-agent", { state: agentState("dancing" as Phase) })));
+  expect(last().map((value) => [value.id, value.state])).toEqual([["fixture-agent", "unknown"]]);
 });

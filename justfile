@@ -51,34 +51,39 @@ log-budget seconds='60':
     guardrails-log-budget
 
 # Run fast local lint checks
-lint: ts-check
+lint: ts-check client-lint
     cargo fmt --check
     cargo clippy --all-targets --locked -- -D warnings
     cargo clippy --all-targets --locked --features ts -- -D warnings
+    cargo clippy --locked --bin flk --features web -- -D warnings
 
 # Build internal API docs and reject broken links, markup and other warnings.
 doc-check:
     RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --document-private-items
 
+# Shipped feature set shared by local CI and the archived shard inventory.
+ci_features := "web,ts"
+
 # Run PR CI checks
 ci filter='all()': lint
-    cargo nextest run --locked --features ts -E "{{filter}}" --status-level fail --final-status-level slow --failure-output final --success-output never
+    cargo nextest run --locked --features {{ci_features}} -E "{{filter}}" --status-level fail --final-status-level slow --failure-output final --success-output never
 
 # Build both feature variants with an explicit fixture input, proving GUI
 # embedding and exclusion without the independent frontend build (#1826).
 gui-check:
-    FLOCK_GUI_DIST="{{justfile_directory()}}/tests/fixtures/gui-dist" cargo nextest run --locked --features ts -E 'binary(gui_feature_gate) | binary(gui_bundle_build)' --retries 0
-    FLOCK_GUI_DIST="{{justfile_directory()}}/tests/fixtures/gui-dist" cargo nextest run --locked --features web,ts -E 'test(web::gui::) | binary(gui_feature_gate) | binary(gui_bundle_build)' --retries 0
+    FLOCK_GUI_DIST="{{justfile_directory()}}/tests/fixtures/gui-dist" cargo nextest run --locked --features ts --test gui_feature_gate --test gui_bundle_build -E 'binary(gui_feature_gate) | binary(gui_bundle_build)' --retries 0
+    FLOCK_GUI_DIST="{{justfile_directory()}}/tests/fixtures/gui-dist" cargo nextest run --locked --features web,ts --bin flk --test gui_feature_gate --test gui_bundle_build -E 'test(web::gui::) | binary(gui_feature_gate) | binary(gui_bundle_build)' --retries 0
 
 # Build every test binary once into a nextest archive for CI's shard jobs, then
 # fail unless the shards in .config/ci-shards.toml partition `leg`'s tests
 # exactly (#991). Writes the shard matrix to $GITHUB_OUTPUT when set.
 ci-archive leg archive:
-    cargo nextest archive --locked --features ts --archive-file "{{archive}}"
+    cargo nextest archive --locked --features {{ci_features}} --archive-file "{{archive}}"
     python3 scripts/ci_shards.py verify --leg "{{leg}}" --archive-file "{{archive}}"
 
-# Run one CI shard, named in .config/ci-shards.toml, from an
-# archive made by `ci-archive`. It is extracted into this checkout's target/
+# Run one CI shard inside the dev shell for its runtime tools, from a
+# web/ts archive made by `ci-archive`, with its feature set already compiled.
+# It is extracted into this checkout's target/
 # because the integration tests bake `env!("CARGO_BIN_EXE_flk")` in at compile
 # time, so the binary must sit where the build put it. JUnit lands in
 # target/nextest/ci/junit.xml.
@@ -106,10 +111,13 @@ website-build:
 
 # Check the web client (ADR-0038 G1) from its lockfile: the unit and DOM
 # tests, the fixture-preview screenshot test (needs `just client-browsers`;
-# writes web/client/artifacts/screenshots/), the strict type check and the
-# Vite build.
+# writes web/client/artifacts/screenshots/), the strict type check, the design
+# rules (`client-lint`) and the Vite build. Each browser test file runs in a
+# process of its own: on Linux a Chromium launched by a later file of the same
+# `bun test` process lost its DevTools transport after an earlier file's
+# browser had run (#2931).
 client-check:
-    cd web/client && bun install --frozen-lockfile && bun test && bun test ./e2e && bun x tsc --noEmit -p tsconfig.json && bun run build
+    cd web/client && bun install --frozen-lockfile && bun test && for f in e2e/*.test.ts; do bun test "./$f" || exit 1; done && bun x tsc --noEmit -p tsconfig.json && bun run lint
 
 # Recompute nix/client-deps.json, the pinned hash of the client's
 # dependencies for `nix build .#flock-client` (#1731), after web/client/bun.lock
@@ -159,6 +167,10 @@ client-deps-hash:
 client-browsers:
     cd web/client && bun install --frozen-lockfile && bun x playwright install --with-deps chromium
 
+# Refresh the desktop CLI's fixed-output hash after desktop/bun.lock or Bun changes.
+desktop-deps-hash:
+    python3 scripts/desktop_deps_hash.py
+
 # Build the client in fixture mode (a replay of the recorded session; no flk
 # server needed) and serve it with `vite preview` on the loopback address.
 # To try it from a phone on the local network, opt in explicitly:
@@ -166,6 +178,23 @@ client-browsers:
 # opens on its own, as a single self-contained file.
 client-preview *args:
     cd web/client && bun install --frozen-lockfile && bun run build:fixture && bun x vite preview {{args}}
+
+# Run the Tauri desktop shell (desktop/, #1601) against the client's Vite dev
+# server. Server URL: FLOCK_DESKTOP_SERVER_URL or desktop/README.md's config file.
+desktop-dev:
+    cd desktop && bun install --frozen-lockfile && bun x tauri dev
+
+# The desktop shell's tests (CI, #2477). `generate_context!` embeds
+# web/client/dist at compile time, so build the client first.
+desktop-test:
+    cd web/client && bun install --frozen-lockfile && bun run build
+    cd desktop && cargo test --locked
+
+# Build the client into a release desktop shell. macOS: an ad-hoc signed
+# flock.app in desktop/target/release/bundle/ (identity signing and
+# notarisation are #1636). Elsewhere: only the binary, desktop/target/release/.
+desktop-build:
+    cd desktop && bun install --frozen-lockfile && bun x tauri build
 
 # Build the vendored libghostty-vt source dist
 build-libghostty-vt:
@@ -265,3 +294,9 @@ gen-ts:
 # with the TypeScript compiler pinned in web/client/bun.lock.
 ts-check:
     cd web/client && bun install --frozen-lockfile && bun x tsc --noEmit -p tsconfig.json
+
+# The client's design rules (#2895, web/DESIGN.md): the generated tokens are
+# current, source and shipped CSS use tokens and layout primitives (stylelint),
+# and runtime styles and type suppressions cannot bypass the gates (ESLint).
+client-lint:
+    cd web/client && bun install --frozen-lockfile && bun run lint

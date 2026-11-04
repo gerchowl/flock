@@ -16,3 +16,9 @@ pub mod transport;
 pub mod workers;
 
 pub(crate) mod identity;
+
+pub(crate) mod publication;
+
+// State contracts are consumed by the following native-view slices.
+#[allow(dead_code)]
+pub(crate) mod view;

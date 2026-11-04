@@ -17,6 +17,7 @@ use crate::terminal::{TerminalId, TerminalRuntime, TerminalRuntimeRegistry, Term
 mod aggregate;
 pub(crate) mod git;
 mod tab;
+pub(crate) use tab::Content;
 
 pub(crate) use self::aggregate::{pane_attention_priority, PaneDetail, PaneSignal};
 #[cfg(test)]
@@ -253,6 +254,53 @@ impl DerefMut for Workspace {
 }
 
 impl Workspace {
+    /// Native-only root placement; allocates no terminal state, runtime or process.
+    pub(crate) fn native(
+        target: crate::structured::view::Target,
+        cwd: PathBuf,
+        events: mpsc::Sender<AppEvent>,
+        render_notify: Arc<Notify>,
+        render_dirty: Arc<AtomicBool>,
+    ) -> Self {
+        let (layout, root) = crate::layout::TileLayout::new();
+        let tab = Tab {
+            custom_name: None,
+            number: 1,
+            root_pane: root,
+            layout,
+            panes: HashMap::new(),
+            native_views: HashMap::from([(
+                root,
+                crate::structured::view::placement::View::Ready(target),
+            )]),
+            #[cfg(test)]
+            runtimes: HashMap::new(),
+            zoomed: false,
+            events,
+            render_notify,
+            render_dirty,
+        };
+        Self {
+            id: generate_workspace_id(),
+            custom_name: None,
+            identity_cwd: cwd,
+            cached_git_branch: None,
+            cached_git_ahead_behind: None,
+            pr_state: None,
+            cached_git_space: None,
+            git_identity_resolved: false,
+            worktree_space: None,
+            public_pane_numbers: HashMap::from([(root, 1)]),
+            next_public_pane_number: 2,
+            next_public_tab_number: 2,
+            tabs: vec![tab],
+            active_tab: 0,
+            same_repo_family_memo: std::cell::RefCell::new(None),
+            display_label_memo: std::cell::RefCell::new(None),
+            #[cfg(test)]
+            test_runtimes: HashMap::new(),
+        }
+    }
     pub fn new(
         initial_cwd: PathBuf,
         rows: u16,
@@ -505,8 +553,8 @@ impl Workspace {
             return false;
         }
         let tab = self.tabs.remove(idx);
-        for pane_id in tab.panes.keys() {
-            self.unregister_pane(*pane_id);
+        for pane_id in tab.layout.pane_ids() {
+            self.unregister_pane(pane_id);
         }
         if self.active_tab >= self.tabs.len() {
             self.active_tab = self.tabs.len() - 1;
@@ -662,8 +710,8 @@ impl Workspace {
             return tab_count <= 1 || self.close_active_tab_and_report();
         }
 
-        if let Some((removed, _terminal_id)) = self.active_tab_mut().and_then(Tab::close_focused) {
-            self.unregister_pane(removed);
+        if let Some(detached) = self.active_tab_mut().and_then(Tab::close_focused) {
+            self.unregister_pane(detached.pane_id());
         }
         false
     }
@@ -690,8 +738,8 @@ impl Workspace {
             return false;
         }
 
-        if let Some((removed, _terminal_id)) = self.tabs[tab_idx].remove_pane(pane_id) {
-            self.unregister_pane(removed);
+        if let Some(detached) = self.tabs[tab_idx].remove_pane(pane_id) {
+            self.unregister_pane(detached.pane_id());
         }
         false
     }
@@ -700,22 +748,38 @@ impl Workspace {
     /// alive. The returned `TakenPane` describes whether the host tab and/or
     /// the workspace itself are now empty so the caller can decide whether to
     /// drop them.
-    pub(crate) fn take_pane_for_move(&mut self, pane_id: PaneId) -> Option<TakenPane> {
-        let tab_idx = self.find_tab_index_for_pane(pane_id)?;
+    pub(crate) fn take_pane_for_move(
+        &mut self,
+        pane_id: PaneId,
+    ) -> Result<TakenPane, crate::structured::view::PlacementError> {
+        use crate::structured::view::PlacementError;
+        let tab_idx = self
+            .find_tab_index_for_pane(pane_id)
+            .ok_or(PlacementError::Membership)?;
+        if matches!(
+            self.tabs[tab_idx].content(pane_id)?,
+            tab::Content::Native(_)
+        ) {
+            return Err(PlacementError::RelocationUnsupported);
+        }
         let pane_count = self.tabs[tab_idx].layout.pane_count();
         if pane_count <= 1 {
             let mut tab = self.tabs.remove(tab_idx);
-            let moved = tab.take_pane_for_move(pane_id)?;
+            let moved = tab
+                .take_pane_for_move(pane_id)
+                .ok_or(PlacementError::Membership)?;
             self.adjust_active_tab_after_removal(tab_idx);
-            return Some(TakenPane {
+            return Ok(TakenPane {
                 moved,
                 removed_tab_idx: Some(tab_idx),
                 workspace_empty: self.tabs.is_empty(),
             });
         }
 
-        let moved = self.tabs[tab_idx].take_pane_for_move(pane_id)?;
-        Some(TakenPane {
+        let moved = self.tabs[tab_idx]
+            .take_pane_for_move(pane_id)
+            .ok_or(PlacementError::Membership)?;
+        Ok(TakenPane {
             moved,
             removed_tab_idx: None,
             workspace_empty: false,
@@ -1163,7 +1227,7 @@ impl Workspace {
     pub fn find_tab_index_for_pane(&self, pane_id: PaneId) -> Option<usize> {
         self.tabs
             .iter()
-            .position(|tab| tab.panes.contains_key(&pane_id))
+            .position(|tab| tab.content(pane_id).is_ok())
     }
 
     pub fn pane_state(&self, pane_id: PaneId) -> Option<&PaneState> {
@@ -1199,13 +1263,13 @@ impl Workspace {
             return false;
         }
 
-        if let Some((removed, _terminal_id)) = self.tabs[tab_idx].close_pane(pane_id) {
-            self.unregister_pane(removed);
+        if let Some(detached) = self.tabs[tab_idx].close_pane(pane_id) {
+            self.unregister_pane(detached.pane_id());
         }
         false
     }
 
-    fn register_new_pane(&mut self, pane_id: PaneId) {
+    pub(crate) fn register_new_pane(&mut self, pane_id: PaneId) {
         let number = self.next_public_pane_number;
         self.register_new_pane_with_number(pane_id, number);
     }
@@ -1264,6 +1328,7 @@ impl Workspace {
             root_pane: root_id,
             layout,
             panes,
+            native_views: HashMap::new(),
             runtimes: HashMap::new(),
             zoomed: false,
             events,
@@ -1341,6 +1406,7 @@ impl Workspace {
             root_pane: root_id,
             layout,
             panes,
+            native_views: HashMap::new(),
             runtimes: HashMap::new(),
             zoomed: false,
             events,

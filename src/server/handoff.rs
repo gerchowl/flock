@@ -20,6 +20,15 @@ use tracing::info;
 
 #[cfg(unix)]
 const HANDOFF_VERSION: u32 = 1;
+/// Two locked open descriptions follow the optional TCP listener and PTYs.
+#[cfg(unix)]
+pub(crate) const SOCKET_OWNER_HANDOFF_VERSION: u32 = 3;
+/// A local WebSocket ownership description follows the API and terminal owners.
+#[cfg(unix)]
+pub(crate) const LOCAL_WS_HANDOFF_VERSION: u32 = 4;
+/// Descriptor extension: old receivers must refuse before ready, even with zero PTYs.
+#[cfg(unix)]
+pub(crate) const CLIENT_LISTENER_HANDOFF_VERSION: u32 = 2;
 /// Import-only credential channel, consumed before the importer starts children.
 #[cfg(unix)]
 pub(crate) const HANDOFF_TOKEN_ENV: &str = "FLOCK_HANDOFF_TOKEN";
@@ -53,6 +62,30 @@ pub(crate) const MAX_REPLAY_BYTES_PER_PANE: usize = 8 * 1024;
 #[cfg(unix)]
 pub(crate) const COMMIT_TIMEOUT: Duration = READY_TIMEOUT;
 
+/// Concurrent pane drain allowance before export starts.
+pub(crate) const PANE_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+/// Additional time for a failed importer's public socket descriptors to close.
+const PUBLIC_SOCKET_RELEASE_MARGIN: Duration = Duration::from_secs(2);
+/// Wait for a failed importer's public sockets before restoring ownership.
+pub(crate) const ROLLBACK_SOCKET_TIMEOUT: Duration =
+    COMMIT_TIMEOUT.saturating_add(PUBLIC_SOCKET_RELEASE_MARGIN);
+
+/// Conservative sum of the synchronous handoff handler's phase bounds.
+/// Import startup overlaps the accept phase, but both are reserved because the
+/// import watchdog begins in the child. Commit and rollback are reserved too:
+/// the API response is sent only after `perform_live_handoff` returns.
+pub(crate) fn operation_budget() -> Duration {
+    crate::structured::workers::SHUTDOWN_GRACE
+        .saturating_add(crate::structured::workers::SHUTDOWN_CLEANUP)
+        .saturating_add(PANE_DRAIN_TIMEOUT)
+        .saturating_add(READY_TIMEOUT)
+        .saturating_add(IMPORT_STARTUP_TIMEOUT)
+        .saturating_add(COMMIT_TIMEOUT)
+        .saturating_add(OWNED_ACK_TIMEOUT)
+        .saturating_add(IMPORT_REAP_TIMEOUT)
+        .saturating_add(ROLLBACK_SOCKET_TIMEOUT)
+}
+
 #[cfg(unix)]
 #[derive(Serialize, Deserialize)]
 pub(crate) struct HandoffManifest {
@@ -68,6 +101,15 @@ pub(crate) struct HandoffManifest {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub structured_unknown: Vec<String>,
     pub panes: Vec<crate::handoff_runtime::HandoffRuntimeState>,
+    /// One listening TCP descriptor follows the PTY descriptors when present.
+    #[serde(default)]
+    pub client_listener: bool,
+    /// API then terminal socket ownership; retained through public socket rebind.
+    #[serde(default)]
+    pub socket_owners: bool,
+    /// Local WebSocket ownership is adopted before preparing either client transport.
+    #[serde(default)]
+    pub local_ws_owner: bool,
     /// Operator drafts kept in panes' stashes (#850), so a handoff does not
     /// drop them. Absent from an older server's manifest.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
@@ -447,7 +489,18 @@ fn receive_after_token(stream: &mut UnixStream) -> io::Result<(HandoffManifest, 
     let manifest_line = read_line_unbuffered(stream)?;
     let manifest: HandoffManifest = serde_json::from_str(&manifest_line)
         .map_err(|err| io::Error::other(format!("handoff manifest deserialize failed: {err}")))?;
-    if manifest.version != HANDOFF_VERSION {
+    if ![
+        HANDOFF_VERSION,
+        CLIENT_LISTENER_HANDOFF_VERSION,
+        SOCKET_OWNER_HANDOFF_VERSION,
+        LOCAL_WS_HANDOFF_VERSION,
+    ]
+    .contains(&manifest.version)
+        || (manifest.version < SOCKET_OWNER_HANDOFF_VERSION
+            && manifest.client_listener != (manifest.version == CLIENT_LISTENER_HANDOFF_VERSION))
+        || manifest.socket_owners != (manifest.version >= SOCKET_OWNER_HANDOFF_VERSION)
+        || manifest.local_ws_owner != (manifest.version == LOCAL_WS_HANDOFF_VERSION)
+    {
         return Err(io::Error::other(format!(
             "unsupported handoff version {}",
             manifest.version
@@ -474,6 +527,12 @@ fn receive_after_token(stream: &mut UnixStream) -> io::Result<(HandoffManifest, 
             crate::build_info::version()
         )));
     }
+    if (manifest.client_listener || manifest.local_ws_owner) && !cfg!(feature = "web") {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "handoff listener requires a web-enabled replacement",
+        ));
+    }
     stream.write_all(b"validated\n")?;
     stream.flush()?;
     if cfg!(debug_assertions)
@@ -487,7 +546,13 @@ fn receive_after_token(stream: &mut UnixStream) -> io::Result<(HandoffManifest, 
             manifest.panes.len()
         )));
     }
-    let fds = recv_fds(stream, manifest.panes.len())?;
+    let fds = recv_fds(
+        stream,
+        manifest.panes.len()
+            + usize::from(manifest.client_listener)
+            + 2 * usize::from(manifest.socket_owners)
+            + usize::from(manifest.local_ws_owner),
+    )?;
     Ok((manifest, fds))
 }
 
@@ -537,6 +602,9 @@ pub(crate) fn manifest_for(
         structured_unknown: Vec::new(),
         panes,
         kept_drafts: Default::default(),
+        client_listener: false,
+        socket_owners: false,
+        local_ws_owner: false,
     }
 }
 
@@ -602,7 +670,7 @@ fn read_line_unbuffered(stream: &mut UnixStream) -> io::Result<String> {
 /// copies: a failure part-way leaves the receiver short, it refuses, and the
 /// kernel closes whatever was still in flight when the stream drops.
 #[cfg(unix)]
-fn send_fds(stream: &UnixStream, fds: &[RawFd]) -> io::Result<()> {
+pub(crate) fn send_fds(stream: &UnixStream, fds: &[RawFd]) -> io::Result<()> {
     for batch in fds.chunks(MAX_FDS_PER_BATCH) {
         send_fd_batch(stream, batch)?;
     }
@@ -656,7 +724,7 @@ fn send_tagged_fd_batch(stream: &UnixStream, fds: &[RawFd], tag: u8) -> io::Resu
 /// the moment it arrives, so any refusal, including one part-way through a
 /// batch, closes all of them rather than leaking into the importer.
 #[cfg(unix)]
-fn recv_fds(stream: &UnixStream, expected: usize) -> io::Result<Vec<RawFd>> {
+pub(crate) fn recv_fds(stream: &UnixStream, expected: usize) -> io::Result<Vec<RawFd>> {
     let mut out = Vec::with_capacity(expected);
     match recv_fds_into(stream, expected, &mut out) {
         Ok(()) => Ok(out),
@@ -676,6 +744,17 @@ fn close_fds(fds: &[RawFd]) {
 
 #[cfg(unix)]
 fn recv_fds_into(stream: &UnixStream, expected: usize, out: &mut Vec<RawFd>) -> io::Result<()> {
+    recv_fds_into_observing(stream, expected, out, |_| {})
+}
+
+/// Observe kernel-installed descriptor flags before the portable fcntl fallback.
+#[cfg(unix)]
+fn recv_fds_into_observing(
+    stream: &UnixStream,
+    expected: usize,
+    out: &mut Vec<RawFd>,
+    mut received: impl FnMut(&[RawFd]),
+) -> io::Result<()> {
     // Sized well past one batch, so a batch carrying more than the remainder,
     // or more than the batch limit, arrives whole and is refused by count.
     // Truncation is not a safe way to refuse: on macOS the kernel installs
@@ -698,7 +777,13 @@ fn recv_fds_into(stream: &UnixStream, expected: usize, out: &mut Vec<RawFd>) -> 
         msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
         msg.msg_controllen = space as _;
 
-        let read = unsafe { libc::recvmsg(stream.as_raw_fd(), &mut msg, 0) };
+        let read = unsafe {
+            libc::recvmsg(
+                stream.as_raw_fd(),
+                &mut msg,
+                crate::platform::received_fd::RECV_FLAGS,
+            )
+        };
         if read < 0 {
             let err = io::Error::last_os_error();
             if err.kind() == io::ErrorKind::Interrupted {
@@ -723,6 +808,11 @@ fn recv_fds_into(stream: &UnixStream, expected: usize, out: &mut Vec<RawFd>) -> 
             return Err(io::Error::other("handoff fd control message was truncated"));
         }
         collected?;
+        received(&out[before..]);
+        // Set every received PTY/listener descriptor before any importer child can be spawned.
+        for fd in &out[before..] {
+            crate::platform::received_fd::close_on_exec(*fd)?;
+        }
         if byte[0] != FD_BATCH_TAG {
             return Err(io::Error::other(format!(
                 "handoff fd batch carried data byte {:#04x}, expected {:#04x}",
@@ -808,6 +898,51 @@ pub(crate) fn log_import_result(panes: usize) {
 
 #[cfg(all(test, unix))]
 mod tests {
+    #[test]
+    fn socket_ownership_survives_fd_transfer_exporter_close_and_rebind() {
+        use std::os::fd::AsRawFd;
+        let root = crate::test_support::TempDir::socket();
+        let path = root.path().join("flock-ws.sock");
+        let owner = crate::ipc::prepare_socket_path(&path, |_| "busy".into()).unwrap();
+        let listener = UnixListener::bind(&path).unwrap();
+        let (sender, receiver) = UnixStream::pair().unwrap();
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let fd = owner.duplicate().unwrap();
+        send_fds(&sender, &[std::os::fd::AsRawFd::as_raw_fd(&fd)]).unwrap();
+        drop(fd);
+        let mut received = recv_fds(&receiver, 1).unwrap();
+        let imported = crate::ipc::SocketOwner::take(&path, &mut received).unwrap();
+        assert_eq!(
+            crate::ipc::SocketOwner::acquire(&path).unwrap_err().kind(),
+            io::ErrorKind::AddrInUse
+        );
+        drop(listener);
+        drop(owner);
+        assert_eq!(
+            crate::ipc::SocketOwner::acquire(&path).unwrap_err().kind(),
+            io::ErrorKind::AddrInUse
+        );
+        imported.prepare(&path).unwrap();
+        let rebound = UnixListener::bind(&path).unwrap();
+        assert_eq!(
+            crate::ipc::SocketOwner::acquire(&path).unwrap_err().kind(),
+            io::ErrorKind::AddrInUse
+        );
+        let identity = crate::ipc::socket_file_identity(&path).unwrap();
+        crate::ipc::remove_socket_file_if_owned(&path, identity).unwrap();
+        drop(rebound);
+        drop(imported);
+        let _next = crate::ipc::SocketOwner::acquire(&path).unwrap();
+        // Ownership descriptors always remain close-on-exec when duplicated or received.
+        let owned = _next.duplicate().unwrap();
+        assert_ne!(
+            unsafe { libc::fcntl(owned.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0
+        );
+    }
+
     use super::*;
     use std::io::Read;
     use std::os::unix::net::UnixStream;
@@ -1210,6 +1345,31 @@ mod tests {
     }
 
     #[test]
+    fn handoff_receive_passes_platform_flags_before_fcntl() {
+        let (reads, writes) = pipes(1);
+        let (sender, receiver) = pair_with_timeout();
+        send_fds(&sender, &writes).unwrap();
+        let mut received = Vec::new();
+        let mut observed = Vec::new();
+        let result = recv_fds_into_observing(&receiver, 1, &mut received, |fds| {
+            observed.extend(
+                fds.iter()
+                    .map(|fd| unsafe { libc::fcntl(*fd, libc::F_GETFD) }),
+            );
+        });
+        close_fds(&received);
+        close_fds(&writes);
+        assert_all_write_ends_closed(&reads);
+        result.unwrap();
+        assert_eq!(
+            observed.len(),
+            1,
+            "inspect before fallback can mask a missing receive flag"
+        );
+        crate::platform::received_fd::assert_kernel_received_flags(&observed);
+    }
+
+    #[test]
     fn receiver_accumulates_150_fds_across_batches_in_order() {
         let (reads, writes) = pipes(150);
         let (sender, receiver) = pair_with_timeout();
@@ -1222,6 +1382,11 @@ mod tests {
         // Each received fd must be the write end of the pipe at the same
         // index: the importer pairs fds with manifest panes by position.
         for (idx, &fd) in received.iter().enumerate() {
+            assert_ne!(
+                unsafe { libc::fcntl(fd, libc::F_GETFD) } & libc::FD_CLOEXEC,
+                0,
+                "PTY descriptor must not reach an importer child"
+            );
             let tag = idx as u8;
             assert_eq!(unsafe { libc::write(fd, (&tag as *const u8).cast(), 1) }, 1);
             let mut got = 0u8;

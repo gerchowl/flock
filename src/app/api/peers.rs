@@ -6,6 +6,11 @@ use crate::app::App;
 use super::responses::{encode_error, encode_success};
 
 impl App {
+    /// Home health shared by discovery and the fleet, without a GUI poll.
+    pub(crate) fn fleet_home_health(&self) -> Option<PeerSystemSummary> {
+        self.state.system_stats.as_ref().map(system_summary)
+    }
+
     /// Serve this server's federated summary: one entry per workspace with
     /// project identity + attention-leading agent status. Peers poll this
     /// over SSH to fold our workspaces into their sidebars.
@@ -40,8 +45,9 @@ impl App {
                 version: Some(crate::build_info::version()),
                 protocol: Some(crate::protocol::PROTOCOL_VERSION),
                 icon: configured_node_icon(),
-                system: self.state.system_stats.as_ref().map(system_summary),
+                system: self.fleet_home_health(),
                 workspaces: self.self_workspace_summaries(),
+                structured_agents: self.self_structured_summaries(),
                 // Gossip v3 (#101): relay this server's OWN polled peers only —
                 // never the cache we received via relay ourselves. That bounds
                 // hop count to one and precludes gossip loops.
@@ -249,7 +255,13 @@ impl App {
             }
             None => fleet.extend(hub_self),
         }
-        crate::peers::merge_hub_pushed_fleet(&mut self.state.relayed_fleet_cache, fleet, &hub);
+        crate::peers::merge_hub_pushed_fleet(
+            &mut self.state.relayed_fleet_cache,
+            fleet,
+            &hub,
+            hub_node.as_deref(),
+            std::time::Instant::now(),
+        );
         self.note_mesh_owners();
         self.state.evict_expired_relayed_entries();
         self.render_dirty
@@ -264,6 +276,7 @@ impl App {
     pub(crate) fn hub_self_row(&self) -> RelayedFleetPeer {
         let us = short_host_name();
         RelayedFleetPeer {
+            structured_agents: self.self_structured_summaries(),
             node_id: self.node_id.clone(),
             name: us.clone(),
             // Never dialled by the spoke (hub-pushed rows are display-only),
@@ -272,7 +285,7 @@ impl App {
             host: Some(us.clone()),
             version: Some(crate::build_info::version()),
             protocol: Some(crate::protocol::PROTOCOL_VERSION),
-            system: self.state.system_stats.as_ref().map(system_summary),
+            system: self.fleet_home_health(),
             latency_ms: None,
             workspaces: self.self_workspace_summaries(),
             // We ARE the origin of our own reading, taken right now.
@@ -294,6 +307,7 @@ impl App {
             .map(|peer| {
                 let age_secs = peer.last_ok.map(|at| at.elapsed().as_secs());
                 RelayedFleetPeer {
+                    structured_agents: peer.structured_agents.clone(),
                     // Gossip carries the ingress-validated report, not a local
                     // sidebar binding that could recreate a rejected claim.
                     node_id: peer.node_id.clone(),
@@ -390,6 +404,23 @@ impl App {
             ),
             Err(err) => encode_error(id, "checkout_prepare_failed", err),
         }
+    }
+
+    fn self_structured_summaries(&self) -> Vec<crate::api::schema::PeerStructuredAgentSummary> {
+        self.state
+            .structured_agents
+            .observations()
+            .map(
+                |(record, projection)| crate::api::schema::PeerStructuredAgentSummary {
+                    agent_id: record.agent_id.clone(),
+                    agent: Some(record.harness.clone()),
+                    status: super::structured_agents::structured_status(
+                        projection.update.state.phase,
+                    ),
+                    runtime: record.runtime,
+                },
+            )
+            .collect()
     }
 
     /// This server's own workspaces in the federated summary shape — the same
@@ -926,9 +957,13 @@ fn compute_short_host_name() -> String {
     if let Some(name) = macos_local_host_name() {
         return name;
     }
-    sysinfo::System::host_name()
-        .map(|h| h.split('.').next().unwrap_or(&h).to_string())
-        .unwrap_or_else(|| "unknown".to_string())
+    match sysinfo::System::host_name() {
+        Ok(host) => host.split('.').next().unwrap_or(&host).to_string(),
+        Err(error) => {
+            crate::logging::system_information_unavailable("short_host_name", &error);
+            "unknown".to_string()
+        }
+    }
 }
 
 /// The `name` from config.toml, if set — the node's friendly self-label (#42).
@@ -1146,6 +1181,7 @@ mod tests {
 
     fn summary(name: &str, ssh_target: &str) -> crate::peers::PeerSummaryState {
         crate::peers::PeerSummaryState {
+            structured_agents: Vec::new(),
             node_id: None,
             dial: Default::default(),
             stream_error: None,
@@ -1166,6 +1202,24 @@ mod tests {
             proxy_jump: None,
             icon: None,
         }
+    }
+
+    #[test]
+    fn hub_relay_clones_structured_directory_from_its_polled_peer() {
+        let mut app = test_app();
+        let mut peer = summary("fixture.example", "fixture.example");
+        peer.structured_agents = serde_json::from_value(serde_json::json!([
+            {"agent_id":"native-id", "agent":"claude", "status":"idle", "runtime":"structured"}
+        ]))
+        .unwrap();
+        app.state.peer_summaries.push(peer);
+        let relayed = app.own_relayed_fleet();
+        assert_eq!(
+            relayed[0].structured_agents,
+            app.state.peer_summaries[0].structured_agents
+        );
+        app.state.peer_summaries[0].structured_agents.clear();
+        assert_eq!(relayed[0].structured_agents.len(), 1);
     }
 
     #[test]
@@ -1398,6 +1452,7 @@ mod tests {
         app.state.relayed_fleet_cache.insert(
             "spoke2.invalid".to_string(),
             crate::peers::relayed_entry_from_wire(crate::api::schema::RelayedFleetPeer {
+                structured_agents: Vec::new(),
                 node_id: None,
                 dial: None,
                 name: "spoke2.invalid".into(),
@@ -1450,6 +1505,7 @@ mod tests {
     /// A row `kiln` relays about `node-b`, with the target only kiln resolves.
     fn relayed_by_anvil(name: &str, ssh_target: &str) -> crate::api::schema::RelayedFleetPeer {
         crate::api::schema::RelayedFleetPeer {
+            structured_agents: Vec::new(),
             node_id: None,
             dial: None,
             name: name.into(),
@@ -1493,6 +1549,8 @@ mod tests {
             &mut app.state.relayed_fleet_cache,
             vec![relayed_by_anvil("node-b.invalid", "ws00860001")],
             "kiln.invalid",
+            None,
+            std::time::Instant::now(),
         );
 
         let prepared = app
@@ -1546,6 +1604,8 @@ mod tests {
             &mut app.state.relayed_fleet_cache,
             vec![relayed_by_anvil("node-b.invalid", "ws00860001")],
             "kiln.invalid",
+            None,
+            std::time::Instant::now(),
         );
         assert!(app
             .prepare_switch_server(PeerSwitchRequest::RelayedPeer {
@@ -1578,6 +1638,8 @@ mod tests {
             &mut app.state.relayed_fleet_cache,
             vec![hub_row("node-b.invalid", "ws00860001", 0)],
             "hopper",
+            None,
+            std::time::Instant::now(),
         );
         assert!(app.state.relayed_fleet_cache["node-b.invalid"].hub_pushed);
         assert!(app
@@ -1637,6 +1699,7 @@ mod tests {
 
     fn hub_row(name: &str, ssh_target: &str, age: u64) -> crate::api::schema::RelayedFleetPeer {
         crate::api::schema::RelayedFleetPeer {
+            structured_agents: Vec::new(),
             node_id: None,
             dial: None,
             name: name.into(),
@@ -1794,6 +1857,7 @@ mod tests {
         app.state.relayed_fleet_cache.insert(
             "spoke2.invalid".to_string(),
             crate::peers::relayed_entry_from_wire(crate::api::schema::RelayedFleetPeer {
+                structured_agents: Vec::new(),
                 node_id: None,
                 dial: None,
                 name: "spoke2.invalid".into(),
@@ -1846,6 +1910,7 @@ mod tests {
                 peer: "kiln".into(),
                 stream_error: None,
                 result: Ok(crate::peers::PeerSummaryPayload {
+                    structured_agents: Vec::new(),
                     node_id: None,
                     outbound_pending: false,
                     host: "kiln".into(),
@@ -1855,6 +1920,7 @@ mod tests {
                     latency_ms: 5,
                     workspaces: Vec::new(),
                     relayed_fleet: vec![crate::api::schema::RelayedFleetPeer {
+                        structured_agents: Vec::new(),
                         node_id: None,
                         dial: None,
                         name: "loop-back".into(),
@@ -2155,6 +2221,13 @@ mod tests {
             .state
             .relayed_fleet_cache
             .contains_key("\0node:node-home.example:test-node-node-home.example"));
+        let ingested = &spoke.state.relayed_fleet_cache
+            ["\0node:node-home.example:test-node-node-home.example"];
+        assert_eq!(
+            ingested.source_node.as_deref(),
+            Some("test-node-node-home.example")
+        );
+        assert_eq!(ingested.peer.last_ok, ingested.peer.ingested_at);
     }
 
     #[tokio::test]
@@ -2623,5 +2696,233 @@ mod tests {
             offline,
             super::workspace_peer_summary(&app.workspaces[0], &app.terminals, &runtimes)
         );
+    }
+
+    fn relay_ingest_peer(app: &mut App) -> crate::config::PeerConfig {
+        let peer = crate::config::PeerConfig {
+            name: "hub.example".into(),
+            ssh: "hub.example".into(),
+            ..Default::default()
+        };
+        app.state
+            .peer_summaries
+            .push(crate::peers::PeerSummaryState::new(&peer));
+        app.state.peers.push(peer.clone());
+        peer
+    }
+    fn ingest_relay_poll(
+        app: &mut App,
+        peer: &crate::config::PeerConfig,
+        sender: &str,
+        owner: &str,
+        now: std::time::Instant,
+    ) {
+        let result = serde_json::json!({"host":"hub.example", "node_id":sender,
+            "protocol":crate::protocol::PROTOCOL_VERSION, "workspaces":[],
+            "relayed_fleet":if owner.is_empty() {vec![]} else {vec![serde_json::json!({"node_id":owner, "name":"leaf.example",
+                "ssh_target":"leaf.example", "origin":"hub.example", "age_secs":0})]}});
+        let payload = crate::peers::test_parse_summary_response(
+            &serde_json::json!({"result":result}).to_string(),
+            2,
+        )
+        .unwrap();
+        app.handle_internal_event_at(
+            crate::events::AppEvent::PeerSummaryFetched(crate::peers::PeerSummaryFetch {
+                peer: peer.name.clone(),
+                result: Ok(payload),
+                stream_error: None,
+            }),
+            now,
+        );
+    }
+    fn ingest_bindings(app: &mut App) {
+        let request = serde_json::from_value(serde_json::json!({
+            "id":"bindings", "method":"peers.enrollment", "params":{}}))
+        .unwrap();
+        let response: serde_json::Value =
+            serde_json::from_str(&app.handle_api_request(request)).unwrap();
+        assert!(response.get("error").is_none(), "{response}");
+    }
+    #[tokio::test]
+    async fn rejected_poll_identity_cannot_ingest_owner_relays() {
+        let _guard = crate::config::test_config_env_guard();
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        let mut app = test_app();
+        let peer = relay_ingest_peer(&mut app);
+        let owner = crate::mesh::identity::NodeIdentity::fixture([81; 32]).node_id();
+        let impostor = crate::mesh::identity::NodeIdentity::fixture([82; 32]).node_id();
+        crate::peer_stream::test_enroll(&peer, &owner);
+        ingest_bindings(&mut app);
+        ingest_relay_poll(
+            &mut app,
+            &peer,
+            &impostor,
+            &owner,
+            std::time::Instant::now(),
+        );
+        let entry = app.state.relayed_fleet_cache.values().next().unwrap();
+        assert_eq!(entry.source_node, None);
+        assert_eq!(
+            app.state.server_peer_node(&entry.peer),
+            None,
+            "rejected sender supplied proven relay rows"
+        );
+    }
+    #[tokio::test]
+    async fn repinning_alias_cannot_authenticate_previously_ingested_relays() {
+        let _guard = crate::config::test_config_env_guard();
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        let mut app = test_app();
+        let peer = relay_ingest_peer(&mut app);
+        let old = crate::mesh::identity::NodeIdentity::fixture([81; 32]).node_id();
+        let new = crate::mesh::identity::NodeIdentity::fixture([82; 32]).node_id();
+        crate::peer_stream::test_enroll(&peer, &old);
+        ingest_relay_poll(&mut app, &peer, &old, &new, std::time::Instant::now());
+        crate::peer_stream::test_enroll(&peer, &new);
+        ingest_bindings(&mut app);
+        let entry = app.state.relayed_fleet_cache.values().next().unwrap();
+        assert_eq!(
+            app.state.server_peer_node(&entry.peer),
+            None,
+            "old sender borrowed new pin"
+        );
+        ingest_relay_poll(&mut app, &peer, &new, "", std::time::Instant::now());
+        assert!(
+            app.state.relayed_fleet_cache.is_empty(),
+            "new source must evict old-source rows even on an empty delivery"
+        );
+        ingest_relay_poll(&mut app, &peer, &new, &new, std::time::Instant::now());
+        assert_eq!(app.state.relayed_fleet_cache.len(), 1);
+        let entry = app.state.relayed_fleet_cache.values().next().unwrap();
+        assert_eq!(app.state.server_peer_node(&entry.peer), Some(new.as_str()));
+    }
+    #[tokio::test]
+    async fn missing_current_binding_revokes_ingested_relay_proof() {
+        let _guard = crate::config::test_config_env_guard();
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        let mut app = test_app();
+        let peer = relay_ingest_peer(&mut app);
+        let owner = crate::mesh::identity::NodeIdentity::fixture([81; 32]).node_id();
+        crate::peer_stream::test_enroll(&peer, &owner);
+        ingest_bindings(&mut app);
+        ingest_relay_poll(&mut app, &peer, &owner, &owner, std::time::Instant::now());
+        let proven = |app: &App| {
+            let entry = app.state.relayed_fleet_cache.values().next().unwrap();
+            app.state.server_peer_node(&entry.peer).map(str::to_owned)
+        };
+        assert_eq!(proven(&app), Some(owner.clone()));
+        crate::peer_stream::reset_enrollment(&peer.name);
+        ingest_bindings(&mut app);
+        assert!(!app.state.server_nodes.contains_key(&peer.name));
+        assert_eq!(proven(&app), None, "removed binding retained proof");
+        crate::peer_stream::test_enroll(&peer, &owner);
+        ingest_bindings(&mut app);
+        assert_eq!(proven(&app), Some(owner));
+        app.state.peers.clear();
+        ingest_bindings(&mut app);
+        assert_eq!(proven(&app), None, "dropped configured peer retained proof");
+        crate::peer_stream::reset_enrollment(&peer.name);
+    }
+
+    #[tokio::test]
+    async fn store_read_failure_revokes_ingested_relay_proof() {
+        let _guard = crate::config::test_config_env_guard();
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        let mut app = test_app();
+        let peer = relay_ingest_peer(&mut app);
+        let owner = crate::mesh::identity::NodeIdentity::fixture([81; 32]).node_id();
+        crate::peer_stream::test_enroll(&peer, &owner);
+        ingest_bindings(&mut app);
+        ingest_relay_poll(&mut app, &peer, &owner, &owner, std::time::Instant::now());
+        let entry = app.state.relayed_fleet_cache.values().next().unwrap();
+        assert_eq!(
+            app.state.server_peer_node(&entry.peer),
+            Some(owner.as_str())
+        );
+        crate::peer_stream::reset_enrollment(&peer.name);
+        crate::mesh::runtime_store::failed("fixture store read failure".into());
+        assert!(crate::mesh::runtime_store::read(|store| {
+            store.get_pin(&peer.name).map_err(|error| error.to_string())
+        })
+        .is_err());
+        ingest_bindings(&mut app);
+        assert!(!app.state.server_nodes.contains_key(&peer.name));
+        let entry = app.state.relayed_fleet_cache.values().next().unwrap();
+        assert_eq!(
+            app.state.server_peer_node(&entry.peer),
+            None,
+            "server_pin_unavailable retained proof"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_poll_evicts_previously_proven_rows() {
+        let _guard = crate::config::test_config_env_guard();
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        let mut app = test_app();
+        let peer = relay_ingest_peer(&mut app);
+        let owner = crate::mesh::identity::NodeIdentity::fixture([81; 32]).node_id();
+        let impostor = crate::mesh::identity::NodeIdentity::fixture([82; 32]).node_id();
+        crate::peer_stream::test_enroll(&peer, &owner);
+        ingest_bindings(&mut app);
+        ingest_relay_poll(&mut app, &peer, &owner, &owner, std::time::Instant::now());
+        assert_eq!(
+            app.state
+                .relayed_fleet_cache
+                .values()
+                .next()
+                .unwrap()
+                .source_node
+                .as_deref(),
+            Some(owner.as_str())
+        );
+        ingest_relay_poll(&mut app, &peer, &impostor, "", std::time::Instant::now());
+        assert!(
+            app.state.relayed_fleet_cache.is_empty(),
+            "rejected poll retained old proven rows"
+        );
+        crate::peer_stream::reset_enrollment(&peer.name);
+    }
+
+    #[test]
+    fn absent_sender_has_the_same_unproven_cache_rule_on_both_paths() {
+        let owner = crate::mesh::identity::NodeIdentity::fixture([81; 32]).node_id();
+        let now = std::time::Instant::now();
+        for hub_push in [false, true] {
+            let mut cache = std::collections::HashMap::new();
+            let row = || {
+                let mut row = hub_row("leaf.example", "leaf.example", 0);
+                row.node_id = Some(owner.clone());
+                row
+            };
+            let merge = if hub_push {
+                crate::peers::merge_hub_pushed_fleet
+            } else {
+                crate::peers::merge_relayed_fleet
+            };
+            merge(&mut cache, vec![row()], "hub.example", Some(&owner), now);
+            assert_eq!(cache.len(), 1);
+            merge(&mut cache, vec![], "hub.example", None, now);
+            assert!(cache.is_empty(), "absent sender retained proven rows");
+            merge(&mut cache, vec![row()], "hub.example", None, now);
+            assert_eq!(cache.len(), 1);
+            assert_eq!(cache.values().next().unwrap().source_node, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn poll_and_its_relay_share_one_observation_instant() {
+        let _guard = crate::config::test_config_env_guard();
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        let mut app = test_app();
+        let peer = relay_ingest_peer(&mut app);
+        let owner = crate::mesh::identity::NodeIdentity::fixture([81; 32]).node_id();
+        crate::peer_stream::test_enroll(&peer, &owner);
+        let now = std::time::Instant::now() + std::time::Duration::from_secs(100);
+        ingest_relay_poll(&mut app, &peer, &owner, &owner, now);
+        let relay = &app.state.relayed_fleet_cache.values().next().unwrap().peer;
+        assert_eq!(relay.ingested_at, Some(now));
+        assert_eq!(relay.last_ok, Some(now));
+        assert_eq!(app.state.peer_summaries[0].last_ok, Some(now));
     }
 }

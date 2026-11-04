@@ -135,8 +135,8 @@ fn title_output_worker() {
             .unwrap();
         let result = rt.block_on(run_client_loop(
             client,
-            80,
-            24,
+            (80, 24, 0, 0),
+            Box::new(|_| Ok((80, 24, 0, 0))),
             quit.clone(),
             crate::config::SoundConfig::default(),
             3,

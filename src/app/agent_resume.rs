@@ -534,23 +534,23 @@ mod tests {
             let sequence = app.event_hub.current_sequence();
             // Theme deferral cannot claim that a live execution exists.
             assert!(!app.start_pending_agent_resumes(false));
-            assert!(app.event_hub.events_after(sequence).is_empty());
+            assert!(app.event_hub.ring_snapshot_after(sequence).is_empty());
             let launched = if explicit {
                 app.resume_hibernated_pane(0, pane).is_ok()
             } else {
                 app.start_pending_agent_resumes(true)
             };
             let live_status = app.pane_info(0, pane).unwrap().agent_status;
-            let events = app.event_hub.events_after(sequence);
+            let events = app.event_hub.ring_snapshot_after(sequence);
             let repeated = app.start_pending_agent_resumes(true);
-            let repeated_events = app.event_hub.events_after(sequence);
+            let repeated_events = app.event_hub.ring_snapshot_after(sequence);
             // Reap the owned fake shell before any assertions can panic.
             for (_, runtime) in app.terminal_runtimes.drain() {
                 runtime.shutdown();
             }
             drop(app);
             let reopened = crate::api::EventHub::with_persistence(log.clone());
-            let replayed = reopened.events_after(sequence);
+            let replayed = reopened.ring_snapshot_after(sequence);
             drop(reopened);
             std::fs::remove_file(log).unwrap();
             assert_eq!(
@@ -748,7 +748,9 @@ mod tests {
         app.state.active = Some(0);
         app.state.ensure_test_terminals();
         let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
-        terminal.set_agent_name("retry-agent".into());
+        terminal
+            .set_agent_name("retry-agent".into())
+            .expect("the retry fixture uses a valid agent name");
         terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
             source: "flock:codex".into(),
             agent: "codex".into(),
@@ -839,7 +841,7 @@ mod tests {
                 .terminals
                 .get_mut(&terminal_id)
                 .expect("test terminal should exist");
-            terminal.set_agent_name("reviewer".into());
+            terminal.set_agent_name("reviewer".into()).unwrap();
             terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
                 source: "flock:codex".into(),
                 agent: "codex".into(),
@@ -868,7 +870,7 @@ mod tests {
         assert!(!app.start_pending_agent_resumes(false));
         assert!(
             app.event_hub
-                .events_after(sequence)
+                .ring_snapshot_after(sequence)
                 .iter()
                 .all(|(_, event)| !matches!(
                     event.data,
@@ -886,7 +888,7 @@ mod tests {
             .terminals
             .get(&terminal_id)
             .expect("terminal should survive a failed resume");
-        assert_eq!(terminal.agent_name.as_deref(), Some("reviewer"));
+        assert_eq!(terminal.agent_name(), Some("reviewer"));
         assert!(terminal.resume_failed);
         assert!(terminal.pending_agent_resume_plan.is_some());
         assert!(terminal.hibernated_resume_plan.is_none());

@@ -3738,11 +3738,6 @@ mod tests {
         )
         .unwrap();
         relayed.node_id = Some(node.clone());
-        crate::peers::merge_relayed_fleet(
-            &mut app.state.relayed_fleet_cache,
-            vec![relayed],
-            "node-b.example",
-        );
         let pid = std::process::id();
         let birth = crate::platform::process_start_time(pid).unwrap();
         app.inbound
@@ -3755,6 +3750,22 @@ mod tests {
         edge.enrollment.peer = "node-b.example".into();
         edge.enrollment.node_id = Some(node.clone());
         edge.enrollment.state = "pinned".into();
+        app.current_api_peer_pid = Some(pid);
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "ingest".into(),
+            method: crate::api::schema::Method::PeersHubFleet(
+                crate::api::schema::PeersHubFleetParams {
+                    hub: "node-b.example".into(),
+                    fleet: vec![relayed],
+                    hub_self: None,
+                },
+            ),
+        });
+        assert!(serde_json::from_str::<serde_json::Value>(&response)
+            .unwrap()
+            .get("error")
+            .is_none());
+        app.current_api_peer_pid = None;
         // Drive the real pin/path projection endpoint before building the band.
         let request = serde_json::from_value(serde_json::json!({
             "id":"fixture", "method":"peers.enrollment", "params":{}}))
@@ -3773,6 +3784,7 @@ mod tests {
         let (mut app, _) = server_identity1076_fixture();
         let spoof = app.state.relayed_fleet_cache.values_mut().next().unwrap();
         spoof.via = Some("node-c.example".into());
+        spoof.source_node = None;
         spoof.peer.ssh_target = "attacker.example".into();
         let rows = app.state.remote_peers();
         assert_eq!(rows.len(), 2, "unproven claims remain separate");
@@ -3993,6 +4005,8 @@ mod tests {
             &mut app.state.relayed_fleet_cache,
             vec![row],
             "node-c.example",
+            None,
+            std::time::Instant::now(),
         );
         let request = serde_json::from_value(
             serde_json::json!({"id":"route", "method":"peers.enrollment", "params":{}}),
@@ -4031,13 +4045,21 @@ mod tests {
             &mut cache,
             vec![row("node-one"), row("node-two")],
             "node-a.example",
+            None,
+            std::time::Instant::now(),
         );
         assert_eq!(
             cache.len(),
             2,
             "hostnames cannot overwrite a different node"
         );
-        crate::peers::merge_relayed_fleet(&mut cache, vec![row("node-one")], "node-c.example");
+        crate::peers::merge_relayed_fleet(
+            &mut cache,
+            vec![row("node-one")],
+            "node-c.example",
+            None,
+            std::time::Instant::now(),
+        );
         assert_eq!(
             cache.len(),
             3,
@@ -4047,7 +4069,13 @@ mod tests {
             "name":"legacy.example", "host":"node:node-one", "ssh_target":"legacy.example",
             "origin":"node-a.example", "age_secs":0}))
         .unwrap();
-        crate::peers::merge_relayed_fleet(&mut cache, vec![legacy], "node-a.example");
+        crate::peers::merge_relayed_fleet(
+            &mut cache,
+            vec![legacy],
+            "node-a.example",
+            None,
+            std::time::Instant::now(),
+        );
         assert_eq!(
             cache.len(),
             4,
@@ -4546,6 +4574,7 @@ mod tests {
         let relayed = |name: &str, host: Option<&str>, target: &str| {
             let mut entry =
                 crate::peers::relayed_entry_from_wire(crate::api::schema::RelayedFleetPeer {
+                    structured_agents: Vec::new(),
                     node_id: None,
                     name: name.to_string(),
                     ssh_target: target.to_string(),
@@ -5785,6 +5814,7 @@ mod tests {
             "claim".into(),
             crate::peers::RelayedEntry {
                 peer: claim,
+                source_node: None,
                 via: Some("node-hub.example".into()),
                 hub_pushed: true,
             },
@@ -8442,7 +8472,8 @@ mod tests {
         app.terminals
             .get_mut(&first_terminal_id)
             .unwrap()
-            .set_agent_name("planner".into());
+            .set_agent_name("planner".into())
+            .unwrap();
         app.active = Some(0);
         app.selected = 0;
         app.set_agent_panel_scope(AgentPanelScope::AllWorkspaces);
@@ -9664,7 +9695,8 @@ mod tests {
         app.terminals
             .get_mut(&tid)
             .unwrap()
-            .set_agent_name("researcher".to_string());
+            .set_agent_name("researcher".to_string())
+            .unwrap();
 
         let (_, row) = agents_band_rows(&app);
         assert!(
@@ -9816,7 +9848,8 @@ mod tests {
         app.terminals
             .get_mut(&tid)
             .unwrap()
-            .set_agent_name("researcher".into());
+            .set_agent_name("researcher".into())
+            .unwrap();
 
         let (_, agent_row) = agents_band_rows(&app);
         let space_rows = space_and_member_rows(&mut app, Rect::new(0, 0, 44, 40));
@@ -9857,7 +9890,8 @@ mod tests {
         app.terminals
             .get_mut(&tid)
             .unwrap()
-            .set_agent_name("researcher".into());
+            .set_agent_name("researcher".into())
+            .unwrap();
         app.agent_aliases
             .insert("researcher".to_string(), "codex".to_string());
         app.config.ui.agents_agent_label = AgentLabelConfig::Symbol;

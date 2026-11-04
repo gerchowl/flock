@@ -58,6 +58,7 @@ struct UserInput {
 enum Input {
     User(UserInput),
     Decision(Control),
+    Refusal(Vec<u8>),
 }
 enum Command {
     Decide(Control),
@@ -86,7 +87,7 @@ impl std::error::Error for TurnEndUnknown {}
 pub struct StreamLocation {
     /// Existing flock data root (not the harness profile).
     pub data_dir: PathBuf,
-    /// Storage threshold captured from `[sessions]` at launch.
+    /// Caller-supplied persistence policy captured for this session.
     pub storage: super::blobs::StorageConfig,
     /// Agent identifier, containing only ASCII letters, digits, '-' or '_'.
     pub agent: String,
@@ -133,6 +134,10 @@ pub struct StreamRecord {
     /// Retained on disk so replay cannot manufacture a transient human prompt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_grant_request_id: Option<String>,
+    /// Book-issued permission handle for this stdout request, never copied from
+    /// harness JSON. Older records lack a handle and cannot authorize decisions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_request_seq: Option<u64>,
     /// Exact line without its LF; synthetic summaries explicitly identify loss.
     pub raw: String,
 }
@@ -167,22 +172,27 @@ impl Received {
         {
             return Some(super::state::Input::Progress);
         }
+        if let Some(request_seq) = self.record.permission_request_seq {
+            if matches!(self.event, SessionEvent::CanUseTool(_)) {
+                return Some(super::state::Input::PermissionEvent(
+                    &self.event,
+                    request_seq,
+                ));
+            }
+        }
         if self.record.origin == RecordOrigin::Flk {
+            if let SessionEvent::PermissionRequest(record) = &self.event {
+                return match record.state {
+                    crate::structured_wire::PermissionState::Closed { .. } => {
+                        Some(super::state::Input::ControlAnswered(&record.request_id))
+                    }
+                    _ => None,
+                };
+            }
             if let SessionEvent::Unknown { value, .. } = &self.event {
                 if value.get("type").and_then(Value::as_str) == Some("flk_input_accepted") {
                     // Monotonic stamps belong to this launch, never to replay.
                     return None;
-                }
-                if value.get("type").and_then(Value::as_str) == Some("flk_permission_request") {
-                    return match (
-                        value.get("state").and_then(Value::as_str),
-                        value.get("request_id").and_then(Value::as_str),
-                    ) {
-                        (Some("closed"), Some(id)) => {
-                            Some(super::state::Input::ControlAnswered(id))
-                        }
-                        _ => None,
-                    };
                 }
             }
         }
@@ -219,6 +229,8 @@ pub(super) struct InputHandle {
     accepted: mpsc::SyncSender<Accepted>,
     decisions: mpsc::SyncSender<Command>,
     permissions: Permissions,
+    #[cfg(test)]
+    permission_attempt: Arc<parking_lot::Mutex<Option<mpsc::Sender<bool>>>>,
     busy: Arc<AtomicBool>,
     uncertain: Arc<AtomicBool>,
     cancel: Arc<AtomicBool>,
@@ -285,12 +297,13 @@ impl Transport {
         }
         private_fs::set_nonblocking(&stdout)?;
         private_fs::set_nonblocking(&stdin)?;
-        let (input, input_rx) = mpsc::sync_channel(permissions::MAX_OPEN + 1);
+        let (input, input_rx) = mpsc::sync_channel(permissions::MAX_OPEN_PERMISSION_REQUESTS + 1);
         let (decisions, decision_rx) = mpsc::sync_channel(4);
         let permissions = Arc::new(parking_lot::Mutex::new(Book::new(location.agent.clone())));
         // The busy gate permits one admission until stdout retires its turn.
         // The stdout owner drains these facts before handling each response.
-        let (accepted_tx, accepted) = mpsc::sync_channel(permissions::MAX_OPEN + 1);
+        let (accepted_tx, accepted) =
+            mpsc::sync_channel(permissions::MAX_OPEN_PERMISSION_REQUESTS + 1);
         let plane = ControlPlane {
             accepted,
             book: permissions.clone(),
@@ -355,6 +368,8 @@ impl Transport {
                 accepted: accepted_tx,
                 decisions,
                 permissions,
+                #[cfg(test)]
+                permission_attempt: Default::default(),
                 busy,
                 uncertain,
                 cancel,
@@ -409,8 +424,9 @@ impl Transport {
         self.input.close_permissions(principal, id, reason)
     }
 
-    /// Open permission ids; contention fails closed rather than claiming no wait.
-    pub fn waiting_on_human(&self) -> Result<Vec<String>, ErrorCode> {
+    /// Open `(request_id, request_seq)` handles; contention fails closed rather
+    /// than claiming no wait. Carry the surfaced pair unchanged into a decide.
+    pub fn waiting_on_human(&self) -> Result<Vec<(String, u64)>, ErrorCode> {
         self.input.waiting_on_human()
     }
 
@@ -452,12 +468,45 @@ impl Drop for Transport {
 }
 
 impl InputHandle {
-    pub(super) fn waiting_on_human(&self) -> Result<Vec<String>, ErrorCode> {
-        Ok(self
-            .permissions
-            .try_lock()
-            .ok_or(ErrorCode::SessionBusy)?
-            .waiting())
+    pub(super) fn session_grants(
+        &self,
+        principal: &Principal<'_>,
+        revoke: Option<&permissions::grants::GrantHandle>,
+        show_input: bool,
+    ) -> Result<Vec<permissions::grants::SessionGrant>, ErrorCode> {
+        if !matches!(principal, Principal::Operator) {
+            return Err(ErrorCode::OperatorOnly);
+        }
+        if self.cancel.load(Ordering::Acquire) || self.close.load(Ordering::Acquire) {
+            return Err(ErrorCode::AgentNotFound);
+        }
+        let mut book = self.permissions.try_lock().ok_or(ErrorCode::SessionBusy)?;
+        if let Some(handle) = revoke {
+            book.revoke(handle)?;
+        }
+        Ok(book.grants(show_input && revoke.is_none()))
+    }
+    pub(super) fn waiting_on_human(&self) -> Result<Vec<(String, u64)>, ErrorCode> {
+        Ok(self.permission_book(false)?.waiting())
+    }
+
+    /// Queue-worker preflight waits for in-memory book operations to finish.
+    /// Losing a try_lock here would strand an idle queue without a wakeup.
+    pub(super) fn queue_waiting_on_human(&self) -> Result<Vec<(String, u64)>, ErrorCode> {
+        Ok(self.permission_book(true)?.waiting())
+    }
+
+    /// Only the synchronous journal-owning queue worker may wait. All holders
+    /// must release the book before I/O, logging, await or blocking channel calls.
+    fn permission_book(&self, wait: bool) -> Result<parking_lot::MutexGuard<'_, Book>, ErrorCode> {
+        let book = self.permissions.try_lock();
+        #[cfg(test)]
+        self.observe_permission_attempt(book.is_none());
+        match book {
+            Some(book) => Ok(book),
+            None if wait => Ok(self.permissions.lock()),
+            None => Err(ErrorCode::SessionBusy),
+        }
     }
     pub(super) fn agent_decide(
         &self,
@@ -473,17 +522,18 @@ impl InputHandle {
         let bytes = match encode(&answer.response) {
             Ok(bytes) => bytes,
             Err(_) => {
-                book.aborted(&answer.id);
+                book.aborted(&answer.id, answer.request_seq);
                 return Err(ErrorCode::InvalidParams);
             }
         };
         let id = answer.id.clone();
+        let request_seq = answer.request_seq;
         if self
             .decisions
             .try_send(Command::Decide(Control { answer, bytes }))
             .is_err()
         {
-            book.aborted(&id);
+            book.aborted(&id, request_seq);
             return Err(ErrorCode::SessionBusy);
         }
         Ok(())
@@ -541,6 +591,25 @@ impl InputHandle {
         user: &Value,
         observer_unavailable: impl FnOnce(),
     ) -> io::Result<()> {
+        self.submit(user, observer_unavailable, false)
+    }
+
+    /// Admit from the queue worker, waiting through book contention at this
+    /// second acquisition too. Operator-facing admission remains nonblocking.
+    /// Like `try_submit`, this passes a no-op acceptance observer. If acceptance
+    /// cannot reach the pump, submission sets I/O cancellation and returns
+    /// `BrokenPipe` without directly calling `stop.request()` via that observer.
+    /// The queue pump separately handles the returned `InputWriteFailed` offer.
+    pub(super) fn queue_submit(&self, user: &Value) -> io::Result<()> {
+        self.submit(user, || {}, true)
+    }
+
+    fn submit(
+        &self,
+        user: &Value,
+        observer_unavailable: impl FnOnce(),
+        wait_permissions: bool,
+    ) -> io::Result<()> {
         if self.cancel.load(Ordering::Acquire) || self.close.load(Ordering::Acquire) {
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
@@ -551,9 +620,8 @@ impl InputHandle {
             return Err(io::Error::other(TurnEndUnknown));
         }
         let permissions = self
-            .permissions
-            .try_lock()
-            .ok_or_else(|| io::Error::from(io::ErrorKind::WouldBlock))?;
+            .permission_book(wait_permissions)
+            .map_err(|_| io::Error::from(io::ErrorKind::WouldBlock))?;
         if permissions.blocked() {
             return Err(io::Error::from(io::ErrorKind::WouldBlock));
         }
@@ -609,7 +677,7 @@ impl InputHandle {
     }
 }
 
-fn encode(value: &Value) -> io::Result<Vec<u8>> {
+fn encode(value: &impl Serialize) -> io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     serde_json::to_writer(InputBuffer(&mut bytes), value)?;
     bytes.push(b'\n');
@@ -680,6 +748,7 @@ fn write_inputs(
                     }
                     Input::User(input) => (input.bytes, None),
                     Input::Decision(control) => (control.bytes, Some(control.answer)),
+                    Input::Refusal(bytes) => (bytes, None),
                 };
                 if let Some(check) = before_first_write.take() {
                     check()?;
@@ -720,7 +789,10 @@ fn write_inputs(
 /// Recovery truncates only a final tail without a trailing LF, syncs the repair,
 /// logs discarded bytes and resumes the last good sequence. Malformed records
 /// ending in LF are corruption and are refused, as are non-dense sequences.
-fn open_stream(location: StreamLocation, cancel: &AtomicBool) -> io::Result<(File, u64)> {
+fn open_stream(
+    location: StreamLocation,
+    cancel: &AtomicBool,
+) -> io::Result<(File, u64, permissions::Orphaned)> {
     let dir = location.data_dir.join("sessions");
     private_fs::ensure_private_dir(&dir)?;
     let dir = dir.join(location.agent);
@@ -729,12 +801,17 @@ fn open_stream(location: StreamLocation, cancel: &AtomicBool) -> io::Result<(Fil
     let mut file = match private_fs::create_private_file(&path) {
         Ok(file) => {
             drop(file);
-            return Ok((private_fs::open_append_file(&path)?, 0));
+            return Ok((
+                private_fs::open_append_file(&path)?,
+                0,
+                permissions::Orphaned::default(),
+            ));
         }
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => private_fs::open_append_file(&path)?,
         Err(e) => return Err(e),
     };
     let length = file.metadata()?.len();
+    let mut orphaned = permissions::Orphaned::default();
     let mut good_bytes = 0;
     let mut seq = 0_u64;
     {
@@ -757,6 +834,7 @@ fn open_stream(location: StreamLocation, cancel: &AtomicBool) -> io::Result<(Fil
                     return Err(io::Error::other("non-dense session sequence"));
                 }
                 seq = record.seq;
+                orphaned.observe(&record);
                 good_bytes += n;
             } else {
                 // A bounded scan accepts only an unterminated final tail. Any
@@ -783,7 +861,7 @@ fn open_stream(location: StreamLocation, cancel: &AtomicBool) -> io::Result<(Fil
         file.sync_all()?;
         crate::logging::structured_stream_repaired(length - good_bytes);
     }
-    Ok((file, seq))
+    Ok((file, seq, orphaned))
 }
 
 fn pump(
@@ -799,8 +877,8 @@ fn pump(
 ) -> io::Result<()> {
     let blobs = super::blobs::BlobStore::open(&location.data_dir).map_err(io::Error::other)?;
     let threshold = location.storage.blob_min_bytes;
-    let (mut file, mut seq) = open_stream(location, cancel)?;
-    history.initialize(&file, seq)?;
+    let (mut file, mut seq, orphaned) = open_stream(location, cancel)?;
+    history.initialize(&file, seq, file.metadata()?.len())?;
     let mut recorder = control::Recorder::new(
         &mut file,
         &mut seq,
@@ -813,6 +891,7 @@ fn pump(
         (&blobs, threshold, history),
     );
     let result = (|| {
+        recorder.recover(orphaned)?;
         let mut line = Vec::new();
         let mut count = 0_u64;
         let mut metadata = metadata::Line::default();
@@ -906,7 +985,7 @@ fn emit(
     storage: (&super::blobs::BlobStore, usize, &super::history::History),
 ) -> io::Result<()> {
     let received = persist(
-        file, seq, line, count, version, busy, uncertain, synthetic, None, storage,
+        file, seq, line, count, version, busy, uncertain, synthetic, None, None, storage,
     )?;
     publish(received, tx, cancel)
 }
@@ -921,6 +1000,7 @@ fn persist(
     uncertain: &AtomicBool,
     synthetic: bool,
     grant_request_id: Option<&str>,
+    permission_request_seq: Option<u64>,
     storage: (&super::blobs::BlobStore, usize, &super::history::History),
 ) -> io::Result<Received> {
     let origin = if synthetic || count > MAX_LINE_BYTES as u64 || std::str::from_utf8(line).is_err()
@@ -988,6 +1068,7 @@ fn persist(
         origin,
         result_subtype,
         permission_grant_request_id: grant_request_id.map(str::to_owned),
+        permission_request_seq,
         raw,
     };
     if let Some(raw) = stored_raw {
@@ -998,8 +1079,17 @@ fn persist(
         file.sync_data()?;
         let stored = Arc::new(record);
         storage.2.publish(stored.clone(), encoded.len())?;
-        record = Arc::unwrap_or_clone(stored);
-        record.raw = live_raw;
+        record = StreamRecord {
+            raw: live_raw,
+            seq: stored.seq,
+            known: stored.known,
+            shape: stored.shape.clone(),
+            received_at_ms: stored.received_at_ms,
+            origin: stored.origin,
+            result_subtype: stored.result_subtype.clone(),
+            permission_grant_request_id: stored.permission_grant_request_id.clone(),
+            permission_request_seq: stored.permission_request_seq,
+        };
     }
     if ends_turn || (origin == RecordOrigin::Flk && turn_end == "result") {
         uncertain.store(false, Ordering::Release);
@@ -1018,11 +1108,7 @@ fn persist(
         accepted: None,
     })
 }
-fn publish(
-    mut received: Received,
-    tx: &mpsc::SyncSender<Received>,
-    cancel: &AtomicBool,
-) -> io::Result<()> {
+fn publish<T>(mut received: T, tx: &mpsc::SyncSender<T>, cancel: &AtomicBool) -> io::Result<()> {
     loop {
         if cancel.load(Ordering::Acquire) {
             return Err(cancelled());
@@ -1038,5 +1124,7 @@ fn publish(
     }
 }
 
+#[cfg(test)]
+mod test_support;
 #[cfg(test)]
 mod tests;

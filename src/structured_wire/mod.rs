@@ -14,11 +14,16 @@ use serde_json::Value;
 #[cfg(test)]
 pub(crate) mod fixture;
 mod minimal;
+mod permission;
 // Later wire slices consume these exact payload re-exports.
 #[cfg_attr(feature = "web", allow(unused_imports))]
 pub use minimal::{
-    AgentDecide, AgentDecideErrorCode, AgentDecideResult, FleetAgentRow, FleetDelta,
-    PermissionDecision,
+    AgentDecide, AgentDecideErrorCode, AgentDecideResult, AgentSendResult, FleetAgentRow,
+    FleetDelta, FleetNodeRow, FleetProjectRow, PermissionDecision,
+};
+pub use permission::{
+    IgnoredPermissionReason, IgnoredPermissionSuggestions, PermissionAnswer, PermissionClose,
+    PermissionCloseReason, PermissionRecord, PermissionState,
 };
 #[cfg(test)]
 mod review_tests;
@@ -32,7 +37,8 @@ pub const WIRE_JSON_VERSION: u32 = 1;
 #[cfg_attr(feature = "web", allow(dead_code))]
 pub const CONNECT_DEADLINE_MS: u64 = 10_000;
 /// WebSocket-open to authenticated welcome ceiling, on both peers.
-pub const HANDSHAKE_DEADLINE_MS: u64 = 5_000;
+pub const HANDSHAKE_DEADLINE_MS: u64 =
+    crate::structured::permissions::auth::tokens::server::HANDSHAKE_DEADLINE_MS;
 /// Server application ping cadence, independent of other traffic.
 pub const HEARTBEAT_INTERVAL_MS: u64 = 15_000;
 /// Missing valid frame/pong ceiling; unrelated streams do not renew progress.
@@ -135,6 +141,8 @@ pub enum ClientFrame {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum SubfailCode {
+    /// Unsafe or reserved agent namespace. Select a valid subject, never retry unchanged.
+    InvalidAgent,
     /// Clear only this stream's state/cursor and bootstrap without after.
     CursorAhead,
     /// Stop until the principal changes.
@@ -143,36 +151,38 @@ pub enum SubfailCode {
     UnknownStream,
     /// Stop until read authorization changes.
     Scope,
+    /// Token mutation is pending; registered session_busy retries later on a fresh ID.
+    SessionBusy,
     /// Subscription identity was already used on this connection; allocate a fresh one.
     SubIdReused,
 }
 
-/// Token removed/replaced; ack precedes close 4403. Registered when S7 emits it.
-// Client timers and later wire slices consume this contract constant.
+/// Token removed or replaced: acknowledge `auth_revoked` before 4403 socket fan-out.
+// Later command admission emits this revocation wire spelling.
 #[cfg_attr(feature = "web", allow(dead_code))]
 pub const AUTH_REVOKED: &str = "auth_revoked";
-/// Valid token lacks scope. Registered when S7 emits it.
-// Client timers and later wire slices consume this contract constant.
+/// Valid token lacks the requested scope; refuse the operation without executing it.
+// Later scoped command/subscription admission emits this wire spelling.
 #[cfg_attr(feature = "web", allow(dead_code))]
 pub const SCOPE: &str = "scope";
-/// Unsupported subscription path. Registered when S7 emits it.
-// Client timers and later wire slices consume this contract constant.
+/// Unsupported stream path: refuse this subscription until a supported path is selected.
+// Later subscription routing emits this wire spelling.
 #[cfg_attr(feature = "web", allow(dead_code))]
 pub const UNKNOWN_STREAM: &str = "unknown_stream";
-/// Cursor exceeds the stream head; clear it and bootstrap.
-// Client timers and later wire slices consume this contract constant.
+/// Cursor exceeds the stream head: clear only that stream and bootstrap without `after`.
+// Later replay admission emits this wire spelling.
 #[cfg_attr(feature = "web", allow(dead_code))]
 pub const CURSOR_AHEAD: &str = "cursor_ahead";
-/// Stream requires an operator principal.
-// Client timers and later wire slices consume this contract constant.
+/// Current principal cannot read an operator-only stream; require a different principal.
+// Later operator-stream authorization emits this wire spelling.
 #[cfg_attr(feature = "web", allow(dead_code))]
 pub const OPERATOR_ONLY: &str = "operator_only";
-/// Subscription identity was already used on the current connection.
-// Client timers and later wire slices consume this contract constant.
+/// Subscription ID was already used on this connection: allocate a fresh ID.
+// Later subscription identity tracking emits this wire spelling.
 #[cfg_attr(feature = "web", allow(dead_code))]
 pub const SUB_ID_REUSED: &str = "sub_id_reused";
-/// Original command effect remains uncertain; never dispatch a missing claim.
-// Client timers and later wire slices consume this contract constant.
+/// Original command outcome is uncertain; a missing resume-only claim never dispatches.
+// Later idempotent command recovery emits this wire spelling.
 #[cfg_attr(feature = "web", allow(dead_code))]
 pub const SESSION_UNCONFIRMED: &str = "session_unconfirmed";
 

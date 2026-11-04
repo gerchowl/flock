@@ -4,6 +4,8 @@ mod peer_uid_tests;
 mod scoped_mcp_tests;
 #[cfg(test)]
 mod structured_lease_tests;
+#[cfg(test)]
+mod structured_relay_tests;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
@@ -27,6 +29,9 @@ mod mesh_replies;
 pub(crate) mod mesh_routes;
 mod mesh_spokes;
 pub(super) mod messages;
+mod native_inbox;
+#[cfg(test)]
+mod native_inbox_caller_tests;
 mod owner;
 mod owners;
 mod panes;
@@ -34,6 +39,12 @@ pub(crate) mod peers;
 pub(super) mod responses;
 mod revert;
 mod spawn;
+mod structured_agents;
+mod structured_grants;
+pub(crate) mod structured_messages;
+pub(crate) mod structured_queue;
+mod structured_relay;
+mod structured_start;
 mod tabs;
 pub(crate) mod workspaces;
 mod worktrees;
@@ -155,13 +166,28 @@ fn run_pr_poll_round(
     })
 }
 
-/// Local-operator evidence borrowed from the classified API request.
-/// Only this dispatcher can construct it; it cannot outlive or mutate its caller.
+/// Local-operator evidence borrowed from a classified API request or sealed TUI peer.
+/// Only this module can construct it; it cannot outlive or mutate its caller.
 pub(crate) struct LocalOperator<'a> {
     _app: &'a mut App,
+    peer: crate::platform::peer::Credentials,
+}
+
+impl LocalOperator<'_> {
+    /// Accepted kernel evidence from this proof's connection, never a caller argument.
+    pub(crate) fn peer_credentials(&self) -> crate::platform::peer::Credentials {
+        self.peer
+    }
 }
 
 impl App {
+    pub(super) fn api_peer_credentials(&self) -> crate::platform::peer::Credentials {
+        crate::platform::peer::Credentials {
+            pid: self.current_api_peer_pid,
+            uid: self.current_api_peer_uid.flatten(),
+            birth: self.current_api_peer_birth.flatten(),
+        }
+    }
     /// Mint token-management authority only from the existing kernel/lease policy.
     pub(crate) fn client_token_authority(
         &mut self,
@@ -169,7 +195,16 @@ impl App {
         if !self.caller_is_local_operator() {
             return Err(crate::api::error_code::ErrorCode::OperatorOnly);
         }
-        Ok(LocalOperator { _app: self })
+        let peer = self.api_peer_credentials();
+        Ok(LocalOperator { _app: self, peer })
+    }
+
+    /// Reuse sealed transport admission for a TUI attach, without replacing API scope.
+    pub(crate) fn native_client_authority(&mut self, peer: &super::LocalPeer) -> LocalOperator<'_> {
+        LocalOperator {
+            peer: peer.credentials(),
+            _app: self,
+        }
     }
 
     /// Arm and spawn a transcript read for `pane_id` at the currently
@@ -201,6 +236,16 @@ impl App {
     }
 
     pub(crate) fn handle_internal_event(&mut self, ev: AppEvent) {
+        self.handle_internal_event_at(ev, std::time::Instant::now());
+    }
+
+    /// Apply an owner event with one observation instant shared by poll health
+    /// and every directly or indirectly delivered reading.
+    pub(crate) fn handle_internal_event_at(
+        &mut self,
+        ev: AppEvent,
+        observed_at: std::time::Instant,
+    ) {
         if let AppEvent::PasteConfirm { paste, respond_to } = ev {
             self.advance_paste(paste, respond_to);
             return;
@@ -454,7 +499,7 @@ impl App {
             // still proves the local poller is alive — dropping the health
             // update here would silently turn a config edit into a "poller
             // stopped" alert.
-            let now = std::time::Instant::now();
+            let now = observed_at;
             match &fetch.result {
                 Ok(_) => self.peer_poll_health.mark_success(now),
                 Err(msg) => self
@@ -462,6 +507,12 @@ impl App {
                     .mark_failure(now, crate::health::PeerPollErrorKind::classify(msg)),
             }
             let summary_every = self.state.config.gossip.dial_failure_summary();
+            let pinned = self
+                .state
+                .peers
+                .iter()
+                .find(|p| p.name == fetch.peer)
+                .and_then(|p| crate::peer_stream::enrollment(p).node_id);
             let Some(summary) = self
                 .state
                 .peer_summaries
@@ -477,15 +528,9 @@ impl App {
             summary.stream_error = fetch.stream_error;
             match fetch.result {
                 Ok(mut payload) => {
-                    let pinned = self
-                        .state
-                        .peers
-                        .iter()
-                        .find(|p| p.name == fetch.peer)
-                        .and_then(|p| crate::peer_stream::enrollment(p).node_id);
                     payload.node_id =
                         crate::peers::validated_summary_node(payload.node_id, pinned.as_deref());
-                    summary.node_id = payload.node_id.clone();
+                    summary.bind_node(payload.node_id.clone());
                     if payload.outbound_pending {
                         self.mesh_outbound_polls
                             .entry(fetch.peer.clone())
@@ -493,15 +538,12 @@ impl App {
                             .note_wake();
                         self.mesh_collect_at = None;
                     }
-                    // Gossip v3 (#101): merge the polled peer's relayed_fleet
-                    // into our cache BEFORE we mutate `summary`. Loop
-                    // prevention rides on the origin field: we drop entries
-                    // whose origin is us (the ONE full-cycle we could see —
-                    // hub A polls hub B, hub B relayed A's own peers back).
                     crate::peers::merge_relayed_fleet(
                         &mut self.state.relayed_fleet_cache,
                         payload.relayed_fleet,
                         &fetch.peer,
+                        payload.node_id.as_deref(),
+                        now,
                     );
                     summary.host = (!payload.host.is_empty()).then_some(payload.host);
                     summary.version = payload.version;
@@ -524,7 +566,8 @@ impl App {
                     }
                     summary.latency_ms = Some(payload.latency_ms);
                     summary.workspaces = payload.workspaces;
-                    summary.last_ok = Some(std::time::Instant::now());
+                    summary.structured_agents = payload.structured_agents;
+                    summary.last_ok = Some(now);
                     summary.error = None;
                     if let crate::peers::DialLog::Recovered {
                         failures,
@@ -551,6 +594,11 @@ impl App {
                 // #418: and say it in the log without saying it every poll —
                 // the edges, plus one summary per window while it lasts.
                 Err(error) => {
+                    // A failed transport proves no identity change. Only a known
+                    // replacement pin can rebind the cached owner facts.
+                    if pinned.is_some() {
+                        summary.bind_node(pinned);
+                    }
                     let reason = crate::peers::SshFailureReason::classify(&error);
                     let log = summary.dial.record_failure(reason, now, summary_every);
                     let consecutive = summary.dial.consecutive_failures;
@@ -592,6 +640,7 @@ impl App {
             // Only meaningful now that carried freshness decays.
             self.note_mesh_owners();
             self.state.evict_expired_relayed_entries();
+            self.sync_directory_events();
             self.render_dirty.store(true, Ordering::Release);
             self.render_notify.notify_one();
             return;
@@ -1057,7 +1106,10 @@ impl App {
                 data: crate::api::schema::EventData::PaneAgentDetected {
                     pane_id: pane_id.clone(),
                     workspace_id: workspace_id.clone(),
-                    agent: update.agent_label.clone(),
+                    agent: crate::terminal::agent_name::received(
+                        update.agent_label.clone(),
+                        "gui_event",
+                    ),
                 },
             });
         }
@@ -1092,7 +1144,10 @@ impl App {
                     pane_id,
                     workspace_id,
                     agent_status,
-                    agent: update.agent_label.clone(),
+                    agent: crate::terminal::agent_name::received(
+                        update.agent_label.clone(),
+                        "gui_event",
+                    ),
                     title: presentation.title,
                     display_agent: presentation.display_agent,
                     custom_status: presentation.custom_status,
@@ -1397,6 +1452,7 @@ impl App {
         // ADR-0005) before the response goes out, so a socket caller sees its
         // own event on the stream.
         self.drain_pending_ui_events();
+        self.sync_directory_events();
         response
     }
 
@@ -1406,6 +1462,10 @@ impl App {
         request: &crate::api::schema::Request,
     ) -> Option<String> {
         use crate::api::{error_code::ErrorCode, schema::Method};
+        // Mint validates kernel evidence before any generic start-time recheck.
+        if matches!(request.method, Method::ClientAppMint(_)) {
+            return None;
+        }
         if self
             .current_api_scope
             .as_ref()
@@ -1420,13 +1480,16 @@ impl App {
         let uid = self.current_api_peer_uid?;
         let code = if matches!(
             request.method,
-            Method::ServerStop(_)
+            Method::StructuredGrantsList(_)
+                | Method::StructuredGrantsRevoke(_)
+                | Method::ServerStop(_)
                 | Method::ServerReloadConfig(_)
                 | Method::ServerLiveHandoff(_)
                 | Method::ClientTokenAdd(_)
                 | Method::ClientTokenRemove(_)
                 | Method::ClientTokenList(_)
                 | Method::ClientOpen(_)
+                | Method::ClientAppMint(_)
         ) && !matches!(self.spawn_caller(), spawn::SpawnCaller::Operator { .. })
         {
             Some(ErrorCode::OperatorOnly)
@@ -1443,6 +1506,13 @@ impl App {
                 .uid_policy
                 .refusal(uid, attributed, &request.method)
         }?;
+        let code = if matches!(&request.method, Method::AgentSend(p)
+            if matches!(self.structured_send_target(&p.target), Ok(Some(_))))
+        {
+            ErrorCode::NotAuthorized
+        } else {
+            code
+        };
         Some(responses::encode_error(
             request.id.clone(),
             code.as_str(),
@@ -1454,6 +1524,7 @@ impl App {
         use crate::api::schema::{
             ErrorBody, ErrorResponse, Method, ResponseResult, SuccessResponse,
         };
+        self.structured_sends.staged = None;
         self.input_writes.abandon_staged();
         self.pending_integration_install = None;
         self.detach_pending_message_relay();
@@ -1504,6 +1575,27 @@ impl App {
             );
         }
         let response = match request.method {
+            Method::StructuredGrantsList(p) => {
+                return self.handle_structured_grants(
+                    request.id,
+                    p.agent_id,
+                    None,
+                    None,
+                    p.show_input,
+                )
+            }
+            Method::StructuredGrantsRevoke(p) => {
+                return self.handle_structured_grants(
+                    request.id,
+                    p.agent_id,
+                    Some(p.generation),
+                    Some(crate::structured::permissions::grants::GrantHandle {
+                        request_id: p.request_id,
+                        request_seq: p.request_seq,
+                    }),
+                    false,
+                )
+            }
             Method::ServerStop(_) => {
                 self.state.should_quit = true;
                 SuccessResponse {
@@ -1587,6 +1679,7 @@ impl App {
             Method::TabClose(target) => return self.handle_tab_close(request.id, target),
             Method::AgentList(_) => return self.handle_agent_list(request.id),
             Method::AgentGet(target) => return self.handle_agent_get(request.id, target),
+            Method::AgentStop(target) => return self.handle_structured_stop(request.id, target),
             Method::AgentFocus(target) => return self.handle_agent_focus(request.id, target),
             Method::AgentRename(params) => return self.handle_agent_rename(request.id, params),
             Method::AgentStart(params) => return self.handle_agent_start(request.id, params),
@@ -1603,7 +1696,8 @@ impl App {
             Method::ClientTokenAdd(_)
             | Method::ClientTokenRemove(_)
             | Method::ClientTokenList(_)
-            | Method::ClientOpen(_) => {
+            | Method::ClientOpen(_)
+            | Method::ClientAppMint(_) => {
                 return self.handle_client_token(request.id, request.method);
             }
             Method::ChannelHello(params) => return self.handle_channel_hello(request.id, params),
@@ -1695,6 +1789,9 @@ impl App {
             }
             Method::PaneStashRestore(target) => {
                 return self.handle_pane_stash_restore(request.id, target)
+            }
+            Method::PaneResolveCodexLock(params) => {
+                return self.handle_resolve_codex_lock(request.id, params)
             }
             Method::PaneSendKeys(params) | Method::PaneWriteKeys(params) => {
                 return self.handle_pane_send_keys(request.id, params)
@@ -1999,6 +2096,7 @@ mod tests {
                 peer: "kiln".into(),
                 stream_error: None,
                 result: Ok(crate::peers::PeerSummaryPayload {
+                    structured_agents: Vec::new(),
                     node_id: None,
                     outbound_pending: false,
                     host: "kiln-host".into(),
@@ -2160,6 +2258,7 @@ mod tests {
                 crate::peers::PeerSummaryFetch {
                     peer: "atlas".into(),
                     result: Ok(crate::peers::PeerSummaryPayload {
+                        structured_agents: Vec::new(),
                         node_id: None,
                         outbound_pending: false,
                         host: "atlas".into(),
@@ -2225,6 +2324,7 @@ mod tests {
                 peer: "kiln".into(),
                 stream_error: None,
                 result: Ok(crate::peers::PeerSummaryPayload {
+                    structured_agents: Vec::new(),
                     node_id: None,
                     outbound_pending: false,
                     host: "kiln-host".into(),
@@ -2355,7 +2455,7 @@ mod tests {
         terminal.detected_agent = Some(Agent::Claude);
         // Exactly what `flock_agent_start` does when the calling model supplies
         // one: `agent_name` outranks the detected harness in `pane_details`.
-        terminal.set_agent_name("researcher".into());
+        terminal.set_agent_name("researcher".into()).unwrap();
         terminal.state = AgentState::Working;
 
         let response = app.handle_peers_summary("req_peers".into());
@@ -2398,7 +2498,8 @@ mod tests {
             .terminals
             .get_mut(&terminal_id)
             .unwrap()
-            .set_agent_name("researcher".into());
+            .set_agent_name("researcher".into())
+            .unwrap();
 
         let response = app.handle_peers_summary("req_peers".into());
         let value: serde_json::Value = serde_json::from_str(&response).unwrap();
@@ -2579,7 +2680,7 @@ mod tests {
 
         let published: Vec<crate::api::schema::EventEnvelope> = app
             .event_hub
-            .events_after(0)
+            .ring_snapshot_after(0)
             .into_iter()
             .map(|(_, envelope)| envelope)
             .collect();
@@ -2938,15 +3039,16 @@ mod tests {
             });
         }
 
-        let reports_done = |app: &App| {
-            app.event_hub.events_after(0).iter().any(|(_, event)| {
+        let reports_done =
+            |app: &App| {
+                app.event_hub.ring_snapshot_after(0).iter().any(|(_, event)| {
                 matches!(
                     &event.data,
                     crate::api::schema::EventData::PaneAgentStatusChanged { agent_status, .. }
                         if *agent_status == crate::api::schema::AgentStatus::Done
                 )
             })
-        };
+            };
         // At the deferring edge the pane is Idle but `seen` is still true → it
         // reports `Idle`, never `Done`.
         assert!(
@@ -2999,7 +3101,7 @@ mod tests {
             .get_mut(&terminal_id)
             .expect("test terminal should exist");
         terminal.respawn_shell_on_exit = true;
-        terminal.set_agent_name("codex".into());
+        terminal.set_agent_name("codex".into()).unwrap();
         terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
             source: "flock:codex".into(),
             agent: "codex".into(),
@@ -3020,7 +3122,7 @@ mod tests {
             .expect("terminal should survive respawn");
         assert!(!terminal.respawn_shell_on_exit);
         assert!(terminal.persisted_agent_session.is_none());
-        assert!(terminal.agent_name.is_none());
+        assert!(terminal.agent_name().is_none());
 
         for (_, runtime) in app.terminal_runtimes.drain() {
             runtime.shutdown();
@@ -3517,6 +3619,7 @@ mod tests {
                 peer: "kiln".into(),
                 stream_error: None,
                 result: Ok(crate::peers::PeerSummaryPayload {
+                    structured_agents: Vec::new(),
                     node_id: None,
                     outbound_pending: false,
                     host: "kiln-host".into(),
