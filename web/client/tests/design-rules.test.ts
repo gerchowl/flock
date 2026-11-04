@@ -158,6 +158,36 @@ describe("ESLint style ban", () => {
   });
 });
 
+describe("ESLint key-listener ban (one keyboard layer, #2904; the runtime key guard is the authority)", () => {
+  test.each([
+    ["a document keydown listener", 'document.addEventListener("keydown", () => undefined);'],
+    ["a window keyup listener", "window.addEventListener(`keyup`, () => undefined);"],
+    ["an element capture listener", 'document.body.addEventListener("keydown", () => undefined, true);'],
+    ["the event name through a const", 'const type = "keydown"; document.addEventListener(type, () => undefined);'],
+    ["a bound alias", 'const on = document.addEventListener.bind(document); on("keydown", () => undefined);'],
+    ["an unbound alias through .call", 'const add = EventTarget.prototype.addEventListener; add.call(document, "keyup", () => undefined);'],
+    ["an onkeydown property", "document.onkeydown = () => undefined;"],
+    ["a computed onkeyup property", 'const key = "onkeyup"; document[key] = () => undefined;'],
+    ["a JSX onKeyDown handler", "export const A = () => <div onKeyDown={() => undefined} />;"],
+    ["a JSX on:keydown handler", "export const A = () => <div on:keydown={() => undefined} />;"],
+    ["a JSX onKeyDownCapture handler", "export const A = () => <div onKeyDownCapture={() => undefined} />;"],
+    ["a JSX onKeyUpCapture handler", "export const A = () => <div onKeyUpCapture={() => undefined} />;"],
+    ["a spread object with onKeyDown", "const props = { onKeyDown: () => undefined }; export const A = () => <input {...props} />;"],
+    ["a forged layer brand", 'export const brand = Symbol.for("flock.keyboard-layer");'],
+  ])("rejects %s outside the keyboard layer", async (_name, source) => {
+    const { code, output } = await eslint("src/workbench/Seeded.tsx", source);
+    expect(code).toBe(1);
+    expect(output).toContain("Keys go through the keyboard layer");
+  });
+
+  test("only the keyboard layer itself is exempt, by its override; the gallery is not", async () => {
+    expect((await eslint("src/workbench/keys.ts", 'document.addEventListener("keydown", () => undefined);')).code).toBe(0);
+    const tsx = "export const A = () => <div onKeyDown={() => undefined} />;";
+    expect((await eslint("src/gallery/Seeded.tsx", tsx)).code).toBe(1);
+    expect((await eslint("src/workbench/Seeded.tsx", 'document.addEventListener("click", () => undefined); export const A = { onClick: () => undefined };')).code).toBe(0);
+  });
+});
+
 describe("typed spacing", () => {
   test("an off-scale space is a type error", async () => {
     const { code, output } = await run(["x", "tsc", "--noEmit", "-p", "test/seeded/tsconfig.json"]);

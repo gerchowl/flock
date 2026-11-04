@@ -420,7 +420,7 @@ export function installChecks(): void {
           el.setAttribute("data-hig-name", String(idOf(el)));
           return { id: idOf(el), where: where(el), name: name(el) };
         }),
-      dialogOpen: () => [...document.querySelectorAll('[role="dialog"]')].some(shown) && document.activeElement?.closest('[role="dialog"]') !== null,
+      dialogOpen: () => [...document.querySelectorAll('[role="dialog"], dialog')].some(shown) && document.activeElement?.closest('[role="dialog"], dialog') !== null,
     },
   });
 }

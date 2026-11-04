@@ -274,8 +274,9 @@ so the required `client` CI check runs it on every change. One test per rule:
    equal the name in Chromium's accessibility tree, so the two cannot drift.
    ArrowDown moves the selection of every list widget,
    the palette's included, and a list with nothing to focus fails. ⌘K opens
-   the palette from wherever focus is, and Esc closes it and returns focus
-   there.
+   the palette and `?` the shortcut sheet from wherever focus is (`?` from
+   any but a text field); Tab and Shift+Tab stay inside each, and Esc closes
+   it and returns focus there.
    ([Keyboards](https://developer.apple.com/design/human-interface-guidelines/keyboards);
    [WCAG 2.2 SC 2.1.1, 2.4.7, 4.1.2](https://www.w3.org/TR/WCAG22/).)
 9. **Structure.** A sidebar's disclosure groups nest at most two deep. On
@@ -301,7 +302,7 @@ times out fails the run, and the browser's processes are killed and reaped
 either way.
 
 Every check, and each part of rules 4, 8 and 9, has a seeded violation in
-the test's `SEEDS` (28 in all: one below the fold, one only in dark mode,
+the test's `SEEDS` (35 in all: one below the fold, one only in dark mode, one swallowing Tab so focus walks out of a dialog, six key listeners outside the keyboard layer,
 one hiding the page, one where the parity walk misses a toolbar's
 buttons, four icon buttons named only by a tooltip or a hidden icon's `<title>`, two label references whose text is hidden, one name walk that drifts from Chromium's). A test runs each check on its page with and without
 its seed and fails unless the seed adds a finding.
@@ -354,6 +355,34 @@ These follow the accepted redesign (#2903).
 - **Composer.** One field: the text area with the send icon button inside
   it at the trailing edge, then the agent's phase and the shortcut hint
   (⌘↩) under it. There is no Send button below.
+- **Keyboard** (#2904). `workbench/keys.ts` is the one registry of
+  shortcuts; the `?` sheet and the ⌘K palette list it, and its one listener
+  dispatches every key the client handles. A screen binds what a shortcut
+  does on an element (`bindKeys`); an open palette, sheet or popover pushes
+  a key layer (`pushLayer`) for its Esc, Tab and list keys. A modal layer
+  (the palette, the `?` sheet) is exclusive: while it is open nothing
+  behind it acts, even with focus forced behind it. Labels write modifiers in
+  ⌃⌥⇧⌘ order; ⌘ is Ctrl off Apple platforms. A standard shortcut keeps its
+  meaning: in a text field the keys edit text, and ⌘↩/⌘⌫ answer a request
+  only on its focused card. Nothing fires while an input method is
+  composing (#2967): the one listener holds the one composition guard.
+  A focused list widget (the gallery's) binds its arrows too
+  (`listbox.next`/`listbox.previous`); nothing is exempt.
+- **One listener, enforced.** The layer's listener carries a brand
+  (`Symbol.for("flock.keyboard-layer")`). In every browser test (the
+  keyboard harness, conformance in every page and mode, screenshots, CSP,
+  Details), a key guard (`e2e/key-guard.ts`) is the first init script: it
+  wraps `addEventListener` and the `onkey*` setters and records every
+  key listener without the brand, whatever the alias (`.bind`, `.call`,
+  a `const` event name) or phase (capture), and it scans the rendered
+  elements for Solid's delegated `$$key*` handlers, which any JSX key
+  prop (spread or not) becomes. It reads every frame of the page, child
+  frames included. Any finding fails the run. Seeds prove each
+  bypass is caught: `KEYS_SEED=<const|bind|spread|capture|iframe>` runs real
+  compiled code in the keyboard harness, and the conformance `keys-*`
+  seeds assert their finding. ESLint's `design/keys` rule is the early
+  warning for the spellings it can see statically; the layer module is
+  exempt by an `overrides` entry, and nothing else is.
 
 ## Layout
 

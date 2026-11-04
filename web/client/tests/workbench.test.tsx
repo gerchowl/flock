@@ -24,6 +24,7 @@ import { markFor } from "../src/workbench/marks";
 import { previewControls } from "../src/workbench/preview";
 import { SAMPLE_AGENTS } from "../src/workbench/samples";
 import { shortcutLabel } from "../src/workbench/Palette";
+import { COMMAND, LAYER_COMMANDS } from "./keys-command";
 import { Workbench } from "../src/workbench/Workbench";
 import { readFixture } from "./fixture-replay";
 import { Harness, WELCOME, live, sentFrames, step } from "./wire/harness";
@@ -440,27 +441,31 @@ describe("command palette", () => {
   test("with preview, the toolbar's unbuilt actions follow the agents, dimmed: every toolbar action has its command", async () => {
     const root = mount(() => <Workbench fleet={createFixtureFleet(SAMPLE_AGENTS)} transport={createFixtureTransport("")} inbox={[]} layout={emptyLayout()} sender={null} saveLayout={() => undefined} source="replay" preview />);
     await tick();
-    key(document, { key: "k", metaKey: true });
+    key(document, { key: "k", ...COMMAND });
     expect($$(root, "palette-item").length).toBe(4);
     const waiting = $$(root, "palette-command") as HTMLElement[];
+    // The keyboard layer's commands run now; the unbuilt actions follow them, dimmed.
     expect(waiting.map((item) => [item.textContent, item.getAttribute("aria-disabled")])).toEqual([
+      ["Previous agent↑", null],
+      ["Next agent↓", null],
+      ["Keyboard shortcuts?", null],
       ["Hide sidebarWaits for collapsible panes", "true"],
       ["Needs youWaits for the attention count", "true"],
       ["New agentWaits for the harness picker", "true"],
       ["Show inspectorWaits for the inspector", "true"],
     ]);
-    waiting[2]?.click();
+    waiting[5]?.click();
     expect($(root, "palette")).not.toBeNull();
   });
 
   test("⌘K opens it; typing filters agents; Enter focuses the match", async () => {
     const root = await workbench(createFixtureFleet(SAMPLE_AGENTS));
     expect($(root, "palette")).toBeNull();
-    key(document, { key: "k", metaKey: true });
+    key(document, { key: "k", ...COMMAND });
     const input = $(root, "palette")?.querySelector("input") as HTMLInputElement;
     expect($$(root, "palette-item").length).toBe(4);
-    // Unbuilt actions are hidden, so the palette lists only the agents.
-    expect($(root, "palette-command")).toBeNull();
+    // Unbuilt actions are hidden, so the palette lists the agents, then only the keyboard layer's commands.
+    expect($$(root, "palette-command").map((item) => item.firstElementChild?.textContent)).toEqual([...LAYER_COMMANDS]);
     input.value = "wr";
     input.dispatchEvent(new InputEvent("input", { bubbles: true }));
     expect($$(root, "palette-item").map((item) => item.textContent)).toEqual(["wrenTurn finished"]);
@@ -486,7 +491,7 @@ describe("command palette", () => {
     const root = await workbench(createFixtureFleet(SAMPLE_AGENTS));
     const row = $(root, "agent-row") as HTMLButtonElement;
     row.focus();
-    document.dispatchEvent(new KeyboardEvent("keydown", { key: "k", metaKey: true, bubbles: true }));
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "k", ...COMMAND, bubbles: true }));
     await tick();
     const input = $(root, "palette")?.querySelector("input") as HTMLInputElement;
     expect(document.activeElement).toBe(input);
@@ -510,8 +515,8 @@ describe("command palette", () => {
     expect($$(root, "palette-item").every((item) => item.getAttribute("role") === "option")).toBe(true);
   });
 
-  test("the shortcut reads ⌘K on Apple platforms and Ctrl K elsewhere", () => {
-    expect(["MacIntel", "iPhone", "Win32", "Linux x86_64"].map(shortcutLabel)).toEqual(["⌘K", "⌘K", "Ctrl K", "Ctrl K"]);
+  test("the shortcut reads ⌘K on Apple platforms and Ctrl+K elsewhere", () => {
+    expect(["MacIntel", "iPhone", "Win32", "Linux x86_64"].map(shortcutLabel)).toEqual(["⌘K", "⌘K", "Ctrl+K", "Ctrl+K"]);
   });
 
   test("a query that matches no listed agent opens one by id; Escape closes", async () => {
@@ -846,7 +851,7 @@ describe("composer", () => {
     expect(buttons[0]?.querySelector('svg[aria-hidden="true"]')?.getAttribute("data-icon")).toBe("send");
     textarea(root).value = "ship it";
     textarea(root).dispatchEvent(new InputEvent("input", { bubbles: true }));
-    textarea(root).dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", metaKey: true, bubbles: true }));
+    textarea(root).dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", ...COMMAND, bubbles: true }));
     expect(sent).toEqual(["ship it"]);
   });
 });
@@ -991,7 +996,7 @@ describe("rendered copy", () => {
         ($$(root, "agent-row")[0] as HTMLButtonElement).click();
         await tick();
         seen.push(...copyOf(root));
-        document.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, key: "k", metaKey: true }));
+        document.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, key: "k", ...COMMAND }));
         expect($(root, "palette")).not.toBeNull();
         seen.push(...copyOf(root));
         expect(seen.filter((copy) => FORBIDDEN.test(copy))).toEqual([]);
