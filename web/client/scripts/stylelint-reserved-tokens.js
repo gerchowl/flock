@@ -89,6 +89,37 @@ function categories(prop) {
   return null;
 }
 
+/** Deterministic sums/differences of pixel tokens; no runtime CSS math or eval. */
+function calcPixels(value) {
+  const input = value.replace(/calc\(/gi, "(");
+  const parts = input.match(/\d*\.?\d+px|[()+-]/g) ?? [];
+  if (parts.join("") !== input.replace(/\s/g, "")) throw new Error("calc() requires pixel tokens and + or - only.");
+  let cursor = 0;
+  function operand() {
+    if (parts[cursor] === "(") {
+      cursor++;
+      const value = sum();
+      if (parts[cursor++] !== ")") throw new Error("Unbalanced calc() expression.");
+      return value;
+    }
+    const token = parts[cursor++];
+    if (!token?.endsWith("px")) throw new Error("Expected a pixel token in calc().");
+    return Number.parseFloat(token);
+  }
+  function sum() {
+    let value = operand();
+    while (["+", "-"].includes(parts[cursor])) {
+      const operator = parts[cursor++];
+      const next = operand();
+      value += operator === "+" ? next : -next;
+    }
+    return value;
+  }
+  const result = sum();
+  if (cursor !== parts.length || !Number.isFinite(result)) throw new Error("Unresolvable calc() expression.");
+  return result;
+}
+
 const valuesRule = (options) => (root, result) => {
   if (!stylelint.utils.validateOptions(result, valuesRuleName, { actual: options, possible: [true, Object] })) return;
   const { legacy = false, layout = false } = options === true ? {} : options;
@@ -123,6 +154,15 @@ const valuesRule = (options) => (root, result) => {
 
     /** Check all definitions, regardless of selectors or source order: no cascade guess. */
     function resolve(text, seen = new Set()) {
+      // Match the strict-value rule's properties; existing layout calculations
+      // (dimensions, flex-basis and transforms) retain their separate contracts.
+      const strict = legacy ? /color$|^(?:background-color|fill|stroke)$/ :
+        /color$|^background|^border|^font|^line-height$|^(?:box|text)-shadow$|^(?:fill|stroke|z-index)$|^-webkit-text-(?:stroke|fill)|gap$|^margin|^padding/;
+      const math = strict.test(prop) && /\bcalc\s*\(/i.test(text);
+      if (math && (!/^calc\([\s\S]*\)$/i.test(text.trim()) ||
+        !/var\(/i.test(text) || /[^\s()+-]/.test(text.replace(/var\(\s*--[\w-]+\s*\)/gi, "").replace(/calc\(/gi, "(")))) {
+        fail("calc() must be a whole-value sum/difference of same-category tokens.");
+      }
       const replaced = text.replace(/var\(\s*(--[\w-]+)\s*\)/gi, (_all, name) => {
         if (seen.has(name)) { fail(`Cyclic custom property ${name}.`); return ""; }
         if (tokens.has(name)) {
@@ -137,6 +177,12 @@ const valuesRule = (options) => (root, result) => {
         let first;
         for (const definition of definitions) {
           const resolved = resolve(definition, next);
+          if (math) {
+            try {
+              const pixels = calcPixels(`calc(${resolved})`);
+              if (expected?.includes("space-") && pixels % 4 !== 0) fail("calc() spacing must stay on the 4px grid in every mode.");
+            } catch (error) { fail(error.message); }
+          }
           first ??= resolved;
           if (fenced && prop === "display" && !display.has(resolved.trim().toLowerCase())) fail("Resolved display is disallowed outside src/layout/.");
           if (fenced && prop === "position" && !position.has(resolved.trim().toLowerCase())) fail("Resolved position is disallowed outside src/layout/.");
@@ -145,6 +191,9 @@ const valuesRule = (options) => (root, result) => {
         return first;
       });
       if (/\bvar\s*\(/i.test(replaced)) { fail("var() fallbacks and malformed references are disallowed."); }
+      if (math) {
+        try { calcPixels(replaced); } catch (error) { fail(error.message); }
+      }
       return replaced;
     }
     if (!legacy && /filter$/.test(prop)) {

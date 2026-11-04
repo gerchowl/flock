@@ -13,7 +13,7 @@
  * test process carries happy-dom's globals (tests/setup.ts).
  */
 import { describe, expect, test } from "bun:test";
-import { mkdtemp, mkdir, writeFile, rm, copyFile } from "node:fs/promises";
+import { mkdtemp, mkdir, writeFile, rm, copyFile, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -416,4 +416,91 @@ test("fenced token values are checked in every generated mode", async () => {
       expect((await lint()).code).toBe(0);
     }
   } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+
+describe("review paint and calc boundaries (#2937)", () => {
+  test.each([false, true])("checks imported JSX paint through types (keyword=%s)", async (keyword) => {
+    const root = await mkdtemp(join(CLIENT_ROOT, "node_modules/.cache/paint-types-"));
+    try {
+      await writeFile(join(root, "paint.ts"), keyword
+        ? 'export const paints = { fill: "none", stroke: "currentColor" } as const'
+        : 'export const paints = { fill: "#ac1234", stroke: "#321abc" }');
+      const entry = join(root, "probe.tsx");
+      await writeFile(entry, 'import { paints } from "./paint"; export const Probe = () => <svg><rect {...paints} /></svg>');
+      const result = await run(["scripts/check-design-types.ts", entry]);
+      expect({ code: result.code, output: result.code === 0 ? "" : result.output }).toMatchObject({ code: keyword ? 0 : 1 });
+      if (!keyword) expect(result.output).toContain("fill");
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
+  test.each([
+    ["embedded style", '<style>rect { color:#ac1234; fill:currentColor; stroke:#321abc }</style><rect width="10" height="10"/>'],
+    ["presentation attribute", '<rect fill="#ac1234" width="10" height="10"/>'],
+  ])("rejects imported SVG %s in the build", async (_name, content) => {
+    const root = await mkdtemp(join(tmpdir(), "design-svg-"));
+    try {
+      await mkdir(join(root, "src"));
+      await writeFile(join(root, "index.html"), '<script type="module" src="/src/main.ts"></script>');
+      await writeFile(join(root, "src/main.ts"), 'import image from "./probe.svg"; document.body.innerHTML = `<img src="${image}">`');
+      await writeFile(join(root, "src/probe.svg"), `<svg xmlns="http://www.w3.org/2000/svg">${content}</svg>`);
+      const result = await run(["run", "build", root]);
+      expect({ code: result.code, output: result.output }).toMatchObject({ code: 1 });
+      expect(result.output).toContain("design SVG");
+    } finally { await rm(root, { recursive: true, force: true }); }
+  }, 30_000);
+
+  test("accepts a resolvable same-category calc", async () => {
+    expect(await stylelint("src/probe.css", ".a { padding: calc(var(--space-2) + var(--space-3)); }")).toEqual({ code: 0, output: "" });
+  });
+
+  test.each([
+    ".a { padding: calc(var(--space-2) + 3px); }",
+    ".a { padding: calc(var(--space-2) + var(--font-size-13)); }",
+    ".a { padding: calc(var(--space-2) / 3); }",
+    ".a { padding: calc(var(--space-2) + var(--missing)); }",
+    ".a { padding: calc(var(--space-2, 3px) + var(--space-3)); }",
+    ".a { padding: calc(var(--space-2) + var(--space-3)) red; }",
+    ".a { padding: calc(var(--space-2) + var(--space-3); }",
+  ])("rejects an unprovable calc: %s", async (css) => {
+    expect((await stylelint("src/probe.css", css)).code).toBe(2);
+  });
+
+  test("accepts nested sums and local aliases", async () => {
+    expect((await stylelint("src/probe.css", ".a { --p: var(--space-2); padding: calc((var(--p) + var(--space-3)) - var(--space-1)); }")).code).toBe(0);
+  });
+
+  test.each([false, true])("checks cross-file JSX paint in a real build (raw=%s)", async (raw) => {
+    const root = await mkdtemp(join(tmpdir(), "design-paint-"));
+    try {
+      await mkdir(join(root, "src"));
+      await symlink(join(CLIENT_ROOT, "node_modules"), join(root, "node_modules"), "dir");
+      await writeFile(join(root, "vite.config.ts"), `export { default } from ${JSON.stringify(join(CLIENT_ROOT, "vite.config.ts"))}`);
+      await writeFile(join(root, "index.html"), '<script type="module" src="/src/main.tsx"></script>');
+      await writeFile(join(root, "src/paint.ts"), raw
+        ? 'export const paints = { fill: "#ac1234", stroke: "#321abc" }'
+        : 'export const paints = { fill: "none", stroke: "currentColor" } as const');
+      await writeFile(join(root, "src/main.tsx"), 'import { paints } from "./paint"; export const Probe = () => <svg><rect {...paints}/></svg>; console.log(Probe)');
+      const result = await run(["run", "build", root]);
+      expect({ code: result.code, output: result.code === 0 ? "" : result.output }).toMatchObject({ code: raw ? 1 : 0 });
+      if (raw) expect(result.output).toContain("design source types");
+    } finally { await rm(root, { recursive: true, force: true }); }
+  }, 30_000);
+
+  test.each(["public", "new URL", "mutated brand"])("rejects SVG via %s", async (kind) => {
+    const root = await mkdtemp(join(tmpdir(), "design-svg-"));
+    try {
+      await mkdir(join(root, "src"));
+      await mkdir(join(root, "public"));
+      await writeFile(join(root, "index.html"), '<script type="module" src="/src/main.ts"></script>');
+      await writeFile(join(root, "src/main.ts"), kind === "public" ? 'console.log("probe")' :
+        'console.log(new URL("./favicon.svg", import.meta.url).href)');
+      const logo = await Bun.file(join(CLIENT_ROOT, "src/favicon.svg")).text();
+      await writeFile(join(root, kind === "public" ? "public/probe.svg" : "src/favicon.svg"),
+        kind === "mutated brand" ? logo.replace("#d9dad8", "#ac1234") : '<svg xmlns="http://www.w3.org/2000/svg"><style>rect { fill: red }</style></svg>');
+      const result = await run(["run", "build", root]);
+      expect({ code: result.code, output: result.output }).toMatchObject({ code: 1 });
+      expect(result.output).toContain("design SVG");
+    } finally { await rm(root, { recursive: true, force: true }); }
+  }, 30_000);
 });

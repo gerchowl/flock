@@ -67,7 +67,8 @@ const strict = (properties) => [
   properties,
   {
     ignoreFunctions: false,
-    ignoreValues: KEYWORDS,
+    // Whole-value calc() is validated, including its resolved units, by design-values.
+    ignoreValues: [...KEYWORDS, "/^calc\\([\\s\\S]*\\)$/"],
     expandShorthand: true,
     recurseLonghand: true,
     disableFix: true,

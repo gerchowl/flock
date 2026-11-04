@@ -28,10 +28,24 @@ try {
       (method) => `readonly ${method.slice(0, method.indexOf("("))}: unknown;`));
   const lib = join(root, "lib.dom.d.ts");
   await writeFile(lib, dom);
+  // JSX intrinsic attributes must keep this constraint through imported spreads.
+  // Keep the pinned library intact; the compiler sees a restricted declaration copy.
+  const solid = dirname(fileURLToPath(import.meta.resolve("solid-js/package.json")));
+  const jsx = await readFile(join(solid, "types/jsx.d.ts"), "utf8");
+  const paint = /\b(color|fill|stroke)\?: string \| undefined;/g;
+  if (!["color", "fill", "stroke"].every((key) => jsx.includes(`${key}?: string | undefined;`))) {
+    throw new Error("design types: Solid paint declaration shape changed");
+  }
+  const jsxLib = join(root, "jsx.d.ts");
+  await writeFile(jsxLib, jsx.replace(paint,
+    '$1?: "none" | "currentColor" | "transparent" | "inherit" | "initial" | "unset" | "revert" | "revert-layer" | undefined;'));
   const seeds = process.argv.slice(2);
   await writeFile(join(root, "tsconfig.json"), JSON.stringify({
     extends: join(client, "tsconfig.json"),
-    compilerOptions: { lib: ["es2022", "dom.iterable"] },
+    compilerOptions: {
+      lib: ["es2022", "dom.iterable"],
+      paths: { "solid-js/jsx-runtime": [jsxLib], "solid-js/jsx-dev-runtime": [jsxLib] },
+    },
     files: [lib, join(client, "scripts/design-types.d.cts"), ...seeds.map((seed) => resolve(seed))],
     include: seeds.length ? [] : [join(client, "src/**/*.ts"), join(client, "src/**/*.tsx")],
   }));

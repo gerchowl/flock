@@ -109,6 +109,12 @@ the scale is a design question, not a missing token.
    additionally accepts its explicit `--l-*` input contract, supplied by
    typed primitive props. `@property` is forbidden outside generated tokens,
    including in LEGACY and layout files.
+   Whole-value `calc()` sums and differences of same-category pixel tokens
+   are allowed, including parentheses and local aliases. Every referenced
+   spacing value must remain on the 4 px grid in every generated mode.
+   Raw operands, scalar multiplication/division, mixed or relative units,
+   and calculations that cannot be resolved statically are rejected.
+   Existing layout dimension and transform calculations keep their own contracts.
    (stylelint, `stylelint-declaration-strict-value` and `flock/design-values`.)
 
    Token categories follow aliases too: padding, margin and gap require
@@ -361,6 +367,21 @@ loaded or a declaration's expected shape changes. Standard type checking still
 runs separately. This avoids declaration-merging precedence and covers concrete
 HTML, SVG and inline-style interfaces without guessing which variable is a DOM
 object.
+
+The same pass loads a restricted copy of Solid's pinned JSX declarations.
+`fill`, `stroke` and `color` accept only paint keywords (`none`, `currentColor`,
+`transparent` and CSS-wide keywords); token colours belong in CSS classes.
+This constraint also checks objects imported from other files and spread onto
+an intrinsic SVG element. A keyword object may preserve its literals with
+`as const`; an arbitrary string remains a type error.
+
+Standalone SVG images are restricted to the reviewed brand mark, verified by
+its exact SHA-256 content digest. Icons belong in the JSX catalogue
+(`src/workbench/marks.tsx`), where the paint rules apply. The build checks
+imported SVG modules, emitted SVG assets (including `new URL` references),
+and SVG files copied from Vite's public directory. Embedded styles and
+presentation attributes cannot introduce a new independently styled image;
+changing even the brand mark's paint requires a deliberate policy review.
 
 `unknown` also prevents passing an unavailable capability directly to generic
 object-mutating helpers; `never` would remain assignable there.
