@@ -266,7 +266,10 @@ so the required `client` CI check runs it on every change. One test per rule:
    Every control has an accessible name with a letter or digit, so an icon
    alone is not one, and a control that shows no letter or digit of its own
    (an icon button) takes it from `aria-label` or `aria-labelledby`: a
-   `title` is a tooltip, not a name. ArrowDown moves the selection of every list widget,
+   `title` is a tooltip, not a name. Names and shown words are read from
+   the whole subtree as the accessibility tree has it, so nothing under
+   `aria-hidden` counts, an SVG `<title>` in a hidden icon included.
+   ArrowDown moves the selection of every list widget,
    the palette's included, and a list with nothing to focus fails. ⌘K opens
    the palette from wherever focus is, and Esc closes it and returns focus
    there.
@@ -295,9 +298,9 @@ times out fails the run, and the browser's processes are killed and reaped
 either way.
 
 Every check, and each part of rules 4, 8 and 9, has a seeded violation in
-the test's `SEEDS` (22 in all: one below the fold, one only in dark mode,
+the test's `SEEDS` (25 in all: one below the fold, one only in dark mode,
 one hiding the page, one where the parity walk misses a toolbar's
-buttons, one icon button named only by its tooltip). A test runs each check on its page with and without
+buttons, four icon buttons named only by a tooltip or a hidden icon's `<title>`). A test runs each check on its page with and without
 its seed and fails unless the seed adds a finding.
 `CONFORMANCE_SEED=<seed> bun test ./e2e/conformance.test.ts` injects one
 seed for the whole run instead, and its rule's test fails. The suite's own
@@ -327,9 +330,10 @@ add next (#2899).
 These follow the accepted redesign (#2903).
 
 - **Density.** Desktop body text is 13 px and a regular control 28 px
-  (`--size-control`); single-line controls and rows stay within 28 to
-  32 px. The phone layout's controls keep `--size-touch`, 44 px, at any
-  window width.
+  (`--size-control`); controls and rows stay within 28 to 32 px. An agent
+  row is one line: its mark, its name, then its activity, each cut short
+  with an ellipsis (the activity's full text is its tooltip). The phone
+  layout's controls keep `--size-touch`, 44 px, at any window width.
 - **Selection.** The workbench marks its window `data-window="active"` or
   `"inactive"` from the window's focus (`workbench/window-focus.ts`). A
   selected row or palette item is the accent (`selection.active`, the

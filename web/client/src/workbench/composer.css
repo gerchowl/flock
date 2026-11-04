@@ -78,11 +78,6 @@
   display: none;
 }
 
-.phone .composer__input,
-.phone .composer__send {
+.phone .composer__input {
   min-block-size: var(--size-touch);
-}
-
-.phone .composer__send {
-  min-inline-size: var(--size-touch);
 }

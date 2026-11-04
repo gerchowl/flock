@@ -67,13 +67,13 @@ async function expectTouchTargets(page: Page): Promise<void> {
 
 /**
  * Desktop density (#2903): every button and summary is at least a 28 px
- * regular control, and the single-line ones are no taller than 32 px. An
- * agent row is two lines (name and activity), and a node's heading wraps
- * its status line (#2930 flattens it), so those are only held to 28.
+ * regular control, and the single-line ones, agent rows included, are no
+ * taller than 32 px. A node's heading wraps its status line (#2930
+ * flattens it), so it is only held to 28.
  */
 async function expectDesktopDensity(page: Page): Promise<void> {
   const boxes = await page.locator("button:visible, summary:visible").evaluateAll((nodes) =>
-    nodes.map((node) => ({ row: node.matches('.agent-row, [data-testid="group-node"] > .group__head'), box: node.getBoundingClientRect() })),
+    nodes.map((node) => ({ row: node.matches('[data-testid="group-node"] > .group__head'), box: node.getBoundingClientRect() })),
   );
   expect(boxes.length).toBeGreaterThan(0);
   expect(Math.min(...boxes.map(({ box }) => Math.min(box.width, box.height)))).toBeGreaterThanOrEqual(28);
@@ -156,6 +156,18 @@ describe("fixture preview", () => {
     expect(send!.y).toBeGreaterThanOrEqual(field!.y);
     await expect(page.getByTestId("composer").locator("button").count()).resolves.toBe(1);
     await expect(page.getByRole("button", { name: "Send" }).count()).resolves.toBe(1);
+    await page.close();
+  });
+
+  test("?layout=phone on a wide window keeps 44 px touch targets on the agent screen", async () => {
+    const page = await browser.newPage({ viewport: DESKTOP });
+    await page.goto(`${pathToFileURL(`${DIST}/index.html`).href}?layout=phone`);
+    await page.getByTestId("inbox-headline").waitFor({ timeout: 10_000 });
+    await page.getByRole("button", { name: "Agents" }).click();
+    await expectTouchTargets(page);
+    await page.getByTestId("agent-row").first().click();
+    await page.getByTestId("transcript-synced").waitFor({ timeout: 10_000 });
+    await expectTouchTargets(page);
     await page.close();
   });
 

@@ -12,7 +12,7 @@
  *
  * @module
  */
-import { splitProps, type JSX } from "solid-js";
+import type { JSX } from "solid-js";
 
 import "./icon.css";
 
@@ -60,19 +60,32 @@ export function Icon(props: { readonly name: IconName; readonly size?: 12 | 14 |
   );
 }
 
-/** Props of {@link IconButton}: a button's own attributes, its glyph and its required name. */
-export type IconButtonProps = Omit<JSX.ButtonHTMLAttributes<HTMLButtonElement>, "aria-label" | "children" | "style"> & {
+/** Props of {@link IconButton}: its glyph, its required name, and the few button attributes a screen sets. */
+export type IconButtonProps = {
   readonly icon: IconName;
   /** The accessible name, also shown as the tooltip. Shortcuts go in `title` separately when there is one. */
   readonly label: string;
+  readonly title?: string;
+  readonly type?: "button" | "submit";
+  readonly class?: string;
+  readonly disabled?: boolean;
+  readonly onClick?: () => void;
+  readonly "data-testid"?: string;
 };
 
 /** A button that shows only a glyph; `label` is its accessible name. */
 export function IconButton(props: IconButtonProps): JSX.Element {
-  const [own, rest] = splitProps(props, ["icon", "label", "class", "title", "type"]);
   return (
-    <button {...rest} type={own.type ?? "button"} class={own.class === undefined ? "icon-button" : `icon-button ${own.class}`} aria-label={own.label} title={own.title ?? own.label}>
-      <Icon name={own.icon} />
+    <button
+      type={props.type ?? "button"}
+      class={props.class === undefined ? "icon-button" : `icon-button ${props.class}`}
+      aria-label={props.label}
+      title={props.title ?? props.label}
+      disabled={props.disabled}
+      onClick={() => props.onClick?.()}
+      data-testid={props["data-testid"]}
+    >
+      <Icon name={props.icon} />
     </button>
   );
 }

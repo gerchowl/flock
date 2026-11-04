@@ -20,6 +20,12 @@
   cursor: pointer;
 }
 
+/* The phone layout keeps 44 px touch targets at any width. */
+.phone .icon-button {
+  min-inline-size: var(--size-touch);
+  min-block-size: var(--size-touch);
+}
+
 .icon-button:hover:enabled {
   background: var(--color-selection-inactive);
 }

@@ -118,6 +118,25 @@ const SEEDS: Readonly<Record<string, Seed>> = {
     into: "main",
     html: '<button data-testid="seed" class="icon-button" title="Send"><svg class="icon" aria-hidden="true" viewBox="0 0 16 16" width="16" height="16"><path d="M8 13V3.5"></path></svg></button>',
   },
+  // A hidden icon's <title> is no name, at any depth: inside a wrapper, under a hidden ancestor, or beside whitespace-only text.
+  "icon-label-wrapper": {
+    check: "keyboard",
+    page: "gallery",
+    into: "main",
+    html: '<button data-testid="seed" class="icon-button"><span><svg class="icon" aria-hidden="true" viewBox="0 0 16 16" width="16" height="16"><title>Send</title><path d="M8 13V3.5"></path></svg></span></button>',
+  },
+  "icon-label-hidden-title": {
+    check: "keyboard",
+    page: "gallery",
+    into: "main",
+    html: '<button data-testid="seed" class="icon-button"><span><span aria-hidden="true"><svg class="icon" viewBox="0 0 16 16" width="16" height="16"><title>Send</title><path d="M8 13V3.5"></path></svg></span></span></button>',
+  },
+  "icon-label-whitespace": {
+    check: "keyboard",
+    page: "gallery",
+    into: "main",
+    html: '<button data-testid="seed" class="icon-button" title="Send"> <span> <svg class="icon" aria-hidden="true" viewBox="0 0 16 16" width="16" height="16"><title>Send</title><path d="M8 13V3.5"></path></svg> </span> </button>',
+  },
   "tab-reach": { check: "tab-reach", page: "gallery", into: "main", html: '<span data-testid="seed" class="g-button" role="button">Unreachable</span>' },
   "focus-ring": { check: "focus-ring", page: "gallery", into: "main", html: '<button data-testid="seed" class="g-button" style="outline: none">Ringless</button>' },
   "focus-ring-resting-shadow": {

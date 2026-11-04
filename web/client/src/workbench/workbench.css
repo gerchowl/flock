@@ -80,17 +80,27 @@
   color: var(--color-label-on-selection);
 }
 
+/* One line (#2903): the name, then the activity, each cut short with an ellipsis. */
 .agent-row__text {
   display: flex;
-  flex-direction: column;
+  flex: 1;
+  align-items: baseline;
+  gap: var(--space-2);
   min-width: 0;
 }
 
 .agent-row__name {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
   font-weight: var(--font-weight-semibold);
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .agent-row__activity {
+  flex: 1 1 0;
+  min-width: 0;
   overflow: hidden;
   color: var(--color-legacy-muted);
   text-overflow: ellipsis;
@@ -386,6 +396,16 @@
 .phone .card__choices .waits {
   flex: 1 1 100%;
   align-items: stretch;
+}
+
+/* The phone layout's controls are 44 px touch targets at any width,
+   `?layout=phone` on a wide window included (HIG Accessibility). */
+.phone .action,
+.phone .agent-row,
+.phone .transcript__fold,
+.phone .host__trigger,
+.phone details > summary {
+  min-height: var(--size-touch);
 }
 
 .phone .card__choices .action {

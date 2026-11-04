@@ -121,20 +121,44 @@ export function installChecks(): void {
     const [hi, lo] = [luminance(a), luminance(b)].sort((x, y) => y - x);
     return (hi! + 0.05) / (lo! + 0.05);
   };
-  /** The text a control shows, without its hidden decoration (an icon's glyph). */
-  const ownText = (el: Element): string =>
-    [...el.childNodes]
-      .filter((node) => !(node instanceof Element && node.closest('[aria-hidden="true"]')))
-      .map((node) => node.textContent ?? "")
-      .join("")
-      .trim();
+  /**
+   * A subtree's text as the accessibility tree has it, at any depth (accname
+   * 1.2, name from content). Nothing under `aria-hidden` or unrendered counts,
+   * an SVG `<title>` in a hidden icon included. For a name, an element's
+   * `aria-label` stands in for its content and a shown SVG gives its `<title>`;
+   * for `words`, only text a sighted reader sees counts, so labels and titles
+   * do not.
+   */
+  const contentText = (node: Node, words: boolean): string => {
+    if (node.nodeType === Node.TEXT_NODE) return node.textContent ?? "";
+    if (!(node instanceof Element) || node.getAttribute("aria-hidden") === "true") return "";
+    if ((node instanceof HTMLElement || node instanceof SVGSVGElement) && !node.checkVisibility({ visibilityProperty: true })) return "";
+    const tag = node.tagName.toLowerCase();
+    if (node instanceof SVGElement && (tag === "title" || tag === "desc")) return "";
+    const label = node.getAttribute("aria-label")?.trim();
+    if (!words && label) return label;
+    if (!words && node instanceof SVGSVGElement) {
+      const title = [...node.children].find((child) => child.tagName.toLowerCase() === "title");
+      if (title?.textContent?.trim()) return title.textContent;
+    }
+    if (node instanceof HTMLImageElement) return words ? "" : node.alt;
+    return [...node.childNodes].map((child) => contentText(child, words)).join("");
+  };
+  /** The words a control shows, without its hidden decoration (an icon's glyph). */
+  const ownText = (el: Element): string => contentText(el, true).trim();
+  /** The text of the elements `aria-labelledby` names, or null when it names none. */
+  const labelledBy = (el: Element): string | null => {
+    const ids = el.getAttribute("aria-labelledby")?.split(/\s+/).filter(Boolean) ?? [];
+    const text = ids.map((id) => document.getElementById(id)?.textContent ?? "").join(" ").trim();
+    return ids.length > 0 && text !== "" ? text : null;
+  };
+  /** The accessible name: aria-labelledby, aria-label, a label, the content, then the tooltip. */
   const name = (el: Element): string => {
-    const labelled = el.getAttribute("aria-labelledby");
-    const label = el.getAttribute("aria-label") ?? (labelled ? document.getElementById(labelled)?.textContent : null);
+    const label = labelledBy(el) ?? (el.getAttribute("aria-label")?.trim() || null);
     if (label) return label;
     const labels = (el as HTMLInputElement).labels;
     if (labels && labels.length > 0) return [...labels].map((each) => each.textContent).join(" ");
-    return ownText(el) || (el.getAttribute("title") ?? "");
+    return contentText(el, false).trim() || (el.getAttribute("title") ?? "");
   };
   const report = (rule: string, hits: Hit[]): { rule: string; where: string; detail: string; el: Element }[] =>
     hits.map((hit) => ({ rule, where: where(hit.el), detail: hit.detail, el: hit.el }));
@@ -270,7 +294,7 @@ export function installChecks(): void {
       for (const el of interactive()) {
         if (!named.test(name(el))) hits.push({ el, detail: `control has no accessible name (${JSON.stringify(name(el))})` });
         // An icon-only control (#2903) shows no words, so an aria-label names it: a tooltip (`title`) is not a name.
-        else if (!named.test(ownText(el)) && !el.hasAttribute("aria-labelledby") && !named.test(el.getAttribute("aria-label") ?? "") && !(el as HTMLInputElement).labels?.length)
+        else if (!named.test(ownText(el)) && !named.test(labelledBy(el) ?? "") && !named.test(el.getAttribute("aria-label") ?? "") && !(el as HTMLInputElement).labels?.length)
           hits.push({ el, detail: "icon-only control without an aria-label" });
       }
       return hits;

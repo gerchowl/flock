@@ -41,7 +41,9 @@ export function AgentRowButton(props: { readonly row: AgentRow; readonly focused
       <StatusMark mark={markFor(props.row)} label={PHASE_LABELS[props.row.state]} count={props.row.waitingOnHuman.length} />
       <span class="agent-row__text">
         <span class="agent-row__name">{props.row.label}</span>
-        <span class="agent-row__activity">{props.row.activity}</span>
+        <span class="agent-row__activity" title={props.row.activity}>
+          {props.row.activity}
+        </span>
       </span>
     </button>
   );
