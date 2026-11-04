@@ -151,6 +151,10 @@ describe("lint what ships (#2933)", () => {
 describe("shipped CSS graph (#2933)", () => {
   test.each([
     ["pcss", "src/probe.pcss", ".a { color: red; }", false],
+    ["paint declaration", "vendor/probe.css", ".a { fill: red; }", false],
+    ["registered property", "vendor/probe.css", '@property --p { syntax: "*"; inherits: false; initial-value: flex; } .a { display: var(--p); }', false],
+    ["resolved fence", "vendor/probe.css", ".a { --p: var(--font-family-system); display: var(--p); }", false],
+    ["transitive category", "vendor/probe.css", ".a { --x: var(--y); --y: var(--font-size-13); padding: var(--x); }", false],
     ["raw graph import", "src/probe.txt?raw", ".a { color: inherit; }", false],
     ["inline graph import", "src/probe.css?inline", ".a { color: inherit; }", false],
     ["dependency CSS", "node_modules/evilpkg/style.css", ".nm{color:red;margin:13px;display:flex;position:absolute}", false],
@@ -281,4 +285,107 @@ describe("fix round 1 typed capabilities", () => {
       expect(result.output).toContain("probe.ts");
     } finally { await rm(root, { recursive: true, force: true }); }
   }, 30_000);
+});
+
+
+describe("declaration and fence seeds (#2937)", () => {
+  test.each([
+    ["5 fill", ".a { fill: #ff0000; }"],
+    ["5 stroke", ".a { stroke: red; }"],
+    ["5 text shadow", ".a { text-shadow: 1px 2px red; }"],
+    ["5 filter", ".a { filter: drop-shadow(1px 2px red); }"],
+    ["5 text stroke", ".a { -webkit-text-stroke: 1px red; }"],
+    ["6 font", ".a { font: 14px/1.3 Comic Sans MS; }"],
+    ["7 fallback", ".a { padding: var(--space-1, 13px); }"],
+    ["7 undefined", ".a { color: var(--nope); }"],
+    ["7 undefined token", ".a { padding: var(--space-999); }"],
+    ["8 fixed", ".a { position: fixed; }"],
+    ["8 sticky", ".a { position: sticky; }"],
+    ["8 table", ".a { display: table; }"],
+    ["8 contents", ".a { display: contents; }"],
+    ["8 vendor box", ".a { display: -webkit-box; }"],
+    ["8 float", ".a { float: left; }"],
+    ["8 columns", ".a { columns: 2; }"],
+    ["8 inset", ".a { inset: 0; }"],
+    ["8 top", ".a { top: 0; }"],
+    ["8 translate", ".a { translate: 1px; }"],
+    ["8 container", "@container (width > 1px) { .a { color: inherit; } }"],
+    ["8 supports", "@supports (display: grid) { .a { color: inherit; } }"],
+    ["8 import", '@import "other.css" screen and (max-width: 10px);'],
+    ["12 property", '@property --p { syntax: "<length>"; inherits: false; initial-value: 13px; } .a { padding: var(--p); }'],
+    ["12 resolved display", ".a { --d: var(--font-family-system); display: var(--d); }"],
+    ["12 keyword display", ".a { --d: auto; display: var(--d); }"],
+    ["14 padding", ".a { padding: var(--font-size-13); }"],
+    ["14 font size", ".a { font-size: var(--space-2); }"],
+    ["14 transitive", ".a { --a: var(--b); --b: var(--font-size-13); padding: var(--a); }"],
+    ["14 colour", ".a { color: var(--space-2); }"],
+    ["14 radius", ".a { border-radius: var(--space-2); }"],
+    ["14 layer", ".a { z-index: var(--space-2); }"],
+    ["legacy colour", ".a { color: var(--color-legacy-fg); }"],
+    ["legacy alias", ".a { --x: var(--color-legacy-fg); color: var(--x); }"],
+  ])("rejects bypass %s", async (_name, css) => {
+    const result = await stylelint("src/probe.css", css);
+    expect({ code: result.code, output: result.output }).toMatchObject({ code: 2 });
+  });
+
+  test.each([
+    ["cyclic aliases", ".a { --a: var(--b); --b: var(--a); padding: var(--a); }"],
+    ["alternative alias category", ".a { --x: var(--space-2); padding: var(--x); } .b { --x: var(--font-size-13); }"],
+    ["logical spacing", ".a { padding-inline-start: var(--font-size-13); }"],
+    ["font family category", ".a { font-family: var(--color-label-primary); }"],
+    ["font weight category", ".a { font-weight: var(--space-2); }"],
+    ["border width category", ".a { border-width: var(--space-2); }"],
+    ["border colour category", ".a { border-color: var(--border-width-thin); }"],
+    ["shadow colour category", ".a { text-shadow: var(--font-size-13); }"],
+    ["filter fallback", ".a { filter: drop-shadow(var(--space-1, 13px) 0 red); }"],
+    ["resolved fixed", ".a { --p: var(--x); --x: auto; position: var(--p); }"],
+    ["case normalized", ".a { DISPLAY: TABLE; }"],
+    ["escaped display", String.raw`.a { displa\79: table; }`],
+  ])("rejects %s", async (_name, css) => {
+    expect((await stylelint("src/probe.css", css)).code).toBe(2);
+  });
+  test("validates references inside LEGACY and layout files too", async () => {
+    for (const file of ["src/styles.css", "src/layout/primitives/seeded.css"]) {
+      expect((await stylelint(file, ".a { color: var(--missing); }")).code).toBe(2);
+      expect((await stylelint(file, '@property --x { syntax: "*"; initial-value: flex; }')).code).toBe(2);
+    }
+    expect((await stylelint("src/styles.css", ".a { color: var(--color-legacy-fg); }")).code).toBe(0);
+    expect((await stylelint("src/layout/primitives/seeded.css", ".a { gap: var(--font-size-13); }")).code).toBe(2);
+  });
+
+  test.each(["fill", "stroke", "color"])("rejects JSX %s", async (prop) => {
+    expect((await eslint("src/Probe.tsx", `<svg><rect ${prop}="#ff0000" /></svg>`)).code).toBe(1);
+  });
+
+  test.each([
+    '<rect fill={"red"} />',
+    '<rect attr:fill="red" />',
+    'const paint = "red"; <rect stroke={paint} />',
+    '<rect {...{color: "red"}} />',
+    'const props = {["fi" + "ll"]: "red"}; <rect {...props} />',
+  ])("rejects indirect JSX paint %s", async (source) => {
+    expect((await eslint("src/Probe.tsx", source)).code).toBe(1);
+  });
+  test.each([
+    '<rect fill="none" stroke="currentColor" />',
+    '<rect fill={"currentColor"} />',
+    '<rect {...{fill: "none"}} />',
+    'const data = {color: "red"}; export {data}',
+  ])("accepts paint keywords and ordinary data %s", async (source) => {
+    expect((await eslint("src/Probe.tsx", source)).code).toBe(0);
+  });
+  test.each(["gap", "margin", "padding"])("checks %s category inside layout", async (prop) => {
+    expect((await stylelint("src/layout/primitives/seeded.css", `.a { ${prop}: var(--font-size-13); }`)).code).toBe(2);
+    expect((await stylelint("src/layout/primitives/seeded.css", `.a { ${prop}: var(--space-2); }`)).code).toBe(0);
+  });
+
+  test.each([
+    ".a { --a: var(--b); --b: var(--space-2); padding: var(--a); }",
+    ".a { display: block; position: relative; }",
+    ".a { --d: none; display: var(--d); }",
+    ".a { backdrop-filter: blur(var(--space-5)); filter: drop-shadow(var(--space-1) 0 var(--color-label-primary)); }",
+    ".a { fill: currentColor; stroke: var(--color-label-primary); text-shadow: none; filter: none; }",
+  ])("accepts valid declaration %s", async (css) => {
+    expect(await stylelint("src/probe.css", css)).toEqual({ code: 0, output: "" });
+  });
 });

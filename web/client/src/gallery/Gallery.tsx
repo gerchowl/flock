@@ -10,7 +10,7 @@
  */
 import { For, createSignal, type JSX } from "solid-js";
 
-import { Center, Cluster, Grid, Sidebar, Stack, Switcher } from "../layout/primitives";
+import { Center, Cluster, Grid, Sidebar, Stack, Sticky, Switcher } from "../layout/primitives";
 import { SPACE } from "../tokens";
 import "./gallery.css";
 
@@ -57,7 +57,7 @@ export function Gallery(): JSX.Element {
   return (
     <div>
       <Sidebar side="left" sideWidth="240px" contentMin="50%" space={SPACE[4]}>
-        <nav class="g-sidebar" aria-label="Projects">
+        <Sticky as="nav" class="g-sidebar" aria-label="Projects">
           <Group title="flock">
             <Group title="web client">
               <button type="button" class="g-button">
@@ -65,7 +65,7 @@ export function Gallery(): JSX.Element {
               </button>
             </Group>
           </Group>
-        </nav>
+        </Sticky>
         <Center as="main" max="960px" gutters={SPACE[4]}>
           <Stack space={SPACE[6]}>
             <h1>Gallery</h1>

@@ -48,6 +48,12 @@ const design = {
       }
     }
     const report = (node, message = NO_STYLE) => context.report({ node, message });
+    function paint(node, key, value) {
+      if (!["fill", "stroke", "color"].includes(key)) return;
+      const literal = value?.type === "JSXExpressionContainer" ? value.expression : value;
+      if (literal?.type === "Literal" && /^(?:none|currentColor|transparent|inherit|initial|unset|revert|revert-layer)$/i.test(literal.value)) return;
+      report(node, "JSX paint attributes require a static keyword; use a CSS class for token colours.");
+    }
     return {
       Program(node) {
         for (const item of node.body) if (item.type === "ImportDeclaration") {
@@ -71,6 +77,7 @@ const design = {
           seen.add(node);
           if ((node.type === "TSAsExpression" || node.type === "TSTypeAssertion") && name(node.typeAnnotation.typeName) !== "const") report(node, "Value casts bypass typed design props; keep the original type.");
           if (node.type === "Property" && name(node.key) === "style") report(node);
+          if (node.type === "Property") paint(node, staticKey(node.key), node.value);
           if (node.type === "Identifier") {
             let scope = context.sourceCode.getScope(node);
             while (scope && !scope.set.has(node.name)) scope = scope.upper;
@@ -89,6 +96,7 @@ const design = {
       },
       JSXSpreadAttribute(node) { designValues.push(node.argument); },
       JSXAttribute(node) {
+        paint(node, name(node.name.type === "JSXNamespacedName" ? node.name.name : node.name), node.value);
         if (node.name.type === "JSXNamespacedName" && name(node.name.namespace) === "style") tokenWrite(node, node.name.name);
         if (designProps.has(name(node.name))) designValues.push(node.value);
         if (!layout && name(node.name) === "style") report(node);

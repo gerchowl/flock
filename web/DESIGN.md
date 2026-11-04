@@ -92,18 +92,54 @@ the scale is a design question, not a missing token.
 ## Rules
 
 1. **No raw values.** Colour, background, border, radius, `font-*`,
-   `line-height`, `box-shadow`, `z-index`, gaps, margins and padding take a
-   token or a keyword (`0`, `auto`, `inherit`, `currentColor`, `none`, …).
+   `line-height`, `box-shadow`, `text-shadow`, SVG `fill`/`stroke`,
+   `-webkit-text-stroke*`/`-webkit-text-fill*`, `z-index`, gaps, margins
+   and padding take a token or a keyword (`0`, `auto`, `inherit`, `currentColor`, `none`, …).
    Raw values appear only in the generated `tokens.css`. A custom property
    may only alias tokens: `--x: var(--space-2)`, never `--x: 8px`.
-   (stylelint, `stylelint-declaration-strict-value`.)
+   `font` shorthand is allowed only as `font: inherit`. Filters take
+   `blur()`/`drop-shadow()` with token arguments, zero and `currentColor`,
+   or a keyword; raw lengths and colours are rejected.
+   `var()` fallbacks are forbidden, even when the primary token exists.
+   Every reference must name a generated token or a local alias defined in
+   the same stylesheet. All alias definitions are checked transitively,
+   including alternatives in other selectors; unknown names and cycles
+   fail. Cross-file local aliases are deliberately rejected because their
+   cascade cannot be proven from one stylesheet. The primitive stylesheet
+   additionally accepts its explicit `--l-*` input contract, supplied by
+   typed primitive props. `@property` is forbidden outside generated tokens,
+   including in LEGACY and layout files.
+   (stylelint, `stylelint-declaration-strict-value` and `flock/design-values`.)
+
+   Token categories follow aliases too: padding, margin and gap require
+   `--space-*`; font size and line height require `--font-size-*`; font
+   family and weight require their corresponding `--font-family-*` and
+   `--font-weight-*`; radius requires `--radius-*`; z-index requires
+   `--layer-*`. Colours, backgrounds and SVG paints require `--color-*`;
+   border widths require `--border-width-*`. Border/outline shorthands may
+   combine width and colour tokens; shadows and filters may combine space,
+   border-width and colour tokens. Control dimensions accept size or space
+   tokens. Other font properties and border styles accept keywords, with
+   no token category. LEGACY files retain their existing raw-value and
+   category exemptions, but unknown references and fallbacks still fail.
+   `--color-legacy-*` references are allowed only in the existing LEGACY
+   stylesheets and generated tokens, including through aliases.
 2. **Layout lives in `src/layout/`.** Outside it, CSS may not use
-   `display: flex` or `grid` (inline forms included), `gap`, margins,
-   `position: absolute` or `@media`. Compose the primitives instead.
-   (stylelint overrides.)
+   any `display` except `none`, `block`, `inline`, `inline-block` and CSS
+   global keywords, or any `position` except `static`, `relative` and global
+   keywords. The same allowlists apply after resolving every local alias.
+   Gap, margins, float/clear, columns and their count/width/span/fill,
+   inset (including logical forms), top/right/bottom/left and translate
+   are fenced, as are `@media`, `@container`, `@supports` and conditional
+   `@import`. Compose the primitives instead. Existing LEGACY files retain
+   their layout exemption. (stylelint overrides and `flock/design-values`.)
 3. **No inline styles.** Source outside `src/layout/primitives/` may not set `style=` (or
    `attr:style`/`prop:style`): an inline style escapes both rules above.
-   JSX spreads containing inline styles are fenced too. DOM styling APIs,
+   JSX spreads containing inline styles are fenced too. JSX `fill`, `stroke`
+   and `color` (including namespaced attributes and local spread objects)
+   accept only static CSS keywords such as `none` and `currentColor`.
+   Literal and expression colours belong in token-based CSS classes. DOM
+   styling APIs,
    including computed access, stylesheet construction and adoption, are
    unavailable to the design type check. Plain data with a `style` key and
    plain objects with an `animate` method remain legal. Only primitives own
@@ -274,8 +310,9 @@ tab-bar rows (#2913), and the sidebar's third level (#2930).
 
 ## Layout
 
-The primitives in `src/layout/primitives/` follow
-[Every Layout](https://every-layout.dev/layouts/):
+The flow primitives in `src/layout/primitives/` follow
+[Every Layout](https://every-layout.dev/layouts/). `Sticky` keeps navigation
+or header chrome at the top of its scrolling container:
 
 | Primitive | Does | Props |
 | --- | --- | --- |
@@ -285,6 +322,7 @@ The primitives in `src/layout/primitives/` follow
 | `Switcher` | One row above a width threshold, one column below. | `threshold`, `space` |
 | `Center` | A centred column with a maximum width. | `max`, `gutters`, `intrinsic` |
 | `Grid` | As many equal columns as fit. | `min`, `space` |
+| `Sticky` | Chrome pinned to the top of its scrolling container. | `as`, `class` |
 
 Each takes `as` (the element), `class` and the element's other attributes.
 They respond to their container, not the viewport, so screens need no media
