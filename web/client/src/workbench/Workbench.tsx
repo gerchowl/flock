@@ -8,7 +8,7 @@
  * or placement field appears on screen.
  *
  * Parts that are not built yet are hidden (§2a as amended by #2900). With
- * `?preview` (the `preview` prop) they show disabled, naming what they wait
+ * the `preview` prop (a development build, `preview.ts`) they show disabled, naming what they wait
  * for, never as buttons that do nothing. There is no *Terminal* action:
  * structured agents replace terminal agents.
  *
@@ -62,7 +62,7 @@ export type WorkbenchProps = {
   readonly source: TranscriptSource;
   /** Phone or desktop; `auto` (the default) follows the viewport width. */
   readonly mode?: Mode;
-  /** Shows the unbuilt controls, disabled, with what they wait for (`?preview`); hidden by default. */
+  /** Shows the unbuilt controls, disabled, with what they wait for  (development builds only, `preview.ts`); hidden by default. */
   readonly preview?: boolean | undefined;
 };
 

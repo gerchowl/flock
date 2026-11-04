@@ -120,12 +120,12 @@ describe("fixture preview", () => {
     expect(await page.getByRole("button", { name: "‹ Back" }).isVisible()).toBe(true);
     await capture(page, "workbench-phone-agent-390x844");
 
-    // With ?preview, a card's answers are the phone's full-width 48 px buttons.
+    // A production build ignores ?preview: unbuilt controls are only for development builds (ADR-0048 D7).
     await page.goto(`${pathToFileURL(`${DIST}/index.html`).href}?preview`);
     await page.getByTestId("inbox-headline").waitFor({ timeout: 10_000 });
-    const choice = await page.getByTestId("inbox-card").first().locator("button").first().boundingBox();
-    expect(choice?.height).toBeGreaterThanOrEqual(48);
-    expect(choice?.width).toBeGreaterThan(PHONE.width / 2);
+    await expect(page.getByTestId("inbox-card").locator("button").count()).resolves.toBe(0);
+    await expect(page.locator(".waits, [aria-disabled]").count()).resolves.toBe(0);
+    await expect(page.getByRole("button", { name: "Activity" }).count()).resolves.toBe(0);
 
     expect(seen.requests.filter((url) => !url.startsWith("file:") && !url.startsWith("data:"))).toEqual([]);
     expect(seen.errors).toEqual([]);

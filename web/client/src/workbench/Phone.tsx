@@ -1,7 +1,7 @@
 /**
  * The phone workbench (ADR-0038 §2a, "Phone: inbox first"): a bottom tab
  * bar with Inbox (the default) and Agents, and an agent screen pushed over
- * the tabs. With `?preview` the unbuilt parts show disabled: the Activity tab
+ * the tabs. In a development build (`preview.ts`) the unbuilt parts show disabled: the Activity tab
  * and the agent screen's Summary and PR views. There are no splits; back returns to the origin
  * (§2 Phone), through the layout's history.
  *

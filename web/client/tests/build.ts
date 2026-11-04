@@ -9,11 +9,16 @@ import { readdir } from "node:fs/promises";
 /** The client's root directory. */
 export const CLIENT_ROOT = `${import.meta.dir}/..`;
 
-/** Builds the client in `mode` into `outDir` and lists the emitted files. */
+/**
+ * Builds the client in `mode` into `outDir` and lists the emitted files.
+ * `bun test` sets `NODE_ENV=test`, and Vite builds a development bundle
+ * (`import.meta.env.DEV`) under any `NODE_ENV` but `production`, so the
+ * child gets `production`: tests see the bundle `bun run build` ships.
+ */
 export async function buildClient(mode: "production" | "fixture" | "gallery", outDir: string): Promise<string[]> {
   const child = Bun.spawn(
     [process.execPath, "x", "vite", "build", "--mode", mode, "--outDir", outDir, "--emptyOutDir", "--logLevel", "error"],
-    { cwd: CLIENT_ROOT, stdout: "pipe", stderr: "pipe" },
+    { cwd: CLIENT_ROOT, stdout: "pipe", stderr: "pipe", env: { ...process.env, NODE_ENV: "production" } },
   );
   const [code, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()]);
   if (code !== 0) {

@@ -73,14 +73,17 @@ const REQUIRED_MEDIA: readonly string[] = ["light/no-preference/reduce", "dark/n
 
 /**
  * The fewest rendered elements and controls a page's walk may cover in any
- * mode: about nine tenths of what each renders today (43 and 14, 330 and
- * 68, 41 and 10), so hiding part of a page fails. Raise them as pages grow.
+ * mode. An emptiness detector, not a freeze on the page's size: a page that
+ * rendered nothing, or only an error line, falls under it, while hiding or
+ * removing controls does not. The smallest page (the phone inbox) renders 20
+ * elements and 2 controls; a one-message screen renders under 10.
  */
+const MIN_ELEMENTS = 10;
 const MIN_COVERAGE: Readonly<Record<PageName, { elements: number; controls: number }>> = {
-  gallery: { elements: 39, controls: 12 },
-  workbench: { elements: 300, controls: 60 },
-  "workbench-phone": { elements: 37, controls: 9 },
-  "workbench-forced-phone": { elements: 37, controls: 9 },
+  gallery: { elements: MIN_ELEMENTS, controls: 1 },
+  workbench: { elements: MIN_ELEMENTS, controls: 1 },
+  "workbench-phone": { elements: MIN_ELEMENTS, controls: 1 },
+  "workbench-forced-phone": { elements: MIN_ELEMENTS, controls: 1 },
 };
 
 /** The keyboard and structure checks that drive the page from the test, beside the in-page rules. */
@@ -144,6 +147,14 @@ const SEEDS: Readonly<Record<string, Seed>> = {
   },
   appearance: { check: "structure", page: "gallery", into: "main", html: '<button data-testid="seed" class="g-button">Dark mode</button>' },
   parity: { check: "parity", page: "workbench", into: "header.topbar", html: '<button data-testid="seed" type="button" class="action">Archive</button>' },
+  // A walk that drops a toolbar's actions (here all of them, as a filter on disabled ones would) must not pass as "no actions".
+  "parity-missed": {
+    check: "parity",
+    page: "workbench",
+    into: "header.topbar",
+    html: '<button data-testid="seed" type="button" class="action" aria-disabled="true">Archive</button>',
+    script: "{ const hig = globalThis.__hig; const walk = hig.toolbars; hig.toolbars = () => walk().map((bar) => ({ ...bar, actions: [] })); }",
+  },
   "focus-ring-dark": {
     check: "focus-ring",
     page: "gallery",
@@ -506,11 +517,18 @@ const DRIVEN: Readonly<Record<Driven, (page: Page, name: PageName) => Promise<st
     if (await hig<boolean>(page, "dialogOpen")) return ["Esc does not close the palette"];
     return (await hig<number | null>(page, "focusedId")) === before ? [] : ["Esc does not return focus to the control that had it"];
   },
-  // Every toolbar has actions, and each one, disabled or not, is a ⌘K command.
+  // Every toolbar action, disabled or not, is a ⌘K command. A toolbar with no actions passes, but
+  // the walk must have looked: it saw every toolbar and every rendered button in each.
   parity: async (page) => {
     const bars = await hig<{ where: string; actions: string[] }[]>(page, "toolbars");
-    if (bars.length === 0) return [];
-    const out = bars.filter((bar) => bar.actions.length === 0).map((bar) => `${bar.where}: a toolbar with no actions`);
+    const counted = await hig<{ where: string; buttons: number }[]>(page, "toolbarButtons");
+    const out = counted.flatMap((each, index) => {
+      const bar = bars[index];
+      if (bar === undefined || bar.where !== each.where) return [`${each.where}: a toolbar the parity walk never saw`];
+      return bar.actions.length === each.buttons ? [] : [`${each.where}: the parity walk saw ${bar.actions.length} of its ${each.buttons} buttons`];
+    });
+    if (bars.length > counted.length) out.push(`the parity walk saw ${bars.length} toolbars, the page renders ${counted.length}`);
+    if (bars.length === 0) return out;
     const actions = [...new Set(bars.flatMap((bar) => bar.actions))];
     if (!(await openPalette(page))) return [...out, ...actions.map((action) => `toolbar action "${action}": no ⌘K palette on this screen`)];
     const commands = await hig<string[]>(page, "commands");

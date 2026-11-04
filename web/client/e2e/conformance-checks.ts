@@ -340,6 +340,12 @@ export function installChecks(): void {
             where: where(bar),
             actions: [...bar.querySelectorAll("button")].filter((el) => shown(el) && !el.matches('[data-testid="palette-trigger"]')).map(name),
           })),
+      // The same toolbars' rendered buttons, counted apart from the walk above: parity
+      // compares the two, so a walk that misses a toolbar's actions fails instead of passing empty.
+      toolbarButtons: () =>
+        [...document.querySelectorAll('[role="toolbar"], header')]
+          .filter((el) => shown(el) && el.closest('[role="dialog"]') === null && !(el.matches("header") && el.closest('[role="toolbar"]') !== null))
+          .map((bar) => ({ where: where(bar), buttons: [...bar.querySelectorAll("button")].filter((el) => shown(el) && el.getAttribute("data-testid") !== "palette-trigger").length })),
       // What a walk covers, and the media the page itself sees, so a hidden page or a dropped mode shows.
       coverage: () => ({
         elements: elements().length,

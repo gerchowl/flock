@@ -4,7 +4,7 @@
  * {@link InboxCard} is a presentation type. Fixture mode shows the sample
  * cards below, labelled as samples. Live mode shows open permission prompts
  * (`workbench/permissions.ts`, #1749 PR 1; the server's open/closed record, `wire/permission-record.ts`), which answer for real.
- * A sample card's answers are not built: hidden, and with `?preview`
+ * A sample card's answers are not built: hidden, and in a development build
  * disabled, naming what they wait for.
  *
  * @module

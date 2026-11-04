@@ -901,8 +901,13 @@ describe("status marks", () => {
   });
 });
 
-test("?preview, with or without a value, asks for the unbuilt controls; nothing else does", () => {
-  expect(["?preview", "?preview=1", "?layout=phone&preview", "", "?previews", "?layout=preview"].map(previewControls)).toEqual([true, true, true, false, false, false]);
+test("unbuilt controls: always in a development build, with ?preview in a test build, never in a production build", () => {
+  const searches = ["?preview", "?preview=1", "?layout=phone&preview", "", "?previews", "?layout=preview"];
+  const test = { dev: false, production: false };
+  expect(searches.map((search) => previewControls(search, test))).toEqual([true, true, true, false, false, false]);
+  expect(searches.map((search) => previewControls(search))).toEqual([true, true, true, false, false, false]);
+  expect(searches.map((search) => previewControls(search, { dev: true, production: false }))).toEqual(searches.map(() => true));
+  expect(searches.map((search) => previewControls(search, { dev: false, production: true }))).toEqual(searches.map(() => false));
 });
 
 describe("rendered copy", () => {

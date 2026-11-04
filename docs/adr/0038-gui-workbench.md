@@ -285,8 +285,10 @@ or placement field appears in the product.
 | *New agent* | ADR-0036 S17 (harness, model and effort picker) | post-MVP |
 | Node summary ("2 nodes live") | G4 #1596 and the mesh | post-MVP: the MVP shows this node only |
 
-A post-MVP part is **hidden in production; visible only with `?preview`**,
-where it shows disabled with the name of what it waits for (amended by #2900).
+A post-MVP part is **hidden in production builds; visible only in development
+builds** (ADR-0048 D7 amendment 2, implemented by #2900; a test build also shows
+it with `?preview`, a production build never does), where it shows disabled
+with the name of what it waits for.
 It is never a button that does nothing, and no caption names an ADR, slice or
 issue. A control disabled for a runtime reason the server reports is not a
 post-MVP part and shows either way.
