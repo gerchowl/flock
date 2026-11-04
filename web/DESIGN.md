@@ -127,7 +127,8 @@ the scale is a design question, not a missing token.
 2. **Layout lives in `src/layout/`.** Outside it, CSS may not use
    any `display` except `none`, `block`, `inline`, `inline-block` and CSS
    global keywords, or any `position` except `static`, `relative` and global
-   keywords. The same allowlists apply after resolving every local alias.
+   keywords. The same allowlists apply after resolving every local alias
+   and every generated token mode.
    Gap, margins, float/clear, columns and their count/width/span/fill,
    inset (including logical forms), top/right/bottom/left and translate
    are fenced, as are `@media`, `@container`, `@supports` and conditional

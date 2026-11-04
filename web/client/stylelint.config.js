@@ -85,7 +85,7 @@ const ALIAS = {
 };
 
 export default {
-  plugins: ["stylelint-declaration-strict-value", "./scripts/stylelint-reserved-tokens.js", "./scripts/stylelint-design-values.js"],
+  plugins: ["stylelint-declaration-strict-value", "./scripts/stylelint-reserved-tokens.js"],
   rules: {
     "scale-unlimited/declaration-strict-value": strict(STRICT),
     "flock/no-token-redeclaration": true,

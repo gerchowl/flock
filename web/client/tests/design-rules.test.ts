@@ -13,7 +13,7 @@
  * test process carries happy-dom's globals (tests/setup.ts).
  */
 import { describe, expect, test } from "bun:test";
-import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, writeFile, rm, copyFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -388,4 +388,29 @@ describe("declaration and fence seeds (#2937)", () => {
   ])("accepts valid declaration %s", async (css) => {
     expect(await stylelint("src/probe.css", css)).toEqual({ code: 0, output: "" });
   });
+});
+
+
+test("fenced token values are checked in every generated mode", async () => {
+  const root = await mkdtemp(join(CLIENT_ROOT, "node_modules/.cache/token-modes-"));
+  try {
+    await mkdir(join(root, "scripts"));
+    await mkdir(join(root, "src"));
+    await copyFile(join(CLIENT_ROOT, "scripts/stylelint-reserved-tokens.js"), join(root, "scripts/stylelint-reserved-tokens.js"));
+    await writeFile(join(root, "config.json"), JSON.stringify({
+      plugins: ["./scripts/stylelint-reserved-tokens.js"], rules: { "flock/design-values": true },
+    }));
+    for (const [prop, safe, forbidden] of [["display", "block", "flex"], ["position", "relative", "fixed"]]) {
+      const lint = () => run(["x", "stylelint", "--config", join(root, "config.json"), "--config-basedir", root,
+        "--stdin-filename", "src/probe.css"], `.a { ${prop}: var(--layout-value); }`);
+      await writeFile(join(root, "src/tokens.css"), `:root {\n  --layout-value: ${safe};\n}
+@media (prefers-color-scheme: dark) { :root {\n  --layout-value: ${forbidden};\n} }
+@media (prefers-contrast: more) { :root {\n  --layout-value: ${safe};\n} }`);
+      const rejected = await lint();
+      expect(rejected.code).toBe(2);
+      expect(rejected.output).toContain(`Resolved ${prop} is disallowed`);
+      await writeFile(join(root, "src/tokens.css"), `:root {\n  --layout-value: ${safe};\n}`);
+      expect((await lint()).code).toBe(0);
+    }
+  } finally { await rm(root, { recursive: true, force: true }); }
 });
