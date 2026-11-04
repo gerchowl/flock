@@ -272,6 +272,10 @@ CI fetches `dev` for that comparison. Today it holds the legacy
 stylesheets' body size, count badge, rem spacing and touching sidebar and
 tab-bar rows (#2913), and the sidebar's third level (#2930).
 
+`web/baseline/` measures these rules' numbers against public pages of
+well-designed productivity apps and proposes the budgets the suite should
+add next (#2899).
+
 ## Layout
 
 The primitives in `src/layout/primitives/` follow
