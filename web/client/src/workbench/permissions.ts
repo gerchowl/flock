@@ -51,6 +51,7 @@ import { sessionStore, type StreamReader } from "../store/sessions";
 import type { Transport } from "../transport";
 import { TITLE_MAX, boundText, inputSummary } from "../views/turns";
 import type { InboxCard } from "./inbox";
+import { explain } from "./refusals";
 
 type Tracked = {
   label: string;
@@ -62,6 +63,11 @@ type Tracked = {
 };
 
 const CHOICES = ["Allow once", "Always allow", "Deny"] as const;
+
+/** A card whose stream failed: then the shared map's line for the server's code, its raw message behind Details. */
+const UNLOADED = "This request's details could not load.";
+/** A record the client could not read; what was wrong with it sits behind Details. */
+const UNUSABLE = "This permission record could not be read, so it cannot be answered here.";
 
 /** The live permission inbox over `transport`. */
 export type PermissionInbox = {
@@ -103,14 +109,13 @@ export function createPermissionInbox(transport: Transport): PermissionInbox {
       const { request, request_seq: requestSeq } = found.record;
       return { ...common, card: { ...base(agent, tracked, id), title: boundText(typeof request.display_name === "string" ? request.display_name : request.tool_name, TITLE_MAX), detail: inputSummary(request.tool_name, request.input), requestSeq } };
     }
-    const pending =
-      bad !== undefined
-        ? `Unusable permission record: ${bad.problem}`
-        : progress?.phase === "failed"
-          ? `Details unavailable: ${progress.failure.message}`
-          : progress?.phase === "synced"
-            ? "This agent's stream has no open permission record for it."
-            : "Loading details…";
+    if (bad !== undefined) return { ...common, card: { ...base(agent, tracked, id), title: pendingTitle, detail: UNUSABLE, diagnosis: { message: bad.problem } } };
+    if (progress?.phase === "failed") {
+      const { code, message } = progress.failure;
+      const detail = code === undefined ? UNLOADED : `${UNLOADED} ${explain({ code, message }).line}`;
+      return { ...common, card: { ...base(agent, tracked, id), title: pendingTitle, detail, diagnosis: { ...(code === undefined ? {} : { code }), message } } };
+    }
+    const pending = progress?.phase === "synced" ? "This agent's stream has no open permission record for it." : "Loading details…";
     return { ...common, card: { ...base(agent, tracked, id), title: pendingTitle, detail: pending } };
   };
 
@@ -126,7 +131,8 @@ export function createPermissionInbox(transport: Transport): PermissionInbox {
       agent,
       agentLabel: tracked.label,
       title: id === null ? `${tracked.label} · unreadable permission record` : `${tracked.label} · permission ${id} (not awaiting you)`,
-      detail: `Unusable permission record: ${problem}`,
+      detail: UNUSABLE,
+      diagnosis: { message: problem },
       choices: [],
       blocking: false,
       },

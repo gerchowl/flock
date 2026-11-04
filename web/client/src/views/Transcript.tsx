@@ -36,6 +36,7 @@ import type { JsonValue } from "../gen/serde_json/JsonValue";
 import type { KnownSessionEvent } from "../gen/KnownSessionEvent";
 import type { SessionEntry, SessionStream, Transport, TransportFailure } from "../transport";
 import { sessionStore } from "../store/sessions";
+import { ErrorState, explain } from "../workbench/refusals";
 import { type ToolRun, type TurnFold } from "./turns";
 import { UnknownBlock } from "./UnknownBlock";
 
@@ -73,9 +74,14 @@ function userText(entry: SessionEntry): string | null {
 }
 
 const WORDING = {
-  replay: { loading: "Replaying…", synced: (count: number) => `End of recording · ${count} events`, failed: "Replay failed" },
-  live: { loading: "Loading history…", synced: () => "Up to date", failed: "Couldn't load this agent's history" },
+  replay: { loading: "Replaying…", synced: (count: number) => `End of recording · ${count} events`, failed: "Replay failed." },
+  live: { loading: "Loading history…", synced: () => "Up to date", failed: "Couldn't load this agent's history." },
 } as const;
+
+/** A failure's plain line, when the server named a code; the fixture's own failures carry none. */
+function worded(failure: TransportFailure): string | null {
+  return failure.code === undefined ? null : explain({ code: failure.code, message: failure.message }).line;
+}
 
 function json(value: JsonValue | undefined): string {
   return JSON.stringify(value, null, 2) ?? "";
@@ -207,8 +213,23 @@ function Entry(props: { readonly entry: SessionEntry; readonly turns: TurnFold }
   );
 }
 
-/** Renders a session stream from its first entry, as the transport delivers it. */
+/**
+ * Renders a session stream from its first entry, as the transport delivers it.
+ * A failed stream is over for good (`store/sessions.ts`), so *Retry* remounts
+ * the view, and its new read opens a fresh subscription.
+ */
 export function Transcript(props: TranscriptProps): JSX.Element {
+  const [attempt, setAttempt] = createSignal(0);
+  return (
+    <Show when={attempt() + 1} keyed>
+      {(_attempt) => <TranscriptStream view={props} retry={() => setAttempt(attempt() + 1)} />}
+    </Show>
+  );
+}
+
+/** One subscription's transcript; `retry` replaces it with a fresh one. */
+function TranscriptStream(own: { readonly view: TranscriptProps; readonly retry: () => void }): JSX.Element {
+  const props = own.view;
   // The store owns the entries, the turn fold and the progress; this view reads them (ADR-0038 §3).
   const stream = sessionStore(props.transport).read(props.stream, {
     entry: (entry) => props.onEntry?.(entry.seq, userText(entry)),
@@ -249,9 +270,13 @@ export function Transcript(props: TranscriptProps): JSX.Element {
       </Switch>
       <Show when={failure()}>
         {(shown) => (
-          <p class="transcript__status state-error" role="alert">
-            {WORDING[props.source].failed}: {shown().message}
-          </p>
+          <ErrorState
+            title={WORDING[props.source].failed}
+            line={worded(shown())}
+            code={shown().code}
+            message={shown().message}
+            retry={own.retry}
+          />
         )}
       </Show>
     </section>

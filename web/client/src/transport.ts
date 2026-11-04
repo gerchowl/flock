@@ -31,6 +31,7 @@
  * @module
  */
 import type { KnownSessionEvent } from "./gen/KnownSessionEvent";
+import type { SubfailCode } from "./gen/SubfailCode";
 import type { UnknownInput } from "./unknown";
 
 /** A session stream's name, as in ADR-0036 §5 (`agent/<id>`). */
@@ -53,8 +54,12 @@ export type SessionEntry =
   | { readonly seq: number; readonly tsMs?: number; readonly kind: "unknown"; readonly unknown: UnknownInput }
   | { readonly seq: number; readonly kind: "gap"; readonly from: number; readonly to: number };
 
-/** Why a subscription ended; shown to the user as-is. */
-export type TransportFailure = { readonly message: string };
+/**
+ * Why a subscription ended: the server's refusal code, when it sent one, and
+ * a diagnosis. The view words the code (`workbench/refusals.tsx`) and keeps
+ * the message for its Details.
+ */
+export type TransportFailure = { readonly code?: SubfailCode; readonly message: string };
 
 /** Callbacks for one subscription; see the module contract. */
 export type SessionObserver = {

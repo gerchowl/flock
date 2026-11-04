@@ -68,7 +68,7 @@ export function createWireTransport(connection: WireConnection): Transport {
           refused: (refusal) => {
             if (!open) return;
             close();
-            observer.failed({ message: refusal.message });
+            observer.failed({ code: refusal.code, message: refusal.message });
           },
         },
         after,

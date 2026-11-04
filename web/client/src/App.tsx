@@ -40,6 +40,7 @@ import { driveBridge, driveTokenProvider, type ShellTokens } from "./wire/provid
 import { createWireTransport } from "./wire/transport";
 import { ConnectionBanner } from "./workbench/ConnectionBanner";
 import { healthOf, type Health, type HostView } from "./workbench/HostStatus";
+import { CONNECTION_COPY } from "./workbench/refusals";
 import { createWireSender } from "./workbench/sender";
 import { SAMPLE_INBOX } from "./workbench/inbox";
 import { previewControls } from "./workbench/preview";
@@ -137,20 +138,32 @@ function WireApp(props: { readonly config: WireShellConfig | BridgeShellConfig; 
     // A shell still asked after a Disconnect is not signing in: its token waits for Connect.
     return (exchanging() && idle) || (shell?.asking === true && connection.state === "NeedsToken");
   };
+  /**
+   * The state line, in the shared plain-language map's words. In NeedsToken the
+   * error is this client's own sentence about the token, and it leads the next
+   * step; in every other state it is a lost connection's diagnosis, which
+   * {@link diagnose} keeps for Details.
+   */
   const describe = (): string => {
     if (signingIn()) return "Signing in…";
     const prompt = shell === null ? (failed() ? EXCHANGE_FAILED : RUN_CLIENT_OPEN) : shell.error;
-    const ask = connection.state === "NeedsToken" ? prompt : null;
-    const parts = [connection.state, connection.error, ask].filter((part) => part !== null);
-    return `${parts[0]}${parts.length > 1 ? ` · ${parts.slice(1).join(" ")}` : ""}`;
+    const token = connection.state === "NeedsToken";
+    return [CONNECTION_COPY[connection.state], token ? connection.error : null, token ? prompt : null].filter((part) => part !== null).join(" ");
+  };
+  /** What sits behind the state line's Details: the version gap in ReadOnly, else a failure's diagnosis. */
+  const diagnose = (): string | null => {
+    if (signingIn() || connection.state === "NeedsToken") return null;
+    return connection.state === "ReadOnly" ? connection.versionGap : connection.error;
   };
   const [status, setStatus] = createSignal<string>(describe());
+  const [diagnosis, setDiagnosis] = createSignal<string | null>(diagnose());
   const health = (): Health => healthOf(connection.state, connection.error, signingIn());
   const [shown, setShown] = createSignal<Health>(health());
   /** A failed renewal while the session runs on (ADR-0038 §6): a dismissible notice, never NeedsToken. */
   const [renewalNotice, setRenewalNotice] = createSignal<string | null>(null);
   const refresh = (): void => {
     setStatus(describe());
+    setDiagnosis(diagnose());
     setShown(health());
     setRenewalNotice(shell?.notice ?? null);
   };
@@ -265,6 +278,7 @@ function WireApp(props: { readonly config: WireShellConfig | BridgeShellConfig; 
     name: url === null ? BRIDGE_HOST : new URL(url).host,
     health: shown,
     detail: status,
+    diagnosis,
     connected: () => (revision(), connection.state !== "Disconnected"),
     connect: () => connection.connect(),
     disconnect: () => connection.disconnect(),

@@ -6,7 +6,8 @@
  * The client never derives queue order or delivery (§3), so nothing here
  * predicts what will happen: the phase line is the server's last report,
  * worded as a fact ({@link phaseLine}), and each message's line says what
- * has happened to it so far ({@link STATUS_LABELS}). The `ack` is the
+ * has happened to it so far ({@link STATUS_LABELS}; a refusal in the shared
+ * plain-language map's words, `refusals.tsx`, its code behind Details). The `ack` is the
  * authority on what happened. Optimism is visual only: a message never
  * appears in the transcript until the server's event does, and once a
  * person's turn has arrived after an accepted message, it leaves "Your
@@ -38,13 +39,14 @@
  *
  * @module
  */
-import { For, createSignal, type JSX } from "solid-js";
+import { For, Show, createSignal, type JSX } from "solid-js";
 
 import type { AgentDecide } from "../gen/AgentDecide";
 import type { OutboxStatus } from "../gen/OutboxStatus";
 import type { Phase } from "../gen/Phase";
 import type { AgentRow } from "../fleet";
 import type { OutboxEntry } from "../wire/outbox";
+import { RefusalDetails, explain, type Explained } from "./refusals";
 
 /** Sending, as the workbench sees it. */
 export type Sender = {
@@ -212,7 +214,7 @@ export function Composer(props: {
     return mode.open ? props.sender.blocked() : mode.line;
   };
   /** Accepted messages whose event the transcript has shown are left out (see the module doc). */
-  const mine = (): { readonly id: string; readonly text: string; readonly status: OutboxStatus; readonly error?: string }[] => {
+  const mine = (): { readonly id: string; readonly text: string; readonly status: OutboxStatus; readonly refusal?: Explained }[] => {
     const own = (props.sender?.commands() ?? []).flatMap((entry) => {
       const sent = sentText(entry, props.agent);
       return sent === null ? [] : [{ entry, sent }];
@@ -221,7 +223,7 @@ export function Composer(props: {
     const echoed = props.state.echoed(props.agent, accepted);
     return own
       .filter(({ entry }) => !echoed.has(entry.cmd_id))
-      .map(({ entry, sent }) => ({ id: entry.cmd_id, text: sent, status: entry.status, ...(entry.error ? { error: entry.error.message } : {}) }));
+      .map(({ entry, sent }) => ({ id: entry.cmd_id, text: sent, status: entry.status, ...(entry.error ? { refusal: explain(entry.error) } : {}) }));
   };
   const submit = (): void => {
     const message = text().trim();
@@ -248,7 +250,8 @@ export function Composer(props: {
           {(item) => (
             <li class={`sent sent--${item.status}`} data-testid="sent-message" data-status={item.status}>
               <span class="sent__text">{item.text}</span>
-              <span class="sent__status">{item.error === undefined ? STATUS_LABELS[item.status] : `${STATUS_LABELS[item.status]}: ${item.error}`}</span>
+              <span class="sent__status">{item.refusal?.line ?? STATUS_LABELS[item.status]}</span>
+              <Show when={item.refusal}>{(refusal) => <RefusalDetails code={refusal().code} message={refusal().message} />}</Show>
             </li>
           )}
         </For>
