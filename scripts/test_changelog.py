@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import subprocess
 import json
 import tempfile
 import unittest
+from unittest.mock import patch
+from types import SimpleNamespace
 from pathlib import Path
 
 from scripts.changelog import (
@@ -23,7 +27,10 @@ from scripts.changelog import (
     ensure_manifest_is_outdated,
     ensure_manifest_matches_expected,
     ensure_version_is_releasable,
+    build_release_pr_body,
+    cmd_pr_body,
     extract_section_body,
+    release_pr_preamble,
     foreign_release_entries,
     infer_protocol_from_notes,
     load_json,
@@ -32,6 +39,9 @@ from scripts.changelog import (
     NO_STABLE_RELEASE_VERSION,
     prepare_release,
     cmd_prepare,
+    cmd_sync_latest_json,
+    fetch_release_payload,
+    EXPECTED_ASSET_NAMES,
     collect_fragments,
     fold_fragments,
     read_protocol_version,
@@ -354,6 +364,99 @@ class ChangelogScriptTests(unittest.TestCase):
         finally:
             path.unlink(missing_ok=True)
 
+    def test_sync_latest_json_preserves_checksums_and_legacy_archive(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = root / "latest.json"
+            announcement = root / "announcement.json"
+            manifest.write_text(build_latest_json("0.1.0", "Old", default_release_assets("0.1.0")))
+            announcement.write_text("null\n")
+            assets = default_release_assets("0.1.1")
+            payload = {"tagName": "v0.1.1", "body": "Notes", "assets": [
+                {"name": name, "url": assets[target], "sha256": "a" * 64}
+                for target, name in EXPECTED_ASSET_NAMES.items()
+            ]}
+            with patch("scripts.changelog.fetch_release_payload", return_value=payload):
+                cmd_sync_latest_json(argparse.Namespace(output=str(manifest), version="0.1.1",
+                    repo=DEFAULT_RELEASE_REPO, announcement=str(announcement), protocol=5))
+            original = manifest.read_text()
+            without_hashes = {**payload, "tagName": "v0.1.2", "assets": [
+                {key: value for key, value in asset.items() if key != "sha256"}
+                for asset in payload["assets"]
+            ]}
+            with patch("scripts.changelog.fetch_release_payload", return_value=without_hashes):
+                with self.assertRaisesRegex(ChangelogError, "sha256 sidecar"):
+                    cmd_sync_latest_json(argparse.Namespace(output=str(manifest), version="0.1.2",
+                        repo=DEFAULT_RELEASE_REPO, announcement=str(announcement), protocol=5))
+            self.assertEqual(manifest.read_text(), original)
+            result = json.loads(original)
+            self.assertEqual(result["assets"], {
+                target: {"url": url, "sha256": "a" * 64} for target, url in assets.items()
+            })
+            self.assertEqual(result["releases"]["0.1.0"]["assets"], default_release_assets("0.1.0"))
+            ensure_manifest_assets_belong_to_repo(result)
+            ensure_current_release_assets_are_mirrored(result, "fixture")
+            result["assets"]["linux-x86_64"]["url"] = "https://example.invalid/foreign"
+            with self.assertRaises(ChangelogError):
+                ensure_manifest_assets_belong_to_repo(result)
+
+    def test_release_fetch_reads_published_checksum_sidecars(self) -> None:
+        payload = {"tagName": "v0.1.1", "body": "Notes", "assets": []}
+        for name in EXPECTED_ASSET_NAMES.values():
+            payload["assets"].extend([{"name": name, "url": "https://example.invalid/" + name},
+                                      {"name": name + ".sha256"}])
+        def run(command, **kwargs):
+            if "download" in command:
+                root = Path(command[command.index("--dir") + 1])
+                for name in EXPECTED_ASSET_NAMES.values():
+                    (root / (name + ".sha256")).write_text("a" * 64 + "  " + name + "\n")
+            return SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="")
+        with patch("scripts.changelog.subprocess.run", side_effect=run):
+            result = fetch_release_payload("0.1.1", DEFAULT_RELEASE_REPO)
+        for asset in result["assets"]:
+            if asset["name"] in EXPECTED_ASSET_NAMES.values():
+                self.assertEqual(asset.get("sha256"), "a" * 64)
+
+    def test_release_fetch_refuses_corrupt_or_incomplete_sidecars(self) -> None:
+        payload = {"assets": [{"name": name} for name in EXPECTED_ASSET_NAMES.values()] +
+                   [{"name": name + ".sha256"} for name in EXPECTED_ASSET_NAMES.values()]}
+        for damage in ["missing", "filename", "digest", "download"]:
+            with self.subTest(damage=damage):
+                def run(command, **kwargs):
+                    if "download" in command:
+                        if damage == "download":
+                            return SimpleNamespace(returncode=1, stdout="", stderr="fixture refusal")
+                        root = Path(command[command.index("--dir") + 1])
+                        for index, name in enumerate(EXPECTED_ASSET_NAMES.values()):
+                            if index == 0 and damage == "missing":
+                                continue
+                            filename = "other" if index == 0 and damage == "filename" else name
+                            digest = "wrong" if index == 0 and damage == "digest" else "a" * 64
+                            (root / (name + ".sha256")).write_text(digest + "  " + filename + "\n")
+                    return SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="")
+                with patch("scripts.changelog.subprocess.run", side_effect=run):
+                    with self.assertRaises(ChangelogError):
+                        fetch_release_payload("0.1.1", DEFAULT_RELEASE_REPO)
+
+    def test_release_workflow_hashes_every_uploaded_binary(self) -> None:
+        from scripts.test_actions_cache import workflow
+        release = workflow("release.yml")
+        build = release["jobs"]["build"]
+        step = next(step for step in build["steps"] if step.get("name") == "Compute asset checksum")
+        upload = next(step for step in build["steps"] if step.get("name") == "Upload artifact")
+        self.assertIn("${{ matrix.name }}.sha256", upload["with"]["path"].splitlines())
+        publish = next(step for step in release["jobs"]["release"]["steps"] if step.get("name") == "Create release")
+        self.assertIn("flock-*/*.sha256", publish["with"]["files"].splitlines())
+        for target in build["strategy"]["matrix"]["include"]:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / target["name"]).write_bytes(b"built asset")
+                result = subprocess.run(["/bin/sh", "-eu", "-c", step["run"].replace("${{ matrix.name }}", target["name"])],
+                                        cwd=root, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual((root / (target["name"] + ".sha256")).read_text(),
+                                 hashlib.sha256(b"built asset").hexdigest() + "  " + target["name"] + "\n")
+
     def test_manifest_from_release_payload_uses_release_body_and_asset_urls(self) -> None:
         manifest = manifest_from_release_payload(
             {
@@ -637,7 +740,17 @@ class CheckedInManifestTests(unittest.TestCase):
         version = manifest["version"]
         self.assertNotEqual(version, NO_STABLE_RELEASE_VERSION)
         self.assertTrue(manifest["assets"])
-        for name, url in manifest["assets"].items():
+        for name, asset in manifest["assets"].items():
+            # A string is a bare URL; an object is {url, sha256} (#2081).
+            if isinstance(asset, str):
+                url = asset
+            else:
+                self.assertIsInstance(asset, dict, name)
+                url = asset.get("url")
+                self.assertIsInstance(url, str, name)
+                digest = asset.get("sha256")
+                self.assertIsInstance(digest, str, name)
+                self.assertRegex(digest, r"^[0-9a-f]{64}$", name)
             self.assertIn(f"/releases/download/v{version}/", url, name)
 
 
@@ -871,6 +984,40 @@ class VersionCheckTests(unittest.TestCase):
 
         ensure_version_is_releasable(plan, "0.0.1", set())
         ensure_version_is_releasable(plan, "1.0.0", set())
+
+
+class ReleasePrBodyTests(unittest.TestCase):
+    def test_small_notes_are_inlined_unchanged(self) -> None:
+        notes = "### Fixed\n- One.\n"
+
+        body = build_release_pr_body("1.2.3", notes)
+
+        self.assertEqual(body, release_pr_preamble("1.2.3") + notes)
+
+    def test_oversized_notes_become_a_pointer_under_the_limit(self) -> None:
+        notes = "### Added\n" + "- Entry with é and 日本語.\n" * 4000 + "### Fixed\n- Only.\n"
+        self.assertGreater(len(release_pr_preamble("1.2.3") + notes), 65536)
+
+        body = build_release_pr_body("1.2.3", notes)
+
+        self.assertLess(len(body), 65536)
+        self.assertIn("https://github.com/gerchowl/flock/blob/release/v1.2.3/CHANGELOG.md", body)
+        self.assertIn(release_pr_preamble("1.2.3").rstrip("\n"), body)
+        self.assertIn("- Added: 4000 entries", body)
+        self.assertIn("- Fixed: 1 entry", body)
+        self.assertNotIn("Entry with", body)
+
+    def test_command_writes_the_body_from_the_changelog(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            changelog = Path(tmp) / "CHANGELOG.md"
+            changelog.write_text("# Changelog\n\n## [1.2.3] - 2026-01-01\n\n### Fixed\n- " + "x" * 2000 + "\n")
+            out = Path(tmp) / "body.md"
+
+            cmd_pr_body(argparse.Namespace(path=str(changelog), version="1.2.3", limit=100000, output=str(out)))
+            self.assertIn("x" * 2000, out.read_text())
+            cmd_pr_body(argparse.Namespace(path=str(changelog), version="1.2.3", limit=1500, output=str(out)))
+            self.assertNotIn("x" * 2000, out.read_text())
+            self.assertIn("- Fixed: 1 entry", out.read_text())
 
 
 if __name__ == "__main__":

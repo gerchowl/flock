@@ -17,8 +17,8 @@
 #   libraries. `$out` is the built `dist/`: `index.html` plus `assets/`.
 #
 # The hash is pinned in `nix/client-deps.json`, together with the sha256
-# of the `bun.lock` it was computed from. Evaluation fails, naming the file
-# and the command, when the lock no longer matches: run
+# of the `bun.lock` and the Bun version it was computed from. Evaluation
+# fails, naming the file and command, when either no longer matches: run
 # `just client-deps-hash` and commit `nix/client-deps.json`.
 #
 # This is only the bundle. Serving it from `flk` (embedding, cache headers,
@@ -75,16 +75,15 @@ let
         --linker=hoisted --backend=copyfile --os='*' --cpu='*'
       runHook postBuild
     '';
-    # Kept: what `vite build` loads on the systems below. TypeScript's own
-    # per-platform compilers (about 400 MB) are type-checking only, and so
-    # are dropped, as are other platforms' bindings. The rule depends on no
-    # system, so the hash stays the same everywhere.
+    # Keep build bindings and the compiler used by the source-graph audit on
+    # each supported system. TypeScript's Linux suffix omits `-gnu`.
+    # The rule depends on no system, so one hash covers every build.
     installPhase = ''
       runHook preInstall
-      rm -rf node_modules/.cache node_modules/@typescript/typescript-*
-      for binding in node_modules/@rolldown/binding-* node_modules/lightningcss-*; do
+      rm -rf node_modules/.cache
+      for binding in node_modules/@rolldown/binding-* node_modules/lightningcss-* node_modules/@typescript/typescript-*; do
         case "$binding" in
-          ${lib.concatMapStringsSep "|" (suffix: "*-${suffix}") (lib.attrValues suffixes)}) ;;
+          ${lib.concatMapStringsSep "|" (suffix: "*-${suffix}") (lib.unique ((lib.attrValues suffixes) ++ (map (lib.removeSuffix "-gnu") (lib.attrValues suffixes))))}) ;;
           *) rm -rf "$binding" ;;
         esac
       done
@@ -97,12 +96,19 @@ let
     outputHashMode = "recursive";
     outputHashAlgo = "sha256";
     outputHash = if pinned.hash == "" then lib.fakeHash else pinned.hash;
+    passthru.bunVersion = bun.version;
   };
 in
 assert lib.assertMsg (pinned.lock == lockSha256) ''
   web/client/bun.lock changed since nix/client-deps.json was computed
   (pinned for sha256 ${pinned.lock}, the lock is now ${lockSha256}).
   Run `just client-deps-hash` and commit nix/client-deps.json.'';
+assert lib.assertMsg (pinned.hash == "" || (pinned.bun or null) == bun.version) ''
+  Bun changed since nix/client-deps.json was computed
+  (pinned for ${pinned.bun or "unrecorded"}, nixpkgs supplies ${bun.version}).
+  Run `just client-deps-hash` and commit nix/client-deps.json.
+  A same-version nixpkgs Bun patch can reuse the cached fixed-output outPath
+  without detecting changed output. Refresh explicitly with the same command.'';
 stdenv.mkDerivation {
   pname = "flock-client";
   version = "0.0.0";
@@ -113,6 +119,12 @@ stdenv.mkDerivation {
       lock
       (root + "/index.html")
       (root + "/vite.config.ts")
+      (root + "/scripts/lint-build.ts")
+      (root + "/scripts/check-design-types.ts")
+      (root + "/scripts/design-types.d.cts")
+      (root + "/scripts/stylelint-reserved-tokens.js")
+      (root + "/stylelint.config.js")
+      (root + "/eslint.config.js")
       (root + "/tsconfig.json")
       (root + "/src")
     ];
@@ -128,9 +140,9 @@ stdenv.mkDerivation {
     runHook preConfigure
     cp -R ${deps}/node_modules node_modules
     chmod -R u+w node_modules
-    for binding in node_modules/@rolldown/binding-* node_modules/lightningcss-*; do
+    for binding in node_modules/@rolldown/binding-* node_modules/lightningcss-* node_modules/@typescript/typescript-*; do
       case "$binding" in
-        *-${hostSuffix}) ;;
+        *-${hostSuffix}|node_modules/@typescript/typescript-${lib.removeSuffix "-gnu" hostSuffix}) ;;
         *) rm -rf "$binding" ;;
       esac
     done

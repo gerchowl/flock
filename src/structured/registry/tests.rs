@@ -2,7 +2,7 @@ use super::*;
 use crate::api::agent_state::{Attention, Background, Phase, StateSource, Turn, Waiting};
 use crate::structured::claude::SessionEvent;
 
-fn record(id: &str) -> Record {
+pub(super) fn record(id: &str) -> Record {
     Record {
         runtime: crate::structured::registry::StructuredRuntime::Structured,
         agent_id: id.into(),
@@ -364,4 +364,29 @@ fn fresh_launch_resets_observations_and_fences_the_previous_generation() {
         registry.begin_launch(id, old),
         Err(RegistryError::StaleGeneration)
     ));
+}
+
+#[test]
+fn security_agent_name_structured_registry_rejects_and_retains_inactive() {
+    let mut failures = Vec::new();
+    for (case, name) in crate::test_support::hostile_agent_names() {
+        let mut bad = record("agent-name-security");
+        bad.name = Some(name);
+        let raw = serde_json::json!([bad]);
+        let mut registry = Registry::default();
+        let refused = registry.register(bad).is_err();
+        let restored: Registry = serde_json::from_value(raw.clone()).unwrap();
+        if !refused
+            || !restored.records().is_empty()
+            || restored.is_empty()
+            || restored.retained_count() != 1
+        {
+            failures.push(case);
+        }
+        assert_eq!(serde_json::to_value(restored).unwrap(), raw);
+    }
+    assert!(
+        failures.is_empty(),
+        "accepted structured name cases: {failures:?}"
+    );
 }

@@ -1,7 +1,7 @@
 //! Verified incremental rollout bytes for ADR-0028 §1a (#1855).
 //!
 //! This is a file/cursor foundation, not runtime lifecycle authority. Read on a
-//! supervised worker (#1857); prepare resume/fork segments before trust admission
+//! supervised worker (`segment::worker::Worker`); prepare resume/fork segments before trust admission
 //! (#1856). A successful empty EOF never changes a turn or renews a lease.
 use std::io::{Read, Seek, SeekFrom};
 use std::time::Instant;

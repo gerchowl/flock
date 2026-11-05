@@ -4,7 +4,7 @@
 - Date: 2026-10-16, amended the same day (#1648: the ratchet's exact type set and baseline; §8: the owner's decisions recorded)
 - Issues: [#1614](https://github.com/gerchowl/flock/issues/1614) (this record), [#1648](https://github.com/gerchowl/flock/issues/1648) (the ratchet, gates V1a.0), [#1300](https://github.com/gerchowl/flock/issues/1300) (adoption, gated on a vigil release), [#1323](https://github.com/gerchowl/flock/issues/1323) (superseded by the owner's vigil decision), [#1619](https://github.com/gerchowl/flock/issues/1619) (G13, the GUI views)
 - Builds on: ADR-0038 §4a and §11 item 5 (the owner chose vigil on 2026-10-16; the GUI's telemetry views); ADR-0036 §4 and §5 (session streams, wire scopes, `cmd_id`); ADR-0010 (`flk report`); ADR-0005 and ADR-0028 (the durable event log, which stays state, not telemetry); ADR-0014 and ADR-0035 (operator-only verbs); ADR-0026 (mesh)
-- Implemented: nothing. vig-os/vigil is pre-alpha on 2026-10-16: no release, and its `src/` holds only a version constant. Every implementation slice below waits for the vigil release that ships the API it uses.
+- Implemented early by #1698: the first V1a.0 input types and input-log redaction on today's writer (§1). vig-os/vigil is pre-alpha on 2026-10-16: no release, and its `src/` holds only a version constant. Slices that use vigil wait for the release that ships the API they use.
 
 ## Summary
 
@@ -63,6 +63,34 @@ The event names and their meaning carry over unchanged. **The fields do not: thi
 
 - **Why `&'static str` counts.** A static string can't carry runtime content, but it is an open vocabulary: nothing stops a new call site from passing a new value, and readers (the GUI filters, the log-budget gate) need the closed set. `Box::leak` can also turn runtime text into one. So all 32 become closed enums, and none is exempt.
 - **Raw input and keys are content.** `raw_input_*` logs up to `MAX_TRACE_BYTE_PREVIEW` bytes of what the user typed into a pane, and `terminal_key_*` logs the key code, which for a character key is the character. Both can carry passwords typed into a terminal. Debug level does not make them safe, because `[log] level` can be raised. They keep only lengths and key classes.
+- **Canonical input schema (amendment, #1698).** `src/logging/types.rs` is the V1a.0 types module. #1698 implements these first types early on today's JSON writer, retaining this field shape for V1a.4 and the later OTLP switch (which prefixes attributes with `flk.`). The enums serialize in snake_case. Optional fields are omitted, never null.
+
+  | Field | Type and applicability |
+  |---|---|
+  | `input_len` | `usize`, chunk byte length, always present for raw input |
+  | `input_class` | `InputClass`: `key`, `mouse`, `paste`, `focus`, `resize`, `unknown` |
+  | `key_class` | `KeyClass`: `character`, `named`, `function`; only for keys |
+  | `named_key` | `NamedKey`: `enter`, `tab`, `back_tab`, `backspace`, `esc`, `up`, `down`, `left`, `right`, `home`, `end`, `page_up`, `page_down`, `insert`, `delete`, `null`, `caps_lock`, `scroll_lock`, `num_lock`, `print_screen`, `pause`, `menu`, `keypad_begin`, `media`, `modifier`, `other`; only for named keys |
+  | `function_key` | `u8`; only for function keys |
+  | `modifiers` | `KeyModifiers`, object of booleans `shift`, `control`, `alt`, `super_key`, `hyper`, `meta`, containing only true flags; present for keys (including an empty object), and for mouse events with modifiers |
+
+  Character keys never carry their character. Paste events have only `input_len` and `input_class=paste` beyond the fixed event envelope. Pending UTF-8, incomplete input and unsupported escape diagnostics carry only `input_len` beyond their envelope. Terminal-key records use the same key metadata, with no character, raw encoding, key state or codepoint. Resize belongs to the closed schema but the raw byte parser does not produce resize events. Named media and modifier keys collapse their subtypes. The report allowlist excludes all input metadata, and also excludes legacy `raw_bytes`, `parsed`, `key`, `code`, `bytes`, `sequence` and `encoded` fields.
+
+  Non-input payload sizes on self-compaction, clipboard-image staging and handoff
+  events use `byte_count`. Structured worker shutdown uses `failure_code` for
+  its typed flk error code, not a process exit status. Reports allow these
+  unambiguous diagnostic names while continuing to exclude all input metadata
+  and the legacy `code`/`bytes` fields, including in existing log files.
+
+  Input-event JSON retains the default formatter's field order (timestamp
+  first), expanding the sealed carrier at its original position. The lone-escape
+  WARN keeps the hint that an escape after an alt chord or focus switch may
+  reach the pane as plain esc, without recording its bytes.
+
+  Stable tracing accepts scalar fields only. Its JSON event formatter expands the sealed, serialized `InputMetadata` into these top-level fields, preserving `modifiers` as an object, rather than a JSON string. The internal carrier never appears in written JSON. This adapter fails formatting on an invalid carrier instead of emitting a different schema.
+
+  No telemetry ratchet exists in this tree yet. This change removes eight non-allowlisted emitting parameters: the raw parsed bytes and debug string become one typed value, and five other raw-input bytes/text parameters plus the terminal-key encoded bytes become lengths. The historical 439 inventory is therefore reduced by eight by this slice, independently of subsequent facade additions. The obsolete non-emitting `bounded_bytes_debug` formatter is removed. Terminal key wrappers still classify crossterm events at the facade boundary, pending the remaining V1a.4 call-site migration tracked by #1614.
+
 - **21 raw `.display()` fields:** 14 `path =`, plus `directory` (:22), `exe` (:1720), `api_socket` and `client_socket` (:1884-1885), `socket` (:2094), `to` (:4183) and `target` (:4250).
 - **1 `error = %err` field** (:28), and 105 `err: &str` parameters.
 - **Path-valued string parameters:** `path` (10), `checkout_path` (4), `dest` (4), `repo_root` (2), `to` and `from`, `cwd`, `file_name`.
@@ -233,7 +261,7 @@ Each waits for the vigil release that ships what it uses, and codes against that
 | # | Slice | Needs |
 |---|---|---|
 | V0 | #1300 step 1: spike `vigil::init` behind a `vigil` cargo feature; confirm the file layout, rotation options and per-role init; report deviations from this record | vigil 0.1.0 |
-| V1a.0 | The types, needing no vigil: `TelemetryError` with its constructors, the path kinds, the id newtypes and enums the facade needs, the canary harness, and the ratchet test (§1), recorded at 439 | — |
+| V1a.0 | The types in `src/logging/types.rs`, needing no vigil: `InputClass`, `KeyClass`, `NamedKey`, `KeyModifiers` and `InputMetadata` (implemented early by #1698), then `TelemetryError` with its constructors, the path kinds, the id newtypes and enums the facade needs, the canary harness, and the ratchet test (§1), recorded at 439 | — |
 | V1a.1–V1a.6 | The rewrite of all 439 parameters outside the allowlist, with their call sites, one sub-PR per subsystem: (1) api and server; (2) client and switch; (3) peers, ssh and remote; (4) pane, terminal and UI; (5) process, spawn and platform; (6) notifications, hooks, structured and MCP. Each lowers the ratchet and stays within ~400 hand-written lines. The whole is an estimated 1,200–1,800 changed lines, which is why it is split. The last one brings the ratchet to 0 and updates `redact.rs` | V1a.0 |
 | V1b | The switch: logs through vigil, `[telemetry]` retention and the total bound, the non-blocking channel, and every §6 reader | V0, V1a.6 |
 | V2 | Spans: `flk.api.request`, `flk.cmd`, `flk.question`, `flk.mesh.hop`; id newtypes | V1b, vigil 0.2.0 |
@@ -253,7 +281,7 @@ Each waits for the vigil release that ships what it uses, and codes against that
 
 ## Failure modes and known limits
 
-- **vigil slips or changes its API.** Every slice is gated on a release, and V0 reports any deviation before V1 starts. Until then, flk keeps today's writer, and nothing in this record has shipped.
+- **vigil slips or changes its API.** Every slice is gated on a release, and V0 reports any deviation before V1 starts. Until then, flk keeps today's writer. The V1a redaction work can proceed independently, beginning with #1698's input types and input-log redaction.
 - **Disk full.** For audit, see §5 (fail-closed after the reserve). For telemetry, a write failure must not fail the operation it describes. vigil's writer error is counted, and flk surfaces it once per process in `flk report` and on the `node` tile. It is never retried in a loop.
 - **A process killed mid-line** leaves a torn last line. Readers skip an undecodable last line and count it. They never fail the whole file.
 - **Clock skew across nodes** misorders a joined cross-node waterfall. Hops are ordered by `MessageKey` and per-node time, never by cross-node time alone.
