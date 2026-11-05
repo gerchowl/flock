@@ -248,6 +248,9 @@ pub(crate) fn effect(response: &Value, exit_code: i32) -> i32 {
 /// The registered code for an io error that ended a verb.
 pub(crate) fn io_error_code(err: &std::io::Error) -> ErrorCode {
     use std::io::ErrorKind::*;
+    if let Some(code) = crate::server::executable::error_code(err) {
+        return code;
+    }
     match err.kind() {
         TimedOut | WouldBlock => ErrorCode::Timeout,
         NotFound | ConnectionRefused | ConnectionReset | ConnectionAborted | BrokenPipe
