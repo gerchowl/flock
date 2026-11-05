@@ -205,6 +205,7 @@ impl Run {
         );
         assert!(self.workers.entries[&self.case.id].thread.is_none());
     }
+    /// Return only after worker completion has released the journal lock.
     async fn stop(&mut self) {
         self.workers.stop(&self.case.id, self.case.generation);
         self.ended().await;
@@ -275,6 +276,31 @@ fn default_policy(_: &Case) -> NonZeroU64 {
     crate::config::Config::default()
         .sessions
         .queue_rewrite_bytes
+}
+
+#[tokio::test]
+async fn stop_releases_journal_during_concurrent_fork_before_exec() {
+    for iteration in 0..200 {
+        let mut r = Run::new(2966, "queue", default_policy).await;
+        // The existing bounded platform fixture forks with all CLOEXEC files
+        // still open, including this worker's journal. Keep it alive across stop.
+        let mut window =
+            crate::platform::client_token_lock::inherited_holder::Holder::spawn(&r.driver).unwrap();
+        r.stop().await;
+        let reopened = Journal::open(r.case.fixture.root.path(), &r.case.id)
+            .unwrap_or_else(|error| panic!("iteration {iteration}: reopen after stop: {error}"));
+        window.verify().unwrap();
+        // The new owner's lock must survive closure of the inherited old fd.
+        drop(window);
+        assert_eq!(
+            Journal::open(r.case.fixture.root.path(), &r.case.id)
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        drop(reopened);
+    }
 }
 fn path(case: &Case) -> std::path::PathBuf {
     case.fixture

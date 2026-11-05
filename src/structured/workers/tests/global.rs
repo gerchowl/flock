@@ -168,6 +168,7 @@ impl AppQueue {
         self.driver = driver.unwrap();
         self.driver.set_write_timeout(Some(LIMIT)).unwrap();
     }
+    /// Return only after worker completion has released the journal lock.
     pub(crate) async fn stop(&mut self) {
         self.app
             .structured_workers
