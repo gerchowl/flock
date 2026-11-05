@@ -4648,7 +4648,7 @@ mod tests {
             false,
             None,
             None,
-            None,
+            &crate::config::Config::default(),
         )
         .unwrap_err();
         worker.join().unwrap();
