@@ -868,6 +868,7 @@ async fn a_paste_held_by_an_injection_claims_no_evidence() {
     let response = app.handle_api_request(Request {
         id: "paste".into(),
         method: Method::AgentSend(crate::api::schema::AgentSendParams {
+            item_id: None,
             write_timeout_ms: None,
             raw: true,
             target: pane.clone(),
@@ -921,6 +922,7 @@ fn typing_verbs(pane: &str, raw: bool) -> Vec<(&'static str, Method)> {
         (
             "agent send --no-submit",
             Method::AgentSend(crate::api::schema::AgentSendParams {
+                item_id: None,
                 write_timeout_ms: None,
                 target: pane.into(),
                 text: "note".into(),
@@ -1090,6 +1092,7 @@ async fn a_submit_into_an_agent_pane_stashes_one_row_and_refuses_several() {
         let agent = harness.agent;
         let send_submit = |pane: &str| {
             Method::AgentSend(crate::api::schema::AgentSendParams {
+                item_id: None,
                 write_timeout_ms: None,
                 target: pane.into(),
                 text: "hello".into(),

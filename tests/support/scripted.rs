@@ -21,7 +21,7 @@ pub struct ScriptedServer {
 
 /// A socket that answers every request with `answer(request)`, and the protocol
 /// check a state-changing verb sends first (#868) with this build's protocol
-/// unless `answer` returns a pong of its own.
+/// and completed-write capability, unless `answer` returns a pong of its own.
 pub fn scripted_server(
     name: &str,
     answer: fn(&serde_json::Value) -> serde_json::Value,
@@ -55,7 +55,8 @@ pub fn scripted_server(
                 && answered.pointer("/result/type") != Some(&serde_json::json!("pong"))
             {
                 serde_json::json!({"result":{
-                    "type":"pong","version":"fixture","protocol":super::PROTOCOL_VERSION
+                    "type":"pong","version":"fixture","protocol":super::PROTOCOL_VERSION,
+                    "capabilities":{"pane_input_write_ack":true,"live_handoff":false}
                 }})
             } else {
                 answered

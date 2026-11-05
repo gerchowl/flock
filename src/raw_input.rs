@@ -346,7 +346,7 @@ fn send_raw_input_events(events: Vec<RawInputEvent>, tx: &mpsc::Sender<RawInputE
 }
 
 #[cfg(test)]
-fn drain_buffer(buffer: &mut Vec<u8>, tx: &mpsc::Sender<RawInputEvent>) {
+pub(crate) fn drain_buffer(buffer: &mut Vec<u8>, tx: &mpsc::Sender<RawInputEvent>) {
     for bytes in drain_complete_input_bytes(buffer) {
         let Some((event, _consumed)) = extract_one_event(&bytes) else {
             continue;
