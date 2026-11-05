@@ -1246,16 +1246,23 @@ impl Workspace {
         self.active_tab().map(|tab| tab.layout.focused())
     }
 
-    pub fn close_pane(&mut self, pane_id: PaneId) -> bool {
-        let tab_idx = match self.find_tab_index_for_pane(pane_id) {
-            Some(idx) => idx,
-            None => return false,
-        };
+    /// Close an explicitly addressed placement, returning whether its workspace
+    /// should close. Missing storage or inconsistent membership refuses before
+    /// any layout, numbering or content mutation, including a single-pane tab.
+    pub(crate) fn close_pane(
+        &mut self,
+        pane_id: PaneId,
+    ) -> Result<bool, crate::structured::view::PlacementError> {
+        use crate::structured::view::PlacementError;
+        let tab_idx = self
+            .find_tab_index_for_pane(pane_id)
+            .ok_or(PlacementError::Membership)?;
+        self.tabs[tab_idx].content(pane_id)?;
         let pane_count = self.tabs[tab_idx].layout.pane_count();
         let tab_count = self.tabs.len();
         if pane_count <= 1 {
             if tab_count <= 1 {
-                return true;
+                return Ok(true);
             }
             self.tabs.remove(tab_idx);
             self.unregister_pane(pane_id);
@@ -1264,13 +1271,13 @@ impl Workspace {
             } else if tab_idx <= self.active_tab && self.active_tab > 0 {
                 self.active_tab -= 1;
             }
-            return false;
+            return Ok(false);
         }
 
         if let Some(detached) = self.tabs[tab_idx].close_pane(pane_id) {
             self.unregister_pane(detached.pane_id());
         }
-        false
+        Ok(false)
     }
 
     pub(crate) fn register_new_pane(&mut self, pane_id: PaneId) {
@@ -1876,6 +1883,60 @@ mod tests {
     }
 
     #[test]
+    fn close_orphan_with_one_tab_preserves_workspace() {
+        assert_orphan_close_preserves_workspace(1);
+    }
+
+    #[test]
+    fn close_orphan_with_several_tabs_preserves_workspace() {
+        assert_orphan_close_preserves_workspace(3);
+    }
+
+    fn assert_orphan_close_preserves_workspace(tab_count: usize) {
+        for native in [false, true] {
+            let mut ws = Workspace::test_new("orphan-close");
+            for _ in 1..tab_count {
+                ws.test_add_tab(None);
+            }
+            let orphan = PaneId::alloc();
+            if native {
+                ws.tabs[0].native_views.insert(
+                    orphan,
+                    crate::structured::view::placement::View::Ready(
+                        crate::structured::view::Target {
+                            agent_id: "fixture-agent".into(),
+                            generation: 1,
+                        },
+                    ),
+                );
+            } else {
+                ws.tabs[0]
+                    .panes
+                    .insert(orphan, PaneState::new(TerminalId::alloc()));
+            }
+            ws.register_new_pane(orphan);
+            let layouts: Vec<_> = ws.tabs.iter().map(|tab| tab.layout.pane_ids()).collect();
+            let active = ws.active_tab;
+            let number = ws.public_pane_number(orphan);
+            assert_eq!(
+                ws.close_pane(orphan),
+                Err(crate::structured::view::PlacementError::Membership)
+            );
+            assert_eq!(ws.tabs.len(), tab_count);
+            assert_eq!(ws.active_tab, active);
+            assert_eq!(ws.public_pane_number(orphan), number);
+            assert_eq!(
+                ws.tabs
+                    .iter()
+                    .map(|tab| tab.layout.pane_ids())
+                    .collect::<Vec<_>>(),
+                layouts
+            );
+            assert_eq!(ws.find_tab_index_for_pane(orphan), Some(0));
+        }
+    }
+
+    #[test]
     fn pane_public_numbers_are_stable_and_not_reused_after_close() {
         let mut ws = Workspace::test_new("test");
         let root = ws.tabs[0].root_pane;
@@ -1886,7 +1947,7 @@ mod tests {
         assert_eq!(ws.public_pane_number(second), Some(2));
         assert_eq!(ws.public_pane_number(third), Some(3));
 
-        assert!(!ws.close_pane(second));
+        assert_eq!(ws.close_pane(second), Ok(false));
 
         assert_eq!(ws.public_pane_number(root), Some(1));
         assert_eq!(ws.public_pane_number(second), None);
