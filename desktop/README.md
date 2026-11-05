@@ -50,7 +50,7 @@ remains available with `just desktop-build`.
 On the server's machine the shell needs no token input (ADR-0038 §6, "The
 server on the same machine"). The init script sets the bundle's
 `__FLOCK_SHELL_CONFIG__` (`web/client/src/config.ts`) to the contract's
-`{ transport: "bridge", openBridge }`; `src/open-bridge.js` is that function.
+`{ transport: "bridge", openBridge, setBadgeCount }`; `src/open-bridge.js` is that function.
 
 - **The mint.** The shell's native side (`src/mint.rs`) opens `flock.sock` and
   sends `client.app.mint`. The server picks the scopes and binds the token to
@@ -152,10 +152,15 @@ or a handoff) resolves the open and closes the socket with 1006; the server's 50
 Each rule has a test in `src/hardening.rs` or `src/config.rs`:
 
 - **Capabilities:** `capabilities/main.json` grants `allow-bridge-open`,
-  `allow-bridge-send` and `allow-bridge-close`, for the only app commands
-  (`build.rs` declares them), so no `shell`, `fs`, `http` or `dialog`, no
-  global Tauri API and no remote IPC. Starting `flk server` is the shell's own
-  Rust code, not a webview permission.
+  `allow-bridge-send`, `allow-bridge-close`, and `allow-set-badge-count` for
+  the four app commands (`build.rs` declares them). No `shell`, `fs`, `http`
+  or `dialog`, global Tauri API, or remote IPC is granted. The badge command
+  calls Tauri's typed native setters on the invoking window to mirror the
+  server-reported count of structured agents waiting on a person. Known
+  zero clears it; macOS uses `N+` and `?` labels for partial and unknown
+  counts, while other platforms show only the known numeric total. Browser builds have
+  no badge capability. Starting `flk server` is the shell's own Rust code,
+  not a webview permission.
 - **CSP:** `default-src 'self'; connect-src 'none'; frame-src blob: 'self'`.
   The webview opens no connection of its own; the session runs in Rust.
 - **Navigation:** only the bundle's origin, its `blob:` frames and, under
