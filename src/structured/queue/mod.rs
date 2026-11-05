@@ -54,6 +54,8 @@ pub struct Cut {
     pub through: u64,
 }
 /// Blocking storage owned by one dedicated worker, not AppState or render code.
+/// Drop explicitly unlocks ownership before closing the descriptor, so a
+/// concurrent fork cannot retain the lock until its inherited descriptor closes.
 pub struct Journal {
     path: PathBuf,
     agent: String,
@@ -72,7 +74,17 @@ pub struct Journal {
     opaque: HashSet<String>,
     poisoned: bool,
     rewrite: Option<RewritePolicy>,
-    _lease: File,
+    _lease: WriterLease,
+}
+// Cover both a complete journal and fallible setup after lock acquisition.
+struct WriterLease(File);
+impl Drop for WriterLease {
+    fn drop(&mut self) {
+        // Close alone leaves flock held by descriptors inherited before exec.
+        if let Err(error) = self.0.unlock() {
+            crate::logging::structured_queue_unlock_failed(&error);
+        }
+    }
 }
 fn problem(message: &str) -> io::Error {
     io::Error::other(message)
@@ -172,6 +184,7 @@ impl Journal {
             fs::TryLockError::WouldBlock => io::Error::from(io::ErrorKind::WouldBlock),
             fs::TryLockError::Error(error) => error,
         })?;
+        let lease = WriterLease(lease);
         let path = dir.join("queue.jsonl");
         let file = open(&path)?;
         for path in [&root, &sessions, &dir] {
