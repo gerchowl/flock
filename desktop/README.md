@@ -155,8 +155,10 @@ Each rule has a test in `src/hardening.rs` or `src/config.rs`:
   `allow-bridge-send`, `allow-bridge-close`, and `allow-set-badge-count` for
   the four app commands (`build.rs` declares them). No `shell`, `fs`, `http`
   or `dialog`, global Tauri API, or remote IPC is granted. The badge command
-  calls Tauri's typed native setter on the invoking window to mirror the
-  structured-agent attention count (zero clears it). Browser builds have
+  calls Tauri's typed native setters on the invoking window to mirror the
+  server-reported count of structured agents waiting on a person. Known
+  zero clears it; macOS uses `N+` and `?` labels for partial and unknown
+  counts, while other platforms show only the known numeric total. Browser builds have
   no badge capability. Starting `flk server` is the shell's own Rust code,
   not a webview permission.
 - **CSP:** `default-src 'self'; connect-src 'none'; frame-src blob: 'self'`.

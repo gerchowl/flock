@@ -251,7 +251,7 @@ describe("phone", () => {
     const root = await phone();
     expect($(root, "workbench")).toBeNull();
     expect(tab(root, "Inbox")?.getAttribute("aria-current")).toBe("page");
-    expect($(root, "inbox-headline")?.textContent).toBe("2 blocked on you.");
+    expect($(root, "inbox-headline")?.textContent).toBe("agents waiting: unknown; no nodes reporting");
     expect($$(root, "inbox-card").length).toBe(3);
     expect([...root.querySelectorAll(".tabbar button")].map((button) => button.textContent)).toEqual(["Inbox", "Agents"]);
   });
@@ -283,7 +283,7 @@ describe("phone", () => {
       <Workbench fleet={createFixtureFleet([])} transport={createFixtureTransport("")} inbox={[]} sender={null} layout={emptyLayout()} saveLayout={() => undefined} mode="phone" source="live" />
     ));
     await tick();
-    expect($(root, "inbox-headline")?.textContent).toBe("Nothing is blocked on you.");
+    expect($(root, "inbox-headline")?.textContent).toBe("agents waiting: unknown; no nodes reporting");
     expect($$(root, "inbox-card")).toHaveLength(0);
     expect($(root, "phone")?.textContent).not.toMatch(/Sample|G5/);
   });
@@ -446,7 +446,7 @@ describe("command palette", () => {
     const waiting = $$(root, "palette-command") as HTMLElement[];
     // The keyboard layer's commands run now; the unbuilt actions follow them, dimmed.
     expect(waiting.map((item) => [item.textContent, item.getAttribute("aria-disabled")])).toEqual([
-      ["First agent needing you (2 agents need you)", null],
+      ["First agent needing you (? agents waiting on you; agents waiting: unknown; no nodes reporting)", null],
       ["Previous agent↑", null],
       ["Next agent↓", null],
       ["Keyboard shortcuts?", null],
@@ -465,7 +465,7 @@ describe("command palette", () => {
     const input = $(root, "palette")?.querySelector("input") as HTMLInputElement;
     expect($$(root, "palette-item").length).toBe(4);
     // Unbuilt actions are hidden, so the palette lists the agents, then only the keyboard layer's commands.
-    expect($$(root, "palette-command").map((item) => item.firstElementChild?.textContent)).toEqual(LAYER_COMMANDS.map((label) => label === "First agent needing you" ? `${label} (2 agents need you)` : label));
+    expect($$(root, "palette-command").map((item) => item.firstElementChild?.textContent)).toEqual(LAYER_COMMANDS.map((label) => label === "First agent needing you" ? `${label} (? agents waiting on you; agents waiting: unknown; no nodes reporting)` : label));
     input.value = "wr";
     input.dispatchEvent(new InputEvent("input", { bubbles: true }));
     expect($$(root, "palette-item").map((item) => item.textContent)).toEqual(["wrenTurn finished"]);

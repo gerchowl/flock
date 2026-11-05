@@ -2,6 +2,8 @@
 //! `web/client` bundle (ADR-0038 §6, #1601). See `desktop/README.md`.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+#[path = "platform/badge.rs"]
+mod badge;
 mod bridge;
 mod config;
 #[cfg(test)]
@@ -100,18 +102,40 @@ fn bridge_close(
 
 // Keep the versioned Tauri contract on the native side, where the compiler checks it.
 #[tauri::command]
-fn set_badge_count(window: tauri::Window, count: u32) -> Result<(), String> {
-    window
-        .set_badge_count(Some(count.into()))
-        .map_err(|error| error.to_string())
+fn set_badge_count(window: tauri::Window, count: u32, label: Option<String>) -> Result<(), String> {
+    badge::set(&window, count, label).map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
 mod badge_contract {
+    use super::badge::{action, Badge};
+    #[test]
+    fn platform_badges_preserve_known_partial_and_unknown_values() {
+        for count in [0, 7] {
+            assert_eq!(action(count, None, true), Badge::Count(count));
+            assert_eq!(action(count, None, false), Badge::Count(count));
+        }
+        for (count, label) in [(2, "2+"), (0, "0+"), (0, "?")] {
+            assert_eq!(
+                action(count, Some(label.into()), true),
+                Badge::Label(label.into())
+            );
+            assert_eq!(
+                action(count, Some(label.into()), false),
+                Badge::Count(count)
+            );
+        }
+    }
+
     #[test]
     fn pinned_tauri_badge_setter_accepts_an_optional_i64() {
-        let _command: fn(tauri::Window, u32) -> Result<(), String> = super::set_badge_count;
+        let _command: fn(tauri::Window, u32, Option<String>) -> Result<(), String> =
+            super::set_badge_count;
         let _setter: fn(&tauri::Window, Option<i64>) -> tauri::Result<()> =
             tauri::Window::set_badge_count;
+        // Tauri exposes this typed API only on macOS, while routing tests run on every platform.
+        #[cfg(target_os = "macos")]
+        let _label: fn(&tauri::Window, Option<String>) -> tauri::Result<()> =
+            tauri::Window::set_badge_label;
     }
 }

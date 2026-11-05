@@ -259,8 +259,9 @@ test("attention count, title, sidebar and palette jump agree in the built client
   try {
     await page.goto(pathToFileURL(`${DIST}/index.html`).href);
     await page.getByTestId("needs-you-count").waitFor();
-    expect(await page.title()).toBe("(2) flock");
-    expect(await page.getByTestId("needs-you-count").textContent()).toBe("2 agents need you");
+    expect(await page.title()).toBe("(1+) flock");
+    expect(await page.getByTestId("needs-you-count").textContent()).toBe("1+ agents waiting on you");
+    expect(await page.getByTestId("needs-you-count").getAttribute("aria-label")).toContain("1 or more agents waiting; 1 node not reporting");
     expect(await page.getByTestId("needs-you-section").getByTestId("agent-row").locator(".agent-row__name").allTextContents()).toEqual(["fixture", "kite"]);
     await page.getByTestId("agent-row").filter({ hasText: "wren" }).click();
     await page.getByTestId("needs-you-count").click();

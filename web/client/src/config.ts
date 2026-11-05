@@ -54,7 +54,7 @@ export type ShellToken = { readonly token: string; readonly expiresInMs?: number
 export type TokenProvider = () => Promise<ShellToken>;
 
 /** Optional native badge capability, provided only by a desktop shell. */
-export type SetBadgeCount = (count: number) => Promise<void>;
+export type SetBadgeCount = (count: number, label?: string | null) => Promise<void>;
 
 /** Live mode: connect to a `flk` server over ADR-0036 §5's WebSocket. */
 export type WireShellConfig = {

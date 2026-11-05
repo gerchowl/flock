@@ -8,8 +8,8 @@ test("shell badge calls Tauri's window badge command and has only its specific p
   const badge = (0, eval)(source) as (count: number) => Promise<void>;
   await badge(3); await badge(0);
   expect(calls).toEqual([
-    ["set_badge_count", { count: 3 }],
-    ["set_badge_count", { count: 0 }],
+    ["set_badge_count", { count: 3, label: null }],
+    ["set_badge_count", { count: 0, label: null }],
   ]);
   const capability = await Bun.file(new URL("../capabilities/main.json", import.meta.url)).json();
   expect(capability.permissions).toContain("allow-set-badge-count");
@@ -22,8 +22,22 @@ test("shell badge calls Tauri's window badge command and has only its specific p
 // The command uses the pinned crate's public typed API instead of encoding its private IPC.
 test("native badge uses Tauri's typed setter rather than the internal command payload", async () => {
   const source = (await Bun.file(new URL("../src/main.rs", import.meta.url)).text()).replace(/\s+/g, "");
-  expect(source).toContain("window.set_badge_count(Some(count.into()))");
-  expect(source).toContain("fnset_badge_count(window:tauri::Window,count:u32)");
+  expect(source).toContain("badge::set(&window,count,label)");
+  const native = (await Bun.file(new URL("../src/platform/badge.rs", import.meta.url)).text()).replace(/\s+/g, "");
+  expect(native).toContain("window.set_badge_count(Some(count.into()))");
+  expect(native).toContain("window.set_badge_label(Some(label))");
+  expect(source).toContain("fnset_badge_count(window:tauri::Window,count:u32,label:Option<String>)");
   const adapter = await Bun.file(new URL("../src/set-badge-count.js", import.meta.url)).text();
   expect(adapter).not.toContain("plugin:window|");
 });
+
+for (const [count, label] of [[0, null], [7, null], [2, "2+"], [0, "0+"], [0, "?"]] as const) {
+  test(`native badge carries count ${count} and label ${label}`, async () => {
+    const calls: unknown[] = [];
+    (globalThis as unknown as { window: unknown }).window = { __TAURI_INTERNALS__: { invoke: async (...args: unknown[]) => { calls.push(args); } } };
+    const source = await Bun.file(new URL("../src/set-badge-count.js", import.meta.url)).text();
+    const badge = (0, eval)(source) as (count: number, label: string | null) => Promise<void>;
+    await badge(count, label);
+    expect(calls).toEqual([["set_badge_count", { count, label }]]);
+  });
+}

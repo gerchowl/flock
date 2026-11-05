@@ -51,6 +51,7 @@ import { PhoneWorkbench } from "./Phone";
 import { ShortcutSheet } from "./ShortcutSheet";
 import { HOME_UNKNOWN, NeedsYou, SidebarTrees } from "./Sidebar";
 import { buildTrees, homeNodeId, inScope } from "./trees";
+import { waitingOnYou } from "./waiting";
 import { createWindowActive } from "./window-focus";
 import "./workbench.css";
 
@@ -136,13 +137,13 @@ export function Workbench(props: WorkbenchProps): JSX.Element {
   const scoped = createMemo(() => rows().filter((row) => inScope(prefs().scope, home(), row.nodeId)));
   const attention = createMemo(() => rows().filter(needsYou));
   const remaining = createMemo(() => rows().filter((row) => !needsYou(row)));
-  const count = createMemo(() => attention().length);
-  const attentionLabel = (): string => `${count()} ${count() === 1 ? "agent needs you" : "agents need you"}`;
-  const attentionCommand = (): string => `First agent needing you (${attentionLabel()})`;
+  const waiting = createMemo(() => waitingOnYou(fleet.nodes.items()));
+  const attentionLabel = (): string => waiting().text;
+  const attentionCommand = (): string => `First agent needing you (${attentionLabel()}${waiting().description === attentionLabel() ? "" : `; ${waiting().description}`})`;
   const badge = createBadgeWriter(props.setBadgeCount);
   createEffect(() => {
-    document.title = count() === 0 ? "flock" : `(${count()}) flock`;
-    badge(count());
+    document.title = waiting().title;
+    badge(waiting().total, waiting().badgeLabel);
   });
   onCleanup(() => {
     document.title = "flock";
@@ -206,7 +207,7 @@ export function Workbench(props: WorkbenchProps): JSX.Element {
     const first = attention()[0];
     if (first !== undefined) openAgent(first.id);
   };
-  const moves = { "attention.first": { run: firstAttention, available: () => count() > 0 }, "agent.previous": () => stepAgent(-1), "agent.next": () => stepAgent(1) };
+  const moves = { "attention.first": { run: firstAttention, available: () => attention().length > 0 && waiting().token !== "" }, "agent.previous": () => stepAgent(-1), "agent.next": () => stepAgent(1) };
   onCleanup(bindKeys(document.body, moves));
   /** The layer's commands, each run as its shortcut would be from the page. */
   const keyCommands = createMemo((): PaletteCommand[] => SHORTCUTS.filter((entry) => entry.command).map((entry) => ({ label: entry.id === "attention.first" ? attentionCommand() : entry.label, hint: formatCombo(entry.combo), ...(entry.id === "attention.first" ? { available: () => pageShortcutAvailable(entry.id) } : {}), run: () => void runPageShortcut(entry.id) })));
@@ -302,6 +303,7 @@ export function Workbench(props: WorkbenchProps): JSX.Element {
       <PhoneWorkbench
         host={hostStatus}
         rows={scoped}
+        waiting={() => waiting().description}
         fleetNote={() => fleetNote() ?? (prefs().scope === "node" && home() === null ? HOME_UNKNOWN : null)}
         agent={focusedAgent}
         row={focusedRow}

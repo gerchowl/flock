@@ -2,8 +2,8 @@
 import type { SetBadgeCount } from "../config";
 
 /** Disposal must enqueue zero through this same writer, after any in-flight write. */
-export function createBadgeWriter(set: SetBadgeCount | undefined): (count: number) => void {
-  let pending: number | undefined;
+export function createBadgeWriter(set: SetBadgeCount | undefined): (count: number, label?: string | null) => void {
+  let pending: { readonly count: number; readonly label: string | null } | undefined;
   let writing = false;
   const drain = async (): Promise<void> => {
     writing = true;
@@ -11,15 +11,15 @@ export function createBadgeWriter(set: SetBadgeCount | undefined): (count: numbe
       const value = pending;
       pending = undefined;
       try {
-        await set?.(value);
+        await set?.(value.count, value.label);
       } catch (error: unknown) {
         console.error("Could not update the app badge", error);
       }
     }
     writing = false;
   };
-  return (count) => {
-    pending = count;
+  return (count, label = null) => {
+    pending = { count, label };
     if (!writing) void drain();
   };
 }
