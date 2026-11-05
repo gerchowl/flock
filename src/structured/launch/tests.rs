@@ -612,3 +612,20 @@ fn successful_spawn_keeps_armed_files_until_owned_child_is_reaped() {
         .expect("confirmed cleanup");
     assert!(!path.exists());
 }
+
+#[test]
+fn opening_refusal_display_omits_option_debug_and_uses_source_display() {
+    let absent = LaunchError::QueueAdmission {
+        code: ErrorCode::InvalidRequest,
+        source: None,
+    };
+    assert_eq!(absent.to_string(), "opening turn refused: invalid_request");
+    let present = LaunchError::QueueAdmission {
+        code: ErrorCode::InputWriteUnknown,
+        source: Some(io::Error::other("owned fixture failure")),
+    };
+    assert_eq!(
+        present.to_string(),
+        "opening turn refused: input_write_unknown: owned fixture failure"
+    );
+}

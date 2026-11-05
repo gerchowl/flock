@@ -99,6 +99,34 @@ pub(crate) fn dedicated_uid() -> io::Result<Option<u32>> {
     Ok((!found.is_null()).then_some(entry.pw_uid))
 }
 
+/// At most sixteen stable process links are supported for strict operator proof.
+/// Unknown parents, reused ancestors, cycles, or a truncated chain refuse proof.
+/// `facts` must reject dead processes; `birth` independently rereads the birth.
+pub(crate) fn complete_ancestry(
+    pid: u32,
+    mut facts: impl FnMut(u32) -> Option<(u32, u64)>,
+    mut birth: impl FnMut(u32) -> Option<u64>,
+) -> bool {
+    let mut current = pid;
+    let mut seen = std::collections::BTreeSet::new();
+    for _ in 0..16 {
+        if current <= 1 {
+            return true;
+        }
+        if !seen.insert(current) {
+            return false;
+        }
+        let Some((parent, captured_birth)) = facts(current) else {
+            return false;
+        };
+        if birth(current) != Some(captured_birth) {
+            return false;
+        }
+        current = parent;
+    }
+    current <= 1
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,5 +147,87 @@ mod tests {
             super::super::process_start_time(std::process::id())
         );
         assert!(captured.birth.is_some());
+    }
+    #[test]
+    fn ancestry_refuses_an_incomplete_chain() {
+        assert!(!complete_ancestry(
+            3,
+            |pid| (pid == 3).then_some((2, 7)),
+            |pid| {
+                assert_eq!(pid, 3, "missing facts must stop the walk");
+                Some(7)
+            }
+        ));
+    }
+    #[test]
+    fn ancestry_accepts_sixteen_links_and_refuses_seventeen() {
+        assert!(complete_ancestry(17, |pid| Some((pid - 1, 7)), |_| Some(7)));
+        assert!(!complete_ancestry(
+            18,
+            |pid| Some((pid - 1, 7)),
+            |_| Some(7)
+        ));
+    }
+    #[test]
+    fn ancestry_refuses_a_cycle_before_reading_a_process_twice() {
+        let mut seen = std::collections::BTreeSet::new();
+        assert!(!complete_ancestry(
+            3,
+            |pid| {
+                assert!(
+                    seen.insert(pid),
+                    "cycle must stop before another process read"
+                );
+                Some((if pid == 3 { 2 } else { 3 }, 7))
+            },
+            |_| Some(7)
+        ));
+    }
+    #[test]
+    fn ancestry_refuses_a_changed_birth() {
+        assert!(!complete_ancestry(2, |_| Some((1, 7)), |_| Some(8)));
+    }
+}
+
+#[cfg(test)]
+mod live_scope_tests {
+    #[test]
+    fn scoped_liveness_refuses_an_exited_unreaped_process() {
+        let mut command = crate::process::TracedCommand::new("/bin/sh", "scoped-zombie-fixture");
+        command.args(["-c", "exit 0"]);
+        command.stdin(std::process::Stdio::piped());
+        let mut child = command.spawn_traced().unwrap();
+        let pid = child.id();
+        let (done, received) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            // SAFETY: siginfo_t is a zero-initializable output buffer. The PID
+            // belongs to this fixture; WNOWAIT preserves it for the assertion.
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            let result =
+                unsafe { libc::waitid(libc::P_PID, pid, &mut info, libc::WEXITED | libc::WNOWAIT) };
+            let _ = done.send(result);
+        });
+        let result = received.recv_timeout(std::time::Duration::from_secs(5));
+        if result.is_err() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        waiter.join().unwrap();
+        assert_eq!(
+            result.expect("fixture exit must arrive within the fail ceiling"),
+            0
+        );
+        let legacy = crate::platform::process_start_time(pid);
+        let live = crate::platform::live_process_facts(pid);
+        let reaped = child.wait().unwrap();
+        assert!(reaped.success());
+        assert!(
+            legacy.is_some(),
+            "the fixture was deliberately left unreaped"
+        );
+        assert!(
+            live.is_none(),
+            "zombie process facts cannot authorize a request"
+        );
     }
 }
