@@ -38,7 +38,10 @@ jobs:
   lint:
     name: lint
     runs-on: ${{ inputs.leg }}
-    timeout-minutes: 30
+    # Cold macOS lint measured 12m56s on #2989 after removing unused tool
+    # builds. 28m is about twice that initial upper sample, including setup
+    # and rustdoc. Recheck the week-long p95 after landing. Linux keeps 30m.
+    timeout-minutes: ${{ inputs.leg == 'macos-15' && 28 || 30 }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7
