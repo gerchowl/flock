@@ -1,3 +1,5 @@
+use super::safe_diagnostic::Diagnostic;
+use super::validation::{message, Cause};
 #[cfg(test)]
 use crossterm::event::KeyEvent;
 use crossterm::event::{KeyCode, KeyModifiers};
@@ -590,8 +592,7 @@ impl Config {
             let command_field = format!("keys.command[{index}].command");
 
             if command.command.trim().is_empty() {
-                let diag =
-                    format!("empty custom command: {command_field}; disabling custom command");
+                let diag = message(Cause::EmptyCommand, &command_field, Some(index));
                 crate::logging::config_diagnostic(&diag);
                 diagnostics.push(diag);
                 continue;
@@ -679,7 +680,7 @@ fn parse_action_bindings_owned(
                 bindings.push(binding);
             }
             Some(ParsedBinding::Range(_)) if !allow_ranges => {
-                let diag = format!("range keybinding is only valid for indexed actions: {field} = {raw:?}; disabling binding");
+                let diag = message(Cause::Range, field, None);
                 crate::logging::config_diagnostic(&diag);
                 diagnostics.push(diag);
             }
@@ -693,7 +694,7 @@ fn parse_action_bindings_owned(
                 }
             }
             None => {
-                let diag = format!("invalid keybinding: {field} = {raw:?}; disabling binding");
+                let diag = message(Cause::InvalidBinding, field, None);
                 crate::logging::config_diagnostic(&diag);
                 diagnostics.push(diag);
             }
@@ -723,12 +724,12 @@ fn parse_navigate_bindings(
                 bindings.push(binding);
             }
             Some(ParsedBinding::Range(_)) => {
-                let diag = format!("range keybinding is only valid for indexed actions: {field} = {raw:?}; disabling binding");
+                let diag = message(Cause::Range, field, None);
                 crate::logging::config_diagnostic(&diag);
                 diagnostics.push(diag);
             }
             None => {
-                let diag = format!("invalid keybinding: {field} = {raw:?}; disabling binding");
+                let diag = message(Cause::InvalidBinding, field, None);
                 crate::logging::config_diagnostic(&diag);
                 diagnostics.push(diag);
             }
@@ -753,10 +754,7 @@ fn parse_indexed_bindings(
                     label: binding.label,
                 })
             } else {
-                let diag = format!(
-                    "indexed keybinding must use 1..9: {field} = {:?}; disabling binding",
-                    binding.label
-                );
+                let diag = message(Cause::Indexed, field, None);
                 crate::logging::config_diagnostic(&diag);
                 diagnostics.push(diag);
                 None
@@ -808,9 +806,7 @@ fn append_legacy_indexed_bindings(
         return;
     }
     let Some(modifiers) = parse_modifier_combo(configured_label) else {
-        let diag = format!(
-            "invalid indexed keybinding: {field} = {configured_label:?}; disabling binding"
-        );
+        let diag = message(Cause::InvalidModifier, field, None);
         crate::logging::config_diagnostic(&diag);
         diagnostics.push(diag);
         return;
@@ -843,27 +839,23 @@ fn reject_navigate_binding(
     diagnostics: &mut Vec<String>,
 ) -> bool {
     if binding.trigger.is_prefix() {
-        let diag = format!(
-            "navigate keybinding must not include prefix: {field} = {:?}; disabling binding",
-            binding.label
-        );
+        let diag = message(Cause::NavigatePrefix, field, None);
         crate::logging::config_diagnostic(&diag);
         diagnostics.push(diag);
         return true;
     }
 
     if matches!(normalize_key_combo(binding.trigger.combo()).0, KeyCode::Esc) {
-        let diag = format!(
-            "navigate keybinding cannot use esc: {field} = {:?}; disabling binding",
-            binding.label
-        );
+        let diag = message(Cause::NavigateEsc, field, None);
         crate::logging::config_diagnostic(&diag);
         diagnostics.push(diag);
         return true;
     }
 
     if let Some(first_field) = registry.conflict(binding) {
-        let diag = format!("{}: kept {first_field}, disabled {field}", binding.label);
+        let diag = Diagnostic::validation(Cause::Conflict, field, None)
+            .with_related(first_field)
+            .to_string();
         crate::logging::config_diagnostic(&diag);
         diagnostics.push(diag);
         return true;
@@ -879,28 +871,23 @@ fn reject_binding(
     diagnostics: &mut Vec<String>,
 ) -> bool {
     if binding.trigger.is_prefix() && registry.prefix_rhs_is_reserved(binding.trigger.combo()) {
-        let diag = format!(
-            "reserved keybinding: {field} = {:?} uses keys.prefix as the prefix-mode key; pressing the prefix twice sends a literal prefix key, so this binding is disabled",
-            binding.label
-        );
+        let diag = message(Cause::Reserved, field, None);
         crate::logging::config_diagnostic(&diag);
         diagnostics.push(diag);
         return true;
     }
 
     if let Some(first_field) = registry.conflict(binding) {
-        let diag = format!("{}: kept {first_field}, disabled {field}", binding.label);
+        let diag = Diagnostic::validation(Cause::Conflict, field, None)
+            .with_related(first_field)
+            .to_string();
         crate::logging::config_diagnostic(&diag);
         diagnostics.push(diag);
         return true;
     }
 
     if binding.trigger.is_direct() && is_unmodified_printable(binding.trigger.combo()) {
-        let suggestion = format!("prefix+{}", binding.label);
-        let diag = format!(
-            "unsafe direct keybinding: {field} = {:?} would intercept typing; use {:?} to require the prefix; disabling binding",
-            binding.label, suggestion
-        );
+        let diag = message(Cause::DirectPrintable, field, None);
         crate::logging::config_diagnostic(&diag);
         diagnostics.push(diag);
         return true;
@@ -1149,7 +1136,9 @@ fn parse_key_combo_with_diagnostic(
     match parse_key_combo(s) {
         Some(binding) => (binding, None),
         None => {
-            let diag = format!("invalid keybinding: {field} = {s:?}; using fallback");
+            let diag = Diagnostic::validation(Cause::InvalidBinding, field, None)
+                .fallback()
+                .to_string();
             crate::logging::config_diagnostic(&diag);
             (fallback, Some(diag))
         }
@@ -1673,7 +1662,8 @@ navigate_pane_down = "ctrl+j"
             .matches_direct_key(TerminalKey::new(KeyCode::Char('j'), KeyModifiers::CONTROL)));
         assert!(diagnostics.iter().any(|diag| {
             diag.contains("kept keys.navigate_workspace_up")
-                && diag.contains("disabled keys.navigate_workspace_down")
+                && diag.contains("key=keys.navigate_workspace_down")
+                && diag.contains("disabling binding")
         }));
     }
 
@@ -1729,7 +1719,8 @@ command = "echo hi"
             .matches_direct_key(TerminalKey::new(KeyCode::Char('f'), KeyModifiers::empty())));
         assert!(!keybinds.custom_commands.is_empty());
         assert!(!diagnostics.iter().any(|diag| {
-            diag.contains("disabled keys.navigate_workspace_down")
+            diag.contains("key=keys.navigate_workspace_down")
+                && diag.contains("disabling binding")
                 && (diag.contains("keys.next_tab") || diag.contains("keys.command"))
         }));
     }
@@ -1792,7 +1783,9 @@ command = "echo no"
         let diagnostics = config.collect_diagnostics();
         assert!(config.keybinds().custom_commands.is_empty());
         assert!(diagnostics.iter().any(|diag| {
-            diag.contains("reserved keybinding") && diag.contains("keys.command[0].key")
+            diag.contains("reserved keybinding")
+                && diag.contains("key=keys.command[].key")
+                && diag.contains("entry_index=0")
         }));
     }
 
@@ -1811,7 +1804,9 @@ command = "echo no"
         let diagnostics = config.collect_diagnostics();
         assert!(config.keybinds().custom_commands.is_empty());
         assert!(diagnostics.iter().any(|diag| {
-            diag.contains("unsafe direct keybinding") && diag.contains("keys.command[0].key")
+            diag.contains("unsafe direct keybinding")
+                && diag.contains("key=keys.command[].key")
+                && diag.contains("entry_index=0")
         }));
     }
 
@@ -1833,7 +1828,10 @@ command = "echo no"
         assert!(!keybinds.new_tab.bindings.is_empty());
         assert!(keybinds.custom_commands.is_empty());
         assert!(diagnostics.iter().any(|diag| {
-            diag.contains("kept keys.new_tab") && diag.contains("disabled keys.command[0].key")
+            diag.contains("kept keys.new_tab")
+                && diag.contains("key=keys.command[].key")
+                && diag.contains("entry_index=0")
+                && diag.contains("disabling binding")
         }));
     }
 
@@ -1917,7 +1915,9 @@ new_workspace = "prefix+n"
         let kb = config.keybinds();
         assert!(kb.next_tab.bindings.is_empty() || kb.new_workspace.bindings.is_empty());
         assert!(diagnostics.iter().any(|diag| {
-            diag.contains("kept keys.new_workspace") && diag.contains("disabled keys.next_tab")
+            diag.contains("kept keys.new_workspace")
+                && diag.contains("key=keys.next_tab")
+                && diag.contains("disabling binding")
         }));
     }
 
@@ -1953,5 +1953,96 @@ directory = "/tmp/x"
         .unwrap();
         let kb = config.keybinds();
         assert_eq!(kb.branch_session.label().as_deref(), Some("prefix+y"));
+    }
+}
+
+#[cfg(test)]
+mod producer_security_tests {
+    use super::*;
+    fn binding_rejection(case: usize) {
+        // Labels stay private even when a caller supplies an already resolved binding.
+        let mut registry = BindingRegistry::new((KeyCode::Char('b'), KeyModifiers::CONTROL));
+        let trigger = match case {
+            0 | 3 => BindingTrigger::Prefix((KeyCode::Char('b'), KeyModifiers::CONTROL)),
+            1 | 4 => BindingTrigger::Direct((KeyCode::Char('x'), KeyModifiers::CONTROL)),
+            2 => BindingTrigger::Direct((KeyCode::Char('x'), KeyModifiers::empty())),
+            _ => BindingTrigger::Direct((KeyCode::Esc, KeyModifiers::empty())),
+        };
+        let binding = ResolvedBinding {
+            trigger,
+            label: format!("SECRET_REJECTION_{case}_2384"),
+        };
+        if matches!(case, 1 | 4) {
+            registry.register(&binding, "keys.command[3].key");
+        }
+        let mut diagnostics = Vec::new();
+        let logs = crate::logging::capture_logs(|| {
+            let rejected = if case < 3 {
+                reject_binding("keys.command[7].key", &binding, &registry, &mut diagnostics)
+            } else {
+                reject_navigate_binding(
+                    "keys.navigate_workspace_up",
+                    &binding,
+                    &registry,
+                    &mut diagnostics,
+                )
+            };
+            assert!(rejected);
+        });
+        assert!(logs.contains("config.diagnostic"), "{logs}");
+        assert!(
+            !format!("{diagnostics:?} {logs}").contains("SECRET_REJECTION_"),
+            "case={case}: {diagnostics:?} {logs}"
+        );
+    }
+    macro_rules! rejection {
+        ($test:ident, $case:expr) => {
+            #[test]
+            fn $test() {
+                binding_rejection($case);
+            }
+        };
+    }
+    rejection!(security2384_producer_reserved, 0);
+    rejection!(security2384_producer_conflict, 1);
+    rejection!(security2384_producer_direct, 2);
+    rejection!(security2384_producer_navigate_prefix, 3);
+    rejection!(security2384_producer_navigate_conflict, 4);
+    rejection!(security2384_producer_navigate_escape, 5);
+    fn range_or_indexed(field: &'static str, value: &str, indexed: bool) {
+        let mut registry = BindingRegistry::new((KeyCode::Char('b'), KeyModifiers::CONTROL));
+        let mut diagnostics = Vec::new();
+        let logs = crate::logging::capture_logs(|| {
+            if indexed {
+                parse_indexed_bindings(
+                    field,
+                    &BindingConfig::One(value.into()),
+                    &mut registry,
+                    &mut diagnostics,
+                );
+            } else {
+                parse_action_bindings_owned(
+                    field,
+                    &BindingConfig::One(value.into()),
+                    false,
+                    &mut registry,
+                    &mut diagnostics,
+                );
+            }
+        });
+        assert!(!diagnostics.is_empty());
+        assert!(logs.contains("config.diagnostic"), "{logs}");
+        assert!(
+            !format!("{diagnostics:?} {logs}").contains(value),
+            "{diagnostics:?} {logs}"
+        );
+    }
+    #[test]
+    fn security2384_producer_range() {
+        range_or_indexed("keys.new_tab", "ctrl+1..9", false);
+    }
+    #[test]
+    fn security2384_producer_indexed() {
+        range_or_indexed("keys.switch_tab", "ctrl+é", true);
     }
 }
