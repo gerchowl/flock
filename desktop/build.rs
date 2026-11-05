@@ -1,5 +1,10 @@
-/// The bridge's open, send and close (src/main.rs), and no other command.
-const BRIDGE_COMMANDS: [&str; 3] = ["bridge_open", "bridge_send", "bridge_close"];
+/// The bridge commands and the native badge capability (src/main.rs).
+const BRIDGE_COMMANDS: [&str; 4] = [
+    "bridge_open",
+    "bridge_send",
+    "bridge_close",
+    "set_badge_count",
+];
 
 fn main() {
     // Declaring the app's commands puts them under the ACL: each needs its

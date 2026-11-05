@@ -34,7 +34,7 @@ export type PaletteProps = {
 export type WaitingAction = { readonly label: string; readonly waitsFor: string };
 
 /** A command the palette runs when chosen. */
-export type PaletteCommand = { readonly label: string; readonly hint: string; readonly run: () => void };
+export type PaletteCommand = { readonly label: string; readonly hint: string; readonly run: () => void; readonly available?: () => boolean };
 
 type Item = { readonly id: string; readonly label: string; readonly hint: string; readonly disabled?: true; readonly run?: () => void };
 
@@ -61,7 +61,7 @@ export function Palette(props: PaletteProps): JSX.Element {
       .map((row) => ({ id: row.id, label: row.label, hint: row.activity }));
     const commands = (props.commands ?? [])
       .filter((command) => text === "" || command.label.toLowerCase().includes(text))
-      .map((command): Item => ({ id: `run:${command.label}`, label: command.label, hint: command.hint, run: command.run }));
+      .map((command): Item => ({ id: `run:${command.label}`, label: command.label, hint: command.hint, run: command.run, ...(command.available?.() === false ? { disabled: true as const } : {}) }));
     const waiting = (props.waiting ?? [])
       .filter((action) => text === "" || action.label.toLowerCase().includes(text))
       .map((action): Item => ({ id: `waits:${action.label}`, label: action.label, hint: `Waits for ${action.waitsFor}`, disabled: true }));

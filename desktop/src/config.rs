@@ -10,10 +10,14 @@ const SHELL_CONFIG_GLOBAL: &str = "__FLOCK_SHELL_CONFIG__";
 /// The contract's `openBridge` over the three bridge commands.
 const OPEN_BRIDGE: &str = include_str!("open-bridge.js");
 
+/// The desktop badge capability, kept out of the web bundle.
+const SET_BADGE_COUNT: &str = include_str!("set-badge-count.js");
+
 /// The script that runs before the bundle: the contract's bridge transport.
 pub fn init_script() -> String {
     format!(
-        "window.{SHELL_CONFIG_GLOBAL} = Object.freeze({{ transport: \"bridge\", openBridge: {} }});",
+        "window.{SHELL_CONFIG_GLOBAL} = Object.freeze({{ transport: \"bridge\", setBadgeCount: {}, openBridge: {} }});",
+        SET_BADGE_COUNT.trim_end(),
         OPEN_BRIDGE.trim_end()
     )
 }
@@ -47,7 +51,7 @@ mod tests {
     fn init_script_installs_the_bridge_and_no_server_or_token() {
         let script = init_script();
         let prefix =
-            "window.__FLOCK_SHELL_CONFIG__ = Object.freeze({ transport: \"bridge\", openBridge: ";
+            "window.__FLOCK_SHELL_CONFIG__ = Object.freeze({ transport: \"bridge\", setBadgeCount: ";
         assert!(script.starts_with(prefix), "{script}");
         assert!(script.ends_with("\n} });"), "{script}");
         for command in ["\"bridge_open\"", "\"bridge_send\"", "\"bridge_close\""] {

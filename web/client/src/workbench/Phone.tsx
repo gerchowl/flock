@@ -22,6 +22,7 @@ import { AgentRowButton, AgentTitle, InboxCards, Waits, type ClosedIds } from ".
 /** What the phone screens show, and what they can do. */
 export type PhoneProps = {
   readonly rows: () => readonly AgentRow[];
+  readonly waiting: () => string;
   /** Why the agent list is empty or ended, if it is. */
   readonly fleetNote: () => string | null;
   readonly agent: () => string | null;
@@ -49,9 +50,7 @@ type Tab = "inbox" | "agents";
 export function PhoneWorkbench(props: PhoneProps): JSX.Element {
   const [tab, setTab] = createSignal<Tab>("inbox");
   const [onAgent, setOnAgent] = createSignal(false);
-  // The same count as the sidebar badge: what the server lists as waiting on a human.
-  const blocked = (): number => props.rows().reduce((sum, row) => sum + row.waitingOnHuman.length, 0);
-  const headline = (): string => (blocked() === 0 ? "Nothing is blocked on you." : `${blocked()} blocked on you.`);
+  const headline = (): string => props.waiting();
   /*
    * The agent screen is a history entry, so the system back gesture returns
    * to the tab it came from instead of leaving the app. `pushState` without

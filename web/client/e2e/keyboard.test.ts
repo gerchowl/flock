@@ -21,6 +21,7 @@ import { expectNoKeyListeners, guardKeys, keyListeners } from "./key-guard";
 const OUT = `${CLIENT_ROOT}/artifacts/keys-harness`;
 const ORIGIN = "http://keys.test";
 const LIMIT = 30_000;
+const REQUEST = '[data-testid="inbox-card"][data-request-seq="7"]';
 /** `KEYS_SEED=<seed>` loads that harness seed into every page, so every test's key guard fails (`e2e/keys/harness.tsx`). */
 const RUN_SEED = process.env["KEYS_SEED"];
 
@@ -132,7 +133,7 @@ describe("↑/↓ move through the agents", () => {
     await composer(page).press("ArrowUp");
     expect(await composer(page).evaluate((field: HTMLTextAreaElement) => field.selectionStart)).toBeLessThan(4);
     await composer(page).press("ArrowDown");
-    await page.getByTestId("inbox-card").focus();
+    await page.locator(REQUEST).focus();
     await page.keyboard.press("ArrowDown");
     expect(await openAgent(page)).toBe(first);
     await done(page);
@@ -206,7 +207,7 @@ describe("⌘↩ allows and ⌘⌫ denies the focused card, and nothing else", (
     const page = await open();
     await page.keyboard.press("ControlOrMeta+Enter");
     await page.keyboard.press("ControlOrMeta+Backspace");
-    const card = page.getByTestId("inbox-card");
+    const card = page.locator(REQUEST);
     await card.getByRole("button", { name: "Deny" }).focus();
     await page.keyboard.press("ControlOrMeta+Enter");
     await page.keyboard.press("ControlOrMeta+Backspace");
@@ -221,7 +222,7 @@ describe("⌘↩ allows and ⌘⌫ denies the focused card, and nothing else", (
 
   test("on the focused card: ⌘↩ allows once and ⌘⌫ denies that request", async () => {
     const page = await open();
-    const card = page.getByTestId("inbox-card");
+    const card = page.locator(REQUEST);
     expect(await card.getAttribute("aria-keyshortcuts")).toMatch(/^(Meta|Control)\+Enter (Meta|Control)\+Backspace$/);
     await card.focus();
     await page.keyboard.press("ControlOrMeta+Enter");
@@ -250,7 +251,7 @@ describe("Esc", () => {
     await composer(page).focus();
     await page.keyboard.press("Escape");
     expect(await activeTestId(page)).toBe("body");
-    const message = page.getByTestId("inbox-card").getByRole("textbox");
+    const message = page.locator(REQUEST).getByRole("textbox");
     await message.focus();
     await page.keyboard.press("Escape");
     expect(await message.evaluate((field) => field === document.activeElement)).toBe(true);
@@ -263,10 +264,10 @@ describe("a modal owns the keyboard: nothing behind the palette or the sheet act
     const page = await open();
     await page.keyboard.press("ControlOrMeta+k");
     await palette(page).waitFor();
-    await page.getByTestId("inbox-card").evaluate((card: HTMLElement) => card.focus());
+    await page.locator(REQUEST).evaluate((card: HTMLElement) => card.focus());
     await page.keyboard.press("ControlOrMeta+Enter");
     await page.keyboard.press("ControlOrMeta+Backspace");
-    await dispatchOn(page, '[data-testid="inbox-card"]', "Enter", { command: true });
+    await dispatchOn(page, REQUEST, "Enter", { command: true });
     expect(await sent(page)).toEqual([]);
     expect(await palette(page).isVisible()).toBe(true);
     await page.keyboard.press("Escape");
@@ -278,8 +279,8 @@ describe("a modal owns the keyboard: nothing behind the palette or the sheet act
     const page = await open();
     await page.keyboard.press("?");
     await sheet(page).waitFor();
-    await dispatchOn(page, '[data-testid="inbox-card"]', "Enter", { command: true });
-    await dispatchOn(page, '[data-testid="inbox-card"]', "Backspace", { command: true });
+    await dispatchOn(page, REQUEST, "Enter", { command: true });
+    await dispatchOn(page, REQUEST, "Backspace", { command: true });
     await dispatchOn(page, "body", "ArrowDown");
     expect(await sent(page)).toEqual([]);
     expect(await openAgent(page)).toBe(null);

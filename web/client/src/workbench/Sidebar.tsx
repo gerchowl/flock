@@ -143,6 +143,18 @@ function NodeGroup(props: { readonly entry: NodeEntry; readonly stamp: Stamps; r
   );
 }
 
+/** Pinned attention across the fleet, before the scoped trees. */
+export function NeedsYou(props: { readonly rows: readonly AgentRow[] } & Opener): JSX.Element {
+  return (
+    <section class="group group--tree" aria-label="Needs you" data-testid="needs-you-section">
+      <h2 class="inbox__title">Needs you</h2>
+      <Show when={props.rows.length > 0} fallback={<p class="sidebar__note">No agents need you.</p>}>
+        <Agents rows={props.rows} focused={props.focused} open={props.open} />
+      </Show>
+    </section>
+  );
+}
+
 /** The scope toggle, the Fleet tree and the Projects tree. */
 export function SidebarTrees(props: {
   readonly trees: Accessor<Trees>;
