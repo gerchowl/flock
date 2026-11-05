@@ -119,10 +119,10 @@ class ActionsCachePolicy(unittest.TestCase):
     def test_ci_lint_uses_the_dev_shell_and_bounded_dev_only_store_cache(self):
         document = workflow('ci-leg.yml')
         job = document['jobs']['lint']
-        self.assert_ci_dev_shell_cache(document, job, 'nix develop -c just lint')
+        self.assert_ci_dev_shell_cache(document, job, 'nix develop .#ci-lint -c just lint')
         commands = {step['run'] for step in job['steps'] if 'run' in step}
         self.assertEqual(commands, {
-            'nix develop -c just lint', 'nix develop -c just doc-check',
+            'nix develop .#ci-lint -c just lint', 'nix develop .#ci-lint -c just doc-check',
         })
 
     def test_script_tests_job_uses_the_dev_shell_and_bounded_dev_only_store_cache(self):

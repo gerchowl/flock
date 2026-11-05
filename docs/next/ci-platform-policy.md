@@ -3,7 +3,10 @@
 Owner-approved policy (2026-10-16, #1613): ordinary pull requests run full Linux
 build, lint and test checks, plus macOS build and lint (`macos-15 / build` and
 `macos-15 / lint`). They schedule no macOS test shards. The build still compiles
-all test binaries and verifies the complete shard partition.
+all test binaries and verifies the complete shard partition. As a targeted
+exception (#2569), the macOS build job also runs the native suspend-clock
+tests from that archive on every Rust PR, proving continuous-time kqueue
+timers work through the production Tokio reactor on `macos-15`.
 
 Landing batch PRs whose head branch starts with `land/`, and pushes to `dev` or
 `main`, run the full macOS test suite as well. Batch detection uses
@@ -23,7 +26,8 @@ gate. The Linux gate retains the same failure rules and full test coverage.
 
 A macOS-only test failure may first surface in a landing batch, rather than its
 individual PR. The batch must pass its full macOS checks before landing. A green
-ordinary PR's macOS aggregate is evidence of build/lint success, not test success.
+ordinary PR's macOS aggregate proves build/lint and the targeted suspend-clock
+checks, but does not prove the full macOS suite passed.
 The policy reduces PR runner demand; it does not reduce batch coverage or change
 the existing action pins, permissions, test filters or shard assignments.
 
@@ -54,3 +58,17 @@ event, and `check (ubuntu-latest)` requires it, so they are never skipped. Detec
 empty diff, a `land/` head, `merge_group`, push, or a failed `changes` job runs
 everything. The `check (...)` gates still run with `always()`; they accept a
 `skipped` leg only when `changes` explicitly reported `skip_rust=true`.
+
+## Desktop shell tests
+
+The `desktop (ubuntu-latest)` and `desktop (macos-15)` jobs (`ci-desktop.yml`,
+called from `ci.yml`, #2477) run `just desktop-test`: the client build that
+`tauri::generate_context!` embeds, then `cargo test --locked` in `desktop/`, a crate
+outside flk's workspace (Linux installs Tauri v2's WebKitGTK 4.1 prerequisites).
+They run on every ordinary PR and every other event, like the Rust legs, and follow
+the same `skip_rust` decision rather than a path filter of their own: `desktop/`,
+`justfile` and the workflow are not allow-listed, so only docs/web-client-only PRs
+skip them. `check (ubuntu-latest)` and `check (macos-15)` list their desktop job in
+`needs` and, in a step that runs with `always()`, accept `skipped` only when
+`changes` reported `skip_rust=true`; failed, cancelled or missing results fail the
+gate. Signing, notarisation and the nix build of the shell stay with G9c (#1636).

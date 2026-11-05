@@ -71,6 +71,14 @@ when the runtime ends. Successful revocation emits the persisted global event
 
 `server.live_handoff` transfers the running server's panes to a replacement executable. Optional params are `import_exe` (executable path), `expected_protocol`, `expected_version`, and `skip_undrained` (default `false`). A `handoff_failed` response carries its stable cause category in `error.data.kind`: `import_refused`, `broken_pipe`, `connection_reset`, `invalid_input`, or `other`. The category describes the cause, not the ownership-commit stage. Treat every category, including unknown future values, as a failure and inspect `message` for diagnostics.
 
+The server canonicalizes an explicit `import_exe`, or its own executable when
+absent, before stopping workers or transferring panes. A missing, dangling or
+non-file target returns `server_executable_unresolved` (retry class
+`after_inspecting`). Restore the binary or select a valid target before retrying.
+Auto-detected daemons use the same resolver, with no unresolved-path fallback.
+The resolved pathname does not pin file contents, and handoff version/protocol
+checks remain required.
+
 ## Mesh edge enrollment
 
 `mesh.hello` is a held-relay handshake. A `begin` offer carries `mesh`,
@@ -118,8 +126,8 @@ retained across restart as offline hints.
 
 `peers.summary` optionally includes `structured_agents` beside `workspaces`.
 Each row carries `agent_id`, `agent` (harness label), `status`, and
-`runtime: "structured"`; `pane_id` is absent because these identities have no
-pane placement. Workspace agent rows keep their required `pane_id` field,
+`runtime: "structured"`; `pane_id` is absent because native placement is local
+and is not advertised by gossip. Workspace agent rows keep their required `pane_id` field,
 including an empty string; a separate structured row type omits it. The list is omitted when empty and defaults to empty when
 reading older peers. Readers skip individual unsupported or invalid structured
 rows (including unknown `runtime` or `status` values) with a diagnostic, keeping
@@ -1414,8 +1422,24 @@ Pane-only operations return `runtime_unsupported` (retry `never`, CLI exit 2).
 `agent.send` instead uses structured queue admission: `submit:false` returns
 `structured_submit_required`; `submit:true` acknowledges the durable lifecycle ID.
 A name or ID shared with a terminal still returns `agent_target_ambiguous`.
-These contracts do not enable public structured start; that remains gated until
-all #1843 routing and #1734 credential protection land. Mesh VERSION remains 5.
+Structured start retains its launcher and credential-protection gates.
+Mesh VERSION remains 5.
+
+Structured `agent.start` creates and focuses one native view in the active tab,
+or a native-only workspace when none exists. `agent.focus` reuses that placement
+without starting another worker. `StructuredAgentInfo.view` is the real
+`{workspace_id, tab_id, pane_id}`, absent while detached; closing the view does not
+stop its runtime. A resumed generation rebinds the same placement. Explicit
+workspace/tab/split selectors, `here`, labels and dry runs remain unsupported
+for structured starts. Native views allocate no PTY or terminal identity.
+A launch admitted before placement fails returns the typed result
+`structured_agent_started_unplaced {agent_id, generation, placement_error}`.
+The registered cause is in `placement_error.code`. CLI/MCP report exit 1 while
+preserving this result, since the launch remains owned and discoverable.
+Inspect `agent.get`, then focus or stop that ID; do not repeat start blindly.
+Duplicate native placements or invalid layout membership make `agent.get` and
+`agent.focus` refuse with `internal_error` without changing the layout.
+
 
 ### Queue item lifecycle facts
 

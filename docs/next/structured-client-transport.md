@@ -5,14 +5,30 @@ from #1893 is mounted by #1894 in the real headless-server lifecycle, alongside
 the GUI bundle and browser-code exchange. Build with the `web` feature and set
 `[client] bind = "127.0.0.1:7682"` to opt in. Port 0 asks the OS for a free port;
 `flk client open --print` reports the live address, including after a config
-reload. The listener is off by default. `flk web` remains the separate terminal
-bridge.
+reload. This TCP listener is off by default. `flk web` remains the separate
+terminal bridge.
+
+Web-enabled servers also expose `GET /v1/ws` over the private sibling
+`flock-ws.sock`, independently of the TCP bind. An API override such as
+`custom.sock` derives `custom-ws.sock` in the same protected directory. The
+native process must both mint over the API socket and own the WebSocket
+connection: app bearers are bound to its live PID and process birth. TCP
+refuses app bearers with 4401 `peer_process_changed`; browser/file credentials
+retain their scopes. Native admission additionally requires kernel-verified
+LocalOperator identity and never trusts headers as identity. See the
+[app-session credential contract](app-session-token-foundation.md) for exact
+HTTP refusals and handoff behavior.
 
 The first data message is a generated `hello` frame containing a client token.
 The core opens the store once off the async executor, then verifies current
 private token storage using S2a's bounded blocking-I/O budget. Unproven hellos
 never take the exclusive management/cleanup lock. An absolute five-second
 deadline covers receipt, verification and the successful `welcome` write.
+Hello lookup stays independent of token-management ownership. Registration
+waits for concurrent management and revocation intents within that same deadline,
+rather than dropping an otherwise valid browser hello immediately. The shared
+registration lock still fences insertion against revocation; cancelled waiters
+cannot register later.
 Missing, malformed, removed or incorrect credentials and explicit
 authentication-scope refusals fail closed with 4401. If the first `hello` never
 arrives before the five-second deadline, the server closes 1001 and the client
@@ -117,18 +133,26 @@ No valid pong for 45 seconds ends the socket and releases its resources. The
 initial baseline is the successful welcome. A supplied monotonic clock governs
 handshake, write and heartbeat deadlines; wall-clock changes grant no liveness.
 
-There are at most 32 HTTP connections before upgrade, plus at most 16 upgraded
-sockets. HTTP overflow closes the accepted I/O before reading a request. The entire HTTP connection has a five-second ceiling, including headers,
-body receipt, response writes and keepalive. Expiry closes its I/O. Successful
-upgrades leave that HTTP lifetime and use the core's independent deadlines. Only
-four unverified
-hello/recheck attempts may be in flight at once; a verified token principal may
-register at most four sockets. Pending overload refuses upgrade with 503; principal overload closes
-1001. Existing authenticated connections retain capacity when slow hellos fill
-the probation slots. This bounds ownership; repeated local connection spam can
-still delay a new connection. It does not grant per-process fairness before
-credentials are known. Each connection has an eight-message
-data queue and a four-message priority queue.
+Each TCP or Unix listener owns at most 32 incomplete HTTP connections and four
+separate overload-response writers. An available response writer sends typed
+503 `preauth_capacity` without parsing another header, then half-closes and
+drains within the same absolute five-second deadline. When that response budget
+is also full, additional over-cap connections close without allocating work.
+Refusals never block normal acceptance. The HTTP deadline includes headers,
+body receipt, response writes and keepalive. Successful upgrades leave that
+lifetime and use the core's independent deadlines.
+
+The two transports share at most 16 upgraded sockets. Each has four pending
+hello/recheck reservations. Each sealed credential digest may register four
+sockets across both transports, including pending welcome. Renewed app mints
+have independent budgets even when they share an operator principal. Pending
+overload refuses upgrade with typed 503; per-credential overload after upgrade
+closes 1001. Existing authenticated connections retain capacity when slow hellos
+fill the probation slots. Management-lock waits use a separate eight-worker budget and retain their
+original hello deadline. They do not reserve the four shared credential-I/O
+workers needed by established subscriptions. These bounds do not promise
+per-process fairness.
+Each connection has an eight-message data queue and a four-message priority queue.
 The writer checks priority between data writes. Frames and reassembled messages
 are capped at 64 KiB, and outgoing serialization stops at that cap rather than
 first allocating an arbitrarily large JSON string. Compression is never
@@ -136,18 +160,16 @@ negotiated. A blocked write fails within 45 seconds; missing pongs retain their
 independent original ceiling. Saturated internal queues end the connection
 rather than growing a backlog. Oversized server output also ends the socket.
 
-The core owns verified token-to-socket identities until teardown. The future
-command slice calls its 4403 fan-out only after the triggering auth_revoked ack
-has been written, within the existing write/liveness bound. The primitive closes
-all registered sockets for that principal, leaving other principals alone.
-A verified socket registers before welcome and rechecks current token storage
-after registration; revocation in that gap closes 4403 without welcome. A
-store failure or handshake deadline, during either verification, instead closes 1001,
-keeping the credential eligible for reconnect. A failed welcome encode or send drops the
-transport without another send or an auth close. Neither failure proves token
-revocation (ADR-0036 §5a). No
-filesystem watcher or automatic command-time revocation route is added
-here; the command slice must recheck storage before dispatch as ADR-0036 requires.
+The core owns verified token-to-socket identities until teardown. Command
+revocation flushes its triggering `auth_revoked` acknowledgement before 4403,
+within the existing write/liveness bound. Fan-out closes registered sockets of
+that credential, leaving other credentials alone. A refused hello before
+registration closes 4401 without welcome. After registration, storage recheck or
+process-exit revocation closes 4403, including before welcome. A store failure or
+handshake deadline instead closes 1001, preserving the credential for reconnect.
+A failed welcome encode or send drops the transport without another send or an
+authentication close; neither proves revocation (ADR-0036 §5a). Commands recheck
+storage before dispatch under the admission/revocation fence.
 Closing the core cancels pending hellos and authenticated sockets. Explicit
 shutdown waits up to five seconds for connection leases and reports failure to
 release them; it never treats that ceiling as evidence of success.
@@ -176,12 +198,28 @@ framing or form actions; every other response carries a deny-all policy
 (see [GUI bundle hosting](structured-gui-hosting.md#document-security-policy),
 #1848). There is no generated configuration script.
 
-Startup runs `tailscale serve status --json` off the async executor, bounded at
-five seconds and 64 KiB. Any serve or funnel configuration targeting the bound
-port, unsuccessful or malformed status, and an unavailable probe refuse the
-configured listener and server startup; there is no silent fallback. Exit status
-is checked before parsing JSON. Forwarding changes after startup are not
-monitored. The operator must keep forwarding to this port disabled.
+Startup distinguishes three forwarding-probe outcomes off the async executor:
+
+- `NotInstalled`: no CLI on PATH or in the standard macOS app bundle, and no
+  LocalAPI socket at the platform's standard locations. Start the listener
+  and emit one INFO record listing the paths checked and why the forwarding
+  check was skipped. Inspection errors never establish absence.
+- `Status`: use the discovered PATH or app-bundle CLI for
+  `tailscale serve status --json`, bounded at five seconds and 64 KiB. Any
+  serve/funnel rule targeting the bound port still refuses startup.
+- `Unavailable`: installation evidence exists but status cannot be obtained,
+  including a socket with no CLI, failed execution, nonzero exit or malformed
+  JSON. Refuse startup, naming the evidence and failure. Exit status is checked
+  before parsing JSON; there is no fallback after an unsuccessful probe.
+
+On macOS the standard bundle CLI is
+`/Applications/Tailscale.app/Contents/MacOS/Tailscale` and the default daemon
+socket is `/var/run/tailscaled.socket`. Linux checks both
+`/var/run/tailscale/tailscaled.sock` and `/run/tailscale/tailscaled.sock`.
+Custom installation/socket locations outside those defaults are not inferred;
+make the CLI available on the server's PATH. Host/Origin checks, IPv4 loopback
+binding and all other admission rules are unchanged. Forwarding changes after
+startup are not monitored; the operator must keep this port unforwarded.
 
 Live handoff transfers the bound listening descriptor rather than rebinding its
 port after commit. The importer validates a listening socket and its configured

@@ -30,6 +30,14 @@ class CiChanges(unittest.TestCase):
                       ["CHANGELOG.md"], ["nested/NOTES.md"], ["flake.nix"], [], [""]):
             self.assertFalse(self.skip(paths), paths)
 
+    def test_desktop_shell_and_its_ci_run_rust_legs(self):
+        # The desktop jobs follow skip_rust (#2477): a change to the shell, its
+        # recipe or its workflow must never be skippable.
+        for path in ("desktop/src/main.rs", "desktop/tauri.conf.json", "desktop/capabilities/default.json",
+                     "desktop/Cargo.lock", "justfile", ".github/workflows/ci-desktop.yml"):
+            self.assertFalse(allowed(path), path)
+            self.assertFalse(self.skip(["docs/a.md", path]), path)
+
     def test_rename_generated_and_script_tested_paths_run_everything(self):
         # `--no-renames` lists both sides of a rename: the old path is outside the allow-list.
         self.assertFalse(self.skip(["src/x.rs", "docs/x.rs"]))

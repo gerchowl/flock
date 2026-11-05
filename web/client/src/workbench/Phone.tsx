@@ -1,14 +1,18 @@
 /**
  * The phone workbench (ADR-0038 §2a, "Phone: inbox first"): a bottom tab
- * bar with Inbox (the default), Agents and Activity, and an agent screen
- * pushed over the tabs. There are no splits; back returns to the origin
+ * bar with Inbox (the default) and Agents, and an agent screen pushed over
+ * the tabs. In a development build (`preview.ts`) the unbuilt parts show disabled: the Activity tab
+ * and the agent screen's Summary and PR views. There are no splits; back returns to the origin
  * (§2 Phone), through the layout's history.
  *
  * @module
  */
 import { For, Match, Show, Switch, createSignal, createUniqueId, onCleanup, type JSX } from "solid-js";
 
+import { Icon } from "../components/Icon";
 import type { AgentRow } from "../fleet";
+import { Cluster } from "../layout/primitives";
+import { SPACE } from "../tokens";
 import type { Transport } from "../transport";
 import { Transcript, type TranscriptSource } from "../views/Transcript";
 import { Composer, type ComposerState, type Sender } from "./Composer";
@@ -33,6 +37,10 @@ export type PhoneProps = {
   readonly closed: ClosedIds;
   readonly sender: Sender | null;
   readonly composer: ComposerState;
+  /** Shows the unbuilt tabs and views, disabled, with what they wait for. */
+  readonly preview: boolean;
+  /** The connection's status dot and popover, beside the Inbox title (wire mode); renders nothing in fixture mode. */
+  readonly host?: (() => JSX.Element) | undefined;
 };
 
 type Tab = "inbox" | "agents";
@@ -92,11 +100,14 @@ export function PhoneWorkbench(props: PhoneProps): JSX.Element {
           <main class="phone__screen">
             <Switch>
               <Match when={tab() === "inbox"}>
-                <h1 class="phone__title">Inbox</h1>
+                <Cluster justify="space-between" space={SPACE[2]}>
+                  <h1 class="phone__title">Inbox</h1>
+                  {props.host?.()}
+                </Cluster>
                 <p class="phone__headline" data-testid="inbox-headline">
                   {headline()}
                 </p>
-                <InboxCards cards={props.inbox} closed={props.closed} source={props.source} sender={props.sender} />
+                <InboxCards cards={props.inbox} closed={props.closed} source={props.source} sender={props.sender} preview={props.preview} />
               </Match>
               <Match when={tab() === "agents"}>
                 <h1 class="phone__title">Agents</h1>
@@ -108,27 +119,27 @@ export function PhoneWorkbench(props: PhoneProps): JSX.Element {
         }
       >
         {(agent) => {
-          const [summary, pr, terminal] = [createUniqueId(), createUniqueId(), createUniqueId()];
+          const [summary, pr] = [createUniqueId(), createUniqueId()];
           return (
           <main class="phone__screen phone__screen--agent" data-testid="phone-agent">
             <header class="phone__agent-header">
               <button type="button" class="action" onClick={back}>
-                ‹ Back
+                <Icon name="chevron-left" size={14} /> Back
               </button>
               <AgentTitle agent={agent} row={props.row()} />
             </header>
-            <div class="segmented" role="group" aria-label="Agent view">
-              <Waits label="Summary" reasonId={summary} />
-              <button type="button" class="action" aria-pressed="true">
-                Transcript
-              </button>
-              <Waits label="PR" reasonId={pr} />
-              <Waits label="Terminal" reasonId={terminal} />
-            </div>
-            <p class="waits__reason" data-testid="segmented-reasons">
-              <span id={summary}>Summary waits for goal and step records (ADR-0038 §8).</span> <span id={pr}>PR waits for a PR source.</span>{" "}
-              <span id={terminal}>Terminal waits for the terminal tile.</span>
-            </p>
+            <Show when={props.preview}>
+              <div class="segmented" role="group" aria-label="Agent view">
+                <Waits label="Summary" reasonId={summary} />
+                <button type="button" class="action" aria-pressed="true">
+                  Transcript
+                </button>
+                <Waits label="PR" reasonId={pr} />
+              </div>
+              <p class="waits__reason" data-testid="segmented-reasons">
+                <span id={summary}>Summary waits for goal and step records.</span> <span id={pr}>PR waits for a PR source.</span>
+              </p>
+            </Show>
             <div class="phone__body">
               <Transcript
                 transport={props.transport}
@@ -146,7 +157,9 @@ export function PhoneWorkbench(props: PhoneProps): JSX.Element {
       <nav class="tabbar" aria-label="Sections">
         {tabButton("inbox", "Inbox")}
         {tabButton("agents", "Agents")}
-        <Waits label="Activity" waitsFor="the events stream (S7-rest)" />
+        <Show when={props.preview}>
+          <Waits label="Activity" waitsFor="the events stream" />
+        </Show>
       </nav>
     </div>
   );

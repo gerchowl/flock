@@ -229,6 +229,8 @@ pub(super) struct InputHandle {
     accepted: mpsc::SyncSender<Accepted>,
     decisions: mpsc::SyncSender<Command>,
     permissions: Permissions,
+    #[cfg(test)]
+    permission_attempt: Arc<parking_lot::Mutex<Option<mpsc::Sender<bool>>>>,
     busy: Arc<AtomicBool>,
     uncertain: Arc<AtomicBool>,
     cancel: Arc<AtomicBool>,
@@ -366,6 +368,8 @@ impl Transport {
                 accepted: accepted_tx,
                 decisions,
                 permissions,
+                #[cfg(test)]
+                permission_attempt: Default::default(),
                 busy,
                 uncertain,
                 cancel,
@@ -483,11 +487,26 @@ impl InputHandle {
         Ok(book.grants(show_input && revoke.is_none()))
     }
     pub(super) fn waiting_on_human(&self) -> Result<Vec<(String, u64)>, ErrorCode> {
-        Ok(self
-            .permissions
-            .try_lock()
-            .ok_or(ErrorCode::SessionBusy)?
-            .waiting())
+        Ok(self.permission_book(false)?.waiting())
+    }
+
+    /// Queue-worker preflight waits for in-memory book operations to finish.
+    /// Losing a try_lock here would strand an idle queue without a wakeup.
+    pub(super) fn queue_waiting_on_human(&self) -> Result<Vec<(String, u64)>, ErrorCode> {
+        Ok(self.permission_book(true)?.waiting())
+    }
+
+    /// Only the synchronous journal-owning queue worker may wait. All holders
+    /// must release the book before I/O, logging, await or blocking channel calls.
+    fn permission_book(&self, wait: bool) -> Result<parking_lot::MutexGuard<'_, Book>, ErrorCode> {
+        let book = self.permissions.try_lock();
+        #[cfg(test)]
+        self.observe_permission_attempt(book.is_none());
+        match book {
+            Some(book) => Ok(book),
+            None if wait => Ok(self.permissions.lock()),
+            None => Err(ErrorCode::SessionBusy),
+        }
     }
     pub(super) fn agent_decide(
         &self,
@@ -572,6 +591,25 @@ impl InputHandle {
         user: &Value,
         observer_unavailable: impl FnOnce(),
     ) -> io::Result<()> {
+        self.submit(user, observer_unavailable, false)
+    }
+
+    /// Admit from the queue worker, waiting through book contention at this
+    /// second acquisition too. Operator-facing admission remains nonblocking.
+    /// Like `try_submit`, this passes a no-op acceptance observer. If acceptance
+    /// cannot reach the pump, submission sets I/O cancellation and returns
+    /// `BrokenPipe` without directly calling `stop.request()` via that observer.
+    /// The queue pump separately handles the returned `InputWriteFailed` offer.
+    pub(super) fn queue_submit(&self, user: &Value) -> io::Result<()> {
+        self.submit(user, || {}, true)
+    }
+
+    fn submit(
+        &self,
+        user: &Value,
+        observer_unavailable: impl FnOnce(),
+        wait_permissions: bool,
+    ) -> io::Result<()> {
         if self.cancel.load(Ordering::Acquire) || self.close.load(Ordering::Acquire) {
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
@@ -582,9 +620,8 @@ impl InputHandle {
             return Err(io::Error::other(TurnEndUnknown));
         }
         let permissions = self
-            .permissions
-            .try_lock()
-            .ok_or_else(|| io::Error::from(io::ErrorKind::WouldBlock))?;
+            .permission_book(wait_permissions)
+            .map_err(|_| io::Error::from(io::ErrorKind::WouldBlock))?;
         if permissions.blocked() {
             return Err(io::Error::from(io::ErrorKind::WouldBlock));
         }
@@ -1087,5 +1124,7 @@ fn publish<T>(mut received: T, tx: &mpsc::SyncSender<T>, cancel: &AtomicBool) ->
     }
 }
 
+#[cfg(test)]
+mod test_support;
 #[cfg(test)]
 mod tests;

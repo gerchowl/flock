@@ -34,7 +34,15 @@ impl TestClock {
         }))
     }
     pub(crate) fn advance(&self, ms: u64) {
-        self.0.elapsed.fetch_add(ms, Ordering::SeqCst);
+        self.0
+            .elapsed
+            .fetch_add(ms.saturating_mul(1_000_000), Ordering::SeqCst);
+        self.0.signal.send_modify(|generation| *generation += 1);
+    }
+    /// Move to an actual producer capture instant without losing submillisecond precision.
+    pub(crate) fn advance_to(&self, at: Instant) {
+        let nanos = u64::try_from(at.saturating_duration_since(self.0.base).as_nanos()).unwrap();
+        self.0.elapsed.fetch_max(nanos, Ordering::SeqCst);
         self.0.signal.send_modify(|generation| *generation += 1);
     }
     pub(crate) async fn deadline(&self, ms: u64) {
@@ -49,7 +57,7 @@ impl TestClock {
             .filter(|&&d| d == self.0.base + Duration::from_millis(ms))
             .count()
     }
-    async fn deadline_count(&self, ms: u64, count: usize) {
+    pub(crate) async fn deadline_count(&self, ms: u64, count: usize) {
         let mut signal = self.0.signal.subscribe();
         within(async {
             loop {
@@ -73,7 +81,7 @@ impl TestClock {
 }
 impl Clock for TestClock {
     fn now(&self) -> Instant {
-        self.0.base + Duration::from_millis(self.0.elapsed.load(Ordering::SeqCst))
+        self.0.base + Duration::from_nanos(self.0.elapsed.load(Ordering::SeqCst))
     }
     fn until(&self, deadline: Instant) -> BoxFuture<'_, ()> {
         let mut signal = self.0.signal.subscribe();
@@ -102,6 +110,12 @@ impl Server {
         Self::with_clock(|clock| Arc::new(clock)).await
     }
     async fn with_clock(wrap: impl FnOnce(TestClock) -> Arc<dyn Clock>) -> Self {
+        Self::with_setup(wrap, |_| ()).await
+    }
+    async fn with_setup(
+        wrap: impl FnOnce(TestClock) -> Arc<dyn Clock>,
+        setup: impl FnOnce(&mut Core),
+    ) -> Self {
         let root =
             crate::structured::launch::SessionConfigDir::create(&std::env::temp_dir()).unwrap();
         let dir = root.path().join("client-tokens");
@@ -117,14 +131,27 @@ impl Server {
             fs::write(&path, json!({"token":token.repeat(64),"principal":principal.repeat(32),"scopes":["read","send","answer","operate"]}).to_string()).unwrap();
             fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
         }
+        let store = TokenStore::open(root.path()).unwrap();
+        Self::from_store_with_setup(root, store, wrap, setup).await
+    }
+    /// Serve an actual issued store; root owns its isolated filesystem lifetime.
+    async fn from_store(
+        root: crate::structured::launch::SessionConfigDir,
+        store: TokenStore,
+        wrap: impl FnOnce(TestClock) -> Arc<dyn Clock>,
+    ) -> Self {
+        Self::from_store_with_setup(root, store, wrap, |_| ()).await
+    }
+    async fn from_store_with_setup(
+        root: crate::structured::launch::SessionConfigDir,
+        store: TokenStore,
+        wrap: impl FnOnce(TestClock) -> Arc<dyn Clock>,
+        setup: impl FnOnce(&mut Core),
+    ) -> Self {
         let clock = TestClock::new();
         let wake = Arc::new(tokio::sync::Notify::new());
-        let core = Core::with_clock(
-            TokenStore::open(root.path()).unwrap(),
-            wrap(clock.clone()),
-            wake.clone(),
-        )
-        .unwrap();
+        let mut core = Core::with_clock(store, wrap(clock.clone()), wake.clone()).unwrap();
+        setup(&mut core);
         let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let bind = socket.local_addr().unwrap();
         let router = core.router();
@@ -157,7 +184,7 @@ impl Drop for Server {
         self.task.abort();
     }
 }
-pub(crate) struct Socket(pub(crate) tokio::net::TcpStream);
+pub(crate) struct Socket<S = tokio::net::TcpStream>(pub(crate) S);
 #[derive(Debug)]
 pub(crate) enum Received {
     Text(Value),
@@ -186,6 +213,8 @@ impl Socket {
         })
         .await
     }
+}
+impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> Socket<S> {
     pub(crate) async fn send(&mut self, value: Value) {
         self.raw(value.to_string().as_bytes(), 0x81).await;
     }
@@ -793,7 +822,9 @@ fn covers_selected_fixture_handshake_vectors_run_against_the_core() {
                     matches!(
                         line.step,
                         FixtureStep::Send {
-                            frame: ServerFrame::Ping { .. },
+                            frame: crate::structured_wire::fixture::FixtureServerFrame::Literal(
+                                ServerFrame::Ping { .. }
+                            ),
                             ..
                         }
                     )
@@ -880,7 +911,7 @@ fn unknown_post_hello_operations_and_binary_frames_execute_nothing() {
 }
 
 #[test]
-fn held_management_lock_does_not_block_valid_or_junk_hello_verification() {
+fn held_management_lock_refuses_junk_and_welcomes_valid_hello_after_bounded_wait() {
     runtime(async {
         let server = Server::new().await;
         let lock = fs::OpenOptions::new()
@@ -889,8 +920,12 @@ fn held_management_lock_does_not_block_valid_or_junk_hello_verification() {
             .open(server._root.path().join("client-tokens/.lock"))
             .unwrap();
         lock.lock().unwrap();
-        let mut valid = Socket::open(&server).await;
-        assert_eq!(valid.hello(1, &"a".repeat(64)).await["t"], "welcome");
+        assert!(server
+            .core
+            .shared
+            .store
+            .authenticate(&Bearer("a".repeat(64)))
+            .is_ok());
         let mut junk = Socket::open(&server).await;
         junk.send(
             json!({"t":"hello","protocol":1,"client":{"name":"f","version":"1"},"token":"invalid"}),
@@ -900,7 +935,18 @@ fn held_management_lock_does_not_block_valid_or_junk_hello_verification() {
             junk.receive().await,
             Received::Close(AUTH_REFUSED_CLOSE)
         ));
-        drop(lock);
+        let waited = Arc::new(AtomicBool::new(false));
+        let observed = waited.clone();
+        server.core.shared.store.on_peer_stage(
+            crate::structured::permissions::auth::tokens::server::PeerStage::Waiting,
+            move || {
+                observed.store(true, Ordering::SeqCst);
+                drop(lock);
+            },
+        );
+        let mut valid = Socket::open(&server).await;
+        assert_eq!(valid.hello(1, &"a".repeat(64)).await["t"], "welcome");
+        assert!(waited.load(Ordering::SeqCst));
         server.finish().await;
     });
 }
@@ -989,7 +1035,8 @@ fn revocation_between_verification_and_registration_never_welcomes() {
 }
 #[test]
 fn revocation_after_storage_recheck_never_welcomes() {
-    runtime(revoke_during_hello(3, 1));
+    // The registration deadline precedes the final storage recheck deadline.
+    runtime(revoke_during_hello(4, 1));
 }
 async fn revoke_during_hello(at: u64, registered: usize) {
     let action = Arc::new(Mutex::new(None));
@@ -1025,10 +1072,12 @@ async fn revoke_during_hello(at: u64, registered: usize) {
     }));
     let mut client = Socket::open(&server).await;
     client.send(json!({"t":"hello","protocol":1,"client":{"name":"fixture","version":"1"},"token":"a".repeat(64)})).await;
-    assert!(matches!(
-        client.receive().await,
-        Received::Close(AUTH_REVOKED_CLOSE)
-    ));
+    let expected = if registered == 0 {
+        AUTH_REFUSED_CLOSE
+    } else {
+        AUTH_REVOKED_CLOSE
+    };
+    assert!(matches!(client.receive().await, Received::Close(code) if code == expected));
     assert_eq!(fired.load(Ordering::SeqCst), 1);
     server.finish().await;
 }
@@ -1068,7 +1117,7 @@ fn registered_recheck_deadline_preserves_the_token_with_a_non_auth_close() {
         .build().unwrap().block_on(async {
             let action = Arc::new(Mutex::new(None));
             let server = Server::with_clock(|clock| Arc::new(RevokeClock {
-                clock, calls: AtomicU64::new(0), at: 1, action: action.clone(),
+                clock, calls: AtomicU64::new(0), at: 2, action: action.clone(),
             })).await;
             let (started, ready) = tokio::sync::oneshot::channel();
             let (release, wait) = std::sync::mpsc::channel();
@@ -1083,7 +1132,7 @@ fn registered_recheck_deadline_preserves_the_token_with_a_non_auth_close() {
             let mut client = Socket::open(&server).await;
             client.send(json!({"t":"hello","protocol":1,"client":{"name":"fixture","version":"1"},"token":"a".repeat(64)})).await;
             within(ready).await.unwrap();
-            server.clock.deadline_count(HANDSHAKE_DEADLINE_MS, 4).await;
+            server.clock.deadline_count(HANDSHAKE_DEADLINE_MS, 5).await;
             assert_eq!(server.core.shared.clients.lock().unwrap().len(), 1);
             server.clock.advance(HANDSHAKE_DEADLINE_MS);
             let result = client.receive().await;
@@ -1433,6 +1482,7 @@ fn subscriptions_are_accepted_on_the_actual_socket() {
 mod subscriptions;
 
 mod fleet;
+mod fleet_nodes;
 
 mod commands;
 
@@ -1490,4 +1540,46 @@ fn overlapping_read_admissions_keep_subscriptions_and_socket_alive() {
     });
 }
 
-mod app_sessions;
+pub(crate) mod app_sessions;
+
+mod native;
+
+pub(crate) fn lease_counter(core: &Core) -> Arc<Semaphore> {
+    core.shared.slots.clone()
+}
+
+#[test]
+fn poisoned_client_map_still_retires_a_lease() {
+    runtime(async {
+        let server = Server::new().await;
+        let shared = server.core.shared.clone();
+        let live = Arc::new(AtomicBool::new(true));
+        let lease = Lease {
+            shared: shared.clone(),
+            id: 99,
+            live: live.clone(),
+            _permit: shared.slots.clone().try_acquire_owned().unwrap(),
+        };
+        let poisoning = shared.clone();
+        assert!(std::thread::spawn(move || {
+            let _guard = poisoning.clients.lock().unwrap();
+            panic!("fixture poisons only its owned client map");
+        })
+        .join()
+        .is_err());
+        drop(lease);
+        assert!(!live.load(Ordering::Acquire));
+        assert!(shared.clients.lock().err().unwrap().into_inner().is_empty());
+        assert_eq!(shared.slots.available_permits(), CONNECTIONS as usize);
+        shared.clients.clear_poison();
+        server.finish().await;
+    });
+}
+
+mod trace_auth;
+
+mod trace_protocol;
+
+mod trace_ping;
+
+mod trace_revocation;

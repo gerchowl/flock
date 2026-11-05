@@ -69,7 +69,7 @@ fn refusal(response: &str) -> (&str, &str) {
     let (headers, body) = response.split_once("\r\n\r\n").unwrap();
     assert!(headers
         .lines()
-        .any(|line| line == "cache-control: no-store"));
+        .any(|line| line.eq_ignore_ascii_case("cache-control: no-store")));
     (headers.lines().next().unwrap(), body)
 }
 fn bearer(endpoint: &Endpoint) -> String {
@@ -80,7 +80,7 @@ fn bearer(endpoint: &Endpoint) -> String {
         .unwrap()
         .to_owned()
 }
-struct WebSocket(TcpStream);
+struct WebSocket<S = TcpStream>(S);
 impl WebSocket {
     fn upgrade(endpoint: &Endpoint, host: &str, origin: Option<&str>) -> (Self, String) {
         let mut socket = stream(endpoint.address);
@@ -106,6 +106,8 @@ impl WebSocket {
         assert!(response.starts_with("HTTP/1.1 101"));
         socket
     }
+}
+impl<S: Read + Write> WebSocket<S> {
     fn send(&mut self, opcode: u8, bytes: &[u8]) {
         assert!(bytes.len() <= u16::MAX as usize);
         let mut frame = vec![0x80 | opcode];
@@ -281,21 +283,24 @@ fn real_server_caps_incomplete_http_connections_and_shutdown_closes_them() {
         held.push(stream(endpoint.address));
     }
     let mut excess = stream(endpoint.address);
-    let sent = write!(
+    write!(
         excess,
         "GET / HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
         endpoint.address
+    )
+    .unwrap();
+    let mut response = String::new();
+    excess.read_to_string(&mut response).unwrap();
+    let (status, body) = refusal(&response);
+    assert!(status.starts_with("HTTP/1.1 503"), "{response}");
+    assert!(response
+        .to_ascii_lowercase()
+        .contains("content-type: application/json"));
+    assert_eq!(
+        serde_json::from_str::<Value>(body).unwrap(),
+        json!({"error":{"code":"preauth_capacity","message":"Pre-authentication capacity exhausted"}})
     );
     let mut byte = [0];
-    match sent.and_then(|_| excess.read(&mut byte)) {
-        Ok(0) => {}
-        Err(error)
-            if matches!(
-                error.kind(),
-                std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
-            ) => {}
-        outcome => panic!("over-capacity HTTP admission must close: {outcome:?}"),
-    }
     assert!(server.api("server.stop", json!({})).get("result").is_some());
     server.owner.wait_exited(Duration::from_secs(10)).unwrap();
     for mut socket in held {
@@ -381,6 +386,9 @@ fn real_server_refuses_serve_and_funnel_targeting_its_bound_port() {
 #[test]
 fn real_handoff_transfers_the_bound_listener_and_survives_import_refusal() {
     let server = Server::start();
+    let app_token = native_token(&server);
+    let mut native = native_socket(&server);
+    assert_eq!(native.hello(&app_token).0, 1);
     let endpoint = endpoint(&server);
     let token = bearer(&endpoint);
     assert!(
@@ -410,6 +418,15 @@ fn real_handoff_transfers_the_bound_listener_and_survives_import_refusal() {
     assert_eq!(replacement.hello(&token).0, 1);
     let new_endpoint = self::endpoint(&server);
     assert_eq!(new_endpoint.address, endpoint.address);
+    let (opcode, close) = native.receive();
+    assert_eq!(opcode, 8);
+    assert_eq!(u16::from_be_bytes([close[0], close[1]]), 4403);
+    let mut retired = native_socket(&server);
+    let (opcode, close) = retired.hello(&app_token);
+    assert_eq!(opcode, 8);
+    assert_eq!(u16::from_be_bytes([close[0], close[1]]), 4401);
+    let fresh = native_token(&server);
+    assert_eq!(native_socket(&server).hello(&fresh).0, 1);
     assert!(server
         .api("pane.get", json!({"pane_id":pane}))
         .get("result")
@@ -544,7 +561,7 @@ peer.settimeout(5)
 peer.connect(sys.argv[3])
 peer.sendall(os.environ.pop('FLOCK_HANDOFF_TOKEN').encode()+b'\n')
 manifest=json.loads(peer.makefile('rb').readline(65536))
-Path(OBSERVATION).write_text(json.dumps({'version':manifest['version'],'listener':manifest.get('client_listener',False),'socket_owners':manifest.get('socket_owners',False),'panes':len(manifest['panes'])}))
+Path(OBSERVATION).write_text(json.dumps({'version':manifest['version'],'listener':manifest.get('client_listener',False),'socket_owners':manifest.get('socket_owners',False),'local_ws_owner':manifest.get('local_ws_owner',False),'panes':len(manifest['panes'])}))
 if manifest['version'] != 1:
     peer.sendall(b'error: legacy importer refuses descriptor extension\n')
 else:
@@ -567,7 +584,7 @@ PY
     // ADR-0036 transfers ownership descriptors under manifest v3, still refused by v1.
     assert_eq!(
         observed,
-        json!({"version":3,"listener":true,"socket_owners":true,"panes":0})
+        json!({"version":4,"listener":true,"socket_owners":true,"local_ws_owner":true,"panes":0})
     );
     let mut original = WebSocket::open(&endpoint);
     assert_eq!(original.hello(&token).0, 1);
@@ -605,4 +622,62 @@ fn real_server_stalled_http_body_expires_but_upgraded_socket_stays_usable() {
     let (kind, close) = active.receive();
     assert_eq!(kind, 8);
     assert_eq!(u16::from_be_bytes(close[..2].try_into().unwrap()), 1008);
+}
+
+fn native_token(server: &Server) -> String {
+    let reply = server.api("client.app.mint", json!({}));
+    reply["result"]["issued"]["token"]
+        .as_str()
+        .unwrap_or_else(|| panic!("mint refused: {reply}"))
+        .to_owned()
+}
+fn native_socket(server: &Server) -> WebSocket<UnixStream> {
+    let path = server.socket.with_file_name("a-ws.sock");
+    assert_eq!(
+        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let mut socket = UnixStream::connect(path).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    socket
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    socket.write_all(b"GET /v1/ws HTTP/1.1\r\nHost: fixture.example\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n").unwrap(); // gitleaks:allow -- RFC 6455 public example nonce
+    let mut header = Vec::new();
+    while !header.ends_with(b"\r\n\r\n") {
+        let mut byte = [0];
+        socket.read_exact(&mut byte).unwrap();
+        header.push(byte[0]);
+        assert!(header.len() < 8192);
+    }
+    assert!(String::from_utf8(header)
+        .unwrap()
+        .starts_with("HTTP/1.1 101"));
+    WebSocket(socket)
+}
+#[test]
+fn real_native_listener_uses_the_api_namespace_and_tcp_refuses_its_app_bearer() {
+    let server = Server::start();
+    let parent_mode = fs::metadata(server.socket.parent().unwrap())
+        .unwrap()
+        .permissions()
+        .mode();
+    let token = native_token(&server);
+    let mut native = native_socket(&server);
+    assert_eq!(native.hello(&token).0, 1);
+    assert_eq!(
+        fs::metadata(server.socket.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode(),
+        parent_mode
+    );
+    assert!(server.api("ping", json!({})).get("result").is_some());
+    let mut tcp = WebSocket::open(&endpoint(&server));
+    let (opcode, close) = tcp.hello(&token);
+    assert_eq!(opcode, 8);
+    assert_eq!(u16::from_be_bytes([close[0], close[1]]), 4401);
+    assert_eq!(&close[2..], b"peer_process_changed");
 }

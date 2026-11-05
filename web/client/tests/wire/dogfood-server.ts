@@ -1,13 +1,14 @@
 /** #1833: actual endpoint, public admission and browser wire, with an owned fake harness. */
 import { strict as assert } from "node:assert";
+import { assertSeedSucceeded } from "./seed-process";
 import type { FleetDelta } from "../../src/gen/FleetDelta";
 import type { JsonValue } from "../../src/gen/serde_json/JsonValue";
 import type { ServerFrame } from "../../src/gen/ServerFrame";
 import type { WireEvent } from "../../src/gen/WireEvent";
-import { WireConnection } from "../../src/wire/connection";
+import { WireConnection, type SnapshotLine } from "../../src/wire/connection";
 import { browserClock, memoryStore, type SocketLike } from "../../src/wire/env";
 
-const [url, token, readerToken, agent, binary, disabled] = process.argv.slice(2);
+const [url, token, readerToken, agent, binary, disabled, journal] = process.argv.slice(2);
 assert(url && token && readerToken && agent && binary);
 const events: WireEvent[] = [];
 const rows = new Map<string, { waiting_on_human: string[]; activity?: string }>();
@@ -68,7 +69,7 @@ const handler = { event(_seq: number, event: WireEvent) { events.push(event); ch
 connection.subscribe(`agent/${agent}`, handler);
 const fleetHandler = { ...handler,
   event(_seq: number, ev: WireEvent) { apply(ev); changed(); },
-  snapshot(values: readonly WireEvent[]) { rows.clear(); for (const value of values) apply(value); changed(); },
+  snapshot(lines: readonly SnapshotLine[]) { rows.clear(); for (const line of lines) apply(line.ev); changed(); },
 };
 function apply(value: WireEvent): void {
   const event = value as FleetDelta;
@@ -101,12 +102,21 @@ try {
   assert(frames.some((f) => f.t === "ack" && f.cmd_id === "scope-denied" && !f.ok && f.error?.code === "scope"));
   if (disabled === "without-operate") {
     // #2585 tracks whether send alone should suffice; pin the current S6 policy.
+    assert(journal, "scope proof receives its owned queue journal");
+    const before = await Bun.file(journal).bytes();
     await command("agent.send", { target: agent, text: "must not arrive", submit: true }, "not_authorized");
+    assert.deepEqual(await Bun.file(journal).bytes(), before, "send without operate journaled nothing");
+    // Seed the permission only after the byte-for-byte refusal check, so its
+    // legitimate queue writes cannot race the negative assertion.
+    const seed = Bun.spawn([binary, "--json", "agent", "send", agent, "fixture message"], { stdout: "pipe", stderr: "pipe" });
+    const seeded = JSON.parse(await assertSeedSucceeded(seed)) as { result?: unknown };
+    assert(seeded.result, "operator seed acknowledges durable queue admission");
     await until(() => records().some((e) => e.type === "flk_permission_request" && e.state === "open"), "operator-created permission request");
     const prompt = records().find((e) => e.type === "flk_permission_request" && e.state === "open")!;
+    await until(() => rows.get(agent)?.waiting_on_human.includes(String(prompt.request_id)) === true, "operator-created permission fleet handle");
     await command("agent.decide", { agent, request_id: String(prompt.request_id), request_seq: Number(prompt.request_seq), decision: "deny" }, "not_authorized");
     assert(rows.get(agent)?.waiting_on_human.includes(String(prompt.request_id)), "refused decision kept its real permission handle");
-    console.log(JSON.stringify({ status: "passed", without_operate: { send: "not_authorized", decide: "not_authorized" } }));
+    console.log(JSON.stringify({ status: "passed", without_operate: { send: "not_authorized", journal_unchanged: true, decide: "not_authorized" } }));
   } else {
     const sent = await command("agent.send", { target: agent, text: "fixture message", submit: true });
     assert(sent.result, "ack identifies durable queue admission");

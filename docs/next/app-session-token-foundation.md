@@ -35,11 +35,15 @@ principal, `app:operator:<uid>` (decimal kernel-attested UID). Identity survives
 restart and handoff while credentials do not. Revocation fanout is per
 credential; each mint has four registered-socket slots keyed by its bearer
 digest, including pending welcome. A fully occupied old mint cannot starve a
-fresh mint's socket budget. The four unauthenticated hello slots and sixteen
-upgraded sockets remain global. At most
-128 app entries live. Issuance first reclaims expired/exited entries; capacity
+fresh mint's socket budget. Each transport has four unauthenticated hello
+slots; sixteen upgraded sockets are shared server-wide. At most 128 app entries
+live. Issuance first reclaims expired/exited entries; capacity
 or admission contention refuses with `session_busy`. No failed mint discloses
 a credential. Storage/entropy failures return `internal_error`.
+
+Hello lookup returns a snapshot without taking the management lock. Registration
+waits for shared ownership and pending revocation within the original five-second
+hello deadline; an expired waiter cannot register later.
 
 Admission rechecks its original source under the shared filesystem lock, held
 through bounded dispatch. Revocation and shutdown publish the existing intent
@@ -51,7 +55,7 @@ for a model.
 Idle sessions await the injected suspend-inclusive deadline and kernel exit readiness
 (kqueue NOTE_EXIT on macOS, pidfd on Linux); no PID liveness polling occurs.
 Each reactor waiter owns a separate descriptor for the same persistent watch.
-Expiry, process exit and explicit revocation use the existing close 4403,
+For registered sockets, expiry, process exit and explicit revocation use close 4403,
 with no new authentication error names. An in-flight command that detects revocation
 flushes its `auth_revoked` error acknowledgement before the close. This drain
 uses the existing bounded transport-write window. During server shutdown,
@@ -62,9 +66,8 @@ issuance reclaims them. Revocation notifications happen after earlier shared
 admissions drain.
 
 The captured shell Origin/header pair is admitted only on `/v1/ws` (#2442).
-The sibling listener, pre-auth UID attribution and revised transport budgets
-belong to the next approved #2500 slice. Existing pending-hello and connection
-limits are unchanged here. There are no `desktop/` changes in this server slice.
+Web-enabled servers also prepare a private sibling HTTP/WebSocket listener.
+There are no `desktop/` changes in this server slice.
 
 The server's transport-neutral `App::admit_local_peer` checks explicit kernel
 credentials rather than borrowing the current CLI request's caller context.
@@ -81,18 +84,19 @@ credentials.
 through its registration callback. Local app credentials must match the minting
 PID and birth; a missing peer proof cannot admit one. Persistent credentials
 retain exactly their current grants, including send-only credentials. Watch or
-store I/O failures remain distinct from process-instance refusal. This primitive
-is staged for the sibling-listener integration in #2500; the TCP hello behavior
-switches together with that listener, not in this preparatory slice.
+store I/O failures remain distinct from process-instance refusal. The native
+listener supplies that proof on every hello; TCP supplies none and
+therefore refuses app-session bearers with close 4401, reason
+`peer_process_changed`. Browser/file credentials remain supported on TCP.
 
-The next preparatory slice supplies `local_listener::Listener`, reusing the
-existing HTTP server over Unix streams and capturing credentials from the
+`local_listener::Listener` reuses the existing HTTP server over Unix streams and capturing credentials from the
 accepted kernel socket. `prepare` binds without accepting, `activate` starts
 serving only when explicitly called, and `stop` cancels the acceptor and its
-owned HTTP tasks. Production startup does not call these methods yet, so this
-slice creates no new reachable endpoint and does not change TCP authentication.
-Owner admission and the TCP app-session refusal will activate together in the
-following #2500 slice.
+owned HTTP tasks. `HeadlessServer` prepares the listener at startup and activates
+it only after handoff commit when importing. The containing `client_listener::Listener::shutdown` also stops
+the shared core, drains upgraded WebSocket leases and retires app-session bearers.
+The native route is only `GET /v1/ws`; it does not serve the GUI, token exchange,
+or minting. It is available independently of the optional TCP bind.
 
 `socket_path` derives `flock-ws.sock` beside `flock.sock`; an API override such
 as `custom.sock` instead derives `custom-ws.sock`, keeping separate instances
@@ -103,9 +107,58 @@ refuses unsafe parents without creating or repairing them. The socket uses the
 API's `0600` mode constant and permanent `SocketOwner` lock. `owner` retains a
 rollback reference; its duplicate can pass through the existing SCM_RIGHTS
 handoff machinery and be adopted before `prepare`. `unlink` and destruction
-remove only the recorded binding's inode. Exporter/importer orchestration and
-its manifest extension belong to the activation slice; no new descriptor is
-exported by production handoff in this foundation.
+remove only the recorded binding's inode. Internal handoff manifest version 4
+appends the native ownership descriptor.
+The importer adopts it before preparing the replacement path; failure rebinds
+under the exporter's retained guard. Older importers refuse before transfer.
+Mesh and WebSocket protocol versions do not change.
+
+TCP and native listeners each own 32 incomplete HTTP reservations and four
+pending hellos with absolute five-second deadlines. They share 16 upgraded
+sockets and four registered sockets per credential digest. Capacity refusal
+before upgrade is HTTP 503 with `preauth_capacity`; it never evicts an existing
+session. Missing/wrong UID, pane/agent ancestry or a mesh caller receives HTTP
+403 `operator_only`; missing or changed PID/birth receives HTTP 403
+`peer_process_changed`. Both return the ADR-0036 JSON body, no-store cache policy,
+and close the connection. Kernel proof never adds bearer scopes or mints a token.
+
+Each listener also permits at most four concurrent overload-response writers,
+independent of normal admissions. They write the typed 503 and drain after
+half-close within the same five-second bound. A full response-writer budget
+closes additional over-cap connections without allocating work. Existing
+connections and newly available normal admission slots continue independently.
+
+A hello refused before registration, including a minter exit after the
+first verification, closes 4401 without welcome. An exit after registration
+closes 4403 and reaches all sockets of that credential. File-token verification
+remains lock-free; registration must acquire its shared admission fence. An
+exclusive management fence makes hello wait within its original five-second
+deadline, without treating a valid token as an authentication failure. These
+kernel-lock waits have a separate eight-worker budget; only credential I/O and
+registration reserve one of the four shared store-I/O workers. Reconnecting
+hellos cannot consume the workers used by established subscriptions. When all
+eight lock waiters are released together, registration still competes for only
+four store-I/O slots. A hello that loses that capacity race closes with retryable
+1001; it does not invalidate its credential or close an established socket.
+
+App-session retirement and shutdown also wait outside the shared store-I/O
+pool. They publish revocation intent before acquiring exclusive ownership,
+then retain that ownership through removal and notification (ADR-0036 §5a).
+The separate retirement-wait pool has seventeen shared slots (the live-socket
+cap plus one), without reserving one for shutdown. Cancellation retains a slot
+until its helper is reaped. Aborted connections can leave helpers running while
+replacement sockets arrive; if they exhaust the pool, shutdown fails closed
+with a worker-unavailable error and still drains the transports. The existing
+two-second lock ceiling is unchanged. Only intent publication and the fenced
+mutation reserve store-I/O capacity.
+
+Retirement acquires capacity separately for each phase. If the shared
+store-I/O pool is full at the finish step, the exclusive fence and intent are
+released without removing the app credential, and the socket closes with 1001.
+A still-live bearer can remain usable until another retirement, process exit,
+or its fixed TTL makes it invalid; the failed transport does not claim
+successful revocation. Successful retirement still precedes the credential's
+4403 close.
 
 The enforcing clock is Linux `CLOCK_BOOTTIME` or macOS `mach_continuous_time`
 (#2489), so sleep counts without trusting a settable wall clock. Absolute
@@ -118,3 +171,4 @@ from the same issue sample and enforced deadline.
 
 The timer domains follow the [Linux timerfd contract](https://man7.org/linux/man-pages/man2/timerfd_create.2.html)
 and [Darwin continuous-time timer flags](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/sys/event.h).
+

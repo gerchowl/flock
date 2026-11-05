@@ -1358,20 +1358,29 @@ fn queue_cancelled_input_requests_stop_through_the_real_event_pump() {
     let stop = StopRequest::default();
     let control = transport.stop_handle();
     control.cancel();
+    assert!(!transport.input_inflight());
     let (tx, _rx) = mpsc::sync_channel(4);
     let facts = collect(&transport, &stop, &control, tx, &|| {}, Some(service));
     let mut outcomes = vec![];
     let mut saw_write_failure = false;
     while let Some(update) = client.update() {
         outcomes.push(format!("{update:?}"));
-        saw_write_failure |= update
-            .offer
-            .is_err_and(|e| e.code == crate::api::error_code::ErrorCode::InputWriteFailed);
+        saw_write_failure |= update.offer.as_ref().is_err_and(|e| {
+            e.code == crate::api::error_code::ErrorCode::InputWriteFailed
+                && e.source
+                    .as_ref()
+                    .is_some_and(|source| source.kind() == io::ErrorKind::BrokenPipe)
+        });
     }
     assert!(
         saw_write_failure,
         "queue never exercised cancelled stdin admission: {outcomes:?}, stop={}, error={:?}",
         stop.requested(),
+        facts.error
+    );
+    assert!(
+        facts.error.is_none(),
+        "unexpected transport failure: {:?}",
         facts.error
     );
     assert!(

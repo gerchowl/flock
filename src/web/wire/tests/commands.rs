@@ -1,4 +1,4 @@
-//! Decide-only port of the approved command tests: real authenticated sockets and harness stdin.
+//! Real authenticated command and replay traces with owned harness input.
 use super::*;
 use crate::structured::{workers::tests::Case as Worker, workers::Workers};
 use crate::web::wire::commands as wire_commands;
@@ -17,7 +17,7 @@ fn script(name: &str) -> Vec<Value> {
     };
     let typed: Vec<FixtureLine> = text
         .lines()
-        .map(|line| serde_json::from_str(line).unwrap())
+        .map(|line| FixtureLine::parse(line).unwrap())
         .collect();
     assert!(
         matches!(&typed[0].step, FixtureStep::Given { covers, .. } if covers.contains(&FixtureCoverage::S7Min))
@@ -37,6 +37,9 @@ struct Case {
 }
 impl Case {
     async fn new(n: u32) -> Self {
+        Self::with_server(n, Server::new().await, "queue").await
+    }
+    async fn with_server(n: u32, server: Server, mode: &str) -> Self {
         let notify = Arc::new(tokio::sync::Notify::new());
         let (_, rx) = mpsc::unbounded_channel();
         let mut app = crate::app::App::new(
@@ -48,7 +51,7 @@ impl Case {
         );
         app.structured_workers = Workers::new(notify.clone());
         let (mut worker, launch, factory) =
-            Worker::prepare(&mut app.state.structured_agents, n, "queue", vec![]);
+            Worker::prepare(&mut app.state.structured_agents, n, mode, vec![]);
         let listener =
             tokio::net::UnixListener::bind(worker.fixture.root.path().join("queue.sock")).unwrap();
         worker.generation = app
@@ -64,8 +67,12 @@ impl Case {
                 Instant::now(),
             )
             .await;
+        let path = server._root.path().join("client-tokens/one.token");
+        let mut token: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        token["principal"] = json!("0123456789abcdef0123456789abcdef");
+        fs::write(path, token.to_string()).unwrap();
         Self {
-            server: Server::new().await,
+            server,
             app,
             worker,
             notify,
@@ -75,7 +82,8 @@ impl Case {
     }
     async fn open(&self) -> Socket {
         let mut socket = Socket::open(&self.server).await;
-        socket.hello(1, &"a".repeat(64)).await;
+        let welcome = socket.hello(1, &"a".repeat(64)).await;
+        assert_eq!(welcome["principal"], "0123456789abcdef0123456789abcdef");
         socket
     }
     fn service(&mut self) {
@@ -797,3 +805,7 @@ fn previous_runtime_permission_handle_is_refused_after_restart() {
         case.stop().await;
     });
 }
+
+mod trace_permission;
+
+mod trace_clean;

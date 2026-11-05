@@ -7,7 +7,46 @@ Flock’s CLI talks to the running server over the same local socket API used by
 
 Most commands print JSON responses. Use them from scripts when you want deterministic automation.
 
-When an existing status ping, submission guard, or failed command reveals a different server protocol, the CLI prints one warning to stderr per invocation. Read-only commands add no status probe; a state-changing command adds one ping per invocation, cached for the rest of it (see below). Unknown-method errors from older-protocol servers become `server_version_gap`, with the server version, protocol, required client protocol, and recovery command: `flk server live-handoff` (or restart the server). Surfaced failures return **exit code 78**; optional lookups that consume the error preserve the command's successful exit. Equal or newer protocols retain the original API error. Every state-changing command (`delegate start` and `send`, `agent start`, `restart` and `send`, `pane send-*` and `submit`, `worktree create`, `msg send` and `reply`, and the rest) checks the server protocol before its first state-changing request and refuses an older server with `server flk X (protocol N) is incompatible with client flk Y (protocol M)` and exit 78, so nothing is half-created. That check costs one ping per invocation. Read-only commands, `flk status` and `flk server` (including `live-handoff` and `stop`) still reach an older server, since handing it off is the fix. Diagnosis probes have a 500 ms timeout and reuse a server identity already obtained during the invocation. An unavailable probe leaves the original error intact. MCP tools return the same skew message with `error.data.refusal: "server_version_gap"`.
+When an existing status ping, submission guard, or failed command reveals a different server protocol, the CLI prints one warning to stderr per invocation. Read-only commands add no status probe; a state-changing command adds one ping per invocation, cached for the rest of it (see below). Unknown-method errors from older-protocol servers become `server_version_gap`, with the server version, protocol, required client protocol, and recovery command: `flk server live-handoff` (or restart the server). Surfaced failures return **exit code 78**; optional lookups that consume the error preserve the command's successful exit. Equal or newer protocols retain the original API error. Every state-changing command (`delegate start` and `send`, `agent start`, `restart` and `send`, `pane send-*` and `submit`, `worktree create`, `msg send` and `reply`, and the rest) checks the server protocol before its first state-changing request and refuses an older server with `server flk X (protocol N) is incompatible with client flk Y (protocol M)` and exit 78, so nothing is half-created. That check costs one ping per invocation. Read-only commands, `flk status` and `flk server` (including `live-handoff` and `stop`) still reach an older server, since handing it off is the fix. Diagnosis probes have a 500 ms timeout and reuse a server identity already obtained during the invocation. An unavailable probe leaves the original error intact; an expired probe reports a typed timeout before a mutation is dispatched. MCP tools return the same skew message with `error.data.refusal: "server_version_gap"`.
+
+## Socket deadlines
+
+Ordinary API exchanges have a 10-second monotonic deadline covering connect,
+write and reply, including partial replies and transient `EAGAIN`/`EINTR` reads.
+`flk status` uses its status-ping cap; compatibility probes use 500 ms.
+A listening server that stops replying reports a timeout, not “server not running”.
+Errors name the socket and elapsed time.
+
+Blocking output/reply/event waits and long polls use at least their requested
+operation timeout plus a fixed 5-second transport margin, rather than the
+ordinary cap. An omitted output/reply/event wait timeout has a finite 24-hour
+transport cap plus that margin. Explicit caller deadlines can be shorter.
+Worktree create/kill, workspace create/close and agent start have a shared
+60-second total client allowance, also used by delegate. This is client patience,
+not a server execution limit: server work can continue after a dispatched
+request expires with `request_outcome_unknown` (exit 14). Server cancellation
+and partial-state cleanup are tracked in
+[#2209](https://github.com/gerchowl/flock/issues/2209).
+Completed input writes retain their capability-bound client budget and reply
+margin: raw writes use 10 seconds and guarded submit reserves the server's
+complete submit wait bound plus capability and reply margins. Lost replies
+report `input_write_unknown` (exit 8); inspect the pane before retrying.
+Live handoff reserves the server's shutdown,
+pane-drain, import-startup, commit and rollback phase budgets plus the margin:
+the handler replies only after those synchronous phases finish.
+
+A timeout before dispatch, or on an explicitly read-only/idempotent request,
+returns `timeout`, exit **124** (`retry: yes`). After a mutation has written any
+bytes, expiry outside the completed input-write contract instead returns `request_outcome_unknown`, exit **14**
+(`retry: after_inspecting`): the operation may have been applied. Inspect server
+state before repeating it. These mutations are never automatically resent.
+Unclassified API calls default to mutating; callers must declare safe reads.
+
+This covers the shared request client and ordinary CLI send path. Peer relay
+and subscription lifecycle deadlines follow in
+[#2180](https://github.com/gerchowl/flock/issues/2180); session, update and
+standalone probe paths and their typed exit propagation follow in
+[#2181](https://github.com/gerchowl/flock/issues/2181).
 
 CLI text arguments must be valid UTF-8. Invalid encoding is refused before command
 execution with `invalid_params` and usage exit 2, rather than panicking. This early
@@ -184,6 +223,18 @@ flk server reload-config
 `flk server` runs the headless server explicitly. Use it for supervised or service-style setups. `reload-config` applies reloadable settings without restarting panes.
 
 `live-handoff` moves every live pane to a new server process without stopping it, which is how an upgrade reaches a running session. The new server is the binary of the `flk` you ran, resolved through symlinks to its real path, and the importer must report that binary's version and protocol or the handoff rolls back and the old server keeps the panes. On a versioned install (Nix, or any `/store/<hash>-flock-<version>/bin/flk` layout) the old server's own path stays valid after an upgrade, so re-executing it would only restart the old version. When it finishes, the command prints both versions (`live handoff complete: server flk A -> flk B`) after the new server answers with the target version. It exits 1, rather than reporting success, when the new server is not the requested version, or when it is the same version the old server ran while the client is a different one. A client older than the running server (a stale `flk` earlier on `PATH`) refuses the default handoff instead of downgrading the server to itself, naming both versions and the client's path.
+
+Auto-detected daemons and handoff replacements use the same executable resolver.
+It resolves symlinks once before constructing each server launch, so the daemon's
+recorded executable and `argv[0]` use the canonical path even if the launch alias
+is later removed or repointed. If the current binary or an explicit `--import-exe`
+cannot be resolved to a regular file, startup refuses with
+`server_executable_unresolved` (`retry: after_inspecting`, exit 1). Restore the
+binary or select an existing target before retrying. There is no fallback to the
+alias, `PATH`, or the old server's image. A handoff refuses this condition before
+stopping structured workers or transferring panes. Resolution pins a pathname,
+not file contents: removal afterwards remains a spawn failure, and version and
+protocol checks still protect the handoff.
 
 The JSON socket API reports `server.live_handoff` failures with `error.code: "handoff_failed"` and a stable `error.data.kind`: `import_refused`, `broken_pipe`, `connection_reset`, `invalid_input`, or `other`. `error.message` remains diagnostic prose and must not be parsed to classify failures. `other` includes timeouts and unexpected control messages. `invalid_input` alone does not prove peer closure; a caller needs evidence of the operation and stage. Clients should treat unknown kinds as failures. The kind describes the cause, not whether ownership committed. Existing clients can ignore this additive field.
 
@@ -469,7 +520,8 @@ The pane defaults to the calling pane. Use `--pane <pane_id>` or a legacy leadin
 Structured session records are listed separately as `structured_agents` in the
 JSON response. `get` and its `status` alias accept the registered agent id or a
 unique name. They return runtime, session identity, lifecycle, canonical state,
-and lease-binding evidence without inventing a pane. `stop` requests asynchronous
+and lease-binding evidence. `view` names the actual native workspace/tab/pane
+placement, and is absent when detached. `stop` requests asynchronous
 cleanup for a structured session; poll `status` for the resulting lifecycle. Only
 the operator or the structured agent itself may stop it. Stopping an Offline
 record is harmless.
@@ -479,7 +531,40 @@ restart (`structured_recovery_required`, retry `after_human`, exit 1).
 Pane-only operations on structured records, including attach, readiness and
 settled waits, return `runtime_unsupported` (retry `never`, exit 2). Use the
 structured state for observation instead. PTY records keep their existing fields.
-Start a pane-free session with `flk agent start NAME --runtime structured --model MODEL --cwd /absolute/checkout -- claude`.
+Start a structured session with `flk agent start NAME --runtime structured --model MODEL --cwd /absolute/checkout -- claude`.
+
+An attached local TUI can choose **Allow once** or **Deny** on a native permission
+card. The server authenticates the attaching process and uses a private app-session
+credential with the GUI app session's fixed scopes and 12-hour lifetime, including
+suspend time. It never takes a credential from terminal input. Detach, client exit
+or expiry removes decision authority; reconnect to obtain a fresh session. An
+expired or exited session reports `auth_revoked`; unverified attaches cannot approve.
+Decisions require Operate: Answer alone is insufficient and refuses with
+`not_authorized`. A direct terminal attach without a capability also reports
+`not_authorized`.
+**Always (session)** currently refuses with `permission_decision_unsupported` until
+the confirmation flow in [#1430](https://github.com/gerchowl/flock/issues/1430) is available.
+
+In a native structured pane, printable Unicode edits the composer. Backspace deletes
+one extended grapheme; Left/Right move by grapheme. Drafts are limited to 64 KiB of
+UTF-8; overflow and invalid control characters refuse without truncation. App
+shortcuts and a visible float retain precedence. Enter submits the current text
+for durable queue admission. Moving the cursor while admission is pending does not
+retain an already admitted draft; editing its text preserves the newer draft.
+Admission is separate from delivery at the session's idle boundary.
+
+Tab/Shift-Tab select painted controls; Enter activates the selected control. Click
+the composer or edit it to leave that selection. Enter events marked as repeats never
+submit or activate controls. Legacy terminals may report repeats as fresh presses;
+those events cannot be distinguished. Native paste currently refuses with `invalid_params`, retaining
+the draft and queue (#2703); floats and PTY panes retain their paste routing. Further
+editor/newline keys and history follow in #2702 and #2704. Detaching drops the local
+draft; already admitted queue items remain durable.
+
+Start creates and focuses one native view in the active tab (a native-only
+workspace if none exists). Focus reuses that placement, including after resume;
+closing it detaches without stopping the worker. Explicit workspace/tab/split
+selectors, `--here`, labels and dry runs remain unsupported for structured starts.
 The CLI refuses an older server without the `structured_agents` capability
 (`server_version_gap`, retry `after_handoff`, exit 78). CLI starts are idle; the
 narrowed MCP spawn also delivers its framed opening prompt through stream stdin.
@@ -1002,7 +1087,7 @@ Exposed tools:
 | Tool | Wraps | Notes |
 | --- | --- | --- |
 | `flock_agent_list` | `agent.list` | `structured_agents` contains pane-free typed records; `agents` = this server's panes (`blocked` ones need attention); `fleet` = every addressable agent INCLUDING other hosts, with `agent_id`, `host` and `local`. |
-| `flock_agent_get` | `agent.get` | Target is a pane id, terminal id, structured agent id, or unique name. Structured records use `StructuredAgentInfo` and have no placement. |
+| `flock_agent_get` | `agent.get` | Target is a pane id, terminal id, structured agent id, or unique name. Structured records use `StructuredAgentInfo` with an optional real native placement. |
 | `flock_agent_stop` | `agent.stop` | `{target: string}` stops a structured session; operator or that agent itself only. PTY targets return `runtime_unsupported` (never retry, exit 2). |
 | `flock_agent_read` | `agent.read` | The pane's terminal output as drawn. Read-only: it changes no pane state and does not move the operator's attention ordering. |
 | `flock_agent_history` | `agent.history` | The agent's own conversation from its session transcript, not the pane's wrapped output. Safe to poll: it touches no pane state. `detail` picks `reply`/`collapsed`/`full`; hand back `next_cursor` to get only what has been written since. A turn with `after_compaction: true` is the first of a new epoch — everything older was superseded by a compaction, so it is history rather than context. Claude and opencode. |

@@ -18,7 +18,7 @@ import { App, SHELL_OWNS_TOKENS } from "../src/App";
 import { BRIDGE_ALONE, readShellConfig, type BridgeSocket, type OpenBridge, type ShellToken, type TokenProvider } from "../src/config";
 import type { ServerFrame } from "../src/gen/ServerFrame";
 import { OUTBOX_KEY } from "../src/wire/outbox";
-import { WireConnection } from "../src/wire/connection";
+import { DEADLINES, WIRE_PROTOCOL, WireConnection } from "../src/wire/connection";
 import { MAX_REMINTS, MAX_TIMER_DELAY, REMINTS_SPENT, RENEW_AT, driveBridge, driveTokenProvider } from "../src/wire/provider";
 import { RUN_CLIENT_OPEN, type SessionLike } from "../src/wire/token";
 import { FIXTURE_TOKEN, Harness, WELCOME, live, sentFrames, step, type FakeNetwork, type FakeSocket } from "./wire/harness";
@@ -107,7 +107,7 @@ function provider(mode: Mode, ...replies: Reply[]) {
     hellos: [] as Record<string, unknown>[],
     lifetimes: [] as { readonly at: number; readonly expiresInMs: number }[],
     net: null as FakeNetwork | null,
-    resolve: (token: string) => release?.({ token }),
+    resolve: (token: string, expiresInMs?: number) => release?.({ token, ...(expiresInMs === undefined ? {} : { expiresInMs }) }),
     /** Rejects the deferred call with `failure`. */
     reject: (failure: unknown) => refuse?.(failure),
     /** The native side loses its bearer, so its next open mints one the client did not cause. */
@@ -198,7 +198,10 @@ function mount(shell: Shell | undefined, options: { outbox?: readonly (typeof PE
   return { h, root, entries, requests };
 }
 
-const status = (root: HTMLElement): string => root.querySelector(".topbar__status")?.textContent ?? "";
+/** The connection's state line, in the toolbar's popover. */
+const status = (root: HTMLElement): string => root.querySelector('[data-testid="host-detail"]')?.textContent ?? "";
+/** The raw diagnosis behind the popover's Details. */
+const diagnosis = (root: HTMLElement): string => root.querySelector('[data-testid="host-panel"] .details__body')?.textContent?.trim() ?? "";
 const prompt = (root: HTMLElement): Element | null => root.querySelector('input[aria-label="New client token"]');
 const click = (root: HTMLElement, selector: string): void => (root.querySelector(selector) as HTMLButtonElement).click();
 const frames = (h: Harness, t: string): Record<string, unknown>[] => sentFrames(h).filter((frame) => (frame as { t: string }).t === t) as Record<string, unknown>[];
@@ -208,9 +211,9 @@ const started = (h: Harness, mode: Mode): number => (mode === "bridge" ? frames(
 const fleetSubs = (h: Harness): Record<string, unknown>[] => frames(h, "sub").filter((frame) => frame["stream"] === "fleet");
 
 /** Opens the current socket, welcomes it as `principal` and syncs the fleet stream at `seq`: Live. */
-function welcome(h: Harness, seq: number, principal = WELCOME.t === "welcome" ? WELCOME.principal : ""): void {
+function welcome(h: Harness, seq: number, principal = WELCOME.t === "welcome" ? WELCOME.principal : "", protocol = WIRE_PROTOCOL): void {
   h.step(step({ step: "open" }));
-  send(h, { ...WELCOME, principal });
+  send(h, { ...WELCOME, principal, protocol });
   const fleet = fleetSubs(h).at(-1)?.["sub_id"] as string;
   send(h, { t: "gap", sub_id: fleet, from: 1, to: seq, snapshot_to: seq });
   send(h, { t: "synced", sub_id: fleet, seq });
@@ -222,7 +225,7 @@ for (const mode of MODES) {
     const first = provider(mode, "t1");
     const { h, root, entries } = mount(first);
     // A bridged attempt waits for its session in Connecting; a provider's token is asked for in NeedsToken.
-    expect(status(root)).toBe(mode === "bridge" ? "Connecting" : "Signing in…");
+    expect(status(root)).toBe(mode === "bridge" ? "Connecting…" : "Signing in…");
     expect(prompt(root)).toBeNull();
     await tick();
     expect([first.calls, started(h, mode)]).toEqual([1, 1]);
@@ -230,7 +233,7 @@ for (const mode of MODES) {
     expect(frames(h, "hello").map((frame) => frame["token"])).toEqual(["t1"]);
     // The client's own `hello` on a bridge carries no token key at all: the native side adds its bearer.
     expect(first.hellos.map((frame) => "token" in frame)).toEqual(mode === "bridge" ? [false] : []);
-    expect(status(root)).toBe("Live");
+    expect(status(root)).toBe("Connected.");
     expect(entries.size).toBe(0);
     dispose?.();
     const reloaded = provider(mode, "t2");
@@ -259,7 +262,7 @@ for (const mode of MODES) {
     expect(frames(h, "hello").map((frame) => frame["token"])).toEqual(["t1", "t2"]);
     expect(fleetSubs(h).map((frame) => frame["after"])).toEqual([undefined, 7]);
     send(h, { t: "synced", sub_id: fleetSubs(h)[1]?.["sub_id"], seq: 7 });
-    expect(status(root)).toBe("Live");
+    expect(status(root)).toBe("Connected.");
     expect(frames(h, "cmd").map((frame) => frame["cmd_id"])).toEqual(["c0"]);
     expect(root.querySelector('[data-testid="outbox-problem"]')).toBeNull();
   });
@@ -274,7 +277,7 @@ for (const mode of MODES) {
     h.step(step({ step: "token_refused", code: 4403 }));
     await tick();
     welcome(h, 0, "another-principal");
-    expect(status(root)).toBe("Live");
+    expect(status(root)).toBe("Connected.");
     expect(frames(h, "cmd")).toEqual([]);
     const dropped = root.querySelector('[data-testid="outbox-dropped"]');
     expect(dropped?.textContent).toContain("Dropped 1 unsent command: the server now names another identity, and commands never run under another.");
@@ -293,7 +296,7 @@ for (const mode of MODES) {
       const tokens = provider(mode, reply);
       const { h, root } = mount(tokens);
       await tick();
-      expect(status(root)).toBe(`NeedsToken · ${PANE}`);
+      expect(status(root)).toBe(`Sign-in needed. ${PANE}`);
       expect(prompt(root)).toBeNull();
       h.clock.advanceTo(h.clock.now() + 120_000);
       await tick();
@@ -304,7 +307,7 @@ for (const mode of MODES) {
   test("a provider that returns no promise lands in NeedsToken, never a crash", async () => {
     const { h, root } = mount(provider(mode, { value: undefined }));
     await tick();
-    expect(status(root)).toBe(`NeedsToken · ${mode === "bridge" ? "The shell gave no bridge session." : "The shell gave no token."}`);
+    expect(status(root)).toBe(`Sign-in needed. ${mode === "bridge" ? "The shell gave no bridge session." : "The shell gave no token."}`);
     expect(started(h, mode)).toBe(0);
   });
 
@@ -337,7 +340,7 @@ for (const mode of MODES) {
     expect(tokens.calls).toBe(2);
     welcome(h, 0);
     expect(frames(h, "hello").map((frame) => frame["token"])).toEqual(["t1", "t1", "t2"]);
-    expect(status(root)).toBe("Live");
+    expect(status(root)).toBe("Connected.");
     expect(frames(h, "cmd").map((frame) => frame["cmd_id"])).toEqual(["c0"]);
   });
 
@@ -353,7 +356,7 @@ for (const mode of MODES) {
       await tick();
     }
     expect(tokens.calls).toBe(MAX_REMINTS + 1);
-    expect(status(root)).toBe(`NeedsToken · The server refused the token. ${REMINTS_SPENT}`);
+    expect(status(root)).toBe(`Sign-in needed. The server refused the token. ${REMINTS_SPENT}`);
   });
 
   test(`a server that revokes every token at once is asked ${MAX_REMINTS} times on §3's backoff, then NeedsToken says why`, async () => {
@@ -375,7 +378,7 @@ for (const mode of MODES) {
       }
       expect(tokens.calls).toBe(Math.min(remint, MAX_REMINTS) + 1);
     }
-    expect(status(root)).toBe(`NeedsToken · The token was revoked. ${REMINTS_SPENT}`);
+    expect(status(root)).toBe(`Sign-in needed. The token was revoked. ${REMINTS_SPENT}`);
     h.clock.advanceTo(h.clock.now() + 600_000);
     await tick();
     expect(tokens.calls).toBe(MAX_REMINTS + 1);
@@ -417,7 +420,24 @@ for (const mode of MODES) {
       h.clock.advanceTo(h.clock.now() + 30_000);
       send(h, { t: "ping", nonce: `n${revoked}` });
       h.clock.advanceTo(h.clock.now() + 30_000);
-      expect(status(root)).toBe("Live");
+      expect(status(root)).toBe("Connected.");
+      h.step(step({ step: "token_refused", code: 4403 }));
+      await tick();
+      expect(tokens.calls).toBe(revoked + 1);
+    }
+  });
+
+  test("a session ReadOnly for §3's healthy period ends the streak too: every revocation re-mints at once", async () => {
+    const tokens = provider(mode, ...Array.from({ length: MAX_REMINTS + 3 }, (_, index) => `t${index}`));
+    const { h, root } = mount(tokens);
+    await tick();
+    for (let revoked = 1; revoked <= MAX_REMINTS + 2; revoked++) {
+      // A server one protocol older than the client: ReadOnly, which counts like Live (ADR-0038 §3, §6).
+      welcome(h, 0, undefined, WIRE_PROTOCOL - 1);
+      h.clock.advanceTo(h.clock.now() + 30_000);
+      send(h, { t: "ping", nonce: `n${revoked}` });
+      h.clock.advanceTo(h.clock.now() + 30_000);
+      expect(status(root)).toBe("Connected, read-only.");
       h.step(step({ step: "token_refused", code: 4403 }));
       await tick();
       expect(tokens.calls).toBe(revoked + 1);
@@ -463,7 +483,7 @@ for (const mode of MODES) {
     expect(started(h, mode)).toBe(2);
     welcome(h, 0);
     expect(frames(h, "hello").map((frame) => frame["token"])).toEqual(["t1", "t2"]);
-    expect(status(root)).toBe("Live");
+    expect(status(root)).toBe("Connected.");
     expect(frames(h, "cmd").map((frame) => frame["cmd_id"])).toEqual(["c0"]);
     // t2 carries no expiresInMs, so nothing renews it.
     h.clock.advanceTo(h.clock.now() + 600_000);
@@ -479,7 +499,7 @@ for (const mode of MODES) {
     h.clock.advanceTo(h.clock.now() + 20_000 * RENEW_AT);
     await tick();
     expect(tokens.calls).toBe(2);
-    expect(status(root)).toBe("Live");
+    expect(status(root)).toBe("Connected.");
     const notice = root.querySelector('[data-testid="renewal-notice"]');
     expect(notice?.textContent).toContain(PANE);
     (notice?.querySelector("button") as HTMLButtonElement).click();
@@ -501,9 +521,9 @@ for (const mode of MODES) {
       await tick();
       welcome(h, 0);
       const start = h.clock.now();
-      click(root, ".connection-bar__toggle");
+      click(root, '[data-testid="host-toggle"]');
       if (reconnectFirst) {
-        click(root, ".connection-bar__toggle");
+        click(root, '[data-testid="host-toggle"]');
         await tick();
         welcome(h, 0);
       }
@@ -526,11 +546,11 @@ for (const mode of MODES) {
       h.clock.advanceTo(h.clock.now() + 30_000);
       await tick();
     }
-    expect(status(root)).toBe(`NeedsToken · The token was revoked. ${REMINTS_SPENT}`);
+    expect(status(root)).toBe(`Sign-in needed. The token was revoked. ${REMINTS_SPENT}`);
     h.clock.advanceTo(h.clock.now() + 600_000);
     await tick();
     expect(tokens.calls).toBe(MAX_REMINTS + 1);
-    expect(status(root)).toBe(`NeedsToken · The token was revoked. ${REMINTS_SPENT}`);
+    expect(status(root)).toBe(`Sign-in needed. The token was revoked. ${REMINTS_SPENT}`);
   });
 
   for (const [name, expiresInMs] of [
@@ -543,7 +563,7 @@ for (const mode of MODES) {
     test(`an expiresInMs of ${name} is refused: NeedsToken says why, and nothing connects`, async () => {
       const { h, root } = mount(provider(mode, { token: "t1", expiresInMs }));
       await tick();
-      expect(status(root)).toBe(`NeedsToken · The shell's ${mode === "bridge" ? "bridge session" : "token"} has an invalid expiresInMs: it must be a positive, finite number of milliseconds.`);
+      expect(status(root)).toBe(`Sign-in needed. The shell's ${mode === "bridge" ? "bridge session" : "token"} has an invalid expiresInMs: it must be a positive, finite number of milliseconds.`);
       expect(started(h, mode)).toBe(0);
     });
   }
@@ -553,13 +573,13 @@ for (const mode of MODES) {
     const { h, root } = mount(tokens);
     await tick();
     expect(tokens.calls).toBe(1);
-    click(root, ".connection-bar__toggle");
-    expect(status(root)).toBe("Disconnected");
+    click(root, '[data-testid="host-toggle"]');
+    expect(status(root)).toBe("Not connected.");
     tokens.resolve("late");
     await tick();
     expect(started(h, mode)).toBe(0);
-    expect(status(root)).toBe("Disconnected");
-    click(root, ".connection-bar__toggle");
+    expect(status(root)).toBe("Not connected.");
+    click(root, '[data-testid="host-toggle"]');
     h.step(step({ step: "open" }));
     expect(frames(h, "hello").map((frame) => frame["token"])).toEqual(["late"]);
     expect(tokens.calls).toBe(1);
@@ -577,14 +597,14 @@ for (const mode of MODES) {
     expect(started(h, mode)).toBe(0);
   });
 
-  test("Connect pressed again while the provider is asked makes no second call", async () => {
+  test("Connect cannot be pressed again while the provider is asked: the banner leaves until the ask fails", async () => {
     const tokens = provider(mode, { reject: PANE }, "deferred");
     const { root } = mount(tokens);
     await tick();
     click(root, '[data-testid="shell-connect"]');
-    click(root, '[data-testid="shell-connect"]');
+    expect(root.querySelector('[data-testid="shell-connect"]')).toBeNull();
     await tick();
-    expect(tokens.calls).toBe(2);
+    expect([tokens.calls, status(root)]).toEqual([2, "Signing in…"]);
   });
 
   for (const [end, code] of [
@@ -626,7 +646,7 @@ for (const mode of MODES) {
     tokens.resolve("t2");
     await tick();
     welcome(h, 0);
-    expect(status(root)).toBe("Live");
+    expect(status(root)).toBe("Connected.");
     expect(frames(h, "hello").map((frame) => frame["token"])).toEqual(["t1", "t2"]);
     expect(tokens.calls).toBe(2);
   });
@@ -663,7 +683,7 @@ for (const mode of MODES) {
 test("without a provider, NeedsToken still prompts for a token and names flk client open", () => {
   const { h, root } = mount(undefined);
   expect(h.net.attempts).toHaveLength(0);
-  expect(status(root)).toBe(`NeedsToken · ${RUN_CLIENT_OPEN}`);
+  expect(status(root)).toBe(`Sign-in needed. ${RUN_CLIENT_OPEN}`);
   expect(prompt(root)).not.toBeNull();
   expect(root.querySelector('[data-testid="shell-connect"]')).toBeNull();
 });
@@ -763,7 +783,7 @@ describe("the bridge transport", () => {
     expect(shell.renews).toEqual([false, true, false]);
     expect(shell.openedAt.at(-1)).toBe(h.clock.now());
     welcome(h, 0);
-    expect(status(root)).toBe("Live");
+    expect(status(root)).toBe("Connected.");
     expect(root.querySelector('[data-testid="renewal-notice"]')?.textContent).toContain(PANE);
   });
 
@@ -789,7 +809,7 @@ describe("the bridge transport", () => {
     welcome(h, 0);
     expect(frames(h, "hello").map((frame) => frame["token"])).toEqual(["t1", "t1", "t2"]);
     expect(shell.hellos.some((frame) => "token" in frame)).toBe(false);
-    expect(status(root)).toBe("Live");
+    expect(status(root)).toBe("Connected.");
   });
 
   for (const [end, code, welcomed] of [
@@ -818,13 +838,41 @@ describe("the bridge transport", () => {
     });
   }
 
+  test("a bridge-made 1013 preauth_capacity close is Socket lost: later under capped backoff, outside the re-mint streak", async () => {
+    const shell = provider("bridge", "t1", "t2");
+    const { h, root } = mount(shell);
+    await tick();
+    // ADR-0038 §6: the native bridge makes this close before a welcome.
+    // §3's Socket lost retries later, never as an auth end, even past the mint cap.
+    for (let attempt = 0; attempt <= MAX_REMINTS + 1; attempt++) {
+      h.step(step({ step: "close", code: 1013, reason: "preauth_capacity" }));
+      expect([status(root), diagnosis(root)]).toEqual(["Connection lost. Reconnecting…", "Connection lost: the socket closed (1013: preauth_capacity)."]);
+      const opened = shell.renews.length;
+      const later = Math.min(30_000, 500 * 2 ** attempt) / 2;
+      h.clock.advanceTo(h.clock.now() + later - 1);
+      await tick();
+      expect(shell.renews.length).toBe(opened);
+      h.clock.advanceTo(h.clock.now() + 1);
+      await tick();
+      expect([shell.calls, shell.renews.length]).toEqual([1, opened + 1]);
+      expect(shell.renews.every((renew) => !renew)).toBe(true);
+    }
+    // The first actual auth refusal must still get its first, immediate re-mint.
+    h.step(step({ step: "token_refused", code: 4401 }));
+    await tick();
+    expect(shell.calls).toBe(2);
+    expect(shell.openedAt.at(-1)).toBe(h.clock.now());
+    welcome(h, 0);
+    expect(status(root)).toBe("Connected.");
+  });
+
   test("a 1006 is an ordinary reconnect: Reconnecting on §3's backoff, then one openBridge that mints nothing, and the streak is untouched", async () => {
     const shell = provider("bridge", "t1");
     const { h, root } = mount(shell);
     await tick();
     welcome(h, 0);
     h.step(step({ step: "drop" }));
-    expect(status(root)).toBe("Reconnecting · Connection lost: the socket closed (1006).");
+    expect([status(root), diagnosis(root)]).toEqual(["Connection lost. Reconnecting…", "Connection lost: the socket closed (1006)."]);
     // Attempt 0's backoff is [250, 500] ms; random 0 takes 250.
     h.clock.advanceTo(h.clock.now() + 249);
     await tick();
@@ -833,7 +881,7 @@ describe("the bridge transport", () => {
     await tick();
     expect([shell.renews, shell.calls, started(h, "bridge")]).toEqual([[false, false], 1, 2]);
     welcome(h, 0);
-    expect(status(root)).toBe("Live");
+    expect(status(root)).toBe("Connected.");
   });
 
   test("a 1008 is a protocol close: the diagnosis is shown and the connection goes to Reconnecting, never NeedsToken", async () => {
@@ -841,7 +889,7 @@ describe("the bridge transport", () => {
     const { h, root } = mount(shell);
     await tick();
     h.step(step({ step: "close", code: 1008, reason: "the first frame was not a token-free hello" }));
-    expect(status(root)).toBe("Reconnecting · Connection lost: the socket closed (1008: the first frame was not a token-free hello).");
+    expect([status(root), diagnosis(root)]).toEqual(["Connection lost. Reconnecting…", "Connection lost: the socket closed (1008: the first frame was not a token-free hello)."]);
     h.clock.advanceTo(h.clock.now() + 250);
     await tick();
     expect([shell.renews, shell.calls, started(h, "bridge")]).toEqual([[false, false], 1, 2]);
@@ -855,7 +903,7 @@ describe("the bridge transport", () => {
     // The server ended t1, so the reconnect's open must mint, and the shell refuses.
     h.step(step({ step: "token_refused", code: 4403 }));
     await tick();
-    expect(status(root)).toBe(`NeedsToken · The token was revoked. ${PANE}`);
+    expect(status(root)).toBe(`Sign-in needed. The token was revoked. ${PANE}`);
     h.clock.advanceTo(h.clock.now() + 600_000);
     await tick();
     expect([shell.renews, shell.calls]).toEqual([[false, false], 2]);
@@ -863,7 +911,7 @@ describe("the bridge transport", () => {
     await tick();
     expect([shell.renews, shell.calls]).toEqual([[false, false, false], 3]);
     welcome(h, 0);
-    expect(status(root)).toBe("Live");
+    expect(status(root)).toBe("Connected.");
   });
 
   test("a bearer's renewal is asked once: after it fails, reconnects on the same bearer never ask again, and the notice stands", async () => {
@@ -892,8 +940,8 @@ describe("the bridge transport", () => {
     await tick();
     welcome(h, 0);
     h.clock.advanceTo(20_000);
-    click(root, ".connection-bar__toggle");
-    click(root, ".connection-bar__toggle");
+    click(root, '[data-testid="host-toggle"]');
+    click(root, '[data-testid="host-toggle"]');
     await tick();
     welcome(h, 0);
     // The session on t1 reports 20 s left: due at 20 + 15 s, where the forgotten due time was 30 s.
@@ -935,7 +983,7 @@ describe("the bridge transport", () => {
   test("a fresh that is not a boolean is refused: NeedsToken says why, and its socket is closed", async () => {
     const { h, root } = mount(provider("bridge", { token: "t1", fresh: "yes" }));
     await tick();
-    expect(status(root)).toBe("NeedsToken · The shell's bridge session has an invalid fresh: it must be a boolean.");
+    expect(status(root)).toBe("Sign-in needed. The shell's bridge session has an invalid fresh: it must be a boolean.");
     expect([frames(h, "hello").length, h.net.closes.map((close) => close.code)]).toEqual([0, [1000]]);
   });
 
@@ -971,8 +1019,8 @@ describe("the bridge transport", () => {
     h.step(step({ step: "token_refused", code: 4403 }));
     await tick();
     expect(shell.calls).toBe(2);
-    click(root, ".connection-bar__toggle");
-    click(root, ".connection-bar__toggle");
+    click(root, '[data-testid="host-toggle"]');
+    click(root, '[data-testid="host-toggle"]');
     await tick();
     expect([shell.renews, shell.calls]).toEqual([[false, false, false], 3]);
     welcome(h, 0);
@@ -985,7 +1033,7 @@ describe("the bridge transport", () => {
     const shell = provider("bridge", "deferred");
     const { h, root } = mount(shell);
     await tick();
-    click(root, ".connection-bar__toggle");
+    click(root, '[data-testid="host-toggle"]');
     shell.resolve("late");
     await tick();
     expect(h.net.closes).toEqual([]);
@@ -998,18 +1046,18 @@ describe("the bridge transport", () => {
     const shell = provider("bridge", "deferred");
     const { h, root } = mount(shell);
     await tick();
-    click(root, ".connection-bar__toggle");
+    click(root, '[data-testid="host-toggle"]');
     shell.resolve("late");
     await tick();
     // The native side's socket to the server went away while nobody used it.
     h.net.current().drop();
-    click(root, ".connection-bar__toggle");
-    expect(status(root)).toBe("Connecting");
+    click(root, '[data-testid="host-toggle"]');
+    expect(status(root)).toBe("Connecting…");
     await tick();
     expect([shell.renews, shell.calls]).toEqual([[false, false], 1]);
     welcome(h, 0);
     expect(frames(h, "hello").map((frame) => frame["token"])).toEqual(["late"]);
-    expect(status(root)).toBe("Live");
+    expect(status(root)).toBe("Connected.");
   });
 
   test("a session that resolves after the app is gone is closed, and one with an invalid lifetime is closed too", async () => {
@@ -1032,6 +1080,10 @@ for (const mode of MODES) {
   describe(`the ${mode} driver on a bare connection`, () => {
   /** A Live connection (given → hello → welcome), a driver on it, and every delay it armed. */
   function driven(...replies: Reply[]) {
+    return drivenWithRandom(() => 0, ...replies);
+  }
+
+  function drivenWithRandom(random: () => number, ...replies: Reply[]) {
     const h = new Harness();
     const tokens = provider(mode, ...replies);
     if (mode === "provider") live(h);
@@ -1050,10 +1102,273 @@ for (const mode of MODES) {
     const browserDelay = (ms: number): number => (ms > 2 ** 31 - 1 ? 0 : ms);
     const clock = { ...h.clock, now: () => h.clock.now(), wallNow: () => h.clock.wallNow(), clearTimeout: (handle: Parameters<typeof h.clock.clearTimeout>[0]) => h.clock.clearTimeout(handle), setTimeout: (callback: () => void, ms: number) => (delays.push(ms), h.clock.setTimeout(callback, browserDelay(ms))) };
     const config = tokens.config;
-    if ("openBridge" in config) driveBridge(h.connection, config.openBridge, clock, () => 0, () => undefined);
-    else driveTokenProvider(h.connection, config.tokenProvider, clock, () => 0, () => undefined);
-    return { h, tokens, delays };
+    const driver = "openBridge" in config
+      ? driveBridge(h.connection, config.openBridge, clock, random, () => undefined)
+      : driveTokenProvider(h.connection, config.tokenProvider, clock, random, () => undefined);
+    return { h, tokens, delays, driver };
   }
+
+  test("a successful renewal after Disconnect leaves no renewal timer", async () => {
+    const { h, tokens, driver } = driven({ token: "t2", expiresInMs: 20 }, "deferred");
+    dispose = () => { driver.dispose(); h.connection.disconnect(); };
+    h.step(step({ step: "token_refused", code: 4403 }));
+    await tick();
+    h.step(step({ step: "open" }));
+    send(h, WELCOME);
+    h.clock.advanceTo(15);
+    await tick();
+    expect(tokens.calls).toBe(2);
+    h.connection.disconnect();
+    expect(h.clock.pendingTimers).toBe(0);
+    tokens.resolve("late", 40);
+    await tick();
+    expect([h.connection.state, h.clock.pendingTimers]).toEqual(["Disconnected", 0]);
+    h.clock.advanceTo(45);
+    await tick();
+    expect(tokens.calls).toBe(2);
+  });
+
+  for (const connectAt of [20, 115]) {
+    test(`Connect at ${connectAt} resumes the late renewal's absolute due time`, async () => {
+      const { h, tokens, driver } = driven({ token: "t2", expiresInMs: 20 }, "deferred", "t4");
+      dispose = () => { driver.dispose(); h.connection.disconnect(); };
+      h.step(step({ step: "token_refused", code: 4403 }));
+      await tick();
+      h.step(step({ step: "open" }));
+      send(h, WELCOME);
+      h.clock.advanceTo(15);
+      await tick();
+      h.connection.disconnect();
+      tokens.resolve("late", 40);
+      await tick();
+      expect([h.connection.state, h.clock.pendingTimers]).toEqual(["Disconnected", 0]);
+      h.clock.advanceTo(connectAt);
+      expect(h.clock.pendingTimers).toBe(0);
+      h.connection.connect();
+      await tick();
+      h.step(step({ step: "open" }));
+      send(h, WELCOME);
+      expect(frames(h, "hello").at(-1)?.["token"]).toBe("late");
+      const due = Math.max(connectAt, 45); // Late result at 15 + floor(40 * 3/4).
+      if (connectAt < due) {
+        h.clock.advanceTo(due - 1);
+        await tick();
+        expect(tokens.calls).toBe(2);
+      }
+      h.clock.advanceTo(due);
+      await tick();
+      expect(tokens.calls).toBe(3);
+      h.step(step({ step: "open" }));
+      send(h, WELCOME);
+      expect([h.connection.state, frames(h, "hello").at(-1)?.["token"]]).toEqual(["Live", "t4"]);
+      driver.dispose();
+      h.connection.disconnect();
+      expect(h.clock.pendingTimers).toBe(0);
+    });
+  }
+
+  test("user Connect during renewal uses the actual bearer and a documented reactive fallback", async () => {
+    const { h, tokens, driver } = driven({ token: "original", expiresInMs: 20 }, "deferred", "reactive");
+    dispose = () => { driver.dispose(); h.connection.disconnect(); };
+    h.step(step({ step: "token_refused", code: 4403 }));
+    await tick();
+    h.step(step({ step: "open" }));
+    send(h, WELCOME);
+    h.clock.advanceTo(15);
+    await tick();
+    expect(tokens.calls).toBe(2);
+    h.connection.disconnect();
+    h.connection.connect();
+    h.clock.advanceTo(16);
+    if (mode === "provider") {
+      h.step(step({ step: "open" }));
+      send(h, WELCOME);
+    }
+    tokens.resolve("discarded", 40);
+    await tick();
+    if (mode === "bridge") {
+      h.step(step({ step: "open" }));
+      send(h, WELCOME);
+      // This fake native side keeps the bearer from its resolved renewal. The
+      // fresh open reports its remaining lifetime; renew at 16 + floor(40*3/4).
+      h.clock.advanceTo(45);
+      await tick();
+      expect(tokens.calls).toBe(2);
+      h.clock.advanceTo(46);
+      await tick();
+      expect(tokens.calls).toBe(3);
+    } else {
+      expect(frames(h, "hello").at(-1)?.["token"]).toBe("original");
+      // Token mode has no new lifetime report on Connect. Discarding the stale
+      // renewal cannot assign its lifetime to original: only auth ends renew it.
+      h.clock.advanceTo(115);
+      await tick();
+      expect([tokens.calls, h.connection.state, h.clock.pendingTimers]).toEqual([2, "Live", 2]);
+      h.step(step({ step: "token_refused", code: 4403 }));
+      await tick();
+      expect(tokens.calls).toBe(3);
+    }
+    driver.dispose();
+    h.connection.disconnect();
+    expect(h.clock.pendingTimers).toBe(0);
+  });
+
+  for (const pending of ["mint", "renewal"] as const) {
+    test(`the re-mint cap discards an in-flight ${pending} success`, async () => {
+      const { h, tokens, driver } = pending === "mint"
+        ? driven("deferred")
+        : driven({ token: "t2", expiresInMs: 20 }, "deferred");
+      dispose = () => { driver.dispose(); h.connection.disconnect(); };
+      h.step(step({ step: "token_refused", code: 4403 }));
+      await tick();
+      if (pending === "renewal") {
+        h.step(step({ step: "open" }));
+        send(h, WELCOME);
+        h.clock.advanceTo(15);
+        await tick();
+        h.step(step({ step: "token_refused", code: 4403 }));
+      }
+      // Deliberate external handoffs reach the cap while the original call
+      // stays unresolved, rather than waiting for a new mint on each end.
+      for (let revoked = pending === "mint" ? 2 : 3; revoked <= MAX_REMINTS + 1; revoked++) {
+        if (mode === "bridge") h.connection.setSocket(tokens.open("handoff"));
+        else h.connection.setToken("handoff");
+        h.step(step({ step: "open" }));
+        send(h, WELCOME);
+        h.step(step({ step: "token_refused", code: 4403 }));
+      }
+      expect(driver.error).toBe(REMINTS_SPENT);
+      const hellos = frames(h, "hello").length;
+      const closes = h.net.closes.length;
+      tokens.resolve("late", 40);
+      await tick();
+      expect([h.connection.state, driver.error, driver.asking, h.clock.pendingTimers]).toEqual(["NeedsToken", REMINTS_SPENT, false, 0]);
+      expect(frames(h, "hello")).toHaveLength(hellos);
+      if (mode === "bridge") expect(h.net.closes.slice(closes)).toEqual([{ code: 1000, reason: "disposed", at: h.clock.now(), consumed: false }]);
+    });
+  }
+
+  for (const settlement of ["success", "failure"] as const) {
+    test(`Connect behind a capped mint recovers after its stale ${settlement}`, async () => {
+      const { h, tokens, driver } = driven("deferred", "fresh", "next");
+      dispose = () => { driver.dispose(); h.connection.disconnect(); };
+      h.step(step({ step: "token_refused", code: 4403 }));
+      await tick();
+      // External session handoffs reach the cap without resolving the first mint.
+      for (let revoked = 2; revoked <= MAX_REMINTS + 1; revoked++) {
+        if (mode === "bridge") h.connection.setSocket(tokens.open("handoff"));
+        else h.connection.setToken("handoff");
+        h.step(step({ step: "open" }));
+        send(h, WELCOME);
+        h.step(step({ step: "token_refused", code: 4403 }));
+      }
+      expect(driver.error).toBe(REMINTS_SPENT);
+      h.connection.disconnect();
+      expect(h.clock.pendingTimers).toBe(0);
+      h.connection.connect();
+      await tick();
+      const callsBefore = mode === "bridge" ? tokens.renews.length : tokens.calls;
+      const hellosBefore = frames(h, "hello").length;
+      if (settlement === "success") tokens.resolve("stale");
+      else tokens.reject(PANE);
+      await tick();
+      expect(mode === "bridge" ? tokens.renews.length : tokens.calls).toBe(callsBefore + 1);
+      h.step(step({ step: "open" }));
+      send(h, WELCOME);
+      expect([h.connection.state, driver.error, driver.asking]).toEqual(["Live", null, false]);
+      expect(frames(h, "hello")).toHaveLength(hellosBefore + 1);
+      expect(h.clock.pendingTimers).toBe(2); // Only the wire's liveness/healthy timers.
+      h.clock.advanceTo(250);
+      await tick();
+      const beforeEnd = mode === "bridge" ? tokens.renews.length : tokens.calls;
+      // The fresh epoch's first auth end is immediate, rather than still capped.
+      h.step(step({ step: "token_refused", code: 4403 }));
+      await tick();
+      expect(mode === "bridge" ? tokens.renews.length : tokens.calls).toBe(beforeEnd + 1);
+      expect(driver.error).not.toBe(REMINTS_SPENT);
+      driver.dispose();
+      h.connection.disconnect();
+      expect(h.clock.pendingTimers).toBe(0);
+    });
+  }
+
+  test("successful renewals never reset a revoked-token streak or its growing backoff", async () => {
+    const { h, tokens, driver } = driven(...Array.from({ length: 60 }, (_, n) => ({ token: `cycle-${n}`, expiresInMs: 20 })));
+    dispose = () => { driver.dispose(); h.connection.disconnect(); };
+    h.step(step({ step: "token_refused", code: 4403 }));
+    await tick();
+    for (let revoked = 2; revoked <= MAX_REMINTS + 1; revoked++) {
+      h.step(step({ step: "open" }));
+      send(h, WELCOME);
+      h.clock.advanceTo(h.clock.now() + 15);
+      await tick();
+      h.step(step({ step: "open" }));
+      send(h, WELCOME);
+      const beforeEnd = tokens.calls;
+      h.step(step({ step: "token_refused", code: 4403 }));
+      await tick();
+      if (revoked <= MAX_REMINTS) {
+        const due = h.clock.now() + Math.min(30_000, 500 * 2 ** (revoked - 2)) / 2;
+        h.clock.advanceTo(due - 1);
+        await tick();
+        expect(tokens.calls).toBe(beforeEnd);
+        h.clock.advanceTo(due);
+        await tick();
+        expect(tokens.calls).toBe(beforeEnd + 1);
+      }
+    }
+    expect([driver.error, tokens.calls, h.connection.state, h.clock.pendingTimers]).toEqual([REMINTS_SPENT, MAX_REMINTS * 2, "NeedsToken", 0]);
+    h.clock.advanceTo(h.clock.now() + 60_000);
+    await tick();
+    expect(tokens.calls).toBe(MAX_REMINTS * 2);
+  });
+
+  test("the re-mint cap cancels a pending wait and keeps its error", async () => {
+    const { h, tokens, driver } = driven("t2", "unexpected");
+    dispose = () => { driver.dispose(); h.connection.disconnect(); };
+    h.step(step({ step: "token_refused", code: 4403 }));
+    await tick();
+    h.step(step({ step: "open" }));
+    send(h, WELCOME);
+    h.step(step({ step: "token_refused", code: 4403 }));
+    expect(h.clock.pendingTimers).toBe(1);
+    // Deliberate session-handoff fault injection: each already-open session
+    // arrives during the same pending re-mint, then the server revokes it.
+    for (let revoked = 3; revoked <= MAX_REMINTS + 1; revoked++) {
+      if (mode === "bridge") h.connection.setSocket(tokens.open("handoff"));
+      else h.connection.setToken("handoff");
+      h.step(step({ step: "open" }));
+      send(h, WELCOME);
+      h.step(step({ step: "token_refused", code: 4403 }));
+    }
+    const atCap = [driver.error, h.clock.pendingTimers, tokens.calls];
+    h.clock.advanceTo(30_000);
+    await tick();
+    expect([atCap, driver.error, tokens.calls, driver.asking]).toEqual([[REMINTS_SPENT, 0, 1], REMINTS_SPENT, 1, false]);
+  });
+
+  test("re-mint jitter uses the injected non-zero random value without opening early", async () => {
+    const { h, tokens, driver } = drivenWithRandom(() => 0.5, "t2", "t3", "t4");
+    dispose = () => { driver.dispose(); h.connection.disconnect(); };
+    h.step(step({ step: "token_refused", code: 4403 }));
+    await tick();
+    // Equal jitter at random 0.5 gives 375 ms, then 750 ms (not the minima).
+    for (const [beforeCalls, delay] of [[1, 375], [2, 750]] as const) {
+      h.step(step({ step: "open" }));
+      send(h, WELCOME);
+      h.step(step({ step: "token_refused", code: 4403 }));
+      const due = h.clock.now() + delay;
+      h.clock.advanceTo(due - 1);
+      await tick();
+      expect(tokens.calls).toBe(beforeCalls);
+      h.clock.advanceTo(due);
+      await tick();
+      expect(tokens.calls).toBe(beforeCalls + 1);
+    }
+    driver.dispose();
+    h.connection.disconnect();
+    expect(h.clock.pendingTimers).toBe(0);
+  });
 
   test("a renewal timer is armed only for a token with expiresInMs, at RENEW_AT of it", async () => {
     const plain = driven("t2");
@@ -1120,6 +1435,147 @@ describe("a bridged connection", () => {
     shell.net = h.net;
     return { h, shell, open: (token: string) => shell.open(token) };
   }
+
+  /** A deferred renewal at 649 ms overlaps a re-mint scheduled for 750 ms. */
+  async function renewalDuringRemint(reconnect = true) {
+    const h = new Harness();
+    h.conn = new WireConnection({ bridged: true, client: { name: "fixture", version: "1" }, clock: h.clock, random: () => 0, store: h.store });
+    const shell = provider("bridge", "t1", "t2", { token: "t3", expiresInMs: 533 }, "deferred", "deferred");
+    shell.net = h.net;
+    const config = shell.config as { readonly openBridge: OpenBridge };
+    const driver = driveBridge(h.connection, config.openBridge, h.clock, () => 0, () => undefined);
+    dispose = () => { driver.dispose(); h.connection.disconnect(); };
+    h.connection.connect();
+    await tick();
+    send(h, WELCOME);
+    h.step(step({ step: "token_refused", code: 4403 }));
+    await tick();
+    send(h, WELCOME);
+    h.step(step({ step: "token_refused", code: 4403 }));
+    h.clock.advanceTo(250);
+    await tick();
+    send(h, WELCOME);
+    h.step(step({ step: "token_refused", code: 4403 }));
+    // Deliberate session-handoff injection: an already-open session arrives while
+    // the 500 ms re-mint waits, then drops. This overlaps all three driver timers.
+    h.connection.setSocket(shell.open("t3"));
+    if (reconnect) h.step(step({ step: "drop" }));
+    else send(h, WELCOME);
+    h.clock.advanceTo(500);
+    await tick();
+    expect(h.connection.awaitingSession).toBe(reconnect);
+    // t3's renewal is due at 250 + floor(533 * 3/4), before the re-mint at 750.
+    h.clock.advanceTo(649);
+    await tick();
+    expect(shell.renews).toEqual([false, false, false, true]);
+    return { h, shell, driver };
+  }
+
+  test("renewal cancels an obsolete mint while Live, without manufacturing owed work", async () => {
+    const { h, shell, driver } = await renewalDuringRemint(false);
+    h.clock.advanceTo(660);
+    shell.reject(PANE);
+    await tick();
+    h.clock.advanceTo(750);
+    await tick();
+    expect([h.connection.state, shell.openedAt, driver.asking]).toEqual(["Live", [0, 0, 250, 649], false]);
+    driver.dispose();
+    h.connection.disconnect();
+    expect(h.clock.pendingTimers).toBe(0);
+  });
+
+  test("a reconnect requested during re-mint backoff is owed when a renewal overlaps it, without a connect deadline", async () => {
+    const { h, shell, driver } = await renewalDuringRemint();
+    h.clock.advanceTo(750);
+    shell.reject(PANE);
+    await tick();
+    const servedAt = shell.openedAt.at(-1);
+    if (h.connection.state === "Hello") send(h, WELCOME);
+    h.clock.advanceTo(500 + DEADLINES.connect);
+    expect([servedAt, h.connection.state, h.connection.error, shell.renews]).toEqual([750, "Live", null, [false, false, false, true, false]]);
+    driver.dispose();
+    h.connection.disconnect();
+    expect(h.clock.pendingTimers).toBe(0);
+  });
+
+  test("a newer reconnect keeps the cancelled mint due time: no open at 660, one open at 750", async () => {
+    const { h, shell, driver } = await renewalDuringRemint();
+    h.clock.advanceTo(660);
+    shell.reject(PANE);
+    await tick();
+    const atFailure = [...shell.openedAt];
+    h.clock.advanceTo(749);
+    await tick();
+    const beforeDue = [...shell.openedAt];
+    h.clock.advanceTo(750);
+    await tick();
+    expect([atFailure, beforeDue, shell.openedAt]).toEqual([[0, 0, 250, 649], [0, 0, 250, 649], [0, 0, 250, 649, 750]]);
+    driver.dispose();
+    h.connection.disconnect();
+    expect(h.clock.pendingTimers).toBe(0);
+  });
+
+  test("Disconnect drops the old owed deadline before a new Connect", async () => {
+    const { h, shell, driver } = await renewalDuringRemint();
+    h.clock.advanceTo(650);
+    h.connection.disconnect();
+    h.connection.connect();
+    h.clock.advanceTo(660);
+    shell.reject(PANE);
+    await tick();
+    expect(shell.openedAt).toEqual([0, 0, 250, 649, 660]);
+    driver.dispose();
+    h.connection.disconnect();
+    expect(h.clock.pendingTimers).toBe(0);
+  });
+
+  test("a settled request cannot delay a later renewal's reconnect", async () => {
+    const { h, shell, driver } = await renewalDuringRemint();
+    shell.resolve("renewed", 20);
+    await tick();
+    send(h, WELCOME);
+    h.clock.advanceTo(664);
+    await tick();
+    h.clock.advanceTo(665);
+    h.step(step({ step: "drop" }));
+    h.connection.networkChange();
+    h.clock.advanceTo(666);
+    shell.reject(PANE);
+    await tick();
+    expect(shell.openedAt).toEqual([0, 0, 250, 649, 664, 666]);
+    driver.dispose();
+    h.connection.disconnect();
+    expect(h.clock.pendingTimers).toBe(0);
+  });
+
+  test("a successful renewal cancels the waiting mint: exactly one openBridge and Live, with no timer left after cleanup", async () => {
+    const { h, shell, driver } = await renewalDuringRemint();
+    shell.resolve("renewed");
+    await tick();
+    send(h, WELCOME);
+    // While Live, only the wire's liveness and healthy timers remain.
+    const timersWhileLive = h.clock.pendingTimers;
+    h.clock.advanceTo(750);
+    await tick();
+    const settled = [h.connection.state, shell.renews.slice(3)];
+    driver.dispose();
+    h.connection.disconnect();
+    expect([timersWhileLive, settled, h.clock.pendingTimers]).toEqual([2, ["Live", [true]], 0]);
+  });
+
+  test("Disconnect during renewal cancels the waiting mint even when renewal fails, with no pending timers", async () => {
+    const { h, shell, driver } = await renewalDuringRemint();
+    h.connection.disconnect();
+    shell.reject(PANE);
+    await tick();
+    const timersAfterDisconnect = h.clock.pendingTimers;
+    h.clock.advanceTo(750);
+    await tick();
+    const settled = [h.connection.state, shell.renews.slice(3), h.clock.pendingTimers];
+    driver.dispose();
+    h.connection.disconnect();
+    expect([timersAfterDisconnect, settled, h.clock.pendingTimers]).toEqual([0, ["Disconnected", [true], 0], 0]);
+  });
 
   test("a held session replaced by another is closed", () => {
     const { h, open } = bridged();

@@ -1,39 +1,6 @@
-/* System font stacks only: the bundle makes no network requests. */
+/* Colours, fonts and other values come from tokens.css (web/DESIGN.md). */
 :root {
   color-scheme: light dark;
-  --bg: #fbfbfa;
-  --fg: #1d1d1f;
-  --muted: #5f6368;
-  --border: #d9d9d6;
-  --surface: #f1f1ee;
-  --badge-bg: #7a3e00;
-  --badge-fg: #ffffff;
-  --error: #a4161a;
-  --working: #1f5fbf;
-  --needs: #b25e00;
-  --idle: #6b6f76;
-  --done: #2e7d32;
-  --failed: #8e1b1b;
-  --font-ui: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-  --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #161618;
-    --fg: #ececec;
-    --muted: #a0a0a5;
-    --border: #3a3a3e;
-    --surface: #222226;
-    --badge-bg: #f0a040;
-    --badge-fg: #1a1100;
-    --error: #ff8a80;
-    --working: #7fb0ff;
-    --needs: #ffb347;
-    --idle: #a0a4ab;
-    --done: #7bd389;
-    --failed: #ff8a80;
-  }
 }
 
 *,
@@ -45,42 +12,54 @@
 html,
 body {
   margin: 0;
-  background: var(--bg);
-  color: var(--fg);
-  font: 14px/1.5 var(--font-ui);
+  background: var(--color-legacy-bg);
+  color: var(--color-legacy-fg);
+  font: 14px/1.5 var(--font-family-system);
   overflow-wrap: anywhere;
+}
+
+/* 13 px body text on desktop (HIG Typography; #2903). The root stays 14 px:
+   it is the rem the legacy spacing is written in, until #2913 replaces it
+   with tokens. */
+body {
+  font-size: var(--font-size-13);
+}
+
+/* A shortcut label (the palette's ⌘K) is in the system font, like a menu's. */
+kbd {
+  font-family: inherit;
 }
 
 /* One visible focus ring for every control, keyboard focus only. */
 :focus-visible {
-  outline: 2px solid var(--working);
+  outline: 2px solid var(--color-legacy-working);
   outline-offset: 2px;
 }
 
-/* ADR-0038 §2a: 14 px body text on desktop, 15 px below the phone breakpoint. */
+/* ADR-0038 §2a: 15 px body text below the phone breakpoint. */
 @media (max-width: 767.98px) {
   html,
   body {
-    font-size: 15px;
+    font-size: var(--font-size-15);
   }
 }
 
 .replay-badge {
   position: sticky;
   top: 0;
-  z-index: 1;
+  z-index: var(--layer-sticky);
   display: flex;
   flex-wrap: wrap;
   align-items: center;
   gap: 0.25rem 0.75rem;
   min-height: 44px;
   padding: 0.5rem 1rem;
-  background: var(--badge-bg);
-  color: var(--badge-fg);
+  background: var(--color-legacy-badge-bg);
+  color: var(--color-legacy-badge-fg);
 }
 
 .replay-badge__source {
-  font: 0.8125rem/1.4 var(--font-mono);
+  font: 0.8125rem/1.4 var(--font-family-mono);
   opacity: 0.9;
   min-width: 0;
 }
@@ -95,7 +74,7 @@ body {
   max-width: 40rem;
   margin: 2rem auto;
   padding: 1rem;
-  color: var(--error);
+  color: var(--color-legacy-error);
 }
 
 .transcript {
@@ -107,20 +86,20 @@ body {
 .event {
   min-width: 0;
   padding: 0.75rem 1rem;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  background: var(--surface);
+  border: var(--border-width-thin) solid var(--color-legacy-border);
+  border-radius: var(--radius-medium);
+  background: var(--color-legacy-surface);
 }
 
 .event--assistant {
-  background: var(--bg);
+  background: var(--color-legacy-bg);
 }
 
 .event__label {
   margin: 0 0 0.25rem;
   font-size: 0.8125rem;
-  font-weight: 600;
-  color: var(--muted);
+  font-weight: var(--font-weight-semibold);
+  color: var(--color-legacy-muted);
 }
 
 .text {
@@ -128,11 +107,11 @@ body {
   white-space: pre-wrap;
 }
 
-/* Collapsed blocks: the summary is the touch target (at least 44 px). */
+/* Collapsed blocks: the summary is a regular control (44 px on a phone, workbench.css). */
 details > summary {
   display: flex;
   align-items: center;
-  min-height: 44px;
+  min-height: var(--size-control);
   cursor: pointer;
   list-style: none;
 }
@@ -151,7 +130,7 @@ details > summary::-webkit-details-marker {
 }
 
 .event--unknown > summary {
-  font-family: var(--font-mono);
+  font-family: var(--font-family-mono);
   font-size: 0.875rem;
 }
 
@@ -161,16 +140,16 @@ details > summary::-webkit-details-marker {
   margin: 0.25rem 0 0;
   padding: 0.5rem 0.75rem;
   overflow-x: auto;
-  border-radius: 6px;
-  background: var(--bg);
-  font: 0.8125rem/1.45 var(--font-mono);
+  border-radius: var(--radius-small);
+  background: var(--color-legacy-bg);
+  font: 0.8125rem/1.45 var(--font-family-mono);
   white-space: pre;
   overflow-wrap: normal;
 }
 
 .transcript__status {
   margin: 0.5rem 0 2rem;
-  color: var(--muted);
+  color: var(--color-legacy-muted);
   font-size: 0.875rem;
 }
 
@@ -178,9 +157,9 @@ details > summary::-webkit-details-marker {
 .transcript__gap {
   margin: 0.75rem 0;
   padding: 0.5rem 0.75rem;
-  border: 1px dashed var(--border);
-  border-radius: 6px;
-  color: var(--muted);
+  border: var(--border-width-thin) dashed var(--color-legacy-border);
+  border-radius: var(--radius-small);
+  color: var(--color-legacy-muted);
   font-size: 0.875rem;
 }
 
@@ -193,15 +172,15 @@ details > summary::-webkit-details-marker {
 
 .turn + .turn {
   padding-top: 0.75rem;
-  border-top: 1px solid var(--border);
+  border-top: var(--border-width-thin) solid var(--color-legacy-border);
 }
 
 .transcript__fold {
-  min-height: 44px;
-  border: 1px dashed var(--border);
-  border-radius: 6px;
+  min-height: var(--size-control);
+  border: var(--border-width-thin) dashed var(--color-legacy-border);
+  border-radius: var(--radius-small);
   background: none;
-  color: var(--muted);
+  color: var(--color-legacy-muted);
   font: inherit;
   cursor: pointer;
 }
@@ -212,24 +191,24 @@ details > summary::-webkit-details-marker {
 }
 
 .tool-run__name {
-  font-weight: 600;
+  font-weight: var(--font-weight-semibold);
 }
 
 .tool-run__command {
   min-width: 0;
   overflow: hidden;
-  font-family: var(--font-mono);
+  font-family: var(--font-family-mono);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .tool-run__outcome {
   margin-left: auto;
-  color: var(--muted);
+  color: var(--color-legacy-muted);
 }
 
 .tool-run__outcome--error {
-  color: var(--error);
+  color: var(--color-legacy-error);
 }
 
 /* A failed sign-in link while a session works on (ADR-0038 §3): a dismissible notice over the workbench. */
@@ -237,15 +216,15 @@ details > summary::-webkit-details-marker {
   position: fixed;
   inset-inline: 16px;
   bottom: 16px;
-  z-index: 10;
+  z-index: var(--layer-overlay);
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: var(--space-3);
   padding: 10px 14px;
-  background: var(--surface);
-  color: var(--fg);
-  border: 1px solid var(--border);
-  border-radius: 8px;
+  background: var(--color-legacy-surface);
+  color: var(--color-legacy-fg);
+  border: var(--border-width-thin) solid var(--color-legacy-border);
+  border-radius: var(--radius-medium);
 }
 
 .notice span {

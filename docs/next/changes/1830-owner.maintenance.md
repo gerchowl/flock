@@ -1,1 +1,0 @@
-- Add a bounded internal history-owner bridge with generation-fenced retained recovery, and discard queued deliveries for closed subscription identities while preserving sibling traffic and heartbeat priority.

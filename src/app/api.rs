@@ -166,16 +166,17 @@ fn run_pr_poll_round(
     })
 }
 
-/// Local-operator evidence borrowed from the classified API request.
-/// Only this dispatcher can construct it; it cannot outlive or mutate its caller.
+/// Local-operator evidence borrowed from a classified API request or sealed TUI peer.
+/// Only this module can construct it; it cannot outlive or mutate its caller.
 pub(crate) struct LocalOperator<'a> {
     _app: &'a mut App,
+    peer: crate::platform::peer::Credentials,
 }
 
 impl LocalOperator<'_> {
     /// Accepted kernel evidence from this proof's connection, never a caller argument.
     pub(crate) fn peer_credentials(&self) -> crate::platform::peer::Credentials {
-        self._app.api_peer_credentials()
+        self.peer
     }
 }
 
@@ -194,7 +195,16 @@ impl App {
         if !self.caller_is_local_operator() {
             return Err(crate::api::error_code::ErrorCode::OperatorOnly);
         }
-        Ok(LocalOperator { _app: self })
+        let peer = self.api_peer_credentials();
+        Ok(LocalOperator { _app: self, peer })
+    }
+
+    /// Reuse sealed transport admission for a TUI attach, without replacing API scope.
+    pub(crate) fn native_client_authority(&mut self, peer: &super::LocalPeer) -> LocalOperator<'_> {
+        LocalOperator {
+            peer: peer.credentials(),
+            _app: self,
+        }
     }
 
     /// Arm and spawn a transcript read for `pane_id` at the currently
@@ -226,6 +236,16 @@ impl App {
     }
 
     pub(crate) fn handle_internal_event(&mut self, ev: AppEvent) {
+        self.handle_internal_event_at(ev, std::time::Instant::now());
+    }
+
+    /// Apply an owner event with one observation instant shared by poll health
+    /// and every directly or indirectly delivered reading.
+    pub(crate) fn handle_internal_event_at(
+        &mut self,
+        ev: AppEvent,
+        observed_at: std::time::Instant,
+    ) {
         if let AppEvent::PasteConfirm { paste, respond_to } = ev {
             self.advance_paste(paste, respond_to);
             return;
@@ -479,7 +499,7 @@ impl App {
             // still proves the local poller is alive — dropping the health
             // update here would silently turn a config edit into a "poller
             // stopped" alert.
-            let now = std::time::Instant::now();
+            let now = observed_at;
             match &fetch.result {
                 Ok(_) => self.peer_poll_health.mark_success(now),
                 Err(msg) => self
@@ -487,6 +507,12 @@ impl App {
                     .mark_failure(now, crate::health::PeerPollErrorKind::classify(msg)),
             }
             let summary_every = self.state.config.gossip.dial_failure_summary();
+            let pinned = self
+                .state
+                .peers
+                .iter()
+                .find(|p| p.name == fetch.peer)
+                .and_then(|p| crate::peer_stream::enrollment(p).node_id);
             let Some(summary) = self
                 .state
                 .peer_summaries
@@ -502,15 +528,9 @@ impl App {
             summary.stream_error = fetch.stream_error;
             match fetch.result {
                 Ok(mut payload) => {
-                    let pinned = self
-                        .state
-                        .peers
-                        .iter()
-                        .find(|p| p.name == fetch.peer)
-                        .and_then(|p| crate::peer_stream::enrollment(p).node_id);
                     payload.node_id =
                         crate::peers::validated_summary_node(payload.node_id, pinned.as_deref());
-                    summary.node_id = payload.node_id.clone();
+                    summary.bind_node(payload.node_id.clone());
                     if payload.outbound_pending {
                         self.mesh_outbound_polls
                             .entry(fetch.peer.clone())
@@ -518,15 +538,12 @@ impl App {
                             .note_wake();
                         self.mesh_collect_at = None;
                     }
-                    // Gossip v3 (#101): merge the polled peer's relayed_fleet
-                    // into our cache BEFORE we mutate `summary`. Loop
-                    // prevention rides on the origin field: we drop entries
-                    // whose origin is us (the ONE full-cycle we could see —
-                    // hub A polls hub B, hub B relayed A's own peers back).
                     crate::peers::merge_relayed_fleet(
                         &mut self.state.relayed_fleet_cache,
                         payload.relayed_fleet,
                         &fetch.peer,
+                        payload.node_id.as_deref(),
+                        now,
                     );
                     summary.host = (!payload.host.is_empty()).then_some(payload.host);
                     summary.version = payload.version;
@@ -550,7 +567,7 @@ impl App {
                     summary.latency_ms = Some(payload.latency_ms);
                     summary.workspaces = payload.workspaces;
                     summary.structured_agents = payload.structured_agents;
-                    summary.last_ok = Some(std::time::Instant::now());
+                    summary.last_ok = Some(now);
                     summary.error = None;
                     if let crate::peers::DialLog::Recovered {
                         failures,
@@ -577,6 +594,11 @@ impl App {
                 // #418: and say it in the log without saying it every poll —
                 // the edges, plus one summary per window while it lasts.
                 Err(error) => {
+                    // A failed transport proves no identity change. Only a known
+                    // replacement pin can rebind the cached owner facts.
+                    if pinned.is_some() {
+                        summary.bind_node(pinned);
+                    }
                     let reason = crate::peers::SshFailureReason::classify(&error);
                     let log = summary.dial.record_failure(reason, now, summary_every);
                     let consecutive = summary.dial.consecutive_failures;

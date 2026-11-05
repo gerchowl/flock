@@ -38,5 +38,6 @@ fn s7_public_server_browser_dogfood_and_causal_controls() {
 fn s7_send_and_answer_without_operate_have_typed_refusals() {
     let proof = proof("--verify-scopes");
     assert_eq!(proof["without_operate"]["send"], "not_authorized");
+    assert_eq!(proof["without_operate"]["journal_unchanged"], true);
     assert_eq!(proof["without_operate"]["decide"], "not_authorized");
 }

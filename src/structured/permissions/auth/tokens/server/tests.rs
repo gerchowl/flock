@@ -22,12 +22,17 @@ fn process_bound_hello_and_registration_require_the_exact_minting_peer() {
         )
         .unwrap();
     let matched = store
-        .admit_peer(&minted.token, Some(&local_a), |session| session.info)
+        .admit_peer(
+            &minted.token,
+            Some(&local_a),
+            Duration::from_secs(5),
+            |session| session.info,
+        )
         .unwrap();
     assert_eq!(matched, minted.info);
     for refused in [Some(&local_b), None] {
         assert!(matches!(
-            store.admit_peer(&minted.token, refused, |_| panic!(
+            store.admit_peer(&minted.token, refused, Duration::from_secs(5), |_| panic!(
                 "mismatched registration"
             )),
             Err(PeerAdmissionError::PeerProcessChanged)
@@ -43,7 +48,9 @@ fn process_bound_hello_and_registration_require_the_exact_minting_peer() {
         .unwrap();
     for origin in [Some(&local_a), None] {
         let info = store
-            .admit_peer(&file.token, origin, |session| session.info)
+            .admit_peer(&file.token, origin, Duration::from_secs(5), |session| {
+                session.info
+            })
             .unwrap();
         assert_eq!(info.scopes, [Scope::Send].into());
     }
@@ -67,9 +74,12 @@ fn ready_peer_exit_prevents_registration_before_notifications_are_serviced() {
         Duration::from_secs(5)
     ));
     assert!(matches!(
-        store.admit_peer(&minted.token, Some(&local), |_| panic!(
-            "exited registration"
-        )),
+        store.admit_peer(
+            &minted.token,
+            Some(&local),
+            Duration::from_secs(5),
+            |_| panic!("exited registration")
+        ),
         Err(PeerAdmissionError::Token(TokenError::Revoked))
     ));
 }
@@ -87,7 +97,7 @@ fn registered_callback_retains_the_shared_revocation_fence() {
         )
         .unwrap();
     store
-        .admit_peer(&minted.token, Some(&local), |_| {
+        .admit_peer(&minted.token, Some(&local), Duration::from_secs(5), |_| {
             let file = store.files.lock_file().unwrap();
             assert!(matches!(
                 file.try_lock(),
@@ -118,9 +128,12 @@ fn persistent_file_bearer_refuses_an_exited_local_peer() {
         "file bearer remains valid"
     );
     assert!(matches!(
-        store.admit_peer(&file.token, Some(&local), |_| panic!(
-            "exited file registration"
-        )),
+        store.admit_peer(
+            &file.token,
+            Some(&local),
+            Duration::from_secs(5),
+            |_| panic!("exited file registration")
+        ),
         Err(PeerAdmissionError::PeerProcessChanged)
     ));
 }

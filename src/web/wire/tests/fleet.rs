@@ -8,6 +8,7 @@ struct Case {
     server: Server,
     registry: Registry,
     workers: Workers,
+    home: bool,
 }
 impl Case {
     async fn new() -> Self {
@@ -17,13 +18,17 @@ impl Case {
             server,
             registry: Registry::default(),
             workers,
+            home: false,
         }
     }
     fn service(&mut self) {
-        Arc::get_mut(&mut self.server.core).unwrap().service(
+        Arc::get_mut(&mut self.server.core).unwrap().service_local(
             &self.registry,
             &mut self.workers,
             self.server._root.path(),
+            self.home
+                .then(|| crate::mesh::identity::NodeIdentity::fixture([72; 32]).node_id())
+                .as_deref(),
         );
     }
     fn add(&mut self, id: &str) {
@@ -134,6 +139,7 @@ impl Case {
 fn fleet_replay_cut_is_immutable_while_owner_mutates_before_delivery() {
     runtime(async {
         let mut case = Case::new().await;
+        case.home = true;
         case.add("fixture-agent");
         case.add("second-fixture-agent");
         case.service();
@@ -155,6 +161,8 @@ fn fleet_replay_cut_is_immutable_while_owner_mutates_before_delivery() {
         let b = wire.frame().await;
         assert_eq!(a["ev"]["row"]["id"], "fixture-agent");
         assert_eq!(b["ev"]["row"]["id"], "second-fixture-agent");
+        assert_eq!(wire.frame().await["ev"]["type"], "fleet.node.upsert");
+        assert_eq!(wire.frame().await["ev"]["type"], "fleet.project.upsert");
         assert_eq!(
             wire.frame().await,
             json!({"t":"synced","sub_id":"cut","seq":snapshot_end})
@@ -162,7 +170,8 @@ fn fleet_replay_cut_is_immutable_while_owner_mutates_before_delivery() {
         let removal = wire.frame().await;
         assert_eq!(
             removal["ev"],
-            json!({"type":"fleet.remove","id":"second-fixture-agent"})
+            json!({"type":"fleet.remove","id":"second-fixture-agent",
+                "node_id": crate::mesh::identity::NodeIdentity::fixture([72; 32]).node_id()})
         );
         assert_eq!(removal["seq"], snapshot_end + 1);
         drop(wire);
@@ -485,7 +494,13 @@ fn fleet_server_driven_script_removes_absent_rows_only_at_snapshot_completion() 
                                 assert!(row.activity.is_none());
                                 target.insert(row.id.clone(), row);
                             }
-                            FleetDelta::Remove { id } => {
+                            FleetDelta::NodeUpsert { .. }
+                            | FleetDelta::NodeRemove { .. }
+                            | FleetDelta::ProjectUpsert { .. }
+                            | FleetDelta::ProjectRemove { .. } => {
+                                panic!("unexpected entity in agent-only fixture")
+                            }
+                            FleetDelta::Remove { id, .. } => {
                                 target.remove(&id);
                             }
                         }
@@ -578,6 +593,165 @@ fn fleet_read_scope_refusal_retires_the_id_before_cut_registration() {
                 .await;
             assert_eq!(case.frame(&mut socket).await["code"], expected);
         }
+        case.server.finish().await;
+    });
+}
+
+#[test]
+fn local_home_projects_share_the_public_fleet_cut() {
+    runtime(async {
+        let mut case = Case::new().await;
+        case.home = true;
+        case.add("fixture-agent");
+        case.service();
+        let mut socket = case.open().await;
+        socket
+            .send(json!({"t":"sub","sub_id":"local","stream":"fleet"}))
+            .await;
+        let mut rows = Vec::new();
+        let mut positions = Vec::new();
+        loop {
+            let frame = case.frame(&mut socket).await;
+            if frame["t"] == "synced" {
+                break;
+            }
+            if frame["t"] == "ev" {
+                positions.push(frame["seq"].as_u64().unwrap());
+                rows.push(frame["ev"].clone());
+            }
+        }
+        assert!(
+            rows.iter().any(|r| r["type"] == "fleet.node.upsert"),
+            "home node missing from public checkpoint"
+        );
+        let home = crate::mesh::identity::NodeIdentity::fixture([72; 32]).node_id();
+        let node = &rows
+            .iter()
+            .find(|r| r["type"] == "fleet.node.upsert")
+            .unwrap()["row"];
+        assert_eq!(node["node_id"], home);
+        assert!(node["name"].as_str().unwrap().starts_with("Node "));
+        assert_eq!(node["version"], crate::build_info::version());
+        for field in [
+            "health",
+            "latency_ms",
+            "last_ok",
+            "error",
+            "route",
+            "counts",
+        ] {
+            assert!(node[field].is_null(), "{field}");
+        }
+        assert_eq!(node["online"], true);
+        let project = &rows
+            .iter()
+            .find(|r| r["type"] == "fleet.project.upsert")
+            .unwrap()["row"];
+        assert_eq!(project["node_id"], home);
+        assert_eq!(project["id"], case.server._root.path().to_str().unwrap());
+        let agent = &rows.iter().find(|r| r["type"] == "fleet.upsert").unwrap()["row"];
+        assert_eq!(agent["node_id"], home);
+        assert_eq!(agent["project"], project["id"]);
+        assert!(positions.windows(2).all(|w| w[1] == w[0] + 1));
+        case.remove("fixture-agent");
+        case.service();
+        let mut removed = Vec::new();
+        while removed.len() < 2 {
+            let frame = case.frame(&mut socket).await;
+            if frame["t"] == "ev" {
+                removed.push(frame["ev"]["type"].clone());
+            }
+        }
+        assert!(removed.contains(&json!("fleet.remove")));
+        assert!(removed.contains(&json!("fleet.project.remove")));
+        case.home = false;
+        case.service();
+        assert_eq!(
+            case.frame(&mut socket).await["ev"],
+            json!({"type":"fleet.node.remove","node_id":home})
+        );
+        case.server.finish().await;
+    });
+}
+
+#[test]
+fn local_fleet_loads_legacy_and_retains_unknown_entities_without_key_collisions() {
+    runtime(async {
+        let mut case = Case::new().await;
+        case.home = true;
+        let home = crate::mesh::identity::NodeIdentity::fixture([72; 32]).node_id();
+        case.add(&home);
+        let future = json!({"kind":"future_entity", "row":{"id":home,"payload":"keep"}});
+        let legacy = json!({"id":home,"label":"old", "state":crate::api::agent_state::AgentState::unknown(), "waiting_on_human":[], "legacy_extension":true});
+        std::fs::write(
+            case.server._root.path().join("fleet.json"),
+            json!({"high_water":7,"rows":[legacy,future]}).to_string(),
+        )
+        .unwrap();
+        case.service();
+        let mut socket = case.open().await;
+        socket
+            .send(json!({"t":"sub","sub_id":"mixed","stream":"fleet"}))
+            .await;
+        let mut kinds = Vec::new();
+        loop {
+            let frame = case.frame(&mut socket).await;
+            if frame["t"] == "synced" {
+                assert!(frame["seq"].as_u64().unwrap() > 7);
+                break;
+            }
+            if frame["t"] == "ev" {
+                kinds.push(frame["ev"]["type"].clone());
+            }
+        }
+        assert_eq!(
+            kinds.len(),
+            3,
+            "agent, home and project must occupy distinct typed keys"
+        );
+        assert!(kinds.contains(&json!("fleet.node.upsert")));
+        assert!(kinds.contains(&json!("fleet.project.upsert")));
+        let saved: Value = serde_json::from_slice(
+            &std::fs::read(case.server._root.path().join("fleet.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(saved["rows"].as_array().unwrap().contains(&future));
+        case.server.finish().await;
+    });
+}
+
+#[test]
+fn pre_entity_wire_receives_lossless_unknown_node_and_project_payloads() {
+    runtime(async {
+        let mut case = Case::new().await;
+        case.home = true;
+        case.add("fixture-agent");
+        case.service();
+        let mut socket = Socket::open(&case.server).await;
+        socket.hello(0, &"a".repeat(64)).await;
+        socket
+            .send(json!({"t":"sub","sub_id":"old","stream":"fleet"}))
+            .await;
+        let mut unknown = Vec::new();
+        loop {
+            let frame = case.frame(&mut socket).await;
+            if frame["t"] == "synced" {
+                break;
+            }
+            if frame["t"] == "ev" && frame["ev"]["type"] == "unknown" {
+                let raw: Value =
+                    serde_json::from_str(frame["ev"]["raw"].as_str().unwrap()).unwrap();
+                assert_eq!(
+                    frame["ev"]["shape"],
+                    format!("flk/wire/1/{}", raw["type"].as_str().unwrap())
+                );
+                unknown.push(raw["type"].clone());
+            }
+        }
+        assert_eq!(
+            unknown,
+            vec![json!("fleet.node.upsert"), json!("fleet.project.upsert")]
+        );
         case.server.finish().await;
     });
 }

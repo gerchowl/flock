@@ -7,17 +7,46 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use tracing_subscriber::fmt::writer::MakeWriter;
+use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{filter::FilterExt, layer::SubscriberExt, Layer};
 
 const DEFAULT_MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
 // Keep previous generations on rotation: retained=0 DELETED the log at the
 // cap, and the failure being diagnosed usually lived in the tail just dropped.
 const DEFAULT_RETAINED_LOG_FILES: usize = 2;
 
+// Keep failure categories and I/O kinds observable without logging OS error payloads.
+pub(crate) fn system_information_unavailable(operation: &'static str, error: &sysinfo::Error) {
+    let (reason, io_kind) = match error {
+        sysinfo::Error::Unsupported => ("unsupported", None),
+        sysinfo::Error::Io(error) => ("io", Some(error.kind())),
+        sysinfo::Error::Other(_) => ("other", None),
+    };
+    tracing::warn!(
+        event = "system.information.unavailable",
+        operation,
+        reason,
+        io_kind = ?io_kind,
+        "system information unavailable"
+    );
+}
+
 /// Fleet storage failures expose only the typed I/O kind.
 #[cfg(feature = "web")]
 pub(crate) fn structured_fleet_stopped(error: &io::Error) {
     tracing::error!(event = "structured.fleet.stopped", kind = ?error.kind(), "fleet stream owner stopped");
+}
+
+/// A directory without a UTF-8 identity cannot be a fleet project. No path or
+/// agent contents are logged, and the agent remains available in the stream.
+pub(crate) fn structured_fleet_project_unavailable() {
+    tracing::warn!(
+        event = "structured.fleet.project_unavailable",
+        code = "fleet_project_unavailable",
+        reason = "non_utf8_cwd",
+        "fleet agent project unavailable"
+    );
 }
 
 /// Recovery facts contain only a closed variant and a durable cursor floor.
@@ -95,6 +124,17 @@ pub(crate) fn client_exchange_failed(
     tracing::warn!(event = "client.exchange.internal_failure", subsystem = "structured_client", reason, io_kind = ?io_kind, "browser credential exchange unavailable");
 }
 
+/// Once per listener startup, report positive absence rather than hiding a failed probe.
+#[cfg(feature = "web")]
+pub(crate) fn client_tailscale_not_installed(checked_paths: &str) {
+    tracing::info!(
+        event = "client.listener.tailscale_not_installed",
+        subsystem = "structured_client",
+        checked_paths,
+        "Tailscale forwarding check skipped because Tailscale is not installed"
+    );
+}
+
 /// Report secondary listener cleanup errors without replacing the primary server failure.
 #[cfg(feature = "web")]
 pub(crate) fn client_listener_shutdown_failed(error: &std::io::Error) {
@@ -147,6 +187,15 @@ pub(crate) fn structured_queue_record_skipped(sequence: Option<u64>, reason: &'s
         sequence = ?sequence,
         reason,
         "skipped queue record; original journal retained"
+    );
+}
+
+/// Report an OS unlock failure without exposing journal paths or contents.
+pub(crate) fn structured_queue_unlock_failed(error: &std::io::Error) {
+    tracing::error!(
+        event = "structured.queue.unlock_failed",
+        errno = error.raw_os_error(),
+        "queue journal unlock failed"
     );
 }
 
@@ -212,6 +261,14 @@ pub(crate) fn init_file_logging(file_name: &str) {
         return;
     };
 
+    let _ = file_log_subscriber(make_writer).try_init();
+}
+
+/// Build the disk subscriber, shared with real-wire secret regression tests.
+fn file_log_subscriber<W>(make_writer: W) -> impl tracing::Subscriber + Send + Sync
+where
+    W: for<'a> MakeWriter<'a> + Send + Sync + 'static,
+{
     // Default filter covers both the crate's module_path (`flk`, the [[bin]]
     // name from Cargo.toml; see ADR-0003) AND the explicit brand-namespaced
     // `target: "flock::..."` events (e.g. `flock::attach`, `flock::peers`)
@@ -228,17 +285,54 @@ pub(crate) fn init_file_logging(file_name: &str) {
     // Spans are off: nothing #[instrument]s yet, and the default timestamp
     // precision matches the old text layer, preserving merge_log_records'
     // lexicographic-sort contract across mixed-format tails.
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(make_writer)
-        .with_ansi(false)
-        .with_target(true)
-        .json()
-        .flatten_event(true)
-        .with_current_span(false)
-        .with_span_list(false)
-        .event_format(InputJsonFormat::default())
-        .try_init();
+    tracing_subscriber::registry().with(
+        tracing_subscriber::fmt::layer()
+            .with_writer(make_writer)
+            .with_ansi(false)
+            .with_target(true)
+            .json()
+            .flatten_event(true)
+            .with_current_span(false)
+            .with_span_list(false)
+            .event_format(InputJsonFormat::default())
+            .with_filter(credential_safe_filter(filter)),
+    )
+}
+
+/// Apply an immutable credential boundary alongside the user's filter (ADR-0036 §5,
+/// ADR-0038 §6). WebSocket TRACE events dump raw hello/frame payloads. Protocol
+/// DEBUG events also dump peer-controlled close reasons, so that module uses INFO.
+/// An AND filter, rather than overridable EnvFilter directives, enforces the caps
+/// even for more specific module/span directives from FLOCK_LOG or RUST_LOG.
+/// File and web console subscribers share this boundary; flk TRACE is unaffected.
+/// The cap advertises TRACE (its highest permitted level) so AND preserves the
+/// user's lower max-level hint and default INFO callsites retain their fast path.
+pub(crate) fn credential_safe_filter<S>(
+    directives: EnvFilter,
+) -> impl tracing_subscriber::layer::Filter<S>
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    directives.and(
+        tracing_subscriber::filter::filter_fn(|metadata| {
+            let target = metadata.target();
+            let module = |name: &str| {
+                target == name
+                    || target
+                        .strip_prefix(name)
+                        .is_some_and(|tail| tail.starts_with("::"))
+            };
+            let cap = if module("tungstenite::protocol") {
+                tracing::Level::INFO
+            } else if module("tungstenite") || module("tokio_tungstenite") {
+                tracing::Level::DEBUG
+            } else {
+                tracing::Level::TRACE
+            };
+            *metadata.level() <= cap
+        })
+        .with_max_level_hint(tracing_subscriber::filter::LevelFilter::TRACE),
+    )
 }
 
 /// Bridge typed input metadata into stable tracing's scalar-only field API.
@@ -5200,9 +5294,55 @@ pub(crate) fn selection_content_unavailable(pane_closed: bool) {
     );
 }
 
+/// Close metadata only: no bearer, frame payload or client-provided reason.
+#[cfg(feature = "web")]
+pub(crate) fn client_wire_closing(code: u16, source: &'static str, line: u32) {
+    let source = source.rsplit('/').next().unwrap_or("wire");
+    tracing::debug!(
+        event = "client.wire.closing",
+        close_code = code,
+        source,
+        line,
+        "structured transport closing"
+    );
+}
+/// Internal cause and I/O class, without paths or raw parser errors.
+#[cfg(feature = "web")]
+pub(crate) fn client_wire_unavailable(cause: &'static str, kind: Option<io::ErrorKind>) {
+    tracing::debug!(event = "client.wire.unavailable", cause, kind = ?kind, "structured transport unavailable");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn system_information_failures_log_typed_reasons_without_error_payloads() {
+        let out = capture_logs(|| {
+            system_information_unavailable("cpu", &sysinfo::Error::Unsupported);
+            system_information_unavailable(
+                "disk",
+                &sysinfo::Error::Io(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "private system error payload",
+                )),
+            );
+            system_information_unavailable(
+                "network",
+                &sysinfo::Error::from("private system error payload"),
+            );
+        });
+        for expected in [
+            "system.information.unavailable",
+            "unsupported",
+            "io",
+            "PermissionDenied",
+            "other",
+        ] {
+            assert!(out.contains(expected), "{out}");
+        }
+        assert!(!out.contains("private system error payload"), "{out}");
+    }
 
     #[cfg(feature = "web")]
     #[test]
@@ -7340,3 +7480,6 @@ mod tests {
         assert!(out.contains("INFO"), "{out}");
     }
 }
+
+#[cfg(all(test, feature = "web"))]
+mod secret_tests;

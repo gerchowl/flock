@@ -10,6 +10,11 @@
 //! Unconfirmed cleanup retains lease
 //! authority and Unknown lifecycle, requiring explicit recovery rather than restart.
 #![deny(missing_docs)]
+/// Grace period for structured workers to stop before forced cleanup.
+pub(crate) const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+/// Bound on forced cleanup after the structured-worker grace period.
+pub(crate) const SHUTDOWN_CLEANUP: std::time::Duration = std::time::Duration::from_secs(10);
+
 use super::{
     launch::{LaunchError, LaunchProfile, SessionMcp},
     lease::SessionLeases,
@@ -30,6 +35,9 @@ use std::{
 };
 use tokio::sync::Notify;
 pub(crate) mod queue;
+// Consumed by the following S10b projection slice (#1430).
+#[allow(dead_code)]
+pub(crate) mod live;
 const BATCH: usize = 4;
 mod admission;
 pub(crate) use admission::Admission;
@@ -74,6 +82,7 @@ enum Message {
     End(Report),
 }
 struct Worker {
+    live: live::Source,
     generation: u64,
     messages: mpsc::Receiver<Message>,
     runtime: Option<Runtime>,
@@ -346,6 +355,7 @@ impl Workers {
         self.entries.insert(
             agent_id,
             Worker {
+                live: live::Source::default(),
                 generation,
                 messages,
                 runtime: None,
@@ -375,6 +385,13 @@ impl Workers {
         let (generation, source) = self.history.get(id)?;
         let (_, _, current) = registry.get(id)?;
         (*generation == current).then_some(source)
+    }
+    /// Subscribe without runtime or permission authority; old generations cannot attach.
+    #[allow(dead_code)] // S10b (#1430) adds the native consumer.
+    pub(crate) fn live(&self, registry: &Registry, id: &str) -> Option<live::Subscription> {
+        let worker = self.entries.get(id)?;
+        let (_, _, generation) = registry.get(id)?;
+        (generation == worker.generation).then(|| worker.live.subscribe())
     }
     /// Cold recovery requires a joined producer without retained cleanup authority.
     /// Existing canonical history remains readable while a worker is active.
@@ -483,6 +500,9 @@ impl Workers {
             .collect()
     }
     /// Latch cancellation without blocking on preparation, process or I/O cleanup.
+    /// Await the terminal [`Self::report`] through polling before reopening the
+    /// journal. Confirmed completion drops its owner and explicitly releases its
+    /// lock, even when a concurrent fork still holds an inherited descriptor.
     pub fn stop(&self, id: &str, generation: u64) -> bool {
         let Some(worker) = self.entries.get(id).filter(|w| w.generation == generation) else {
             return false;
@@ -491,6 +511,8 @@ impl Workers {
         true
     }
     /// Inspect terminal evidence only after queued stream facts have been projected.
+    /// A report without retained authority confirms journal lock release as well
+    /// as process cleanup. Requesting [`Self::stop`] alone is not completion.
     pub fn report(&self, id: &str, generation: u64) -> Option<&Report> {
         self.entries
             .get(id)
@@ -512,6 +534,7 @@ impl Workers {
                 .get(id)
                 .is_none_or(|(_, _, g)| g != worker.generation)
             {
+                worker.live.finish(live::End::Retired);
                 worker.stop();
             }
             for _ in 0..3 {
@@ -571,6 +594,12 @@ impl Workers {
                                 received.record.received_at_ms.min(u128::from(u64::MAX)) as u64,
                             );
                         }
+                        if registry
+                            .get(id)
+                            .is_some_and(|(_, _, g)| g == worker.generation)
+                        {
+                            worker.live.observe(&received);
+                        }
                         if index + 1 == BATCH {
                             self.notify.notify_one();
                         }
@@ -626,6 +655,7 @@ impl Workers {
                     self.notify.notify_one();
                     continue;
                 }
+                worker.live.finish(live::End::ProducerEnded);
                 worker.finished = true;
                 // Retain bounded terminal cuts until the consumer drains or relaunches.
                 // Runtime authority is already closed; runtime() refuses finished entries.
@@ -658,7 +688,7 @@ impl Workers {
     /// cleanup interval. Diagnostics are cached and reported without vetoing handoff.
     /// Uncertain records cross handoff as Unknown; this call never retries teardown.
     pub fn shutdown(&mut self, registry: &mut Registry) -> Result<(), ShutdownError> {
-        self.shutdown_until(registry, Duration::from_secs(10), Duration::from_secs(10))
+        self.shutdown_until(registry, SHUTDOWN_GRACE, SHUTDOWN_CLEANUP)
     }
     fn shutdown_until(
         &mut self,

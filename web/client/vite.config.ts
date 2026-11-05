@@ -10,10 +10,14 @@
  *   fixture page is one self-contained file that opens without any server.
  *   Production builds keep separate files, because the Tauri shell's
  *   `default-src 'self'` policy refuses inline scripts.
+ * - `--mode gallery` builds `gallery.html` (#2896) instead of the app, inlined
+ *   the same way, for the design-conformance suite. It is never part of a
+ *   production build; `vite` serves it in development at `/gallery.html`.
  * - `vite preview` binds to the loopback address unless `--host` is given.
  *
  * @module
  */
+import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 
 import { defineConfig, type Plugin } from "vite";
@@ -25,6 +29,12 @@ const repoRoot = fileURLToPath(new URL("../..", import.meta.url));
 function fixtureShell(): Plugin {
   return {
     name: "flock-fixture-shell",
+    async load(id) {
+      if (!id.endsWith(".jsonl")) return;
+      const text = await readFile(id, "utf8");
+      for (const line of text.split("\n").filter((line) => line.trim())) JSON.parse(line);
+      return `export default ${JSON.stringify(text)}`;
+    },
     transformIndexHtml: {
       order: "pre",
       handler: (html) => {
@@ -53,19 +63,19 @@ function escapeRegExp(text: string): string {
   return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-/** Inlines every emitted chunk and stylesheet into `index.html`. */
-function inlineFixtureBundle(): Plugin {
+/** Inlines every emitted chunk and stylesheet into the page `pageName`. */
+function inlineFixtureBundle(pageName = "index.html"): Plugin {
   return {
     name: "flock-inline-fixture-bundle",
     enforce: "post",
     generateBundle(_options, bundle) {
-      const page = bundle["index.html"];
+      const page = bundle[pageName];
       if (page?.type !== "asset" || typeof page.source !== "string") {
-        throw new Error("fixture build: index.html was not emitted");
+        throw new Error(`fixture build: ${pageName} was not emitted`);
       }
       let html = page.source;
       for (const [fileName, output] of Object.entries(bundle)) {
-        if (fileName === "index.html") {
+        if (fileName === pageName) {
           continue;
         }
         const ref = escapeRegExp(`./${fileName}`);
@@ -97,9 +107,14 @@ function inlineFixtureBundle(): Plugin {
 
 export default defineConfig(({ mode }) => ({
   base: "./",
-  plugins: [solid(), ...(mode === "fixture" ? [fixtureShell(), inlineFixtureBundle()] : [])],
+  plugins: [
+    solid(),
+    ...(mode === "fixture" ? [fixtureShell(), inlineFixtureBundle()] : []),
+    ...(mode === "gallery" ? [inlineFixtureBundle("gallery.html")] : []),
+  ],
   build: {
     target: "es2022",
+    ...(mode === "gallery" ? { rollupOptions: { input: "gallery.html" } } : {}),
     // Production images must remain same-origin resources under the document CSP.
     assetsInlineLimit: 0,
     // The preload polyfill would add an inline helper; nothing here is lazy.

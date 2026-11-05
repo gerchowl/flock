@@ -96,7 +96,7 @@ pub(super) fn call(
     cap: Duration,
     deadline: Option<Instant>,
 ) -> Result<Value, ApiClientError> {
-    if let Some(refusal) = crate::api::compatibility::refuse_skew(client, request) {
+    if let Some(refusal) = crate::api::compatibility::refuse_skew(client, request)? {
         return Ok(refusal);
     }
     let end = deadline.map_or(Instant::now() + cap, |end| end.min(Instant::now() + cap));
@@ -110,13 +110,15 @@ pub(super) fn call(
             "caller budget exhausted before input dispatch",
         ));
     }
-    let ping = client.request_value_with_timeout(
-        &Request {
-            id: "api:input-write-capability".into(),
-            method: Method::Ping(PingParams::default()),
-        },
-        left(),
-    )?;
+    let ping = client
+        .with_class(RequestClass::ReadOrIdempotent)
+        .request_value_with_timeout(
+            &Request {
+                id: "api:input-write-capability".into(),
+                method: Method::Ping(PingParams::default()),
+            },
+            left(),
+        )?;
     if ping
         .pointer("/result/capabilities/pane_input_write_ack")
         .and_then(Value::as_bool)

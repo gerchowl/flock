@@ -8,16 +8,30 @@ fn json_file(text: &str) -> Value {
 }
 
 #[test]
-fn capabilities_grant_no_shell_fs_http_or_dialog() {
+fn capabilities_grant_only_the_bridge() {
     let conf = json_file(include_str!("../tauri.conf.json"));
     assert_eq!(conf["app"]["security"]["capabilities"], json!(["main"]));
     assert_eq!(conf["app"]["withGlobalTauri"], false);
-    // The bundle calls no command yet; PR 2 adds the token command, and nothing else.
+    // Exactly the bridge's open, send and close, and they are the only app
+    // commands: no shell, fs, http or dialog, and none returns the bearer.
     let main = json_file(include_str!("../capabilities/main.json"));
+    let bridge = json!([
+        "allow-bridge-open",
+        "allow-bridge-send",
+        "allow-bridge-close"
+    ]);
     assert_eq!(
         (&main["windows"], &main["permissions"]),
-        (&json!(["main"]), &json!([]))
+        (&json!(["main"]), &bridge)
     );
+    let declared =
+        r#"const BRIDGE_COMMANDS: [&str; 3] = ["bridge_open", "bridge_send", "bridge_close"];"#;
+    assert!(include_str!("../build.rs").contains(declared));
+    assert!(include_str!("../build.rs").contains(".commands(&BRIDGE_COMMANDS)"));
+    let handler = "tauri::generate_handler![bridge_open,bridge_send,bridge_close]";
+    let code: String = main_code().split_whitespace().collect();
+    assert!(code.contains(handler));
+    assert_eq!(main_code().matches("#[tauri::command]").count(), 3);
     assert!(
         main.get("remote").is_none(),
         "no remote origin may reach the IPC"
@@ -27,32 +41,16 @@ fn capabilities_grant_no_shell_fs_http_or_dialog() {
 }
 
 #[test]
-fn csp_names_the_configured_server_only() {
+fn csp_connects_nowhere() {
     let security = &json_file(include_str!("../tauri.conf.json"))["app"]["security"];
-    assert_eq!(security["csp"], crate::config::csp(None).as_str());
+    let policy = "default-src 'self'; connect-src 'none'; frame-src blob: 'self'";
+    assert_eq!(security["csp"], policy);
     assert!(security.get("devCsp").is_none());
     assert!(security
         .get("dangerousDisableAssetCspModification")
         .is_none());
-    // The context main runs with carries the policy for the configured server.
-    let csp = |server| {
-        crate::context(&server)
-            .config()
-            .app
-            .security
-            .csp
-            .as_ref()
-            .map(ToString::to_string)
-    };
-    let server = url::Url::parse("ws://127.0.0.1:7682").unwrap();
-    let connect = "connect-src ws://127.0.0.1:7682 http://127.0.0.1:7682";
-    assert_eq!(
-        csp(Ok(server)),
-        Some(format!(
-            "default-src 'self'; {connect}; frame-src blob: 'self'"
-        ))
-    );
-    assert_eq!(csp(Err("bad".into())), Some(crate::config::csp(None)));
+    // The context main runs with keeps the checked-in policy.
+    assert!(!main_code().contains("security.csp"));
 }
 
 /// `main.rs` without its comments, so a commented-out rule does not count.
@@ -70,6 +68,17 @@ fn main_code() -> String {
 fn navigation_is_locked_to_the_bundle() {
     let lock = ".on_navigation(move |url| config::navigation_allowed(url, dev_url.as_ref()))";
     assert!(main_code().contains(lock));
+}
+
+#[test]
+fn a_page_that_goes_away_ends_its_sessions() {
+    let code: String = main_code().split_whitespace().collect();
+    let reload = "ifload.event()==PageLoadEvent::Started{webview.state::<bridge::Bridge>().webview_gone(webview.label());}";
+    let closed = "ifletWindowEvent::Destroyed=event{window.state::<bridge::Bridge>().webview_gone(window.label());}";
+    assert!(code.contains(".on_page_load(") && code.contains(reload));
+    assert!(code.contains(".on_window_event(") && code.contains(closed));
+    assert!(code.contains("events.send(event).is_ok()"));
+    assert!(code.contains("bridge.open(webview.label(),renew,sink)"));
 }
 
 #[test]

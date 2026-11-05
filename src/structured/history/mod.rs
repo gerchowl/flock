@@ -23,7 +23,7 @@ pub const PAGE_BYTES: usize = 32 * 1024;
 const RECORD_BYTES: usize = super::transport::RECORD_LIMIT as usize;
 
 /// Why a range cannot be reconstructed. Neither kind is an entity snapshot.
-#[derive(Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GapReason {
     /// The retained file begins after this range.

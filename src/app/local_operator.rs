@@ -7,6 +7,27 @@ use crate::{
 };
 use std::sync::Arc;
 
+/// Exhaustive LocalOperator identity refusals shared by CLI and native admission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LocalPeerRefusal {
+    /// UID or origin cannot establish local operator authority.
+    OperatorOnly,
+    /// The live process instance cannot be proved.
+    PeerProcessChanged,
+}
+impl LocalPeerRefusal {
+    /// Existing registered error code; transport adapters cannot invent another refusal.
+    pub(crate) fn code(self) -> ErrorCode {
+        match self {
+            Self::OperatorOnly => ErrorCode::OperatorOnly,
+            Self::PeerProcessChanged => ErrorCode::PeerProcessChanged,
+        }
+    }
+    /// CLI encoding retains its established public error string.
+    pub(crate) fn as_str(self) -> &'static str {
+        self.code().as_str()
+    }
+}
 /// Sealed LocalOperator origin plus a live process instance, independent of bearer scopes.
 /// Admission consumers must recheck the persistent exit evidence under their fence.
 #[derive(Clone)]
@@ -27,7 +48,10 @@ impl LocalPeer {
 impl App {
     /// Validate an explicit peer without changing the current API caller or scope.
     /// UID/ancestry refusals take precedence over missing or changed process evidence.
-    pub(crate) fn admit_local_peer(&mut self, peer: Credentials) -> Result<LocalPeer, ErrorCode> {
+    pub(crate) fn admit_local_peer(
+        &mut self,
+        peer: Credentials,
+    ) -> Result<LocalPeer, LocalPeerRefusal> {
         self.admit_local_peer_using(peer, crate::platform::live_process_facts)
     }
     // Only the facts reader varies: production always uses the platform's live snapshot.
@@ -35,11 +59,11 @@ impl App {
         &mut self,
         peer: Credentials,
         mut facts: impl FnMut(u32) -> Option<(u32, u64)>,
-    ) -> Result<LocalPeer, ErrorCode> {
+    ) -> Result<LocalPeer, LocalPeerRefusal> {
         if peer.uid != Some(self.runtime_config.uid_policy.operator)
             || self.runtime_config.uid_policy.classify(peer.uid) != Principal::Operator
         {
-            return Err(ErrorCode::OperatorOnly);
+            return Err(LocalPeerRefusal::OperatorOnly);
         }
         // Arm before ancestry validation, then recheck readiness before publishing proof.
         let process = ExitWatch::arm(peer);
@@ -48,9 +72,9 @@ impl App {
             self.lease_caller_for(peer.pid, Some(Principal::Operator)),
         );
         if origin == Some(false) {
-            return Err(ErrorCode::OperatorOnly);
+            return Err(LocalPeerRefusal::OperatorOnly);
         }
-        let process = process.map_err(|_| ErrorCode::PeerProcessChanged)?;
+        let process = process.map_err(|_| LocalPeerRefusal::PeerProcessChanged)?;
         if origin != Some(true)
             || !peer.pid.is_some_and(|pid| {
                 crate::platform::peer::complete_ancestry(
@@ -60,13 +84,13 @@ impl App {
                 )
             })
         {
-            return Err(ErrorCode::OperatorOnly);
+            return Err(LocalPeerRefusal::OperatorOnly);
         }
         if process
             .exited()
-            .map_err(|_| ErrorCode::PeerProcessChanged)?
+            .map_err(|_| LocalPeerRefusal::PeerProcessChanged)?
         {
-            return Err(ErrorCode::PeerProcessChanged);
+            return Err(LocalPeerRefusal::PeerProcessChanged);
         }
         Ok(LocalPeer {
             peer,

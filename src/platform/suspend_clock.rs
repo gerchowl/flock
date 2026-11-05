@@ -219,6 +219,58 @@ mod tests {
     }
 
     #[test]
+    fn future_continuous_timer_stays_pending_without_sleeping() {
+        let deadline = now(&Kernel).unwrap() + Duration::from_secs(3600);
+        let descriptor = timer(deadline).unwrap();
+        let mut probe = libc::pollfd {
+            fd: descriptor.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: the borrowed descriptor and single output live through this nonblocking call.
+        assert_eq!(unsafe { libc::poll(&mut probe, 1, 0) }, 0);
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let waiting = until(deadline);
+                tokio::pin!(waiting);
+                std::future::poll_fn(|cx| {
+                    assert!(std::future::Future::poll(waiting.as_mut(), cx).is_pending());
+                    std::task::Poll::Ready(())
+                })
+                .await;
+                // Drive the reactor using an expired timer, without waiting for the future one.
+                tokio::time::timeout(Duration::from_secs(5), until(now(&Kernel).unwrap()))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                std::future::poll_fn(|cx| {
+                    assert!(std::future::Future::poll(waiting.as_mut(), cx).is_pending());
+                    std::task::Poll::Ready(())
+                })
+                .await;
+            });
+    }
+
+    #[test]
+    fn future_continuous_timer_fires_through_production_reactor() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let deadline = now(&Kernel).unwrap() + Duration::from_millis(1);
+                tokio::time::timeout(Duration::from_secs(5), until(deadline))
+                    .await
+                    .expect("native timer must become readable through the reactor")
+                    .unwrap();
+                assert!(now(&Kernel).unwrap() >= deadline);
+            });
+    }
+
+    #[test]
     fn absolute_continuous_timer_is_kernel_ready_without_sleeping() {
         let deadline = now(&Kernel).unwrap();
         tokio::runtime::Builder::new_current_thread()

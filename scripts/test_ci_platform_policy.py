@@ -83,7 +83,8 @@ class PlatformPolicy(unittest.TestCase):
                                  ('push', '', 'refs/heads/dev'), ('push', '', 'refs/heads/main')]:
             for platform, gate_name in [('macos', 'check-macos'), ('ubuntu', 'check-ubuntu')]:
                 gate = self.ci['jobs'][gate_name]
-                self.assertEqual(gate['needs'], ['changes', platform] + (['script-tests'] if platform == 'ubuntu' else []))
+                self.assertEqual(gate['needs'], ['changes', platform, 'desktop-' + platform]
+                                 + (['script-tests'] if platform == 'ubuntu' else []))
                 self.assertEqual(gate['if'], 'always()')
                 self.assertFalse(gate.get('continue-on-error', False))
                 step = next(step for step in gate['steps'] if step['name'] == 'Require every job of the leg')
@@ -139,6 +140,32 @@ class PlatformPolicy(unittest.TestCase):
                 outcome = subprocess.run(['/bin/sh', '-c', step['run']], capture_output=True, text=True,
                                          env={**os.environ, 'RESULT': result, 'SKIP_RUST': skip}, timeout=10)
                 self.assertEqual(outcome.returncode, code)
+
+    def test_desktop_shell_tests_run_on_both_platforms_and_gate_both_checks(self):
+        # #2477: the desktop crate's tests guard nothing unless a required check needs them.
+        called = workflow('ci-desktop.yml')
+        self.assertEqual(called['jobs']['test']['runs-on'], '${{ inputs.leg }}')
+        self.assertIn('just desktop-test', [s.get('run') for s in called['jobs']['test']['steps']])
+        for platform, leg in [('ubuntu', 'ubuntu-latest'), ('macos', 'macos-15')]:
+            job = self.ci['jobs']['desktop-' + platform]
+            self.assertEqual(job['uses'], './.github/workflows/ci-desktop.yml')
+            self.assertEqual(job['with'], {'leg': leg})
+            self.assertEqual(job['needs'], 'changes')
+            self.assertEqual(job['if'], "${{ !cancelled() && needs.changes.outputs.skip_rust != 'true' }}")
+            gate = self.ci['jobs'][{'ubuntu': 'check-ubuntu', 'macos': 'check-macos'}[platform]]
+            step = next(s for s in gate['steps'] if s['name'] == 'Require the desktop shell tests')
+            self.assertEqual(step['if'], 'always()')
+            self.assertFalse(step.get('continue-on-error', False))
+            self.assertEqual(step['env']['RESULT'], '${{ needs.desktop-' + platform + '.result }}')
+            for result, skip, code in [('success', 'false', 0), ('success', 'true', 0), ('failure', 'false', 1),
+                                       ('failure', 'true', 1), ('cancelled', 'false', 1), ('cancelled', 'true', 1),
+                                       ('skipped', 'false', 1), ('skipped', '', 1), ('skipped', 'true', 0), ('', 'false', 1)]:
+                with self.subTest(platform=platform, result=result, skip=skip):
+                    outcome = subprocess.run(['/bin/sh', '-c', step['run']], capture_output=True, text=True,
+                                             env={**os.environ, 'RESULT': result, 'SKIP_RUST': skip}, timeout=10)
+                    self.assertEqual(outcome.returncode, code)
+                    if code:
+                        self.assertIn('ended as', outcome.stderr)
 
     def test_changes_job_never_skips_outside_ordinary_prs(self):
         job = self.ci['jobs']['changes']

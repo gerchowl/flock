@@ -1,1 +1,0 @@
-- Keep retained-history head and byte boundaries from the same capture, and avoid copying stored raw payloads when live subscribers hold the record.

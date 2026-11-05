@@ -24,6 +24,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { chromium, type Browser, type Page } from "playwright";
 
 import { CLIENT_ROOT, buildClient } from "../tests/build";
+import { expectNoKeyListeners, guardKeys } from "./key-guard";
 
 const DIST = `${CLIENT_ROOT}/artifacts/csp-dist`;
 const POLICY_FILE = `${CLIENT_ROOT}/../../src/web/gui/document-policy.txt`;
@@ -102,6 +103,7 @@ afterAll(async () => {
 /** A page whose violations and errors are recorded before any page script runs. */
 async function open(config?: object): Promise<{ page: Page; errors: string[] }> {
   const page = await browser.newPage({ viewport: { width: 1280, height: 800 } });
+  await guardKeys(page);
   const errors: string[] = [];
   page.on("pageerror", (error) => errors.push(error.message));
   await page.addInitScript((shell) => {
@@ -122,10 +124,12 @@ function violations(page: Page): Promise<string[]> {
 describe("served document policy", () => {
   test("the entry document carries the embedded policy with the listener authority", async () => {
     const page = await browser.newPage();
+    await guardKeys(page);
     const response = await page.goto(`http://127.0.0.1:${site}/`);
     expect(response?.headers()["content-security-policy"]).toBe(
       `default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self' ws://127.0.0.1:${site}/v1/ws; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'`,
     );
+    await expectNoKeyListeners(page);
     await page.close();
   });
 
@@ -152,6 +156,7 @@ describe("served document policy", () => {
     expect(await violations(page)).toEqual([]);
     expect(missing).toEqual([]);
     expect(errors).toEqual([]);
+    await expectNoKeyListeners(page);
     await page.close();
   });
 
@@ -160,10 +165,11 @@ describe("served document policy", () => {
     const { page, errors } = await open({ transport: "fixture", fixtureJsonl, source: "csp-probe" });
     await page.goto(`http://127.0.0.1:${site}/`);
     await page.getByTestId("transcript-synced").waitFor({ timeout: READY_MS });
-    // The external stylesheet applied under style-src 'self'.
-    expect(await page.evaluate(() => parseFloat(getComputedStyle(document.body).fontSize))).toBe(14);
+    // The external stylesheet applied under style-src 'self': desktop body text is 13 px, the browser default 16.
+    expect(await page.evaluate(() => parseFloat(getComputedStyle(document.body).fontSize))).toBe(13);
     expect(await violations(page)).toEqual([]);
     expect(errors).toEqual([]);
+    await expectNoKeyListeners(page);
     await page.close();
   });
 
@@ -176,6 +182,7 @@ describe("served document policy", () => {
     expect(hello.frame).toContain('"hello"');
     expect(await violations(page)).toEqual([]);
     expect(errors).toEqual([]);
+    await expectNoKeyListeners(page);
     await page.close();
   });
 
@@ -218,6 +225,7 @@ describe("served document policy", () => {
     expect(outcome.inlineRan).toBe(false);
     expect(outcome.fontSize).not.toBe(99);
     expect(host.events.filter((event) => event.foreign !== undefined)).toEqual([]);
+    await expectNoKeyListeners(page);
     await page.close();
   });
 });
