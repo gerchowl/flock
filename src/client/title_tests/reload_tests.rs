@@ -125,8 +125,8 @@ pub(super) fn run(mode: &str, mut snapshot: Config) {
         .unwrap();
     let result = rt.block_on(run_client_loop(
         client,
-        80,
-        24,
+        (80, 24, 0, 0),
+        Box::new(|_| Ok((80, 24, 0, 0))),
         quit.clone(),
         snapshot.ui.sound.clone(),
         3,

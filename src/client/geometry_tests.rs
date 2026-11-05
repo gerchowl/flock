@@ -331,7 +331,7 @@ fn startup_guard_worker() {
         Instant::now(),
         true,
         &signal,
-        &crate::config::Config::default(),
+        &mut crate::config::Config::default(),
     )
     .is_ok());
     let (mut handshake_peer, _) = listener.accept().unwrap();
@@ -364,7 +364,7 @@ fn startup_guard_worker() {
                 None,
                 &mut input,
                 Instant::now(),
-                &crate::config::Config::default(),
+                &mut crate::config::Config::default(),
             ),
         )
         .await
@@ -605,7 +605,7 @@ fn exercise_geometry_attach(mut probe: GeometryQuery) {
         Instant::now(),
         false,
         &signal,
-        &crate::config::Config::default(),
+        &mut crate::config::Config::default(),
     );
     server.join().unwrap();
     assert!(result.is_ok());
