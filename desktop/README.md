@@ -152,13 +152,13 @@ or a handoff) resolves the open and closes the socket with 1006; the server's 50
 Each rule has a test in `src/hardening.rs` or `src/config.rs`:
 
 - **Capabilities:** `capabilities/main.json` grants `allow-bridge-open`,
-  `allow-bridge-send` and `allow-bridge-close`, for the only app commands
-  (`build.rs` declares them), so no `shell`, `fs`, `http` or `dialog`, no
-  global Tauri API and no remote IPC. The additional
-  `core:window:allow-set-badge-count` permission lets the injected shell
-  capability mirror the structured-agent attention count in the dock badge
-  (zero clears it). Browser builds have no badge capability. Starting `flk server` is the shell's own
-  Rust code, not a webview permission.
+  `allow-bridge-send`, `allow-bridge-close`, and `allow-set-badge-count` for
+  the four app commands (`build.rs` declares them). No `shell`, `fs`, `http`
+  or `dialog`, global Tauri API, or remote IPC is granted. The badge command
+  calls Tauri's typed native setter on the invoking window to mirror the
+  structured-agent attention count (zero clears it). Browser builds have
+  no badge capability. Starting `flk server` is the shell's own Rust code,
+  not a webview permission.
 - **CSP:** `default-src 'self'; connect-src 'none'; frame-src blob: 'self'`.
   The webview opens no connection of its own; the session runs in Rust.
 - **Navigation:** only the bundle's origin, its `blob:` frames and, under

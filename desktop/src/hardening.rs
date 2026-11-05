@@ -19,20 +19,21 @@ fn capabilities_grant_only_the_bridge() {
         "allow-bridge-open",
         "allow-bridge-send",
         "allow-bridge-close",
-        "core:window:allow-set-badge-count"
+        "allow-set-badge-count"
     ]);
     assert_eq!(
         (&main["windows"], &main["permissions"]),
         (&json!(["main"]), &bridge)
     );
-    let declared =
-        r#"const BRIDGE_COMMANDS: [&str; 3] = ["bridge_open", "bridge_send", "bridge_close"];"#;
-    assert!(include_str!("../build.rs").contains(declared));
+    let declared = r#"const BRIDGE_COMMANDS: [&str; 4] = ["bridge_open", "bridge_send", "bridge_close", "set_badge_count",];"#;
+    let build: String = include_str!("../build.rs").split_whitespace().collect();
+    let declared: String = declared.split_whitespace().collect();
+    assert!(build.contains(&declared));
     assert!(include_str!("../build.rs").contains(".commands(&BRIDGE_COMMANDS)"));
-    let handler = "tauri::generate_handler![bridge_open,bridge_send,bridge_close]";
+    let handler = "tauri::generate_handler![bridge_open,bridge_send,bridge_close,set_badge_count]";
     let code: String = main_code().split_whitespace().collect();
     assert!(code.contains(handler));
-    assert_eq!(main_code().matches("#[tauri::command]").count(), 3);
+    assert_eq!(main_code().matches("#[tauri::command]").count(), 4);
     assert!(
         main.get("remote").is_none(),
         "no remote origin may reach the IPC"

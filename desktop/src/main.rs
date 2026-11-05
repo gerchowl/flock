@@ -56,13 +56,14 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             bridge_open,
             bridge_send,
-            bridge_close
+            bridge_close,
+            set_badge_count
         ])
         .run(context)
         .expect("the Tauri runtime failed");
 }
 
-// The webview's three commands: the bridge's open, send and close (ADR-0038 §6,
+// The webview's bridge commands: open, send and close (ADR-0038 §6,
 // "Never in the webview"). None of them returns or reports the bearer.
 
 /// Opens a bridged session for this webview; its frames and close arrive
@@ -95,4 +96,22 @@ fn bridge_close(
     reason: Option<String>,
 ) -> Result<(), String> {
     bridge.close(id, code, reason)
+}
+
+// Keep the versioned Tauri contract on the native side, where the compiler checks it.
+#[tauri::command]
+fn set_badge_count(window: tauri::Window, count: u32) -> Result<(), String> {
+    window
+        .set_badge_count(Some(count.into()))
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod badge_contract {
+    #[test]
+    fn pinned_tauri_badge_setter_accepts_an_optional_i64() {
+        let _command: fn(tauri::Window, u32) -> Result<(), String> = super::set_badge_count;
+        let _setter: fn(&tauri::Window, Option<i64>) -> tauri::Result<()> =
+            tauri::Window::set_badge_count;
+    }
 }

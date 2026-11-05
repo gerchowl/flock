@@ -38,11 +38,12 @@ import { fleetStore } from "../store/fleet";
 import { SPACE } from "../tokens";
 import type { Transport } from "../transport";
 import { Transcript, type TranscriptSource } from "../views/Transcript";
+import { createBadgeWriter } from "./badge";
 import { attentionCards, needsYou } from "./attention";
 import type { InboxCard } from "./inbox";
 import { Composer, createComposerState, type Sender } from "./Composer";
 import { HEALTH_LABELS, HostStatus, type HostView } from "./HostStatus";
-import { SHORTCUTS, bindKeys, formatCombo, runPageShortcut } from "./keys";
+import { SHORTCUTS, bindKeys, formatCombo, pageShortcutAvailable, runPageShortcut } from "./keys";
 import { Palette, type PaletteCommand, type WaitingAction } from "./Palette";
 import { createPermissionInbox } from "./permissions";
 import { AgentTitle, InboxCards, Waits, createClosedIds } from "./parts";
@@ -138,13 +139,14 @@ export function Workbench(props: WorkbenchProps): JSX.Element {
   const count = createMemo(() => attention().length);
   const attentionLabel = (): string => `${count()} ${count() === 1 ? "agent needs you" : "agents need you"}`;
   const attentionCommand = (): string => `First agent needing you (${attentionLabel()})`;
+  const badge = createBadgeWriter(props.setBadgeCount);
   createEffect(() => {
     document.title = count() === 0 ? "flock" : `(${count()}) flock`;
-    void props.setBadgeCount?.(count()).catch((error: unknown) => console.error("Could not update the app badge", error));
+    badge(count());
   });
   onCleanup(() => {
     document.title = "flock";
-    void props.setBadgeCount?.(0).catch((error: unknown) => console.error("Could not clear the app badge", error));
+    badge(0);
   });
   const trees = createMemo(() => buildTrees(remaining(), fleet.nodes.items(), fleet.projects.items(), prefs().scope, home()));
   const fleetNote = createMemo((): string | null => {
@@ -204,10 +206,10 @@ export function Workbench(props: WorkbenchProps): JSX.Element {
     const first = attention()[0];
     if (first !== undefined) openAgent(first.id);
   };
-  const moves = { "attention.first": firstAttention, "agent.previous": () => stepAgent(-1), "agent.next": () => stepAgent(1) };
+  const moves = { "attention.first": { run: firstAttention, available: () => count() > 0 }, "agent.previous": () => stepAgent(-1), "agent.next": () => stepAgent(1) };
   onCleanup(bindKeys(document.body, moves));
   /** The layer's commands, each run as its shortcut would be from the page. */
-  const keyCommands = createMemo((): PaletteCommand[] => SHORTCUTS.filter((entry) => entry.command).map((entry) => ({ label: entry.id === "attention.first" ? attentionCommand() : entry.label, hint: formatCombo(entry.combo), run: () => void runPageShortcut(entry.id) })));
+  const keyCommands = createMemo((): PaletteCommand[] => SHORTCUTS.filter((entry) => entry.command).map((entry) => ({ label: entry.id === "attention.first" ? attentionCommand() : entry.label, hint: formatCombo(entry.combo), ...(entry.id === "attention.first" ? { available: () => pageShortcutAvailable(entry.id) } : {}), run: () => void runPageShortcut(entry.id) })));
   const preview = (): boolean => props.preview === true;
   // The server's name: the home node's as the fleet sends it, else the connection's own.
   const hostName = (host: HostView): string => fleet.nodes.items().find((node) => node.node_id === home())?.name ?? host.name;
@@ -245,7 +247,7 @@ export function Workbench(props: WorkbenchProps): JSX.Element {
           waiting={preview() ? [...TOOLBAR_WAITING, ...(focusedAgent() === null ? [] : PANE_ACTIONS)] : []}
         />
         <Cluster space={SPACE[2]}>
-          <button type="button" class="action" data-testid="needs-you-count" aria-label={attentionCommand()} disabled={count() === 0} onClick={firstAttention}>
+          <button type="button" class="action" data-testid="needs-you-count" aria-label={attentionCommand()} disabled={!pageShortcutAvailable("attention.first")} onClick={() => void runPageShortcut("attention.first")}>
             {attentionLabel()}
           </button>
           <Show when={preview()}>

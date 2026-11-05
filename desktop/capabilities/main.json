@@ -3,5 +3,5 @@
   "identifier": "main",
   "description": "The main window. Its permissions are the window badge and the bridge's open, send and close (ADR-0038 §6, \"Never in the webview\"); nothing else.",
   "windows": ["main"],
-  "permissions": ["allow-bridge-open", "allow-bridge-send", "allow-bridge-close", "core:window:allow-set-badge-count"]
+  "permissions": ["allow-bridge-open", "allow-bridge-send", "allow-bridge-close", "allow-set-badge-count"]
 }

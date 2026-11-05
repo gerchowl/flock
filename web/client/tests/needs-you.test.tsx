@@ -90,3 +90,50 @@ test("a desktop shell's real bridge frames reach its badge through App", async (
   await tick();
   expect(counts.at(-1)).toBe(1); expect(document.title).toBe("(1) flock");
 });
+
+for (const clear of ["update", "dispose"] as const) {
+  test(`a delayed badge write cannot overwrite the latest clear on ${clear}`, async () => {
+    let observer!: FleetObserver;
+    let visible = 0;
+    let inFlight = 0;
+    let maximum = 0;
+    const pending: (() => void)[] = [];
+    const setBadgeCount = (count: number): Promise<void> => new Promise((resolve) => {
+      maximum = Math.max(maximum, ++inFlight);
+      pending.push(() => { visible = count; inFlight--; resolve(); });
+    });
+    mount(() => <Workbench fleet={{ subscribe(next) { observer = next; return () => {}; } }} transport={createFixtureTransport("")} inbox={[]} sender={null} layout={emptyLayout()} saveLayout={() => {}} source="replay" setBadgeCount={setBadgeCount} />);
+    pending.pop()?.(); await tick();
+    observer.rows([row("blocked", "blocked")]); await tick();
+    if (clear === "update") observer.rows([]);
+    else { dispose?.(); dispose = undefined; }
+    await tick();
+    // Finish newer requests first: the old implementation then applies its stale one last.
+    for (let turn = 0; turn < 4 && pending.length > 0; turn++) { pending.pop()?.(); await tick(); }
+    expect(inFlight).toBe(0);
+    expect(visible).toBe(0);
+    expect(maximum).toBe(1);
+    expect(document.title).toBe("flock");
+  });
+}
+
+test("the registry, palette and toolbar share attention command availability", async () => {
+  let observer!: FleetObserver;
+  mount(() => <Workbench fleet={{ subscribe(next) { observer = next; return () => {}; } }} transport={createFixtureTransport("")} inbox={[]} sender={null} layout={emptyLayout()} saveLayout={() => {}} source="replay" />);
+  observer.rows([]); await tick();
+  document.querySelector<HTMLButtonElement>('[data-testid="palette-trigger"]')!.click();
+  const command = (): HTMLElement => [...document.querySelectorAll<HTMLElement>('[data-testid="palette-command"]')].find((el) => el.textContent?.startsWith("First agent needing you"))!;
+  expect(command().getAttribute("aria-disabled")).toBe("true");
+  command().click();
+  expect(document.querySelector('[data-testid="palette"]')).not.toBeNull();
+  expect(runPageShortcut("attention.first")).toBe(false);
+  expect(button()?.disabled).toBe(true);
+  observer.rows([row("blocked", "blocked")]); await tick();
+  expect(command().getAttribute("aria-disabled")).toBeNull();
+  expect(button()?.disabled).toBe(false);
+  expect(runPageShortcut("attention.first")).toBe(true);
+  expect(document.querySelector('[data-testid="focus-pane"] h1')?.textContent).toBe("blocked");
+  observer.rows([]); await tick();
+  expect(command().getAttribute("aria-disabled")).toBe("true");
+  expect(runPageShortcut("attention.first")).toBe(false);
+});

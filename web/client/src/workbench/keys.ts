@@ -157,7 +157,10 @@ export function editsText(element: Element | null): boolean {
   return element instanceof HTMLInputElement && !["button", "checkbox", "radio", "range", "color", "file", "submit", "reset", "image"].includes(element.type);
 }
 
-type Handlers = Map<ShortcutId, () => void>;
+/** A binding may supply reactive availability, shared by dispatch and command menus. */
+export type KeyBinding = (() => void) | { readonly run: () => void; readonly available: () => boolean };
+
+type Handlers = Map<ShortcutId, KeyBinding>;
 
 const bindings = new WeakMap<Element, Handlers>();
 /** An open palette, sheet or popover: its keys, and whether it is modal (exclusive). */
@@ -174,16 +177,21 @@ function release(): void {
 }
 
 /** The handlers in `handlers` that name a shortcut, as entries. */
-function entriesOf(handlers: Partial<Record<ShortcutId, () => void>>): (readonly [ShortcutId, () => void])[] {
+function entriesOf(handlers: Partial<Record<ShortcutId, KeyBinding>>): (readonly [ShortcutId, KeyBinding])[] {
   return SHORTCUTS.flatMap(({ id }) => {
     const run = handlers[id];
     return run === undefined ? [] : [[id, run] as const];
   });
 }
 
-/** The handler `element` has bound for `id`, if any. */
+function actionOf(binding: KeyBinding | undefined): (() => void) | undefined {
+  if (typeof binding === "function") return binding;
+  return binding?.available() === true ? binding.run : undefined;
+}
+
+/** The available handler `element` has bound for `id`, if any. */
 function handlerOf(element: Element | null, id: ShortcutId): (() => void) | undefined {
-  return element === null ? undefined : bindings.get(element)?.get(id);
+  return element === null ? undefined : actionOf(bindings.get(element)?.get(id));
 }
 
 /** The handler that runs for `entry` with focus on `target`, if any. */
@@ -215,7 +223,7 @@ function onKey(event: KeyboardEvent): void {
   // Open layers first, top down; a modal one ends the search, so the page behind it is inert.
   for (const layer of [...layers].reverse()) {
     const entry = SHORTCUTS.find((each) => each.scope === "layer" && layer.handlers.has(each.id) && matches(event, each.combo));
-    const handler = entry === undefined ? undefined : layer.handlers.get(entry.id);
+    const handler = entry === undefined ? undefined : actionOf(layer.handlers.get(entry.id));
     if (handler !== undefined) return run(handler);
     if (layer.modal) return;
   }
@@ -234,7 +242,7 @@ Object.defineProperty(onKey, LAYER_BRAND, { value: true });
  * returns the unbinding. The document listener is installed while anything
  * is bound.
  */
-export function bindKeys(element: Element, handlers: Partial<Record<ShortcutId, () => void>>): () => void {
+export function bindKeys(element: Element, handlers: Partial<Record<ShortcutId, KeyBinding>>): () => void {
   const own: Handlers = bindings.get(element) ?? new Map();
   bindings.set(element, own);
   const entries = entriesOf(handlers);
@@ -251,7 +259,7 @@ export function bindKeys(element: Element, handlers: Partial<Record<ShortcutId, 
  * closing, which is safe to call twice. A `modal` layer makes every key
  * binding behind it inert while it is open.
  */
-export function pushLayer(handlers: Partial<Record<ShortcutId, () => void>>, options: { readonly modal: boolean }): () => void {
+export function pushLayer(handlers: Partial<Record<ShortcutId, KeyBinding>>, options: { readonly modal: boolean }): () => void {
   const layer: Layer = { handlers: new Map(entriesOf(handlers)), modal: options.modal };
   layers.push(layer);
   retain();
@@ -268,4 +276,9 @@ export function runPageShortcut(id: ShortcutId): boolean {
   const run = handlerOf(document.body, id);
   run?.();
   return run !== undefined;
+}
+
+/** The page binding's current availability, also read by its toolbar and palette command. */
+export function pageShortcutAvailable(id: ShortcutId): boolean {
+  return handlerOf(document.body, id) !== undefined;
 }
