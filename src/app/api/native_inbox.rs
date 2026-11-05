@@ -4,6 +4,48 @@ use crate::{
     app::App,
 };
 impl App {
+    /// Share native inbox ownership with wake checks without reading message bodies.
+    pub(super) fn native_inbox_owner(
+        &self,
+        target: Option<&str>,
+    ) -> Result<Option<(String, String)>, crate::api::error_code::ErrorCode> {
+        use crate::{api::error_code::ErrorCode, structured::lease::Caller};
+        let caller = match self.lease_caller() {
+            Caller::Agent { agent, .. } => {
+                let session = self
+                    .state
+                    .structured_agents
+                    .get(&agent)
+                    .ok_or(ErrorCode::NotAuthorized)?
+                    .0
+                    .session_id
+                    .clone();
+                Some((agent, session))
+            }
+            Caller::Uncertain => return Err(ErrorCode::NotAuthorized),
+            Caller::Unrelated => None,
+        };
+        let selected = match target {
+            Some(target) => self.structured_send_target(target)?,
+            None => None,
+        };
+        let Some((agent, session)) = caller else {
+            return if selected.is_some() {
+                Err(ErrorCode::InboxNotOwner)
+            } else {
+                Ok(None)
+            };
+        };
+        if target.is_some()
+            && selected
+                .as_ref()
+                .is_none_or(|(selected, _)| selected != &agent)
+        {
+            return Err(ErrorCode::InboxNotOwner);
+        }
+        Ok(Some((agent, session)))
+    }
+
     /// Native inbox identity is attested, never supplied by a target parameter.
     /// `None` leaves legacy pane/operator handling unchanged.
     pub(super) fn native_inbox_request(
@@ -13,47 +55,14 @@ impl App {
         consume: bool,
     ) -> Option<String> {
         use super::responses::{encode_error, encode_success};
-        use crate::{
-            api::{
-                error_code::ErrorCode,
-                schema::{InboxMessage, QueuedMessageInfo, ResponseResult},
-            },
-            structured::lease::Caller,
+        use crate::api::{
+            error_code::ErrorCode,
+            schema::{InboxMessage, QueuedMessageInfo, ResponseResult},
         };
-        let result = (|| {
-            let caller = match self.lease_caller() {
-                Caller::Agent { agent, .. } => {
-                    let session = self
-                        .state
-                        .structured_agents
-                        .get(&agent)
-                        .ok_or(ErrorCode::NotAuthorized)?
-                        .0
-                        .session_id
-                        .clone();
-                    Some((agent, session))
-                }
-                Caller::Uncertain => return Err(ErrorCode::NotAuthorized),
-                Caller::Unrelated => None,
+        let result: Result<Option<ResponseResult>, ErrorCode> = (|| {
+            let Some((agent, session)) = self.native_inbox_owner(target)? else {
+                return Ok(None);
             };
-            let selected = match target {
-                Some(target) => self.structured_send_target(target)?,
-                None => None,
-            };
-            let Some((agent, session)) = caller else {
-                return if selected.is_some() {
-                    Err(ErrorCode::InboxNotOwner)
-                } else {
-                    Ok(None)
-                };
-            };
-            if target.is_some()
-                && selected
-                    .as_ref()
-                    .is_none_or(|(selected, _)| selected != &agent)
-            {
-                return Err(ErrorCode::InboxNotOwner);
-            }
             let preview = self.read_native_inbox(&agent, &session, false)?;
             // Resolve presentation before consuming; a directory failure loses no mail.
             let names = crate::mesh::hello::with_store(|s| {

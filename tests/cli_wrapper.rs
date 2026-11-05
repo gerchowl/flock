@@ -682,6 +682,113 @@ fn answer_protocol_check(stream: &mut UnixStream, line: &str) -> bool {
 }
 
 #[test]
+fn stop_hook_inbox_authority_notice_is_once_and_never_blocks_the_real_cli() {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    let root = support::socket_dir::SocketDir::reserve("hka");
+    let socket = root.path().join("api.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let done = Arc::new(AtomicBool::new(false));
+    let server_done = done.clone();
+    let server = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut wakes = 0;
+        while !server_done.load(Ordering::Acquire) {
+            assert!(
+                Instant::now() < deadline,
+                "hook fixture exceeded its failure ceiling"
+            );
+            let mut stream = match listener.accept() {
+                Ok((stream, _)) => stream,
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                Err(err) => panic!("accept: {err}"),
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let line = read_request_line(&stream);
+            if answer_protocol_check(&mut stream, &line) {
+                continue;
+            }
+            let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+            let response = if request["method"] == "msg.wake" {
+                wakes += 1;
+                if wakes == 3 {
+                    serde_json::json!({"id":request["id"], "result":{"type":"msg_wake", "count":2}})
+                } else {
+                    serde_json::json!({"id":request["id"], "error":{"code":"not_authorized", "message":"native inbox authority refused or unavailable"}})
+                }
+            } else {
+                serde_json::json!({"id":request["id"], "result":{"type":"ok"}})
+            };
+            writeln!(stream, "{response}").unwrap();
+        }
+        wakes
+    });
+    for turn in 0..4 {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_flk"))
+            .args(["hook", "claude", "stop"])
+            .envs(support::environment::isolated_env(root.path(), root.path()))
+            .env("FLOCK_ENV", "1")
+            .env("FLOCK_SOCKET_PATH", &socket)
+            .env("FLOCK_PANE_ID", "p_1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(
+                br#"{"session_id":"hook-authority-fixture","last_assistant_message":"done"}"#,
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while child.try_wait().unwrap().is_none() {
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("stop hook exceeded its failure ceiling");
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        if turn == 1 {
+            assert!(
+                output.stdout.is_empty(),
+                "a repeated refusal must stay silent"
+            );
+        } else {
+            let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            if turn == 2 {
+                assert_eq!(value["decision"], "block");
+                assert!(value["reason"]
+                    .as_str()
+                    .unwrap()
+                    .contains("2 unread messages"));
+            } else {
+                assert!(value.get("decision").is_none(), "{value}");
+                assert!(value["systemMessage"]
+                    .as_str()
+                    .unwrap()
+                    .contains("flk msg read"));
+            }
+        }
+    }
+    done.store(true, Ordering::Release);
+    assert_eq!(server.join().unwrap(), 4);
+}
+
+#[test]
 fn request_reader_waits_for_data_on_a_nonblocking_stream() {
     let (server, mut client) = UnixStream::pair().unwrap();
     server.set_nonblocking(true).unwrap();
