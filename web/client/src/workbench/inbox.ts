@@ -13,7 +13,7 @@
 /** One card in the attention queue. */
 export type InboxCard = {
   readonly id: string;
-  readonly kind: "permission" | "question";
+  readonly kind: "permission" | "question" | "attention";
   /** The agent the card belongs to, as in `agent/<id>`. */
   readonly agent: string;
   /** The agent's name in the sidebar. */
