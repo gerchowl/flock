@@ -27,6 +27,7 @@ pub(crate) mod sheep;
 mod sidebar;
 pub(crate) mod state_signal;
 pub(crate) mod status;
+pub(crate) mod structured;
 mod tabs;
 mod widgets;
 pub(crate) mod window_title;
@@ -425,12 +426,14 @@ fn compute_view_internal(
         config_diagnostic_lines: banner_lines,
         session_warning_lines,
         pane_infos,
+        structured: Default::default(),
         split_borders,
     };
 
     // After the view lands: pane geometry is now current, so the panel's
     // rows can be re-wrapped at the width they will actually render at (#254).
     refresh_prompt_layout(app);
+    app.view.structured = structured::prepare(app);
 }
 
 fn compute_mobile_view(
@@ -513,12 +516,14 @@ fn compute_mobile_view(
         config_diagnostic_lines: banner_lines,
         session_warning_lines,
         pane_infos,
+        structured: Default::default(),
         split_borders,
     };
 
     // After the view lands: pane geometry is now current, so the panel's
     // rows can be re-wrapped at the width they will actually render at (#254).
     refresh_prompt_layout(app);
+    app.view.structured = structured::prepare(app);
 }
 
 /// Render the UI — reads AppState but does not mutate it.

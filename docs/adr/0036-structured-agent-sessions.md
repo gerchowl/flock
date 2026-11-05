@@ -13,6 +13,9 @@
   define transport recovery, snapshot bootstrap and `synced` before S7a.
   Numeric parameters in §5a are proposals with rationale for review; no
   transport implementation or deployment decision is claimed.
+- S6e amendment Accepted (2026-10-29, #2242/#2731): the owner typed
+  "accept all rec with star". All S6e recommendations are decided; no
+  question-thread implementation is claimed.
 - Implemented: the S0 probes (#1356); the slices are tracked in #1307.
 - Date: 2026-10-13
 - Issues: #1299 (the spike this records, with the owner decisions of
@@ -666,6 +669,9 @@ of typing into a pane.
 
 ### 2a. Questions do not block, except honest blockers (#1301)
 
+**Historical design:** S6e (#2242) below supersedes the hold check and direct
+fork answer. Its recorded owner decisions govern the next question slices.
+
 A question is a record, not a state the turn waits in, unless the agent has
 nothing else to do.
 
@@ -789,6 +795,9 @@ nothing else to do.
 
 ### 2b. Two question channels: stdio first, an MCP tool for richer asks (owner decision 3)
 
+**Historical channel order:** S6e (#2242) below replaces this with one MCP ask
+channel plus conversion of stray stdio calls; the A.13 concurrency limits stand.
+
 Both channels end in the same question record of §2a and the same answer
 verbs; they differ in what the agent can say and in what can block them.
 
@@ -863,6 +872,15 @@ same queue (owner decision 5): there is no second input path.
   relevant_now?: { p, band },         the last relevance check (below)
   body, attachments: [blob refs] }
 ```
+
+Queue-worker permission preflight and stdin admission wait for the permission
+book mutex (#2627). A transient contention refusal cannot be retried by an idle
+agent's event stream: releasing the book produces no event. The synchronous
+session-events worker already owns journal I/O and may block here; operator
+APIs retain nonblocking acquisition. Every book holder must finish its bounded
+in-memory state, JSON or hashing work before any await, I/O, logging or blocking
+channel operation. Audit persistence, pipe writes and notifications happen after
+release. Allocation and OS scheduling still have no hard wall-clock bound.
 
 - **One gate.** Each item passes `queue.gate` once: `send` (deliver per
   `delivery`), `hold` (until a human releases it), `stash` (keep, never
@@ -1335,6 +1353,15 @@ uses the same `/v1/ws` protocol over a sibling Unix socket, with kernel peer
 credentials as an additional admission gate (the local-transport amendment
 below). That listener does not enable TCP exposure.
 
+The optional TCP listener's Tailscale forwarding guard has three typed
+outcomes (#2476): positive absence (`NotInstalled`) permits startup with one
+INFO record naming the checked CLI/bundle/socket paths; discovered CLI status
+(`Status`) keeps the five-second/64-KiB serve/funnel refusal checks;
+installation evidence with an unreadable status (`Unavailable`) refuses
+startup and names the evidence/failure. Standard platform paths are defined
+in `platform::tailscale`; lookup errors never count as absence. Host/Origin
+and loopback checks do not change, and no failed probe is silently skipped.
+
 Messages are JSON text frames, one object each, tagged by `t`:
 
 ```text
@@ -1520,6 +1547,82 @@ are deferred to S6 (#1429); this types slice names the contracts only.
   is visible through `ps` for the opener's lifetime. Single use, the 60-second
   TTL and fragment-only transport bound this known exposure; process logging
   masks the code. This exception does not permit long-lived tokens in argv.
+  Log-only argv scrubbing also masks userinfo in malformed URL tokens: raw
+  `/`, `#` or quotes before the final `@` must not expose a password prefix.
+  Without escaping, userinfo and path text containing `@` are ambiguous; the
+  conservative rule can hide preceding host/path text in logs. Quoted URL
+  wrappers are retained when the URL tail has no such ambiguity. Whitespace
+  and angle brackets (`<`, `>`) terminate URL tokens: malformed userinfo with
+  these characters can leave a password prefix visible. This backstop cannot
+  replace keeping credentials in stdin or the environment.
+  Query, fragment and semicolon parameter names containing a full credential
+  argument/header label, or `code`, `key`, `auth`, `pwd`,
+  `jwt` or `signature`, have their values masked
+  even when the label is mid-name, such as `api_key_v2` or `token_type`.
+  This intentionally also masks false positives such as `keyboard`, `monkey`,
+  `unicode` and `sessionid`; the short `sig` alias
+  matches only the complete name, preserving ordinary `design` parameters.
+  Credential header names include `Authentication`, standard credential headers,
+  API-key names and any hyphenated name with a credential-label segment
+  (for example `X-Access-Key`, `Ocp-Apim-Subscription-Key`, `X-Signature`
+  or `X-Hub-Signature-256`). These names
+  allow horizontal whitespace before `:` and mask values even without space
+  after it, including names glued to curl's `-H` option or a short-flag
+  cluster ending in uppercase `H`, such as `-sSLH`, `-4H`, `-0sH`, `-#H`
+  or `-:H`. Digit, progress-meter and next-transfer flags are valid cluster
+  members; lowercase `h` requests help and is not a header option. Header
+  recognition classifies the complete name, so `refs/heads/cookie` is a ref name rather
+  than a `Cookie` header. Generic credential labels such as `token`, `session`
+  and `secret`, including prefixed labels, require whitespace or end-of-string
+  after `:`. This preserves refspecs and terminal targets such as
+  `refs/heads/token:refs/heads/x`, `token:main` and
+  `mysession:0`.
+  Bare compact refspecs such as `cookie:cookie` and `authorization:main` are
+  masked in logs, along with hyphenated names such as `deploy-token:main`
+  and `custom-cookie:main`, because they are indistinguishable from compact
+  credential headers, an acceptable loss of diagnostic detail to avoid exposing secrets.
+  Everything after the first header-shaped label is value, never part of a
+  later label. If a later credential-header match would retain text following
+  an earlier colon, mask the whole argument instead. Curl's leading `-:` switch
+  is not a header delimiter. This deliberately over-masks ambiguous chains such
+  as `-:Hfoo:HAuthorization:z`, including `z`, and may hide option labels in that
+  argument; the program and other arguments remain logged. Skipped matches never
+  promote earlier values into a retained label.
+  JSON-quoted header names allow a closing quote before the colon. Labels
+  followed by `=` are scrubbed in every argument, including shell command text.
+  A backslash-escaped space belongs to the value and cannot expose its suffix.
+  Named flags match whole hyphen/underscore segments of the shared credential
+  vocabulary, including single-dash Go-style options. Key labels in compound
+  flags require a credential qualifier (`api`, `access`, `private` or `secret`),
+  so `--ssh-key-path`, `--hotkey`, `--keys`, `--keyring` and `--author` retain
+  their diagnostic values. Negated and known boolean prefixes (`no-`,
+  `disable-`, `enable-`, `show-`) never consume a following value.
+  Credential aliases (`-u`, `-b`, `-U`, `--user`, `--cookie`,
+  `--proxy-user`, `--oauth2-bearer`) use the value's shape independently of the
+  program: user/proxy values contain `:` or start with `@`; cookie values contain
+  `=` or start with `@`; OAuth bearer values are always secret. This also covers
+  wrappers, executable aliases, remote command strings and nested shell text.
+  Recognizing curl adds masking of its unshaped credential values, but never
+  gates the value-shape rule. Thus `git worktree add -b fix-1`,
+  `git push -u origin main`, `git add -u src` and `sort -u x` retain their
+  diagnostic values.
+  Labelled assignments and token-shaped secrets are scrubbed independently.
+  Short options are case-sensitive and clusters follow the
+  [curl option rules](https://curl.se/docs/manpage.html#options): the first
+  argument-taking letter owns the remainder, or the next argument. A public
+  option such as `-A` prevents a later `u` in its value from becoming a credential
+  switch. Both attached and `=` forms use the same value classifier. Quote and
+  escape handling retains value spans for masking; executed commands are unchanged.
+  The report/stderr scrubber splits labels on `_`, `-` and camelCase boundaries.
+  Compound labels ending in `key`, `auth`, `token`, `secret`, `password` or
+  `credential` mask with either delimiter, including `DEPLOY_KEY`, `ssh_key`,
+  `authKey` and the AWS `access_key_id` spelling. Strong credential words such as
+  `authorization`, `signature` and `password` also mask as bare labels. Bare
+  `key` and `auth` require `=` or a quoted JSON key. Consequently
+  `primary key: id`, `hotkey: ctrl-a`, `monkey=banana` and `auth: ok` stay visible.
+  Glued non-option prefixes such as `SECRET-HAuthorization` remain
+  conservatively masked as header labels.
+  These rules shape diagnostic logs only; executed argv is never rewritten.
   The token then travels in the unchanged normal `hello` frame.
   The served client derives its server and transport from its own location
   (same-origin `ws://<host>/v1/ws`); the bundle router serves no config script.
@@ -1933,8 +2036,21 @@ the recheck and bounded callback, with exclusive locks for token mutation.
 Revocation intent fences new admissions before waiting for existing callbacks;
 readers check it again after shared acquisition. Revoke cannot return while an
 admitted callback remains in flight. This preserves S6 decision fencing and is
-the same shared/exclusive split recorded in ADR-0038 §6. A subscription's typed
-`session_busy` is retryable `later`, not a transport failure; unsafe storage and
+the same shared/exclusive split recorded in ADR-0038 §6. Hello lookup returns a snapshot and does not acquire the management lock.
+Registration still holds shared file ownership through insertion, but waits for
+management and any published revocation intent within the remaining original
+five-second handshake deadline. Its descriptor-only shared-lock helper is owned
+and reaped by a separate eight-slot hello-wait pool (four pending hellos per
+listener); abandoned async waiters retain that reservation until the bounded
+helper returns. No kernel-lock wait holds one of the four shared store-I/O
+permits. Only after acquiring the fence does registration acquire a store-I/O
+permit for credential recheck and insertion; the same fence stays owned across
+that transfer. Thus reconnects waiting on management cannot exhaust the store
+pool used by established subscriptions. The deadline also bounds welcome, and cancelled
+or expired waiters cannot insert a late registration. Command and subscription
+dispatch retain fail-fast admission with the existing retry class.
+
+A subscription's typed `session_busy` is retryable `later`, not a transport failure; unsafe storage and
 I/O failures retain their connection-close behavior.
 
 ### 6. One schema, generated TypeScript
@@ -2336,6 +2452,9 @@ P16 and P17 have no source in the stream today and are not promised;
   admission, while the durable close retires the card. Unknown fields or future
   reasons retain the lossless unknown-event wrapper instead of being discarded.
   `session_ended` marks the restart sweep in #2236.
+  Fixture time markers declare `after_ack` for pre-ACK persistence, otherwise
+  `record_delivery`. Both require exact persisted equality and a zero-slack
+  window to that observed bound; missing bounds fail (#2467 slice-3 ruling).
 - **Startup permission recovery (S6, #2236).** The stream owner projects host
   audit headers while scanning the existing stream. Before admitting any new
   control request, it appends a `closed` / `session_ended` record without a
@@ -2421,6 +2540,641 @@ to this record:
 3. **The TUI's text fallback.** Every block kind has a plain-text rendering
    that the TUI shows; a kind without one is not admitted.
 
+### Amendment: S6e — Non-blocking question threads and routing (#2242)
+
+**Status: Accepted (2026-10-29); design only, post-MVP.** This amendment
+specifies #1301/#1717, not an implemented endpoint. The owner typed "accept all
+rec with star" on #2731 on 2026-10-29, accepting all S6e recommended options.
+The earlier decisions on #1717 remain binding. Alternatives below are retained
+as rejected options and costs, not open questions. S6e supersedes §2a's
+System-One hold, §2b's two-channel preference, S6d, and the direct
+fork-to-answer path. Permissions in S6 remain blocking and separate.
+
+#### Recorded decisions and compatibility
+
+Owner decision 15 (typed “y” on #1717, 2026-10-19) retakes decision 3a: the
+asker chooses blocking. Omitted `blocking` means false. `blocking: true`
+requires `blocking_reason`, trimmed UTF-8, 1–512 bytes, one paragraph, checked
+with `prompt_control_bytes`. It is forbidden otherwise. One named schema
+constant owns the bound. Invalid input returns `invalid_params` before recording
+anything. S6d never holds a turn; no model judge may delay, downgrade or
+override this choice. A blocking question may hold its own tool call, never
+other sessions.
+
+`flock_question_ask` is the one taught question channel, including plain
+choices. The structured launch profile disallows `AskUserQuestion` and
+pre-allows the MCP question tool. A stray stdio question is converted to the
+same durable, non-blocking record and receives §2a/A.12's exact deferral text on
+the `deny` carrier. It is not a permission denial. Compiled context, recap
+extraction, CLI and harness adapters all target this service; a recap question
+is always non-blocking. Deduplicate the observed source/tool-call identity
+before opening anything. Unknown shapes retain their raw record under §8; no
+invented options. An MCP call cannot bypass a permission already open earlier in
+its message (A.13); agents must ask before starting work that may prompt.
+
+The server derives `asked_by` from the structured session lease, or from the PTY
+pane's attested agent attribution. No caller-supplied origin is accepted. An
+anonymous call is refused. The current `questions` policy still constrains
+routing; `deny` stays a refusal. A legacy harness without S6e capability keeps
+its existing adapter contract, visibly reported as legacy, rather than claiming
+non-blocking support. Enabling the S6e profile and service is one rollout gate.
+
+Owner decisions 12–14, reaffirmed on 2026-10-29, require recipient review/edit
+before applying a proposal, durable original and applied texts plus edit
+attribution, stopping the thread fork after a successful merge while retaining
+its transcript/lineage, and a read-only fork through the general S19
+permission-tier machinery (#1321). No thread-specific permission bypass is
+introduced.
+
+#### One typed record, with independent question and delivery lifecycles
+
+The following is a schema sketch for Rust types and generated TypeScript, not
+hand-maintained wire declarations. IDs use existing typed identifiers;
+question/proposal revisions and cursors use §6's integer representation.
+
+```text
+QuestionRecord {
+  question_id: QuestionId, content_digest: Sha256, revision: QuestionRevision,
+  asked_by: AgentIdentity, source: QuestionSource,
+  ask_point: Option<MessageBoundary>, source_ref: SourceRef,
+  prompt: BoundedText, context: Option<BoundedMarkdown>, refs: Vec<ContextRef>,
+  options: Vec<QuestionOption>, multi_select: bool, allow_other: bool,
+  blocking: bool, blocking_reason: Option<BlockingReason>,
+  recipient: Recipient, route: RouteReceipt, urgency: Urgency,
+  created_at: Timestamp, expires_at: Option<Timestamp>, state: QuestionState,
+  delivery: Option<DeliveryState>
+}
+QuestionOption { id: OptionId, label: BoundedText, description:
+  Option<BoundedText> }
+Recipient = Operator | Agent(AgentIdentity)
+QuestionSource = Mcp | Session | Recap | Message | Screen
+QuestionState = Pending | Answered(AnswerReceipt)
+              | Superseded(Supersession) | Expired(ExpiryReceipt)
+Answer = Choices { option_ids: Vec<OptionId>, other: Option<BoundedText> }
+       | Text(BoundedText)
+AnswerReceipt { answer_id: AnswerId, by: AuthenticatedPrincipal, answer: Answer,
+                proposal_id: Option<ProposalId>, edited: bool,
+                route_revision: RouteRevision, delivery_id: ItemId }
+DeliveryState = PendingAdmission | Queued(ItemId) | Started(ItemId)
+              | Held(ItemId, DeliveryHold) | Failed(ItemId, DeliveryFailure)
+```
+
+`AgentIdentity` includes the durable agent identity, never its reusable label. A
+process generation pins a held call or operation, not the durable question's
+lifetime. `SourceRef` is a closed source-specific enum, not arbitrary JSON.
+`ContextRef` holds validated blob/file references and no authority. Text,
+options, context and attachment counts have explicit schema bounds before the
+first producer ships. The limits below were accepted on 2026-10-29; no unlimited
+input is admitted. Option IDs are stable, unique within a record; answers use
+IDs, never label matching or key injection. Single-select requires one choice;
+multi-select rejects duplicates and unknown IDs; Other requires `allow_other`.
+Free-text questions accept Text; choice questions accept Choices. A reviewed
+prose proposal for a choice question must still include a valid typed selection.
+
+Keep §2a's canonical content hash and byte-stable rendering across re-asks,
+including its normalization and hash inputs. Persist the full digest and compare
+canonical content: a shortened-ID collision refuses rather than merging two
+questions. A repeated pending ask updates its observation/ask count without a
+new inbox card. Re-asking an answered question returns its recorded answer to
+that tool call (`via: record`), without a second queued reply. Terminal
+superseded or expired records do not reopen; a genuinely changed ask has new
+content.
+
+Pending may have zero or more threads and proposals: those are separate typed
+records, not extra terminal question states. GUI `open`, `threaded`, `proposed`
+are projections of Pending plus these records. Superseded carries a closed
+reason (`withdrawn`, `subject_replaced`, or an explicit replacement question
+ID); ADR-0028/G5's existing `withdrawn` projection remains compatible. Answered,
+Superseded and Expired are terminal. A compare-and-set on question identity and
+revision lets only the first valid answer/withdrawal/expiry win; stale answers
+return `question_closed` and the current projection, without mutating it.
+
+Recorded questions survive restart and handoff of the same asker. A held tool
+call lost with its process becomes deferred; the record stays Pending and a
+later answer goes through the queue. Identity replacement supersedes it with
+`subject_replaced`, stales every proposal and never retargets the successor.
+Screen-only PTY dialogs keep ADR-0028's withdrawal when the live dialog leaves.
+Durable JSONL is folded leniently under ADR-0028 §3a; unknown records are
+retained raw, logged and skipped. New record kinds require unknown-kind replay
+coverage. Checkpoint writes use temp-file fsync, rename, then directory fsync.
+
+#### Answer custody, idle delivery and crash limits
+
+Every accepted deferred answer owns one stable `AnswerId` and `ItemId`, anchored
+to its question. Persist the answer and a typed delivery obligation together in
+one authoritative append before acknowledging acceptance. The question stream
+cannot atomically append to a second queue file: recovery reconciles that
+obligation with the queue owner's durable idempotency key, rather than assuming
+two writes are a transaction. Admit one authenticated `reply` producer through
+§3's gate, `delivery: at_idle`, under that same key on recovery. Reply is
+already admitted by the queue (`validate_kind` in
+`src/structured/queue/admission.rs`;
+#2364 is closed). S6e-8 must bind every question Reply to an existing, committed
+AnswerReceipt, checking its asker, question identity and delivery ItemId at the
+mutation fence. Naming Reply or supplying an anchor is not that proof. Recipient
+answering authority authorizes this specific reply, not general sends to the
+asker.
+
+Repeated client commands replay their original receipt. A competing *new* answer
+gets `question_closed`. The delivery receipt appears separately from Answered:
+“answer recorded, delivery pending” is honest even while the queue is busy,
+held, or the agent is offline. Queue-full admission keeps the obligation durable
+and wakes recovery on capacity/readiness; it never silently drops the answer.
+The queue's persisted `command_lifecycle.started` drives one `reply.delivered`
+record, deduplicated by ItemId. A held blocking call, still live, consumes the
+answer once through that call instead; a serialized generation fence chooses
+held delivery OR queued delivery, including a racing runtime exit. If writing a
+held result may already have succeeded, recovery holds it unconfirmed instead of
+automatically falling through to queued delivery.
+
+**Exactly once** means one winning answer, one durable queue item, and one
+observed started receipt. It does not promise exactly-once model execution after
+an uncertain stdin write or exactly-once external side effects. Preserve §3's
+`session_unconfirmed` hold on restart: inspect receipts/transcript and require
+explicit recovery, never reissue a fresh reply identity to resolve uncertainty.
+A replaced asker fails the obligation visibly. A stopped asker keeps it pending
+for the same identity's restart; closing the question does not erase delivery.
+
+**Q1 — Decided 2026-10-29: a committed answer is a wake trigger, limited to its
+asker.** The owner accepted the recommended option. This extends ADR-0044 Q5 in
+[PR #2728](https://github.com/gerchowl/flock/pull/2728), inspected at
+`1ba1c7c9`: accepting the answer mints a server-internal wake obligation bound
+to `(AnswerId, asker identity, ItemId)`. It authorizes only resuming that same,
+confirmed Hibernated asker to consume that reply. It grants no general send,
+focus, start, operate or permission authority to the responder; an answer-only
+client or the admitted architect need not acquire those scopes. Validate the
+committed receipt and current asker identity, ownership and absence proofs at
+wake admission, not caller-provided wake fields. Subscription, progress reads,
+proposals and uncommitted answers grant no wake. Stopped, Crashed, replaced or
+uncertain askers retain their existing explicit-start/recovery requirements.
+Coalesce with other admitted wakes under ADR-0044's per-agent/per-node limits,
+retain the original ItemId, use its guarded resume bootstrap and record wake
+owed across restart. Never silently create a fresh conversation.
+
+**Rejected alternative:** record the reply but wait for a separate authorized
+send or operator resume. This needs no Q5 extension and saves a wake, but an
+unattended hibernated asker may never receive its answer. **Accepted cost:**
+extra resume compute/latency and one narrowly typed wake obligation. Acceptance
+alongside ADR-0044 Q5 does not make read or answer scope generic lifecycle
+authority.
+
+**Outstanding answer custody blocks hibernation.** Extend ADR-0044 Q2's “no
+unresolved batch or admission” eligibility rule and its quiesce protocol step 2
+to include the question owner's unfulfilled answer obligations, even before they
+reach the queue: PendingAdmission, queue-full and unresolved commit/admission
+proof all refuse the freeze. An eligible queued reply already blocks through
+Q2's “no eligible queued item” rule. A Pending non-blocking question alone is
+not a live prompt for Q2; a held blocking question remains a prompt and prevents
+hibernation. Check this under the shared lifecycle/input freeze fence, not an
+eventually consistent EventHub count. An answer committed before freeze
+invalidates eligibility; one committed after the hibernation intent records wake
+owed, finishes confirmed cleanup and then resumes, per ADR-0044's quiesce
+protocol step 4. Never launch alongside a still-exiting process. This is a
+prerequisite of S6e's wake integration, including the pristine focus-only exit.
+
+Render replies with §3's per-item random nonce frame. Put attested responder,
+question ID and optional fork ID in the header, outside untrusted answer text.
+Use the same saved frame on retries. Preserve §2a's stable interior text; nonce
+safety takes precedence over a byte-identical whole frame. Neither a proposal
+nor a recipient label in its body can forge the authenticated producer.
+
+#### Routing, escalation and configuration (ADR-0034; ADR-0042 #2724)
+
+The ask accepts `auto | operator | architect | agent(AgentId)` as a requested
+route, never as authority. Server policy resolves an admitted Recipient. `auto`
+follows ADR-0034 §2: live parent architect for route agents; operator for
+roots/ask_operator; deny for deny. For S6e questions `ask_human` still addresses
+the operator, through the shared inbox rather than an inline question dialog. An
+architect request with no live parent follows the documented orphan route.
+
+**Operator endpoint — decided 2026-10-29 (ADR-0045 D8).** An escalation that
+reaches the operator creates the durable attention/inbox record and targets the
+Tauri GUI's notifications on desktop and mobile (iOS/Android, #2733). Telegram
+is only an optional stand-in until mobile push ships, then is removed. It is not
+a second permanent escalation route. Notification transport does not grant
+answer authority; answers still pass the recipient-specific mutation fence.
+
+An explicit other-agent target must be a live, operator-authorized routing edge;
+an agent cannot address arbitrary peers or elevate its own route to the owner.
+Reassignment re-addresses Pending questions under the same QuestionId and logs
+old/new recipients. Old cards become stale. Only the *current* recipient may
+answer; knowing an old message correlation ID grants no authority.
+
+`RouteReceipt` records selected rule ID, config revision, recipient identity,
+route revision, visited recipients, escalation deadline and reason. Reassign,
+orphan and timeout serialize against answer acceptance. A bounded visited set
+prevents cycles; exhausting the hop limit leaves the question visible with a
+typed routing failure, never an implicit answer. Explicit `question.escalate`
+uses the same policy check and audit as timeout-driven escalation.
+
+The accepted config schema is a closed set, not arbitrary routing expressions:
+
+```text
+RouteRule {
+  rule_id: RouteRuleId, asker: Option<AgentId>, project: Option<ProjectId>,
+  to: RecipientSelector, escalate_to: Option<RecipientSelector>
+}
+RecipientSelector = Operator | ParentArchitect | Agent(AgentId)
+```
+
+Selectors in a rule are ANDed; the first matching rule wins within the resolved
+list. No match uses the existing policy default. A rule cannot override `deny`
+or an authority floor; invalid/stale target IDs fail visibly before delivery.
+
+ADR-0042 (#2724) was accepted by the owner on 2026-10-29; its implementation is
+still a prerequisite, not a feature claimed here. Its single Rust schema, scoped
+resolver, provenance and audited writer must own:
+
+- **`questions.routing.rules`**
+  Typed value and admission: Ordered RouteRule list: registered asker/project
+  selectors, admitted recipient selector, escalation target
+  Apply boundary: New asks; explicit reroute for pending records
+
+- **`questions.routing.escalate_after_ms`**
+  Typed value and admission: Optional duration, 1 second–30 days; null
+  disables automatic escalation
+  Apply boundary: Snapshot into RouteReceipt
+
+- **`questions.routing.max_hops`**
+  Typed value and admission: Positive integer, default 8 and maximum 32
+  Apply boundary: New asks; existing chains keep their recorded budget
+
+- **`questions.expire_after_ms`**
+  Typed value and admission: Optional duration, 1 second–30 days; null means
+  no automatic expiry
+  Apply boundary: Persist one absolute deadline at ask
+
+- **`questions.max_pending_per_asker`**
+  Typed value and admission: Positive integer, default 32 and maximum 256;
+  named schema constants
+  Apply boundary: Admission checks the durable Pending count per stable asker
+  identity
+
+No routing map in env strings, CLI or GUI bypasses schema validation. Use
+ADR-0042's defaults < file < env < explicit flags < runtime resolution, with
+admitted global/node/project/agent scopes and stable IDs. Routing policy is
+operator-owned: a repository or agent cannot widen human access or weaken deny.
+Agents may narrow through existing policy. No secret or executable command is a
+route value. Writes require operate/local-operator authority, revision checks
+and audit; read views redact per the config contract. Existing
+`questions.human_tools` remains independent. Reload never silently rewrites a
+Pending route/deadline; an explicit audited reroute uses the new revision.
+
+**Decisions Q2–Q6 — accepted 2026-10-29.** The owner selected every recommended
+option; the rejected alternatives and their costs remain below.
+
+- **Q2: escalation timing — decided 2026-10-29**
+  Accepted option and cost: Disabled by default; explicit policy may escalate
+  after 5 minutes, along admitted architect edges, default max_hops 8 (hard
+  cap 32). Orphans follow the existing operator route immediately.
+  Rejected alternative and cost: Automatic owner paging on every timeout
+  reduces unattended waits but increases interruptions and may disclose an
+  agent-only question to the owner without an admitted route.
+
+- **Q3: expiry — decided 2026-10-29**
+  Accepted option and cost: No implicit expiry; an explicit admitted deadline
+  expires without answering. Check persisted wall-clock deadlines on restart;
+  a runtime deadline also bounds each wait.
+  Rejected alternative and cost: Default 24-hour expiry bounds inbox growth
+  but can discard a slow, still relevant decision.
+
+- **Q4: other-agent routing — decided 2026-10-29**
+  Accepted option and cost: Explicit operator-managed edges only, local node
+  initially.
+  Rejected alternative and cost: Arbitrary peer or cross-node routing needs
+  mesh identity, delegated scopes and custody proof; defer that implementation
+  to ADR-0034's mesh follow-up.
+
+- **Q5: input bounds — decided 2026-10-29**
+  Accepted option and cost: Prompt/answer 16 KiB each, context 32 KiB, up to
+  16 options (label 256 bytes, description 2 KiB), 32 typed refs (path 1 KiB),
+  4 live threads and 8 live proposals per question, total serialized record
+  128 KiB. Named schema constants validate trimmed UTF-8 and prompt control
+  bytes; blocking reason keeps its already-decided 512-byte bound.
+  Rejected alternative and cost: Reusing an entire prompt/blob allowance
+  simplifies validation but makes question cards and replay substantially
+  larger.
+
+- **Q6: pending flood guard — decided 2026-10-29**
+  Accepted option and cost: At most 32 Pending questions per asker by default,
+  configurable 1–256. Re-asks reuse their slot; terminal commit releases it.
+  Refuse overflow with `session_busy` and typed pending-question-limit detail
+  before any write, without evicting existing questions.
+  Rejected alternative and cost: No count cap avoids admission refusals but
+  permits unbounded inbox/replay growth; a global-only cap lets one asker
+  exhaust everyone else.
+
+Timeout never applies a default choice. It reroutes or expires only as
+configured, including for blocking asks. Expiry ends a held call with a typed
+expired result, not a fabricated user answer. A timer is durable scheduling
+metadata, not a sleep loop. Manual answers, timeout, restart and reassign race
+through the same reducer.
+
+Expiry or supersession also commits a typed terminal-notice obligation to the
+original asker: question ID, terminal revision and reason, with no fabricated
+answer. Deliver it at idle through the queue's existing typed Message path,
+framed as server metadata plus untrusted question text. One stable notice ItemId
+per terminal transition prevents duplicates across restart; queue-full retains
+the obligation. Identity replacement never delivers into the successor: retain a
+visible failed notice for the old identity. A still-live blocking call receives
+its terminal result once instead of an additional notice. Notices alone do not
+grant the AnswerReceipt wake capability: a hibernated asker reads them on its
+next independently authorized wake. Unresolved notice admission is also covered
+by Q2's unresolved-admission freeze gate; a live eligible queued notice blocks
+hibernation like other input.
+
+#### Authorization and proposals
+
+The following explicitly narrows ADR-0028 §8a's blanket MCP answer path and
+preserves ADR-0034 §3's architect answers. It agrees with ADR-0038 §5b:
+
+- **Read/list/subscribe**
+  Required authenticated authority: `read` plus recipient/agent visibility; an
+  agent sees its own asks and questions addressed to it
+
+- **Answer an operator question**
+  Required authenticated authority: Client-token `answer` OR `operate`;
+  attested local operator CLI/TUI; or an operator-bound channel's existing
+  `reply` scope
+
+- **Answer an agent question**
+  Required authenticated authority: Its attested current recipient via CLI/MCP
+  or authenticated reply capability; never a self-asserted label
+
+- **Create/resolve a thread proposal**
+  Required authenticated authority: Attested fork bound to that question; it
+  may propose, never answer for the operator
+
+- **Start a thread fork**
+  Required authenticated authority: `operate`/local operator, or existing
+  admitted architect lifecycle authority for its delegate; cost preview still
+  checks visibility
+
+- **Receipt-bound wake of a Hibernated asker**
+  Required authenticated authority: S6e/ADR-0044 Q5 capability accepted
+  2026-10-29: from an accepted AnswerReceipt, for that asker and ItemId only
+
+- **Permission `agent.decide`, generic lifecycle or tier widening**
+  Required authenticated authority: `operate` or the existing specific
+  operator authority, unchanged
+
+`answer` is sufficient for a question reply and insufficient for a permission
+prompt. `send` alone answers neither, starts no fork, and cannot act as the
+operator (#2585). Its later attributed-principal implementation is a separate
+slice; today's stricter send behavior remains until then. Keep the question
+handler separate from `agent.decide`, including when rendered in one inbox. MCP
+is not an operator credential; it may answer only agent-addressed questions. All
+auth is checked again at the mutation fence, with revocation and identity
+checks. Neither tool arguments nor source labels can mint an answering
+principal.
+
+Proposals use a shared typed envelope with #1719: `Proposal<T> { proposal_id,
+source_agent, target, base_revision, value: T }`. `T` is a closed return-kind
+union: question Answer or §9 Finding, not arbitrary instructions for the server.
+A fork's `question.resolve` persists `question.proposed`, leaving the question
+Pending. The recipient reviews and may edit the typed answer, then applies
+`question.answer { question_id, revision, proposal_id, answer }` (GUI
+`inbox.answer` delegates here). The log retains proposal, applied answer,
+responder and edit flag/text for later analysis (#1717). It checks
+proposal/question/fork identity and route revision; stale proposals remain
+inspectable but cannot auto-send. Only successful answer commit triggers
+idempotent fork stop; restart recovery completes a missed stop. Keep transcript
+and lineage. A losing thread is marked stale; it is never silently merged or
+stopped as though its answer won.
+
+#### Fork points and progress (#2365, #2726)
+
+`question.fork { question_id, at: ask_point | latest, dry_run? }` delegates to
+§9 and #2365, without another fork engine. Persist the ask's complete
+message/tool result boundary. If it is not sealed yet, report pending
+availability; never cut between tool_use and tool_result. Recompute
+`fork_points` when compaction or retention changes: warm `resume_at`, cold
+`rehydrate`, or latest `fork_session`. A missing retained prefix is
+`fork_prefix_gone`, distinct from an invalid cut; PTY asks offer latest only.
+Dry-run reports mechanism, prefix size and estimated cache-read/write cost;
+admission revalidates it and refuses a changed point or cost needing new
+confirmation. Never fall back from ask_point to latest silently. The read-only
+tier is enforced by general permission machinery, not UI controls.
+
+For #2726, link ThreadRef to the fork's agent identity and normal subscriptions:
+phase/current step, recent actions/tool calls, token/time spend, blocked/waiting
+state and pending questions, with details opening its retained transcript.
+**Progress decision — accepted 2026-10-29:** derive objective facts from the
+event log and allow a separate labelled self-reported step; latest-wins
+coalescing under the existing stream budgets, never coalescing terminal/custody
+records. Rejected alternative: a progress tool alone costs model cooperation and
+can go silent; derivation alone cannot know intended next steps. The fork and
+parent viewers must independently pass read visibility; inheritance of lineage
+grants no transcript access. A parent AGENT reads through existing bounded `flk
+events read` + `flk events wait` / MCP `flock_events_read` cursor-and-wait
+surface, filtered to its admitted fork identities; #2726 adds a generated typed
+progress projection there, backed by the same owner stream the GUI subscribes
+to. An authenticated parent may read a bounded snapshot and wait from its
+cursor, with gap/replay handling, rather than scraping a tile or injecting every
+progress event into its own prompt. Registration survives an agent compaction
+through #2718's server-owned durable goal/task subscriptions: progress links the
+fork to its owning goal/task, and a terminal or blocked fact can wake that
+goal's admitted supervision loop. Neither task ownership nor a lineage edge
+bypasses read or wake authority; these loops do not acquire the AnswerReceipt
+capability. Progress cannot apply a proposal. Detailed progress schema/rate
+tuning belongs to #2726 and durable goal/task loop delivery to #2718; neither
+gates answer custody or non-blocking questions.
+
+#### GUI, TUI and CLI contracts
+
+G5 #1597, TUI and `flk question list/show/answer/fork` project one reducer and
+invoke the same typed service. MCP `flock_question_ask/answer` are adapters, not
+second stores. Rust owns schemas with generated TypeScript; frontend records
+carry question identity/revision, recipient, blocking reason, choices, context,
+refs, threads/proposals, fork availability/cost and delivery receipt. Server
+ordering is blocking, urgency, age; Pending non-blocking questions do not change
+a working agent to NeedsHuman. A held explicit blocker does, with its reason.
+
+The card shows server-attested asker/recipient and untrusted body separately.
+Select by option IDs, support multi-select/Other and editable proposal review,
+and render all control text as data, never escape sequences or active HTML.
+Terminal states remove the inbox card but keep history/thread tiles inspectable.
+A failed stale apply displays the current state. Read-only or unauthorized users
+see disabled actions with the required authority; they cannot bypass it via CLI.
+Use existing TUI controls and G5's transcript tile, not a new screen protocol.
+Expose `fork_points` absence with its typed reason rather than a dead action.
+
+#### Pre-mortem
+
+- **Agent idles behind its ask**
+  Prevention and observable result: Non-blocking tool completes immediately
+  after durable receipt; fake harness continues independent work before any
+  answer. No S6d hold.
+
+- **Hibernated asker never sees its answer, or reply races freeze**
+  Prevention and observable result: Owner-approved receipt-bound wake only for
+  that asker; PendingAdmission/queue-full obligations block Q2 eligibility;
+  post-freeze answer records wake owed until cleanup.
+
+- **One asker floods the shared inbox**
+  Prevention and observable result: Per-asker Pending cap, enforced before
+  append; re-ask dedupe, bounded proposals/threads and typed overflow without
+  eviction.
+
+- **Two answers, or crash between log and queue**
+  Prevention and observable result: Serialized question transition, durable
+  obligation, same queue key; exactly one item/started receipt, uncertainty
+  held visibly.
+
+- **An agent impersonates the owner**
+  Prevention and observable result: Lease/pane origin and recipient-specific
+  auth; answer scope cannot approve tools; proposals require separate
+  recipient apply.
+
+- **Escalation loops or leaks a question**
+  Prevention and observable result: Admitted edges, route revisions, bounded
+  visited set, read checks and no timeout auto-answer.
+
+- **Proposal survives replacement**
+  Prevention and observable result: Identity and revision checks; superseded
+  questions reject it and preserve the losing text.
+
+- **Cold fork surprises the user**
+  Prevention and observable result: Recomputed availability/cost,
+  confirmation, no silent latest fallback; read-only tier enforced by the
+  server.
+
+- **Poisoned answer changes producer labels**
+  Prevention and observable result: Per-item nonce framing, metadata outside
+  body, no permission inferred from model text.
+
+- **Restart loses blocking call or fork stop**
+  Prevention and observable result: Held-to-deferred recovery and durable
+  answer obligation; idempotent stop after apply.
+
+- **Progress claims completion or leaks context**
+  Prevention and observable result: Progress is advisory, separately scoped,
+  with source labels; answer custody reads durable records.
+
+#### Ordered implementation slices (each at most 400 production lines)
+
+These are accepted sub-slices of #2242 (2026-10-29), not implementation claims.
+File each sub-issue before work; further splits keep the same public acceptance
+boundary. Dependencies on S12/S13 (#2365), S19 (#1321), G5 and ADR-0042 are
+explicit. Every row adds a fail-first test through public CLI/socket/MCP
+adapters into an isolated server and the existing
+`tests/fixtures/structured-public/claude.py` fake harness; no real model,
+ambient profile, sleeps or timeout widening. Use injected clocks, notifications
+and bounded event receives. Show one behavioral red before each slice; a parent
+compilation error is build evidence, not a behavioral failure.
+
+- **S6e-1**
+  Scope / production budget: Typed records, bounds, generated DTOs and public
+  read/replay adapter, ≤300
+  Fail-first public-path acceptance: Launch isolated server with retained
+  fake-produced ask/terminal log; CLI/socket read replays the pair through the
+  real classifier as known typed records. An unknown-kind line is
+  preserved/skipped. Public adapter rejects invalid bounds; no seeded reducer
+  state.
+
+- **S6e-2**
+  Scope / production budget: Lease/pane origin and one ask adapter, ≤350
+  Fail-first public-path acceptance: Fake asks, emits independent work before
+  answer; absent blocking returns Pending; forged origin refuses; true
+  blocking without valid reason refuses.
+
+- **S6e-3**
+  Scope / production budget: Launch profile, MCP/stdio and recap convergence,
+  ≤300
+  Fail-first public-path acceptance: Stray AskUserQuestion gets the exact
+  deny-carried deferral and continues; duplicate source observation opens one
+  question; permissions still block.
+
+- **S6e-4**
+  Scope / production budget: Reducer persistence and lifecycle, ≤300
+  Fail-first public-path acceptance: Restart preserves Pending; replacement
+  supersedes; held exit becomes deferred; racing expiry/answer has one winner,
+  no half-written checkpoint.
+
+- **S6e-5**
+  Scope / production budget: Recipient routing and config schema, ≤350;
+  depends on accepted ADR-0042/config registry slices (#2724)
+  Fail-first public-path acceptance: Auto routes delegate to architect and
+  root to operator; authorized other-agent edge works; forbidden widening
+  refuses. Config round-trip/provenance through ADR-0042.
+
+- **S6e-6**
+  Scope / production budget: Reroute, escalation and deadlines, ≤300
+  Fail-first public-path acceptance: Inject clock, reassign/orphan/timeout;
+  old recipient refuses, cycle stops at bound, disabled timeout never answers
+  or expires; terminal notice reaches the original fake once at idle after
+  expiry/supersession.
+
+- **S6e-7**
+  Scope / production budget: Answer admission/auth and durable obligation,
+  ≤350
+  Fail-first public-path acceptance: Answer-only token answers question but
+  refuses agent.decide; send-only and wrong recipient refuse; concurrent
+  answers retain one immutable receipt; Pending cap refuses the next ask
+  without a write and releases one slot only on terminal commit.
+
+- **S6e-8**
+  Scope / production budget: AnswerReceipt-bound Reply admission and queue
+  recovery, ≤350
+  Fail-first public-path acceptance: Answer while busy delivers only at
+  result; crash after answer append/before queue ack recovers same ItemId;
+  unknown write holds, no duplicate started receipt. Fake sees one reply; a
+  forged Reply/receipt binding refuses before mutation.
+
+- **S6e-9**
+  Scope / production budget: Question fork adapter / availability, ≤300, after
+  #2365/S19
+  Fail-first public-path acceptance: Dry-run advertises warm/cold path;
+  compaction updates cost; missing prefix refuses; PTY latest only; read-only
+  fork cannot widen tools.
+
+- **S6e-10**
+  Scope / production budget: Generic proposals and reviewed apply, ≤300
+  Fail-first public-path acceptance: Bound fork resolves proposal, original
+  keeps working; recipient edit/apply logs both texts;
+  stale/replaced/wrong-question proposal refuses.
+
+- **S6e-11**
+  Scope / production budget: Thread stop recovery and progress link, ≤250
+  Fail-first public-path acceptance: Crash after apply/before stop then
+  restart stops once; lineage/transcript retained; unauthorized progress
+  subscriber gets no details (#2726).
+
+- **S6e-12**
+  Scope / production budget: G5 projection / review controls, ≤350, after
+  S6e-8/10
+  Fail-first public-path acceptance: GUI fixture and real-server adapter agree
+  on revisions and delivery; duplicate tap shows current state;
+  multiple-choice edits retain typed option IDs.
+
+- **S6e-13**
+  Scope / production budget: TUI/CLI projection and generated help, ≤350
+  Fail-first public-path acceptance: Same pending/answered data as GUI; fork
+  proposal cannot be applied by another agent; late idle reply reaches fake
+  with its question and fork attribution.
+
+- **S6e-14**
+  Scope / production budget: Answer wake and hibernation eligibility, ≤300;
+  after S6e-8 and the ADR-0044 Q2/Q5 lifecycle owner
+  Fail-first public-path acceptance: Fake asks, becomes confirmed Hibernated,
+  then an answer-only client answers: exactly one resume and original reply
+  ItemId, no general start permission. Gate queue admission
+  full/PendingAdmission and prove hibernate refuses; answer on either side of
+  freeze yields cancellation or one wake owed after cleanup. Stopped/replaced
+  targets and reads/proposals never wake. Restart retains the same obligation,
+  never a second input.
+
+- **S6e-15**
+  Scope / production budget: Coordinated rollout gate, ≤200; after core
+  custody/auth/routing, public projections and S6e-14 when hibernation is
+  enabled
+  Fail-first public-path acceptance: Start isolated server with gate off,
+  observe truthful legacy capabilities and launch profile; flip through the
+  admitted config API and launch a new fake: MCP shared-channel profile and
+  typed capability appear together, stray stdio converts. Gate-on with a
+  missing dependency refuses without changing profile; existing generations
+  retain their recorded contract.
+
 ## Failure modes and known limits
 
 - **Hidden flags move.** `--resume-session-at`, `--permission-prompt-tool
@@ -2496,8 +3250,9 @@ decision by the owner.
 2. **Build on `--resume-session-at`.** As recommended: yes, behind the §9
    capability probe, with the rehydrate path as the measured fallback
    (E11). (§9)
-3. **Question and permission channel.** Both, not stdio alone: stdio is
-   primary, and an MCP tool (`flock_question_ask`) is the richer path, used
+3. **Question and permission channel.** Superseded for questions by S6e
+   (#2242; owner direction on #1717). Original decision: both, not stdio
+   alone; stdio is primary, and an MCP tool (`flock_question_ask`) is the richer path, used
    for asks that need more than a choice and whenever stdio would block. The
    owner's concern that stdio can itself block is answered case by case in
    §2b: an open permission request (S0 measures whether it holds a
@@ -2510,8 +3265,10 @@ decision by the owner.
    before the prompting one ran first. A concurrency-safe `Read` behind
    the open permission was held too, and with no permission open a slow
    non-concurrency-safe call still held a later one. (§2b case 1, A.13)
-   - 3a. **Non-blocking questions (#1301).** As recommended (questions are
-     deferred, permission requests block), plus three additions now in
+   - 3a. **Non-blocking questions (#1301).** Retaken by owner decision 15
+     on #1717 (2026-10-19), carried in S6e: the asker decides, absent blocking
+     is false, and true requires a reason. Original decision: as recommended
+     (questions are deferred, permission requests block), plus three additions now in
      §2a: an honest-blocker question, where the agent has nothing else to
      do, holds, and a System-One check decides hold or continue from the
      last turn or turns, the question, and the open tasks and work packages
@@ -2645,9 +3402,10 @@ remaining slice-8 acceptance is tracked in #2467; #1833 and #1746 stay open.
 | S11 | Hot reload: idle → close → `--resume`, init diff event and notice, staged fleet reload | S5 | 300 |
 | S12 | Forks: `at` / `shape`, cut rules, `resume_at` / `rehydrate` / `slice` paths, capability probe, cost guard, warm-then-fan-out, lineage fields | S3 | 400 |
 | S13 | Return channel: `finding` items from forks into the parent's queue | S5, S12 | 150 |
-| S6b | Non-blocking questions: question records with stable hashed ids and fixed-template rendering, the placeholder result on the `deny` carrier (A.12) with the §2 deny carve-out, `question.answer` / `question.fork` / `question.resolve`, re-ask from the record, exactly one reply (§2a, #1301) | S0, S6, S12 | 350 |
-| S6c | The MCP question path: `flock_question_ask`'s new fields (`blocking`, `context`, `refs`, `waits_on`, `recipient`, `urgency`), pre-allowed in the launch profile, the placeholder as its result, the fallback to an MCP permission tool when the capability probe finds `stdio` gone (§2b, owner decision 3) | S6b | 250 |
-| S6d | The hold-or-continue System One check: state from the last turns, the question and the open task and work-package graph, hold on `strong` only, recorded for rating (§2a, owner decision 3a) | S6b | 200 |
+| S6b | Historical question plan, superseded by S6e sub-slices: question records with stable hashed ids and fixed-template rendering, the placeholder result on the `deny` carrier (A.12) with the §2 deny carve-out, `question.answer` / `question.fork` / `question.resolve`, re-ask from the record, exactly one reply (§2a, #1301) | S0, S6, S12 | 350 |
+| S6c | Historical MCP question plan, superseded by S6e sub-slices: `flock_question_ask`'s new fields (`blocking`, `context`, `refs`, `waits_on`, `recipient`, `urgency`), pre-allowed in the launch profile, the placeholder as its result, the fallback to an MCP permission tool when the capability probe finds `stdio` gone (§2b, owner decision 3) | S6b | 250 |
+| S6d | Superseded as a hold by S6e and owner decision 15 (#1717/#2242); no turn-holding judge is scheduled | — | 0 |
+| S6e | Non-blocking question service, recipient routing, reviewed fork proposals and idle reply custody; ordered sub-slices in the S6e amendment (#2242) | S6, S5; fork/UI/config dependencies per sub-slice | ≤400 each |
 | S14 | Codex `app-server` adapter onto `SessionEvent` | S4 | 400 |
 | S15 | opencode `serve` adapter | S4 | 400 |
 | S16 | Storage sealing (zstd segments) and thinking retention | S3 | 250 |
@@ -3734,8 +4492,18 @@ in that audit trail. This does not expose credentials or change answer policy.
 - **Storage.** App-session tokens live in a second, in-memory store that
   `authenticate` checks beside the file tokens. They are never written under
   `client-tokens/` and never listed as file tokens.
-- **TTL.** A fixed 12 hours from the mint, with no sliding renewal. The shell
-  renews by minting again.
+- **TTL (#2489 owner decision).** A fixed 12 suspend-inclusive elapsed hours
+  from the mint, with no sliding renewal. Linux uses `CLOCK_BOOTTIME`; macOS
+  uses `mach_continuous_time`. Sleep counts, and wall-clock changes cannot
+  extend validity. The shell renews by minting again. `expires_in_ms` is
+  derived from the same clock and deadline.
+- **Idle expiry.** The credential clock also owns its absolute kernel timer
+  (Linux timerfd; macOS continuous-time kqueue timer). An elapsed deadline is
+  ready on resume without polling or occupying a blocking worker. This does
+  not request a hardware wakeup or change the transport heartbeat clock.
+  Clock read failures withhold authorization and mint returns `internal_error`;
+  timer failures close with 1001, without falsely claiming revocation. There
+  is no fallback to an awake-time or settable wall clock.
 - **Restart and handoff.** Both revoke every app-session token. A handoff does
   not carry them or their watches to the successor. This amends the §5a
   matrix row "Restart, handoff…".
@@ -4094,10 +4862,11 @@ are refused rather than followed or removed.
 
 The lock follows the **open file description**, including across SCM_RIGHTS.
 `perform_live_handoff` sends the API and terminal ownership descriptors after
-PTYs and the optional TCP listener, under handoff manifest version 3. Older
-importers refuse that version before transfer. `run_handoff_import_server`
-adopts both descriptors before acknowledging restoration or rebinding the
-public paths; the exporter retains its descriptors for rollback. Public Unix
+PTYs and the optional TCP listener. Internal handoff manifest version 4 also
+appends the native WebSocket ownership descriptor; builds without that extension
+retain version 3. Older importers refuse unsupported versions before transfer.
+`run_handoff_import_server` adopts these ownership descriptors before
+acknowledging restoration or rebinding the public paths; the exporter retains its descriptors for rollback. Public Unix
 listeners are rebound under those same locks; TCP retains its listening fd.
 `restore_public_sockets_after_failed_handoff` also reuses the retained locks.
 There is no unlocked interval during either transition. This changes only the
@@ -4121,11 +4890,28 @@ socket shares the API's mode `0600` constant and the ownership protocol above.
 `owner`, `SocketOwner::duplicate` and `SocketOwner::take` retain the same locked
 open description through descriptor transfer, rebind and rollback. `unlink`
 and destruction compare the recorded inode, so an old exporter cannot unlink
-an importer's replacement socket. This slice adds no production call to these
-listener methods and changes neither reachable endpoints nor TCP authentication.
-The following activation slice owns the server handoff manifest extension,
-LocalOperator admission, independent pre-auth pools and the atomic TCP
-app-session refusal.
+an importer's replacement socket. `HeadlessServer::prepare_client_wire` activates the foundation together with
+`Core::local_router` owner admission and TCP app-session refusal. The bounded
+`local_admission::Owner::service` obtains a sealed proof from the application
+owner. `Store::admit_peer` and the final registration check hold the existing
+revocation fence through insertion; `Lease::drop` prevents a cancelled waiter
+from leaving a registration behind. HTTP and hello permits are separate per
+transport; upgraded and per-credential caps belong to the single shared core.
+`client_listener::Listener::shutdown` cancels HTTP acceptance and drains the
+upgraded sessions through `Core::shutdown`; the HTTP task set alone does not
+own upgraded futures. Internal handoff manifest version 4 appends the native
+ownership descriptor after the API and terminal owners; import adopts it before
+preparation and rollback retains the same guard. No mesh or JSON wire version
+changes.
+
+
+PR3b refusal delivery uses four independent writer/drain tasks per listener.
+They do not consume normal HTTP reservations or block acceptance. Each retains
+the same absolute five-second deadline; when that separate budget is exhausted,
+additional over-cap connections are closed without a 503 response or another task.
+This trades a typed overload response for bounded memory and continued acceptance.
+A refused hello closes 4401 before registration; an exit after registration
+closes 4403 and includes every socket already admitted under the fence.
 
 ### Amendment: S10a1 native placement
 
@@ -4136,3 +4922,595 @@ reused on focus, and every UI target is fenced by the registry generation.
 Closing detaches placement without stopping the runtime. Native cross-tab or
 workspace relocation is unsupported and refuses before any layout mutation,
 including removal of a single-pane tab. Public start/render wiring is S10d.
+
+### Amendment: S10a2 frozen view and persistence contracts
+
+`structured::view::contracts` freezes the S10b/S10c snapshot and fenced intent boundary.
+`Snapshot.agent.model` is requested; reported values and absent usage stay distinct.
+`TabSnapshot.native_views`: layout ID → `{kind:"structured",schema:1,agent_id}`.
+Restore uses cold registry generations, never credentials, PIDs or auto-restart.
+Unsupported records remain visible unavailable tiles without attach authority.
+Raw record bytes survive migration/save; native-only tabs survive until explicit close.
+Snapshot format version 3 is deliberately unchanged. Older builds ignore this
+additive field and spawn shells in native tile slots; their next save permanently
+drops `native_views`. This placement loss is preferable to a version bump, which
+would make older builds ignore the entire session, including its terminal tabs.
+
+### Amendment: native card identity and observed tool use
+
+`CardId { seq, ordinal }` separates fold/inspection identity from a shared source
+cursor. Ordinals are deterministic for a given record and projection parser
+version; sibling cards never share a fold key. `ObservedToolUse` retains the
+original id, name, typed input and raw source event, independently of the stdio
+permission `ToolRequest`. Neither observed cards nor their ids grant authority.
+
+The native projection retains at most `history::LIVE_RECORDS` (16) source
+cursors. `Snapshot.earlier_history` explicitly marks the eviction watermark so
+older history can be requested. Window eviction never rewinds the applied cursor
+or claims a storage gap. Live partials are keyed by message identity and block index (source
+cursor when no message id exists), with at most 16 active blocks and at most
+`transport::MAX_LINE_BYTES` (2 MiB) of text per block. Capacity or text overflow
+clears transient cards and marks replay lagged at the observed durable floor;
+further deltas at that floor are suppressed until durable progress. No synthetic
+cursor is allocated. Known live deltas retain only current partial state, rather
+than an additional raw card for every delta. Malformed or unsupported content
+remains inspectable as raw JSON with its original classifier provenance.
+Durable ordinals are raw event at zero, then content-block position plus one.
+Live cards use a disjoint provisional ordinal range, assigned in observation
+order within a source cursor; durable assistant records replace matching completed
+blocks and older cursor-only partials, while preserving unmatched named blocks.
+A block's public envelope is not a whole-message completion signal. Fold state is per-card:
+thinking, unprojected JSON and raw source beside typed cards start folded,
+independently of sibling text/tool cards. Raw inspection remains an explicit
+choice, so raw source cannot bypass a thinking fold by default.
+
+This amendment also specifies `ObservedToolUse.raw: Arc<str>` to share exact
+source events between tool cards, and a disjoint provisional live ordinal range
+beginning at `1 << 31`, as described above. `content_block_start` and
+`content_block_stop` are lifecycle signals ignored by the text projection;
+neither replaces accumulated text. Durable assistant records finalize correlated blocks.
+Fold choices for the 16 most recently retired live blocks survive gap recovery
+and transfer to the final card for the same message/block. Preferences outside
+that bounded live window may return to their defaults on later reconstruction.
+Claude Code 2.1.296 emits one assistant envelope per completed content block
+(E1, A.13). Its public envelope omits the internal API block index. Named
+text/thinking hints therefore transfer only when message identity, content kind
+and exact completed content select a unique retained hint (a bounded SHA-256 fingerprint
+retains no text). Single-block envelopes do not imply block zero. Bundled
+multi-block records additionally match their content positions. Unmatched named
+siblings remain within the same 16-hint cache; unrelated or ambiguous content
+uses default folding. Finalizing one block preserves unmatched named live blocks.
+Content equality correlates a provisional block and its fold preference with a
+completed block; it is not a message-lifetime condition. `Model::partial` retires
+all remaining blocks for a reported `message_stop` identity even if final text
+differs from the deltas. A delayed stop still retires its older partials after
+history catch-up, without recreating stale data or retiring newer partials.
+An anonymous stop retires cursor-only blocks through
+its live cursor; it cannot identify an unrelated named message. `Model::record`
+retires remaining partials at a known top-level turn result, including error
+results, without a content match. Nested tool results do not end the parent
+turn. Only partials preceding that durable result are retired, so already
+received output from a later turn survives history catch-up. Named blocks whose
+stop omits their identity remain until the top-level turn result rather than
+being assigned to a guessed message.
+
+Evicting a partial saves its fold before removing its card. Anonymous hints retire
+with their final message. Anonymous hints whose possible
+final record lies inside an actual missing history range are discarded rather
+than assigned to another message. Anonymous partials at the final record's own
+cursor belong to later output and are preserved.
+
+Permission snapshots retain the latest lifecycle observation per
+`(request_id, request_seq)`, in publication order. Pending opens have no local
+projection count limit or clock-based expiry: only a matching real close retires
+them, including host cancellation or session-end closes. The production producer
+bounds live opens with `permissions::MAX_OPEN_PERMISSION_REQUESTS` (16), and
+`permissions::Orphaned::into_closes` emits `SessionEnded` closes on recovery.
+These upstream bounds do not authorize the projection to drop an unmatched open;
+unmatched opens in older data remain visible until a matching close is observed. Only closed
+observations are bounded to the latest 16; older closed records remain in
+History. Displayed requests never substitute for S6 decision revalidation.
+
+### Amendment: native queue subscription recovery (S10b2)
+
+A lagged native queue reader is spent. Its owner retains the applied queue cursor
+and any incomplete replacement, discards the reader, and waits on the source's
+readiness notification when replacement capture is temporarily busy. Busy capture
+is not an end or a mutation retry. A successful capture resumes after the applied
+cursor; only a producer end or generation retirement ends the subscription. A
+terminal queue refusal remains a typed failure on subsequent polls rather than
+becoming a successful end. Retirement clears old presentation state and leaves
+composer admission refused as `agent_not_found`; it does not grant a new target.
+
+Queue subscribers wake waiters after releasing the book on every result,
+including unwinding from a snapshot callback or registration. One guard owns
+both the mutex guard and its notify-on-drop field; declaration-order field
+destruction releases the book first. Publishers use the same guard for capture,
+finish, publication and teardown, waking both readiness and capture capacity.
+Failed try-locks never self-notify. Ended sources need this wake because their
+publisher has stopped. Capture capacity has a separate notification, armed
+before capture, so a full channel cannot self-wake a retry loop.
+A terminal queue refusal also stops history and live retirement. Canonical
+generation refresh still precedes presentation and can retire the failed view.
+
+### Amendment: S10d1 public native placement
+
+Public structured start and focus use the S10a1 placement lifecycle. Start
+attaches to the active tab, or creates a native-only workspace; focus reuses
+one placement and may rebind it to the current registry generation. Reported
+view IDs come from actual layout membership and public numbering. Detaching
+does not stop the worker. Placement preflight precedes worker admission.
+The App-owned subscription controller is described below; renderer/input routing
+follows in separate S10d slices under #1430. Placement creates no terminal runtime.
+
+### Amendment: S10d1b cancel-safe native continuation
+
+`Stream::next` is cancel-safe. Stream owns its in-flight history task, cut and
+unapplied page, as well as queue cursor/replacement and resubscribe state.
+Cancelling a caller's future preserves that continuation. Resuming an older
+Pending history page yields one step to recheck readiness; a publication that
+predates the new wait cannot leave the continuation asleep. Retirement alone
+discards a dead generation's page. Its blocking work retains the I/O permit
+until completion, even if the Stream is dropped. No timeout, sleep or mutation
+retry substitutes for source readiness.
+
+### Amendment: S10d1b copy-on-write publication
+
+Model owns its projection through an `Arc<Snapshot>` mutation gate. All mutable
+access uses `Arc::make_mut`. The additive Snapshot/card Clone implementations
+exist solely for this copy-on-write boundary. Published frames stay immutable;
+App and render share Arcs and never borrow Model. Unshared mutation reuses the
+allocation. A watch channel's retained last frame is itself a shared owner, so
+it can require a copy even when App has not separately retained that frame.
+No snapshot fields or intent shapes change.
+
+Initial queue admission also belongs to the continuation: opening a view does
+not acquire the publication book or capture channel. Its first poll arms the
+source readiness notification before trying admission, preserving the same
+pending state through contention and cancellation as a lagged resubscribe.
+
+### Amendment: S10d1b App-owned frame driver
+
+This slice supplies the frame/controller lifecycle; renderer dispatch follows in S10d2.
+One typed task per native placement owns its Stream and Model. It publishes the
+same immutable Arc through a latest-wins watch channel, coalescing unread frames.
+App stores only published frames or typed source failures in pure presentation
+state. Render never borrows Model or performs subscription I/O. Canonical target
+facts fence every publish and App validates them again before presentation.
+Closing a placement aborts only its reader task; the worker continues. Reopening
+replays from canonical warm sources. Cold sources retain their typed refusal;
+source refusals remain visible instead of appearing as successful frozen frames.
+An ended stream still accepts canonical metadata updates until placement closes.
+
+### Amendment: S10d1b warm-history opening
+
+A canonical warm history handle can precede producer file initialization.
+`Stream::next` waits on that source's readiness for this opening state, retaining
+it across cancellation. This is not cold recovery: no second writer or loader is
+created. Producer failure and actual page I/O errors stay explicit errors. As with
+a cancelled Pending page, resuming an older opening yields one recheck step so
+an initialization preceding the new wait cannot be missed.
+
+### Amendment: admitted launch with failed placement (#2655)
+
+If placement fails after launch admission, return the typed
+`structured_agent_started_unplaced` result with the admitted ID, generation
+and registered placement cause. Keep the registry/worker under normal ownership
+so it remains inspectable and stoppable. CLI/MCP expose the result with exit 1;
+this is not a clean start refusal and must not trigger a fresh start blindly.
+Duplicate placement and invalid membership remain typed preflight refusals.
+
+### Amendment: S10d2 prepared native rendering
+
+Desktop and client-sized mobile geometry prepare S10c's pane from the App-owned
+immutable frame. The prepared pane and its owned hit-to-Intent payloads live in
+that ViewState, so paint and later input share one cut and geometry. Paint checks
+canonical generation and current placement again; stale cuts and source refusals
+produce a typed error tile. Ready and unavailable native members never fall
+through to PTY rendering. This slice wires rendering; input dispatch remains the
+next S10d2 slice and Unicode composer/admission semantics remain S10d3.
+
+### Amendment: S10d2 local control routing
+
+Native keyboard and mouse routing consumes only complete painted S10c controls,
+revalidating the original target generation before dispatch. Tab/Shift-Tab selects
+a painted control and Enter activates it; Ctrl-W detaches without stopping the
+worker. PageUp/PageDown move the source-card anchor and End follows the tail.
+Float input, global bindings, prefix commands and overlays retain precedence.
+Presentation edits reach the Model through a bounded driver channel, never an
+App borrow of the Model. Permission decision intents keep their exact handles;
+UID-only interactive context remains `not_authorized` under S6 until S10e supplies
+the approved capability and Always confirmation. Text/paste editing remains S10d3.
+Submission and inspection completion follow in the next S10d2 child under #1430.
+
+Native input consumes only unmodified left-button presses on painted controls and
+wheel events; other pointer events reach the workspace handler. An active layout
+or sidebar drag always keeps ownership through release, including over native
+content. Keyboard selection highlights the full painted control label. PageDown
+at the following tail is a no-op; End explicitly resumes following from an anchor.
+Collapse and scroll state are per-driver and shared between panes showing the same
+agent, rather than per frontend viewport. Permission decisions remain refused for
+UID-only Operator context without reserving or closing the exact live request.
+
+### Amendment: S10d2 current-draft submission
+
+Enter without a selected control submits the current composer; Tab/Shift-Tab and
+Enter continue to activate painted controls. S10d2 adds no native Escape binding;
+navigation continues through the existing App routing. Empty or whitespace-only
+drafts refuse with `invalid_params` before admission. A stale draft or generation refuses
+before admission. Send uses the existing durable queue owner as interactive Operator,
+never raw stdin. One in-flight ticket per view prevents duplicate clicks. Only the
+exact committed draft is cleared; refusal or uncertainty retains it, and unknown
+admission stays latched with its lifecycle ID rather than being blindly resent.
+A receipt acknowledges admission, never delivery or turn completion. Details expands
+the exact card and anchors its source cursor; sibling cards share that cursor. S10e still owns full permission inspection,
+capability-backed decisions and Always confirmation; UID-only decisions refuse.
+
+Text and paste are not submission intents. S10d3 explicitly extends the frozen S10
+contracts with typed composer editing: insert, delete, cursor movement, history and
+bounded paste as one insert. It adds editor/history and admission-receipt UX plus
+idle delivery, rather than interpreting printable or pasted text as Send.
+
+### Proposed amendment: S10d3 composer editing contract (#2696)
+
+This is the proposed extension for architect acceptance, not a claim that editing
+has shipped. D3a alone supplies MVP #1424 step 2 on top of S10d2c (#2685);
+D3b–D3e below are issue-tracked post-MVP work. The typed `Composer` gains a
+`text_revision: u64`; its cursor remains a UTF-8 byte offset, now
+restricted to an extended-grapheme boundary. `Action` gains `EditComposer(Edit)`
+with typed focus, insertion, deletion and movement variants; existing `ComposerHistory`
+and `Send(Composer)` remain. Directions and units are enums, never JSON commands.
+A paste is one insertion, not a sequence of key events or a submission.
+
+#### Ownership, focus and keys
+
+The existing App mode and binding dispatcher runs first: overlays, visible floats,
+direct configured actions/commands and the prefix own their existing inputs. Only
+otherwise-unclaimed input in `Mode::Terminal`, focused on a valid native target,
+can edit its composer. A PTY pane keeps its terminal routing. Non-terminal modes
+never edit or submit a hidden composer. Key release does nothing. The runtime
+currently forwards Repeat events to `handle_key` (`src/app/runtime.rs`): D3a must
+consume repeated Enter before either Submit or painted-control activation, even
+when a nonempty draft has no pending ticket. A repeated Enter never submits.
+Repeat may repeat movement/deletion/printable insertion. Legacy input cannot
+distinguish repeated Press events from independent presses; pending admission
+and text-revision-fenced clear still protect those paths without timing guesses.
+
+An accepted composer operation selects the composer, leaving painted-control
+selection; subsequent Enter submits the draft rather than activating an old
+control. A left click inside the painted composer emits typed `Edit::Focus`,
+selecting it without moving the cursor; mouse caret placement is post-MVP #2699.
+A rejected operation preserves both draft and selection. Tab/Shift-Tab
+continue selecting painted controls, and Enter on a selected control activates
+its original generation-fenced intent. Esc acquires no new native binding.
+The full target keymap below applies only after the existing App bindings. D3a
+implements its minimal typing keys; remaining movement/newline bindings are
+post-MVP D3b (#2702), and history is post-MVP D3e (#2704):
+
+| Input | Composer operation |
+| --- | --- |
+| Printable `Char`, unmodified or Shift | Insert the exact Unicode scalar at the cursor |
+| Left / Right | Previous / next extended-grapheme boundary |
+| Backspace / Delete | Delete one preceding / following extended grapheme |
+| Ctrl-Left / Ctrl-Right, Alt-B / Alt-F | Previous word start / next word end |
+| Ctrl-Backspace / Ctrl-Delete | Delete to the preceding word start / following word end |
+| Home or Ctrl-A / Ctrl-E | Start / end of the logical LF-delimited line |
+| Ctrl-Home / Ctrl-End | Start / end of the entire draft |
+| Up / Down | Previous / next logical line, preserving a preferred display-cell column |
+| Ctrl-P / Ctrl-N | Older / newer local committed composer history |
+| Ctrl-J, or distinguishable Shift-Enter | Insert LF; never submit |
+| Plain Enter | Submit the current accepted text revision, unless a painted control is selected |
+| PageUp / PageDown / End | Existing transcript scroll / follow-tail actions |
+| Ctrl-W | Existing detach action, not word deletion |
+
+The raw parser already distinguishes CR (Enter) from LF (Ctrl-J). A terminal that
+encodes Shift-Enter as ordinary CR cannot communicate the distinction: Ctrl-J is
+the newline binding when unclaimed, and the UI never guesses from timing. Other modified keys
+have no implicit insertion fallback. A configured App binding may shadow an editor
+binding; the App binding wins. In particular, `keys.prefix = "ctrl+a"` makes Ctrl-A
+unavailable to the editor (Home remains an alternative). A direct Ctrl-J binding
+without the kitty protocol can leave no distinguishable newline key: Shift-Enter
+may arrive as ordinary CR. The UI must expose that binding gap, not steal Ctrl-J
+from the App or pretend Shift-Enter is distinct. Unbracketed CR retains Enter
+semantics, so a stream of ordinary key events is not promised paste safety.
+
+#### Graphemes, words and bounds
+
+Use `unicode-segmentation`, already locked transitively at 1.13.3, promoted to a
+direct dependency by the implementation. Extended graphemes and Unicode word
+boundaries come from that dependency, not scalar counts, ASCII-only words or a
+second hand-written segmenter. Word-left skips intervening separators to the
+preceding word start; word-right skips separators and traverses the next word to
+its end. Combining marks, regional-indicator flags and ZWJ emoji remain indivisible.
+Insertion can join adjacent graphemes: resegment around the edit and move the
+caret to the first grapheme boundary at or after the inserted bytes. Never leave
+it inside the newly joined cluster. No Unicode normalization rewrites user text.
+
+Rendering maps grapheme boundaries to cells with the existing Unicode-width
+support, not byte offsets. LF changes logical line; pasted TAB displays as spaces
+to the next eight-cell tab stop. Vertical movement clamps to a grapheme boundary
+on the target logical line, retaining the preferred column across short lines.
+Visual wrapping does not create extra logical lines. Text/horizontal movement
+resets that preferred column. Rendering is pure and never repairs the cursor.
+
+The named draft bound is `COMPOSER_MAX_BYTES = 64 * 1024` UTF-8 bytes. Every insert,
+including a recalled draft, validates the whole result before mutation. Limit
+failure is atomic `invalid_params`, not truncation. Every insertion origin shares
+the control/UTF-8 validator below; only paste normalizes CR. Existing queue/transport
+bounds still apply independently when sending; the editor bound grants no admission.
+
+#### Bracketed paste and the byte boundary
+
+Until post-MVP native paste insertion lands (D3d, #2703), D3a handles a delivered
+paste event targeting a native pane with an `invalid_params` refusal toast and no
+draft or queue mutation. It never silently drops the event. Float/PTY owners keep
+their existing routing. The shared `raw_input` decoder currently buffers paste
+without a bound and stalls on invalid UTF-8; that existing PTY-affecting bug is
+#2701, not a native-only feature deferral. It can prevent a paste event reaching
+the App. D3c (#2705) builds on the #2701 fix, or fixes #2701 in its first child,
+before claiming the bounded end-to-end behavior below.
+
+`COMPOSER_MAX_PASTE_BYTES = 64 * 1024` bounds the original paste payload as bytes;
+the resulting draft must also satisfy `COMPOSER_MAX_BYTES`. Valid UTF-8 is required.
+Normalize CRLF and lone CR to LF for paste only; preserve other Unicode and LF/TAB.
+NUL, ESC, DEL, other C0 controls except LF/TAB, and C1 controls refuse the entire
+paste as `invalid_params`. A genuine U+FFFD is valid text; never use lossy decoding
+to turn invalid bytes into it. Validation precedes any edit, focus change or submit.
+
+The bound must hold before allocation of a complete `String`, at the earliest
+paste accumulator, including the client byte framer and server input decoder.
+The client streams bounded chunks instead of retaining the entire paste; it does
+not guess native destination policy. The first native-aware server accumulator
+enforces the total native paste cap against App-captured context. Existing
+input-byte transport frames carry the same bytes in bounded chunks; their boundaries
+are not key or paste boundaries. Keep per-input-connection framing state through
+those chunks. Internal typed paste-begin/completion/refusal events preserve order;
+this adds no persisted event kind or new public input-message format.
+
+At paste-begin the App captures the native target, generation and input focus.
+Completion is one atomic edit only if that target/focus is still current. It never
+retargets a paste into another pane. Generation retirement gives `agent_not_found`;
+a focus/mode change refuses with `invalid_params`. The receiver derives this
+context; it is not a producer-supplied claim of authority.
+
+On overflow or invalid data, report one typed refusal and drain through the paste
+terminator using bounded delimiter state. Do not interpret the rejected tail as
+keys, terminal escapes or Submit. An unterminated paste remains in bounded drain
+state until its terminator or connection close; a timer must not release its tail
+as commands. Disconnect refuses an incomplete paste as `invalid_params` unless
+already refused, discards it and resets the framer. A valid terminated paste
+followed by another key must leave that key independently
+processable. Chunk splitting inside UTF-8 or the delimiters cannot change results.
+PTY paste forwarding retains its semantics; bounded streaming must not impose the
+native editor's insertion policy on a PTY destination.
+
+#### Authoritative revision and coherent publication
+
+Keep one pure `EditorState` per App-owned driver lifetime, keyed by the exact
+`Target` (agent and generation). It lives in App state, separately from the
+runtime task. The App serializes accepted input into this authority; it never
+reads back its own painted payload as proof of freshness and never borrows Model.
+The driver task still owns Stream and Model. It receives an immutable typed
+`EditorCut` containing composer/text revision, admission state and receipt identity,
+and projects that coherent cut through its existing copy-on-write snapshot.
+Latest-wins publication may skip frames, not accepted edits. Queue/history/live
+projection cannot overwrite the editor with an older composer cut.
+
+A single App-wide monotonically increasing `u64` counter supplies every editor's
+initial `text_revision` and each subsequent actual text change. Creating another
+driver takes a fresh value, so detach/reattach cannot reuse an old driver's
+revision. Intervening edits to another editor can consume values; an editor must
+not assume consecutive values.
+
+Within an editor, only a change to the exact UTF-8 text allocates a new text
+revision: insertion, deletion, paste, history recall that changes text, or clear.
+Cursor/word/line movement, history-index movement or recall of identical text,
+focus, refusal and admission-status updates leave it unchanged. Cursor-only changes
+still publish a new coherent `EditorCut`; text revision is not a frame version.
+The cursor remains in bounds at a grapheme boundary in the same cut.
+
+Keyboard Submit captures the authoritative editor text revision and body, even
+when paint has not caught up. Painted Send retains its captured text revision;
+the dispatcher compares that value to `EditorState` before admission. Cursor
+movement alone does not stale Send: the body is text-only. A matching revision
+admits the authoritative editor text, not a body inferred from a copied frame;
+a stale text revision refuses atomically with `invalid_params`. This replaces the
+circular stale-draft comparison noted in #2655. Existing target and principal
+checks remain mandatory. Each accepted edit commits locally before projection,
+so rapid typing followed by Enter cannot omit the unpainted suffix or spuriously
+reject it as a stale frame.
+
+One outstanding admission ticket per driver still fences Submit (`session_busy`).
+Editing may continue while that ticket is pending. Its completion carries the
+original target, lifecycle ID and captured text revision. Clear applies only if
+the current generation and text revision still match; it empties the text, resets
+the cursor to zero, assigns a new text revision and publishes one cut. Enter
+"hello", Left, then acknowledgement must clear "hello": retaining it would make
+the next Enter resend an already admitted message. This intentionally supersedes
+S10d2c's cursor-mismatch retention. Editing text away and back to identical bytes
+(ABA) changes its text revision and prevents the old clear. A different text
+revision keeps its draft while the receipt still reports the older item's outcome.
+Completion must match the outstanding lifecycle ID; stale or already-settled
+completions cannot clear or append history twice. Deduplication
+does not require an unbounded set of historical IDs.
+
+Refusal preserves the editor. `input_write_unknown` preserves both draft and
+lifecycle identity and stays latched across edits; another Enter still refuses.
+No edit, cursor movement or fresh text revision authorizes automatic resubmission.
+This latch lasts only while its driver/ticket lives: existing detach/reattach drops
+the ticket and therefore clears the unknown-admission latch, even if the item may
+have committed. That is current behavior, not proof that retry is safe. Explicit
+reconciliation and the fix for silent latch loss belong to #2700; D3a does not
+claim that UX or invent a new queue owner.
+
+The composer receipt displays its lifecycle ID and owner-confirmed admission or
+typed refused/unknown outcome, independently of the newer text revision. A
+committed receipt means admission, never start, delivery or completion. Delivery
+continues through the existing queue's canonical idle boundary.
+
+A stale/retired target refuses with `agent_not_found` before editing or sending.
+An unavailable driver/source reports its existing typed failure and preserves the
+editor; it must not accept invisible input into an error tile. App still settles an
+outstanding ticket against editor authority even if its frame cannot be published.
+Publication coalescing is not a mutation failure; stale source cuts cannot roll the
+draft back. A valid App-owned edit requires no asynchronous command-queue retry.
+
+#### History and lifetime
+
+History contains only this driver's acknowledged composer submissions, once per
+lifecycle ID, in commit order. It is not reconstructed from assistant output or
+other principals' queue items. Retain at most `COMPOSER_HISTORY_ENTRIES = 16` and
+`COMPOSER_HISTORY_BYTES = 256 * 1024`, evicting whole oldest entries. Refused and
+uncertain submissions do not become acknowledged history. Different committed IDs
+may retain equal text. Recalling preserves exact text and places the cursor at
+its end; the first older-history action saves the current scratch draft/cursor,
+and moving newer past the newest entry restores it. The 256-KiB history budget
+includes that saved scratch draft; evict oldest entries as needed before saving it.
+The authoritative current draft has its separate 64-KiB bound. An empty history or
+a boundary move is a no-op.
+
+Draft, text revision, history and pending/uncertain presentation survive repaint,
+focus changes, workspace/tab switches and source replay while that driver lives. They
+are local to that App/controller: attached clients showing the same driver share
+them, while another App/server has an independent editor. Explicit detach drops
+that driver and its unsent draft/history; reattach creates a fresh empty editor
+with a fresh text revision from the App-wide counter and no inherited outstanding
+ticket. This also clears the unknown-admission latch under current behavior
+(#2700). The single App-wide counter continues for the App lifetime. Generation
+changes get fresh values from that counter. An App restart has a new counter/empty
+editor state and no outstanding editor receipts from the old App. This slice adds
+no placement/session persistence for editor state. An already committed queue item
+survives detach/restart under the existing journal; dropping its view or ticket
+never cancels or resends it. A new driver must not auto-send or reconstruct an
+uncertain draft from a queued item. Inspect the canonical queue before manually
+repeating a possibly admitted message after reopening.
+
+#### Pre-mortem
+
+| Production failure | Required prevention and evidence |
+| --- | --- |
+| Fast typing outruns the published frame; Enter sends a prefix | App editor authority precedes paint; public test types and submits without yielding to a frame |
+| An old receipt clears a newly edited draft that happens to look identical | Text-revision-fenced clear; hold acknowledgement, type/delete back to the same bytes/cursor, then release it |
+| Cursor movement keeps already admitted text and the next Enter duplicates it | Cursor movement leaves text revision unchanged; Enter, Left, release acknowledgement must clear the draft |
+| Delete corrupts an emoji or caret lands inside a combining cluster | Grapheme segmentation and boundary assertions; real key path covers combining/ZWJ/flag cases and cell rendering |
+| A large, binary or split paste leaks a newline as Submit, or exhausts memory | Bounded byte framing, one typed refusal and drain-to-terminator; test chunks, exact limits and disconnect |
+| A modal/float or another pane receives the wrong draft/paste | Existing routing precedence and captured paste focus/generation; public mode/focus change tests assert zero edit/admission |
+| Detach or worker failure appears to cancel an already admitted item | Per-driver lifetime is explicit; canonical queue/idle tests prove one admission and no automatic retry |
+
+#### Implementation slices and fail-first public acceptance
+
+Each child below is at most 350 production lines (tests excluded), leaving margin
+below the 400-line ceiling. Split further before exceeding the ceiling. Stack in
+order after architect acceptance of this amendment. Every slice uses the existing
+isolated socket-start fake fixture; no real model or operator session is involved.
+Pure reducer/segmentation tests supplement, never replace, the public path.
+
+Implementation staging: D3a1 supplies the typed App editor authority, shared text
+revision allocator, coherent driver cuts, driver-lifetime cleanup and revision-fenced
+admission/clear. It does not yet bind raw text input. D3a2 adds the raw keyboard,
+composer-focus and paste-refusal routing and the public fake-fixture acceptance
+coverage below. Each child carries its own fail-first tests.
+
+1. **D3a — MVP: editor authority, minimal typing and text-revision-fenced
+   submission (#2696; MVP #1424 step 2).** Add typed editor/cut contracts, the
+   App-wide revision allocator, insert/backspace and left/right grapheme edits,
+   coherent publication, and text-revision-based Send/clear. Guard repeated Enter
+   here, not in D3b; handle native paste with a typed unsupported-paste refusal toast
+   until D3d lands. Public acceptance uses the actual raw-event/key path on the
+   socket-started fake fixture:
+   - Type Unicode and Enter without waiting for paint; assert one exact queue body.
+   - Type "hello", press Enter, hold its acknowledgement, move Left, then release it:
+     assert an empty draft and cursor zero; another Enter cannot resend "hello".
+   - Hold a real ticket's completion, edit/delete back to the original text/cursor,
+     then release it; the newer text revision survives. A cursor move leaves a
+     painted Send valid, but a captured stale text revision refuses without mutation.
+   - Deliver Repeat Enter to `handle_raw_input_event` with nonempty text and no
+     pending ticket: zero submissions. Press Enter submits once; repeated Enter
+     still never submits, including after a fresh draft replaces the cleared one.
+   - Deliver a native paste event: a typed refusal toast, unchanged editor and zero
+     queue items. Preserve float/PTY ownership as regression coverage. #2701 covers
+     malformed raw pastes that currently fail before event delivery.
+   - Detach/reattach while the old acknowledgement is held, then release it: it must
+     not clear or settle a new editor with the same text and canonical generation.
+2. **D3b — post-MVP: remaining editor keys and caret rendering (#2702).** Add
+   forward/word deletion, word/line/draft/vertical movement and newline routing.
+   Public acceptance edits combining/flag/ZWJ text through actual key events,
+   inspecting the painted caret and admitted body. Ctrl-J/distinct Shift-Enter adds
+   LF without admission; plain Enter submits once. Prefix Ctrl-A and direct Ctrl-J
+   bindings demonstrate the documented gaps without stealing App ownership. Test
+   App bindings, prefix, modal, float and control focus. Clicking the composer leaves
+   control selection; mouse caret placement is separate #2699. End still follows
+   tail as regression coverage. Key release performs no editor operation; test release-only
+   events here. Repeat-Enter acceptance belongs to D3a.
+3. **D3c — post-MVP: bounded byte-paste framing integration (#2705).** Shared
+   parser hardening #2701 is a prerequisite, or is fixed in the first child here.
+   Capture App destination policy/context at paste-begin, then stream existing
+   input-byte frames with per-connection incremental framing and typed internal
+   completion/refusal. Native insertion remains disabled with D3a's refusal toast.
+   Public acceptance feeds the real client/server raw-input entry with chunk splits
+   inside UTF-8 and delimiters: exact-limit paste arrives once, overflow/invalid
+   UTF-8 refuses once with bounded retained bytes, and tail/newline is never
+   dispatched. Termination/disconnect leaves the next independent input processable;
+   producer death or silence must fail a bounded test, never hang it.
+4. **D3d — post-MVP: atomic native paste routing (#2703).** Revalidate captured
+   App target/focus, normalize/validate and apply one insertion/text revision.
+   Public acceptance uses the same raw-input path on a fake-started native pane:
+   64-KiB boundaries, combined draft overflow, NUL/ESC/C1, CRLF/TAB, and focus/mode/
+   generation changes. Assert exact text/cursor/text revision, unchanged state on
+   refusal and zero queue items until explicit Enter. PTY/float forwarding retains
+   regression coverage through its real paths.
+5. **D3e — post-MVP: bounded history and lifecycle/receipt integration (#2704).**
+   Add history recall/scratch restoration, lifecycle-ID-bearing admission receipt
+   rendering and editor cleanup. Public acceptance commits real fake-worker turns,
+   recalls/edits/submits, covers both history caps, then detaches/reattaches and
+   retires a generation. Recalling equal text does not change text revision;
+   recalling different text does. Assert a fresh editor/text revision and the same
+   durable queue item. A held-busy/then-idle fake worker proves one admission receipt
+   before delivery and one delivery only at idle, as regression coverage. Refusal/
+   unknown retains drafts without automatic retry while the ticket lives; existing
+   detach latch loss is documented, with reconciliation/fix owned by #2700. No new
+   delivery policy or persisted history format is introduced.
+
+For every slice, run its new public acceptance tests against its parent once and
+record the command, behavioral failures and exit code, then record the passing
+focused selection on the child. Preserved App/PTY routing, idle policy and existing
+scroll behavior are explicitly regression coverage; tests for them may pass on the
+parent and must not be claimed as fail-first evidence for the new feature.
+Framing/routing may be split into smaller children rather than merging a partially
+unbounded paste path as a completed native feature.
+
+
+### Amendment: S10e native TUI permission decisions (#1430, #1424)
+
+A full TUI attach over `flock.sock` captures kernel peer credentials before Hello.
+The existing LocalOperator admission seals that process instance and arms its exit
+watch before issuing an existing ADR-0038 §6 app-session token. Its fixed scopes
+are Read, Send, Answer and Operate, with the same suspend-inclusive 12-hour TTL.
+The bearer stays inside the server; neither Hello nor an input frame can supply
+or select one. Direct terminal attaches receive no permission capability.
+
+Each native decision uses only the input connection's session and sealed peer.
+Process identity, liveness, expiry and Operate scope are checked at the existing
+shared admission fence, through `Principal::Token`. Exact request id, request
+sequence and target generation remain mandatory. Allow once resumes the paused
+turn; Deny sends the harness its denial. UID-only or internal interactive calls
+continue to refuse with `not_authorized`; this does not widen send-only principals.
+Per #2585, Answer alone cannot authorize `agent.decide`: missing Operate refuses
+with `not_authorized`. A direct attach without a capability entry also refuses
+with `not_authorized`.
+
+Detach removes the input capability before retiring the credential under the
+existing revocation fence. Retirement errors are logged and the detached
+connection remains disabled. Owner exit and TTL expiry refuse queued decisions
+with `auth_revoked`, even before EOF or a cleanup notification is serviced.
+Reattach mints a new credential and reruns admission. TUI LocalOperator proof
+refusals (unverified UID/origin, agent/relay ancestry, or unavailable process
+evidence) map explicitly to `not_authorized`. A stored credential that has been
+revoked or expired remains `auth_revoked`; the per-decision process-binding check
+continues to report `peer_process_changed` for mismatched evidence. Registration
+uses the production `wait_peer`/`register_peer` fence and the existing GUI handshake
+budget. Detach uses the production begin/wait/finish mutation phases in every
+build. Scheduling these TUI phases off the App thread remains tracked in #2712.
+No credential is persisted or transferred at handoff.
+This slice covers Allow once and Deny. Always (session) remains refused with
+`permission_decision_unsupported` pending the confirmation flow tracked in #1430.

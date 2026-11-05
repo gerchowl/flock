@@ -247,10 +247,38 @@ impl AdmissionFixture {
         .await;
         assert_eq!(
             self.app.state.workspaces.len(),
-            0,
-            "structured launch creates no pane"
+            1,
+            "structured launch creates one native placement"
         );
         (id, generation)
+    }
+    async fn native_initialized(&mut self, id: &str, generation: u64) {
+        let wake = self.app.render_notify.clone();
+        crate::structured::workers::tests::wait(&wake, || {
+            self.app.service_structured_workers(Instant::now());
+            assert!(
+                self.app.structured_workers.report(id, generation).is_none(),
+                "placement producer exited before post-init readiness"
+            );
+            let frame = self.app.state.native_frames[id]
+                .as_ref()
+                .expect("native source failure");
+            // The status follows init through the runtime inspector. An input
+            // audit can be published before the runtime refuses a forbidden init.
+            frame.reported_model.as_deref() == Some("claude-haiku-5-5")
+                && self
+                    .app
+                    .state
+                    .structured_agents
+                    .get(id)
+                    .unwrap()
+                    .1
+                    .update
+                    .state
+                    .turn
+                    == crate::api::agent_state::Turn::Working
+        })
+        .await;
     }
     fn submit(&self, id: &str, generation: u64) {
         use crate::structured::{
@@ -543,9 +571,7 @@ async fn socket_structured_start_refuses_unavailable_launcher_and_unsupported_se
     assert!(!fixture.fixture.root.path().join("version.pid").exists());
     fixture.app.state.config.structured.run_as = crate::structured::launch::RunAs::Operator;
     for (field, value) in [
-        ("focus", json!(true)),
         ("here", json!(true)),
-        ("active", json!(true)),
         ("dry_run", json!(true)),
         ("workspace_id", json!("fixture-space")),
         ("tab_id", json!("fixture-tab")),
@@ -760,3 +786,811 @@ async fn directory_change_is_emitted_once_for_a_real_structured_launch() {
         assert_eq!(changes(&fixture.app), 1, "unchanged reads must not emit");
     }
 }
+
+#[tokio::test]
+async fn public_structured_start_and_focus_reuse_native_placement() {
+    let _guard = crate::config::test_config_env_guard();
+    let mut fixture = AdmissionFixture::new("s4-accepted-silent", 5000);
+    let (id, generation) = fixture.start().await;
+    let get = fixture
+        .request(Method::AgentGet(crate::api::schema::AgentTarget {
+            target: id.clone(),
+        }))
+        .await;
+    let view = get["result"]["agent"]["view"].clone();
+    assert!(
+        view.is_object(),
+        "public start must expose its real placement: {get}"
+    );
+    let count = fixture.app.state.workspaces[0].tabs[0].layout.pane_count();
+    let focused = fixture
+        .request(Method::AgentFocus(crate::api::schema::AgentTarget {
+            target: id.clone(),
+        }))
+        .await;
+    assert_eq!(focused["result"]["agent"]["view"], view);
+    assert_eq!(
+        fixture.app.state.workspaces[0].tabs[0].layout.pane_count(),
+        count
+    );
+    assert_eq!(fixture.app.terminal_runtimes.len(), 0);
+    assert!(fixture.app.state.terminals.is_empty());
+    let pane = fixture.app.state.workspaces[0].tabs[0].root_pane;
+    assert!(fixture.app.state.workspaces[0].close_pane(pane));
+    fixture.app.state.workspaces.clear();
+    fixture.app.state.active = None;
+    assert!(fixture
+        .app
+        .structured_workers
+        .runtime(&id, generation)
+        .is_some());
+    let detached = fixture
+        .request(Method::AgentGet(crate::api::schema::AgentTarget {
+            target: id.clone(),
+        }))
+        .await;
+    assert!(detached["result"]["agent"]["view"].is_null());
+    let reattached = fixture
+        .request(Method::AgentFocus(crate::api::schema::AgentTarget {
+            target: id.clone(),
+        }))
+        .await;
+    assert!(reattached["result"]["agent"]["view"].is_object());
+    assert!(fixture
+        .app
+        .structured_workers
+        .runtime(&id, generation)
+        .is_some());
+    assert!(fixture.app.state.terminals.is_empty());
+}
+
+#[tokio::test]
+async fn public_placement_owns_one_driver_and_detach_keeps_the_worker() {
+    let _guard = crate::config::test_config_env_guard();
+    let mut fixture = AdmissionFixture::new("init-restricted", 5000);
+    let (id, generation) = fixture.start().await;
+    fixture.app.service_structured_workers(Instant::now());
+    assert!(
+        fixture.app.state.native_frames.contains_key(&id),
+        "public start must register its native controller"
+    );
+    let task = fixture.app.structured_views[&id].id();
+    fixture.submit(&id, generation);
+    fixture.native_initialized(&id, generation).await;
+    let held = fixture.app.state.native_frames[&id]
+        .as_ref()
+        .unwrap()
+        .clone();
+    let reply = fixture
+        .request(Method::AgentFocus(crate::api::schema::AgentTarget {
+            target: id.clone(),
+        }))
+        .await;
+    assert!(reply["result"].is_object(), "{reply}");
+    assert_eq!(fixture.app.structured_views[&id].id(), task);
+    fixture.app.state.close_pane();
+    fixture.app.service_structured_workers(Instant::now());
+    assert!(!fixture.app.structured_views.contains_key(&id));
+    assert!(!fixture.app.state.native_frames.contains_key(&id));
+    assert!(fixture
+        .app
+        .structured_workers
+        .runtime(&id, generation)
+        .is_some());
+    fixture
+        .request(Method::AgentFocus(crate::api::schema::AgentTarget {
+            target: id.clone(),
+        }))
+        .await;
+    fixture.native_initialized(&id, generation).await;
+    assert_ne!(fixture.app.structured_views[&id].id(), task);
+    fixture
+        .app
+        .state
+        .structured_agents
+        .begin_launch(&id, generation)
+        .unwrap();
+    fixture.app.service_structured_workers(Instant::now());
+    assert!(!fixture.app.structured_views.contains_key(&id));
+    assert!(matches!(
+        fixture.app.state.native_frames.get(&id),
+        Some(Err(ErrorCode::AgentNotFound))
+    ));
+    assert_eq!(held.target.generation, generation);
+}
+
+thread_local! {
+    pub(super) static FAIL_PLACEMENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+#[tokio::test]
+async fn admitted_start_returns_typed_unplaced_result_and_can_focus_later() {
+    let _guard = crate::config::test_config_env_guard();
+    let mut fixture = AdmissionFixture::new("s4-accepted-silent", 5000);
+    FAIL_PLACEMENT.with(|flag| flag.set(true));
+    let params = serde_json::from_value(json!({"name":"fixture-launch", "runtime":"structured", "model":"fixture-worker-model", "cwd":fixture.fixture.root.path().join("project"), "argv":["claude"]})).unwrap();
+    let reply = fixture.request(Method::AgentStart(params)).await;
+    assert_eq!(
+        reply["result"]["type"], "structured_agent_started_unplaced",
+        "{reply}"
+    );
+    let result = &reply["result"];
+    assert_eq!(result["placement_error"]["code"], "internal_error");
+    assert_eq!(
+        crate::api::effect_exit_code(result),
+        Some(crate::cli::exit::FAILURE)
+    );
+    let id = result["agent_id"].as_str().unwrap().to_owned();
+    let generation = result["generation"].as_u64().unwrap();
+    assert_eq!(fixture.app.state.structured_agents.records().len(), 1);
+    assert!(fixture.app.state.workspaces.is_empty());
+    let notify = fixture.app.render_notify.clone();
+    crate::structured::workers::tests::wait(&notify, || {
+        fixture.app.structured_workers.poll(
+            &mut fixture.app.state.structured_agents,
+            Instant::now(),
+            1000,
+        );
+        assert!(fixture
+            .app
+            .structured_workers
+            .report(&id, generation)
+            .is_none());
+        fixture
+            .app
+            .structured_workers
+            .runtime(&id, generation)
+            .is_some()
+    })
+    .await;
+    let get = fixture
+        .request(Method::AgentGet(crate::api::schema::AgentTarget {
+            target: id.clone(),
+        }))
+        .await;
+    assert_eq!(get["result"]["agent"]["agent_id"], id);
+    let focused = fixture
+        .request(Method::AgentFocus(crate::api::schema::AgentTarget {
+            target: id.clone(),
+        }))
+        .await;
+    assert!(focused["result"]["agent"]["view"].is_object(), "{focused}");
+    assert_eq!(fixture.app.state.structured_agents.records().len(), 1);
+    assert!(fixture
+        .app
+        .structured_workers
+        .runtime(&id, generation)
+        .is_some());
+    assert!(fixture.app.state.terminals.is_empty());
+}
+
+#[tokio::test]
+async fn public_native_placement_renders_its_frame_and_fences_a_stale_cut() {
+    use ratatui::{backend::TestBackend, Terminal};
+    let _guard = crate::config::test_config_env_guard();
+    let mut fixture = AdmissionFixture::new("init-restricted", 5000);
+    let (id, generation) = fixture.start().await;
+    fixture.submit(&id, generation);
+    let wake = fixture.app.render_notify.clone();
+    crate::structured::workers::tests::wait(&wake, || {
+        fixture.app.service_structured_workers(Instant::now());
+        matches!(fixture.app.state.native_frames.get(&id), Some(Ok(f)) if f.applied_cursor > 0)
+    })
+    .await;
+    let frame = fixture.app.state.native_frames[&id]
+        .as_ref()
+        .unwrap()
+        .clone();
+    let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    let text = |terminal: &Terminal<TestBackend>| {
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>()
+    };
+    crate::ui::compute_view_with_runtime_registry(
+        &mut fixture.app.state,
+        &fixture.app.terminal_runtimes,
+        ratatui::layout::Rect::new(0, 0, 100, 30),
+    );
+    terminal
+        .draw(|f| {
+            crate::ui::render_with_runtime_registry(
+                &fixture.app.state,
+                &fixture.app.terminal_runtimes,
+                f,
+            )
+        })
+        .unwrap();
+    let first = text(&terminal);
+    assert!(
+        first.contains("queued for idle"),
+        "native queue region missing: {first}"
+    );
+    assert!(first.contains("Tokens I/O:") && first.contains("Admission:"));
+    assert!(
+        fixture.app.state.terminals.is_empty(),
+        "native painting needs no PTY"
+    );
+    terminal
+        .draw(|f| {
+            crate::ui::render_with_runtime_registry(
+                &fixture.app.state,
+                &fixture.app.terminal_runtimes,
+                f,
+            )
+        })
+        .unwrap();
+    assert_eq!(text(&terminal), first);
+    assert_eq!(frame.target.generation, generation);
+    fixture
+        .app
+        .state
+        .native_frames
+        .insert(id.clone(), Err(ErrorCode::QueueSourceCold));
+    crate::ui::compute_view_with_runtime_registry(
+        &mut fixture.app.state,
+        &fixture.app.terminal_runtimes,
+        ratatui::layout::Rect::new(0, 0, 100, 30),
+    );
+    terminal
+        .draw(|f| {
+            crate::ui::render_with_runtime_registry(
+                &fixture.app.state,
+                &fixture.app.terminal_runtimes,
+                f,
+            )
+        })
+        .unwrap();
+    assert!(text(&terminal).contains("queue_source_cold"));
+    fixture
+        .app
+        .state
+        .native_frames
+        .insert(id.clone(), Ok(frame.clone()));
+    crate::ui::compute_view_with_runtime_registry(
+        &mut fixture.app.state,
+        &fixture.app.terminal_runtimes,
+        ratatui::layout::Rect::new(0, 0, 100, 30),
+    );
+    fixture
+        .app
+        .state
+        .structured_agents
+        .begin_launch(&id, generation)
+        .unwrap();
+    terminal
+        .draw(|f| {
+            crate::ui::render_with_runtime_registry(
+                &fixture.app.state,
+                &fixture.app.terminal_runtimes,
+                f,
+            )
+        })
+        .unwrap();
+    let stale = text(&terminal);
+    assert!(stale.contains("agent_not_found") && !stale.contains("queued for idle"));
+}
+
+#[tokio::test]
+async fn public_native_keyboard_close_detaches_without_stopping() {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    let _guard = crate::config::test_config_env_guard();
+    let mut fixture = AdmissionFixture::new("init-restricted", 5000);
+    let (id, generation) = fixture.start().await;
+    fixture.app.state.mode = crate::app::Mode::Terminal;
+    fixture
+        .app
+        .handle_terminal_key_headless(crate::input::TerminalKey::new(
+            KeyCode::Char('w'),
+            KeyModifiers::CONTROL,
+        ));
+    assert!(
+        fixture
+            .app
+            .state
+            .workspaces
+            .iter()
+            .flat_map(|w| &w.tabs)
+            .all(|t| t.native_views.is_empty()),
+        "native close key must detach placement"
+    );
+    assert_eq!(
+        fixture.app.state.structured_agents.get(&id).unwrap().2,
+        generation
+    );
+    assert!(fixture
+        .app
+        .structured_workers
+        .runtime(&id, generation)
+        .is_some());
+}
+
+#[tokio::test]
+async fn public_native_enter_submits_current_draft_once_without_terminal_bytes() {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    let _guard = crate::config::test_config_env_guard();
+    let mut fixture = AdmissionFixture::new("init-restricted", 5000);
+    let (id, generation) = fixture.start().await;
+    let text = "MVP 中文 e\u{301}\nnext";
+    seed_native_draft(&mut fixture, &id, generation, text, text.len());
+    fixture.app.state.mode = crate::app::Mode::Terminal;
+    crate::ui::compute_view_with_runtime_registry(
+        &mut fixture.app.state,
+        &fixture.app.terminal_runtimes,
+        ratatui::layout::Rect::new(0, 0, 100, 40),
+    );
+    let enter = crate::input::TerminalKey::new(KeyCode::Enter, KeyModifiers::empty());
+    fixture.app.handle_terminal_key_headless(enter);
+    fixture.app.handle_terminal_key_headless(enter);
+    assert!(
+        matches!(fixture.app.state.toast.as_ref(), Some(t) if t.context == "session_busy"),
+        "second Send must see pending admission"
+    );
+    let wake = fixture.app.render_notify.clone();
+    crate::structured::workers::tests::wait(&wake, || {
+        fixture.app.service_structured_workers(Instant::now());
+        matches!(fixture.app.state.native_frames.get(&id), Some(Ok(f)) if f.queue.iter().any(|i| i.body == text))
+    }).await;
+    crate::structured::workers::tests::wait(&wake, || {
+        fixture.app.service_structured_workers(Instant::now());
+        matches!(fixture.app.state.native_frames.get(&id), Some(Ok(f)) if f.composer.text.is_empty())
+    }).await;
+    let frame = fixture.app.state.native_frames[&id].as_ref().unwrap();
+    assert_eq!(frame.queue.iter().filter(|i| i.body == text).count(), 1);
+    assert!(
+        frame.composer.text.is_empty(),
+        "only the committed draft is cleared"
+    );
+    assert!(fixture.app.state.terminals.is_empty());
+    fixture.app.handle_paste("not a submission".into()).await;
+    assert!(fixture.app.state.native_frames[&id]
+        .as_ref()
+        .unwrap()
+        .composer
+        .text
+        .is_empty());
+    fixture.app.handle_terminal_key_headless(enter);
+    assert!(
+        matches!(fixture.app.state.toast.as_ref(),Some(t) if t.context == "invalid_params"),
+        "empty current draft must refuse before queue admission"
+    );
+    assert!(fixture.app.native_submissions.is_empty());
+}
+
+// Regression coverage for S10d2b (#2683), already present before S10d2c.
+#[tokio::test]
+async fn regression_public_native_mouse_uses_painted_fold_and_rejects_stale_hits() {
+    use crate::structured::view::contracts::Action;
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    let _guard = crate::config::test_config_env_guard();
+    let mut fixture = AdmissionFixture::new("init-restricted", 5000);
+    let (id, generation) = fixture.start().await;
+    fixture.submit(&id, generation);
+    fixture.app.state.mode = crate::app::Mode::Terminal;
+    let wake = fixture.app.render_notify.clone();
+    crate::structured::workers::tests::wait(&wake, || {
+        fixture.app.service_structured_workers(Instant::now());
+        matches!(fixture.app.state.native_frames.get(&id), Some(Ok(f)) if !f.transcript.is_empty())
+    })
+    .await;
+    let area = ratatui::layout::Rect::new(0, 0, 100, 40);
+    crate::ui::compute_view_with_runtime_registry(
+        &mut fixture.app.state,
+        &fixture.app.terminal_runtimes,
+        area,
+    );
+    let (pane, prepared) = fixture.app.state.view.structured.iter().next().unwrap();
+    let pane_id = *pane;
+    let prepared = prepared.pane.as_ref().unwrap();
+    let (x, y, card) = (0..40)
+        .flat_map(|y| (0..100).map(move |x| (x, y)))
+        .find_map(|(x, y)| match prepared.hit(x, y) {
+            Some(Action::ToggleFold(id)) => Some((x, y, *id)),
+            _ => None,
+        })
+        .unwrap();
+    let click = MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: x,
+        row: y,
+        modifiers: KeyModifiers::empty(),
+    };
+    fixture.app.handle_mouse(click);
+    crate::structured::workers::tests::wait(&wake, || {
+        fixture.app.service_structured_workers(Instant::now());
+        matches!(fixture.app.state.native_frames.get(&id), Some(Ok(f)) if f.collapsed.contains(&card))
+    }).await;
+    assert_eq!(
+        fixture.app.state.workspaces[0].focused_pane_id(),
+        Some(pane_id)
+    );
+    assert!(fixture.app.state.terminals.is_empty());
+    crate::ui::compute_view_with_runtime_registry(
+        &mut fixture.app.state,
+        &fixture.app.terminal_runtimes,
+        area,
+    );
+    let prepared = fixture.app.state.view.structured[&pane_id]
+        .pane
+        .as_ref()
+        .unwrap();
+    let (dx, dy) = prepared
+        .positions()
+        .into_iter()
+        .find(|&(x, y)| matches!(prepared.hit(x,y),Some(Action::InspectCard(id)) if *id == card))
+        .unwrap();
+    fixture.app.handle_mouse(MouseEvent {
+        column: dx,
+        row: dy,
+        ..click
+    });
+    crate::structured::workers::tests::wait(&wake, || {
+        fixture.app.service_structured_workers(Instant::now());
+        matches!(fixture.app.state.native_frames.get(&id),Some(Ok(f)) if !f.collapsed.contains(&card) && f.scroll_anchor == Some(card.seq))
+    }).await;
+    crate::ui::compute_view_with_runtime_registry(
+        &mut fixture.app.state,
+        &fixture.app.terminal_runtimes,
+        area,
+    );
+    fixture
+        .app
+        .state
+        .structured_agents
+        .begin_launch(&id, generation)
+        .unwrap();
+    fixture.app.handle_mouse(click);
+    assert_eq!(
+        fixture.app.state.toast.as_ref().unwrap().context,
+        "agent_not_found"
+    );
+    assert!(fixture.app.state.workspaces[0].tabs[0]
+        .native_views
+        .contains_key(&pane_id));
+}
+
+// Apply typed operations to the real App authority without raw-key routing (D3a2).
+fn seed_native_draft(
+    fixture: &mut AdmissionFixture,
+    id: &str,
+    generation: u64,
+    text: &str,
+    cursor: usize,
+) {
+    use crate::structured::view::{editor::Edit, Target};
+    fixture.app.sync_structured_views();
+    let target = Target {
+        agent_id: id.into(),
+        generation,
+    };
+    let count = fixture.app.state.native_editors[id]
+        .cut
+        .composer
+        .text
+        .chars()
+        .count();
+    fixture.app.edit_native(&target, Edit::Right).unwrap();
+    for _ in 0..count {
+        fixture.app.edit_native(&target, Edit::Right).unwrap();
+    }
+    for _ in 0..count {
+        fixture.app.edit_native(&target, Edit::Backspace).unwrap();
+    }
+    for c in text.chars() {
+        fixture.app.edit_native(&target, Edit::Insert(c)).unwrap();
+    }
+    while fixture.app.state.native_editors[id].cut.composer.cursor > cursor {
+        fixture.app.edit_native(&target, Edit::Left).unwrap();
+    }
+    fixture.app.state.mode = crate::app::Mode::Terminal;
+}
+fn native_enter(fixture: &mut AdmissionFixture) {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    fixture
+        .app
+        .handle_terminal_key_headless(crate::input::TerminalKey::new(
+            KeyCode::Enter,
+            KeyModifiers::empty(),
+        ));
+}
+
+#[tokio::test]
+async fn public_native_unknown_admission_keeps_draft_and_refuses_next_enter() {
+    use crate::{api::error_code::ErrorCode, structured::view::contracts::Admission};
+    let _guard = crate::config::test_config_env_guard();
+    let mut fixture = AdmissionFixture::new("init-restricted", 5000);
+    let (id, generation) = fixture.start().await;
+    let text = "uncertain draft";
+    seed_native_draft(&mut fixture, &id, generation, text, text.len());
+    native_enter(&mut fixture);
+    // Lose completion routing after enqueue, before the App consumes the owner
+    // acknowledgement. The ticket disconnects; durable work is not cancelled.
+    fixture.app.structured_sends = Default::default();
+    fixture.app.sync_structured_views();
+    native_enter(&mut fixture);
+    assert_eq!(
+        fixture.app.state.toast.as_ref().map(|t| t.context.as_str()),
+        Some(ErrorCode::InputWriteUnknown.as_str())
+    );
+    let wake = fixture.app.render_notify.clone();
+    crate::structured::workers::tests::wait(&wake, || {
+        fixture.app.service_structured_workers(Instant::now());
+        matches!(fixture.app.state.native_frames.get(&id), Some(Ok(f))
+            if matches!(f.admission, Admission::Refused(ErrorCode::InputWriteUnknown))
+                && f.queue.iter().any(|i| i.body == text))
+    })
+    .await;
+    native_enter(&mut fixture);
+    assert_eq!(
+        fixture.app.state.toast.as_ref().unwrap().context,
+        ErrorCode::InputWriteUnknown.as_str()
+    );
+    let frame = fixture.app.state.native_frames[&id].as_ref().unwrap();
+    assert_eq!(frame.composer.text, text);
+    assert_eq!(frame.composer.cursor, text.len());
+    assert_eq!(frame.queue.iter().filter(|i| i.body == text).count(), 1);
+    assert!(fixture.app.state.terminals.is_empty());
+}
+
+async fn public_native_changed_draft_survives_clear(text_changed: bool) {
+    use crate::structured::view::contracts::Admission;
+    let _guard = crate::config::test_config_env_guard();
+    let mut fixture = AdmissionFixture::new("init-restricted", 5000);
+    let (id, generation) = fixture.start().await;
+    let original = "submitted draft";
+    seed_native_draft(&mut fixture, &id, generation, original, original.len());
+    native_enter(&mut fixture);
+    native_enter(&mut fixture);
+    assert_eq!(
+        fixture.app.state.toast.as_ref().map(|t| t.context.as_str()),
+        Some(crate::api::error_code::ErrorCode::SessionBusy.as_str())
+    );
+    let (changed, cursor) = if text_changed {
+        ("newer draft", 11)
+    } else {
+        (original, 0)
+    };
+    // The operator's newer editor cut arrives while the durable ticket is pending.
+    // Preserve Pending so Ready proves the real ticket's completion was applied.
+    seed_native_draft(&mut fixture, &id, generation, changed, cursor);
+    let wake = fixture.app.render_notify.clone();
+    crate::structured::workers::tests::wait(&wake, || {
+        fixture.app.service_structured_workers(Instant::now());
+        matches!(fixture.app.state.native_frames.get(&id), Some(Ok(f))
+            if matches!(f.admission, Admission::Ready)
+                && f.queue.iter().any(|i| i.body == original))
+    })
+    .await;
+    let frame = fixture.app.state.native_frames[&id].as_ref().unwrap();
+    assert_eq!(frame.composer.text, changed);
+    assert_eq!(frame.composer.cursor, cursor);
+    assert_eq!(frame.queue.iter().filter(|i| i.body == original).count(), 1);
+    assert!(fixture.app.state.terminals.is_empty());
+}
+#[tokio::test]
+async fn public_native_changed_text_is_not_cleared_after_admission() {
+    public_native_changed_draft_survives_clear(true).await;
+}
+#[tokio::test]
+async fn public_native_aba_text_is_not_cleared_after_admission() {
+    public_native_changed_draft_survives_clear(false).await;
+}
+
+#[tokio::test]
+async fn d3a1_cursor_preserves_revision_and_painted_send() {
+    use crate::structured::view::{editor::Edit, Target};
+    let _guard = crate::config::test_config_env_guard();
+    let mut fixture = AdmissionFixture::new("init-restricted", 5000);
+    let (id, generation) = fixture.start().await;
+    seed_native_draft(&mut fixture, &id, generation, "hello", 5);
+    let target = Target {
+        agent_id: id.clone(),
+        generation,
+    };
+    let painted = fixture.app.state.native_editors[&id].cut.composer.clone();
+    fixture.app.edit_native(&target, Edit::Left).unwrap();
+    assert_eq!(
+        fixture.app.state.native_editors[&id]
+            .cut
+            .composer
+            .text_revision,
+        painted.text_revision
+    );
+    assert!(
+        fixture.app.submit_native(target, painted).is_ok(),
+        "cursor movement does not stale a painted Send"
+    );
+}
+
+#[tokio::test]
+async fn d3a1_ack_clears_after_cursor_move() {
+    use crate::structured::view::{editor::Edit, Target};
+    let _guard = crate::config::test_config_env_guard();
+    let mut fixture = AdmissionFixture::new("init-restricted", 5000);
+    let (id, generation) = fixture.start().await;
+    seed_native_draft(&mut fixture, &id, generation, "hello", 5);
+    native_enter(&mut fixture);
+    let (ack, release) = hold_native_ack(&mut fixture, &id, generation).await;
+    fixture
+        .app
+        .edit_native(
+            &Target {
+                agent_id: id.clone(),
+                generation,
+            },
+            Edit::Left,
+        )
+        .unwrap();
+    release.send(ack).unwrap();
+    let wake = fixture.app.render_notify.clone();
+    crate::structured::workers::tests::wait(&wake, || {
+        fixture.app.service_structured_workers(Instant::now());
+        fixture.app.state.native_frames[&id]
+            .as_ref()
+            .is_ok_and(|f| f.composer.text.is_empty() && f.queue.iter().any(|q| q.body == "hello"))
+    })
+    .await;
+    assert_eq!(fixture.app.state.native_editors[&id].cut.composer.cursor, 0);
+    native_enter(&mut fixture);
+    assert_eq!(
+        fixture.app.state.toast.as_ref().unwrap().context,
+        "invalid_params"
+    );
+}
+
+#[tokio::test]
+async fn d3a1_aba_revision_survives_ack() {
+    use crate::structured::view::{editor::Edit, Target};
+    let _guard = crate::config::test_config_env_guard();
+    let mut fixture = AdmissionFixture::new("init-restricted", 5000);
+    let (id, generation) = fixture.start().await;
+    seed_native_draft(&mut fixture, &id, generation, "hello", 5);
+    let before = fixture.app.state.native_editors[&id]
+        .cut
+        .composer
+        .text_revision;
+    native_enter(&mut fixture);
+    let target = Target {
+        agent_id: id.clone(),
+        generation,
+    };
+    fixture.app.edit_native(&target, Edit::Insert('!')).unwrap();
+    fixture.app.edit_native(&target, Edit::Backspace).unwrap();
+    let after = fixture.app.state.native_editors[&id]
+        .cut
+        .composer
+        .text_revision;
+    assert!(after > before);
+    let wake = fixture.app.render_notify.clone();
+    crate::structured::workers::tests::wait(&wake, || {
+        fixture.app.service_structured_workers(Instant::now());
+        fixture.app.state.native_frames[&id]
+            .as_ref()
+            .is_ok_and(|f| {
+                matches!(
+                    f.admission,
+                    crate::structured::view::contracts::Admission::Ready
+                ) && f.queue.iter().any(|q| q.body == "hello")
+            })
+    })
+    .await;
+    assert_eq!(
+        fixture.app.state.native_editors[&id].cut.composer.text,
+        "hello"
+    );
+    assert_eq!(
+        fixture.app.state.native_editors[&id]
+            .cut
+            .composer
+            .text_revision,
+        after
+    );
+}
+
+#[tokio::test]
+async fn d3a1_stale_painted_send_refuses_aba() {
+    use crate::structured::view::{editor::Edit, Target};
+    let _guard = crate::config::test_config_env_guard();
+    let mut fixture = AdmissionFixture::new("init-restricted", 5000);
+    let (id, generation) = fixture.start().await;
+    seed_native_draft(&mut fixture, &id, generation, "hello", 5);
+    let wake = fixture.app.render_notify.clone();
+    crate::structured::workers::tests::wait(&wake, || {
+        fixture.app.service_structured_workers(Instant::now());
+        fixture.app.state.native_frames[&id]
+            .as_ref()
+            .is_ok_and(|f| {
+                f.composer.text_revision
+                    == fixture.app.state.native_editors[&id]
+                        .cut
+                        .composer
+                        .text_revision
+            })
+    })
+    .await;
+    crate::ui::compute_view_with_runtime_registry(
+        &mut fixture.app.state,
+        &fixture.app.terminal_runtimes,
+        ratatui::layout::Rect::new(0, 0, 100, 40),
+    );
+    let pane_id = fixture.app.state.workspaces[0].focused_pane_id().unwrap();
+    let pane = fixture
+        .app
+        .state
+        .view
+        .structured
+        .remove(&pane_id)
+        .unwrap()
+        .pane
+        .unwrap();
+    let (x, y) = pane
+        .positions()
+        .into_iter()
+        .find(|&(x, y)| {
+            matches!(
+                pane.hit(x, y),
+                Some(crate::structured::view::contracts::Action::Send(_))
+            )
+        })
+        .unwrap();
+    let painted = pane.into_intent(x, y).unwrap();
+    let target = Target {
+        agent_id: id.clone(),
+        generation,
+    };
+    fixture.app.edit_native(&target, Edit::Insert('!')).unwrap();
+    fixture.app.edit_native(&target, Edit::Backspace).unwrap();
+    assert_eq!(
+        fixture.app.dispatch_native_intent(pane_id, painted),
+        Err(crate::api::error_code::ErrorCode::InvalidParams)
+    );
+    assert!(fixture.app.native_submissions.is_empty());
+    assert_eq!(
+        fixture.app.state.native_editors[&id].cut.composer.text,
+        "hello"
+    );
+}
+
+mod composer;
+
+type HeldNativeAck = Result<crate::api::schema::AgentSendResult, crate::api::error_code::ErrorCode>;
+async fn hold_native_ack(
+    f: &mut AdmissionFixture,
+    id: &str,
+    generation: u64,
+) -> (HeldNativeAck, std::sync::mpsc::Sender<HeldNativeAck>) {
+    let receipt = f.app.state.native_editors[id].cut.receipt.as_ref().unwrap();
+    let (held, release) = f
+        .app
+        .structured_sends
+        .intercept_completion(id, generation, receipt)
+        .unwrap();
+    let mut ack = None;
+    let wake = f.app.render_notify.clone();
+    crate::structured::workers::tests::wait(&wake, || {
+        f.app.service_structured_workers(Instant::now());
+        match held.try_recv() {
+            Ok(result) => {
+                ack = Some(result);
+                true
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                panic!("owner completion producer disappeared")
+            }
+        }
+    })
+    .await;
+    let ack = ack.unwrap();
+    assert!(ack.is_ok(), "real owner refused admission: {ack:?}");
+    assert!(
+        f.app.native_submissions.contains_key(id),
+        "held acknowledgement must not settle the ticket"
+    );
+    (ack, release)
+}
+
+mod native_permissions;

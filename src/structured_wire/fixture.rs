@@ -11,6 +11,9 @@
 use super::*;
 use std::collections::BTreeMap;
 
+/// Fixed token identity shared by permission fixture producers and wire assertions.
+pub(crate) const TOKEN_PRINCIPAL: &str = "0123456789abcdef0123456789abcdef";
+
 /// One versioned script line. Additive transport fields are allowed, script typos aren't.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -20,6 +23,124 @@ pub struct FixtureLine {
     /// Script operation.
     #[serde(flatten)]
     pub step: FixtureStep,
+}
+
+/// Expected server frame, with explicit wall-clock and compiled-build oracles.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(untagged)]
+pub enum FixtureServerFrame {
+    /// Ordinary frames retain exact literal values.
+    Literal(ServerFrame),
+    /// A dynamic event timestamp requires independent persistence and window oracles.
+    Dynamic(DynamicEvent),
+    /// Welcome with an independently supplied build-version oracle.
+    Build(DynamicWelcome),
+}
+
+/// Welcome with a build marker; every other field remains literal.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(tag = "t", rename_all = "snake_case", deny_unknown_fields)]
+pub enum DynamicWelcome {
+    /// Authenticated build identity and exact grants.
+    Welcome {
+        /// Structured wire version.
+        protocol: u32,
+        /// Expected independently supplied build version.
+        server_version: BuildVersion,
+        /// Exact advertised grants.
+        capabilities: Vec<String>,
+        /// Literal token identity.
+        principal: String,
+        /// Literal diagnostic epoch.
+        server_epoch: String,
+        /// Literal command retention window.
+        #[cfg_attr(feature = "ts", ts(type = "number"))]
+        idempotency_window_ms: u64,
+    },
+}
+/// The only build matcher, permitted at welcome.server_version.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(
+    tag = "$dynamic",
+    content = "source",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum BuildVersion {
+    /// Compare with the Rust driver's package version.
+    ServerVersion(BuildSource),
+}
+/// Build evidence must come from the test driver's compiled package metadata.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum BuildSource {
+    /// Independently compiled version, never extracted from received frames.
+    Build,
+}
+
+/// The sole dynamic timestamp marker, valid only at an event's `ts_ms` field.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct PersistedTimestamp {
+    /// Explicit wall-clock matcher kind.
+    #[serde(rename = "$dynamic")]
+    pub kind: TimestampKind,
+    /// Independent oracle required by the interpreter.
+    pub source: TimestampSource,
+    /// Explicit observed upper bound, with zero slack.
+    pub bound: TimestampBound,
+}
+/// Observed upper bound for a persisted event timestamp.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum TimestampBound {
+    /// The action acknowledgement, when persistence precedes it.
+    AfterAck,
+    /// Delivery of the durable record, when ACK only admits the action.
+    RecordDelivery,
+}
+/// Supported wall-clock field; arbitrary dynamic fields are refused.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub enum TimestampKind {
+    /// Runtime receipt timestamp of an event.
+    #[serde(rename = "ts_ms")]
+    TsMs,
+}
+/// Required timestamp provenance.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum TimestampSource {
+    /// Corresponding durable session record, read independently of the socket.
+    Persisted,
+}
+/// Event fixture whose wall-clock timestamp is matched, never fabricated.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(tag = "t", rename_all = "snake_case", deny_unknown_fields)]
+pub enum DynamicEvent {
+    /// Same event semantics as `ServerFrame::Ev`, with a typed timestamp matcher.
+    Ev {
+        /// Subscription identity.
+        sub_id: String,
+        /// Source stream.
+        stream: String,
+        /// Applied sequence, absent only on a live stream.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(optional, type = "number"))]
+        seq: Option<u64>,
+        /// Runtime wall-clock matcher.
+        ts_ms: PersistedTimestamp,
+        /// Exact typed event payload.
+        ev: WireEvent,
+    },
 }
 
 /// Script operations; their effects are supplied by G3's virtual transport/clock.
@@ -116,7 +237,7 @@ pub enum FixtureStep {
         #[cfg_attr(feature = "ts", ts(optional = nullable))]
         socket: SocketTarget,
         /// Frame to inject; previous-socket callbacks must be ignored.
-        frame: ServerFrame,
+        frame: FixtureServerFrame,
     },
     /// Expect the next client frame, matching t plus the named top-level fields.
     Expect {
@@ -343,6 +464,31 @@ impl FixtureLine {
     /// Parse and validate a line; failures include a visible reason, never a fallback.
     pub fn parse(line: &str) -> Result<Self, String> {
         let raw: Value = serde_json::from_str(line).map_err(|e| e.to_string())?;
+        fn markers(value: &Value, path: &str, raw: &Value) -> Result<(), String> {
+            match value {
+                Value::Object(fields) => {
+                    if fields.contains_key("$dynamic")
+                        && !(raw["step"] == "send"
+                            && ((path == ".frame.ts_ms" && raw["frame"]["t"] == "ev")
+                                || (path == ".frame.server_version"
+                                    && raw["frame"]["t"] == "welcome")))
+                    {
+                        return Err("dynamic matcher outside its declared field".into());
+                    }
+                    for (key, child) in fields {
+                        markers(child, &format!("{path}.{key}"), raw)?;
+                    }
+                }
+                Value::Array(items) => {
+                    for child in items {
+                        markers(child, &format!("{path}[]"), raw)?;
+                    }
+                }
+                _ => (),
+            }
+            Ok(())
+        }
+        markers(&raw, "", &raw)?;
         let parsed: Self = serde_json::from_value(raw.clone()).map_err(|e| e.to_string())?;
         let emitted = serde_json::to_value(&parsed).map_err(|e| e.to_string())?;
         // Serde's flattened unit variants otherwise accept stray script fields.
@@ -426,9 +572,13 @@ impl FixtureLine {
                 }
             }
             FixtureStep::Send {
-                frame: ServerFrame::Ev {
-                    stream, seq, ev, ..
-                },
+                frame:
+                    FixtureServerFrame::Literal(ServerFrame::Ev {
+                        stream, seq, ev, ..
+                    })
+                    | FixtureServerFrame::Dynamic(DynamicEvent::Ev {
+                        stream, seq, ev, ..
+                    }),
                 ..
             } => {
                 let live = stream.starts_with("agent/") && stream.ends_with("/live");
@@ -441,9 +591,9 @@ impl FixtureLine {
             }
             FixtureStep::Send {
                 frame:
-                    ServerFrame::Ack {
+                    FixtureServerFrame::Literal(ServerFrame::Ack {
                         ok, result, error, ..
-                    },
+                    }),
                 ..
             } if (*ok && error.is_some()) || (!ok && (error.is_none() || result.is_some())) => {
                 return Err("ack must carry success/result or failure/error exclusively".into());

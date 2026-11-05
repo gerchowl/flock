@@ -17,6 +17,7 @@ use crate::terminal::{TerminalId, TerminalRuntime, TerminalRuntimeRegistry, Term
 mod aggregate;
 pub(crate) mod git;
 mod tab;
+pub(crate) use tab::Content;
 
 pub(crate) use self::aggregate::{pane_attention_priority, PaneDetail, PaneSignal};
 #[cfg(test)]
@@ -253,6 +254,53 @@ impl DerefMut for Workspace {
 }
 
 impl Workspace {
+    /// Native-only root placement; allocates no terminal state, runtime or process.
+    pub(crate) fn native(
+        target: crate::structured::view::Target,
+        cwd: PathBuf,
+        events: mpsc::Sender<AppEvent>,
+        render_notify: Arc<Notify>,
+        render_dirty: Arc<AtomicBool>,
+    ) -> Self {
+        let (layout, root) = crate::layout::TileLayout::new();
+        let tab = Tab {
+            custom_name: None,
+            number: 1,
+            root_pane: root,
+            layout,
+            panes: HashMap::new(),
+            native_views: HashMap::from([(
+                root,
+                crate::structured::view::placement::View::Ready(target),
+            )]),
+            #[cfg(test)]
+            runtimes: HashMap::new(),
+            zoomed: false,
+            events,
+            render_notify,
+            render_dirty,
+        };
+        Self {
+            id: generate_workspace_id(),
+            custom_name: None,
+            identity_cwd: cwd,
+            cached_git_branch: None,
+            cached_git_ahead_behind: None,
+            pr_state: None,
+            cached_git_space: None,
+            git_identity_resolved: false,
+            worktree_space: None,
+            public_pane_numbers: HashMap::from([(root, 1)]),
+            next_public_pane_number: 2,
+            next_public_tab_number: 2,
+            tabs: vec![tab],
+            active_tab: 0,
+            same_repo_family_memo: std::cell::RefCell::new(None),
+            display_label_memo: std::cell::RefCell::new(None),
+            #[cfg(test)]
+            test_runtimes: HashMap::new(),
+        }
+    }
     pub fn new(
         initial_cwd: PathBuf,
         rows: u16,
@@ -1382,7 +1430,7 @@ mod tests {
 
     #[test]
     fn placement_lookup_keeps_invalid_stored_content_addressable_for_validation() {
-        use crate::structured::view::{PlacementError, Target};
+        use crate::structured::view::{placement::View, PlacementError, Target};
         let mut ws = Workspace::test_new("placement-lookup");
         let root = ws.tabs[0].root_pane;
         let view = Target {
@@ -1391,13 +1439,17 @@ mod tests {
         };
         assert_eq!(ws.find_tab_index_for_pane(root), Some(0));
         let native = ws.tabs[0].layout.split_focused(Direction::Horizontal);
-        ws.tabs[0].native_views.insert(native, view.clone());
+        ws.tabs[0]
+            .native_views
+            .insert(native, View::Ready(view.clone()));
         assert_eq!(ws.find_tab_index_for_pane(native), Some(0));
         assert!(ws.tabs[0].membership_valid());
         assert_eq!(ws.find_tab_index_for_pane(PaneId::alloc()), None);
 
         // The storage maps themselves are the index, including corrupt rows.
-        ws.tabs[0].native_views.insert(root, view.clone());
+        ws.tabs[0]
+            .native_views
+            .insert(root, View::Ready(view.clone()));
         assert_eq!(ws.find_tab_index_for_pane(root), Some(0));
         assert!(matches!(
             ws.take_pane_for_move(root),
@@ -1405,7 +1457,7 @@ mod tests {
         ));
         ws.tabs[0].native_views.remove(&root);
         let orphan = PaneId::alloc();
-        ws.tabs[0].native_views.insert(orphan, view);
+        ws.tabs[0].native_views.insert(orphan, View::Ready(view));
         assert_eq!(ws.find_tab_index_for_pane(orphan), Some(0));
         assert!(matches!(
             ws.take_pane_for_move(orphan),

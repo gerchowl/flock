@@ -1,12 +1,17 @@
 /**
  * The composer (ADR-0038 §2a): it states the agent's reported phase, sends
  * a message as `cmd agent.send` through the outbox (§3, G3a #1747), and
- * shows each message's outbox state.
+ * shows each message's outbox state. It is one field (#2903): the send
+ * button is an icon inside it at the trailing edge, ⌘↩ sends too, and the
+ * phase and the shortcut sit under it. There is no Send button below.
+ * ⌘↩ and Esc (leave the field) are bound through the keyboard layer
+ * (`keys.ts`), so neither acts while an input method is composing (#2967).
  *
  * The client never derives queue order or delivery (§3), so nothing here
  * predicts what will happen: the phase line is the server's last report,
  * worded as a fact ({@link phaseLine}), and each message's line says what
- * has happened to it so far ({@link STATUS_LABELS}). The `ack` is the
+ * has happened to it so far ({@link STATUS_LABELS}; a refusal in the shared
+ * plain-language map's words, `refusals.tsx`, its code behind Details). The `ack` is the
  * authority on what happened. Optimism is visual only: a message never
  * appears in the transcript until the server's event does, and once a
  * person's turn has arrived after an accepted message, it leaves "Your
@@ -38,13 +43,19 @@
  *
  * @module
  */
-import { For, createSignal, type JSX } from "solid-js";
+import { For, Show, createSignal, onCleanup, type JSX } from "solid-js";
 
+import { IconButton } from "../components/Icon";
 import type { AgentDecide } from "../gen/AgentDecide";
 import type { OutboxStatus } from "../gen/OutboxStatus";
 import type { Phase } from "../gen/Phase";
 import type { AgentRow } from "../fleet";
+import { Cluster, Sidebar, Stack } from "../layout/primitives";
+import { SPACE } from "../tokens";
 import type { OutboxEntry } from "../wire/outbox";
+import { bindKeys, formatCombo, isApple, shortcut } from "./keys";
+import { RefusalDetails, explain, type Explained } from "./refusals";
+import "./composer.css";
 
 /** Sending, as the workbench sees it. */
 export type Sender = {
@@ -120,9 +131,14 @@ export function rowLine(row: AgentRow | undefined): PhaseLine {
   return row === undefined ? { line: "Agent not in the agent list", open: true } : phaseLine(row.state);
 }
 
-/** The send shortcut as this platform writes it. */
+/** The send shortcut as this platform writes it: the HIG's ⌘↩ on Apple platforms. */
+export function sendShortcut(platform: string): string {
+  return formatCombo(shortcut("composer.send").combo, isApple(platform));
+}
+
+/** The hint under the field. */
 export function sendHint(platform: string): string {
-  return `${/Mac|iPhone|iPad|iPod/.test(platform) ? "⌘" : "Ctrl"} + Enter to send`;
+  return `${sendShortcut(platform)} to send`;
 }
 
 /**
@@ -212,7 +228,7 @@ export function Composer(props: {
     return mode.open ? props.sender.blocked() : mode.line;
   };
   /** Accepted messages whose event the transcript has shown are left out (see the module doc). */
-  const mine = (): { readonly id: string; readonly text: string; readonly status: OutboxStatus; readonly error?: string }[] => {
+  const mine = (): { readonly id: string; readonly text: string; readonly status: OutboxStatus; readonly refusal?: Explained }[] => {
     const own = (props.sender?.commands() ?? []).flatMap((entry) => {
       const sent = sentText(entry, props.agent);
       return sent === null ? [] : [{ entry, sent }];
@@ -221,7 +237,7 @@ export function Composer(props: {
     const echoed = props.state.echoed(props.agent, accepted);
     return own
       .filter(({ entry }) => !echoed.has(entry.cmd_id))
-      .map(({ entry, sent }) => ({ id: entry.cmd_id, text: sent, status: entry.status, ...(entry.error ? { error: entry.error.message } : {}) }));
+      .map(({ entry, sent }) => ({ id: entry.cmd_id, text: sent, status: entry.status, ...(entry.error ? { refusal: explain(entry.error) } : {}) }));
   };
   const submit = (): void => {
     const message = text().trim();
@@ -234,8 +250,11 @@ export function Composer(props: {
       setError((thrown as Error).message);
     }
   };
+  const platform = navigator.platform || navigator.userAgent;
   return (
-    <form
+    <Stack
+      as="form"
+      space={SPACE[2]}
       class="composer"
       data-testid="composer"
       onSubmit={(event) => {
@@ -243,41 +262,37 @@ export function Composer(props: {
         submit();
       }}
     >
-      <ul class="composer__sent" aria-label="Your messages">
+      <Stack as="ul" space={SPACE[1]} class="composer__sent" aria-label="Your messages">
         <For each={mine()}>
           {(item) => (
-            <li class={`sent sent--${item.status}`} data-testid="sent-message" data-status={item.status}>
+            <Cluster as="li" justify="space-between" space={SPACE[4]} class={`sent sent--${item.status}`} data-testid="sent-message" data-status={item.status}>
               <span class="sent__text">{item.text}</span>
-              <span class="sent__status">{item.error === undefined ? STATUS_LABELS[item.status] : `${STATUS_LABELS[item.status]}: ${item.error}`}</span>
-            </li>
+              <span class="sent__status">{item.refusal?.line ?? STATUS_LABELS[item.status]}</span>
+              <Show when={item.refusal}>{(refusal) => <RefusalDetails code={refusal().code} message={refusal().message} />}</Show>
+            </Cluster>
           )}
         </For>
-      </ul>
-      <textarea
-        class="composer__input"
-        aria-label={`Message ${props.row?.label ?? props.agent}`}
-        rows="2"
-        value={text()}
-        disabled={blocked() !== null}
-        onInput={(event) => setText(event.currentTarget.value)}
-        onKeyDown={(event) => {
-          if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
-            event.preventDefault();
-            submit();
-          }
-        }}
-      />
-      <div class="composer__footer">
+      </Stack>
+      <Sidebar side="right" space={SPACE[2]} class="composer__field" data-testid="composer-field">
+        <textarea
+          ref={(field) => onCleanup(bindKeys(field, { "composer.send": submit, "composer.leave": () => field.blur() }))}
+          class="composer__input"
+          aria-label={`Message ${props.row?.label ?? props.agent}`}
+          rows="2"
+          value={text()}
+          disabled={blocked() !== null}
+          onInput={(event) => setText(event.currentTarget.value)}
+        />
+        <IconButton type="submit" icon="send" label="Send" title={`Send ${sendShortcut(platform)}`} class="composer__send" disabled={blocked() !== null} data-testid="send" />
+      </Sidebar>
+      <Cluster justify="space-between" space={SPACE[4]} class="composer__footer">
         <span class="composer__mode" data-testid="agent-phase">
           {blocked() ?? error() ?? rowLine(props.row).line}
         </span>
         <span class="composer__hint" data-testid="send-hint">
-          {sendHint(navigator.platform || navigator.userAgent)}
+          {sendHint(platform)}
         </span>
-        <button type="submit" class="action action--primary" disabled={blocked() !== null}>
-          Send
-        </button>
-      </div>
-    </form>
+      </Cluster>
+    </Stack>
   );
 }

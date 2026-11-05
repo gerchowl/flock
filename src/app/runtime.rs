@@ -231,7 +231,7 @@ impl App {
             &mut self.structured_sends,
         );
         self.finish_structured_messages(changed || published, now);
-        published || changed
+        self.sync_structured_views() || published || changed
     }
 
     pub(crate) fn handle_scheduled_tasks(&mut self, now: Instant, geometry_dirty: bool) -> bool {

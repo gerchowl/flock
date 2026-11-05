@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "main",
-  "description": "The main window. The bundle calls no Tauri command yet, so it is granted none (ADR-0011 §3).",
+  "description": "The main window. Its permissions are the bridge's open, send and close (ADR-0038 §6, \"Never in the webview\"); nothing else.",
   "windows": ["main"],
-  "permissions": []
+  "permissions": ["allow-bridge-open", "allow-bridge-send", "allow-bridge-close"]
 }

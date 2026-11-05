@@ -3,8 +3,9 @@
  *
  * {@link InboxCard} is a presentation type. Fixture mode shows the sample
  * cards below, labelled as samples. Live mode shows open permission prompts
- * (`workbench/permissions.ts`, #1749 PR 1; the server's open/closed record, `wire/permission-record.ts`). In both, the answer buttons are
- * disabled and name what they wait for.
+ * (`workbench/permissions.ts`, #1749 PR 1; the server's open/closed record, `wire/permission-record.ts`), which answer for real.
+ * A sample card's answers are not built: hidden, and in a development build
+ * disabled, naming what they wait for.
  *
  * @module
  */
@@ -29,9 +30,11 @@ export type InboxCard = {
   readonly requestSeq?: number;
   /** The agent's stream had a history gap that nothing has followed yet: the card may be out of date. */
   readonly stale?: boolean;
+  /** Why the card has no usable request, raw, for its Details; `detail` words it plainly (`refusals.tsx`). */
+  readonly diagnosis?: { readonly code?: string; readonly message: string };
 };
 
-const SAMPLE_WAITS_FOR = "the inbox stream (G5 #1597)";
+const SAMPLE_WAITS_FOR = "the inbox stream";
 
 /** Sample cards until G5. */
 export const SAMPLE_INBOX: readonly InboxCard[] = [
@@ -52,7 +55,7 @@ export const SAMPLE_INBOX: readonly InboxCard[] = [
     agent: "atlas",
     agentLabel: "atlas",
     title: "Which fixture set should the replay use?",
-    detail: "The recorded S1 session, or the S7a wire scripts.",
+    detail: "The recorded session, or the wire scripts.",
     choices: ["Recorded session", "Wire scripts"],
     blocking: false,
     waitsFor: SAMPLE_WAITS_FOR,

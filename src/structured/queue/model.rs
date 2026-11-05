@@ -288,7 +288,7 @@ impl Change {
         }
     }
 
-    pub(super) fn apply(&self, items: &mut Vec<Item>) -> std::io::Result<()> {
+    pub(in crate::structured) fn apply(&self, items: &mut Vec<Item>) -> std::io::Result<()> {
         if let Self::Upsert { item, .. } = self {
             if item.metadata.keys().any(|k| {
                 matches!(

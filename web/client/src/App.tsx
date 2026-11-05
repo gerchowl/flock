@@ -12,6 +12,9 @@
  *   shell's token provider (Tauri, ADR-0038 §6) replaces all three
  *   (`src/wire/provider.ts`): its token is kept in memory only, a link's code is
  *   refused with a notice, and NeedsToken asks the shell instead of the person.
+ * - **bridge** runs the same live app on sessions the shell's native side
+ *   opens (ADR-0038 §6, #2500), driven by the provider's rules: no token in
+ *   the webview at all, so nothing is prompted, exchanged or stored.
  *
  * Each mode creates its fleet source and transport once, outside JSX: a
  * prop expression is a getter that would run again on every read.
@@ -21,27 +24,36 @@
 import { Match, Show, Switch, createSignal, onCleanup, type JSX } from "solid-js";
 
 import { ReplayBadge } from "./components/ReplayBadge";
-import { pageSearch, type ConfigResult, type FixtureShellConfig, type WireShellConfig } from "./config";
+import { pageSearch, type BridgeShellConfig, type ConfigResult, type FixtureShellConfig, type WireShellConfig } from "./config";
 import { createFixtureFleet } from "./fleet";
 import { emptyLayout } from "./layout/model";
 import { createLayoutStore } from "./layout/persistence";
+import { createSidebarStore } from "./layout/sidebar";
 import { previewMode } from "./layout/phone";
 import { createFixtureTransport } from "./transport/fixture";
-import { WireConnection, type ConnectionOptions } from "./wire/connection";
-import { browserClock, browserSockets, endpointUrl } from "./wire/env";
+import { WireConnection } from "./wire/connection";
+import { browserClock, browserSockets, endpointUrl, type Clock, type KeyValueStore, type SocketFactory } from "./wire/env";
 import { createWireFleet } from "./wire/fleet";
 import { captureCode, type CodePage } from "./capture-code";
 import { EXCHANGE_FAILED, RUN_CLIENT_OPEN, createTokenStore, exchangeCode, isCode, type ExchangeRequest, type SessionLike } from "./wire/token";
-import { driveTokenProvider, type ShellTokens } from "./wire/provider";
+import { driveBridge, driveTokenProvider, type ShellTokens } from "./wire/provider";
 import { createWireTransport } from "./wire/transport";
-import { ConnectionBar } from "./workbench/ConnectionBar";
+import { ConnectionBanner } from "./workbench/ConnectionBanner";
+import { healthOf, type Health, type HostView } from "./workbench/HostStatus";
+import { CONNECTION_COPY } from "./workbench/refusals";
 import { createWireSender } from "./workbench/sender";
 import { SAMPLE_INBOX } from "./workbench/inbox";
-import { SAMPLE_AGENTS } from "./workbench/samples";
+import { previewControls } from "./workbench/preview";
+import { SAMPLE_AGENTS, SAMPLE_ENTITIES } from "./workbench/samples";
 import { Workbench } from "./workbench/Workbench";
 
 /** What a live connection runs on; tests inject virtual ones. */
-export type WireEnv = Pick<ConnectionOptions, "clock" | "sockets" | "random" | "store"> & {
+export type WireEnv = {
+  readonly clock: Clock;
+  /** The WebSocket factory; a bridge config never uses it. */
+  readonly sockets: SocketFactory;
+  readonly random: () => number;
+  readonly store: KeyValueStore;
   /** This tab's session storage; reading it may throw. Defaults to `sessionStorage`. */
   readonly session?: () => SessionLike | undefined;
   /** The code exchange's request. Defaults to `fetch`. */
@@ -64,13 +76,20 @@ export type AppProps = {
 /** This bundle's identity in `hello` (diagnostic only, ADR-0036 §5). */
 const CLIENT = { name: "flock-web", version: "0.0.0" } as const;
 
+/** The layout's server key for the shell's bridge, which names no server URL. */
+const BRIDGE_KEY = "bridge:local";
+
+/** What the toolbar calls a bridged server until the fleet names its node: the shell runs on this machine. */
+export const BRIDGE_HOST = "This computer";
+
 /** Why a link's code is refused when the shell provides tokens (ADR-0038 §6). */
 export const SHELL_OWNS_TOKENS = "This app gets its token from its shell, so the link's code was not used.";
 
 function FixtureApp(props: { readonly config: FixtureShellConfig }): JSX.Element {
   const store = createLayoutStore({ serverKey: "fixture" });
   const { layout, notice } = store.load();
-  const fleet = createFixtureFleet(SAMPLE_AGENTS);
+  const sidebar = createSidebarStore({ serverKey: "fixture" });
+  const fleet = createFixtureFleet(SAMPLE_AGENTS, SAMPLE_ENTITIES);
   const transport = createFixtureTransport(props.config.fixtureJsonl);
   return (
     <>
@@ -82,50 +101,80 @@ function FixtureApp(props: { readonly config: FixtureShellConfig }): JSX.Element
         sender={null}
         layout={layout}
         saveLayout={(next) => store.save(next)}
-        status={() => notice}
+        sidebar={sidebar.load()}
+        saveSidebar={sidebar.save}
+        notice={notice}
         mode={previewMode(pageSearch(globalThis))}
+        preview={previewControls(pageSearch(globalThis))}
         source="replay"
       />
     </>
   );
 }
 
-function WireApp(props: { readonly config: WireShellConfig; readonly env: WireEnv; readonly code: string | null }): JSX.Element {
-  const { session = () => sessionStorage, request = globalThis.fetch.bind(globalThis), page = window, ...options } = props.env;
-  const url = endpointUrl(props.config.serverUrl);
+function WireApp(props: { readonly config: WireShellConfig | BridgeShellConfig; readonly env: WireEnv; readonly code: string | null }): JSX.Element {
+  const { session = () => sessionStorage, request = globalThis.fetch.bind(globalThis), page = window, sockets, ...options } = props.env;
+  const wire = props.config.transport === "wire" ? props.config : null;
+  const url = wire === null ? null : endpointUrl(wire.serverUrl);
   const tokens = createTokenStore(session);
-  const provider = props.config.tokenProvider;
-  /** The token to fall back on: this tab's stored one, or the shell's fixed one; none beside a provider. */
-  const held = (): string | null => (provider === undefined ? (tokens.get() ?? props.config.token ?? null) : null);
-  // With a code, nothing connects until its exchange settles (a provider's shell never exchanges one).
+  const provider = wire?.tokenProvider;
+  /** The shell owns this app's tokens: a provider gives them, or a bridge keeps them in the shell. */
+  const shellOwned = wire === null || provider !== undefined;
+  /** The token to fall back on: this tab's stored one, or the shell's fixed one; none when the shell owns them. */
+  const held = (): string | null => (shellOwned ? null : (tokens.get() ?? wire?.token ?? null));
+  // With a code, nothing connects until its exchange settles (a shell that owns the tokens never exchanges one).
   let current = props.code === null ? held() : null;
-  const connection = new WireConnection({ url, token: current, client: CLIENT, ...options });
-  const [exchanging, setExchanging] = createSignal(props.code !== null && provider === undefined);
+  const connection = new WireConnection(url === null ? { bridged: true, client: CLIENT, ...options } : { url, token: current, sockets, client: CLIENT, ...options });
+  const [exchanging, setExchanging] = createSignal(props.code !== null && !shellOwned);
   /** The last code failed: NeedsToken says so instead of only asking for one. */
   const [failed, setFailed] = createSignal(false);
   /** A failed code while a session works on: a dismissible notice, never NeedsToken. */
   const [linkNotice, setLinkNotice] = createSignal<string | null>(null);
   /** The shell's token provider, driven by NeedsToken; set below, once `refresh` exists. */
   let shell: ShellTokens | null = null;
-  const describe = (): string => {
+  /** A token is on its way: a code's exchange, or the shell was asked. */
+  const signingIn = (): boolean => {
     const idle = connection.state === "Disconnected" || connection.state === "NeedsToken";
     // A shell still asked after a Disconnect is not signing in: its token waits for Connect.
-    if ((exchanging() && idle) || (shell?.asking === true && connection.state === "NeedsToken")) return "Signing in…";
+    return (exchanging() && idle) || (shell?.asking === true && connection.state === "NeedsToken");
+  };
+  /**
+   * The state line, in the shared plain-language map's words. In NeedsToken the
+   * error is this client's own sentence about the token, and it leads the next
+   * step; in every other state it is a lost connection's diagnosis, which
+   * {@link diagnose} keeps for Details.
+   */
+  const describe = (): string => {
+    if (signingIn()) return "Signing in…";
     const prompt = shell === null ? (failed() ? EXCHANGE_FAILED : RUN_CLIENT_OPEN) : shell.error;
-    const ask = connection.state === "NeedsToken" ? prompt : null;
-    const parts = [connection.state, connection.error, ask].filter((part) => part !== null);
-    return `${parts[0]}${parts.length > 1 ? ` · ${parts.slice(1).join(" ")}` : ""}`;
+    const token = connection.state === "NeedsToken";
+    return [CONNECTION_COPY[connection.state], token ? connection.error : null, token ? prompt : null].filter((part) => part !== null).join(" ");
+  };
+  /** What sits behind the state line's Details: the version gap in ReadOnly, else a failure's diagnosis. */
+  const diagnose = (): string | null => {
+    if (signingIn() || connection.state === "NeedsToken") return null;
+    return connection.state === "ReadOnly" ? connection.versionGap : connection.error;
   };
   const [status, setStatus] = createSignal<string>(describe());
+  const [diagnosis, setDiagnosis] = createSignal<string | null>(diagnose());
+  const health = (): Health => healthOf(connection.state, connection.error, signingIn());
+  const [shown, setShown] = createSignal<Health>(health());
   /** A failed renewal while the session runs on (ADR-0038 §6): a dismissible notice, never NeedsToken. */
   const [renewalNotice, setRenewalNotice] = createSignal<string | null>(null);
   const refresh = (): void => {
     setStatus(describe());
+    setDiagnosis(diagnose());
+    setShown(health());
     setRenewalNotice(shell?.notice ?? null);
   };
-  // Before the first connect, so its NeedsToken already asks the shell.
-  if (provider !== undefined) {
-    const driven = driveTokenProvider(connection, provider, options.clock, options.random, refresh);
+  // Before the first connect, so its first attempt already asks the shell.
+  const driven =
+    props.config.transport === "bridge"
+      ? driveBridge(connection, props.config.openBridge, options.clock, options.random, refresh)
+      : provider === undefined
+        ? null
+        : driveTokenProvider(connection, provider, options.clock, options.random, refresh);
+  if (driven !== null) {
     shell = driven;
     onCleanup(() => driven.dispose());
   }
@@ -185,7 +234,7 @@ function WireApp(props: { readonly config: WireShellConfig; readonly env: WireEn
   let latest = 0;
   const signInWith = (code: string): void => {
     // The shell owns this app's tokens, in memory only: a link's code is never exchanged or stored.
-    if (shell !== null) return void setLinkNotice(SHELL_OWNS_TOKENS);
+    if (shell !== null || wire === null) return void setLinkNotice(SHELL_OWNS_TOKENS);
     if (!isCode(code)) {
       // A bad paste must not discard a good exchange that already consumed its code.
       if (!exchanging()) failExchange();
@@ -195,7 +244,7 @@ function WireApp(props: { readonly config: WireShellConfig; readonly env: WireEn
     const generation = ++latest;
     setExchanging(true);
     refresh();
-    void exchangeCode(code, props.config.serverUrl, request).then((exchanged) => {
+    void exchangeCode(code, wire.serverUrl, request).then((exchanged) => {
       if (disposed || generation !== latest) return;
       if (exchanged === null) return failExchange();
       setExchanging(false);
@@ -219,14 +268,23 @@ function WireApp(props: { readonly config: WireShellConfig; readonly env: WireEn
   };
   page.addEventListener("hashchange", onHashChange);
   onCleanup(() => page.removeEventListener("hashchange", onHashChange));
-  const store = createLayoutStore({ serverKey: url, initial: emptyLayout });
+  const store = createLayoutStore({ serverKey: url ?? BRIDGE_KEY, initial: emptyLayout });
   const { layout, notice } = store.load();
+  const sidebar = createSidebarStore({ serverKey: url ?? BRIDGE_KEY });
   // One fleet source and one transport per connection (ADR-0038 §3, sub ids).
   const fleet = createWireFleet(connection);
   const transport = createWireTransport(connection);
+  const host: HostView = {
+    name: url === null ? BRIDGE_HOST : new URL(url).host,
+    health: shown,
+    detail: status,
+    diagnosis,
+    connected: () => (revision(), connection.state !== "Disconnected"),
+    connect: () => connection.connect(),
+    disconnect: () => connection.disconnect(),
+  };
   return (
     <>
-      <ConnectionBar connection={connection} revision={revision} ask={shell === null ? undefined : () => shell?.ask()} />
       <Show when={linkNotice()}>
         {(message) => (
           <div class="notice" role="status" data-testid="exchange-notice">
@@ -254,8 +312,13 @@ function WireApp(props: { readonly config: WireShellConfig; readonly env: WireEn
         sender={sender}
         layout={layout}
         saveLayout={(next) => store.save(next)}
-        status={() => [notice, status()].filter((part) => part !== null).join(" · ")}
+        sidebar={sidebar.load()}
+        saveSidebar={sidebar.save}
+        notice={notice}
+        host={host}
+        banner={() => <ConnectionBanner connection={connection} revision={revision} host={host} ask={shell === null ? undefined : () => shell?.ask()} />}
         mode={previewMode(pageSearch(globalThis))}
+        preview={previewControls(pageSearch(globalThis))}
         source="live"
       />
     </>

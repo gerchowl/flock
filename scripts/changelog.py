@@ -931,6 +931,65 @@ def cmd_prepare(args: argparse.Namespace) -> int:
     return 0
 
 
+PR_BODY_LIMIT = 60000  # GitHub rejects PR bodies over 65536 characters.
+RELEASE_NOTES_URL = "https://github.com/gerchowl/flock/blob/release/v{version}/CHANGELOG.md"
+
+
+def release_pr_preamble(version: str) -> str:
+    return (
+        f"Prepares v{version} on `dev`. Opened by the Promote workflow.\n\n"
+        "When this merges, release-follow-up.yml waits for the merged commit to pass its "
+        f"checks on `dev`, then fast-forwards `main` to it and tags it `v{version}`, "
+        "which starts the Release workflow.\n\n"
+    )
+
+
+def heading_entry_counts(notes: str) -> list[tuple[str, int]]:
+    """Return (heading, top-level entry count) for each `###` heading in a notes body."""
+    counts: list[tuple[str, int]] = []
+    for line in notes.splitlines():
+        if line.startswith("### "):
+            counts.append((line[4:].strip(), 0))
+        elif line.startswith("- ") and counts:
+            heading, count = counts[-1]
+            counts[-1] = (heading, count + 1)
+    return counts
+
+
+def build_release_pr_body(version: str, notes: str, limit: int = PR_BODY_LIMIT) -> str:
+    """Preamble plus the notes inline, or a pointer to CHANGELOG.md when too long.
+
+    The length is counted in characters, which is what GitHub limits. Notes are
+    never cut in the middle: they are either inlined whole or replaced whole.
+    """
+    preamble = release_pr_preamble(version)
+    full = preamble + notes
+    if len(full) <= limit:
+        return full
+    lines = [
+        preamble.rstrip("\n"),
+        "",
+        "The release notes are too long for a pull request body "
+        "(GitHub's limit is 65536 characters), so they are not inlined here. "
+        f"Read them in full in [CHANGELOG.md]({RELEASE_NOTES_URL.format(version=version)}) "
+        "on the release branch.",
+        "",
+    ]
+    for heading, count in heading_entry_counts(notes):
+        lines.append(f"- {heading}: {count} {'entry' if count == 1 else 'entries'}")
+    body = "\n".join(lines) + "\n"
+    if len(body) > limit:
+        raise ChangelogError(f"release PR summary exceeds {limit} characters")
+    return body
+
+
+def cmd_pr_body(args: argparse.Namespace) -> int:
+    version = normalize_version(args.version)
+    notes = extract_section_body(load_text(Path(args.path)), version)
+    write_text(Path(args.output), build_release_pr_body(version, notes, args.limit))
+    return 0
+
+
 def cmd_extract(args: argparse.Namespace) -> int:
     path = Path(args.path)
     body = extract_section_body(load_text(path), normalize_version(args.version))
@@ -1145,6 +1204,15 @@ def build_parser() -> argparse.ArgumentParser:
     extract.add_argument("--version", required=True)
     extract.add_argument("--output")
     extract.set_defaults(func=cmd_extract)
+
+    pr_body = subparsers.add_parser(
+        "pr-body", help="Write the release PR body, linking CHANGELOG.md when the notes are too long"
+    )
+    pr_body.add_argument("--path", default="CHANGELOG.md")
+    pr_body.add_argument("--version", required=True)
+    pr_body.add_argument("--limit", type=int, default=PR_BODY_LIMIT)
+    pr_body.add_argument("--output", required=True)
+    pr_body.set_defaults(func=cmd_pr_body)
 
     sync_latest_json = subparsers.add_parser(
         "sync-latest-json",

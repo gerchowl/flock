@@ -19,7 +19,7 @@ principal: string,
 scopes: Array<Scope>,
 /**
  * Remaining app-session lifetime at issuance, in milliseconds, absent for file tokens.
- * Derived from the store's enforcing clock/deadline, currently monotonic
- * pending the clock-policy owner decision in #2489. Later reads do not refresh it.
+ * Derived from the store's non-settable, suspend-inclusive clock/deadline (#2489).
+ * Later reads do not refresh it; wall-clock corrections cannot extend it.
  */
 expires_in_ms?: number, };

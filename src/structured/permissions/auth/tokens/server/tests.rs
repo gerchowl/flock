@@ -9,7 +9,7 @@ fn peer(app: &mut crate::app::App, peer: crate::platform::peer::Credentials) {
 #[test]
 fn process_bound_hello_and_registration_require_the_exact_minting_peer() {
     let (_root, files, mut app) = super::super::tests::setup();
-    let store = Store::new(files, Arc::new(app_sessions::SystemClock));
+    let store = Store::new(files, Arc::new(app_sessions::SystemClock::new()));
     let a = Peer::spawn();
     let b = Peer::spawn();
     peer(&mut app, a.credentials);
@@ -22,12 +22,17 @@ fn process_bound_hello_and_registration_require_the_exact_minting_peer() {
         )
         .unwrap();
     let matched = store
-        .admit_peer(&minted.token, Some(&local_a), |session| session.info)
+        .admit_peer(
+            &minted.token,
+            Some(&local_a),
+            Duration::from_secs(5),
+            |session| session.info,
+        )
         .unwrap();
     assert_eq!(matched, minted.info);
     for refused in [Some(&local_b), None] {
         assert!(matches!(
-            store.admit_peer(&minted.token, refused, |_| panic!(
+            store.admit_peer(&minted.token, refused, Duration::from_secs(5), |_| panic!(
                 "mismatched registration"
             )),
             Err(PeerAdmissionError::PeerProcessChanged)
@@ -43,7 +48,9 @@ fn process_bound_hello_and_registration_require_the_exact_minting_peer() {
         .unwrap();
     for origin in [Some(&local_a), None] {
         let info = store
-            .admit_peer(&file.token, origin, |session| session.info)
+            .admit_peer(&file.token, origin, Duration::from_secs(5), |session| {
+                session.info
+            })
             .unwrap();
         assert_eq!(info.scopes, [Scope::Send].into());
     }
@@ -51,7 +58,7 @@ fn process_bound_hello_and_registration_require_the_exact_minting_peer() {
 #[test]
 fn ready_peer_exit_prevents_registration_before_notifications_are_serviced() {
     let (_root, files, mut app) = super::super::tests::setup();
-    let store = Store::new(files, Arc::new(app_sessions::SystemClock));
+    let store = Store::new(files, Arc::new(app_sessions::SystemClock::new()));
     let mut child = Peer::spawn();
     peer(&mut app, child.credentials);
     let local = app.admit_local_peer(child.credentials).unwrap();
@@ -67,16 +74,19 @@ fn ready_peer_exit_prevents_registration_before_notifications_are_serviced() {
         Duration::from_secs(5)
     ));
     assert!(matches!(
-        store.admit_peer(&minted.token, Some(&local), |_| panic!(
-            "exited registration"
-        )),
+        store.admit_peer(
+            &minted.token,
+            Some(&local),
+            Duration::from_secs(5),
+            |_| panic!("exited registration")
+        ),
         Err(PeerAdmissionError::Token(TokenError::Revoked))
     ));
 }
 #[test]
 fn registered_callback_retains_the_shared_revocation_fence() {
     let (_root, files, mut app) = super::super::tests::setup();
-    let store = Store::new(files, Arc::new(app_sessions::SystemClock));
+    let store = Store::new(files, Arc::new(app_sessions::SystemClock::new()));
     let child = Peer::spawn();
     peer(&mut app, child.credentials);
     let local = app.admit_local_peer(child.credentials).unwrap();
@@ -87,7 +97,7 @@ fn registered_callback_retains_the_shared_revocation_fence() {
         )
         .unwrap();
     store
-        .admit_peer(&minted.token, Some(&local), |_| {
+        .admit_peer(&minted.token, Some(&local), Duration::from_secs(5), |_| {
             let file = store.files.lock_file().unwrap();
             assert!(matches!(
                 file.try_lock(),
@@ -100,7 +110,7 @@ fn registered_callback_retains_the_shared_revocation_fence() {
 #[test]
 fn persistent_file_bearer_refuses_an_exited_local_peer() {
     let (_root, files, mut app) = super::super::tests::setup();
-    let store = Store::new(files, Arc::new(app_sessions::SystemClock));
+    let store = Store::new(files, Arc::new(app_sessions::SystemClock::new()));
     let mut child = Peer::spawn();
     peer(&mut app, child.credentials);
     let local = app.admit_local_peer(child.credentials).unwrap();
@@ -118,9 +128,12 @@ fn persistent_file_bearer_refuses_an_exited_local_peer() {
         "file bearer remains valid"
     );
     assert!(matches!(
-        store.admit_peer(&file.token, Some(&local), |_| panic!(
-            "exited file registration"
-        )),
+        store.admit_peer(
+            &file.token,
+            Some(&local),
+            Duration::from_secs(5),
+            |_| panic!("exited file registration")
+        ),
         Err(PeerAdmissionError::PeerProcessChanged)
     ));
 }

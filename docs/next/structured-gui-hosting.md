@@ -97,6 +97,18 @@ The [CSP3 source-matching rules](https://www.w3.org/TR/CSP3/#match-url-to-source
 define WebSocket matching; [MDN's connect-src reference](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Content-Security-Policy/connect-src)
 notes the browser difference for `'self'`.
 
+## Favicon
+
+The GUI document explicitly links a Vite-emitted SVG asset, a bundled copy of
+the flock website's SVG icon. Vite emits `web/client/src/favicon.svg` into the
+dist with a content hash, and the existing embedded-asset router serves it as
+`image/svg+xml` with the asset cache policy below. This follows ADR-0038 §6:
+the same static bundle works in the browser and native shell. The document's
+`default-src 'self'` permits this same-origin image without an inline/data
+exception. The file-based fixture build inlines the icon alongside its scripts
+and styles to remain self-contained. Declaring the icon prevents the browser's
+implicit request for the absent `/favicon.ico`; unknown paths still return 404.
+
 ## Paths and caching
 
 - `/` and `/index.html` serve the entry document with `Cache-Control: no-cache`

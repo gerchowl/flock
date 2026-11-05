@@ -18,6 +18,8 @@ DENY_FILES = {
     "website/latest.json", "CHANGELOG.md",
     # Compiled into the closed configuration diagnostic cause contract test.
     "docs/adr/0041-configuration-v2.md",
+    # Imported by web/client/src/wire/ (bridge and provider types), which Rust reads.
+    "web/client/src/config.ts",
 }
 
 

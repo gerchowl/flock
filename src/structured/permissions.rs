@@ -549,12 +549,15 @@ impl Book {
             }
         }
     }
+    /// Agent identity for diagnostics emitted after the caller releases the book.
+    pub fn agent(&self) -> &str {
+        &self.agent
+    }
     // Called only after observe rejected a valid, uncorrelated ID at capacity.
     // No live slot or grant is reserved; the stream owner durably closes the ID.
     pub fn capacity_refusal(&mut self, id: &str) -> Result<Answer, ErrorCode> {
         let request_seq = self.next_request_seq()?;
         let code = ErrorCode::PermissionRequestLimit.as_str();
-        crate::logging::structured_permission_request_refused(&self.agent, id, request_seq, code);
         let mut fields = PermissionAnswer::new(
             Decision::Deny,
             Some(code.into()),

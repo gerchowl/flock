@@ -64,6 +64,24 @@ describe("streams", () => {
     expect(h.seen.get("s1")?.slice(1)).toEqual([{ kind: "synced" }, { kind: "event", seq: 5, ev: { id: "c" } }]);
   });
 
+  test("each snapshot line reaches the handler with its own frame's ts_ms", () => {
+    const h = new Harness();
+    live(h);
+    const lines: { id: unknown; tsMs: number }[] = [];
+    h.connection.subscribe("fleet", {
+      event: () => undefined,
+      gap: () => undefined,
+      synced: () => undefined,
+      snapshot: (each) => lines.push(...each.map((line) => ({ id: (line.ev as { id: unknown }).id, tsMs: line.tsMs }))),
+      reset: () => undefined,
+      refused: () => undefined,
+    });
+    h.step(step({ step: "send", frame: { t: "gap", sub_id: "s1", from: 1, to: 2, snapshot_to: 4 } }));
+    h.step(step({ step: "send", frame: { ...fleetLine(3, "a"), ts_ms: 111 } as ServerFrame }));
+    h.step(step({ step: "send", frame: { ...fleetLine(4, "b"), ts_ms: 222 } as ServerFrame }));
+    expect(lines).toEqual([{ id: "a", tsMs: 111 }, { id: "b", tsMs: 222 }]);
+  });
+
   test("a newer snapshot supersedes an unfinished one", () => {
     const h = new Harness();
     live(h);
@@ -197,6 +215,33 @@ describe("wire transport", () => {
     ]);
     expect(sentFrames(h).filter((frame) => (frame as { t: string }).t === "unsub")).toEqual([]);
     expect(h.connection.state).toBe("Live");
+  });
+
+  test("a cursor_ahead reset opens a new sync epoch, so its re-sub's synced is delivered; a lagged re-sub's is not (#2234)", () => {
+    const h = new Harness();
+    live(h);
+    const seen: string[] = [];
+    createWireTransport(h.connection).subscribe("agent/a", null, {
+      entry: (entry) => seen.push(`entry ${entry.seq}`),
+      synced: () => seen.push("synced"),
+      failed: (failure) => seen.push(`failed: ${failure.message}`),
+      reset: () => seen.push("reset"),
+    });
+    const send = (frame: ServerFrame): void => h.step(step({ step: "send", frame }));
+    const sub = lastSub(h);
+    send({ t: "ev", sub_id: sub, stream: "agent/a", seq: 3, ts_ms: 0, ev: { type: "user", message: {} } });
+    send({ t: "synced", sub_id: sub, seq: 3 });
+    send({ t: "subfail", sub_id: sub, code: "cursor_ahead", message: "ahead" });
+    const fresh = lastSub(h);
+    expect(fresh).not.toBe(sub);
+    send({ t: "ev", sub_id: fresh, stream: "agent/a", seq: 1, ts_ms: 0, ev: { type: "user", message: {} } });
+    send({ t: "synced", sub_id: fresh, seq: 1 });
+    // A lagged re-sub stays inside the epoch: its barrier is not repeated.
+    send({ t: "lagged", sub_id: fresh, skipped_to: 9 });
+    const resub = lastSub(h);
+    expect(resub).not.toBe(fresh);
+    send({ t: "synced", sub_id: resub, seq: 9 });
+    expect(seen).toEqual(["entry 3", "synced", "reset", "entry 1", "synced"]);
   });
 
   test("a stale gap after a lagged re-sub is dropped, so seqs only increase and no marker repeats", () => {

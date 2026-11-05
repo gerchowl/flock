@@ -3,16 +3,18 @@
  *
  * @module
  */
-import { For, Show, createEffect, createUniqueId, type JSX } from "solid-js";
+import { For, Show, createEffect, createUniqueId, onCleanup, type JSX } from "solid-js";
 
 import type { AgentRow } from "../fleet";
 import type { Sender } from "./Composer";
-import { PermissionActions, createDecideUi, type DecideUi } from "./decide";
+import { PermissionActions, createDecideUi, type CardKeys, type DecideUi } from "./decide";
 import { sortInbox, type InboxCard } from "./inbox";
+import { ariaKeys, bindKeys, shortcut } from "./keys";
 import { PHASE_LABELS, StatusMark, markFor } from "./marks";
+import { RefusalDetails } from "./refusals";
 
 /**
- * A post-MVP action, shown but inert. What it waits for is visible text,
+ * An unbuilt action, shown only in preview (`workbench/preview.ts`) and inert. What it waits for is visible text,
  * which the control names through `aria-describedby`, so phones and
  * keyboards reach it too. `reasonId` points at a reason shared with other
  * actions instead of a caption of its own.
@@ -33,14 +35,33 @@ export function Waits(props: { readonly label: string } & ({ readonly waitsFor: 
   );
 }
 
-/** One sidebar row: status mark, name, activity, and the open-item count. */
-export function AgentRowButton(props: { readonly row: AgentRow; readonly focused: boolean; readonly onFocus: () => void }): JSX.Element {
+/**
+ * One sidebar row: status mark, name, activity, and the open-item count, on
+ * one line. The name is the row's accessible name; the phase and the full
+ * activity, which the line may cut short, are its description, so keyboard
+ * and screen-reader users get them without hovering.
+ */
+export function AgentRowButton(props: { readonly row: AgentRow; readonly focused: boolean; readonly onFocus: () => void; readonly testid?: string | undefined }): JSX.Element {
+  const [mark, name, activity] = [createUniqueId(), createUniqueId(), createUniqueId()];
   return (
-    <button type="button" class="agent-row" aria-current={props.focused ? "true" : undefined} onClick={props.onFocus} data-testid="agent-row">
-      <StatusMark mark={markFor(props.row)} label={PHASE_LABELS[props.row.state]} count={props.row.waitingOnHuman.length} />
+    <button
+      type="button"
+      class="agent-row"
+      aria-current={props.focused ? "true" : undefined}
+      aria-labelledby={name}
+      aria-describedby={`${mark} ${activity}`}
+      onClick={props.onFocus}
+      data-agent-id={props.row.id}
+      data-testid={props.testid ?? "agent-row"}
+    >
+      <StatusMark id={mark} mark={markFor(props.row)} label={PHASE_LABELS[props.row.state]} count={props.row.waitingOnHuman.length} />
       <span class="agent-row__text">
-        <span class="agent-row__name">{props.row.label}</span>
-        <span class="agent-row__activity">{props.row.activity}</span>
+        <span id={name} class="agent-row__name">
+          {props.row.label}
+        </span>
+        <span id={activity} class="agent-row__activity" title={props.row.activity}>
+          {props.row.activity}
+        </span>
       </span>
     </button>
   );
@@ -69,15 +90,22 @@ export function createClosedIds(cards: () => readonly InboxCard[]): ClosedIds {
 }
 
 /** The inbox's cards, blocking first. */
-export function InboxCards(props: { readonly cards: readonly InboxCard[]; readonly closed: ClosedIds; readonly source: "replay" | "live"; readonly sender: Sender | null }): JSX.Element {
+export function InboxCards(props: {
+  readonly cards: readonly InboxCard[];
+  readonly closed: ClosedIds;
+  readonly source: "replay" | "live";
+  readonly sender: Sender | null;
+  /** Shows a sample card's unbuilt answers, disabled, with what they wait for. */
+  readonly preview: boolean;
+}): JSX.Element {
   const note = (): string | null =>
     props.source === "live"
       ? props.cards.length === 0
         ? "No open permission prompts."
         : null
       : props.cards.length === 0
-        ? "The live inbox arrives with G5 (#1597)."
-        : "Sample cards: the live inbox arrives with G5 (#1597).";
+        ? "No sample cards in this recording."
+        : "Sample cards: answering them is not available in a recording.";
   // A card is rebuilt on every record, so what the person typed lives here, by request.
   const uis = new Map<string, DecideUi>();
   const uiFor = (card: InboxCard): DecideUi => {
@@ -101,20 +129,36 @@ export function InboxCards(props: { readonly cards: readonly InboxCard[]; readon
       <Show when={note()}>{(text) => <p class="inbox__note">{text()}</p>}</Show>
       <For each={sortInbox(props.cards)}>
         {(card) => {
-          const reason = createUniqueId();
+          const [reason, title] = [createUniqueId(), createUniqueId()];
+          // A card that answers for real is focusable, and only the focused card takes ⌘↩ and ⌘⌫ (#2904).
+          const answers = card.choices.length > 0 && card.waitsFor === undefined;
+          let keys: CardKeys | undefined;
+          const bind = (article: HTMLElement): void => {
+            if (answers) onCleanup(bindKeys(article, { "card.allow": () => keys?.allow(), "card.deny": () => keys?.deny() }));
+          };
           return (
-          <article class="card" classList={{ "card--blocking": card.blocking }} data-testid="inbox-card" data-request-seq={card.requestSeq}>
+          <article
+            ref={bind}
+            class="card"
+            classList={{ "card--blocking": card.blocking }}
+            data-testid="inbox-card"
+            data-request-seq={card.requestSeq}
+            tabindex={answers ? 0 : undefined}
+            aria-labelledby={answers ? title : undefined}
+            aria-keyshortcuts={answers ? `${ariaKeys(shortcut("card.allow").combo)} ${ariaKeys(shortcut("card.deny").combo)}` : undefined}
+          >
             <p class="card__meta">
               {card.kind === "permission" ? "Permission" : "Question"} · {card.agentLabel}
             </p>
-            <h3 class="card__title">{card.title}</h3>
+            <h3 id={title} class="card__title">{card.title}</h3>
             <p class="card__detail">{card.detail}</p>
+            <Show when={card.diagnosis}>{(raw) => <RefusalDetails code={raw().code} message={raw().message} />}</Show>
             <Show when={card.stale}>
               <p class="card__stale" data-testid="inbox-stale">
                 This agent's history has a gap; this may be out of date.
               </p>
             </Show>
-            <Show when={card.choices.length > 0}>
+            <Show when={card.choices.length > 0 && (card.waitsFor === undefined || props.preview)}>
               <Show
                 when={card.waitsFor === undefined}
                 fallback={
@@ -129,7 +173,7 @@ export function InboxCards(props: { readonly cards: readonly InboxCard[]; readon
                   </>
                 }
               >
-                <PermissionActions card={card} sender={props.sender} ui={uiFor(card)} />
+                <PermissionActions card={card} sender={props.sender} ui={uiFor(card)} keys={(actions) => (keys = actions)} />
               </Show>
             </Show>
           </article>

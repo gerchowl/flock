@@ -2,22 +2,40 @@
 //! The server owner shares this source with socket minting and transport admission.
 use super::*;
 use crate::platform::process_exit::ExitWatch;
-use std::{collections::HashMap, sync::Arc, time::Instant};
+use std::{collections::HashMap, sync::Arc};
 use tokio::sync::watch;
 
 const CAPACITY: usize = 128;
 /// Fixed lifetime; renewal issues a different credential for the same operator identity.
 pub(crate) const TTL: Duration = Duration::from_secs(12 * 60 * 60);
-/// Monotonic time supplied by the owning server, never serialized or wall-clock based.
+/// Fallible clock wait, owned by the caller's async reactor rather than a blocking worker.
+#[cfg(any(feature = "web", test))]
+pub(crate) type Wait<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<()>> + Send + 'a>>;
+/// Supplied non-settable elapsed clock, including suspend, in one deadline domain.
 pub(crate) trait Clock: Send + Sync {
-    /// Read the current monotonic instant without blocking.
-    fn now(&self) -> Instant;
+    /// Read elapsed time; unavailable clock evidence withholds authorization.
+    fn now(&self) -> io::Result<Duration>;
+    /// Await the same clock's absolute deadline without polling.
+    #[cfg(any(feature = "web", test))]
+    fn until(&self, deadline: Duration) -> Wait<'_>;
 }
-/// Production monotonic clock; tests supply the same explicit time domain.
-pub(crate) struct SystemClock;
-impl Clock for SystemClock {
-    fn now(&self) -> Instant {
-        Instant::now()
+/// Production suspend-inclusive clock: CLOCK_BOOTTIME or mach_continuous_time.
+#[derive(Default)]
+pub(crate) struct SystemClock<R = crate::platform::suspend_clock::Kernel>(pub(crate) R);
+impl SystemClock {
+    /// Use the production kernel reader.
+    pub(crate) fn new() -> Self {
+        Self(crate::platform::suspend_clock::Kernel)
+    }
+}
+impl<R: crate::platform::suspend_clock::Read> Clock for SystemClock<R> {
+    fn now(&self) -> io::Result<Duration> {
+        crate::platform::suspend_clock::now(&self.0)
+    }
+    #[cfg(any(feature = "web", test))]
+    fn until(&self, deadline: Duration) -> Wait<'_> {
+        Box::pin(crate::platform::suspend_clock::until(deadline))
     }
 }
 /// Peer evidence failures stay distinct from entropy, storage and admission failures.
@@ -46,7 +64,7 @@ pub(crate) struct Session {
     /// Server-issued identity and fixed operator scopes.
     pub(crate) info: TokenInfo,
     /// Fixed expiry in the supplied clock domain, never extended by lookup.
-    pub(crate) expires: Instant,
+    pub(crate) expires: Duration,
     /// Retained kernel evidence for readiness-driven owner scheduling.
     pub(crate) process: Arc<ExitWatch>,
     /// Changes after fenced removal; owner drop closes the sender.
@@ -73,20 +91,34 @@ pub(crate) struct Store {
     files: Arc<TokenStore>,
     entries: Mutex<Entries>,
     clock: Arc<dyn Clock>,
+    #[cfg(all(test, feature = "web"))]
+    waiting: Mutex<Vec<Box<dyn FnOnce() + Send>>>,
 }
-struct Mutation<'a> {
-    store: &'a Store,
+/// Published revocation intent and owned helper, transferable outside store I/O.
+pub(crate) struct PendingMutation {
+    files: Arc<TokenStore>,
     pending: PendingLock,
-    _intent: priority::Intent<'a>,
+    intent: priority::Intent<Arc<Namespace>>,
 }
-impl Mutation<'_> {
-    fn finish<T>(
-        self,
-        change: impl FnOnce(&mut Entries) -> Result<T, TokenError>,
-    ) -> Result<T, TokenError> {
-        let _guard = self.pending.finish(Duration::from_secs(2))?;
-        let mut entries = self.store.entries.lock().map_err(|_| TokenError::Unsafe)?;
-        change(&mut entries)
+/// Exclusive ownership retained through the memory mutation and notification.
+pub(crate) struct MutationFence {
+    files: Arc<TokenStore>,
+    _guard: LockFile,
+    _intent: priority::Intent<Arc<Namespace>>,
+}
+impl PendingMutation {
+    /// Five-second startup plus two-second contention: seven seconds of IPC wait.
+    /// Caller hooks and owned-child cleanup/scheduling add to this bound.
+    /// Call only on the separately bounded retirement-wait worker.
+    pub(crate) fn wait(self, on_wait: impl FnOnce()) -> Result<MutationFence, TokenError> {
+        let guard = self
+            .pending
+            .finish_notifying(Duration::from_secs(2), on_wait)?;
+        Ok(MutationFence {
+            files: self.files,
+            _guard: guard,
+            _intent: self.intent,
+        })
     }
 }
 impl Store {
@@ -96,15 +128,69 @@ impl Store {
             files,
             entries: Mutex::new(HashMap::new()),
             clock,
+            #[cfg(all(test, feature = "web"))]
+            waiting: Mutex::default(),
         }
     }
-    fn mutation(&self) -> Result<Mutation<'_>, TokenError> {
-        let intent = priority::Intent::begin(&self.files.0, self.files.random::<16>()?)?;
+    /// Install a fixture gate before the contended IPC read starts.
+    #[cfg(all(test, feature = "web"))]
+    pub(crate) fn on_waiting(&self, action: impl FnOnce() + Send + 'static) {
+        self.waiting.lock().unwrap().push(Box::new(action));
+    }
+    /// Signal only after the helper has entered the contended acquisition path.
+    #[cfg(all(test, feature = "web"))]
+    pub(crate) fn notify_waiting(&self) {
+        let action = self.waiting.lock().unwrap().pop();
+        // Release the hook mutex before a gate pauses this worker.
+        if let Some(action) = action {
+            action();
+        }
+    }
+    /// Publish intent and start acquisition without waiting on the store worker.
+    pub(crate) fn begin_mutation(&self) -> Result<PendingMutation, TokenError> {
+        let intent = priority::Intent::begin(self.files.0.clone(), self.files.random::<16>()?)?;
         let pending = PendingLock::begin(self.files.lock_file()?, &self.files.2)?;
-        Ok(Mutation {
-            store: self,
+        Ok(PendingMutation {
+            files: self.files.clone(),
             pending,
-            _intent: intent,
+            intent,
+        })
+    }
+    fn mutate<T>(
+        &self,
+        fence: MutationFence,
+        change: impl FnOnce(&mut Entries) -> Result<T, TokenError>,
+    ) -> Result<T, TokenError> {
+        if !Arc::ptr_eq(&self.files, &fence.files) {
+            return Err(TokenError::Unsafe);
+        }
+        let mut entries = self.entries.lock().map_err(|_| TokenError::Unsafe)?;
+        // Keep the intent and exclusive fence alive until notification is published.
+        let result = change(&mut entries);
+        drop(entries);
+        drop(fence);
+        result
+    }
+    fn mutation(&self) -> Result<MutationFence, TokenError> {
+        self.begin_mutation()?.wait(|| {
+            #[cfg(all(test, feature = "web"))]
+            self.notify_waiting();
+        })
+    }
+    /// Finish a previously fenced retirement; None retires the entire owner domain.
+    pub(crate) fn finish_mutation(
+        &self,
+        fence: MutationFence,
+        session: Option<&Session>,
+    ) -> Result<(), TokenError> {
+        self.mutate(fence, |entries| match session {
+            Some(session) => Self::remove(entries, &session.digest),
+            None => {
+                for (_, entry) in entries.drain() {
+                    entry.revoke.send_replace(true);
+                }
+                Ok(())
+            }
         })
     }
     /// Arm the attested process before reading its identity or generating a bearer.
@@ -134,7 +220,7 @@ impl Store {
         let process = watch;
         let _guard = self.files.lock()?;
         let mut entries = self.entries.lock().map_err(|_| TokenError::Unsafe)?;
-        Self::sweep_entries(&mut entries, self.clock.now())?;
+        Self::sweep_entries(&mut entries, self.clock.now().map_err(TokenError::from)?)?;
         if entries.len() == CAPACITY {
             return Err(TokenError::Busy.into());
         }
@@ -147,15 +233,20 @@ impl Store {
         let uid = authority.peer_credentials().uid.ok_or_else(|| {
             IssueError::PeerProcessChanged(io::Error::other("operator UID is unavailable"))
         })?;
-        let issued_at = self.clock.now();
-        let expires = issued_at + TTL;
+        let issued_at = self.clock.now().map_err(TokenError::from)?;
+        let expires = issued_at.checked_add(TTL).ok_or(TokenError::Unsafe)?;
         let info = TokenInfo {
             name: format!("app:{name}"),
             principal: format!("app:operator:{uid}"),
             scopes: operator_scopes(),
             expires_in_ms: Some(
-                u64::try_from(expires.duration_since(issued_at).as_millis())
-                    .map_err(|_| TokenError::Unsafe)?,
+                u64::try_from(
+                    expires
+                        .checked_sub(issued_at)
+                        .ok_or(TokenError::Unsafe)?
+                        .as_millis(),
+                )
+                .map_err(|_| TokenError::Unsafe)?,
             ),
         };
         let (revoke, revoked) = watch::channel(false);
@@ -174,10 +265,15 @@ impl Store {
         );
         Ok(Issued { info, token })
     }
+    /// Await expiry in the exact clock domain used for issuance and admission.
+    #[cfg(feature = "web")]
+    pub(crate) async fn expired(&self, session: &Session) -> io::Result<()> {
+        self.clock.until(session.expires).await
+    }
     fn current(&self, digest: &[u8; 32]) -> Result<Session, TokenError> {
         let entries = self.entries.lock().map_err(|_| TokenError::Unsafe)?;
         let entry = entries.get(digest).ok_or(TokenError::Revoked)?;
-        if self.clock.now() >= entry.session.expires || entry.session.process.exited()? {
+        if self.clock.now()? >= entry.session.expires || entry.session.process.exited()? {
             return Err(TokenError::Revoked);
         }
         Ok(entry.session.clone())
@@ -191,9 +287,9 @@ impl Store {
             .map_err(|_| TokenError::Unsafe)?
             .contains_key(&digest))
     }
-    /// Lookup only in this private memory domain; file-token authentication is unchanged.
+    /// Lookup returns a snapshot; registration and dispatch separately fence its use.
+    /// Like file-token lookup, it does not wait for token-management ownership.
     pub(crate) fn authenticate(&self, token: &Bearer) -> Result<Session, TokenError> {
-        let _guard = self.files.lock_with(LockFile::try_lock_shared)?;
         if !valid_hex(&token.0, 64) {
             return Err(TokenError::Unauthorized);
         }
@@ -219,20 +315,16 @@ impl Store {
         Ok(())
     }
     /// Publish intent before waiting; after return, admitted callbacks have drained.
+    #[cfg(test)]
     pub(crate) fn revoke(&self, session: &Session) -> Result<(), TokenError> {
-        self.mutation()?
-            .finish(|entries| Self::remove(entries, &session.digest))
+        self.finish_mutation(self.mutation()?, Some(session))
     }
     /// Quiescence fence for restart/handoff; no session state belongs in their snapshots.
+    #[cfg_attr(not(test), allow(dead_code))] // Async transport shutdown uses the split mutation phases.
     pub(crate) fn revoke_all(&self) -> Result<(), TokenError> {
-        self.mutation()?.finish(|entries| {
-            for (_, entry) in entries.drain() {
-                entry.revoke.send_replace(true);
-            }
-            Ok(())
-        })
+        self.finish_mutation(self.mutation()?, None)
     }
-    fn sweep_entries(entries: &mut Entries, now: Instant) -> Result<(), TokenError> {
+    fn sweep_entries(entries: &mut Entries, now: Duration) -> Result<(), TokenError> {
         let mut ended = Vec::new();
         for (digest, entry) in entries.iter() {
             if now >= entry.session.expires || entry.session.process.exited()? {
@@ -248,9 +340,25 @@ impl Store {
     /// Watch I/O errors fail closed; no uncertain observation is silently discarded.
     #[cfg_attr(not(test), allow(dead_code))] // Automatic per-session retirement uses revoke; bulk sweep remains tested.
     pub(crate) fn sweep(&self) -> Result<(), TokenError> {
-        self.mutation()?
-            .finish(|entries| Self::sweep_entries(entries, self.clock.now()))
+        self.mutate(self.mutation()?, |entries| {
+            Self::sweep_entries(entries, self.clock.now()?)
+        })
     }
 }
+#[cfg(test)]
+impl Store {
+    /// Construct an Answer-only app session for scope-refusal tests; issuance stays fixed in production.
+    pub(crate) fn answer_only_for_test(&self, session: &mut Session) {
+        session.info.scopes = [Scope::Answer].into();
+        self.entries
+            .lock()
+            .unwrap()
+            .get_mut(&session.digest)
+            .unwrap()
+            .session
+            .info = session.info.clone();
+    }
+}
+
 #[cfg(test)]
 mod tests;

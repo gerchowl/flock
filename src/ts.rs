@@ -60,6 +60,8 @@ fn contracts() -> BTreeMap<PathBuf, String> {
     collector.add::<crate::structured_wire::ServerFrame>();
     collector.add::<crate::structured_wire::fixture::FixtureLine>();
     collector.add::<crate::structured_wire::FleetAgentRow>();
+    collector.add::<crate::structured_wire::FleetNodeRow>();
+    collector.add::<crate::structured_wire::FleetProjectRow>();
     collector.add::<crate::structured_wire::AgentDecide>();
     collector.add::<crate::structured_wire::PermissionDecision>();
     collector.add::<crate::structured_wire::FleetDelta>();
@@ -109,6 +111,8 @@ export const fixtureExamples = {
             .expect("fixture script")
             .lines()
         {
+            crate::structured_wire::fixture::FixtureLine::parse(line)
+                .expect("validated typed fixture");
             let value: serde_json::Value = serde_json::from_str(line).expect("fixture JSON");
             if name == "permission-decision" {
                 let frame = &value["frame"];

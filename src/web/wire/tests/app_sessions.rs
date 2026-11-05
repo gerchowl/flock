@@ -7,21 +7,43 @@ use std::{
     sync::atomic::AtomicBool,
 };
 
-pub(super) async fn fixture() -> (Server, App, Owner) {
-    let root = crate::structured::launch::SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+pub(crate) async fn fixture() -> (Server, App, Owner) {
+    fixture_with_origin(true).await
+}
+pub(crate) async fn fixture_with_origin(local: bool) -> (Server, App, Owner) {
+    fixture_using(local, |clock| Arc::new(clock)).await
+}
+pub(super) async fn fixture_using(
+    local: bool,
+    wrap: impl FnOnce(TestClock) -> Arc<dyn Clock>,
+) -> (Server, App, Owner) {
     let clock = TestClock::new();
+    let transport = wrap(clock.clone());
+    let ttl = Arc::new(AppClock::new(transport.clone()));
+    fixture_config(clock, transport, ttl, local).await
+}
+async fn fixture_clocks(clock: TestClock, ttl: TestClock) -> (Server, App, Owner) {
+    fixture_store_clock(clock, Arc::new(AppClock::new(Arc::new(ttl)))).await
+}
+async fn fixture_store_clock(
+    clock: TestClock,
+    ttl: Arc<dyn crate::structured::permissions::auth::tokens::app_sessions::Clock>,
+) -> (Server, App, Owner) {
+    fixture_config(clock.clone(), Arc::new(clock), ttl, true).await
+}
+async fn fixture_config(
+    clock: TestClock,
+    transport_clock: Arc<dyn Clock>,
+    ttl: Arc<dyn crate::structured::permissions::auth::tokens::app_sessions::Clock>,
+    local: bool,
+) -> (Server, App, Owner) {
+    let root = crate::structured::launch::SessionConfigDir::create(&std::env::temp_dir()).unwrap();
     let owner = Owner::default();
-    let store = owner
-        .get(root.path(), Arc::new(AppClock(Arc::new(clock.clone()))))
-        .unwrap();
+    let store = owner.get(root.path(), ttl).unwrap();
     let wake = Arc::new(tokio::sync::Notify::new());
-    let core = Core::from_store(store, Arc::new(clock.clone()), wake.clone()).unwrap();
+    let core = Core::from_store(store, transport_clock, wake.clone()).unwrap();
     let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let bind = socket.local_addr().unwrap();
-    let router = core.router();
-    let task = tokio::spawn(async move {
-        axum::serve(socket, router).await.unwrap();
-    });
     let mut app = App::new(
         &crate::config::Config::default(),
         true,
@@ -34,6 +56,20 @@ pub(super) async fn fixture() -> (Server, App, Owner) {
         operator: crate::platform::peer::effective_uid(),
         dedicated: Ok(None).into(),
     };
+    // Unmounted-core lifecycle fixtures supply a sealed proof from a real Unix peer.
+    // Native integration tests instead capture each accepted connection and service admission.
+    let router = if local {
+        let (peer, _other) = UnixStream::pair().unwrap();
+        let proof = app
+            .admit_local_peer(crate::platform::peer::credentials(&peer))
+            .unwrap();
+        core.endpoint(true).layer(axum::Extension(proof))
+    } else {
+        core.router()
+    };
+    let task = tokio::spawn(async move {
+        axum::serve(socket, router).await.unwrap();
+    });
     (
         Server {
             core: Arc::new(core),
@@ -86,7 +122,7 @@ async fn dispatch(app: &mut App, params: Value, alter: impl FnOnce(&mut App)) ->
     worker.join().unwrap();
     serde_json::from_str(&line).unwrap()
 }
-pub(super) async fn mint(app: &mut App) -> Bearer {
+pub(crate) async fn mint(app: &mut App) -> Bearer {
     let reply = dispatch(app, json!({}), |_| {}).await;
     serde_json::from_value(reply["result"]["issued"]["token"].clone())
         .unwrap_or_else(|_| panic!("mint refused: {reply}"))
@@ -99,7 +135,7 @@ fn socket_mint_is_fixed_scoped_shared_memory_only_and_renews_independently() {
         let store = owner
             .get(
                 server._root.path(),
-                Arc::new(AppClock(Arc::new(server.clock.clone()))),
+                Arc::new(AppClock::new(Arc::new(server.clock.clone()))),
             )
             .unwrap();
         let session = store.authenticate(&token).unwrap();
@@ -229,55 +265,9 @@ fn ttl_expires_idle_socket_at_injected_deadline_with_typed_close() {
 }
 #[test]
 fn real_minting_child_exit_closes_idle_socket_without_a_command() {
-    runtime(async {
-        let (server, mut app, _) = fixture().await;
-        let request =
-            json!({"id":"child-app-mint","method":"client.app.mint","params":{}}).to_string();
-        let mut peer = crate::platform::process_exit::tests::Peer::request(Some(&request));
-        let socket = peer.take_stream();
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let worker = std::thread::spawn(move || {
-            crate::api::server::handle_connection(
-                socket,
-                &tx,
-                &EventHub::default(),
-                &Arc::new(AtomicBool::new(true)),
-                None,
-                &Mutex::default(),
-                &crate::api::client_listener::Health::default(),
-                &Default::default(),
-            )
-            .unwrap()
-        });
-        let message = within(rx.recv()).await.unwrap();
-        assert_eq!(message.peer_pid, peer.credentials.pid);
-        app.current_api_peer_pid = message.peer_pid;
-        app.current_api_peer_uid = Some(message.peer_uid);
-        app.current_api_peer_birth = Some(message.peer_birth);
-        let reply = app.handle_api_request(message.request);
-        let value: Value = serde_json::from_str(&reply).unwrap();
-        message.respond_to.send(reply).unwrap();
-        worker.join().unwrap();
-        let token =
-            serde_json::from_value::<Bearer>(value["result"]["issued"]["token"].clone()).unwrap();
-        let mut ws = Socket::open(&server).await;
-        ws.hello(WIRE_JSON_VERSION, &token.0).await;
-        server.clock.deadline(12 * 60 * 60 * 1000).await;
-        let mut sibling = Socket::open(&server).await;
-        sibling.hello(WIRE_JSON_VERSION, &token.0).await;
-        peer.exit();
-        assert_eq!(
-            close_detail(&mut ws).await,
-            (AUTH_REVOKED_CLOSE, "client transport ended".into())
-        );
-        assert_eq!(
-            close_detail(&mut sibling).await,
-            (AUTH_REVOKED_CLOSE, "client transport ended".into())
-        );
-        assert!(server.core.shared.store.authenticate(&token).is_err());
-        server.finish().await;
-    });
+    runtime(super::native::child_bridge_and_exit());
 }
+
 #[test]
 fn shutdown_revokes_both_sockets_and_same_owner_cannot_reuse_tokens() {
     runtime(async {
@@ -376,14 +366,14 @@ fn socket_mint_reports_remaining_lifetime_from_the_store_clock() {
     runtime(async {
         let (server, mut app, owner) = fixture().await;
         server.clock.advance(1731);
-        let issue_time = server.clock.now();
+        let issue_time = Duration::ZERO;
         let reply = dispatch(&mut app, json!({}), |_| {}).await;
         let issued = &reply["result"]["issued"];
         let token: Bearer = serde_json::from_value(issued["token"].clone()).unwrap();
         let store = owner
             .get(
                 server._root.path(),
-                Arc::new(AppClock(Arc::new(server.clock.clone()))),
+                Arc::new(AppClock::new(Arc::new(server.clock.clone()))),
             )
             .unwrap();
         let session = store.authenticate(&token).unwrap();
@@ -392,11 +382,102 @@ fn socket_mint_reports_remaining_lifetime_from_the_store_clock() {
                 .app()
                 .unwrap()
                 .expires
-                .duration_since(issue_time)
+                .checked_sub(issue_time)
+                .unwrap()
                 .as_millis(),
         )
         .unwrap();
         assert_eq!(issued["info"]["expires_in_ms"].as_u64(), Some(expected));
+        within(server.core.shutdown()).await.unwrap();
+        server.finish().await;
+    });
+}
+
+#[test]
+fn suspend_gap_expires_a_mint_and_its_idle_socket_without_awake_time() {
+    runtime(async {
+        let ttl = TestClock::new();
+        let (server, mut app, owner) = fixture_clocks(TestClock::new(), ttl.clone()).await;
+        let awake = server.clock.now();
+        let reply = dispatch(&mut app, json!({}), |_| {}).await;
+        let issued = &reply["result"]["issued"];
+        let token: Bearer = serde_json::from_value(issued["token"].clone()).unwrap();
+        let ttl_ms = u64::try_from(
+            crate::structured::permissions::auth::tokens::app_sessions::TTL.as_millis(),
+        )
+        .unwrap();
+        assert_eq!(issued["info"]["expires_in_ms"], ttl_ms);
+        let store = owner
+            .get(
+                server._root.path(),
+                Arc::new(AppClock::new(Arc::new(ttl.clone()))),
+            )
+            .unwrap();
+        let mut socket = Socket::open(&server).await;
+        socket.hello(WIRE_JSON_VERSION, &token.0).await;
+        server.clock.deadline(15_000).await;
+        ttl.advance(ttl_ms);
+        assert_eq!(
+            server.clock.now(),
+            awake,
+            "no awake time passed during suspend"
+        );
+        assert!(store.authenticate(&token).is_err());
+        assert!(matches!(
+            socket.receive().await,
+            Received::Close(AUTH_REVOKED_CLOSE)
+        ));
+        let renewed = dispatch(&mut app, json!({}), |_| {}).await;
+        assert_eq!(renewed["result"]["issued"]["info"]["expires_in_ms"], ttl_ms);
+        within(server.core.shutdown()).await.unwrap();
+        server.finish().await;
+    });
+}
+
+struct FailedClock(bool);
+impl crate::structured::permissions::auth::tokens::app_sessions::Clock for FailedClock {
+    fn now(&self) -> io::Result<Duration> {
+        if self.0 {
+            Err(io::Error::other("clock fixture unavailable"))
+        } else {
+            Ok(Duration::ZERO)
+        }
+    }
+    fn until(
+        &self,
+        _: Duration,
+    ) -> crate::structured::permissions::auth::tokens::app_sessions::Wait<'_> {
+        Box::pin(async { Err(io::Error::other("timer fixture unavailable")) })
+    }
+}
+#[test]
+fn unavailable_ttl_clock_refuses_socket_mint_without_a_fallback() {
+    runtime(async {
+        let (server, mut app, _) =
+            fixture_store_clock(TestClock::new(), Arc::new(FailedClock(true))).await;
+        let reply = dispatch(&mut app, json!({}), |_| {}).await;
+        assert_eq!(reply["error"]["code"], "internal_error");
+        assert!(reply.get("result").is_none());
+        within(server.core.shutdown()).await.unwrap();
+        server.finish().await;
+    });
+}
+#[test]
+fn unavailable_expiry_timer_closes_without_claiming_credential_revocation() {
+    runtime(async {
+        let (server, mut app, owner) =
+            fixture_store_clock(TestClock::new(), Arc::new(FailedClock(false))).await;
+        let token = mint(&mut app).await;
+        let mut socket = Socket::open(&server).await;
+        socket.send(json!({"t":"hello","protocol":WIRE_JSON_VERSION,"client":{"name":"fixture","version":"1"},"token":token.0})).await;
+        assert!(matches!(
+            socket.receive().await,
+            Received::Close(GOING_AWAY_CLOSE)
+        ));
+        let store = owner
+            .get(server._root.path(), Arc::new(FailedClock(false)))
+            .unwrap();
+        assert!(store.authenticate(&token).is_ok());
         within(server.core.shutdown()).await.unwrap();
         server.finish().await;
     });
@@ -463,7 +544,7 @@ fn app_fanout_matches_the_credential_without_prior_store_retirement() {
         let store = owner
             .get(
                 server._root.path(),
-                Arc::new(AppClock(Arc::new(server.clock.clone()))),
+                Arc::new(AppClock::new(Arc::new(server.clock.clone()))),
             )
             .unwrap();
         let session = store.authenticate(&a).unwrap();
