@@ -90,7 +90,7 @@ async fn native_inbox_caller_ownership_and_directory_ambiguity() {
     app.session_leases = leases;
     let own = seed("fixture-agent", "fixture-session", 60_000);
     seed("other-agent", "other-session", 60_000);
-    for verb in ["msg.list", "msg.read"] {
+    for verb in ["msg.list", "msg.read", "msg.wake"] {
         assert_eq!(
             call(&mut app, Some(&scope), verb, Some("other-name"))["error"]["code"],
             "inbox_not_owner"
@@ -106,7 +106,7 @@ async fn native_inbox_caller_ownership_and_directory_ambiguity() {
         own
     );
     register(&mut app, "native-name", "collision", "collision-session");
-    for verb in ["msg.list", "msg.read"] {
+    for verb in ["msg.list", "msg.read", "msg.wake"] {
         assert_eq!(
             call(&mut app, Some(&scope), verb, Some("native-name"))["error"]["code"],
             "agent_target_ambiguous"
@@ -128,7 +128,7 @@ async fn native_inbox_caller_invalid_and_revoked_credentials_are_uniform() {
     let unknown = crate::api::scoped::tests::unknown_credential(&scope);
     let refused = call(&mut app, Some(&unknown), "msg.read", Some("other-name"));
     drop(lease);
-    for verb in ["msg.list", "msg.read"] {
+    for verb in ["msg.list", "msg.read", "msg.wake"] {
         for target in [None, Some("fixture-agent"), Some("missing")] {
             assert_eq!(call(&mut app, Some(&scope), verb, target), refused);
         }

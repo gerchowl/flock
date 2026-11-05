@@ -906,6 +906,13 @@ impl App {
         id: String,
         params: crate::api::schema::MsgWakeParams,
     ) -> String {
+        if let Err(code) = self.native_inbox_owner(params.pane.as_deref()) {
+            return encode_error(
+                id,
+                code.as_str(),
+                "native inbox authority refused or unavailable",
+            );
+        }
         let pane = match self.resolve_inbox_pane(&id, params.pane, "wake") {
             Ok(pane) => pane,
             Err(refusal) => return refusal,
@@ -3546,6 +3553,50 @@ mod tests {
         })));
         app.current_api_peer_pid = None;
         assert_eq!(app.mailboxes.queued_len(&answerer), 1);
+    }
+
+    #[tokio::test]
+    async fn stop_hook_wake_refuses_the_same_unproven_caller_as_inbox_read() {
+        for mismatch in [false, true] {
+            let mut app = test_app_with_hub(crate::api::EventHub::default());
+            let target = pane_target(&app, 1);
+            waking_send(&mut app, "unread-authority", "fixture mail");
+            let pane = app.state.workspaces[1].focused_pane_id().unwrap();
+            crate::test_support::adopt_unproven_pane_caller(&mut app, pane, mismatch);
+            let read: serde_json::Value = serde_json::from_str(&app.handle_msg_read(
+                "read".into(),
+                MsgReadParams {
+                    pane: Some(target.clone()),
+                },
+            ))
+            .unwrap();
+            assert_eq!(read["error"]["code"], "not_authorized");
+            let wake: serde_json::Value = serde_json::from_str(&app.handle_msg_wake(
+                "wake".into(),
+                crate::api::schema::MsgWakeParams {
+                    pane: Some(target.clone()),
+                },
+            ))
+            .unwrap();
+            assert_eq!(wake["error"]["code"], read["error"]["code"], "{wake}");
+            assert_eq!(app.mailboxes.queued_len(&target), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_hook_wake_keeps_authorized_pane_mail_unconsumed() {
+        let mut app = test_app_with_hub(crate::api::EventHub::default());
+        let target = pane_target(&app, 1);
+        waking_send(&mut app, "readable-authority", "fixture mail");
+        let pane = app.state.workspaces[1].focused_pane_id().unwrap();
+        crate::test_support::attest_pane_caller(&mut app, pane);
+        assert_eq!(wake(&mut app, &target), (1, None));
+        assert_eq!(app.mailboxes.queued_len(&target), 1);
+        let read: serde_json::Value = serde_json::from_str(
+            &app.handle_msg_read("read".into(), MsgReadParams { pane: Some(target) }),
+        )
+        .unwrap();
+        assert_eq!(read["result"]["messages"].as_array().unwrap().len(), 1);
     }
 
     /// `msg.wake` names the inbox it counted (#438), so `flk mcp serve` can
