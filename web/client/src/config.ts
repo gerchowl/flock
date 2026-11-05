@@ -53,6 +53,9 @@ export type ShellToken = { readonly token: string; readonly expiresInMs?: number
  */
 export type TokenProvider = () => Promise<ShellToken>;
 
+/** Optional native badge capability, provided only by a desktop shell. */
+export type SetBadgeCount = (count: number) => Promise<void>;
+
 /** Live mode: connect to a `flk` server over ADR-0036 §5's WebSocket. */
 export type WireShellConfig = {
   readonly transport: "wire";
@@ -109,6 +112,7 @@ export type OpenBridge = (request: { readonly renew: boolean }) => Promise<Bridg
 export type BridgeShellConfig = {
   readonly transport: "bridge";
   readonly openBridge: OpenBridge;
+  readonly setBadgeCount?: SetBadgeCount;
 };
 
 /** Fixture mode: replay a recorded session; no server is contacted. */
@@ -217,10 +221,11 @@ export function readShellConfig(scope: object): ConfigResult {
       return { ok: true, config: { transport: "wire", serverUrl, ...(token === undefined ? {} : { token }), ...(provider === undefined ? {} : { tokenProvider: provider }) } };
     }
     case "bridge": {
-      const { openBridge, serverUrl, token, tokenProvider } = raw;
+      const { openBridge, serverUrl, token, tokenProvider, setBadgeCount } = raw;
       if (serverUrl !== undefined || token !== undefined || tokenProvider !== undefined) return refuse(BRIDGE_ALONE);
       if (typeof openBridge !== "function") return refuse("A bridge configuration needs an openBridge function.");
-      return { ok: true, config: { transport: "bridge", openBridge: openBridge as OpenBridge } };
+      if (setBadgeCount !== undefined && typeof setBadgeCount !== "function") return refuse("setBadgeCount must be a function.");
+      return { ok: true, config: { transport: "bridge", openBridge: openBridge as OpenBridge, ...(setBadgeCount === undefined ? {} : { setBadgeCount: setBadgeCount as SetBadgeCount }) } };
     }
     case "fixture": {
       const { fixtureJsonl, source } = raw;

@@ -50,7 +50,7 @@ remains available with `just desktop-build`.
 On the server's machine the shell needs no token input (ADR-0038 §6, "The
 server on the same machine"). The init script sets the bundle's
 `__FLOCK_SHELL_CONFIG__` (`web/client/src/config.ts`) to the contract's
-`{ transport: "bridge", openBridge }`; `src/open-bridge.js` is that function.
+`{ transport: "bridge", openBridge, setBadgeCount }`; `src/open-bridge.js` is that function.
 
 - **The mint.** The shell's native side (`src/mint.rs`) opens `flock.sock` and
   sends `client.app.mint`. The server picks the scopes and binds the token to
@@ -154,7 +154,10 @@ Each rule has a test in `src/hardening.rs` or `src/config.rs`:
 - **Capabilities:** `capabilities/main.json` grants `allow-bridge-open`,
   `allow-bridge-send` and `allow-bridge-close`, for the only app commands
   (`build.rs` declares them), so no `shell`, `fs`, `http` or `dialog`, no
-  global Tauri API and no remote IPC. Starting `flk server` is the shell's own
+  global Tauri API and no remote IPC. The additional
+  `core:window:allow-set-badge-count` permission lets the injected shell
+  capability mirror the structured-agent attention count in the dock badge
+  (zero clears it). Browser builds have no badge capability. Starting `flk server` is the shell's own
   Rust code, not a webview permission.
 - **CSP:** `default-src 'self'; connect-src 'none'; frame-src blob: 'self'`.
   The webview opens no connection of its own; the session runs in Rust.

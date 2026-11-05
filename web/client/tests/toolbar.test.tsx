@@ -163,12 +163,12 @@ describe("the connection popover", () => {
     const { root } = wireApp();
     key(document, { key: "k", ...COMMAND });
     const commands = [...root.querySelectorAll('[data-testid="palette-command"]')] as HTMLElement[];
-    expect(commands.map((command) => command.firstElementChild?.textContent)).toEqual(["Connection to fixture.invalid", "Disconnect", ...LAYER_COMMANDS]);
+    expect(commands.map((command) => command.firstElementChild?.textContent)).toEqual(["Connection to fixture.invalid", "Disconnect", ...LAYER_COMMANDS.map((label) => label === "First agent needing you" ? `${label} (0 agents need you)` : label)]);
     commands[1]?.click();
     expect([state(root), $(root, "palette")]).toEqual(["Disconnected", null]);
     key(document, { key: "k", ...COMMAND });
     const reopen = [...root.querySelectorAll('[data-testid="palette-command"]')] as HTMLElement[];
-    expect(reopen.map((command) => command.firstElementChild?.textContent)).toEqual(["Connection to fixture.invalid", "Connect", ...LAYER_COMMANDS]);
+    expect(reopen.map((command) => command.firstElementChild?.textContent)).toEqual(["Connection to fixture.invalid", "Connect", ...LAYER_COMMANDS.map((label) => label === "First agent needing you" ? `${label} (0 agents need you)` : label)]);
     reopen[0]?.click();
     await tick();
     expect($(root, "host-panel")?.hidden).toBe(false);

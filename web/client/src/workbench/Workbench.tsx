@@ -28,6 +28,7 @@
  */
 import { For, Show, createEffect, createMemo, createSignal, onCleanup, type JSX } from "solid-js";
 
+import type { SetBadgeCount } from "../config";
 import type { FleetSource } from "../fleet";
 import { createManager, type Layout } from "../layout/model";
 import { Cluster } from "../layout/primitives";
@@ -37,6 +38,7 @@ import { fleetStore } from "../store/fleet";
 import { SPACE } from "../tokens";
 import type { Transport } from "../transport";
 import { Transcript, type TranscriptSource } from "../views/Transcript";
+import { attentionCards, needsYou } from "./attention";
 import type { InboxCard } from "./inbox";
 import { Composer, createComposerState, type Sender } from "./Composer";
 import { HEALTH_LABELS, HostStatus, type HostView } from "./HostStatus";
@@ -46,7 +48,7 @@ import { createPermissionInbox } from "./permissions";
 import { AgentTitle, InboxCards, Waits, createClosedIds } from "./parts";
 import { PhoneWorkbench } from "./Phone";
 import { ShortcutSheet } from "./ShortcutSheet";
-import { HOME_UNKNOWN, SidebarTrees } from "./Sidebar";
+import { HOME_UNKNOWN, NeedsYou, SidebarTrees } from "./Sidebar";
 import { buildTrees, homeNodeId, inScope } from "./trees";
 import { createWindowActive } from "./window-focus";
 import "./workbench.css";
@@ -54,10 +56,9 @@ import "./workbench.css";
 /** The toolbars' unbuilt actions, shown only in preview; each is a button and, dimmed, a palette command. */
 const NEW_AGENT: WaitingAction = { label: "New agent", waitsFor: "the harness picker" };
 const SIDEBAR_TOGGLE: WaitingAction = { label: "Hide sidebar", waitsFor: "collapsible panes" };
-const NEEDS_YOU: WaitingAction = { label: "Needs you", waitsFor: "the attention count" };
 const INSPECTOR_TOGGLE: WaitingAction = { label: "Show inspector", waitsFor: "the inspector" };
 /** In toolbar order: the leading toggle, then the trailing group. */
-const TOOLBAR_WAITING: readonly WaitingAction[] = [SIDEBAR_TOGGLE, NEEDS_YOU, NEW_AGENT, INSPECTOR_TOGGLE];
+const TOOLBAR_WAITING: readonly WaitingAction[] = [SIDEBAR_TOGGLE, NEW_AGENT, INSPECTOR_TOGGLE];
 const PANE_ACTIONS: readonly WaitingAction[] = [
   { label: "Diff", waitsFor: "the diff tile" },
   { label: "Fork", waitsFor: "forks" },
@@ -67,6 +68,8 @@ const PANE_ACTIONS: readonly WaitingAction[] = [
 export type WorkbenchProps = {
   /** Where the sidebar's agent rows come from. */
   readonly fleet: FleetSource;
+  /** Desktop shell badge capability; absent in the browser. */
+  readonly setBadgeCount?: SetBadgeCount | undefined;
   readonly transport: Transport;
   readonly inbox: readonly InboxCard[];
   /** Sends `agent.send` through the outbox; `null` in fixture mode. */
@@ -130,7 +133,20 @@ export function Workbench(props: WorkbenchProps): JSX.Element {
   const home = createMemo(() => homeNodeId(fleet.nodes.items()));
   // Agents in scope: the summary, the palette and the phone list count these; the trees group them.
   const scoped = createMemo(() => rows().filter((row) => inScope(prefs().scope, home(), row.nodeId)));
-  const trees = createMemo(() => buildTrees(rows(), fleet.nodes.items(), fleet.projects.items(), prefs().scope, home()));
+  const attention = createMemo(() => rows().filter(needsYou));
+  const remaining = createMemo(() => rows().filter((row) => !needsYou(row)));
+  const count = createMemo(() => attention().length);
+  const attentionLabel = (): string => `${count()} ${count() === 1 ? "agent needs you" : "agents need you"}`;
+  const attentionCommand = (): string => `First agent needing you (${attentionLabel()})`;
+  createEffect(() => {
+    document.title = count() === 0 ? "flock" : `(${count()}) flock`;
+    void props.setBadgeCount?.(count()).catch((error: unknown) => console.error("Could not update the app badge", error));
+  });
+  onCleanup(() => {
+    document.title = "flock";
+    void props.setBadgeCount?.(0).catch((error: unknown) => console.error("Could not clear the app badge", error));
+  });
+  const trees = createMemo(() => buildTrees(remaining(), fleet.nodes.items(), fleet.projects.items(), prefs().scope, home()));
   const fleetNote = createMemo((): string | null => {
     const progress = fleet.agents.progress();
     if (progress.phase === "failed") return progress.message;
@@ -139,7 +155,7 @@ export function Workbench(props: WorkbenchProps): JSX.Element {
   });
   // Live, the inbox is the open permission prompts the fleet lists; fixture mode keeps its samples.
   onCleanup(() => permissions?.close());
-  const cards = (): readonly InboxCard[] => permissions?.cards() ?? props.inbox;
+  const cards = (): readonly InboxCard[] => [...(permissions?.cards() ?? props.inbox), ...attentionCards(rows())];
   const closed = createClosedIds(cards);
   const [layout, setLayout] = createSignal<Layout>(structuredClone(props.layout));
   const manager = createManager(structuredClone(props.layout));
@@ -184,10 +200,14 @@ export function Workbench(props: WorkbenchProps): JSX.Element {
     openAgent(id);
     if (inside) next.focus();
   };
-  const moves = { "agent.previous": () => stepAgent(-1), "agent.next": () => stepAgent(1) };
+  const firstAttention = (): void => {
+    const first = attention()[0];
+    if (first !== undefined) openAgent(first.id);
+  };
+  const moves = { "attention.first": firstAttention, "agent.previous": () => stepAgent(-1), "agent.next": () => stepAgent(1) };
   onCleanup(bindKeys(document.body, moves));
   /** The layer's commands, each run as its shortcut would be from the page. */
-  const keyCommands: PaletteCommand[] = SHORTCUTS.filter((entry) => entry.command).map((entry) => ({ label: entry.label, hint: formatCombo(entry.combo), run: () => void runPageShortcut(entry.id) }));
+  const keyCommands = createMemo((): PaletteCommand[] => SHORTCUTS.filter((entry) => entry.command).map((entry) => ({ label: entry.id === "attention.first" ? attentionCommand() : entry.label, hint: formatCombo(entry.combo), run: () => void runPageShortcut(entry.id) })));
   const preview = (): boolean => props.preview === true;
   // The server's name: the home node's as the fleet sends it, else the connection's own.
   const hostName = (host: HostView): string => fleet.nodes.items().find((node) => node.node_id === home())?.name ?? host.name;
@@ -221,10 +241,13 @@ export function Workbench(props: WorkbenchProps): JSX.Element {
         <Palette
           rows={scoped}
           onOpen={openAgent}
-          commands={[...(props.host === undefined ? [] : hostCommands(props.host)), ...keyCommands]}
+          commands={[...(props.host === undefined ? [] : hostCommands(props.host)), ...keyCommands()]}
           waiting={preview() ? [...TOOLBAR_WAITING, ...(focusedAgent() === null ? [] : PANE_ACTIONS)] : []}
         />
         <Cluster space={SPACE[2]}>
+          <button type="button" class="action" data-testid="needs-you-count" aria-label={attentionCommand()} disabled={count() === 0} onClick={firstAttention}>
+            {attentionLabel()}
+          </button>
           <Show when={preview()}>
             <For each={TOOLBAR_WAITING.slice(1)}>{waits}</For>
           </Show>
@@ -232,6 +255,7 @@ export function Workbench(props: WorkbenchProps): JSX.Element {
       </Cluster>
       {banners()}
       <nav ref={(element) => ((nav = element), onCleanup(bindKeys(element, moves)))} class="sidebar" aria-label="Agents" data-testid="sidebar">
+        <NeedsYou rows={attention()} focused={focusedAgent} open={openAgent} />
         <Show when={fleetNote()}>{(note) => <p class="sidebar__note">{note()}</p>}</Show>
         <Show when={rows().length > 0 || fleet.nodes.items().length > 0 || fleet.projects.items().length > 0}>
           <SidebarTrees trees={trees} home={home} prefs={prefs} setPrefs={setPrefs} stamp={fleet.nodes.stamp} now={now} focused={focusedAgent} open={openAgent} />

@@ -53,6 +53,7 @@ export type Scope = "anywhere" | "outside-text" | "within" | "focused" | "layer"
 
 /** Every shortcut's id. */
 export type ShortcutId =
+  | "attention.first"
   | "agent.previous"
   | "agent.next"
   | "palette.open"
@@ -75,10 +76,11 @@ export type ShortcutId =
  * also a ⌘K palette command; an `unlisted` one (Tab, a list's own keys)
  * is left off the shortcut sheet.
  */
-export type Shortcut = { readonly id: ShortcutId; readonly label: string; readonly combo: Combo; readonly scope: Scope; readonly command?: true; readonly unlisted?: true };
+export type Shortcut = { readonly id: ShortcutId; readonly label: string; readonly combo?: Combo; readonly scope: Scope; readonly command?: true; readonly unlisted?: true };
 
 /** The registry, in the order the shortcut sheet lists it. */
 export const SHORTCUTS: readonly Shortcut[] = [
+  { id: "attention.first", label: "First agent needing you", scope: "outside-text", command: true, unlisted: true },
   // A focused list widget's own arrows; before the page's ↑/↓, so the focused list wins.
   { id: "listbox.next", label: "Next item in a list", combo: { key: "ArrowDown" }, scope: "focused", unlisted: true },
   { id: "listbox.previous", label: "Previous item in a list", combo: { key: "ArrowUp" }, scope: "focused", unlisted: true },
@@ -119,20 +121,23 @@ const GLYPHS: Readonly<Record<string, readonly [apple: string, other: string]>> 
 };
 
 /** The combo as the platform writes it, modifiers in ⌃⌥⇧⌘ order: `⌃⌥⇧⌘K` on Apple platforms, `Ctrl+Alt+Shift+K` elsewhere. */
-export function formatCombo(combo: Combo, apple: boolean = isApple()): string {
+export function formatCombo(combo: Combo | undefined, apple: boolean = isApple()): string {
+  if (combo === undefined) return "";
   const key = GLYPHS[combo.key]?.[apple ? 0 : 1] ?? combo.key.toUpperCase();
   if (apple) return [combo.ctrl && "⌃", combo.alt && "⌥", combo.shift && "⇧", combo.mod && "⌘", key].filter(Boolean).join("");
   return [(combo.ctrl || combo.mod) && "Ctrl", combo.alt && "Alt", combo.shift && "Shift", key].filter(Boolean).join("+");
 }
 
 /** The combo in `aria-keyshortcuts` syntax. */
-export function ariaKeys(combo: Combo, apple: boolean = isApple()): string {
+export function ariaKeys(combo: Combo | undefined, apple: boolean = isApple()): string {
+  if (combo === undefined) return "";
   const control = combo.ctrl || (combo.mod && !apple);
   return [control && "Control", combo.alt && "Alt", combo.shift && "Shift", combo.mod && apple && "Meta", combo.key].filter(Boolean).join("+");
 }
 
 /** Whether `event` is `combo` on this platform. A symbol such as `?` is typed with Shift, so Shift is compared only for letters and named keys. */
-export function matches(event: KeyboardEvent, combo: Combo, apple: boolean = isApple()): boolean {
+export function matches(event: KeyboardEvent, combo: Combo | undefined, apple: boolean = isApple()): boolean {
+  if (combo === undefined) return false;
   const control = apple ? combo.ctrl === true : combo.ctrl === true || combo.mod === true;
   const meta = apple && combo.mod === true;
   if (event.ctrlKey !== control || event.metaKey !== meta || event.altKey !== (combo.alt === true)) return false;

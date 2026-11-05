@@ -127,13 +127,13 @@ describe("live permission inbox", () => {
     expect(cards(root).map((text) => (text.match(/second\.rs|third\.rs|first cmd/) ?? [""])[0])).toEqual(["first cmd", "second.rs", "third.rs"]);
   });
 
-  test("the phone headline counts waiting_on_human, like the badge, even after a closed record", () => {
+  test("the phone headline counts agents once, like the badge, even after a closed record", () => {
     const { root, fleet, event, close } = mountInbox("phone");
     fleet("atlas", ["r1", "r2"]);
     event("atlas", "r1");
     close("atlas", "r1");
     expect(cards(root)).toHaveLength(1);
-    expect(root.querySelector('[data-testid="inbox-headline"]')?.textContent).toBe("2 blocked on you.");
+    expect(root.querySelector('[data-testid="inbox-headline"]')?.textContent).toBe("1 blocked on you.");
   });
 
   test("a record that does not match the decided shape fails visibly, naming what is wrong", () => {

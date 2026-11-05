@@ -12,13 +12,14 @@ fn capabilities_grant_only_the_bridge() {
     let conf = json_file(include_str!("../tauri.conf.json"));
     assert_eq!(conf["app"]["security"]["capabilities"], json!(["main"]));
     assert_eq!(conf["app"]["withGlobalTauri"], false);
-    // Exactly the bridge's open, send and close, and they are the only app
-    // commands: no shell, fs, http or dialog, and none returns the bearer.
+    // The native badge and bridge open, send and close are the only
+    // permissions: no shell, fs, http or dialog, and none returns the bearer.
     let main = json_file(include_str!("../capabilities/main.json"));
     let bridge = json!([
         "allow-bridge-open",
         "allow-bridge-send",
-        "allow-bridge-close"
+        "allow-bridge-close",
+        "core:window:allow-set-badge-count"
     ]);
     assert_eq!(
         (&main["windows"], &main["permissions"]),

@@ -16,6 +16,7 @@ import { SPACE } from "../tokens";
 import type { Transport } from "../transport";
 import { Transcript, type TranscriptSource } from "../views/Transcript";
 import { Composer, type ComposerState, type Sender } from "./Composer";
+import { needsYou } from "./attention";
 import type { InboxCard } from "./inbox";
 import { AgentRowButton, AgentTitle, InboxCards, Waits, type ClosedIds } from "./parts";
 
@@ -49,8 +50,8 @@ type Tab = "inbox" | "agents";
 export function PhoneWorkbench(props: PhoneProps): JSX.Element {
   const [tab, setTab] = createSignal<Tab>("inbox");
   const [onAgent, setOnAgent] = createSignal(false);
-  // The same count as the sidebar badge: what the server lists as waiting on a human.
-  const blocked = (): number => props.rows().reduce((sum, row) => sum + row.waitingOnHuman.length, 0);
+  // Count scoped structured agents once, as the toolbar does across the fleet.
+  const blocked = (): number => props.rows().filter(needsYou).length;
   const headline = (): string => (blocked() === 0 ? "Nothing is blocked on you." : `${blocked()} blocked on you.`);
   /*
    * The agent screen is a history entry, so the system back gesture returns
