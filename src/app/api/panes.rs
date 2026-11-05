@@ -2609,7 +2609,7 @@ mod tests {
     }
 
     #[test]
-    fn api_pane_close_refuses_invalid_membership_before_side_effects() {
+    fn refused_pane_close_keeps_identity() {
         let (mut app, terminal, public) = app_with_terminal();
         app.state
             .terminals
@@ -2618,21 +2618,43 @@ mod tests {
             .detected_agent = Some(crate::detect::Agent::Claude);
         let agent = app.state.terminals[&terminal].agent_id.to_string();
         let root = app.state.workspaces[0].tabs[0].root_pane;
-        let unrelated = crate::layout::PaneId::alloc();
-        app.state.workspaces[0].tabs[0].layout =
-            crate::layout::TileLayout::from_saved(crate::layout::Node::Pane(unrelated), unrelated);
-        let sequence = app.event_hub.current_sequence();
-        let response:serde_json::Value=serde_json::from_str(&app.handle_api_request(serde_json::from_value(serde_json::json!({"id":"close","method":"pane.close","params":{"pane_id":public}})).unwrap())).unwrap();
-        assert_eq!(response["error"]["code"], "internal_error", "{response}");
-        assert_eq!(app.state.workspaces.len(), 1);
-        assert!(app.state.workspaces[0].tabs[0].panes.contains_key(&root));
-        assert_eq!(
-            app.state.workspaces[0].tabs[0].layout.pane_ids(),
-            vec![unrelated]
+        app.state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
+        app.state.workspaces[0].tabs[0].native_views.insert(
+            root,
+            crate::structured::view::placement::View::Ready(crate::structured::view::Target {
+                agent_id: "fixture-agent".into(),
+                generation: 1,
+            }),
         );
-        assert!(app.state.terminals.contains_key(&terminal));
+        let layout = app.state.workspaces[0].tabs[0].layout.pane_ids();
+        app.sync_directory_events();
+        let sequence = app.event_hub.current_sequence();
+        let request = serde_json::from_value(serde_json::json!({
+            "id": "close", "method": "pane.close", "params": {"pane_id": public}
+        }))
+        .unwrap();
+        let response: serde_json::Value =
+            serde_json::from_str(&app.handle_api_request(request)).unwrap();
         assert_eq!(app.state.terminals[&terminal].agent_id.to_string(), agent);
         assert!(!app.state.terminals[&terminal].agent_identity_retired);
+        assert_eq!(response["error"]["code"], "pane_not_found", "{response}");
+        assert_eq!(app.state.workspaces.len(), 1);
+        let tab = &app.state.workspaces[0].tabs[0];
+        assert_eq!(tab.layout.pane_ids(), layout);
+        assert!(tab.panes.contains_key(&root));
+        assert!(tab.native_views.contains_key(&root));
+        assert_eq!(app.event_hub.current_sequence(), sequence);
+        let survivor = layout[1];
+        let tab = &mut app.state.workspaces[0].tabs[0];
+        tab.layout =
+            crate::layout::TileLayout::from_saved(crate::layout::Node::Pane(survivor), survivor);
+        tab.root_pane = survivor;
+        app.handle_internal_event(crate::events::AppEvent::PaneDied { pane_id: root });
+        assert_eq!(
+            app.state.workspaces[0].tabs[0].layout.pane_ids(),
+            vec![survivor]
+        );
+        assert_eq!(app.state.terminals[&terminal].agent_id.to_string(), agent);
         assert_eq!(app.event_hub.current_sequence(), sequence);
     }
 
