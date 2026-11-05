@@ -15,6 +15,11 @@ pub fn action(count: u32, label: Option<String>, macos: bool) -> Badge {
 
 pub fn set(window: &tauri::Window, count: u32, label: Option<String>) -> tauri::Result<()> {
     match action(count, label, cfg!(target_os = "macos")) {
+        Badge::Count(0) => {
+            #[cfg(target_os = "macos")]
+            window.set_badge_label(None)?;
+            window.set_badge_count(None)
+        }
         Badge::Count(count) => window.set_badge_count(Some(count.into())),
         #[cfg(target_os = "macos")]
         Badge::Label(label) => window.set_badge_label(Some(label)),
