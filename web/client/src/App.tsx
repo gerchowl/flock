@@ -309,6 +309,7 @@ function WireApp(props: { readonly config: WireShellConfig | BridgeShellConfig; 
         fleet={fleet}
         transport={transport}
         inbox={[]}
+        setBadgeCount={props.config.transport === "bridge" ? props.config.setBadgeCount : undefined}
         sender={sender}
         layout={layout}
         saveLayout={(next) => store.save(next)}

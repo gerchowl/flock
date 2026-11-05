@@ -101,7 +101,7 @@ export function InboxCards(props: {
   const note = (): string | null =>
     props.source === "live"
       ? props.cards.length === 0
-        ? "No open permission prompts."
+        ? "No agents need you."
         : null
       : props.cards.length === 0
         ? "No sample cards in this recording."
@@ -148,7 +148,7 @@ export function InboxCards(props: {
             aria-keyshortcuts={answers ? `${ariaKeys(shortcut("card.allow").combo)} ${ariaKeys(shortcut("card.deny").combo)}` : undefined}
           >
             <p class="card__meta">
-              {card.kind === "permission" ? "Permission" : "Question"} · {card.agentLabel}
+              {card.kind === "permission" ? "Permission" : card.kind === "question" ? "Question" : "Needs you"} · {card.agentLabel}
             </p>
             <h3 id={title} class="card__title">{card.title}</h3>
             <p class="card__detail">{card.detail}</p>
