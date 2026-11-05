@@ -2516,9 +2516,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_snapshot_home_claim_cannot_hide_a_separately_received_row() {
-        // A carried home identity is an unproven claim, so it cannot hide
-        // a row received independently through an enrolled edge.
+    async fn a_snapshot_home_claim_folds_as_an_annotation_on_home() {
+        // #2998: a hub-pushed claim about home — the identity the spoke
+        // carries as its origin — folds into the home band slot as a
+        // "+via <hub>" annotation rather than crowding the band with a
+        // separate unverified row. The verified home row — Origin, which
+        // the band renders from the carried origin summary — stays; the
+        // Relayed row that merely restates home's identity is folded.
         let mut spoke = test_app();
         bind_relay(&mut spoke, "hopper");
         let mut hub = hub_row("hopper", "hopper", 0);
@@ -2551,12 +2555,26 @@ mod tests {
             .into_iter()
             .map(|(peer_ref, _)| peer_ref)
             .collect();
-        assert_eq!(rows.len(), 2);
-        assert!(matches!(
-            rows[0],
-            crate::app::state::RemotePeerRef::Relayed { .. }
-        ));
-        assert!(matches!(rows[1], crate::app::state::RemotePeerRef::Origin));
+        assert_eq!(
+            rows.len(),
+            1,
+            "the hub-pushed home claim folds into the Origin row",
+        );
+        assert!(
+            matches!(rows[0], crate::app::state::RemotePeerRef::Origin),
+            "the verified home carrier (Origin) is the surviving row",
+        );
+        // The fold is observable: the home band slot picks up the hubs
+        // that claimed about it. Hopper's own self-claim is suppressed
+        // (a row routed via itself is not a new route), so the list is
+        // empty here but non-empty whenever a DIFFERENT hub claims home.
+        let hubs = spoke
+            .state
+            .fold_hubs(&crate::app::state::ClaimFoldTarget::Home);
+        assert!(
+            hubs.is_empty(),
+            "hopper's self-claim about home is suppressed: {hubs:?}"
+        );
     }
 
     #[test]
