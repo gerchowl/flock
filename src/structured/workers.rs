@@ -500,6 +500,9 @@ impl Workers {
             .collect()
     }
     /// Latch cancellation without blocking on preparation, process or I/O cleanup.
+    /// Await the terminal [`Self::report`] through polling before reopening the
+    /// journal. Confirmed completion drops its owner and explicitly releases its
+    /// lock, even when a concurrent fork still holds an inherited descriptor.
     pub fn stop(&self, id: &str, generation: u64) -> bool {
         let Some(worker) = self.entries.get(id).filter(|w| w.generation == generation) else {
             return false;
@@ -508,6 +511,8 @@ impl Workers {
         true
     }
     /// Inspect terminal evidence only after queued stream facts have been projected.
+    /// A report without retained authority confirms journal lock release as well
+    /// as process cleanup. Requesting [`Self::stop`] alone is not completion.
     pub fn report(&self, id: &str, generation: u64) -> Option<&Report> {
         self.entries
             .get(id)

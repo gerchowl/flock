@@ -29,7 +29,7 @@ class SharedPin(unittest.TestCase):
         source = (ROOT / "nix/nextest.nix").read_text()
         assignments = re.findall(r'^\s*version\s*=\s*(.+);', source, re.MULTILINE)
         self.assertEqual(assignments, [NIX_READ])
-        self.assertIn('(callPackage ./nix/nextest.nix { })', (ROOT / 'flake.nix').read_text())
+        self.assertIn('(pkgs.callPackage ./nix/nextest.nix { })', (ROOT / 'flake.nix').read_text())
 
     def test_nix_source_cache_identity_includes_version(self):
         source = (ROOT / "nix/nextest.nix").read_text()

@@ -16,8 +16,8 @@
   [#965](https://github.com/gerchowl/flock/issues/965) (goal-s1 migration) and
   [#822](https://github.com/gerchowl/flock/issues/822) (caps).
 - Decision owner: repository owner. The owner accepted W1–W8 on 2026-11-03.
-  The owner questions below remain open: the owner asked for more detail
-  before deciding them.
+  The owner decided the six follow-up questions on 2026-11-04; see
+  "Decided" below, including the scope-delegability clarification.
 - Builds on: ADR-0004 (repo `.flk.toml`), ADR-0021 (model registry and tiers),
   ADR-0027 (delegation edges), ADR-0028 (observation and registered waits),
   ADR-0030/0031 (goals), ADR-0032 (compiled context layers), ADR-0033 (forked
@@ -92,7 +92,7 @@ that grants authority is binding state that no agent-editable file may carry.
 | **W2** workflow definition | Versioned declarative `.flk/workflows/<id>.toml`, schema `flk.workflow/1`, validated statically, read from the default branch and **adopted by hash** by the operator; runs pin definition, type, role and rule hashes. GUI: viewer and launcher, then a form editor that round-trips the same file, then a visual builder. | A general scripting language or a GUI-native graph store. |
 | **W3** vocabulary | Nine closed operations: assign, spawn, await, collect-evidence, request-review, request-decision, land, release, file-issue. Each has one server owner, an authority check, ADR-0045 durable transitions, a deterministic effect identity and a reconcile-before-retry rule. | Arbitrary `run = "<shell>"` steps. |
 | **W4** runs | Durable `RunId` records in the ADR-0045 acknowledged log and checkpoints, a typed event ledger, a step DAG with attempts, waits, evidence and pending decisions, explicit `uncertain` states, and shadow mode (ADR-0035 §7) before any script retires. | A separate workflow database; runs held only in memory. |
-| **W5** authority | Deciding a permission is operator authority. An architect exercises it only through an operator-issued, scoped, finite, revocable, audited **decide delegation** for a closed set of permission classes, checked by one resolver on both `hook.decide` and `agent.decide` (decided by the owner). Defaults are a template adopted once into binding state. Forks, children and workflow steps never inherit it; capabilities intersect down the tree; workflow effects have their own grant; lost authority reroutes pending prompts to the operator. | Keep both rules (two answers to one prompt), or make every permission operator-only (strands unattended trees). |
+| **W5** authority | Deciding a permission is operator authority. An architect exercises it only through an operator-issued, scoped, revocable, audited **decide delegation** (ad-hoc delegations are finite; adopted defaults are standing) for a closed set of permission classes, checked by one resolver on both `hook.decide` and `agent.decide` (decided by the owner). Defaults are a template adopted once into binding state. Forks, children and workflow steps never inherit it; capabilities intersect down the tree; workflow effects have their own grant; lost authority reroutes pending prompts to the operator. | Keep both rules (two answers to one prompt), or make every permission operator-only (strands unattended trees). |
 | **W6** separation | Skill = judgement text, workflow = structure flk enforces, config = knobs (ADR-0042 registry). One home per fact; a lint per boundary. | Letting skills keep structural steps "for now". |
 | **W7** risks | Pre-mortem below; the five named risks each get a mechanism and a test. | — |
 | **W8** phasing | P0 none; P1 read-only run view of existing loops; P2 definitions, adoption and shadow runs; P3 live enforcement and the form editor; visual builder after P3. | Builder first. |
@@ -555,8 +555,10 @@ response.
 - **Bounds** (proposed, to be measured like ADR-0045's): 32 active runs per
   authority, 64 steps per definition, `max_parallel` at most 16, 8 attempts per
   step instance, 4 KiB per step instance record. Admission refuses before a
-  bound is crossed; nothing is truncated. Whether runs share ADR-0045's 8 MiB
-  checkpoint budget or reserve their own is owner question 3.
+  bound is crossed; nothing is truncated. Runs share ADR-0045's single 8 MiB
+  aggregate checkpoint budget, including reserved control-state space so
+  uncertain effects, reroutes and escalations can always be recorded when
+  the budget is otherwise full (owner, 2026-11-04).
 - **Dispatch.** Driven by committed changes and deadlines, never by a sleep
   loop (ADR-0045 "Observation sources and coverage"). On restart the server
   refolds runs before serving status, reconciles every `uncertain` effect
@@ -643,7 +645,7 @@ DecideDelegation {
                                           # class answers with the item's
                                           # declared options
   expires_at | standing,                  # ad hoc: finite, default 8 h, at most 7 d
-                                          # standing: adopted defaults only (owner Q1/Q2)
+                                          # standing: adopted defaults only (owner, 2026-11-04)
   by, created_at }
 ```
 
@@ -683,7 +685,7 @@ DecideDelegation {
 - **Every delegation is explicit and operator-issued; defaults are a
   template, never live authority.** The node-scoped operator setting
   `authority.delegation.defaults` (ADR-0042 registry, `G/N` only, so a repo
-  file cannot set it) holds a proposed row: `ParentArchitect` for
+  file cannot set it) holds the rollout template row: `ParentArchitect` for
   `worktree_tool`, `plan_approval` and `form_elicitation`, `allow_once` and
   `deny`, which is ADR-0034 §6 rows 1–3. The widening classes start empty,
   as `architect_may_grant` did. The template authorises nothing by itself.
@@ -699,13 +701,13 @@ DecideDelegation {
     renew <id>`, never automatic.
   Finite expiry and these defaults conflict: an adopted default that expired
   after at most 7 days without renewal would put every tree back to
-  operator-only, the alternative this W5 rejects. Recommended (owner
-  questions 1 and 2): adopted defaults are **standing** grants, revocable at
+  operator-only, the alternative this W5 rejects. Decided (owner,
+  2026-11-04): adopted defaults are **standing** grants, revocable at
   any time but not expiring, and loud in `flk authority show` and the
   standup; ad-hoc delegations, including every widening class, stay finite.
-  Whether the template is adopted at rollout or left unadopted is owner
-  question 1; in every case it reaches binding state only through the
-  operator's adopt step, never on first use.
+  The operator adopts the template at rollout, preserving ADR-0034 §6
+  (owner, 2026-11-04). It reaches binding state only through the operator's
+  adopt step, never on first use.
 - **Owner-typed decision (DECIDED).** Architects answer delegates'
   permission prompts **only** through a `DecideDelegation`. No edge, role,
   config key or run confers that authority by itself.
@@ -719,6 +721,10 @@ DecideDelegation {
   attested role when an item is raised ("Addressee assignment"). It is **never inherited**: not by a fork
   (ADR-0036 §9 creates a new AgentId; lineage grants nothing, as S6e says for
   transcripts), not by a spawned child, a reviewer or a run.
+- **Scoped delegation and sub-delegation remain available** within W5's
+  scope, classes and ceilings (owner, 2026-11-04). Each delegation is
+  explicit and operator-issued; sub-delegation never creates authority
+  through inheritance or an agent-issued grant.
 - Capabilities only shrink down the tree: `effective(child) = requested(type)
   ∩ granted(type) ∩ effective(parent) ∩ ceiling(run)`. Permission preset rank
   is at most the parent's (ADR-0036 §10b rank). Question policy only narrows
@@ -738,7 +744,7 @@ DecideDelegation {
   file-issue, …] }`. A run launched by the operator gets that ceiling. A run
   launched by an architect or owner gets `capabilities ∩
   effective(launcher)` for its agents, and needs a `workflow.launch` grant
-  for that `def_hash`.
+  specific to one `def_hash` (owner, 2026-11-04).
 - **Workflow effects have their own authority, separate from agent
   capabilities.** `merge` (the `land` op), `release` and `file-issue` are not
   agent capabilities (W1), so intersecting with the launcher's capabilities
@@ -838,8 +844,7 @@ moment. The prompt is never auto-answered, never defaulted and never
 dropped. An answer from the former delegate that arrives after the reroute
 is refused at the mutation fence (`delegation_lapsed`) and audited. A
 reroute is not reversed when a new delegation appears later; the operator
-answers it. Whether the operator may hand a rerouted prompt back to a new
-delegate is open (owner question 6).
+answers it and cannot hand it back to a new delegate (owner, 2026-11-04).
 
 ### Why this and not the alternatives
 
@@ -925,7 +930,9 @@ made outside GitHub.
 - **P2: definitions, adoption and shadow runs.** Schema, validator, adopt,
   type and workflow grants, the W5 resolver and delegation verbs (needed
   before #1184 ships), run records and the ledger, shadow mode for
-  `land-issue` and `release`. GUI viewer and launcher.
+  both `land-issue` and `release` (owner, 2026-11-04). `release` stays
+  shadow-only until the W3 adapter prerequisite lands. GUI viewer and
+  launcher.
 - **P3: enforcement and the form editor.** Live mode per workflow after
   cutover; server-side spawn composition; `land` live (#694); the form editor.
 - **Later: visual builder**, after P3's recovery tests pass.
@@ -944,54 +951,50 @@ model, as ADR-0045 requires.
 | W6 | The validator refuses a workflow carrying a registry-owned duration. The skill lint flags a landing command in a role text whose workflow is live. |
 | W7 | Every pre-mortem row above maps to at least one W1–W6 test. |
 
-## Owner questions
-
-These stay open after acceptance (2026-11-03): the owner asked for more
-detail before deciding them.
-
-Recommendations below are recommendations, not decisions. Where the
-independent review (a reviewer, fix round 1) recommends differently from this
-ADR's author, both are given.
-
-1. **Default delegation row (W5).** Should the operator adopt the
-   `ParentArchitect` template row for `worktree_tool`, `plan_approval` and
-   `form_elicitation` at rollout, preserving ADR-0034 §6, or leave it
-   unadopted, making every prompt operator-only until the operator
-   delegates? Either way only the operator's adopt step creates it.
-   *Author recommendation:* adopt at rollout. *Reviewer recommendation:*
-   default delegation off.
-2. **Delegation expiry (W5).** Ad-hoc delegations: default 8 hours, at most
-   7 days, or no expiry with revocation only? Adopted defaults: standing
-   (revocable, not expiring) or finite like ad-hoc grants?
-   *Recommendation (author and reviewer):* ad-hoc expiry 8 h by default, at
-   most 7 d. *Recommendation (author, fix round 2):* adopted defaults
-   standing, because finite defaults without auto-renew lapse into
-   operator-only, which W5 rejects; auto-renew is ruled out because a reload
-   must never recreate authority.
-3. **Checkpoint budget (W4).** Runs share ADR-0045's 8 MiB aggregate budget,
-   or reserve a separate 4 MiB? *Recommendation (author and reviewer):* one
-   shared 8 MiB budget; the reviewer adds that it must hold recovery
-   reserves, so uncertain effects, reroutes and escalations can always be
-   recorded when the budget is otherwise full (ADR-0045's reserved
-   control-state space).
-4. **Launch authority (W5).** May a resident owner or architect launch adopted
-   workflows under a `workflow.launch` grant, or only the operator in P2?
-   *Recommendation (author and reviewer):* allow it, with the grant specific
-   to one `def_hash`.
-5. **First workflows (W8).** `land-issue` and `release` in shadow first, or
-   `land-issue` alone? *Recommendation (author and reviewer):* shadow both
-   landing and release (release stays shadow-only until the W3 adapter
-   prerequisite lands).
-6. **Handing a rerouted prompt back (W5 "Authority loss").** After a prompt
-   is rerouted to the operator, may the operator hand it to a new delegate,
-   or must the operator answer it? Not covered by the review; this ADR
-   assumes the operator answers it until decided.
-
 ## Decided
 
 - **Architects answer delegate permissions only through `DecideDelegation`**
   (owner-typed, 2026-11-03). No edge, role, config key or run confers
   permission-decide authority by itself (W5).
+
+The owner accepted the follow-up answers below on 2026-11-04.
+
+1. **Default delegation row (W5): adopt at rollout** (owner, 2026-11-04).
+   The operator adopts the `ParentArchitect` template row for
+   `worktree_tool`, `plan_approval` and `form_elicitation`, preserving
+   ADR-0034 §6. Only the operator's adopt step creates it.
+   *Rejected alternative (reviewer's dissent):* default delegation off,
+   leaving every prompt operator-only until the operator delegates. Adopt
+   at rollout to preserve ADR-0034 §6's routine delegated answers.
+2. **Delegation expiry (W5): finite ad-hoc grants, standing adopted defaults**
+   (owner, 2026-11-04). Ad-hoc delegations expire after 8 h by default, at
+   most 7 d, as both author and reviewer recommended. Adopted defaults are
+   standing: revocable, not expiring. Finite defaults without auto-renew
+   lapse into operator-only, which W5 rejects; auto-renew is ruled out
+   because a reload must never recreate authority.
+3. **Checkpoint budget (W4): one shared 8 MiB budget with ADR-0045**
+   (owner, 2026-11-04), as both author and reviewer recommended, rather than
+   a separate 4 MiB budget. It holds recovery reserves, as the reviewer
+   required, so uncertain effects, reroutes and escalations can always be
+   recorded when the budget is otherwise full (ADR-0045's reserved
+   control-state space).
+4. **Launch authority (W5): resident owner or architect may launch adopted
+   workflows** (owner, 2026-11-04), including in P2, under a `workflow.launch`
+   grant specific to one `def_hash`. This follows the author and reviewer's
+   recommendation; the hash-specific grant bounds launch authority to the
+   adopted definition.
+5. **First workflows (W8): shadow both `land-issue` and `release`**
+   (owner, 2026-11-04), as both author and reviewer recommended. `release`
+   stays shadow-only until the W3 adapter prerequisite lands.
+6. **Rerouted prompt (W5 "Authority loss"): no hand-back**
+   (owner, 2026-11-04). After a prompt is rerouted to the operator, the
+   operator answers it; it cannot be handed to a new delegate. A later
+   delegation does not reverse the reroute. The review did not cover this
+   question; this confirms the ADR's prior operator-answer assumption.
+7. **Scope delegability (W5): scoped delegation and sub-delegation remain
+   available** (owner, 2026-11-04), within W5's explicit operator-issued
+   grants, scope, classes and ceilings. This makes the scope rule explicit
+   without granting authority through inheritance.
 
 ## Boundaries
 

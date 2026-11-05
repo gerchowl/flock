@@ -475,10 +475,10 @@ that off (a per-project toggle, below).
   has copy; the GUI never maps or collapses reasons. A late answer from the
   former delegate is refused at the mutation fence with `delegation_lapsed`
   (W5), and the evidence row shows the refused late answer. A reroute is not
-  reversed when a later delegation appears (W5); the GUI offers no hand-back
-  verb while ADR-0049's owner question 6 is open. At no point is a pending
-  item in neither place: it is always an operator item or a delegated
-  evidence row.
+  reversed when a later delegation appears (W5). The GUI offers no hand-back
+  verb for a rerouted prompt; the operator answers it, per ADR-0049's decided
+  rule (Q6, owner, 2026-11-04). At no point is a pending item in neither place:
+  it is always an operator item or a delegated evidence row.
 - **The inbox is not the escalation guarantee.** It projects ADR-0045 D8's
   attention record. Reading or dismissing a card does not acknowledge an
   escalation or suppress reminders; only `work.escalation.ack` does, and only

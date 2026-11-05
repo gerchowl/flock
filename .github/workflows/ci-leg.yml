@@ -38,7 +38,10 @@ jobs:
   lint:
     name: lint
     runs-on: ${{ inputs.leg }}
-    timeout-minutes: 30
+    # Cold macOS lint measured 12m56s on #2989 after removing unused tool
+    # builds. 28m is about twice that initial upper sample, including setup
+    # and rustdoc. Recheck the week-long p95 after landing. Linux keeps 30m.
+    timeout-minutes: ${{ inputs.leg == 'macos-15' && 28 || 30 }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -61,11 +64,15 @@ jobs:
           gc-max-store-size-linux: 2G
           gc-max-store-size-macos: 2G
 
+      # Both platforms retain every lint target and feature combination.
+      # macOS additionally checks its cfg-selected implementation and tests,
+      # which Linux cannot compile. The shell omits only unused nextest and
+      # patched sccache, whose source builds added 13–18 minutes (#2970).
       - name: Lint in the dev shell
-        run: nix develop -c just lint
+        run: nix develop .#ci-lint -c just lint
 
       - name: Check Rust documentation
-        run: nix develop -c just doc-check
+        run: nix develop .#ci-lint -c just doc-check
 
   build:
     name: build
