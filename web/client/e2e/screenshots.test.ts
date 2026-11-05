@@ -251,3 +251,28 @@ describe("fixture preview", () => {
     await page.close();
   });
 });
+
+test("attention count, title, sidebar and palette jump agree in the built client", async () => {
+  const page = await browser.newPage({ viewport: DESKTOP });
+  await guardKeys(page);
+  page.setDefaultTimeout(5_000);
+  try {
+    await page.goto(pathToFileURL(`${DIST}/index.html`).href);
+    await page.getByTestId("needs-you-count").waitFor();
+    expect(await page.title()).toBe("(1+) flock");
+    expect(await page.getByTestId("needs-you-count").textContent()).toBe("1+ agents waiting on you");
+    expect(await page.getByTestId("needs-you-count").getAttribute("aria-label")).toContain("1 or more agents waiting; 1 node not reporting");
+    expect(await page.getByTestId("needs-you-section").getByTestId("agent-row").locator(".agent-row__name").allTextContents()).toEqual(["fixture", "kite"]);
+    await page.getByTestId("agent-row").filter({ hasText: "wren" }).click();
+    await page.getByTestId("needs-you-count").click();
+    expect(await page.getByTestId("focus-pane").locator("h1").textContent()).toBe("fixture");
+    await page.getByTestId("agent-row").filter({ hasText: "atlas" }).click();
+    await page.getByTestId("palette-trigger").click();
+    await page.getByRole("option").filter({ hasText: "First agent needing you" }).click();
+    expect(await page.getByTestId("focus-pane").locator("h1").textContent()).toBe("fixture");
+    expect(await page.getByTestId("inbox-card").filter({ hasText: "Agent is blocked" }).count()).toBe(1);
+    await expectNoKeyListeners(page);
+  } finally {
+    await page.close();
+  }
+}, 30_000);
