@@ -31,8 +31,9 @@ import { For, Show, createEffect, createMemo, createSignal, onCleanup, type JSX 
 import type { SetBadgeCount } from "../config";
 import type { FleetSource } from "../fleet";
 import { createManager, type Layout } from "../layout/model";
-import { Cluster } from "../layout/primitives";
+import { Cluster, Split, SplitShell } from "../layout/primitives";
 import { isPhone, type Mode } from "../layout/phone";
+import { DEFAULT_SPLIT, isCompact, splitState, type SplitState } from "../layout/splits";
 import { DEFAULT_SIDEBAR, type SidebarPrefs } from "../layout/sidebar";
 import { fleetStore } from "../store/fleet";
 import { SPACE } from "../tokens";
@@ -46,7 +47,7 @@ import { HEALTH_LABELS, HostStatus, type HostView } from "./HostStatus";
 import { SHORTCUTS, bindKeys, formatCombo, pageShortcutAvailable, runPageShortcut } from "./keys";
 import { Palette, type PaletteCommand, type WaitingAction } from "./Palette";
 import { createPermissionInbox } from "./permissions";
-import { AgentTitle, InboxCards, Waits, createClosedIds } from "./parts";
+import { AgentRowButton, AgentTitle, InboxCards, Waits, createClosedIds } from "./parts";
 import { PhoneWorkbench } from "./Phone";
 import { ShortcutSheet } from "./ShortcutSheet";
 import { HOME_UNKNOWN, NeedsYou, SidebarTrees } from "./Sidebar";
@@ -57,10 +58,8 @@ import "./workbench.css";
 
 /** The toolbars' unbuilt actions, shown only in preview; each is a button and, dimmed, a palette command. */
 const NEW_AGENT: WaitingAction = { label: "New agent", waitsFor: "the harness picker" };
-const SIDEBAR_TOGGLE: WaitingAction = { label: "Hide sidebar", waitsFor: "collapsible panes" };
-const INSPECTOR_TOGGLE: WaitingAction = { label: "Show inspector", waitsFor: "the inspector" };
-/** In toolbar order: the leading toggle, then the trailing group. */
-const TOOLBAR_WAITING: readonly WaitingAction[] = [SIDEBAR_TOGGLE, NEW_AGENT, INSPECTOR_TOGGLE];
+/** Unbuilt toolbar actions, also listed by the preview palette. */
+const TOOLBAR_WAITING: readonly WaitingAction[] = [NEW_AGENT];
 const PANE_ACTIONS: readonly WaitingAction[] = [
   { label: "Diff", waitsFor: "the diff tile" },
   { label: "Fork", waitsFor: "forks" },
@@ -167,6 +166,14 @@ export function Workbench(props: WorkbenchProps): JSX.Element {
     setLayout(snapshot);
     props.saveLayout(snapshot);
   };
+  const regionState = (region: "sidebar" | "inspector"): SplitState => splitState(layout().regions?.[region]);
+  const changeRegion = (region: "sidebar" | "inspector", value: SplitState): void => {
+    manager.state.regions = { sidebar: DEFAULT_SPLIT, inspector: DEFAULT_SPLIT, ...manager.state.regions, [region]: value };
+    publish();
+  };
+  const toggleRegion = (region: "sidebar" | "inspector"): void => changeRegion(region, { ...regionState(region), collapsed: !regionState(region).collapsed });
+  onCleanup(bindKeys(document.body, { "sidebar.toggle": () => toggleRegion("sidebar"), "inspector.toggle": () => toggleRegion("inspector") }));
+  const toggleButton = (region: "sidebar" | "inspector"): JSX.Element => <button type="button" class="action" aria-label={`Toggle ${region}`} aria-expanded={!regionState(region).collapsed} aria-controls={`split-${region}`} onClick={() => toggleRegion(region)}>{region === "sidebar" ? "Sidebar" : "Inspector"}</button>;
   const focusedAgent = createMemo(() => {
     const current = layout();
     return agentOf(current.focused === null ? undefined : current.tiles[current.focused]?.subject);
@@ -189,11 +196,13 @@ export function Workbench(props: WorkbenchProps): JSX.Element {
    * (the two trees list it twice). With neither, ↓ opens the first and ↑ the last. It stops at the ends.
    */
   let nav: HTMLElement | undefined;
+  let compactNav: HTMLElement | undefined;
   const stepAgent = (step: 1 | -1): void => {
-    if (nav === undefined) return;
-    const all = [...nav.querySelectorAll<HTMLElement>("[data-agent-id]")];
+    const navigation = isCompact(width()) ? compactNav : nav;
+    if (navigation === undefined) return;
+    const all = [...navigation.querySelectorAll<HTMLElement>("[data-agent-id]")];
     const active = document.activeElement;
-    const inside = active instanceof HTMLElement && nav.contains(active);
+    const inside = active instanceof HTMLElement && navigation.contains(active);
     const rows = inside ? all : all.filter((row, index) => all.findIndex((other) => other.dataset["agentId"] === row.dataset["agentId"]) === index);
     const from = inside ? active : rows.find((row) => row.dataset["agentId"] === focusedAgent());
     const ahead = (row: HTMLElement): boolean => from === undefined || (from.compareDocumentPosition(row) & (step > 0 ? Node.DOCUMENT_POSITION_FOLLOWING : Node.DOCUMENT_POSITION_PRECEDING)) !== 0;
@@ -235,10 +244,10 @@ export function Workbench(props: WorkbenchProps): JSX.Element {
   );
   const waits = (action: WaitingAction): JSX.Element => <Waits label={action.label} waitsFor={action.waitsFor} />;
   const desktop = (): JSX.Element => (
-    <div class="workbench" data-testid="workbench" data-window={windowActive() ? "active" : "inactive"}>
+    <SplitShell active={windowActive()}>
       <Cluster as="header" class="topbar" justify="space-between" space={SPACE[4]}>
         <Cluster space={SPACE[2]}>
-          <Show when={preview()}>{waits(SIDEBAR_TOGGLE)}</Show>
+          {toggleButton("sidebar")}
           {hostStatus()}
         </Cluster>
         <Palette
@@ -252,18 +261,25 @@ export function Workbench(props: WorkbenchProps): JSX.Element {
             {attentionLabel()}
           </button>
           <Show when={preview()}>
-            <For each={TOOLBAR_WAITING.slice(1)}>{waits}</For>
+            <For each={TOOLBAR_WAITING}>{waits}</For>
           </Show>
+          {toggleButton("inspector")}
         </Cluster>
       </Cluster>
       {banners()}
-      <nav ref={(element) => ((nav = element), onCleanup(bindKeys(element, moves)))} class="sidebar" aria-label="Agents" data-testid="sidebar">
-        <NeedsYou rows={attention()} focused={focusedAgent} open={openAgent} />
-        <Show when={fleetNote()}>{(note) => <p class="sidebar__note">{note()}</p>}</Show>
-        <Show when={rows().length > 0 || fleet.nodes.items().length > 0 || fleet.projects.items().length > 0}>
-          <SidebarTrees trees={trees} home={home} prefs={prefs} setPrefs={setPrefs} stamp={fleet.nodes.stamp} now={now} focused={focusedAgent} open={openAgent} />
-        </Show>
-      </nav>
+      <Split region="sidebar" value={regionState("sidebar")} change={value => changeRegion("sidebar", value)} rail={
+        <nav class="sidebar" aria-label="Agents" data-testid="compact-rail" ref={element => ((compactNav = element), onCleanup(bindKeys(element, moves)))}>
+          <ul class="agent-list"><For each={[...attention(), ...scoped().filter(row => !needsYou(row))]}>{row => <li><AgentRowButton row={row} focused={focusedAgent() === row.id} onFocus={() => openAgent(row.id)} testid="compact-agent-row" /></li>}</For></ul>
+        </nav>
+      }>
+        <nav ref={(element) => ((nav = element), onCleanup(bindKeys(element, moves)))} class="sidebar" aria-label="Agents" data-testid="sidebar">
+          <NeedsYou rows={attention()} focused={focusedAgent} open={openAgent} />
+          <Show when={fleetNote()}>{(note) => <p class="sidebar__note">{note()}</p>}</Show>
+          <Show when={rows().length > 0 || fleet.nodes.items().length > 0 || fleet.projects.items().length > 0}>
+            <SidebarTrees trees={trees} home={home} prefs={prefs} setPrefs={setPrefs} stamp={fleet.nodes.stamp} now={now} focused={focusedAgent} open={openAgent} />
+          </Show>
+        </nav>
+      </Split>
       <main class="focus" aria-label="Focused agent" data-testid="focus-pane">
         <Show when={focusedAgent()} keyed fallback={<p class="focus__empty">Pick an agent on the left.</p>}>
           {(agent) => (
@@ -290,12 +306,14 @@ export function Workbench(props: WorkbenchProps): JSX.Element {
           )}
         </Show>
       </main>
-      <aside class="inbox" aria-label="Inbox" data-testid="inbox">
-        <h2 class="inbox__title">Inbox</h2>
-        <InboxCards cards={cards()} closed={closed} source={props.source} sender={props.sender} preview={preview()} />
-      </aside>
+      <Split region="inspector" value={regionState("inspector")} change={value => changeRegion("inspector", value)}>
+        <aside class="inbox" aria-label="Inbox" data-testid="inbox">
+          <h2 class="inbox__title">Inbox</h2>
+          <InboxCards cards={cards()} closed={closed} source={props.source} sender={props.sender} preview={preview()} />
+        </aside>
+      </Split>
       <ShortcutSheet />
-    </div>
+    </SplitShell>
   );
   return (
     <Show when={phone()} fallback={desktop()}>

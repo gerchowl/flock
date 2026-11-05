@@ -24,6 +24,7 @@ import { markFor } from "../src/workbench/marks";
 import { previewControls } from "../src/workbench/preview";
 import { SAMPLE_AGENTS } from "../src/workbench/samples";
 import { shortcutLabel } from "../src/workbench/Palette";
+import { formatCombo, shortcut } from "../src/workbench/keys";
 import { COMMAND, LAYER_COMMANDS } from "./keys-command";
 import { Workbench } from "../src/workbench/Workbench";
 import { readFixture } from "./fixture-replay";
@@ -51,7 +52,7 @@ const $ = (root: ParentNode, id: string): Element | null => root.querySelector(`
 const $$ = (root: ParentNode, id: string): Element[] => [...root.querySelectorAll(`[data-testid="${id}"]`)];
 const tick = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
 /** The labels of the unbuilt actions §2a drew, Terminal included. */
-const UNBUILT = ["Hide sidebar", "Needs you", "New agent", "Show inspector", "Terminal", "Diff", "Fork", "Summary", "PR", "Activity"];
+const UNBUILT = ["Needs you", "New agent", "Terminal", "Diff", "Fork", "Summary", "PR", "Activity"];
 /** The toolbar's status dot: live, pending, problem or off. */
 const health = (root: ParentNode): string | null | undefined => $(root, "host-status")?.getAttribute("data-health");
 const buttonLabels = (root: ParentNode): string[] => [...root.querySelectorAll("button")].map((button) => button.textContent?.trim() ?? "");
@@ -109,7 +110,7 @@ describe("fixture mode", () => {
       const id = button?.getAttribute("aria-describedby");
       return id ? document.getElementById(id)?.textContent : undefined;
     };
-    expect(buttonLabels(root).filter((label) => UNBUILT.includes(label))).toEqual(["Hide sidebar", "New agent", "Show inspector", "Diff", "Fork"]);
+    expect(buttonLabels(root).filter((label) => UNBUILT.includes(label))).toEqual(["New agent", "Diff", "Fork"]);
     const fork = [...root.querySelectorAll("button")].find((button) => button.textContent === "Fork");
     expect(fork?.getAttribute("aria-disabled")).toBe("true");
     expect(fork?.disabled).toBe(false);
@@ -446,15 +447,15 @@ describe("command palette", () => {
     const waiting = $$(root, "palette-command") as HTMLElement[];
     // The keyboard layer's commands run now; the unbuilt actions follow them, dimmed.
     expect(waiting.map((item) => [item.textContent, item.getAttribute("aria-disabled")])).toEqual([
+      [`Toggle sidebar${formatCombo(shortcut("sidebar.toggle").combo)}`, null],
+      [`Toggle inspector${formatCombo(shortcut("inspector.toggle").combo)}`, null],
       ["First agent needing you (? agents waiting on you; agents waiting: unknown; no nodes reporting)", null],
       ["Previous agent↑", null],
       ["Next agent↓", null],
       ["Keyboard shortcuts?", null],
-      ["Hide sidebarWaits for collapsible panes", "true"],
       ["New agentWaits for the harness picker", "true"],
-      ["Show inspectorWaits for the inspector", "true"],
     ]);
-    waiting[5]?.click();
+    waiting.at(-1)?.click();
     expect($(root, "palette")).not.toBeNull();
   });
 
