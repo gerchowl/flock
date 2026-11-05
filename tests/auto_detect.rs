@@ -177,6 +177,22 @@ fn spawn_flock_auto(
     api_socket_path: &Path,
     _client_socket_path: &Path,
 ) -> SpawnedFlock {
+    spawn_flock_auto_executable(
+        Path::new(env!("CARGO_BIN_EXE_flk")),
+        config_home,
+        runtime_dir,
+        api_socket_path,
+        _client_socket_path,
+    )
+}
+
+fn spawn_flock_auto_executable(
+    executable: &Path,
+    config_home: &Path,
+    runtime_dir: &Path,
+    api_socket_path: &Path,
+    _client_socket_path: &Path,
+) -> SpawnedFlock {
     fs::create_dir_all(config_home.join(support::paths::app_dir_name())).unwrap();
     fs::create_dir_all(runtime_dir).unwrap();
     register_runtime_dir(runtime_dir);
@@ -197,7 +213,7 @@ fn spawn_flock_auto(
         })
         .unwrap();
 
-    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_flk"));
+    let mut cmd = CommandBuilder::new(executable);
     // No subcommand, no --no-session → auto-detect launch
     for (key, value) in support::environment::isolated_env(config_home, runtime_dir) {
         cmd.env(key, value);
@@ -274,6 +290,104 @@ fn spawn_flock_no_session(
         _master: pair.master,
         child,
     }
+}
+
+/// Scope cleanup also runs when an identity assertion fails.
+struct ExecutableSandbox(PathBuf);
+impl Drop for ExecutableSandbox {
+    fn drop(&mut self) {
+        cleanup_test_base(&self.0);
+    }
+}
+
+#[test]
+fn auto_detect_symlink_daemon_has_canonical_identity_after_alias_removal() {
+    use std::io::Read;
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    fs::create_dir_all(&base).unwrap();
+    let _sandbox = ExecutableSandbox(base.clone());
+    let canonical = fs::canonicalize(env!("CARGO_BIN_EXE_flk")).unwrap();
+    let alias = base.join("flk-alias");
+    std::os::unix::fs::symlink(&canonical, &alias).unwrap();
+    let runtime = base.join("runtime");
+    let flock = spawn_flock_auto_executable(
+        &alias,
+        &base.join("config"),
+        &runtime,
+        &base.join("api.sock"),
+        &base.join("client.sock"),
+    );
+    let mut output = flock._master.try_clone_reader().unwrap();
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let reader = thread::spawn(move || {
+        let result = (|| -> std::io::Result<()> {
+            let mut seen = Vec::new();
+            let mut bytes = [0; 4096];
+            // This query is emitted by the thin client only AFTER auto-detect
+            // has spawned the daemon and observed its listening socket.
+            while seen.len() < 128 * 1024 {
+                let n = output.read(&mut bytes)?;
+                if n == 0 {
+                    return Err(std::io::ErrorKind::UnexpectedEof.into());
+                }
+                seen.extend_from_slice(&bytes[..n]);
+                if seen.windows(6).any(|w| w == b"\x1b]10;?") {
+                    return Ok(());
+                }
+            }
+            Err(std::io::Error::other(
+                "client output exceeded the readiness bound",
+            ))
+        })();
+        let _ = tx.send(result);
+    });
+    rx.recv_timeout(Duration::from_secs(10))
+        .expect("auto-detect never reached client attach")
+        .expect("auto-detect exited before attach");
+    reader.join().unwrap();
+    let pids = support::flock_server_pids_for_runtime_dir(&runtime).unwrap();
+    assert_eq!(pids.len(), 1, "one isolated daemon must own the runtime");
+    let identity = support::process_table::process_info(pids[0]).unwrap();
+    assert_eq!(
+        identity.exe_path.as_deref(),
+        Some(canonical.as_path()),
+        "recorded executable"
+    );
+    assert_eq!(
+        identity.argv.first().map(String::as_str),
+        canonical.to_str(),
+        "daemon argv[0]"
+    );
+    fs::remove_file(alias).unwrap();
+    assert_eq!(
+        support::flock_server_pids_for_runtime_dir(&runtime).unwrap(),
+        pids,
+        "ownership proof survives removal of the launch alias"
+    );
+    drop(flock);
+}
+
+#[test]
+fn handoff_unresolvable_executable_is_a_typed_failure_without_fallback() {
+    let base = unique_test_dir();
+    fs::create_dir_all(&base).unwrap();
+    let _sandbox = ExecutableSandbox(base.clone());
+    let mut command = Command::new(env!("CARGO_BIN_EXE_flk"));
+    for (key, value) in
+        support::environment::isolated_env(&base.join("config"), &base.join("runtime"))
+    {
+        command.env(key, value);
+    }
+    let output = command
+        .args(["--json", "server", "live-handoff", "--import-exe"])
+        .arg(base.join("removed-binary"))
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let response: Value = serde_json::from_slice(&output.stdout).expect("typed failure envelope");
+    assert_eq!(response["error"]["code"], "server_executable_unresolved");
+    assert_eq!(response["error"]["retry"], "after_inspecting");
 }
 
 fn ping_socket(socket_path: &Path) -> String {
