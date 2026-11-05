@@ -61,11 +61,15 @@ jobs:
           gc-max-store-size-linux: 2G
           gc-max-store-size-macos: 2G
 
+      # Both platforms retain every lint target and feature combination.
+      # macOS additionally checks its cfg-selected implementation and tests,
+      # which Linux cannot compile. The shell omits only unused nextest and
+      # patched sccache, whose source builds added 13–18 minutes (#2970).
       - name: Lint in the dev shell
-        run: nix develop -c just lint
+        run: nix develop .#ci-lint -c just lint
 
       - name: Check Rust documentation
-        run: nix develop -c just doc-check
+        run: nix develop .#ci-lint -c just doc-check
 
   build:
     name: build
