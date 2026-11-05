@@ -86,6 +86,7 @@ exits! {
     DELEGATE_NOT_STARTED, AfterInspecting, "delegate start / wait: the delegate did not start";
     MSG_REFUSED, Never, "msg: the receiver refused the message";
     POLICY_REFUSED, Never, "refused by policy: an operator-only verb called from an agent (ADR-0014), an agent widening a delegate's question policy, or a goal write the caller may not make (ADR-0030 §1)";
+    REQUEST_OUTCOME_UNKNOWN, AfterInspecting, "mutation timed out after dispatch; inspect before retrying";
     RECONNECT_GAVE_UP, Later, "client gave up reconnecting to its server (EX_TEMPFAIL)";
     PROTOCOL_GAP, AfterHandoff, "client/server protocol gap";
     TIMEOUT, Yes, "timed out";
@@ -173,6 +174,7 @@ pub(crate) mod tests {
             "11 DELEGATE_NOT_STARTED after_inspecting",
             "13 MSG_REFUSED never",
             "13 POLICY_REFUSED never",
+            "14 REQUEST_OUTCOME_UNKNOWN after_inspecting",
             "75 RECONNECT_GAVE_UP later",
             "78 PROTOCOL_GAP after_handoff",
             "124 TIMEOUT yes",

@@ -202,10 +202,19 @@ fn mesh_identity_strict_umask_still_creates_private_writable_files() {
     let id = first.identity();
     drop(first);
     let path = fixture.identity_path();
-    for file in [&path, &path.with_file_name("identity.lock")] {
+    for file in [
+        &path,
+        &path.with_file_name("identity.lock"),
+        &fixture.base.join("strict.sock.lock"),
+        &fixture.base.join("strict-client.sock.lock"),
+    ] {
+        let metadata =
+            fs::metadata(file).unwrap_or_else(|error| panic!("{}: {error}", file.display()));
         assert_eq!(
-            fs::metadata(file).unwrap().permissions().mode() & 0o777,
-            0o600
+            metadata.permissions().mode() & 0o777,
+            0o600,
+            "{}",
+            file.display()
         );
     }
     assert_eq!(fixture.start("reopened", &state).identity(), id);

@@ -667,14 +667,15 @@ fn read_request_line(stream: &UnixStream) -> String {
 }
 
 /// Answers the protocol check a state-changing verb sends first (#868) with
-/// this build's protocol, and says whether `line` was that check.
+/// this build's protocol and write capability, and says whether it was a ping.
 fn answer_protocol_check(stream: &mut UnixStream, line: &str) -> bool {
     let request: serde_json::Value = serde_json::from_str(line).unwrap();
     if request["method"] != "ping" {
         return false;
     }
     let pong = serde_json::json!({"id":request["id"],"result":{
-        "type":"pong","version":"fixture","protocol":support::PROTOCOL_VERSION
+        "type":"pong","version":"fixture","protocol":support::PROTOCOL_VERSION,
+        "capabilities":{"pane_input_write_ack":true,"live_handoff":false}
     }});
     writeln!(stream, "{pong}").unwrap();
     true
@@ -1018,10 +1019,9 @@ fn pane_run_types_the_command_and_presses_enter_as_two_separated_requests() {
                     if answer_protocol_check(&mut stream, &line) {
                         continue;
                     }
-                    stream
-                        .write_all(br#"{"id":"cli:request","result":{"type":"ok"}}"#)
-                        .unwrap();
-                    stream.write_all(b"\n").unwrap();
+                    let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                    let response = serde_json::json!({"id":request["id"],"result":{"type":"ok"}});
+                    writeln!(stream, "{response}").unwrap();
                     stream.flush().unwrap();
                     requests.push((line, Instant::now()));
                 }
@@ -1050,7 +1050,7 @@ fn pane_run_types_the_command_and_presses_enter_as_two_separated_requests() {
     );
 
     let typed: serde_json::Value = serde_json::from_str(&requests[0].0).unwrap();
-    assert_eq!(typed["method"], "pane.send_input");
+    assert_eq!(typed["method"], "pane.write_input");
     assert_eq!(typed["params"]["pane_id"], "1-1");
     assert_eq!(typed["params"]["text"], "echo hello");
     // `keys` is skipped when empty, so its ABSENCE is the assertion: the
@@ -1061,7 +1061,7 @@ fn pane_run_types_the_command_and_presses_enter_as_two_separated_requests() {
     );
 
     let submitted: serde_json::Value = serde_json::from_str(&requests[1].0).unwrap();
-    assert_eq!(submitted["method"], "pane.send_keys");
+    assert_eq!(submitted["method"], "pane.write_keys");
     assert_eq!(submitted["params"]["pane_id"], "1-1");
     assert_eq!(submitted["params"]["keys"], serde_json::json!(["Enter"]));
 
@@ -1077,7 +1077,7 @@ fn pane_run_types_the_command_and_presses_enter_as_two_separated_requests() {
     cleanup_test_base(&base);
 }
 
-/// Run `flk pane run` against a fake server that answers `pane.send_input`
+/// Run `flk pane run` against a fake server that answers `pane.write_input`
 /// with `typed` and anything else with ok. Returns the exit code and the
 /// requests, in order.
 fn pane_run_requests(
@@ -1102,7 +1102,7 @@ fn pane_run_requests(
                         continue;
                     }
                     let request: serde_json::Value = serde_json::from_str(&line).unwrap();
-                    let mut response = if request["method"] == "pane.send_input" {
+                    let mut response = if request["method"] == "pane.write_input" {
                         typed.clone()
                     } else {
                         serde_json::json!({"result": {"type": "ok"}})
@@ -1145,7 +1145,7 @@ fn pane_run_into_an_empty_agent_composer_types_and_presses_enter_as_before() {
         serde_json::json!({"result": {"type": "ok"}}),
     );
     assert_eq!(code, Some(0));
-    assert_eq!(methods(&requests), ["pane.send_input", "pane.send_keys"]);
+    assert_eq!(methods(&requests), ["pane.write_input", "pane.write_keys"]);
     assert_eq!(requests[0]["params"]["text"], "/compact");
     assert!(
         requests[0]["params"].get("raw").is_none(),
@@ -1162,7 +1162,7 @@ fn pane_run_refused_onto_a_draft_exits_10_and_presses_no_enter() {
     let refused = serde_json::json!({"error": {"code": "input_not_empty", "message": "draft"}});
     let (code, requests) = pane_run_requests(&["1-1", "echo hello"], refused);
     assert_eq!(code, Some(10));
-    assert_eq!(methods(&requests), ["pane.send_input"]);
+    assert_eq!(methods(&requests), ["pane.write_input"]);
 }
 
 /// #1162: `--raw` tells the server to type onto whatever is there.
@@ -1173,7 +1173,7 @@ fn pane_run_raw_asks_the_server_to_type_anyway() {
         serde_json::json!({"result": {"type": "ok"}}),
     );
     assert_eq!(code, Some(0));
-    assert_eq!(methods(&requests), ["pane.send_input", "pane.send_keys"]);
+    assert_eq!(methods(&requests), ["pane.write_input", "pane.write_keys"]);
     assert_eq!(requests[0]["params"]["raw"], true);
 }
 

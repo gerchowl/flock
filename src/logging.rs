@@ -7,12 +7,53 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use tracing_subscriber::fmt::writer::MakeWriter;
+use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{filter::FilterExt, layer::SubscriberExt, Layer};
 
 const DEFAULT_MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
 // Keep previous generations on rotation: retained=0 DELETED the log at the
 // cap, and the failure being diagnosed usually lived in the tail just dropped.
 const DEFAULT_RETAINED_LOG_FILES: usize = 2;
+
+// Keep failure categories and I/O kinds observable without logging OS error payloads.
+pub(crate) fn system_information_unavailable(operation: &'static str, error: &sysinfo::Error) {
+    let (reason, io_kind) = match error {
+        sysinfo::Error::Unsupported => ("unsupported", None),
+        sysinfo::Error::Io(error) => ("io", Some(error.kind())),
+        sysinfo::Error::Other(_) => ("other", None),
+    };
+    tracing::warn!(
+        event = "system.information.unavailable",
+        operation,
+        reason,
+        io_kind = ?io_kind,
+        "system information unavailable"
+    );
+}
+
+/// Fleet storage failures expose only the typed I/O kind.
+#[cfg(feature = "web")]
+pub(crate) fn structured_fleet_stopped(error: &io::Error) {
+    tracing::error!(event = "structured.fleet.stopped", kind = ?error.kind(), "fleet stream owner stopped");
+}
+
+/// A directory without a UTF-8 identity cannot be a fleet project. No path or
+/// agent contents are logged, and the agent remains available in the stream.
+pub(crate) fn structured_fleet_project_unavailable() {
+    tracing::warn!(
+        event = "structured.fleet.project_unavailable",
+        code = "fleet_project_unavailable",
+        reason = "non_utf8_cwd",
+        "fleet agent project unavailable"
+    );
+}
+
+/// Recovery facts contain only a closed variant and a durable cursor floor.
+#[cfg(feature = "web")]
+pub(crate) fn structured_fleet_recovered(diagnostic: &crate::structured::fleet_lite::Diagnostic) {
+    tracing::warn!(event = "structured.fleet.recovered", diagnostic = ?diagnostic, "fleet snapshot recovered");
+}
 
 /// Surface retained recovery entries without reading session contents.
 pub(crate) fn structured_sweep_outcome(entry: &crate::structured::supervision::SweepEntry) {
@@ -37,6 +78,21 @@ pub(crate) fn structured_worker_shutdown_failed(error: &crate::structured::worke
     }
 }
 
+/// Optional structured launch provisioning must never prevent server startup.
+/// Resolution details may contain private paths; report only the typed code and category.
+pub(crate) fn structured_mcp_endpoint_unavailable(reason: crate::api::server::McpEndpointFailure) {
+    let reason = match reason {
+        crate::api::server::McpEndpointFailure::Exe => "exe",
+        crate::api::server::McpEndpointFailure::Socket => "socket",
+    };
+    tracing::warn!(
+        event = "structured.mcp.endpoint_unavailable",
+        reason,
+        code = crate::api::error_code::ErrorCode::StructuredEndpointRestartRequired.as_str(),
+        "structured MCP endpoint unavailable; structured start will refuse"
+    );
+}
+
 /// Report failed structured-session cleanup without reading session contents.
 pub(crate) fn structured_config_cleanup_failed(err: &io::Error) {
     tracing::error!(event = "structured.config.cleanup_failed", error = %err,
@@ -52,6 +108,140 @@ pub(crate) fn structured_stream_repaired(bytes_dropped: u64) {
     );
 }
 
+/// Classify internal browser-exchange failures without formatting credential-bearing data.
+#[cfg(feature = "web")]
+pub(crate) fn client_exchange_failed(
+    error: Option<&crate::structured::permissions::auth::tokens::TokenError>,
+) {
+    use crate::structured::permissions::auth::tokens::TokenError;
+    let (reason, io_kind) = match error {
+        Some(TokenError::Io(error)) => ("store_io", Some(error.kind())),
+        Some(TokenError::Unsafe) => ("unsafe_store", None),
+        Some(TokenError::Busy) => ("store_busy", None),
+        Some(TokenError::Unauthorized | TokenError::Revoked | TokenError::Scope) => return,
+        None => ("worker_unavailable", None),
+    };
+    tracing::warn!(event = "client.exchange.internal_failure", subsystem = "structured_client", reason, io_kind = ?io_kind, "browser credential exchange unavailable");
+}
+
+/// Once per listener startup, report positive absence rather than hiding a failed probe.
+#[cfg(feature = "web")]
+pub(crate) fn client_tailscale_not_installed(checked_paths: &str) {
+    tracing::info!(
+        event = "client.listener.tailscale_not_installed",
+        subsystem = "structured_client",
+        checked_paths,
+        "Tailscale forwarding check skipped because Tailscale is not installed"
+    );
+}
+
+/// Report secondary listener cleanup errors without replacing the primary server failure.
+#[cfg(feature = "web")]
+pub(crate) fn client_listener_shutdown_failed(error: &std::io::Error) {
+    tracing::warn!(event = "client.listener.shutdown_failed", subsystem = "structured_client", kind = ?error.kind(), errno = ?error.raw_os_error(), "client listener cleanup failed after server failure");
+}
+
+/// App credential revocation failed; transport shutdown still runs to completion.
+#[cfg(feature = "web")]
+pub(crate) fn client_app_revocation_failed(error: &std::io::Error) {
+    tracing::warn!(event = "client.app.revocation_failed", subsystem = "structured_client", kind = ?error.kind(), errno = ?error.raw_os_error(), "app credential revocation failed during shutdown");
+}
+
+/// Report a single capacity refusal without recording tool input or prompts.
+pub(crate) fn structured_permission_request_refused(
+    agent: &str,
+    request_id: &str,
+    request_seq: u64,
+    error_code: &str,
+) {
+    tracing::warn!(
+        event = "structured.permission.refused",
+        agent_id = agent,
+        request_id,
+        request_seq,
+        error_code,
+        "permission request denied at open-request capacity"
+    );
+}
+
+/// Report accept failures with typed classes and errno, never request contents.
+#[cfg(feature = "web")]
+pub(crate) fn client_accept_failed(
+    error: &std::io::Error,
+    class: crate::platform::client_listener::AcceptFailure,
+) {
+    use crate::platform::client_listener::AcceptFailure;
+    let errno = error.raw_os_error();
+    let event = "client.listener.accept";
+    match class {
+        AcceptFailure::Connection => tracing::debug!(event, errno, ?class),
+        AcceptFailure::Resource | AcceptFailure::Unknown => tracing::warn!(event, errno, ?class),
+        AcceptFailure::Fatal => tracing::error!(event, errno, ?class),
+    }
+}
+
+/// Report skipped queue records with fixed reasons and optional cursors, never payloads.
+pub(crate) fn structured_queue_record_skipped(sequence: Option<u64>, reason: &'static str) {
+    tracing::warn!(
+        event = "structured.queue.record_skipped",
+        sequence = ?sequence,
+        reason,
+        "skipped queue record; original journal retained"
+    );
+}
+
+/// Report startup settlement failure without logging input; reopen fences the item.
+pub(crate) fn structured_queue_opening_settlement_failed(code: crate::api::error_code::ErrorCode) {
+    tracing::error!(
+        event = "structured.queue.opening_settlement_failed",
+        failure_code = code.as_str(),
+        "opening item settlement failed; reopen must settle it before delivery"
+    );
+}
+
+/// Report the first corrupt queue record without exposing any input payload.
+pub(crate) fn structured_queue_corrupt(reason: &crate::structured::queue::QueueJournalCorrupt) {
+    tracing::warn!(
+        event = "structured.queue.corrupt",
+        sequence = ?reason.seq,
+        offset = reason.offset,
+        reason = reason.reason,
+        "queue journal is read-only; operator recovery required"
+    );
+}
+
+/// Report a durable corrupt-blob replacement without exposing stored content.
+pub(crate) fn structured_blob_repaired(reference: &crate::structured::blobs::BlobRef) {
+    tracing::warn!(
+        event = "structured.blob.repaired",
+        blob = reference.blob.as_str(),
+        size = reference.size,
+        "repaired corrupt stored blob"
+    );
+}
+
+/// Report degraded repair coordination without logging OS error text or content.
+pub(crate) fn structured_blob_repair_lock_unavailable(
+    reference: &crate::structured::blobs::BlobRef,
+    kind: io::ErrorKind,
+) {
+    tracing::warn!(
+        event = "structured.blob.repair_lock_unavailable",
+        blob = reference.blob.as_str(),
+        error_kind = ?kind,
+        "repair lock unavailable; publishing without coordination"
+    );
+}
+
+/// Report a malformed permission header without disclosing the stored payload.
+pub(crate) fn structured_permission_recovery_skipped(seq: u64) {
+    tracing::warn!(
+        event = "structured.permission.recovery_skipped",
+        seq,
+        "invalid permission recovery header skipped and preserved"
+    );
+}
+
 pub(crate) fn init_file_logging(file_name: &str) {
     let Ok(make_writer) = RotatingFileMakeWriter::new(
         crate::session::data_dir(),
@@ -62,6 +252,14 @@ pub(crate) fn init_file_logging(file_name: &str) {
         return;
     };
 
+    let _ = file_log_subscriber(make_writer).try_init();
+}
+
+/// Build the disk subscriber, shared with real-wire secret regression tests.
+fn file_log_subscriber<W>(make_writer: W) -> impl tracing::Subscriber + Send + Sync
+where
+    W: for<'a> MakeWriter<'a> + Send + Sync + 'static,
+{
     // Default filter covers both the crate's module_path (`flk`, the [[bin]]
     // name from Cargo.toml; see ADR-0003) AND the explicit brand-namespaced
     // `target: "flock::..."` events (e.g. `flock::attach`, `flock::peers`)
@@ -78,17 +276,54 @@ pub(crate) fn init_file_logging(file_name: &str) {
     // Spans are off: nothing #[instrument]s yet, and the default timestamp
     // precision matches the old text layer, preserving merge_log_records'
     // lexicographic-sort contract across mixed-format tails.
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(make_writer)
-        .with_ansi(false)
-        .with_target(true)
-        .json()
-        .flatten_event(true)
-        .with_current_span(false)
-        .with_span_list(false)
-        .event_format(InputJsonFormat::default())
-        .try_init();
+    tracing_subscriber::registry().with(
+        tracing_subscriber::fmt::layer()
+            .with_writer(make_writer)
+            .with_ansi(false)
+            .with_target(true)
+            .json()
+            .flatten_event(true)
+            .with_current_span(false)
+            .with_span_list(false)
+            .event_format(InputJsonFormat::default())
+            .with_filter(credential_safe_filter(filter)),
+    )
+}
+
+/// Apply an immutable credential boundary alongside the user's filter (ADR-0036 §5,
+/// ADR-0038 §6). WebSocket TRACE events dump raw hello/frame payloads. Protocol
+/// DEBUG events also dump peer-controlled close reasons, so that module uses INFO.
+/// An AND filter, rather than overridable EnvFilter directives, enforces the caps
+/// even for more specific module/span directives from FLOCK_LOG or RUST_LOG.
+/// File and web console subscribers share this boundary; flk TRACE is unaffected.
+/// The cap advertises TRACE (its highest permitted level) so AND preserves the
+/// user's lower max-level hint and default INFO callsites retain their fast path.
+pub(crate) fn credential_safe_filter<S>(
+    directives: EnvFilter,
+) -> impl tracing_subscriber::layer::Filter<S>
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    directives.and(
+        tracing_subscriber::filter::filter_fn(|metadata| {
+            let target = metadata.target();
+            let module = |name: &str| {
+                target == name
+                    || target
+                        .strip_prefix(name)
+                        .is_some_and(|tail| tail.starts_with("::"))
+            };
+            let cap = if module("tungstenite::protocol") {
+                tracing::Level::INFO
+            } else if module("tungstenite") || module("tokio_tungstenite") {
+                tracing::Level::DEBUG
+            } else {
+                tracing::Level::TRACE
+            };
+            *metadata.level() <= cap
+        })
+        .with_max_level_hint(tracing_subscriber::filter::LevelFilter::TRACE),
+    )
 }
 
 /// Bridge typed input metadata into stable tracing's scalar-only field API.
@@ -1797,6 +2032,29 @@ pub(crate) fn client_conn_hello_read_failed(client_id: u64, err: &str) {
     );
 }
 
+/// Structured tty-query failures distinguish confirmed loss from retention.
+pub(crate) fn client_geometry_query_failed(
+    stage: &'static str,
+    reason: &'static str,
+    outcome: &'static str,
+    error: &std::io::Error,
+) {
+    tracing::debug!(event = "client.geometry_query_failed", subsystem = "client", stage,
+        reason, outcome,
+        errno = error.raw_os_error(), kind = ?error.kind(), "terminal geometry query failed");
+}
+
+/// A terminal observer exhausted its no-progress write deadline.
+pub(crate) fn client_conn_write_stalled(client_id: u64) {
+    tracing::warn!(
+        event = "client_conn.write_stalled",
+        subsystem = "client_conn",
+        outcome = "disconnected",
+        client_id,
+        "observer disconnected after exhausting its socket write progress deadline"
+    );
+}
+
 pub(crate) fn client_conn_write_failed(err: &str) {
     tracing::debug!(
         event = "client_conn.write",
@@ -3093,13 +3351,22 @@ pub(crate) fn session_restore_tab_pruned_empty(tab: &str) {
     );
 }
 
+/// Discard untrusted agent identity text without logging its content.
+pub(crate) fn agent_name_dropped(source: &'static str) {
+    tracing::warn!(
+        code = crate::api::error_code::ErrorCode::InvalidAgentName.as_str(),
+        source,
+        "agent name dropped"
+    );
+}
+
 // --- agent-resume family (logging redesign PR-6) ---------------------------
-// The three deferred agent-resume paths (empty argv, shell spawn failure,
-// send-command failure) all reach tracing with %terminal_id / %plan.agent /
-// %err. TerminalId is Display-shaped; the facade takes a shaped &str so no
-// other module carries the raw Display fmt. Level stays WARN — a failed
-// resume drops the pane back to its non-resumed state, which is surfaced
-// to the user via the terminal.
+// The three deferred launch failures are empty argv, shell spawn failure and
+// command send failure. They retain the plan and set resume_failed, suppressing
+// automatic retries in this server. Agent info reports blocked_reason=resume_failed.
+// An explicit operator retry makes one new attempt. All three paths log WARN
+// through the facade with shaped terminal and agent strings. Only spawn and send
+// failures include an err field.
 
 pub(crate) fn agent_resume_empty_argv(pane: u32, terminal: &str, agent: &str) {
     tracing::warn!(
@@ -4996,6 +5263,16 @@ pub(crate) fn mesh_custody_failed(operation: &'static str, code: &'static str) {
     tracing::warn!(target: "flock::mesh", event = "mesh.custody.failed", operation, code, "mesh custody operation failed");
 }
 
+/// Unexpected scope-release failure, with no token, path or bearer contents.
+pub(crate) fn client_token_unlock_failed(error: &std::io::Error) {
+    tracing::warn!(
+        event = "client_token.lock.release_failed",
+        error = %error,
+        errno = error.raw_os_error(),
+        "client-token lock release failed"
+    );
+}
+
 /// An untrusted client-token entry was ignored; never log its contents or bearer.
 pub(crate) fn client_token_entry_unsafe(entry: &str) {
     tracing::warn!(
@@ -5005,9 +5282,88 @@ pub(crate) fn client_token_entry_unsafe(entry: &str) {
     );
 }
 
+/// A content anchor no longer resolves, so copying refuses rather than retargets.
+pub(crate) fn selection_content_unavailable(pane_closed: bool) {
+    tracing::debug!(
+        event = "selection.copy_refused",
+        subsystem = "selection",
+        reason = if pane_closed {
+            "pane_closed"
+        } else {
+            "content_unavailable"
+        },
+        "selected content is no longer available"
+    );
+}
+
+/// Close metadata only: no bearer, frame payload or client-provided reason.
+#[cfg(feature = "web")]
+pub(crate) fn client_wire_closing(code: u16, source: &'static str, line: u32) {
+    let source = source.rsplit('/').next().unwrap_or("wire");
+    tracing::debug!(
+        event = "client.wire.closing",
+        close_code = code,
+        source,
+        line,
+        "structured transport closing"
+    );
+}
+/// Internal cause and I/O class, without paths or raw parser errors.
+#[cfg(feature = "web")]
+pub(crate) fn client_wire_unavailable(cause: &'static str, kind: Option<io::ErrorKind>) {
+    tracing::debug!(event = "client.wire.unavailable", cause, kind = ?kind, "structured transport unavailable");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn system_information_failures_log_typed_reasons_without_error_payloads() {
+        let out = capture_logs(|| {
+            system_information_unavailable("cpu", &sysinfo::Error::Unsupported);
+            system_information_unavailable(
+                "disk",
+                &sysinfo::Error::Io(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "private system error payload",
+                )),
+            );
+            system_information_unavailable(
+                "network",
+                &sysinfo::Error::from("private system error payload"),
+            );
+        });
+        for expected in [
+            "system.information.unavailable",
+            "unsupported",
+            "io",
+            "PermissionDenied",
+            "other",
+        ] {
+            assert!(out.contains(expected), "{out}");
+        }
+        assert!(!out.contains("private system error payload"), "{out}");
+    }
+
+    #[cfg(feature = "web")]
+    #[test]
+    fn structured_fleet_diagnostics_exclude_error_payloads() {
+        let out = capture_logs(|| {
+            structured_fleet_stopped(&io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "private fixture error payload",
+            ));
+            structured_fleet_recovered(
+                &crate::structured::fleet_lite::Diagnostic::SnapshotCorrupt { high_water: 9 },
+            );
+        });
+        assert!(out.contains("structured.fleet.stopped"), "{out}");
+        assert!(out.contains("PermissionDenied"), "{out}");
+        assert!(out.contains("structured.fleet.recovered"), "{out}");
+        assert!(out.contains("SnapshotCorrupt"), "{out}");
+        assert!(!out.contains("private fixture error payload"), "{out}");
+    }
 
     #[test]
     fn remote_bridge_started_logs_full_command_shape() {
@@ -5504,6 +5860,17 @@ mod tests {
         assert!(hello.contains("stage=\"read_hello\""), "{hello}");
         assert!(hello.contains("client_id=11"), "{hello}");
         assert!(hello.contains("DEBUG"), "{hello}");
+    }
+
+    #[test]
+    fn stalled_observer_log_is_typed_and_connection_scoped() {
+        let log = capture_logs(|| client_conn_write_stalled(42));
+        assert!(log.contains("event=\"client_conn.write_stalled\""), "{log}");
+        assert!(log.contains("outcome=\"disconnected\""), "{log}");
+        assert!(log.contains("client_id=42"), "{log}");
+        assert!(log.contains("WARN"), "{log}");
+        assert!(!log.contains("host="), "{log}");
+        assert!(!log.contains("path="), "{log}");
     }
 
     #[test]
@@ -7181,3 +7548,6 @@ mod tests {
         assert!(out.contains("INFO"), "{out}");
     }
 }
+
+#[cfg(all(test, feature = "web"))]
+mod secret_tests;

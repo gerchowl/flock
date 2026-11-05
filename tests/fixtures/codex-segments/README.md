@@ -38,7 +38,8 @@ resume semantics and stale-sequence refusal. The transcript path remains
 unvalidated data, separate from the session ID; it does not select a file or
 supply authority. Claude's source set does not acquire fork.
 
-Worker supervision and writer health remain #1857; runtime authority/consumer
+Worker supervision and writer health are provided by
+[the #1857 worker](../codex-worker/README.md); runtime authority/consumer
 integration remains #1664. #1860 replaces snapshot and admission full-file buffers
 with bounded steps through the shared streaming verifier. `Capture` requires the
 old writer to remain quiescent until it returns a snapshot. `Admission` keeps

@@ -23,7 +23,7 @@ jobs:
           persist-credentials: false
 
       - name: Install Nix
-        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+        uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31.11.3
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
@@ -122,7 +122,7 @@ jobs:
           echo "AR_aarch64_unknown_linux_musl=$GITHUB_WORKSPACE/scripts/zig-cross/ar" >> $GITHUB_ENV
 
       - name: Cache Rust artifacts
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/dev' }}
           key: release-${{ matrix.target }}
@@ -136,11 +136,21 @@ jobs:
       - name: Rename binary
         run: cp target/${{ matrix.target }}/release/flk ${{ matrix.name }}
 
+      - name: Compute asset checksum
+        run: |
+          python3 - <<'PYTHON' | tee ${{ matrix.name }}.sha256
+          import hashlib, pathlib
+          path = pathlib.Path('${{ matrix.name }}')
+          print(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}")
+          PYTHON
+
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.name }}
-          path: ${{ matrix.name }}
+          path: |
+            ${{ matrix.name }}
+            ${{ matrix.name }}.sha256
 
   validate-release-inputs:
     runs-on: ubuntu-latest
@@ -180,6 +190,7 @@ jobs:
             flock-linux-aarch64/flock-linux-aarch64
             flock-macos-x86_64/flock-macos-x86_64
             flock-macos-aarch64/flock-macos-aarch64
+            flock-*/*.sha256
           body_path: RELEASE_NOTES.md
 
   close-released-issues:
@@ -345,7 +356,7 @@ jobs:
       # main with the next release. It is opened with an App token, not
       # GITHUB_TOKEN: a PR opened with GITHUB_TOKEN triggers no workflows, so
       # its required checks would never run and auto-merge would wait forever.
-      - uses: actions/create-github-app-token@v2
+      - uses: actions/create-github-app-token@v3
         id: app-token
         with:
           app-id: ${{ secrets.RELEASE_APP_ID }}

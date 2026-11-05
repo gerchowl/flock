@@ -149,6 +149,7 @@ async fn recovery_replay_preserves_uid_and_restores_the_outer_context() {
         app.current_api_peer_pid,
         app.current_api_peer_birth,
         Some(Some(42)),
+        None,
         respond_to,
     );
     app.replay_recovery_parked();
@@ -241,6 +242,7 @@ sys.stdin.read()
                 &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
                 None,
                 &std::sync::Mutex::default(),
+                &crate::api::client_listener::Health::default(),
                 &Default::default(),
             )
             .unwrap();
