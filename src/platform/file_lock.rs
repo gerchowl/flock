@@ -1,4 +1,4 @@
-//! Scoped advisory file locks shared by every file-lock owner.
+//! Operation-scoped advisory file leases, generalized from the journal writer lease.
 use std::fs::{File, TryLockError};
 use std::io;
 use std::os::fd::AsRawFd;
@@ -22,17 +22,14 @@ const LOCK_RECHECK_INTERVAL: Duration = Duration::from_millis(10);
 /// guard responsible for unlocking the shared description.
 pub(crate) struct LockFile {
     file: File,
-    unlock_on_drop: bool,
 }
 impl LockFile {
     /// Own the description, including while an acquisition helper is waiting.
     pub(crate) fn new(file: File) -> Self {
-        Self {
-            file,
-            unlock_on_drop: true,
-        }
+        Self { file }
     }
-    /// Acquire exclusively, preserving the caller's existing blocking policy.
+    /// Acquire fixture ownership without a deadline.
+    #[cfg(test)]
     pub(crate) fn lock(&self) -> io::Result<()> {
         self.file.lock()
     }
@@ -68,10 +65,9 @@ impl LockFile {
     pub(crate) fn try_lock(&self) -> Result<(), TryLockError> {
         self.file.try_lock()
     }
-    /// Close this duplicate after an acknowledged transfer to another guard.
-    /// Only the receiving owner may subsequently unlock the shared description.
-    pub(super) fn close_after_transfer(mut self) {
-        self.unlock_on_drop = false;
+    /// Share admission ownership without waiting; mutations remain exclusive.
+    pub(crate) fn try_lock_shared(&self) -> Result<(), TryLockError> {
+        self.file.try_lock_shared()
     }
 }
 impl AsRawFd for LockFile {
@@ -81,9 +77,6 @@ impl AsRawFd for LockFile {
 }
 impl Drop for LockFile {
     fn drop(&mut self) {
-        if !self.unlock_on_drop {
-            return;
-        }
         if let Err(error) = self.file.unlock() {
             crate::logging::file_lock_unlock_failed(&error);
         }

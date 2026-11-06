@@ -13,5 +13,5 @@ pub use self::restore::restore;
 pub use self::restore::{handoff_pane_aliases, restore_handoff};
 pub use self::snapshot::{
     capture, capture_history, DirectionSnapshot, IssueDraftSnapshot, LayoutSnapshot,
-    SessionHistorySnapshot, SessionSnapshot, TabSnapshot, WorkspaceSnapshot,
+    RegistryCapture, SessionHistorySnapshot, SessionSnapshot, TabSnapshot, WorkspaceSnapshot,
 };

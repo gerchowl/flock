@@ -374,7 +374,10 @@ impl App {
                 .foreground_cwd_for_pane(pane_id, &self.terminal_runtimes)
                 .map(|cwd| cwd.display().to_string()),
             label: terminal.manual_label.clone(),
-            agent: terminal.effective_agent_label().map(str::to_string),
+            agent: crate::terminal::agent_name::received(
+                terminal.effective_agent_label().map(str::to_string),
+                "pane_info",
+            ),
             title: presentation.title,
             display_agent: presentation.display_agent,
             agent_status: super::api_helpers::pane_agent_status_from_terminal(

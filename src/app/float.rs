@@ -328,7 +328,10 @@ mod tests {
 
         let runtimes = crate::terminal::TerminalRuntimeRegistry::new();
         let snapshot = crate::persist::capture(
-            &state.structured_agents,
+            crate::persist::RegistryCapture {
+                registry: &state.structured_agents,
+                now_ms: Some(42),
+            },
             &state.workspaces,
             &state.terminals,
             &runtimes,

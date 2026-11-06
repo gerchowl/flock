@@ -9,18 +9,62 @@ use std::time::{Duration, Instant};
 
 /// Internal worker argument; the worker receives no path or credential.
 pub(crate) const WORKER_ARG: &str = "--client-token-lock";
+/// Shared admission worker, with the same descriptor-only ownership checks.
+pub(crate) const SHARED_WORKER_ARG: &str = "--client-token-lock-shared";
+/// Ceiling for cold exec and descriptor validation before the started byte.
+/// Separate from lock contention: a silent/dead helper still fails boundedly.
+/// Five seconds matches the existing hello ceiling, rather than allowing a
+/// thirty-second management stall. Absolute caller budgets can shorten it.
+const HELPER_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A management wait budgets only contention; hello retains its absolute ceiling.
+enum WaitBudget {
+    Lock(Duration),
+    Until(Instant),
+}
+impl WaitBudget {
+    fn remaining(&self) -> io::Result<Duration> {
+        match self {
+            Self::Lock(duration) => Ok(*duration),
+            Self::Until(deadline) => deadline
+                .checked_duration_since(Instant::now())
+                .filter(|left| !left.is_zero())
+                .ok_or_else(|| io::ErrorKind::TimedOut.into()),
+        }
+    }
+    fn startup(&self) -> io::Result<Duration> {
+        match self {
+            Self::Lock(_) => Ok(HELPER_STARTUP_TIMEOUT),
+            Self::Until(_) => Ok(self.remaining()?.min(HELPER_STARTUP_TIMEOUT)),
+        }
+    }
+}
 use super::file_lock::LockFile;
 
 /// A pending lock owns its helper until acquisition, cancellation or timeout.
 pub(crate) struct PendingLock {
     file: Option<LockFile>,
     helper: Option<(Child, UnixStream)>,
+    #[cfg(test)]
+    waiting: Option<std::sync::mpsc::Sender<()>>,
 }
 impl PendingLock {
     /// Start without blocking the caller. Only a contended lock needs a helper.
     pub(crate) fn begin(file: File, executable: &Path) -> io::Result<Self> {
+        Self::begin_with(file, executable, false)
+    }
+    /// Wait for shared admission without changing exclusive mutation ownership.
+    pub(crate) fn begin_shared(file: File, executable: &Path) -> io::Result<Self> {
+        Self::begin_with(file, executable, true)
+    }
+    fn begin_with(file: File, executable: &Path, shared: bool) -> io::Result<Self> {
         let file = LockFile::new(file);
-        let contended = match file.try_lock() {
+        let attempt = if shared {
+            file.try_lock_shared()
+        } else {
+            file.try_lock()
+        };
+        let contended = match attempt {
             Ok(()) => false,
             Err(TryLockError::WouldBlock) => true,
             Err(TryLockError::Error(error)) => return Err(error),
@@ -31,7 +75,11 @@ impl PendingLock {
             #[allow(clippy::disallowed_methods)]
             let mut command = std::process::Command::new(executable);
             command
-                .arg(WORKER_ARG)
+                .arg(if shared {
+                    SHARED_WORKER_ARG
+                } else {
+                    WORKER_ARG
+                })
                 .stdin(Stdio::null())
                 .stdout(Stdio::from(OwnedFd::from(child)))
                 .stderr(Stdio::null());
@@ -56,59 +104,141 @@ impl PendingLock {
         Ok(Self {
             file: Some(file),
             helper,
+            #[cfg(test)]
+            waiting: None,
         })
     }
-    /// Wait at most the supplied lock deadline; cleanup also runs when abandoned.
-    pub(crate) fn finish(mut self, deadline: Duration) -> io::Result<LockFile> {
+    /// Observe entry into a contended lock's bounded IPC wait in fence tests.
+    #[cfg(test)]
+    pub(crate) fn notify_waiting(&mut self, ready: std::sync::mpsc::Sender<()>) {
+        self.waiting = Some(ready);
+    }
+    /// Allow five seconds for startup, then the supplied contention budget.
+    /// A two-second management budget thus allows seven seconds of IPC waiting,
+    /// plus caller-hook and owned-child cleanup/scheduling time.
+    /// Cleanup also runs when abandoned.
+    pub(crate) fn finish(self, deadline: Duration) -> io::Result<LockFile> {
+        self.finish_notifying(deadline, || {})
+    }
+    /// Observe a started helper before reading its bounded lock acknowledgement.
+    /// Startup has its own ceiling; the callback precedes the lock-read timeout.
+    /// It must not wait for the helper or manage the guarded token store.
+    /// Fixtures may pause here with a sender-owned gate outside the read budget.
+    pub(crate) fn finish_notifying(
+        self,
+        deadline: Duration,
+        on_wait: impl FnOnce(),
+    ) -> io::Result<LockFile> {
+        self.finish_with(WaitBudget::Lock(deadline), on_wait)
+    }
+    /// Keep an overall caller deadline across startup, callbacks and lock reads.
+    pub(crate) fn finish_until(
+        self,
+        deadline: Instant,
+        on_wait: impl FnOnce(),
+    ) -> io::Result<LockFile> {
+        self.finish_with(WaitBudget::Until(deadline), on_wait)
+    }
+    fn finish_with(mut self, budget: WaitBudget, on_wait: impl FnOnce()) -> io::Result<LockFile> {
+        if let WaitBudget::Until(_) = &budget {
+            budget.remaining()?;
+        }
         if let Some((_, stream)) = &mut self.helper {
-            // A completed peer may reject SO_RCVTIMEO while its ACK is buffered
-            // on Darwin. Readiness waits work for both live and completed peers.
-            wait_readable(stream, deadline)?;
-            let mut ack = [0];
-            stream.read_exact(&mut ack)?;
-            if ack != [b'L'] {
-                return Err(io::ErrorKind::InvalidData.into());
-            }
+            #[cfg(test)]
+            let waiting = self.waiting.take();
+            wait_for_lock(stream, budget, || {
+                on_wait();
+                #[cfg(test)]
+                if let Some(ready) = waiting {
+                    ready.send(()).map_err(|_| io::ErrorKind::BrokenPipe)?;
+                }
+                Ok(())
+            })?;
         }
         self.file
             .take()
             .ok_or_else(|| io::ErrorKind::InvalidData.into())
     }
 }
-/// Wait for the sole-reader acknowledgment socket, including EOF and errors.
-/// Interrupted polls remeasure the monotonic deadline; no retry extends it.
-fn wait_readable(stream: &UnixStream, timeout: Duration) -> io::Result<()> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(io::ErrorKind::TimedOut.into());
-        }
-        let milliseconds = remaining
-            .as_nanos()
-            .div_ceil(1_000_000)
-            .min(i32::MAX as u128) as i32;
-        let mut descriptor = libc::pollfd {
-            fd: stream.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: this live descriptor and the one-element output buffer are owned.
-        let ready = unsafe { libc::poll(&mut descriptor, 1, milliseconds) };
-        if ready > 0 {
-            // Only finish() reads this endpoint, so readiness cannot be consumed
-            // by another reader before the single-byte read (EOF also completes).
-            return Ok(());
-        }
-        if ready < 0 {
-            let error = io::Error::last_os_error();
-            if error.kind() != io::ErrorKind::Interrupted {
+/// IPC timeout seam; tests inject helper startup latency without wall-clock waits.
+trait HelperStream {
+    fn read_byte(&mut self, timeout: Duration) -> io::Result<u8>;
+}
+impl HelperStream for UnixStream {
+    fn read_byte(&mut self, timeout: Duration) -> io::Result<u8> {
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or(io::ErrorKind::InvalidInput)?;
+        loop {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .filter(|left| !left.is_zero())
+                .ok_or(io::ErrorKind::TimedOut)?;
+            let millis = remaining
+                .as_nanos()
+                .div_ceil(1_000_000)
+                .min(i32::MAX as u128);
+            let mut ready = libc::pollfd {
+                fd: self.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: poll borrows one live socket descriptor and a writable record.
+            let result = unsafe { libc::poll(&mut ready, 1, millis as i32) };
+            if result < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
                 return Err(error);
+            }
+            if result == 0 {
+                continue;
+            }
+            let mut byte = 0u8;
+            // SAFETY: recv borrows the live socket and a one-byte writable buffer.
+            // Nonblocking receive keeps a spurious readiness edge within the deadline.
+            let count = unsafe {
+                libc::recv(
+                    self.as_raw_fd(),
+                    (&mut byte as *mut u8).cast(),
+                    1,
+                    libc::MSG_DONTWAIT,
+                )
+            };
+            match count {
+                1 => return Ok(byte),
+                0 => return Err(io::ErrorKind::UnexpectedEof.into()),
+                _ => {
+                    let error = io::Error::last_os_error();
+                    if !matches!(
+                        error.kind(),
+                        io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+                    ) {
+                        return Err(error);
+                    }
+                }
             }
         }
     }
 }
-
+fn wait_for_lock(
+    stream: &mut impl HelperStream,
+    budget: WaitBudget,
+    on_wait: impl FnOnce() -> io::Result<()>,
+) -> io::Result<()> {
+    read_ack(stream, budget.startup()?, b'S')?;
+    on_wait()?;
+    read_ack(stream, budget.remaining()?, b'L')
+}
+fn read_ack(stream: &mut impl HelperStream, timeout: Duration, expected: u8) -> io::Result<()> {
+    // Darwin may reject SO_RCVTIMEO after peer exit even with buffered data.
+    // Readiness + recv needs no socket-option rearm and drains data before EOF.
+    if stream.read_byte(timeout)? != expected {
+        return Err(io::ErrorKind::InvalidData.into());
+    }
+    Ok(())
+}
 impl Drop for PendingLock {
     fn drop(&mut self) {
         if let Some((child, _)) = &mut self.helper {
@@ -158,16 +288,28 @@ pub(crate) fn worker() -> io::Result<()> {
             let _ = monitor.read(&mut [0]);
             std::process::exit(crate::cli::exit::SUCCESS);
         })?;
-    let file = LockFile::new(file);
-    file.lock()?;
-    std::io::stdout().write_all(b"L")?;
-    // The acknowledged parent retains the same description and its unlock guard.
-    file.close_after_transfer();
-    Ok(())
+    {
+        let mut output = std::io::stdout().lock();
+        output.write_all(b"S")?;
+        output.flush()?;
+    }
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == SHARED_WORKER_ARG)
+    {
+        file.lock_shared()?;
+    } else {
+        file.lock()?;
+    }
+    // The parent retains this same description through the operation. Unlocking
+    // here would break the transfer; the parent guard releases it after admission.
+    let mut output = std::io::stdout().lock();
+    output.write_all(b"L")?;
+    output.flush()
 }
 
 #[cfg(test)]
-use super::file_lock::inherited_holder;
+pub(crate) mod inherited_holder;
 
 #[cfg(test)]
 mod tests;

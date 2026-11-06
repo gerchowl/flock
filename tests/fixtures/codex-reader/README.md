@@ -55,8 +55,8 @@ retains at most record_bytes, with bounded JSON/reducer memory. Oversized record
 and exhausted turn-ID capacity still fail explicitly, without eviction. A finite
 history reaches EOF across finite calls; a continuously growing history need not
 be caught up. All scanning APIs require the caller to keep scheduling work.
-Reader supervision, deadlines and scheduling cadence belong to #1857, not to the
-Codex event rate. Bounded bytes do not make kernel filesystem calls nonblocking.
+Reader supervision, deadlines and scheduling cadence are provided by
+[the #1857 worker](../codex-worker/README.md), independently of the Codex event rate. Bounded bytes do not make kernel filesystem calls nonblocking.
 
 The streaming regressions use 3–17-byte work units for files far larger than a
 unit, assert bounded batch/partial sizes, and sum scanned bytes to show exactly
@@ -70,8 +70,8 @@ A returned batch is not lifecycle authority. Segment attribution and admission
 before `Binding::finish`, resume/copy validation, ignoring inherited partial
 records, child fork delimiters, compact continuity and server metadata delivery
 belong to #1856. Live writer checks, worker supervision, bounded cancellation,
-EOF progress/health and stale-capability delivery belong to #1857. Call this
-synchronous file code on that supervised worker; never on the render path.
+EOF progress/health and stale-capability delivery are provided by #1857. Run
+incremental admission/polling there, never on the render path.
 A checkpoint copy alone does not prove destination-local ownership. Actual
 server authority and consumer/screen integration remain #1664. #1663 and #1479
 stay open until their remaining slices land.

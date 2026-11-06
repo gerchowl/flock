@@ -471,3 +471,89 @@ fn unconfirmed_cleanup_logs_reservation_identity() {
     assert_eq!(output.matches("process cleanup unconfirmed").count(), 1);
     assert!(!output.contains("registry busy during release"));
 }
+
+#[test]
+fn public_lease_state_reports_binding_without_authority_or_waiting() {
+    let leases = SessionLeases::default();
+    assert_eq!(leases.state("agent", "session"), LeaseState::Absent);
+    let mut lease = leases.reserve("agent", "session", None).unwrap();
+    assert_eq!(leases.state("agent", "session"), LeaseState::Reserved);
+    assert_eq!(leases.state("other", "session"), LeaseState::Absent);
+    {
+        let _guard = leases.0.lock();
+        assert_eq!(leases.state("agent", "session"), LeaseState::Uncertain);
+    }
+    lease.spawned().unwrap();
+    lease.bind_test_peer(std::process::id());
+    assert_eq!(leases.state("agent", "session"), LeaseState::Bound);
+    lease.generation.revoke();
+    assert_eq!(leases.state("agent", "session"), LeaseState::Uncertain);
+    lease.release();
+    assert_eq!(leases.state("agent", "session"), LeaseState::Absent);
+}
+
+#[test]
+fn owner_admission_reads_published_snapshot_without_waiting() {
+    let leases = SessionLeases::default();
+    let lease = leases
+        .reserve(
+            "fixture-child",
+            "fixture-session",
+            Some(("fixture-parent", 0)),
+        )
+        .unwrap();
+    let shared = leases.clone();
+    let (ready, seen) = std::sync::mpsc::sync_channel(1);
+    let (release, wait) = std::sync::mpsc::sync_channel(1);
+    let holder = std::thread::spawn(move || {
+        let _held = shared.0.lock();
+        ready.send(()).unwrap();
+        // A blocking-lock regression must fail after this ceiling, never hang CI.
+        let _ = wait.recv_timeout(std::time::Duration::from_secs(10));
+    });
+    seen.recv_timeout(std::time::Duration::from_secs(10))
+        .unwrap();
+    let snapshot = leases.admitted_identities();
+    let workers =
+        crate::structured::workers::Workers::new(std::sync::Arc::new(tokio::sync::Notify::new()));
+    let counted = workers.counts(&leases, "fixture-parent");
+    let released = release.send(());
+    holder.join().unwrap();
+    assert_eq!(
+        snapshot,
+        Some(BTreeMap::from([(
+            "fixture-child".into(),
+            Some("fixture-parent".into())
+        )]))
+    );
+    assert_eq!(counted, Ok((1, 1)));
+    drop(lease);
+    released.unwrap();
+}
+
+#[test]
+fn owner_admission_reports_retryable_contention_when_both_views_are_busy() {
+    let leases = SessionLeases::default();
+    let shared = leases.clone();
+    let (ready, seen) = std::sync::mpsc::sync_channel(1);
+    let (release, wait) = std::sync::mpsc::sync_channel(1);
+    let holder = std::thread::spawn(move || {
+        let _live = shared.0.lock();
+        let _published = shared.1.lock();
+        ready.send(()).unwrap();
+        // Bound a blocking-read regression even if the caller never releases.
+        let _ = wait.recv_timeout(std::time::Duration::from_secs(10));
+    });
+    seen.recv_timeout(std::time::Duration::from_secs(10))
+        .unwrap();
+    let workers =
+        crate::structured::workers::Workers::new(std::sync::Arc::new(tokio::sync::Notify::new()));
+    let counted = workers.counts(&leases, "fixture-parent");
+    let released = release.send(());
+    holder.join().unwrap();
+    released.unwrap();
+    assert_eq!(counted, Err(crate::api::error_code::ErrorCode::SessionBusy));
+    let refusal = crate::spawn::SpawnRefusal::RegistryBusy;
+    assert_eq!(refusal.code(), "session_busy");
+    assert!(refusal.retryable());
+}

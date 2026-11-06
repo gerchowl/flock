@@ -131,3 +131,14 @@ mv flock-linux-x86_64 ~/.local/bin/flock
 ## Requirements
 
 Flock supports Linux and macOS. Native Windows support is not available yet; use Flock inside WSL for now.
+
+### Download checksum transition
+
+New stable release manifests publish each platform asset as `{url, sha256}`,
+using the SHA-256 computed from the release build. `flk update` and remote
+bootstrap verify declared checksums before installing. A mismatch refuses the
+download and removes the temporary file. Preview downloads use the same verifier.
+
+Legacy manifests may still contain bare URL strings. Those downloads remain
+unverified during this transition; requiring a checksum is tracked in #2076.
+Checksums detect differences from the manifest and are not independent signatures.

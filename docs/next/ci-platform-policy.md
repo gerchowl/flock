@@ -3,7 +3,10 @@
 Owner-approved policy (2026-10-16, #1613): ordinary pull requests run full Linux
 build, lint and test checks, plus macOS build and lint (`macos-15 / build` and
 `macos-15 / lint`). They schedule no macOS test shards. The build still compiles
-all test binaries and verifies the complete shard partition.
+all test binaries and verifies the complete shard partition. As a targeted
+exception (#2569), the macOS build job also runs the native suspend-clock
+tests from that archive on every Rust PR, proving continuous-time kqueue
+timers work through the production Tokio reactor on `macos-15`.
 
 Landing batch PRs whose head branch starts with `land/`, and pushes to `dev` or
 `main`, run the full macOS test suite as well. Batch detection uses
@@ -23,6 +26,49 @@ gate. The Linux gate retains the same failure rules and full test coverage.
 
 A macOS-only test failure may first surface in a landing batch, rather than its
 individual PR. The batch must pass its full macOS checks before landing. A green
-ordinary PR's macOS aggregate is evidence of build/lint success, not test success.
+ordinary PR's macOS aggregate proves build/lint and the targeted suspend-clock
+checks, but does not prove the full macOS suite passed.
 The policy reduces PR runner demand; it does not reduce batch coverage or change
 the existing action pins, permissions, test filters or shard assignments.
+
+## Anti-vacuous-success assertion
+
+A skipped job reports success, so a mistakenly skipped shard set would leave
+`check (macos-15)` green. On full-matrix events (`land/` batch PRs, `merge_group`,
+pushes) the gate therefore also requires one JUnit report per shard the build
+planned (`ci-leg.yml` exposes the build's `shards` as a workflow output) and fails
+on any mismatch or an empty plan. Ordinary PRs skip that assertion by policy.
+
+## Docs-only and web-only pull requests
+
+The `changes` job in `ci.yml` runs `scripts/ci_changes.py` on the PR's changed
+paths. An ordinary pull request touching only `docs/`, `website/`, `web/client/`
+or root-level Markdown skips the Rust legs (both `ubuntu-latest` and `macos-15`
+build/lint/test); the `client` job still runs. Paths read by Rust or script tests
+or release tooling are never skippable: `docs/next/`, `web/client/test/fixtures/`,
+`web/client/src/gen/` (generated TS checked by a Rust test),
+`web/client/src/wire/`, `web/client/src/fleet*` and `web/client/tests/wire/` (bun
+scripts spawned by Rust tests and their imports; `scripts/test_ci_changes.py`
+computes every file Rust reads or spawns plus its TS import closure and fails if any
+is skippable), `website/scripts/`,
+`website/latest.json`, `CHANGELOG.md`. Changed paths come from
+`git diff --no-renames`, so a rename lists both sides. The maintenance script tests
+(which read some README/docs files) run in their own `script-tests` job on every
+event, and `check (ubuntu-latest)` requires it, so they are never skipped. Detection fails safe: any other path, an
+empty diff, a `land/` head, `merge_group`, push, or a failed `changes` job runs
+everything. The `check (...)` gates still run with `always()`; they accept a
+`skipped` leg only when `changes` explicitly reported `skip_rust=true`.
+
+## Desktop shell tests
+
+The `desktop (ubuntu-latest)` and `desktop (macos-15)` jobs (`ci-desktop.yml`,
+called from `ci.yml`, #2477) run `just desktop-test`: the client build that
+`tauri::generate_context!` embeds, then `cargo test --locked` in `desktop/`, a crate
+outside flk's workspace (Linux installs Tauri v2's WebKitGTK 4.1 prerequisites).
+They run on every ordinary PR and every other event, like the Rust legs, and follow
+the same `skip_rust` decision rather than a path filter of their own: `desktop/`,
+`justfile` and the workflow are not allow-listed, so only docs/web-client-only PRs
+skip them. `check (ubuntu-latest)` and `check (macos-15)` list their desktop job in
+`needs` and, in a step that runs with `always()`, accept `skipped` only when
+`changes` reported `skip_rust=true`; failed, cancelled or missing results fail the
+gate. Signing, notarisation and the nix build of the shell stay with G9c (#1636).
