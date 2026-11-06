@@ -27,6 +27,7 @@ pub(crate) mod sheep;
 mod sidebar;
 pub(crate) mod state_signal;
 pub(crate) mod status;
+pub(crate) mod structured;
 mod tabs;
 mod widgets;
 pub(crate) mod window_title;
@@ -425,12 +426,14 @@ fn compute_view_internal(
         config_diagnostic_lines: banner_lines,
         session_warning_lines,
         pane_infos,
+        structured: Default::default(),
         split_borders,
     };
 
     // After the view lands: pane geometry is now current, so the panel's
     // rows can be re-wrapped at the width they will actually render at (#254).
     refresh_prompt_layout(app);
+    app.view.structured = structured::prepare(app);
 }
 
 fn compute_mobile_view(
@@ -513,12 +516,14 @@ fn compute_mobile_view(
         config_diagnostic_lines: banner_lines,
         session_warning_lines,
         pane_infos,
+        structured: Default::default(),
         split_borders,
     };
 
     // After the view lands: pane geometry is now current, so the panel's
     // rows can be re-wrapped at the width they will actually render at (#254).
     refresh_prompt_layout(app);
+    app.view.structured = structured::prepare(app);
 }
 
 /// Render the UI — reads AppState but does not mutate it.
@@ -1620,6 +1625,10 @@ mod tests {
     #[test]
     fn servers_band_renders_self_row_in_place_with_two_line_peers() {
         let mut app = crate::app::state::AppState::test_new();
+        let narrow_width = app.sidebar_width;
+        // Keep this placement fixture's latency assertion visible beside the
+        // new route prefix. Also exercise the original width below.
+        app.sidebar_width += "direct ".len() as u16;
         app.workspaces = vec![Workspace::test_new("one")];
         app.active = Some(0);
         app.selected = 0;
@@ -1628,6 +1637,10 @@ mod tests {
             name: "kiln".into(),
             ..Default::default()
         });
+        let node = crate::mesh::identity::NodeIdentity::fixture([22; 32]).node_id();
+        peer.node_id = Some(node.clone());
+        app.server_nodes.insert("kiln".into(), node.clone());
+        app.server_paths.insert(node.clone(), node);
         peer.host = Some("kiln".into());
         peer.last_ok = Some(std::time::Instant::now());
         peer.latency_ms = Some(34);
@@ -1678,6 +1691,16 @@ mod tests {
         let peer_title = buffer_row_text(buffer, card.rect, card.rect.y);
         assert!(peer_title.contains("kiln"), "{peer_title}");
         assert!(peer_title.contains("34ms"), "{peer_title}");
+        assert!(peer_title.contains("direct"), "{peer_title}");
+
+        app.sidebar_width = narrow_width;
+        compute_view(&mut app, area);
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        let card = &app.view.server_card_areas[0];
+        assert_eq!(card.rect.height, 2);
+        let title = buffer_row_text(terminal.backend().buffer(), card.rect, card.rect.y);
+        assert!(title.contains("kiln"), "{title}");
+        assert!(title.contains("direct"), "{title}");
     }
 
     #[test]

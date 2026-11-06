@@ -17,6 +17,7 @@ use crate::terminal::{TerminalId, TerminalRuntime, TerminalRuntimeRegistry, Term
 mod aggregate;
 pub(crate) mod git;
 mod tab;
+pub(crate) use tab::Content;
 
 pub(crate) use self::aggregate::{pane_attention_priority, PaneDetail, PaneSignal};
 #[cfg(test)]
@@ -253,6 +254,53 @@ impl DerefMut for Workspace {
 }
 
 impl Workspace {
+    /// Native-only root placement; allocates no terminal state, runtime or process.
+    pub(crate) fn native(
+        target: crate::structured::view::Target,
+        cwd: PathBuf,
+        events: mpsc::Sender<AppEvent>,
+        render_notify: Arc<Notify>,
+        render_dirty: Arc<AtomicBool>,
+    ) -> Self {
+        let (layout, root) = crate::layout::TileLayout::new();
+        let tab = Tab {
+            custom_name: None,
+            number: 1,
+            root_pane: root,
+            layout,
+            panes: HashMap::new(),
+            native_views: HashMap::from([(
+                root,
+                crate::structured::view::placement::View::Ready(target),
+            )]),
+            #[cfg(test)]
+            runtimes: HashMap::new(),
+            zoomed: false,
+            events,
+            render_notify,
+            render_dirty,
+        };
+        Self {
+            id: generate_workspace_id(),
+            custom_name: None,
+            identity_cwd: cwd,
+            cached_git_branch: None,
+            cached_git_ahead_behind: None,
+            pr_state: None,
+            cached_git_space: None,
+            git_identity_resolved: false,
+            worktree_space: None,
+            public_pane_numbers: HashMap::from([(root, 1)]),
+            next_public_pane_number: 2,
+            next_public_tab_number: 2,
+            tabs: vec![tab],
+            active_tab: 0,
+            same_repo_family_memo: std::cell::RefCell::new(None),
+            display_label_memo: std::cell::RefCell::new(None),
+            #[cfg(test)]
+            test_runtimes: HashMap::new(),
+        }
+    }
     pub fn new(
         initial_cwd: PathBuf,
         rows: u16,
@@ -505,8 +553,8 @@ impl Workspace {
             return false;
         }
         let tab = self.tabs.remove(idx);
-        for pane_id in tab.panes.keys() {
-            self.unregister_pane(*pane_id);
+        for pane_id in tab.layout.pane_ids() {
+            self.unregister_pane(pane_id);
         }
         if self.active_tab >= self.tabs.len() {
             self.active_tab = self.tabs.len() - 1;
@@ -662,8 +710,8 @@ impl Workspace {
             return tab_count <= 1 || self.close_active_tab_and_report();
         }
 
-        if let Some((removed, _terminal_id)) = self.active_tab_mut().and_then(Tab::close_focused) {
-            self.unregister_pane(removed);
+        if let Some(detached) = self.active_tab_mut().and_then(Tab::close_focused) {
+            self.unregister_pane(detached.pane_id());
         }
         false
     }
@@ -690,8 +738,8 @@ impl Workspace {
             return false;
         }
 
-        if let Some((removed, _terminal_id)) = self.tabs[tab_idx].remove_pane(pane_id) {
-            self.unregister_pane(removed);
+        if let Some(detached) = self.tabs[tab_idx].remove_pane(pane_id) {
+            self.unregister_pane(detached.pane_id());
         }
         false
     }
@@ -700,22 +748,35 @@ impl Workspace {
     /// alive. The returned `TakenPane` describes whether the host tab and/or
     /// the workspace itself are now empty so the caller can decide whether to
     /// drop them.
-    pub(crate) fn take_pane_for_move(&mut self, pane_id: PaneId) -> Option<TakenPane> {
-        let tab_idx = self.find_tab_index_for_pane(pane_id)?;
+    pub(crate) fn take_pane_for_move(
+        &mut self,
+        pane_id: PaneId,
+    ) -> Result<TakenPane, crate::structured::view::PlacementError> {
+        use crate::structured::view::PlacementError;
+        let tab_idx = self
+            .find_tab_index_for_pane(pane_id)
+            .ok_or(PlacementError::Membership)?;
+        if self.tabs[tab_idx].native_views.contains_key(&pane_id) {
+            return Err(PlacementError::RelocationUnsupported);
+        }
         let pane_count = self.tabs[tab_idx].layout.pane_count();
         if pane_count <= 1 {
             let mut tab = self.tabs.remove(tab_idx);
-            let moved = tab.take_pane_for_move(pane_id)?;
+            let moved = tab
+                .take_pane_for_move(pane_id)
+                .ok_or(PlacementError::Membership)?;
             self.adjust_active_tab_after_removal(tab_idx);
-            return Some(TakenPane {
+            return Ok(TakenPane {
                 moved,
                 removed_tab_idx: Some(tab_idx),
                 workspace_empty: self.tabs.is_empty(),
             });
         }
 
-        let moved = self.tabs[tab_idx].take_pane_for_move(pane_id)?;
-        Some(TakenPane {
+        let moved = self.tabs[tab_idx]
+            .take_pane_for_move(pane_id)
+            .ok_or(PlacementError::Membership)?;
+        Ok(TakenPane {
             moved,
             removed_tab_idx: None,
             workspace_empty: false,
@@ -1160,10 +1221,14 @@ impl Workspace {
         self::git::git_status_snapshot_for_cwd(resolved_identity_cwd, cached)
     }
 
+    /// Locate stored content only when it is a valid layout member.
+    /// Storage narrows the search before checking terminal/native exclusivity
+    /// and layout membership, so corrupt rows never become mutation targets.
     pub fn find_tab_index_for_pane(&self, pane_id: PaneId) -> Option<usize> {
-        self.tabs
-            .iter()
-            .position(|tab| tab.panes.contains_key(&pane_id))
+        self.tabs.iter().position(|tab| {
+            (tab.panes.contains_key(&pane_id) || tab.native_views.contains_key(&pane_id))
+                && tab.content(pane_id).is_ok()
+        })
     }
 
     pub fn pane_state(&self, pane_id: PaneId) -> Option<&PaneState> {
@@ -1178,16 +1243,22 @@ impl Workspace {
         self.active_tab().map(|tab| tab.layout.focused())
     }
 
-    pub fn close_pane(&mut self, pane_id: PaneId) -> bool {
-        let tab_idx = match self.find_tab_index_for_pane(pane_id) {
-            Some(idx) => idx,
-            None => return false,
-        };
+    /// Close an explicitly addressed placement, returning whether its workspace
+    /// should close. Missing storage or inconsistent membership refuses before
+    /// any layout, numbering or content mutation, including a single-pane tab.
+    pub(crate) fn close_pane(
+        &mut self,
+        pane_id: PaneId,
+    ) -> Result<bool, crate::structured::view::PlacementError> {
+        use crate::structured::view::PlacementError;
+        let tab_idx = self
+            .find_tab_index_for_pane(pane_id)
+            .ok_or(PlacementError::Membership)?;
         let pane_count = self.tabs[tab_idx].layout.pane_count();
         let tab_count = self.tabs.len();
         if pane_count <= 1 {
             if tab_count <= 1 {
-                return true;
+                return Ok(true);
             }
             self.tabs.remove(tab_idx);
             self.unregister_pane(pane_id);
@@ -1196,16 +1267,16 @@ impl Workspace {
             } else if tab_idx <= self.active_tab && self.active_tab > 0 {
                 self.active_tab -= 1;
             }
-            return false;
+            return Ok(false);
         }
 
-        if let Some((removed, _terminal_id)) = self.tabs[tab_idx].close_pane(pane_id) {
-            self.unregister_pane(removed);
+        if let Some(detached) = self.tabs[tab_idx].close_pane(pane_id) {
+            self.unregister_pane(detached.pane_id());
         }
-        false
+        Ok(false)
     }
 
-    fn register_new_pane(&mut self, pane_id: PaneId) {
+    pub(crate) fn register_new_pane(&mut self, pane_id: PaneId) {
         let number = self.next_public_pane_number;
         self.register_new_pane_with_number(pane_id, number);
     }
@@ -1264,6 +1335,7 @@ impl Workspace {
             root_pane: root_id,
             layout,
             panes,
+            native_views: HashMap::new(),
             runtimes: HashMap::new(),
             zoomed: false,
             events,
@@ -1341,6 +1413,7 @@ impl Workspace {
             root_pane: root_id,
             layout,
             panes,
+            native_views: HashMap::new(),
             runtimes: HashMap::new(),
             zoomed: false,
             events,
@@ -1357,6 +1430,155 @@ impl Workspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn placement_lookup_checks_only_the_indexed_layout() {
+        for panes_per_tab in [1, 16, 128] {
+            let mut ws = Workspace::test_new("lookup-cost");
+            for _ in 0..3 {
+                ws.test_add_tab(None);
+            }
+            let mut probes = vec![];
+            for tab_idx in 0..ws.tabs.len() {
+                ws.active_tab = tab_idx;
+                for _ in 1..panes_per_tab {
+                    ws.test_split(Direction::Horizontal);
+                }
+                let tab = &mut ws.tabs[tab_idx];
+                for (ordinal, id) in tab.layout.pane_ids().into_iter().enumerate() {
+                    if ordinal % 2 == 0 {
+                        tab.panes.remove(&id);
+                        tab.native_views.insert(
+                            id,
+                            crate::structured::view::placement::View::Ready(
+                                crate::structured::view::Target {
+                                    agent_id: format!("fixture-agent-{ordinal}"),
+                                    generation: 1,
+                                },
+                            ),
+                        );
+                    }
+                    probes.push((id, Some(tab_idx)));
+                }
+                assert!(tab.membership_valid());
+                tab.layout.take_tree_read_count();
+            }
+            probes.push((PaneId::alloc(), None));
+            for (pane, expected) in probes {
+                assert_eq!(ws.find_tab_index_for_pane(pane), expected);
+                for (tab_idx, tab) in ws.tabs.iter().enumerate() {
+                    assert_eq!(
+                        tab.layout.take_tree_read_count(),
+                        usize::from(expected == Some(tab_idx)),
+                        "lookup must validate only its indexed candidate, with {panes_per_tab} panes per tab"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn close_layout_only_pane_reports_membership_without_mutation() {
+        for tabs in [1, 2] {
+            let mut ws = Workspace::test_new("layout-only");
+            if tabs == 2 {
+                ws.test_add_tab(None);
+            }
+            let root = ws.tabs[0].root_pane;
+            ws.tabs[0].panes.remove(&root);
+            let ids = ws.tabs[0].layout.pane_ids();
+            let focused = ws.tabs[0].layout.focused();
+            let number = ws.public_pane_number(root);
+            assert_eq!(
+                ws.close_pane(root),
+                Err(crate::structured::view::PlacementError::Membership)
+            );
+            assert_eq!(ws.tabs.len(), tabs);
+            assert_eq!(ws.tabs[0].layout.pane_ids(), ids);
+            assert_eq!(ws.tabs[0].layout.focused(), focused);
+            assert_eq!(ws.public_pane_number(root), number);
+        }
+    }
+
+    #[test]
+    fn placement_lookup_rejects_invalid_stored_content() {
+        use crate::structured::view::{placement::View, PlacementError, Target};
+        let mut ws = Workspace::test_new("placement-lookup");
+        let root = ws.tabs[0].root_pane;
+        let view = Target {
+            agent_id: "fixture-agent".into(),
+            generation: 1,
+        };
+        assert_eq!(ws.find_tab_index_for_pane(root), Some(0));
+        let native = ws.tabs[0].layout.split_focused(Direction::Horizontal);
+        ws.tabs[0]
+            .native_views
+            .insert(native, View::Ready(view.clone()));
+        assert_eq!(ws.find_tab_index_for_pane(native), Some(0));
+        assert!(ws.tabs[0].membership_valid());
+        assert_eq!(ws.find_tab_index_for_pane(PaneId::alloc()), None);
+
+        // Stored rows still require valid layout membership and exclusive content.
+        ws.tabs[0]
+            .native_views
+            .insert(root, View::Ready(view.clone()));
+        assert_eq!(ws.find_tab_index_for_pane(root), None);
+        assert!(matches!(
+            ws.take_pane_for_move(root),
+            Err(PlacementError::Membership)
+        ));
+        ws.tabs[0].native_views.remove(&root);
+        let orphan = PaneId::alloc();
+        ws.tabs[0].native_views.insert(orphan, View::Ready(view));
+        assert_eq!(ws.find_tab_index_for_pane(orphan), None);
+        ws.tabs[0].native_views.remove(&orphan);
+        ws.tabs[0]
+            .panes
+            .insert(orphan, PaneState::new(TerminalId::alloc()));
+        assert_eq!(ws.find_tab_index_for_pane(orphan), None);
+    }
+
+    #[test]
+    fn native_split_clears_zoom_on_the_destination_tab() {
+        use crate::structured::{
+            registry::{Record, StructuredRuntime},
+            view::Target,
+        };
+        let mut state = crate::app::AppState::test_new();
+        state.workspaces.push(Workspace::test_new("native-zoom"));
+        let generation = state
+            .structured_agents
+            .register(Record {
+                runtime: StructuredRuntime::Structured,
+                agent_id: "fixture-agent".into(),
+                name: None,
+                harness: "claude".into(),
+                session_id: "fixture-session".into(),
+                cwd: std::env::temp_dir(),
+                model: None,
+            })
+            .unwrap();
+        state.workspaces[0].tabs[0].zoomed = true;
+        let id = state
+            .attach_native_view(
+                Target {
+                    agent_id: "fixture-agent".into(),
+                    generation,
+                },
+                0,
+                0,
+                Direction::Horizontal,
+            )
+            .unwrap();
+        let tab = &state.workspaces[0].tabs[0];
+        assert!(
+            !tab.zoomed,
+            "a successful split must expose both placements"
+        );
+        assert_eq!(tab.layout.focused(), id);
+        assert_eq!(tab.layout.pane_count(), 2);
+        assert!(tab.membership_valid());
+    }
 
     fn linked_membership(checkout_path: &str) -> WorktreeSpaceMembership {
         WorktreeSpaceMembership {
@@ -1697,6 +1919,109 @@ mod tests {
     }
 
     #[test]
+    fn orphan_exit_preserves_live_workspace() {
+        let mut state = crate::app::AppState::test_new();
+        let mut ws = Workspace::test_new("orphan-exit");
+        let root = ws.tabs[0].root_pane;
+        let orphan = PaneId::alloc();
+        ws.tabs[0]
+            .panes
+            .insert(orphan, PaneState::new(TerminalId::alloc()));
+        state.workspaces.push(ws);
+        state.active = Some(0);
+        state.handle_app_event(crate::events::AppEvent::PaneDied { pane_id: orphan });
+        assert_eq!(state.workspaces.len(), 1);
+        assert_eq!(state.workspaces[0].tabs[0].layout.pane_ids(), vec![root]);
+    }
+
+    #[tokio::test]
+    async fn split_orphan_target_preserves_live_pane() {
+        let mut ws = Workspace::test_new("orphan-split");
+        let root = ws.tabs[0].root_pane;
+        let orphan = PaneId::alloc();
+        ws.tabs[0]
+            .panes
+            .insert(orphan, PaneState::new(TerminalId::alloc()));
+        let result = ws.split_pane_argv_command(
+            orphan,
+            Direction::Horizontal,
+            24,
+            80,
+            Some(std::env::temp_dir()),
+            &["/bin/sh".into(), "-c".into(), "exit 0".into()],
+            1024,
+            crate::terminal_theme::TerminalTheme::default(),
+            true,
+        );
+        assert_eq!(ws.tabs[0].layout.pane_ids(), vec![root]);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn close_orphan_with_one_tab_preserves_workspace() {
+        assert_orphan_close_preserves_workspace(1);
+    }
+
+    #[test]
+    fn close_orphan_with_several_tabs_preserves_workspace() {
+        assert_orphan_close_preserves_workspace(3);
+    }
+
+    fn assert_orphan_close_preserves_workspace(tab_count: usize) {
+        for native in [false, true] {
+            let mut ws = Workspace::test_new("orphan-close");
+            for _ in 1..tab_count {
+                ws.test_add_tab(None);
+            }
+            let orphan = PaneId::alloc();
+            if native {
+                ws.tabs[0].native_views.insert(
+                    orphan,
+                    crate::structured::view::placement::View::Ready(
+                        crate::structured::view::Target {
+                            agent_id: "fixture-agent".into(),
+                            generation: 1,
+                        },
+                    ),
+                );
+            } else {
+                ws.tabs[0]
+                    .panes
+                    .insert(orphan, PaneState::new(TerminalId::alloc()));
+            }
+            ws.register_new_pane(orphan);
+            let mut state = crate::app::AppState::test_new();
+            state.workspaces.push(ws);
+            state.active = Some(0);
+            assert!(!state.focus_pane_in_workspace(0, orphan));
+            let ws = &mut state.workspaces[0];
+            let layouts: Vec<_> = ws.tabs.iter().map(|tab| tab.layout.pane_ids()).collect();
+            let active = ws.active_tab;
+            let number = ws.public_pane_number(orphan);
+            assert_eq!(
+                ws.close_pane(orphan),
+                Err(crate::structured::view::PlacementError::Membership)
+            );
+            assert!(!ws.remove_pane(orphan));
+            assert!(matches!(
+                ws.take_pane_for_move(orphan),
+                Err(crate::structured::view::PlacementError::Membership)
+            ));
+            assert_eq!(ws.tabs.len(), tab_count);
+            assert_eq!(ws.active_tab, active);
+            assert_eq!(ws.public_pane_number(orphan), number);
+            assert_eq!(
+                ws.tabs
+                    .iter()
+                    .map(|tab| tab.layout.pane_ids())
+                    .collect::<Vec<_>>(),
+                layouts
+            );
+            assert_eq!(ws.find_tab_index_for_pane(orphan), None);
+        }
+    }
+
+    #[test]
     fn pane_public_numbers_are_stable_and_not_reused_after_close() {
         let mut ws = Workspace::test_new("test");
         let root = ws.tabs[0].root_pane;
@@ -1707,7 +2032,7 @@ mod tests {
         assert_eq!(ws.public_pane_number(second), Some(2));
         assert_eq!(ws.public_pane_number(third), Some(3));
 
-        assert!(!ws.close_pane(second));
+        assert_eq!(ws.close_pane(second), Ok(false));
 
         assert_eq!(ws.public_pane_number(root), Some(1));
         assert_eq!(ws.public_pane_number(second), None);

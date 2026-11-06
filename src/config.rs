@@ -1,7 +1,11 @@
 use crossterm::event::{KeyCode, KeyModifiers};
 
 mod diagnostics;
+mod safe_diagnostic;
+pub(crate) mod validation;
+pub(crate) use safe_diagnostic::edit_parse_error;
 mod env;
+mod inventory;
 mod io;
 mod keybinds;
 pub(crate) mod model;
@@ -142,7 +146,7 @@ impl Config {
         let (prefix_diag, _, keybind_diags, _) = self.validated_keybinds();
         let account_warning = (self.security.agent_account == model::AgentAccount::None
             && self.structured.run_as == crate::structured::launch::RunAs::Agent)
-            .then_some("security.agent_account = \"none\" with structured.run_as = \"flk-agent\": agents using a dedicated UID are Unknown (read-only); enable dedicated-account recognition or use structured.run_as = \"operator\"".to_owned());
+            .then_some("security.agent_account = \"none\" with structured.run_as = \"flk-agent\": agents using a dedicated UID are Unknown (read-only); set security.agent_account = \"flk-agent\" or use structured.run_as = \"operator\"".to_owned());
         prefix_diag
             .into_iter()
             .chain(keybind_diags)
@@ -191,7 +195,7 @@ mod tests {
                 .unwrap();
                 let diagnostics = config.collect_diagnostics();
                 let expected = if account == "none" && run_as == "flk-agent" {
-                    vec!["security.agent_account = \"none\" with structured.run_as = \"flk-agent\": agents using a dedicated UID are Unknown (read-only); enable dedicated-account recognition or use structured.run_as = \"operator\"".to_owned()]
+                    vec!["security.agent_account = \"none\" with structured.run_as = \"flk-agent\": agents using a dedicated UID are Unknown (read-only); set security.agent_account = \"flk-agent\" or use structured.run_as = \"operator\"".to_owned()]
                 } else {
                     vec![]
                 };
@@ -225,3 +229,6 @@ command = "lazygit"
         assert!(!profile.contains("[[keys.command]]"));
     }
 }
+
+#[cfg(test)]
+mod producer_tests;
