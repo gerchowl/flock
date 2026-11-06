@@ -1,3 +1,4 @@
+import type { SplitRegions } from "./splits";
 /** Client presentation only (ADR-0038 §2). G3 #1595 maps wire EntityRef onto SubjectRef. */
 export type SubjectRef = string;
 /** Reserved kinds remain labelled empty views until their slices ship. */
@@ -9,7 +10,7 @@ export type Tile = { id: string; kind: Kind; subject: SubjectRef; mode: "Expande
 /** Binary weighted splits terminate in stacks with exactly one active tab. */
 export type Tree = { type: "stack"; tiles: string[]; active: string } | { type: "split"; direction: "horizontal" | "vertical"; weights: [number, number]; children: [Tree, Tree] };
 /** Persisted presentation state; history is phone navigation, not session history. */
-export type Layout = { tree: Tree | null; tiles: Record<string, Tile>; rail: string[]; focused: string | null; next: number; history: string[] };
+export type Layout = { regions?: SplitRegions; tree: Tree | null; tiles: Record<string, Tile>; rail: string[]; focused: string | null; next: number; history: string[] };
 /** Explicit open location; beside names an expanded origin. */
 export type Placement = "replace" | "tab" | "split_right" | "split_down" | "push" | { beside: string };
 /** Callbacks reconcile shared stream ownership; cursors are supplied by G3, never derived here. */

@@ -26,6 +26,13 @@
   --radius-medium: 8px;
   --radius-large: 10px;
   --size-control: 28px;
+  --size-split-sidebar-compact: 48px;
+  --size-split-sidebar-narrow: 192px;
+  --size-split-sidebar-default: 224px;
+  --size-split-sidebar-wide: 272px;
+  --size-split-inspector-narrow: 240px;
+  --size-split-inspector-default: 280px;
+  --size-split-inspector-wide: 336px;
   --size-touch: 44px;
   --border-width-thin: 1px;
   --layer-sticky: 1;

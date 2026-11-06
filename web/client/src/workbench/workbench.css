@@ -8,12 +8,6 @@
   height: 100dvh;
 }
 
-.workbench {
-  display: grid;
-  flex: 1;
-  grid-template: "top top top" auto "banner banner banner" auto "side focus inbox" minmax(0, 1fr) / 16rem minmax(0, 1fr) 20rem;
-  min-height: 0;
-}
 
 .sidebar,
 .inbox {

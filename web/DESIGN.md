@@ -536,3 +536,15 @@ follow-up rather than a claim of complete static isolation:
 
 The runtime seeds complement the DOM-wide conformance suite (#2896); they do not
 make arbitrary unseen application behavior execute in tests.
+
+### Split panes and View commands
+
+View commands work from anywhere, including text fields; the keyboard layer's
+composition guard still applies. Escape cancels a splitter drag, releases its
+pointer capture and discards the preview without saving a width. When collapsing
+a sidebar or inspector hides its focused control, or collapse is invoked from its
+toggle or a command surface, focus moves to that region's toolbar toggle. Each
+region continuously remembers its last focused control, including across toolbar
+and palette interactions. Expanding restores that control if it is still
+connected; otherwise focus moves to the toggle. The palette closes after a
+command runs and preserves the focus target chosen by that command.
