@@ -13,3 +13,4 @@ export { Sidebar, type SidebarProps } from "./Sidebar";
 export { Stack, type StackProps } from "./Stack";
 export { Switcher, type SwitcherProps } from "./Switcher";
 export { Sticky, type StickyProps } from "./Sticky";
+export { Split, SplitShell } from "./Split";
