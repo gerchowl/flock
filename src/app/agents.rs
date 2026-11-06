@@ -1618,7 +1618,7 @@ mod tests {
         });
         assert!(
             app.event_hub
-                .events_after(sequence)
+                .ring_snapshot_after(sequence)
                 .iter()
                 .all(|(_, event)| !matches!(
                     event.data,

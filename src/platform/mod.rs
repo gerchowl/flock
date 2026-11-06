@@ -4,12 +4,19 @@
 //! modules don't scatter `#[cfg]` branches through product logic.
 
 pub(crate) mod client_listener;
+#[cfg(feature = "web")]
+pub(crate) mod tailscale;
 mod url;
 pub use url::{open_url, validate_url, OpenUrlError};
 
 pub(crate) mod peer;
+pub(crate) mod process_exit;
 pub(crate) mod received_fd;
+pub(crate) mod socket;
+pub(crate) mod socket_deadline;
 pub(crate) mod structured;
+pub(crate) mod suspend_clock;
+pub(crate) mod terminal_geometry;
 
 /// A same-device observation is only a possible unmounted-mount hint, not proof.
 pub(crate) fn same_device_as_parent(path: &std::path::Path) -> Option<bool> {
@@ -267,3 +274,5 @@ pub(crate) mod client_tokens;
 
 #[cfg(test)]
 pub(crate) mod socket_test_support;
+
+pub(crate) mod file_lock;

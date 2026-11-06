@@ -1,5 +1,6 @@
 use super::*;
 use crate::structured::launch::SessionConfigDir;
+use crate::structured_wire::fixture::TOKEN_PRINCIPAL;
 use std::fs;
 use std::os::fd::FromRawFd;
 use std::time::Instant;
@@ -778,12 +779,19 @@ fn permission(output: &mut File, id: &str) {
         "request":{"subtype":"can_use_tool","tool_name":"Bash","tool_use_id":"tool-example","input":{"command":"true"}}})).unwrap();
 }
 fn waiting_ids(transport: &Transport) -> Vec<String> {
-    transport
-        .waiting_on_human()
-        .unwrap()
+    waiting_permissions(transport)
         .into_iter()
         .map(|(id, _)| id)
         .collect()
+}
+// Multiple-request fixtures intentionally remain blocked. Only contention is
+// transient when taking their snapshot, not the presence of another open card.
+fn waiting_permissions(transport: &Transport) -> Vec<(String, u64)> {
+    wait(transport, || match transport.waiting_on_human() {
+        Ok(waiting) => Some(waiting),
+        Err(ErrorCode::SessionBusy) => None,
+        Err(code) => panic!("permission snapshot failed: {code}"),
+    })
 }
 fn permission_handle(transport: &Transport, id: &str) -> u64 {
     wait(transport, || match transport.waiting_on_human() {
@@ -809,7 +817,7 @@ fn decide(id: &str, decision: permissions::Decision, request_seq: u64) -> AgentD
 }
 fn owner() -> Principal<'static> {
     Principal::Token(crate::structured::permissions::auth::fixture(
-        "fixture-client",
+        TOKEN_PRINCIPAL,
         true,
     ))
 }
@@ -829,18 +837,139 @@ fn call_decide(
 fn input_line(transport: &Transport, input: &mut File) -> Value {
     private_fs::set_nonblocking(input).unwrap();
     let mut bytes = Vec::new();
+    let mut line = None;
     wait(transport, || {
-        let mut byte = [0];
-        match input.read(&mut byte) {
-            Ok(1) if byte[0] == b'\n' => Some(serde_json::from_slice(&bytes).unwrap()),
-            Ok(1) => {
-                bytes.push(byte[0]);
-                None
+        if line.is_none() {
+            // Drain ready bytes instead of paying a worker-completion wait per byte.
+            // Bounded batches retain the deadline and worker-liveness checks even
+            // when a producer continuously writes without terminating its line.
+            for _ in 0..256 {
+                let mut byte = [0];
+                match input.read(&mut byte) {
+                    Ok(1) if byte[0] == b'\n' => {
+                        line = Some(serde_json::from_slice(&bytes).unwrap());
+                        break;
+                    }
+                    Ok(1) => bytes.push(byte[0]),
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => return None,
+                    other => panic!("unexpected harness stdin: {other:?}"),
+                }
             }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => None,
-            other => panic!("unexpected harness stdin: {other:?}"),
         }
+        line.as_ref()?;
+        // These fixtures leave no other request open. Pipe readability precedes
+        // Book::written (ADR-0036 §10b), so require its slot release in the same wait.
+        // Multiple-open fixtures use single_permission_response and bounded snapshots.
+        let book = transport.input.permissions.try_lock()?;
+        if book.blocked() {
+            return None;
+        }
+        line.take()
     })
+}
+
+#[test]
+fn input_line_does_not_acknowledge_an_unsettled_book_after_worker_failure() {
+    for lock_held in [false, true] {
+        let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+        let (mut transport, mut output, _input) = start(&root);
+        permission(&mut output, "settlement-request");
+        opened(&transport);
+        let request_seq = permission_handle(&transport, "settlement-request");
+        let permissions = transport.input.permissions.clone();
+        // Model the window after audit and pipe write but before Book::written.
+        // The card is already closed for attention, while its slot still blocks.
+        let answer = {
+            let mut book = permissions.lock();
+            let answer = book
+                .prepare(
+                    &owner(),
+                    &decide(
+                        "settlement-request",
+                        permissions::Decision::Deny,
+                        request_seq,
+                    ),
+                )
+                .unwrap();
+            assert!(book.begin_answer(&answer.id, answer.request_seq));
+            book.audited(&answer, 100);
+            assert!(book.waiting().is_empty());
+            assert!(book.blocked());
+            answer
+        };
+        let (mut input, mut writer) = pipe();
+        writeln!(writer, "{}", answer.response).unwrap();
+        let _book = lock_held.then(|| permissions.lock());
+        assert_eq!(
+            transport.waiting_on_human(),
+            if lock_held {
+                Err(ErrorCode::SessionBusy)
+            } else {
+                Ok(Vec::new())
+            }
+        );
+        let (completion, receiver) = mpsc::channel();
+        transport.completion = receiver;
+        completion
+            .send(Completion::Writer(Err(io::Error::other(
+                "settlement worker failed",
+            ))))
+            .unwrap();
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            input_line(&transport, &mut input)
+        }))
+        .expect_err("a readable line does not acknowledge the Book update");
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .expect("panic diagnostic");
+        assert!(message.contains("settlement worker failed"), "{message}");
+    }
+}
+
+#[test]
+fn permission_message_transport_refusal_keeps_open_audit_and_stdin() {
+    // Escaped tabs double the wire bytes without exceeding the permitted message bound.
+    for expected in [
+        "é".repeat(1024),
+        format!(
+            "a{}z",
+            "\t".repeat(permissions::MAX_PERMISSION_DECISION_MESSAGE_BYTES - 2)
+        ),
+    ] {
+        let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+        let (transport, mut output, mut input) = start(&root);
+        permission(&mut output, "request-example");
+        receive_after_accepted(&transport);
+        receive_after_accepted(&transport);
+        let request_seq = permission_handle(&transport, "request-example");
+        let mut request = decide("request-example", permissions::Decision::Deny, request_seq);
+        request.message = Some(format!("{}x", "é".repeat(1024)));
+        assert_eq!(
+            call_decide(&transport, &owner(), &request),
+            Err(ErrorCode::InvalidParams)
+        );
+        assert_eq!(waiting_ids(&transport), vec!["request-example"]);
+        assert_eq!(records(&root).len(), 2);
+        private_fs::set_nonblocking(&input).unwrap();
+        assert_eq!(
+            input.read(&mut [0; 1]).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        request.message = Some(format!("  {expected}  "));
+        call_decide(&transport, &owner(), &request).unwrap();
+        let response = input_line(&transport, &mut input);
+        assert_eq!(response["response"]["response"]["message"], expected);
+        let closed = receive(&transport).record;
+        assert_eq!(closed.origin, RecordOrigin::Flk);
+        let audit: Value = serde_json::from_str(&closed.raw).unwrap();
+        assert_eq!(audit["state"], "closed");
+        assert_eq!(audit["message"], expected);
+        drop(output);
+        reader_done(&transport).unwrap();
+        assert_eq!(records(&root).len(), 3);
+    }
 }
 
 #[test]
@@ -874,7 +1003,7 @@ fn permission_decisions_are_audited_before_control_stdin_and_keep_turn_busy() {
         let closed: Value = serde_json::from_str(&audit[3].raw).unwrap();
         assert_eq!(closed["state"], "closed");
         assert_eq!(closed["decision"], serde_json::to_value(decision).unwrap());
-        assert_eq!(closed["principal"], "fixture-client");
+        assert_eq!(closed["principal"], TOKEN_PRINCIPAL);
         assert_eq!(audit[3].origin, RecordOrigin::Flk);
         assert_eq!(response["type"], "control_response");
         assert_eq!(response["response"]["request_id"], "request-example");
@@ -1677,7 +1806,7 @@ fn session_grant_matches_canonical_input_but_other_input_and_tools_prompt() {
     assert_eq!(audit["state"], "closed");
     assert_eq!(audit["source"], "session_grant");
     assert_eq!(audit["grant_request_id"], "grant");
-    assert_eq!(audit["principal"], "fixture-client");
+    assert_eq!(audit["principal"], TOKEN_PRINCIPAL);
     assert_eq!(
         input_line(&transport, &mut input)["response"]["response"]["behavior"],
         "allow"
@@ -2001,7 +2130,7 @@ fn every_book_close_immediately_clears_s4_needs_human() {
         );
         assert!(update.needs_human.is_empty(), "close mode {mode}");
         assert_ne!(update.state.phase, Phase::NeedsHuman, "close mode {mode}");
-        assert!(transport.waiting_on_human().unwrap().is_empty());
+        assert!(waiting_permissions(&transport).is_empty());
     }
 }
 
@@ -2162,7 +2291,7 @@ fn assert_exact_suggestion_fallback(
     assert!(response["response"]["response"]
         .get("updatedPermissions")
         .is_none());
-    assert!(transport.waiting_on_human().unwrap().is_empty());
+    assert!(waiting_permissions(transport).is_empty());
     assert_eq!(
         call_decide(
             transport,
@@ -2375,7 +2504,7 @@ fn open_permission_limit_denies_only_excess_requests_and_keeps_session_alive() {
             ),
             Err(ErrorCode::PermissionRequestClosed)
         );
-        assert_eq!(transport.waiting_on_human().unwrap().len(), 16);
+        assert_eq!(waiting_permissions(&transport).len(), 16);
     }
     call_decide(
         &transport,
@@ -2401,12 +2530,12 @@ fn open_permission_limit_denies_only_excess_requests_and_keeps_session_alive() {
     .unwrap();
     receive(&transport);
     single_permission_response(&transport, &mut input);
-    assert_eq!(transport.waiting_on_human().unwrap().len(), 14);
+    assert_eq!(waiting_permissions(&transport).len(), 14);
     permission(&mut output, "following-request");
     receive(&transport);
     let open: Value = serde_json::from_str(&receive(&transport).record.raw).unwrap();
     assert_eq!(open["state"], "open");
-    assert_eq!(transport.waiting_on_human().unwrap().len(), 15);
+    assert_eq!(waiting_permissions(&transport).len(), 15);
     assert!(matches!(
         transport.try_completion(),
         Err(mpsc::TryRecvError::Empty)
@@ -2440,7 +2569,7 @@ fn oversized_request_at_open_limit_is_denied_without_retiring_other_requests() {
         "deny"
     );
     assert_eq!(
-        transport.waiting_on_human().unwrap().len(),
+        waiting_permissions(&transport).len(),
         permissions::MAX_OPEN_PERMISSION_REQUESTS
     );
     assert!(matches!(
@@ -2466,10 +2595,7 @@ fn permission_handle_reaches_audit_snapshot_and_decision_and_advances_on_resume(
         let now = Instant::now();
         let update = state.reduce(raw.state_input().unwrap(), now, 0, Duration::from_secs(60));
         assert_eq!(update.permission_requests, [("reused".into(), seq)]);
-        assert_eq!(
-            transport.waiting_on_human().unwrap(),
-            update.permission_requests
-        );
+        assert_eq!(waiting_permissions(&transport), update.permission_requests);
         let audit: Value = serde_json::from_str(&receive(&transport).record.raw).unwrap();
         assert_eq!(audit["request_seq"], seq);
         assert_eq!(
@@ -2542,7 +2668,7 @@ fn blob_references_resolve_while_partial_deltas_are_live_only_and_restart_seq_is
         serde_json::from_value(projected["message"]["content"][0].clone()).unwrap();
     let bytes = super::super::blobs::BlobStore::open(root.path())
         .unwrap()
-        .get(&reference.blob)
+        .get(&reference.blob, reference.size)
         .unwrap();
     assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), block);
     drop(stdout);
@@ -2808,7 +2934,7 @@ fn corrupt_blob_is_repaired_while_the_session_keeps_streaming() {
     assert_eq!(stored.len(), 2);
     let projected: Value = serde_json::from_str(&stored[0].raw).unwrap();
     assert_eq!(projected["message"]["content"][0]["blob"], reference.blob);
-    assert_eq!(store.get(&reference.blob).unwrap(), bytes);
+    assert_eq!(store.get(&reference.blob, reference.size).unwrap(), bytes);
 }
 
 #[test]
@@ -2829,10 +2955,83 @@ fn disconnected_acceptance_observer_requests_stop_without_admitting_bytes() {
     assert!(!handle.input_inflight());
 }
 
+// The replay cursor precedes the audit, but includes the raw control request.
+// Validate the independently authored handles before driving a real producer.
+fn permission_fixture_cut(script: &[Value]) -> u64 {
+    let cursors = script[0]["cursors"]
+        .as_object()
+        .expect("fixture replay cursors");
+    assert_eq!(
+        cursors.len(),
+        1,
+        "permission fixture must declare one stream"
+    );
+    let cut = cursors.values().next().unwrap().as_u64().unwrap();
+    assert!(
+        cut > 0,
+        "permission fixture must include its raw control request"
+    );
+    let mut audits = 0;
+    for line in script {
+        let frame = &line["frame"];
+        if frame["ev"]["type"] == "flk_permission_request" {
+            audits += 1;
+            assert_eq!(
+                frame["ev"]["request_seq"], cut,
+                "permission fixture handle drift: request_seq must equal the declared replay cut"
+            );
+            assert_eq!(
+                frame["seq"],
+                cut + audits,
+                "permission fixture sequence drift: audits must immediately follow the replay cut"
+            );
+        }
+    }
+    assert_eq!(
+        audits, 2,
+        "permission fixture must declare open and close audits"
+    );
+    cut
+}
+
+#[test]
+#[should_panic(expected = "permission fixture handle drift")]
+fn permission_fixture_rejects_handle_drift_before_producing() {
+    let mut script: Vec<Value> =
+        include_str!("../../../web/client/test/fixtures/wire/permission-decision.jsonl")
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+    let open = script
+        .iter_mut()
+        .find(|line| line["frame"]["ev"]["state"] == "open")
+        .unwrap();
+    let original = open["frame"]["ev"]["request_seq"].as_u64().unwrap();
+    open["frame"]["ev"]["request_seq"] = (original + 1).into();
+    permission_fixture_cut(&script);
+}
+
 #[test]
 fn stored_permission_pair_replays_as_known_events() {
     let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+    let script: Vec<Value> =
+        include_str!("../../../web/client/test/fixtures/wire/permission-decision.jsonl")
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+    let cut = permission_fixture_cut(&script);
     let (transport, mut output, mut input) = start(&root);
+    // Reproduce the durable prefix declared by the script's initial replay cursor.
+    // The raw control request occupies the cut, immediately before its open audit.
+    for seq in 1..cut {
+        writeln!(
+            output,
+            "{}",
+            serde_json::json!({"type":"system","subtype":"status"})
+        )
+        .unwrap();
+        assert_eq!(receive(&transport).record.seq, seq);
+    }
     permission(&mut output, "typed-request");
     receive(&transport);
     receive(&transport);
@@ -2852,12 +3051,11 @@ fn stored_permission_pair_replays_as_known_events() {
         })
         .collect();
     assert_eq!(audits.len(), 2);
-    let examples: Vec<Value> =
-        include_str!("../../../web/client/test/fixtures/wire/permission-decision.jsonl")
-            .lines()
-            .map(|line| serde_json::from_str::<Value>(line).unwrap())
-            .filter_map(|line| line.get("frame").and_then(|frame| frame.get("ev")).cloned())
-            .collect();
+    assert_eq!(seq, cut, "producer did not reach the fixture replay cut");
+    let examples: Vec<Value> = script
+        .iter()
+        .filter_map(|line| line.get("frame").and_then(|frame| frame.get("ev")).cloned())
+        .collect();
     assert_eq!(examples.len(), 2);
     for (record, example) in audits.into_iter().zip(examples) {
         assert_eq!(
@@ -2917,7 +3115,7 @@ fn seed_permission_crash(root: &SessionConfigDir, automatic: bool) -> u64 {
         let answer = book.prepare(&owner(), &args).unwrap();
         assert!(book.begin_answer(&answer.id, answer.request_seq));
         audits.push((*answer.audit).clone());
-        book.audited(&answer);
+        book.audited(&answer, 100);
         book.written(answer);
         book.resume_after(audits.len() as u64);
     }
@@ -3143,4 +3341,196 @@ fn recovery_preserves_legacy_unknown_invalid_and_stdout_records() {
     let (transport, output, _input) = start(&root);
     end_restarted_transport(&transport, output);
     assert_eq!(fs::read(path).unwrap(), before);
+}
+
+#[test]
+fn operator_revocation_reaches_the_real_book_and_the_next_request_prompts() {
+    let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+    let (transport, mut output, mut input) = start(&root);
+    transport.try_submit(&user("first")).unwrap();
+    assert_eq!(input_line(&transport, &mut input), user("first"));
+    permission(&mut output, "grant-origin");
+    accepted(&transport);
+    receive(&transport);
+    receive(&transport);
+    let seq = permission_handle(&transport, "grant-origin");
+    call_decide(
+        &transport,
+        &owner(),
+        &decide("grant-origin", permissions::Decision::AllowAlways, seq),
+    )
+    .unwrap();
+    assert_eq!(
+        input_line(&transport, &mut input)["response"]["response"]["behavior"],
+        "allow"
+    );
+    receive(&transport);
+    grant_request(
+        &mut output,
+        "other-grant",
+        "Bash",
+        serde_json::json!({"command":"SECRET_2416_remaining_grant"}),
+        None,
+    );
+    opened(&transport);
+    let second = close_with(
+        &transport,
+        &mut input,
+        "other-grant",
+        permissions::Decision::AllowAlways,
+    );
+    assert_eq!(second["response"]["response"]["behavior"], "allow");
+    let handle = transport.input_handle();
+    let grants = wait(&transport, || {
+        match handle.session_grants(&Principal::Operator, None, false) {
+            Err(ErrorCode::SessionBusy) => None,
+            result => Some(result.unwrap()),
+        }
+    });
+    assert_eq!(grants.len(), 2);
+    let original = grants
+        .iter()
+        .find(|grant| grant.handle.request_id == "grant-origin")
+        .unwrap()
+        .handle
+        .clone();
+    for principal in [
+        Principal::Agent("fixture-agent"),
+        Principal::Lease("fixture-agent"),
+        owner(),
+    ] {
+        assert_eq!(
+            handle
+                .session_grants(&principal, Some(&original), true)
+                .unwrap_err(),
+            ErrorCode::OperatorOnly
+        );
+    }
+    let remaining = wait(&transport, || {
+        match handle.session_grants(&Principal::Operator, Some(&original), true) {
+            Err(ErrorCode::SessionBusy) => None,
+            result => Some(result.unwrap()),
+        }
+    });
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].handle.request_id, "other-grant");
+    assert!(remaining[0].canonical_input_key.is_none());
+    assert!(!serde_json::to_string(&remaining)
+        .unwrap()
+        .contains("SECRET_"));
+    permission(&mut output, "after-revoke");
+    receive(&transport);
+    receive(&transport);
+    assert_eq!(waiting_ids(&transport), vec!["after-revoke"]);
+    private_fs::set_nonblocking(&input).unwrap();
+    assert_eq!(
+        input.read(&mut [0; 1]).unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
+    drop(output);
+    reader_done(&transport).unwrap();
+}
+
+#[test]
+fn queue_permission_contention_releases_into_delivery_without_another_event() {
+    use crate::structured::{
+        queue::{
+            admission::{Gate, Principal},
+            scheduler::Offer,
+        },
+        workers::queue,
+    };
+    let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+    let (transport, _output, mut input) = start(&root);
+    let handle = transport.input_handle();
+    let (attempt_tx, attempt_rx) = mpsc::channel();
+    *handle.permission_attempt.lock() = Some(attempt_tx);
+    let permissions = handle.permissions.clone();
+    // This is the same book that session_grants and agent_decide hold.
+    let book = permissions.lock();
+    let (mut service, client) = queue::Service::open(
+        root.path(),
+        "fixture-agent",
+        std::num::NonZeroU64::new(u64::MAX).unwrap(),
+    )
+    .unwrap();
+    let mut idle = crate::api::agent_state::AgentState::unknown();
+    idle.lifecycle = crate::api::agent_state::Lifecycle::Live;
+    idle.turn = crate::api::agent_state::Turn::Idle;
+    idle.attention = crate::api::agent_state::Attention::None;
+    assert!(client.state(queue::Snapshot {
+        state: idle,
+        through: 0
+    }));
+    client
+        .enqueue(queue::Request {
+            item: crate::structured::queue::tests::item("00000000-0000-4000-8000-000000000001"),
+            principal: Principal::Operator,
+            gate: Gate::Send,
+        })
+        .unwrap();
+    let (done_tx, done_rx) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        assert!(!service.tick(&handle, false, &|| {}));
+        service.flush(false, &|| {});
+        // No more requests, snapshots or events arrive after the contended offer.
+        assert!(!service.tick(&handle, false, &|| {}));
+        service.flush(false, &|| {});
+        done_tx.send(()).unwrap();
+    });
+    assert!(attempt_rx.recv_timeout(Duration::from_secs(10)).unwrap());
+    drop(book);
+    done_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("queue worker must progress on book release");
+    worker.join().unwrap();
+    let mut submitted = false;
+    let mut offers = Vec::new();
+    while let Some(update) = client.update() {
+        submitted |= matches!(update.offer, Ok(Offer::Submitted { .. }));
+        offers.push(format!("{:?}", update.offer));
+    }
+    assert!(
+        submitted,
+        "idle queued message stranded after permission-book release: {offers:?}"
+    );
+    accepted(&transport);
+    let mut poll = [libc::pollfd {
+        fd: std::os::fd::AsRawFd::as_raw_fd(&input),
+        events: libc::POLLIN,
+        revents: 0,
+    }];
+    // SAFETY: poll points to one live descriptor and only waits for readability.
+    assert_eq!(unsafe { libc::poll(poll.as_mut_ptr(), 1, 10_000) }, 1);
+    let mut bytes = [0; 4096];
+    let count = input.read(&mut bytes).unwrap();
+    assert!(count > 0, "submitted input must reach the harness pipe");
+}
+
+#[test]
+fn queue_stdin_admission_waits_for_permission_book_release() {
+    let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+    let (transport, _output, _input) = start(&root);
+    let handle = transport.input_handle();
+    let permissions = handle.permissions.clone();
+    let book = permissions.lock();
+    let (attempt_tx, attempt_rx) = mpsc::channel();
+    *handle.permission_attempt.lock() = Some(attempt_tx);
+    let (done_tx, done_rx) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        done_tx
+            .send(handle.queue_submit(&serde_json::json!({"type":"user"})))
+            .unwrap();
+    });
+    assert!(attempt_rx.recv_timeout(Duration::from_secs(10)).unwrap());
+    drop(book);
+    let result = done_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("admission must progress on book release");
+    worker.join().unwrap();
+    assert!(
+        result.is_ok(),
+        "book contention must not refuse queued input: {result:?}"
+    );
+    accepted(&transport);
 }

@@ -28,8 +28,6 @@ impl App {
         opening_turn: Option<crate::spawn::prompt::SpawnPrompt>,
     ) -> Result<ResponseResult, ErrorCode> {
         if params.dry_run
-            || params.focus
-            || params.active
             || params.here
             || params.split.is_some()
             || params.workspace_id.is_some()
@@ -43,7 +41,21 @@ impl App {
         if params.argv != ["claude"] {
             return Err(ErrorCode::InvalidAgentArgv);
         }
+        let opening_turn = opening_turn
+            .map(|prompt| {
+                let starter = match caller {
+                    SpawnCaller::Agent { agent_id, .. }
+                    | SpawnCaller::Structured {
+                        agent_id: Some(agent_id),
+                        ..
+                    } => agent_id,
+                    _ => return Err(ErrorCode::NotAuthorized),
+                };
+                Ok((starter.clone(), prompt))
+            })
+            .transpose()?;
         let existing = self.structured_target(&params.name)?;
+        let destination = self.native_destination(existing.as_ref().map(|(id, _)| id.as_str()))?;
         // ADR-0036 §1a: neither history ownership nor a relay grants resume authority.
         if (existing.is_some()
             && (!matches!(caller, SpawnCaller::Operator { .. })
@@ -139,6 +151,7 @@ impl App {
                 state,
                 mcp,
                 storage: self.state.config.sessions.storage(),
+                queue_rewrite_bytes: self.state.config.sessions.queue_rewrite_bytes,
                 stall_after: Duration::from_millis(self.state.config.sessions.stall_ms),
                 admission: lineage.as_ref().map(|l| Admission {
                     config: self.state.config.fleet,
@@ -183,11 +196,36 @@ impl App {
                 })
             },
         );
-        if let Err(error) = started {
-            if is_new {
-                let _ = self.state.structured_agents.remove(&agent_id, generation);
+        let generation = match started {
+            Ok(generation) => generation,
+            Err(error) => {
+                if is_new {
+                    let _ = self.state.structured_agents.remove(&agent_id, generation);
+                }
+                return Err(error);
             }
-            return Err(error);
+        };
+        #[cfg(test)]
+        let destination = if tests::FAIL_PLACEMENT.with(|flag| flag.replace(false)) {
+            Some((usize::MAX, 0))
+        } else {
+            destination
+        };
+        if let Err(code) = self.place_structured_view(
+            crate::structured::view::Target {
+                agent_id: agent_id.clone(),
+                generation,
+            },
+            destination,
+        ) {
+            return Ok(ResponseResult::StructuredAgentStartedUnplaced {
+                agent_id, generation,
+                placement_error: crate::api::schema::ErrorBody {
+                    code: code.as_str().into(),
+                    message: "structured launch admitted; placement failed; inspect the agent before focusing or stopping it".into(),
+                    data: None,
+                },
+            });
         }
         self.structured_info(&agent_id)
             .map(|agent| ResponseResult::StructuredAgentInfo { agent })

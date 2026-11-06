@@ -17,7 +17,7 @@ import tempfile
 import time
 
 
-def run(binary, scenario):
+def run(binary, scenario, wire=None, on_failure=None):
     repo = Path(__file__).resolve().parents[2]
     with tempfile.TemporaryDirectory(prefix="fc", dir="/tmp") as temporary:
         root = Path(temporary).resolve()
@@ -43,13 +43,19 @@ def run(binary, scenario):
         # Explicit, owned short endpoint; no inherited FLOCK variable survives.
         env["FLOCK_SOCKET_PATH"] = str(root / "a")
         env["FLOCK_CLIENT_SOCKET_PATH"] = str(root / "c")
+        if wire is not None:
+            env["FLOCK_LOG"] = "debug"
+            tailscale = root / "bin" / "tailscale"
+            tailscale.write_text("#!/bin/sh\nprintf '{}\\n'\n")
+            tailscale.chmod(0o700)
         def configure(operator=True, enabled=True, capacity=1, depth=2, fanout=2):
+            client_config = "[client]\nbind = '127.0.0.1:0'\n" if wire is not None else ""
             config = f'''onboarding = false
 [structured]
 run_as = '{"operator" if operator else "flk-agent"}'
 profile = 'dogfood'
 token_file = {json.dumps(str(token))}
-[security]
+{client_config}[security]
 agent_account = 'none'
 [fleet]
 agent_spawn_enabled = {str(enabled).lower()}
@@ -136,7 +142,7 @@ max_spawn_fanout = {fanout}
             workspace = api("workspace.create", {"cwd":str(root / "project")})
             assert "result" in workspace, workspace
             args = {"runtime":"structured", "agent":"claude", "prompt":"dogfood-task",
-                    "model":"dogfood-child", "name":"dogfood-child",
+                    "model":"dogfood-wire-child" if wire else "dogfood-child", "name":"dogfood-child",
                     "location":{"kind":"worktree_path","path":str(root / "project")}}
             raw = tool("agent.start", args)
             assert raw["error"]["data"]["refusal"] == "not_exposed_via_mcp", raw
@@ -164,11 +170,21 @@ max_spawn_fanout = {fanout}
             assert child["runtime"] == "structured" and "pane_id" not in child
             assert select.select([turn_ready], [], [], 10)[0], "opening turn was not consumed"
             assert os.read(turn_ready, 1) == b"T"
+            journals = list((root / "x").glob(f"**/sessions/{child_id}/queue.jsonl"))
+            assert len(journals) == 1, "one opening journal owner"
+            records = [json.loads(line) for line in journals[0].read_text().splitlines()]
+            added = [record["item"] for record in records if record.get("kind") == "upsert"]
+            assert len(added) == 1, "one durable opening admission"
+            assert added[0]["producer"] == {"agent": parent_id}, "attested MCP starter"
+            assert added[0]["kind"] == "message"
+            assert "dogfood-task" in added[0]["body"] and "UNTRUSTED TASK" in added[0]["body"]
             extra = dict(args, name="extra-child")
             expected = "at_agent_capacity" if scenario == "capacity" else "at_fanout_limit"
             assert tool("flock_agent_start", extra)["error"]["data"]["refusal"] == expected
             observe(child_id, "turn_idle")
             assert any("dogfood-complete" in path.read_text() for path in (root / "x").rglob("*.jsonl")), "turn result must be durably observed"
+            if wire is not None:
+                wire(cli, api, child_id, env, root)
             listing = tool("flock_agent_list", {})
             assert {a["agent_id"] for a in listing["structured_agents"]} == {parent_id, child_id}
             assert all("pane_id" in a for a in listing["agents"])
@@ -177,7 +193,9 @@ max_spawn_fanout = {fanout}
                 assert cli("agent", "status", target)["result"]["agent"]["agent_id"] == child_id
                 assert tool("flock_agent_get", {"target":target})["agent"]["agent_id"] == child_id
             assert tool("flock_agent_stop", {"target":child_id})["error"]["data"]["refusal"] == "not_authorized"
-            assert cli("agent", "focus", child_id, code=2)["error"]["code"] == "runtime_unsupported"
+            focused = cli("agent", "focus", child_id)["result"]["agent"]
+            assert focused["view"] == cli("agent", "get", child_id)["result"]["agent"]["view"]
+            assert focused["view"]["pane_id"], "focus exposes the native placement"
             assert api("agent.start", {"runtime":"structured","name":"argv-bypass","argv":["untrusted-binary"]})["error"]["code"] == "invalid_agent_argv"
             cli("agent", "stop", child_id)
             observe(child_id, "offline")
@@ -190,9 +208,8 @@ max_spawn_fanout = {fanout}
                 assert refusal["response"]["error"]["code"] == "operator_only", refusal
             resumed = cli("agent", "start", "dogfood-child", "--runtime", "structured", "--", "claude")["result"]["agent"]
             assert resumed["agent_id"] == child_id and resumed["session_id"] == child["session_id"]
-            assert select.select([resume_ready], [], [], 10)[0], "operator resume readiness missing"
+            assert select.select([resume_ready], [], [], 10)[0], "opening session resume missing"
             assert os.read(resume_ready, 1) == b"R"
-            # Fanout still bills the original parent after an operator resume.
             assert tool("flock_agent_start", extra)["error"]["data"]["refusal"] == expected
             cli("agent", "stop", child_id)
             observe(child_id, "offline")
@@ -201,11 +218,24 @@ max_spawn_fanout = {fanout}
             channel = None
             control.close()
             cli("agent", "stop", parent_id)
+            observe(parent_id, "offline")
+            resumed_parent = cli("agent", "start", "dogfood-parent", "--runtime", "structured", "--", "claude")["result"]["agent"]
+            assert resumed_parent["session_id"] == created["session_id"]
+            assert select.select([ready], [], [], 10)[0], "idle session resume missing"
+            assert os.read(ready, 1) == b"R"
+            with socket.socket(socket.AF_UNIX) as resumed_control:
+                resumed_control.settimeout(10)
+                resumed_control.connect(str(root / "control"))
+                resumed_control.sendall(b'"close"\n')
+            cli("agent", "stop", parent_id)
+            observe(parent_id, "offline")
             cli("server", "stop")
             assert server.wait(timeout=15) == 0
             return {"scenario":scenario,"status":"passed", "public_cli":True,"real_mcp":True,
-                    "scoped_identity":True,"framed_opening_turn":True,"isolated_home":True}
+                    "scoped_identity":True,"framed_opening_turn":True,"isolated_home":True,
+                    "operator_resume_with_opening":True,"operator_resume_without_opening":True}
         finally:
+            failed = sys.exc_info()[0] is not None
             if channel is not None:
                 channel.close()
             if server.poll() is None:
@@ -219,6 +249,8 @@ max_spawn_fanout = {fanout}
             os.close(ready)
             os.close(turn_ready)
             os.close(resume_ready)
+            if failed and on_failure is not None:
+                on_failure(root)
 
 
 if __name__ == "__main__":

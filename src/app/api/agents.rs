@@ -187,6 +187,34 @@ impl App {
     }
 
     pub(super) fn handle_agent_focus(&mut self, id: String, target: AgentTarget) -> String {
+        match self.structured_target(&target.target) {
+            Ok(Some((agent_id, generation))) => {
+                let result = self
+                    .native_destination(Some(&agent_id))
+                    .and_then(|destination| {
+                        self.place_structured_view(
+                            crate::structured::view::Target {
+                                agent_id: agent_id.clone(),
+                                generation,
+                            },
+                            destination,
+                        )
+                    })
+                    .and_then(|()| self.structured_info(&agent_id));
+                return match result {
+                    Ok(agent) => encode_success(id, ResponseResult::StructuredAgentInfo { agent }),
+                    Err(code) => encode_error(id, code.as_str(), "structured focus refused"),
+                };
+            }
+            Err(code) => {
+                return encode_error(
+                    id,
+                    code.as_str(),
+                    "target is ambiguous across runtimes; use an agent id",
+                )
+            }
+            Ok(None) => (),
+        }
         let agent = match self.focus_agent_target(&target.target) {
             Ok(agent) => agent,
             Err(err) => return encode_error_body(id, self.agent_target_error_body(err)),
@@ -711,6 +739,11 @@ impl App {
     }
 
     pub(super) fn handle_agent_send(&mut self, id: String, params: AgentSendParams) -> String {
+        match self.structured_send_target(&params.target) {
+            Ok(Some(_)) => return self.handle_structured_send(id, params),
+            Err(code) => return encode_error(id, code.as_str(), "agent target is ambiguous"),
+            Ok(None) => (),
+        }
         if params.submit && params.write_timeout_ms.is_some() {
             return encode_error(
                 id,

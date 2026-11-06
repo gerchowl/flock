@@ -534,23 +534,23 @@ mod tests {
             let sequence = app.event_hub.current_sequence();
             // Theme deferral cannot claim that a live execution exists.
             assert!(!app.start_pending_agent_resumes(false));
-            assert!(app.event_hub.events_after(sequence).is_empty());
+            assert!(app.event_hub.ring_snapshot_after(sequence).is_empty());
             let launched = if explicit {
                 app.resume_hibernated_pane(0, pane).is_ok()
             } else {
                 app.start_pending_agent_resumes(true)
             };
             let live_status = app.pane_info(0, pane).unwrap().agent_status;
-            let events = app.event_hub.events_after(sequence);
+            let events = app.event_hub.ring_snapshot_after(sequence);
             let repeated = app.start_pending_agent_resumes(true);
-            let repeated_events = app.event_hub.events_after(sequence);
+            let repeated_events = app.event_hub.ring_snapshot_after(sequence);
             // Reap the owned fake shell before any assertions can panic.
             for (_, runtime) in app.terminal_runtimes.drain() {
                 runtime.shutdown();
             }
             drop(app);
             let reopened = crate::api::EventHub::with_persistence(log.clone());
-            let replayed = reopened.events_after(sequence);
+            let replayed = reopened.ring_snapshot_after(sequence);
             drop(reopened);
             std::fs::remove_file(log).unwrap();
             assert_eq!(
@@ -733,10 +733,22 @@ mod tests {
         assert_eq!(app.terminal_runtimes.len(), 0);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn operator_retry_by_terminal_id_rechecks_failed_plan_and_starts_after_repair() {
+        // capture_logs uses a thread-local subscriber, so keep this test current-thread.
         // ADR-0028 §1/§3: failed plans retain their identity for explicit retry.
-        let mut app = test_app();
+        struct RuntimeCleanup(App);
+
+        impl Drop for RuntimeCleanup {
+            fn drop(&mut self) {
+                for (_, runtime) in self.0.terminal_runtimes.drain() {
+                    runtime.shutdown();
+                }
+            }
+        }
+
+        let mut cleanup = RuntimeCleanup(test_app());
+        let app = &mut cleanup.0;
         app.state.default_shell = "/bin/sh".into();
         app.state.shell_mode = crate::config::ShellModeConfig::NonLogin;
         let workspace = crate::workspace::Workspace::test_new("operator-retry");
@@ -803,10 +815,6 @@ mod tests {
                 .blocked_reason,
             None
         );
-        app.terminal_runtimes
-            .remove(&terminal_id)
-            .unwrap()
-            .shutdown();
     }
 
     #[tokio::test]
@@ -870,7 +878,7 @@ mod tests {
         assert!(!app.start_pending_agent_resumes(false));
         assert!(
             app.event_hub
-                .events_after(sequence)
+                .ring_snapshot_after(sequence)
                 .iter()
                 .all(|(_, event)| !matches!(
                     event.data,

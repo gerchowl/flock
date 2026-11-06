@@ -323,7 +323,12 @@ fn extract_flock_result(mut raw: Value, send_like: bool) -> Result<Value, McpErr
         .map(Value::take)
         .unwrap_or(Value::Null);
     if let Some(code) = crate::api::effect_exit_code(&result) {
-        let message = result["outcome"].as_str().unwrap_or_default().to_owned();
+        let message = result
+            .get("outcome")
+            .or_else(|| result.get("type"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
         let mut data = result;
         if let Some(fields) = data.as_object_mut() {
             let retry = crate::cli::output::exit_retry(code).as_str();
@@ -526,6 +531,39 @@ mod tests {
         }
     }
 
+    #[test]
+    fn s4_mcp_propagates_actual_client_unknown_effect() {
+        let peer = crate::test_support::ScriptedApi::new(vec![
+            (
+                "ping",
+                Some(
+                    json!({"result":{"version":"fixture","protocol":crate::protocol::PROTOCOL_VERSION,"capabilities":{"pane_input_write_ack":true}}}),
+                ),
+            ),
+            ("pane.submit", None),
+        ]);
+        struct Client(ApiClient);
+        impl FlockCall for Client {
+            fn call(&self, method: Method) -> Result<Value, ApiClientError> {
+                self.0.request_value(&Request {
+                    id: "mcp-fixture".into(),
+                    method,
+                })
+            }
+        }
+        let method: Method = serde_json::from_value(
+            json!({"method":"pane.submit","params":{"pane_id":"p_fixture","text":"hello"}}),
+        )
+        .unwrap();
+        let error = call_flock(method, &Client(peer.client())).unwrap_err();
+        let data = error.data.unwrap();
+        assert_eq!(data["refusal"], "input_write_unknown");
+        assert_eq!(data["exit"], crate::cli::exit::UNCONFIRMED);
+        assert_eq!(data["retry"], "after_inspecting");
+        assert_eq!(data["input_write"]["bytes_written"], Value::Null);
+        assert_eq!(data["input_write"]["remainder_discarded"], false);
+        assert_eq!(peer.finish().len(), 2);
+    }
     #[test]
     fn message_target_resolution_errors_keep_typed_kinds_and_shapes() {
         for (kind, exit) in [
@@ -1222,5 +1260,16 @@ mod tests {
         assert_eq!(result["agents"], json!([]));
         assert_eq!(result["structured_agents"], json!([row]));
         assert!(result["structured_agents"][0].get("pane_id").is_none());
+    }
+    #[test]
+    fn admitted_unplaced_start_keeps_its_identity_in_mcp_failure() {
+        let result = json!({"type":"structured_agent_started_unplaced", "agent_id":"fixture-agent", "generation":4, "placement_error":{"code":"internal_error", "message":"placement failed"}});
+        let error = extract_flock_result(json!({"result":result}), false).unwrap_err();
+        assert_eq!(error.code, crate::cli::exit::FAILURE);
+        assert_eq!(error.message, "structured_agent_started_unplaced");
+        let data = error.data.unwrap();
+        assert_eq!(data["agent_id"], "fixture-agent");
+        assert_eq!(data["generation"], 4);
+        assert_eq!(data["placement_error"]["code"], "internal_error");
     }
 }

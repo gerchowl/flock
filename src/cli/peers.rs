@@ -946,7 +946,7 @@ const SUMMARY_PUSH_DEBOUNCE: std::time::Duration = std::time::Duration::from_sec
 /// they were down: mail queued during a 1-30 s resubscribe backoff, and the
 /// change that should make the first push on connect. Stream lines carry no
 /// `seq` to resume from, so they replay what the server still holds, as every
-/// subscription did before; past its retention they get `lagged`, which
+/// subscription did before; past its retention they get a loss notice (`events_lost` on a capable server), which
 /// wakes them the same way.
 const REPLAY_FROM: u64 = 0;
 
@@ -1164,6 +1164,7 @@ mod tests {
     #[test]
     fn peer_status_strips_control_sequences_from_remote_text() {
         let row = crate::api::schema::RelayedFleetPeer {
+            structured_agents: Vec::new(),
             node_id: None,
             dial: Some(crate::api::schema::PeerDialReport {
                 reason: Some("auth_refused".into()),
@@ -1195,6 +1196,7 @@ mod tests {
 
     fn status_row(name: &str, error: Option<&str>) -> crate::api::schema::RelayedFleetPeer {
         crate::api::schema::RelayedFleetPeer {
+            structured_agents: Vec::new(),
             node_id: None,
             dial: None,
             name: name.into(),

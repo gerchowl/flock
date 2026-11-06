@@ -3,10 +3,13 @@ pub mod client;
 pub(crate) mod client_listener;
 pub mod client_tokens;
 pub(crate) mod compatibility;
+pub(crate) mod deadline;
 pub(crate) mod error_code;
 mod event_hub;
 mod events_read;
+pub(crate) mod peer_discovery;
 pub mod question;
+pub mod queue_event;
 mod reply_wait;
 pub mod schema;
 pub(crate) mod scoped;
@@ -100,6 +103,11 @@ pub fn socket_path() -> PathBuf {
 
 /// Shared CLI and MCP effect-failure contract.
 pub(crate) fn effect_exit_code(result: &serde_json::Value) -> Option<i32> {
+    if result.get("type").and_then(serde_json::Value::as_str)
+        == Some("structured_agent_started_unplaced")
+    {
+        return Some(crate::cli::exit::FAILURE);
+    }
     match result.get("outcome").and_then(serde_json::Value::as_str) {
         Some("unconfirmed") => Some(crate::cli::exit::UNCONFIRMED),
         Some("abandoned") => Some(crate::cli::exit::ABANDONED),

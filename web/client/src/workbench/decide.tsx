@@ -7,15 +7,23 @@
  * it too. An accepted ack never removes the card: it leaves on the server's
  * closed record or when the id is delisted (ADR-0038 §1), and until then it
  * says it was answered. A typed refusal is shown in plain words and never
- * retried; the buttons stay disabled for that `request_seq`, and a new open
- * record, with a new seq, enables them again. One decision is in flight per
- * request. "Always allow" is a standing grant, so it takes one inline confirm,
+ * retried; its words come from the shared map (`refusals.tsx`), with the raw
+ * code behind *Details*. The buttons stay disabled for that `request_seq`, and a new open
+ * record, with a new seq, enables them again only after the person clicks
+ * "Review new request" (below). One decision is in flight per request. "Always allow" is a standing grant, so it takes one inline confirm,
  * and every decision is bound to the `request_id` and `request_seq` the person
  * was shown: each button carries the values it was rendered with, and the
  * command sends exactly those, never the card's current ones. When a request's
  * seq changes, the card enters "Request changed — review it": every button
  * (and an open confirm) stays disabled until the person acknowledges with
  * "Review new request", and only then do the buttons bind to the new seq.
+ * The same holds for a request id that closes and comes back: the Workbench remembers
+ * closed ids for the session (its lifetime, across view switches; `createClosedIds`), and a returning id starts unacknowledged.
+ * The server does not promise ids stay unique forever: it rejects an id that is
+ * still open or in its last 1024 closed handles, but "reusing an evicted harness ID
+ * is safe because its new sequence cannot match an old decision", and a new
+ * transport starts a new book (`src/structured/permissions.rs` lines 3-4, 11-14,
+ * `observe`). The bound-decide invariant therefore does not rest on id uniqueness.
  * A card whose agent stream has a history gap is stale: its buttons wait for the
  * resync (ADR-0038 §1).
  *
@@ -27,25 +35,18 @@
  */
 import { For, Show, createEffect, createSignal, createUniqueId, untrack, type JSX, type Signal } from "solid-js";
 
-import type { AgentDecideErrorCode } from "../gen/AgentDecideErrorCode";
 import type { PermissionDecision } from "../gen/PermissionDecision";
 import type { OutboxEntry } from "../wire/outbox";
 import { STATUS_LABELS, type Sender } from "./Composer";
 import type { InboxCard } from "./inbox";
-
-/** What the server's typed refusals mean for the person, in plain words. */
-export const REFUSALS: { readonly [C in AgentDecideErrorCode]: string } = {
-  permission_request_unknown: "The server does not know this request any more. This card follows the agent's list.",
-  permission_request_closed: "This request was already closed. This card follows the agent's list.",
-  not_authorized: "This client is not allowed to answer permission prompts.",
-};
+import { MESSAGE_MAX_BYTES, RefusalDetails, explain, type Explained } from "./refusals";
 
 /** Where the answer to one request stands. */
 export type DecideState =
   | { readonly kind: "idle" }
   | { readonly kind: "inflight"; readonly line: string }
   | { readonly kind: "answered" }
-  | { readonly kind: "refused"; readonly line: string };
+  | { readonly kind: "refused"; readonly line: string; readonly refusal: Explained };
 
 /** The latest `agent.decide` for this card's request and `request_seq`, read from the outbox. */
 export function decideState(commands: readonly OutboxEntry[], card: InboxCard): DecideState {
@@ -67,9 +68,9 @@ export function decideState(commands: readonly OutboxEntry[], card: InboxCard): 
     case "acked":
       return { kind: "answered" };
     case "failed": {
-      const code = entry.error?.code;
-      const known = code !== undefined && Object.hasOwn(REFUSALS, code) ? REFUSALS[code as AgentDecideErrorCode] : null;
-      return { kind: "refused", line: known ?? `${STATUS_LABELS.failed}: ${entry.error?.message ?? "no reason given"}` };
+      // A failed entry always carries the ack's error; the fallback only keeps the type total.
+      const refusal = explain(entry.error ?? { code: "", message: STATUS_LABELS.failed });
+      return { kind: "refused", line: refusal.line, refusal };
     }
     default:
       return { kind: "inflight", line: STATUS_LABELS[entry.status] };
@@ -82,13 +83,7 @@ const CHOICES: readonly { readonly label: string; readonly decision: PermissionD
   { label: "Deny", decision: "deny" },
 ];
 
-/**
- * The longest message the server takes, in UTF-8 bytes of the trimmed text. The server
- * bound is #2249 (2048 bytes, `prompt_control_bytes` rules, typed `invalid_params`); this
- * constant becomes generated once #2249 lands.
- */
-export const MESSAGE_MAX_BYTES = 2048;
-
+/** The server's limit is in UTF-8 bytes; the count calls them characters, exact for plain text and approximate otherwise. */
 const utf8Bytes = (text: string): number => new TextEncoder().encode(text).length;
 
 /** The request a decision is bound to: the one the person was shown and acknowledged. */
@@ -116,19 +111,25 @@ export type DecideUi = {
   readonly error: Signal<Raised | null>;
 };
 
-/** Creates one card's {@link DecideUi}. */
-export function createDecideUi(): DecideUi {
+/**
+ * Creates one card's {@link DecideUi}. A `reopened` card is one whose request id closed earlier in
+ * this view: it starts bound to nothing it shows, so it is "Request changed" until reviewed.
+ */
+export function createDecideUi(reopened = false): DecideUi {
   return {
     message: createSignal(""),
     confirming: createSignal<Target | null>(null),
-    bound: createSignal<Target | null>(null),
+    bound: createSignal<Target | null>(reopened ? UNBOUND : null),
     attempts: createSignal(0),
     error: createSignal<Raised | null>(null),
   };
 }
 
-/** The message box, choices and status line of one live permission card. */
-export function PermissionActions(props: { readonly card: InboxCard; readonly sender: Sender | null; readonly ui: DecideUi }): JSX.Element {
+/** What the card's shortcuts do (#2904): ⌘↩ allows once and ⌘⌫ denies, exactly as the buttons would. */
+export type CardKeys = { readonly allow: () => void; readonly deny: () => void };
+
+/** The message box, choices and status line of one live permission card; `keys` receives the card's shortcut actions. */
+export function PermissionActions(props: { readonly card: InboxCard; readonly sender: Sender | null; readonly ui: DecideUi; readonly keys?: (keys: CardKeys) => void }): JSX.Element {
   const [message, setMessage] = props.ui.message;
   const [confirming, setConfirming] = props.ui.confirming;
   const [bound, setBound] = props.ui.bound;
@@ -166,7 +167,7 @@ export function PermissionActions(props: { readonly card: InboxCard; readonly se
     const now = state();
     if (now.kind === "answered") return "Answered; waiting for the agent";
     if (now.kind === "inflight" || now.kind === "refused") return now.line;
-    if (bytes() > MESSAGE_MAX_BYTES) return `The message is ${bytes() - MESSAGE_MAX_BYTES} bytes over the ${MESSAGE_MAX_BYTES}-byte limit.`;
+    if (bytes() > MESSAGE_MAX_BYTES) return "The message is too long. Shorten it to send your answer.";
     return null;
   };
   const fail = (text: string, at: Target): void => void setError({ text, seq: at.seq, attempt: attempts(), under: blocked() });
@@ -184,6 +185,7 @@ export function PermissionActions(props: { readonly card: InboxCard; readonly se
     }
     setConfirming(null);
   };
+  props.keys?.({ allow: () => send("allow_once", bound() ?? UNBOUND), deny: () => send("deny", bound() ?? UNBOUND) });
   // A changed request cancels an open confirm; the card says why.
   createEffect(() => {
     if (changed() && confirming() !== null) setConfirming(null);
@@ -192,6 +194,11 @@ export function PermissionActions(props: { readonly card: InboxCard; readonly se
     setBound(current());
     setConfirming(null);
     setError(null);
+  };
+  /** The refusal, for its Details, while the status line is the one wording it. */
+  const refused = (): Explained | null => {
+    const now = state();
+    return shownError() === null && now.kind === "refused" && blocked() === now.line ? now.refusal : null;
   };
   const shownError = (): string | null => {
     const raised = error();
@@ -211,7 +218,7 @@ export function PermissionActions(props: { readonly card: InboxCard; readonly se
       />
       <Show when={message().trim() !== ""}>
         <p class="decide__count" data-testid="decide-count">
-          {bytes() > MESSAGE_MAX_BYTES ? `${bytes() - MESSAGE_MAX_BYTES} bytes over the limit` : `${MESSAGE_MAX_BYTES - bytes()} bytes left`}
+          {bytes() > MESSAGE_MAX_BYTES ? "The message is too long" : `About ${MESSAGE_MAX_BYTES - bytes()} characters left`}
         </p>
       </Show>
       <Show when={changed()}>
@@ -260,6 +267,7 @@ export function PermissionActions(props: { readonly card: InboxCard; readonly se
       <p id={reason} class="waits__reason" data-testid="decide-status">
         {shownError() ?? blocked() ?? "Answering sends your decision to the agent."}
       </p>
+      <Show when={refused()}>{(shown) => <RefusalDetails code={shown().code} message={shown().message} />}</Show>
     </div>
   );
 }

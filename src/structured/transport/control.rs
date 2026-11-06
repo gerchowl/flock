@@ -107,7 +107,16 @@ impl<'a> Recorder<'a> {
             return Ok(());
         }
         let event = self.audit(&control.answer.audit)?;
-        self.controls.book.lock().audited(&control.answer);
+        let installed_ms = u64::try_from(event.record.received_at_ms).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "permission audit timestamp exceeds u64 milliseconds",
+            )
+        })?;
+        self.controls
+            .book
+            .lock()
+            .audited(&control.answer, installed_ms);
         publish(event, self.tx, self.cancel)?;
         self.controls
             .input
@@ -171,10 +180,21 @@ impl<'a> Recorder<'a> {
                 answer,
                 refusal: None,
             }),
-            Err(ErrorCode::PermissionRequestLimit) => Ok(Admission {
-                refusal: Some(book.capacity_refusal(id).map_err(io::Error::other)?),
-                ..Admission::default()
-            }),
+            Err(ErrorCode::PermissionRequestLimit) => {
+                let refusal = book.capacity_refusal(id).map_err(io::Error::other)?;
+                let agent = book.agent().to_owned();
+                drop(book);
+                crate::logging::structured_permission_request_refused(
+                    &agent,
+                    id,
+                    refusal.request_seq,
+                    ErrorCode::PermissionRequestLimit.as_str(),
+                );
+                Ok(Admission {
+                    refusal: Some(refusal),
+                    ..Admission::default()
+                })
+            }
             Err(code) => Err(io::Error::other(code)),
         }
     }

@@ -334,6 +334,10 @@ impl App {
             return None;
         }
 
+        if self.handle_structured_key(key) {
+            return None;
+        }
+
         // Prompt-history scrollback panel (#96): when open over the focused
         // pane, intercept Esc/PageUp/PageDown to drive the panel directly,
         // matching the wheel routing. Esc closes; PageUp/Down page by the

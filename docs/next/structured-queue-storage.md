@@ -19,7 +19,8 @@ are private and files are owner-only, with existing symlinks/nonregular files
 refused. The data root itself may be an alias such as a canonicalized temp root.
 
 Every journal begins with a synced
-`{"kind":"queue_identity","agent_id":"...","format_version":2}` header containing the original, case-preserved ID. Open verifies it against the
+`{"kind":"queue_identity","agent_id":"...","format_version":3}` header
+containing the original, case-preserved ID. Open verifies it against the
 requested agent and refuses missing or mismatched first identity headers.
 A repeated identity header opens read-only as structural corruption. An unterminated first line with no records following it is rewritten
 and synced: identity creation only writes into an empty file, so no records
@@ -77,8 +78,8 @@ shares a mutable record buffer with future appends or rewrites.
 ## Format versions and downgrade refusal
 
 The ADR-0036 §4 owner decision in #1820 adds a journal version stamp. The
-current writer supports version 2. A missing `format_version` means version 1;
-opening a v1 journal does not stamp it. Its next checkpoint writes version 2.
+current writer supports version 3. A missing `format_version` means version 1;
+opening a v1 journal does not stamp it. Its next checkpoint writes version 3.
 Before appending to an older format, the writer checkpoints it into its own
 format, so no newer-format record can enter a journal with an older stamp.
 Sequence and encoded-size validation include the snapshot's sequences and happen
@@ -119,6 +120,10 @@ a positive integer opens read-only as typed `QueueJournalCorrupt`; it never
 invents a writable version. Identity mismatches remain namespace violations
 that refuse open.
 
+Version 3 adds the typed `node_asserted { sender, origin }` queue producer for
+remote attribution (#1958). It adds no custody field or event kind. Older queue
+writers refuse mutation of the newer stamp under the existing downgrade guard.
+
 ## Unknown data, corruption and torn tails
 
 The ADR-0036 §4 owner decisions in #1820 and #1922 separate three cases:
@@ -147,35 +152,40 @@ The ADR-0036 §4 owner decisions in #1820 and #1922 separate three cases:
    it is not necessarily a record boundary. Known updates/removals cannot erase
    the raw unknown history.
 
-   Slice 1 of [#1803](https://github.com/gerchowl/flock/issues/1803),
-   [#1954](https://github.com/gerchowl/flock/issues/1954), adds the opt-in journal
-   policy and configuration. `[sessions] queue_rewrite_bytes` is a positive
-   integer byte count, with named default `DEFAULT_QUEUE_REWRITE_BYTES` of
-   8 MiB (8,388,608 bytes). Zero is rejected, including by live config loading.
-   A checkpoint is required when the existing file is **strictly larger** than
-   this value, before another append. An append may cross the threshold; the
-   next mutation checks it. This is a rewrite trigger, not a maximum snapshot
-   size: a materialized queue can itself be larger than the configured value.
+   The journal policy from [#1954](https://github.com/gerchowl/flock/issues/1954)
+   is wired into the worker owner by
+   [#1955](https://github.com/gerchowl/flock/issues/1955). The landed production
+   launch path in [#1843](https://github.com/gerchowl/flock/issues/1843) supplies
+   this configured worker policy, enforcing the production requirement in
+   [#1928](https://github.com/gerchowl/flock/issues/1928).
+   Every worker opens the journal with `Journal::open_with_policy` using
+   `[sessions] queue_rewrite_bytes`, a positive byte count with named default
+   `DEFAULT_QUEUE_REWRITE_BYTES` of 8 MiB (8,388,608 bytes). Zero is rejected.
+   When the existing file is **strictly larger** than the configured value, the
+   worker serializes a checkpoint before further admission/lifecycle appends.
+   This is a rewrite trigger, not a maximum materialized snapshot size.
 
-   `Journal::open_with_policy` installs the same policy for append and recovery.
-   Recovery re-derives the typed unknown-data refusal above the threshold before
-   repairing a torn suffix, leaving refused bytes unchanged. Known supported
-   crash-torn tails keep their existing repair behavior. Known data are rewritten
-   on the next append or explicit `checkpoint_if_required()` call, which returns
-   the complete atomic cut after fsync, rename and directory fsync. A caller must
-   publish that cut, or replay from its pre-operation cursor to include an
-   automatic append-time rewrite; publishing just the appended record loses the
-   checkpoint gap and snapshot. Refusal never returns a successful cut.
+   Reopen measures the entire file **including a torn final suffix** before
+   repair. Thus a torn suffix can make a checkpoint required. If unknown data
+   prevent it, the worker re-derives the typed read-only latch before repairing
+   that suffix and preserves every byte. Supported known data keep the existing
+   torn-tail repair behavior. Recovery never needs a persisted refusal marker.
+   A worker does not retry a latched storage refusal on each pump iteration.
 
-   Production enforcement remains a requirement on
-   [#1955](https://github.com/gerchowl/flock/issues/1955), slice 2: the worker must
-   use this policy with its configured byte threshold on every open, preserve
-   serialized mutation ownership and publish the resulting cuts. The legacy
-   `Journal::open` does not install a policy. Thus production same-version growth
-   is not bounded by this slice alone, and
-   [#1928](https://github.com/gerchowl/flock/issues/1928) remains open until worker
-   integration. Reopening through the policy re-establishes the refusal without
-   adding any persistent marker. A newer-stamped journal instead uses
+   `checkpoint_if_required()` and automatic append-time replacements keep the
+   existing fsync-temp, rename, fsync-directory rule. The worker captures replay
+   from its preceding cursor after each serialized operation, so its bounded
+   completion includes the atomic gap, snapshot and later records. It never
+   reports a successful cut when durability is uncertain. The publication adapter
+   is [#1956](https://github.com/gerchowl/flock/issues/1956); consumers must drain
+   completions to release backpressure. Shutdown notification cancellation is
+   explicit in the runtime report and requires durable replay.
+
+   Valid live reloads that change the threshold keep the active server policy
+   and report `restart required`; restarting applies the new configuration to
+   worker-owned queues. This documents the configuration/reopen requirements
+   from [#1975](https://github.com/gerchowl/flock/issues/1975), items 1–3.
+   A newer-stamped journal instead uses
    `QueueJournalNewer` read-only mode. There is no opaque checkpoint passthrough
    and no inference of a version from unknown contents.
 2. **Malformed known records are corruption.** A supported-version journal still
@@ -212,3 +222,48 @@ The ADR-0036 §4 owner decisions in #1820 and #1922 separate three cases:
 Persistence remains fsync of the temporary file, rename, then fsync of the
 directory. Disk operations are blocking worker operations and must never run
 on the server event loop or during render.
+
+### Message custody completion (ADR-0036 §3/S5)
+
+A successful queue-owner commit transfers the existing native-bound custody
+record from `inbox` to `delivered`. This means durable queue admission, not a
+recipient read. Its signed payload and reply binding remain available under
+existing outcome retention. Reopen restores reply metadata without admitting
+again or spending the sender's blocking budget again. A crash between queue
+commit and custody settlement replays the same MessageKey-derived lifecycle ID,
+which the single queue owner admits idempotently.
+
+Recovered transient failures, including `input_write_unknown`, retain the same
+custody key and retry in the running process using the existing bounded,
+jittered retry policy (up to five minutes). Owner progress can wake a waiting
+admission sooner. The server loop schedules the earliest recovery/backoff deadline,
+including on an otherwise idle headless server; fleet pause suspends admission.
+The sole journal owner retains an in-memory index of committed custody keys,
+rebuilt from the journal on reopen. Recovery checks that proof before refusing a
+key: a later admission conflict cannot revoke an already committed message.
+First settlement still applies blocking accounting and reply settlement once.
+An in-flight admission, opaque journal data, uncertain write, or unavailable
+owner cannot prove absence. Custody remains retryable instead of being revoked
+until the owner resolves admission or reopens the journal.
+Permanent refusals settle the
+existing `refused` or `recipient_gone` outcome and emit `message_delivered` with
+`delivered: false`; ordinary `msg.status` exposes the refusal and its detail.
+Refused duplicates retain a registered terminal refusal code. Legacy rows
+without a terminal typed reason use `msg_not_allowed`; their original detail
+remains available through message status. Expired and refused duplicates return a terminal code instead of restarting
+admission. A changed native session returns `recipient_gone`.
+
+A local reply enters a structured queue only when its original sender comes
+from a verified, locally signed envelope with a matching local recipient/session
+binding and a live or settled inbox outcome. A node signature alone does not
+prove local sender attestation. Claimed legacy `from_agent` metadata
+retains the terminal reply path and grants no structured routing authority.
+No custody schema, identity material, mesh version, or event kind changes.
+
+Unverifiable recovery records and unknown native identities remain raw in
+custody and never enter a legacy mailbox or queue. For unsettled records the
+existing refusal event exposes the typed failure; settled outcomes stay unchanged.
+Correcting unverifiable evidence requires operator action.
+Fresh terminal-bound messages are sealed only when their sender matches the
+authenticated caller, so legitimate replies can prove a structured sender while
+unsigned legacy sender claims remain on the terminal path.

@@ -57,22 +57,17 @@ impl App {
         }
         Ok(found)
     }
-    pub(super) fn structured_info(&self, id: &str) -> Result<StructuredAgentInfo, ErrorCode> {
-        let (record, projection, _) = self
+    pub(in crate::app) fn structured_info(
+        &self,
+        id: &str,
+    ) -> Result<StructuredAgentInfo, ErrorCode> {
+        let (record, projection, generation) = self
             .state
             .structured_agents
             .get(id)
             .ok_or(ErrorCode::InternalError)?;
         let state = projection.update.state.clone();
-        let status = match state.phase {
-            Phase::Gone | Phase::Offline => AgentStatus::Offline,
-            Phase::Hibernated => AgentStatus::Hibernated,
-            Phase::LimitReached | Phase::Blocked | Phase::NeedsHuman => AgentStatus::Blocked,
-            Phase::Working => AgentStatus::Working,
-            Phase::WaitingOnEvent | Phase::Settling => AgentStatus::Idle,
-            Phase::FinishedWithBackground | Phase::Finished => AgentStatus::Done,
-            Phase::Unknown => AgentStatus::Unknown,
-        };
+        let status = structured_status(state.phase);
         Ok(StructuredAgentInfo {
             runtime: record.runtime,
             agent_id: record.agent_id.clone(),
@@ -85,7 +80,10 @@ impl App {
             cwd: record.cwd.to_string_lossy().into_owned(),
             model: record.model.clone(),
             lease_state: self.session_leases.state(id, &record.session_id),
-            view: None,
+            view: self.structured_placement(&crate::structured::view::Target {
+                agent_id: record.agent_id.clone(),
+                generation,
+            })?,
         })
     }
     pub(super) fn structured_infos(&self) -> Result<Vec<StructuredAgentInfo>, ErrorCode> {
@@ -155,5 +153,18 @@ fn may_stop(caller: SpawnCaller, agent: &str) -> bool {
         _ => false,
     }
 }
+/// The same phase projection for local structured metadata and peer discovery.
+pub(in crate::app) fn structured_status(phase: Phase) -> AgentStatus {
+    match phase {
+        Phase::Gone | Phase::Offline => AgentStatus::Offline,
+        Phase::Hibernated => AgentStatus::Hibernated,
+        Phase::LimitReached | Phase::Blocked | Phase::NeedsHuman => AgentStatus::Blocked,
+        Phase::Working => AgentStatus::Working,
+        Phase::WaitingOnEvent | Phase::Settling => AgentStatus::Idle,
+        Phase::FinishedWithBackground | Phase::Finished => AgentStatus::Done,
+        Phase::Unknown => AgentStatus::Unknown,
+    }
+}
+
 #[cfg(test)]
 mod tests;

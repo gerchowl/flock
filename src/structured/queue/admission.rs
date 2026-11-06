@@ -11,6 +11,25 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::io;
 
+impl crate::structured::permissions::Principal<'_> {
+    /// Admission authority from authenticated dispatcher context (ADR-0036 §3).
+    /// Claimed producer names are never accepted as operator capabilities.
+    pub(crate) fn queue_origin(
+        &self,
+    ) -> Result<crate::structured::queue::admission::Principal, crate::api::error_code::ErrorCode>
+    {
+        use crate::structured::queue::{admission::Principal as QueuePrincipal, model::Producer};
+        match self {
+            Self::Operator => Ok(QueuePrincipal::Operator),
+            Self::Token(_) if self.decision_subject().is_ok() => Ok(QueuePrincipal::Operator),
+            Self::Agent(id) | Self::Lease(id) if !id.is_empty() => {
+                Ok(QueuePrincipal::Origin(Producer::Agent((*id).into())))
+            }
+            _ => Err(crate::api::error_code::ErrorCode::NotAuthorized),
+        }
+    }
+}
+
 type Entropy<'a> = &'a mut dyn FnMut(&mut [u8]) -> Result<(), getrandom::Error>;
 
 /// One persisted admission decision; no automatic re-gating exists.
@@ -30,8 +49,16 @@ pub(crate) enum Gate {
 pub(crate) enum Principal {
     /// Authenticated operator or operator-token caller.
     Operator,
+    /// Socket child of a positively classified operator root shell (ADR-0036 §1a).
+    OperatorViaPane(u32),
     /// Authenticated non-operator origin supplied by the dispatcher.
     Origin(Producer),
+}
+impl Principal {
+    /// Operator admission includes the independently verified shell-pane exception.
+    pub(crate) fn is_operator(&self) -> bool {
+        matches!(self, Self::Operator | Self::OperatorViaPane(_))
+    }
 }
 /// Registered refusal or uncertain storage error; callers must inspect before retry.
 #[derive(Debug)]
@@ -87,9 +114,18 @@ impl Admission {
         }
         Ok(Self { journal, max_batch })
     }
+    pub(super) fn take_facts(&mut self) -> Vec<crate::api::queue_event::QueueItemState> {
+        self.journal.take_facts()
+    }
     /// Immutable committed state/replay for the worker's serialized publisher.
     pub fn journal(&self) -> &Journal {
         &self.journal
+    }
+    pub(super) fn subscription(&mut self) -> Result<super::Cut, Failure> {
+        Ok(self.journal.subscription()?)
+    }
+    pub(super) fn checkpoint_if_required(&mut self) -> Result<Option<super::Cut>, Failure> {
+        self.journal.checkpoint_if_required().map_err(Into::into)
     }
     /// Append one new item and its gate before acknowledging acceptance. Operator
     /// authority creates human input; other origins cannot impersonate humans or
@@ -101,11 +137,16 @@ impl Admission {
         gate: Gate,
     ) -> Result<(), Failure> {
         self.journal.writable()?;
+        validate_kind(&item.kind)?;
         if item.delivery != Delivery::AtIdle || item.priority != Priority::Normal {
             return Err(refuse(ErrorCode::QueueModeUnsupported));
         }
+        let pane = match principal {
+            Principal::OperatorViaPane(pane) => Some(pane),
+            _ => None,
+        };
         item.producer = match principal {
-            Principal::Operator => Producer::Human,
+            Principal::Operator | Principal::OperatorViaPane(_) => Producer::Human,
             Principal::Origin(origin)
                 if origin != Producer::Human && item.kind != Kind::Command =>
             {
@@ -115,6 +156,7 @@ impl Admission {
         };
         if [
             "admission_hash",
+            "operator_via_pane",
             "gate",
             "batch_id",
             "awaiting_result",
@@ -140,6 +182,10 @@ impl Admission {
                     .is_none_or(|id| !valid_id(id)))
         {
             return Err(refuse(ErrorCode::InvalidRequest));
+        }
+        if let Some(pane) = pane {
+            item.metadata
+                .insert("operator_via_pane".into(), json!(pane));
         }
         validate_content(&item)?;
         item.state = match &gate {
@@ -187,6 +233,13 @@ impl Admission {
             position: self.journal.items().len(),
         })?;
         Ok(())
+    }
+    /// Settle one retained item without rewriting its body or changing identity.
+    pub(super) fn fail_item(&mut self, item_id: String, reason: ErrorCode) -> Result<(), Failure> {
+        self.commit(Change::Fail {
+            item_id,
+            reason: reason.as_str().into(),
+        })
     }
     fn eligible(&self, item: &Item, now_ms: u64) -> bool {
         !self.journal.opaque.contains(&item.item_id)
@@ -251,7 +304,9 @@ impl Admission {
                     Err(error)
                         if matches!(
                             error.code,
-                            ErrorCode::InvalidRequest | ErrorCode::QueueItemTooLarge
+                            ErrorCode::InvalidRequest
+                                | ErrorCode::QueueItemTooLarge
+                                | ErrorCode::QueueKindReserved
                         ) =>
                     {
                         error.code
@@ -342,7 +397,17 @@ impl Admission {
 }
 // Intake and edits share the same validation. Rendering repeats it so legacy
 // or otherwise malformed durable items are failed instead of wedging a worker.
+pub(super) fn validate_kind(kind: &Kind) -> Result<(), Failure> {
+    if matches!(
+        kind,
+        Kind::Finding | Kind::DelegateResult | Kind::ReloadNotice
+    ) {
+        return Err(refuse(ErrorCode::QueueKindReserved));
+    }
+    Ok(())
+}
 fn validate_content(item: &Item) -> Result<(), Failure> {
+    validate_kind(&item.kind)?;
     if !valid_id(&item.item_id)
         || (item.kind == Kind::Reply
             && metadata(item, "anchor")["question_id"]
@@ -382,10 +447,20 @@ fn render(item: &Item, fill: Entropy<'_>) -> Result<String, Failure> {
     } else {
         String::new()
     };
+    let producer = match item
+        .metadata
+        .get("operator_via_pane")
+        .and_then(Value::as_u64)
+    {
+        Some(pane) if item.producer == Producer::Human => {
+            header_json(&format!("operator via pane {pane}"))?
+        }
+        _ => header_json(&item.producer)?,
+    };
     let nonce = nonce(&item.body, fill)?;
     Ok(format!(
         "From {} (item {}):{reply} Attachments (blob refs): {}\n<<<flk-item {nonce}\n{}\nflk-item {nonce}>>>",
-        header_json(&item.producer)?, item.item_id, header_json(&item.attachments)?, item.body
+        producer, item.item_id, header_json(&item.attachments)?, item.body
     ))
 }
 // The callback is the entropy source, kept local so collision/failure handling
@@ -405,6 +480,10 @@ fn nonce(
             return Ok(hex);
         }
     }
+}
+/// Mint a queue lifecycle UUID using the same entropy source as batch identities.
+pub(crate) fn lifecycle_id() -> Result<String, Failure> {
+    batch_uuid(&mut getrandom::fill)
 }
 fn batch_uuid(fill: Entropy<'_>) -> Result<String, Failure> {
     let mut h = nonce("", fill)?.into_bytes();
@@ -431,7 +510,8 @@ fn serialization(error: serde_json::Error) -> Failure {
         source: Some(error.into()),
     }
 }
-fn canonical_uuid(id: &str) -> bool {
+/// Canonical lower-case UUID spelling used by admission identities.
+pub(crate) fn canonical_uuid(id: &str) -> bool {
     valid_id(id) && !id.bytes().any(|b| b.is_ascii_uppercase())
 }
 

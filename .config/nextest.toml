@@ -107,6 +107,12 @@ filter = 'binary(=flk) & (test(structured::permissions::auth::tokens::) | test(p
 retries = 0
 
 [[profile.default.overrides]]
+# S10f owns an attached TUI and model/MCP processes; serialize without retries.
+filter = 'binary(=structured_tui)'
+test-group = 'serial-pty'
+retries = 0
+
+[[profile.default.overrides]]
 # The remaining integration binaries also spawn the real `flock` process; let
 # them run in parallel but retry to ride out timing hiccups under CI load.
 # #1371's rollback handshake and receiver checks need no retry.

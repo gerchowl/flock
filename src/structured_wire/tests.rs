@@ -1,6 +1,6 @@
 use super::*;
 use crate::structured::claude::SessionEvent;
-use fixture::{FixtureLine, FixtureStep};
+use fixture::{FixtureLine, FixtureStep, TOKEN_PRINCIPAL};
 use serde_json::json;
 use std::collections::BTreeSet;
 
@@ -39,9 +39,16 @@ fn every_script_parses_and_round_trips_all_frame_kinds() {
                 FixtureStep::Send { frame, .. } => {
                     server.insert(value["frame"]["t"].as_str().unwrap().to_owned());
                     let encoded = serde_json::to_string(&frame).unwrap();
+                    if !matches!(frame, fixture::FixtureServerFrame::Literal(_)) {
+                        assert!(serde_json::from_str::<ServerFrame>(&encoded).is_err());
+                        continue;
+                    }
                     assert_eq!(
                         serde_json::from_str::<ServerFrame>(&encoded).unwrap(),
-                        frame
+                        match frame {
+                            fixture::FixtureServerFrame::Literal(frame) => frame,
+                            _ => continue,
+                        }
                     );
                 }
                 FixtureStep::Expect { frame, .. } => {
@@ -201,11 +208,11 @@ fn settled_parameters_and_uncertain_ack_use_existing_exit_constant() {
         .unwrap();
     let FixtureStep::Send {
         frame:
-            ServerFrame::Ack {
+            fixture::FixtureServerFrame::Literal(ServerFrame::Ack {
                 error: Some(error),
                 ok: false,
                 ..
-            },
+            }),
         ..
     } = FixtureLine::parse(line).unwrap().step
     else {
@@ -309,7 +316,6 @@ fn every_header_declares_coverage_and_minimal_scripts_use_only_minimal_operation
         "token-refused",
         "token-revoked",
         "heartbeat-missed",
-        "fleet-lite",
         "unknown-subscription",
     ];
     let files = fixtures();
@@ -319,7 +325,9 @@ fn every_header_declares_coverage_and_minimal_scripts_use_only_minimal_operation
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
-        let expected = if matches!(name.as_str(), "heartbeat-missed" | "unknown-subscription") {
+        let expected = if name == "fleet-lite" {
+            json!(["client-only"])
+        } else if matches!(name.as_str(), "heartbeat-missed" | "unknown-subscription") {
             json!(["s7", "s7-min"])
         } else if minimal.contains(&name.as_str()) {
             json!(["s7-min"])
@@ -473,7 +481,13 @@ fn minimal_fleet_fixture_has_typed_rows_deltas_and_fresh_snapshot_recovery() {
                         unconfirmed.remove(&row.id);
                         agents.insert(row.id.clone(), row);
                     }
-                    FleetDelta::Remove { id } => {
+                    FleetDelta::NodeUpsert { .. }
+                    | FleetDelta::NodeRemove { .. }
+                    | FleetDelta::ProjectUpsert { .. }
+                    | FleetDelta::ProjectRemove { .. } => {
+                        panic!("unexpected entity in agent-only fixture")
+                    }
+                    FleetDelta::Remove { id, .. } => {
                         assert!(
                             snapshot_to.is_none(),
                             "snapshot contains only complete rows"
@@ -697,4 +711,84 @@ fn sub_id_reused_refusal_is_typed_for_both_live_and_closed_ids() {
         assert_eq!(value["code"], "sub_id_reused");
         assert_eq!(serde_json::from_value::<ServerFrame>(value).unwrap(), frame);
     }
+}
+
+#[test]
+fn dynamic_timestamp_is_typed_and_restricted_to_event_wall_time() {
+    let line = json!({"v":1,"step":"send","frame":{"t":"ev","sub_id":"s","stream":"agent/fixture","seq":1,"ts_ms":{"$dynamic":"ts_ms","source":"persisted","bound":"after_ack"},"ev":{"type":"assistant","message":{}}}});
+    assert!(matches!(
+        FixtureLine::parse(&line.to_string()).unwrap().step,
+        FixtureStep::Send {
+            frame: fixture::FixtureServerFrame::Dynamic(_),
+            ..
+        }
+    ));
+    let non_timestamp = json!({"v":1,"step":"send","frame":{"t":"ping","nonce":"fixture","ts_ms":line["frame"]["ts_ms"]}});
+    assert!(
+        FixtureLine::parse(&non_timestamp.to_string()).is_err(),
+        "ping must not discard a dynamic marker as an additive field"
+    );
+    for field in ["seq", "sub_id", "ev"] {
+        let mut invalid = line.clone();
+        invalid["frame"][field] = line["frame"]["ts_ms"].clone();
+        assert!(FixtureLine::parse(&invalid.to_string()).is_err(), "{field}");
+    }
+    for marker in [
+        json!({"$dynamic":"future","source":"persisted","bound":"after_ack"}),
+        json!({"$dynamic":"ts_ms","source":"socket","bound":"after_ack"}),
+        json!({"$dynamic":"ts_ms","source":"persisted","bound":"after_ack","extra":true}),
+        json!({"$dynamic":"ts_ms","source":"persisted"}),
+        json!({"$dynamic":"ts_ms","source":"persisted","bound":"future"}),
+    ] {
+        let mut invalid = line.clone();
+        invalid["frame"]["ts_ms"] = marker;
+        assert!(FixtureLine::parse(&invalid.to_string()).is_err());
+    }
+}
+
+#[test]
+fn permission_fixture_principal_is_a_literal_valid_token_identity() {
+    let lines = include_str!("../../web/client/test/fixtures/wire/permission-decision.jsonl");
+    let close = lines
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|line| line["frame"]["ev"]["state"] == "closed")
+        .unwrap();
+    assert_eq!(close["frame"]["ev"]["principal"], TOKEN_PRINCIPAL);
+}
+
+#[test]
+fn build_version_matcher_is_typed_and_restricted_to_welcome() {
+    let line = json!({"v":1,"step":"send","frame":{"t":"welcome","protocol":1,"server_version":{"$dynamic":"server_version","source":"build"},"capabilities":["read"],"principal":"fixture","server_epoch":"fixture","idempotency_window_ms":1}});
+    assert!(FixtureLine::parse(&line.to_string()).is_ok());
+    for (field, value) in [
+        (
+            "server_version",
+            json!({"$dynamic":"server_version","source":"socket"}),
+        ),
+        (
+            "server_version",
+            json!({"$dynamic":"server_version","source":"build","extra":true}),
+        ),
+        ("server_epoch", line["frame"]["server_version"].clone()),
+    ] {
+        let mut invalid = line.clone();
+        invalid["frame"][field] = value;
+        assert!(FixtureLine::parse(&invalid.to_string()).is_err());
+    }
+}
+
+#[test]
+fn node_and_project_contracts_keep_explicit_nulls_and_scoped_identity() {
+    let node = crate::mesh::identity::NodeIdentity::fixture([71; 32]).node_id();
+    let value = json!({"node_id":node,"name":"Opaque node","health":null,
+        "latency_ms":null,"last_ok":null,"version":null,"error":null,
+        "online":false,"route":null,"counts":null,"unbound_configured_peers":null,
+        "link_diagnostics":[]});
+    let row: FleetNodeRow = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(serde_json::to_value(row).unwrap(), value);
+    let cwd = crate::test_support::unique_temp_path("fleet-project");
+    let project = json!({"node_id":node,"id":cwd,"name":"Project"});
+    let row: FleetProjectRow = serde_json::from_value(project.clone()).unwrap();
+    assert_eq!(serde_json::to_value(row).unwrap(), project);
 }

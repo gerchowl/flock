@@ -50,7 +50,7 @@ impl Drop for Root {
         fs::remove_dir_all(&self.0).unwrap();
     }
 }
-fn item(id: &str) -> Item {
+pub(crate) fn item(id: &str) -> Item {
     Item {
         item_id: id.into(),
         producer: Producer::Human,
@@ -162,7 +162,7 @@ fn failed_append_or_sync_never_folds_or_publishes_and_requires_reopen() {
     peer.shutdown(Shutdown::Write).unwrap();
     let mut recovery = root.open();
     recovery.file = file;
-    recovery.items.clear();
+    recovery.items = Default::default();
     recovery.records.clear();
     recovery.seq = 0;
     assert!(
@@ -550,7 +550,7 @@ fn lease_probe_child() {
         return;
     };
     let file = private_fs::open_append_file(Path::new(&path)).unwrap();
-    match file.try_lock() {
+    match LockFile::new(file).try_lock() {
         Ok(()) => (),
         Err(std::fs::TryLockError::WouldBlock) => std::process::exit(42),
         Err(error) => panic!("unexpected lease failure: {error}"),
@@ -874,7 +874,14 @@ fn assert_missing_variant_name(raw: Value) {
 
 #[test]
 fn object_form_known_producers_reject_numeric_payloads() {
-    for tag in ["human", "agent", "channel", "system", "fork"] {
+    for tag in [
+        "human",
+        "agent",
+        "node_asserted",
+        "channel",
+        "system",
+        "fork",
+    ] {
         assert_corrupt_item_read_only("producer", json!({tag:42}));
     }
 }
@@ -991,7 +998,7 @@ fn unstamped_v1_gains_a_version_stamp_on_checkpoint() {
     assert_eq!(fs::read(root.path()).unwrap(), before);
     journal.checkpoint().unwrap();
     let header: Value = serde_json::from_slice(&root.identity_prefix()).unwrap();
-    assert_eq!(header["format_version"], 2);
+    assert_eq!(header["format_version"], FORMAT_VERSION);
 }
 
 #[test]
@@ -1389,3 +1396,237 @@ fn assert_first_corruption(first: &[u8], reason: &'static str, seq: Option<u64>)
 }
 
 mod policy;
+
+#[test]
+fn queue_global_facts_only_capture_committed_state_transitions() {
+    use crate::api::queue_event::QueueState;
+    let root = Root::new();
+    let mut j = root.open();
+    let mut a = item("a");
+    a.producer = Producer::Agent("sender-fixture".into());
+    j.append(Change::Upsert {
+        item: Box::new(a.clone()),
+        position: 0,
+    })
+    .unwrap();
+    a.body = "edited".into();
+    j.append(Change::Upsert {
+        item: Box::new(a.clone()),
+        position: 0,
+    })
+    .unwrap();
+    j.append(upsert("b", 1)).unwrap();
+    j.append(Change::Upsert {
+        item: Box::new(a.clone()),
+        position: 1,
+    })
+    .unwrap();
+    j.checkpoint().unwrap();
+    assert!(
+        j.take_facts().is_empty(),
+        "add/edit/reorder/checkpoint are not facts"
+    );
+    a.state = State::Delivered;
+    a.metadata.insert(
+        "batch_id".into(),
+        json!("00000000-0000-4000-8000-000000000001"),
+    );
+    let line = j
+        .append(Change::Upsert {
+            item: Box::new(a),
+            position: 1,
+        })
+        .unwrap();
+    let facts = j.take_facts();
+    assert_eq!(facts.len(), 1);
+    assert_eq!(
+        (facts[0].from, facts[0].to),
+        (QueueState::Queued, QueueState::Delivered)
+    );
+    assert_eq!(facts[0].producer, Producer::Agent("sender-fixture".into()));
+    assert_eq!(facts[0].stream, "queue/fixture-agent");
+    assert_eq!(facts[0].stream_seq, line.seq);
+    assert!(facts[0].batch_id.is_some());
+    assert!(j.take_facts().is_empty(), "completion owns each fact once");
+    j.append(Change::Remove {
+        item_id: "a".into(),
+    })
+    .unwrap();
+    assert!(j.take_facts().is_empty());
+}
+
+#[test]
+fn queue_global_facts_keep_original_transition_sequences_across_rewrite() {
+    use crate::api::queue_event::QueueState;
+    let root = Root::new();
+    let mut j = root.open();
+    j.append(upsert("a", 0)).unwrap();
+    let mut a = item("a");
+    a.state = State::Delivered;
+    let delivered = j
+        .append(Change::Upsert {
+            item: Box::new(a.clone()),
+            position: 0,
+        })
+        .unwrap()
+        .seq;
+    a.state = State::Done;
+    let done = j
+        .append(Change::Upsert {
+            item: Box::new(a.clone()),
+            position: 0,
+        })
+        .unwrap()
+        .seq;
+    let checkpoint = j.checkpoint().unwrap();
+    a.state = State::Held;
+    let held = j
+        .append(Change::Upsert {
+            item: Box::new(a),
+            position: 0,
+        })
+        .unwrap()
+        .seq;
+    let facts = j.take_facts();
+    assert_eq!(
+        facts.iter().map(|f| f.stream_seq).collect::<Vec<_>>(),
+        [delivered, done, held]
+    );
+    assert_eq!(
+        facts.iter().map(|f| f.to).collect::<Vec<_>>(),
+        [QueueState::Delivered, QueueState::Done, QueueState::Held]
+    );
+    assert!(checkpoint.through > done);
+    assert!(j
+        .replay(0)
+        .unwrap()
+        .records
+        .iter()
+        .all(|v| v["seq"] != delivered));
+    drop(j);
+    let mut reopened = root.open();
+    assert!(
+        reopened.take_facts().is_empty(),
+        "loading snapshots must not invent transitions"
+    );
+    assert_eq!(reopened.replay(0).unwrap().through, held);
+}
+
+#[test]
+fn queue_global_facts_never_publish_failed_write_or_sync() {
+    for fail_sync in [false, true] {
+        let root = Root::new();
+        let mut j = root.open();
+        j.append(upsert("a", 0)).unwrap();
+        let mut a = item("a");
+        a.state = State::Delivered;
+        j.append(Change::Upsert {
+            item: Box::new(a.clone()),
+            position: 0,
+        })
+        .unwrap();
+        assert_eq!(j.take_facts().len(), 1);
+        let peer = if fail_sync {
+            let (file, peer) = socket_file();
+            j.file = file;
+            Some(peer)
+        } else {
+            j.file = File::open(root.path()).unwrap();
+            None
+        };
+        a.state = State::Done;
+        assert!(j
+            .append(Change::Upsert {
+                item: Box::new(a),
+                position: 0
+            })
+            .is_err());
+        assert!(j.take_facts().is_empty());
+        assert_eq!(j.items()[0].state, State::Delivered);
+        drop(peer);
+    }
+}
+
+#[test]
+fn custody_completion_real_v2_upgrades_on_first_write_and_v2_refuses_v3() {
+    let root = Root::new();
+    let mut bytes =
+        encode(&json!({"kind":"queue_identity","agent_id":"fixture-agent","format_version":2}))
+            .unwrap();
+    bytes.extend(
+        encode(&Record {
+            seq: 1,
+            change: upsert("v2-item", 0),
+        })
+        .unwrap(),
+    );
+    drop(root.open());
+    fs::write(root.path(), &bytes).unwrap();
+    let mut current = root.open();
+    assert_eq!(current.format_version(), 2);
+    assert_eq!(current.items().len(), 1);
+    current.append(upsert("v3-item", 1)).unwrap();
+    assert_eq!(current.format_version(), 3);
+    drop(current);
+    let bytes = fs::read(root.path()).unwrap();
+    let mut old = Journal::open_inner(&root.0, "fixture-agent", None, true, 2).unwrap();
+    assert_eq!(
+        old.read_only(),
+        Some(ReadOnly::Newer(QueueJournalNewer {
+            found: 3,
+            supported: 2
+        }))
+    );
+    assert!(old
+        .append(upsert("old-item", 2))
+        .unwrap_err()
+        .to_string()
+        .contains("queue_journal_newer"));
+    assert!(old.checkpoint().is_err());
+    assert_eq!(fs::read(root.path()).unwrap(), bytes);
+}
+
+#[test]
+fn no_production_queue_removals() {
+    // Retained committed items are the proof behind a definite custody absence.
+    // These three references only decode/fold old records, never construct one.
+    let remove = regex::Regex::new(r"(?:Change|Self)\s*::\s*Remove\b").unwrap();
+    for (path, source) in crate::cli::exit::tests::production_sources() {
+        if path.contains("/tests/") {
+            continue;
+        }
+        let allowed = if path.ends_with("/structured/queue/model.rs") {
+            2
+        } else if path.ends_with("/structured/queue/mod.rs") {
+            1
+        } else {
+            0
+        };
+        assert_eq!(
+            remove.find_iter(&source).count(),
+            allowed,
+            "production removal would invalidate retained custody proof: {path}"
+        );
+    }
+}
+
+#[test]
+fn inherited_queue_lock_does_not_refuse_reopen() {
+    let root = Root::new();
+    let mut journal = root.open();
+    journal.append(upsert("retained", 0)).unwrap();
+    let mut holder =
+        crate::platform::file_lock::inherited_holder::Holder::spawn(&journal._lease).unwrap();
+    drop(journal);
+    let reopened = Journal::open(&root.0, "fixture-agent");
+    holder.verify().unwrap();
+    assert!(
+        reopened.is_ok(),
+        "queue lease retained by child={} fd={} inode={}: {:?}",
+        holder.pid,
+        holder.descriptor,
+        holder.inode,
+        reopened.as_ref().err().map(io::Error::kind)
+    );
+    assert_eq!(reopened.unwrap().items.len(), 1);
+}

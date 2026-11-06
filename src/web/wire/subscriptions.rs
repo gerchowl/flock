@@ -10,6 +10,8 @@ use tokio::{
 const ACTIVE: usize = 8;
 /// Lifetime identity budget. Exhaustion ends the socket without forgetting IDs.
 const IDS: usize = 1024;
+/// Maximum subscription ID length in UTF-8 bytes, also reserved by fleet frames.
+pub(super) const ID_BYTES: usize = 128;
 /// Global queued/running page jobs. Cancelled waiters retain their job's permit.
 pub(super) static IO: Semaphore = Semaphore::const_new(32);
 pub(super) struct Hint {
@@ -29,6 +31,7 @@ impl Drop for Subscription {
     }
 }
 pub(super) struct Subscriptions {
+    protocol: u32,
     used: HashSet<String>,
     active: HashMap<String, Subscription>,
     hints: Hints,
@@ -47,6 +50,7 @@ impl Subscriptions {
     ) -> Self {
         let owner = shared.histories.clone();
         Self {
+            protocol: WIRE_JSON_VERSION,
             used: HashSet::new(),
             active: HashMap::new(),
             hints: Arc::default(),
@@ -57,12 +61,16 @@ impl Subscriptions {
             priority,
         }
     }
+    pub(super) fn for_protocol(mut self, protocol: u32) -> Self {
+        self.protocol = protocol;
+        self
+    }
     pub(super) fn unsubscribe(&mut self, id: &str) {
         self.active.remove(id);
     }
     /// False requests a resource close. Refusals consume the ID too.
     pub(super) fn subscribe(&mut self, id: String, stream: String, after: Option<u64>) -> bool {
-        if id.len() > 128 || stream.len() > 256 {
+        if id.len() > ID_BYTES || stream.len() > 256 {
             return false;
         }
         self.active.retain(|_, sub| !sub.task.is_finished());
@@ -91,6 +99,7 @@ impl Subscriptions {
             self.session.clone(),
             self.priority.clone(),
         );
+        let protocol = self.protocol;
         let task = tokio::spawn(async move {
             let result = if let Some(code) = refusal {
                 Err(Some(code))
@@ -102,7 +111,10 @@ impl Subscriptions {
                     .await
                 {
                     Some(Ok(())) => {
-                        if stream.starts_with("agent/") {
+                        if stream == "fleet" {
+                            super::fleet::replay(&shared.fleet, &data, &fence, &id, after, protocol)
+                                .await
+                        } else if stream.starts_with("agent/") {
                             replay(&owner, &data, &fence, &hints, &id, &stream, after).await
                         } else {
                             Err(Some(SubfailCode::UnknownStream))
@@ -113,9 +125,8 @@ impl Subscriptions {
                         let _ = priority.send(close(AUTH_REVOKED_CLOSE)).await;
                         return;
                     }
-                    Some(Err(TokenError::Busy | TokenError::Unsafe | TokenError::Io(_))) | None => {
-                        Err(None)
-                    }
+                    Some(Err(TokenError::Busy)) => Err(Some(SubfailCode::SessionBusy)),
+                    Some(Err(TokenError::Unsafe | TokenError::Io(_))) | None => Err(None),
                 }
             };
             if result == Err(None) {
@@ -135,7 +146,7 @@ impl Subscriptions {
         true
     }
 }
-async fn deliver(
+pub(super) async fn deliver(
     data: &mpsc::Sender<Delivery>,
     live: &Arc<AtomicBool>,
     frame: ServerFrame,
@@ -203,7 +214,10 @@ pub(super) async fn replay(
         .await
         .map_err(|_| None)?;
         cut = next;
-        let item = item.map_err(|_| None)?;
+        let item = item.map_err(|error| {
+            crate::logging::client_wire_unavailable("agent_replay_page", Some(error.kind()));
+            None
+        })?;
         let frame = match item {
             Item::Record(record) => {
                 cursor = record.seq;

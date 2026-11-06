@@ -5,14 +5,30 @@ from #1893 is mounted by #1894 in the real headless-server lifecycle, alongside
 the GUI bundle and browser-code exchange. Build with the `web` feature and set
 `[client] bind = "127.0.0.1:7682"` to opt in. Port 0 asks the OS for a free port;
 `flk client open --print` reports the live address, including after a config
-reload. The listener is off by default. `flk web` remains the separate terminal
-bridge.
+reload. This TCP listener is off by default. `flk web` remains the separate
+terminal bridge.
+
+Web-enabled servers also expose `GET /v1/ws` over the private sibling
+`flock-ws.sock`, independently of the TCP bind. An API override such as
+`custom.sock` derives `custom-ws.sock` in the same protected directory. The
+native process must both mint over the API socket and own the WebSocket
+connection: app bearers are bound to its live PID and process birth. TCP
+refuses app bearers with 4401 `peer_process_changed`; browser/file credentials
+retain their scopes. Native admission additionally requires kernel-verified
+LocalOperator identity and never trusts headers as identity. See the
+[app-session credential contract](app-session-token-foundation.md) for exact
+HTTP refusals and handoff behavior.
 
 The first data message is a generated `hello` frame containing a client token.
 The core opens the store once off the async executor, then verifies current
 private token storage using S2a's bounded blocking-I/O budget. Unproven hellos
 never take the exclusive management/cleanup lock. An absolute five-second
 deadline covers receipt, verification and the successful `welcome` write.
+Hello lookup stays independent of token-management ownership. Registration
+waits for concurrent management and revocation intents within that same deadline,
+rather than dropping an otherwise valid browser hello immediately. The shared
+registration lock still fences insertion against revocation; cancelled waiters
+cannot register later.
 Missing, malformed, removed or incorrect credentials and explicit
 authentication-scope refusals fail closed with 4401. If the first `hello` never
 arrives before the five-second deadline, the server closes 1001 and the client
@@ -26,10 +42,88 @@ Credentials, raw frames and their parse errors do not enter diagnostics.
 `welcome` carries the wire version, server version, verified opaque principal,
 random server epoch and 24-hour idempotency-window metadata. The epoch is fresh
 per core and never resets durable cursors. A newer client receives the server's
-wire version and no command capability. No command capabilities are advertised; agent-history subscriptions are
-described below, and command dispatch remains assigned to later slices. Binary frames and other non-protocol post-hello
-data operations are policy violations and close with 1008.
-There is no command admission, structured start or claim of durable journaling.
+wire version and cannot execute commands (`server_version_gap`). No command
+capabilities are advertised. Agent-history subscriptions and the send and decision
+command adapters are described below. Binary frames and other non-protocol
+post-hello data operations are policy violations and close with 1008.
+There is no durable command journal in this slice.
+
+## Structured commands
+
+S7-min routes `cmd agent.send` and `cmd agent.decide` on the app owner, using
+ADR-0036 sections 4/5/5a and the existing structured queue and S6 permission APIs.
+`agent.send` uses the socket API's `target`, `text`, `submit` and optional
+`item_id` fields. With `submit: true`, its success ack returns `{ item_id }`
+after durable queue admission. A single input carries that lifecycle identity
+into the harness turn; lifecycle events report subsequent progress. Admission
+does not mean the harness has started or completed the turn. `submit: false`
+returns `structured_submit_required` before queue or stdin work. Terminal-only
+raw/write options are unsupported for structured turns. Structured ID/name
+resolution keeps #2065's cross-runtime ambiguity checks independently of the
+pane-only resolver.
+
+`agent.decide` uses the generated `AgentDecide` contract. Echo both the
+`request_id` and flk-issued `request_seq` from the open permission record;
+never synthesize a sequence. Success returns `{ request_id, decision }` through
+the normal ack envelope after S6 reserves the named answer. The agent stream's
+closed record remains authoritative for dismissing a permission card. Unknown,
+closed, stale and unauthorized decisions keep S6's registered refusal codes.
+Neither verb allocates a runtime. Non-local or terminal targets return
+`unsupported_for_agent` before allocating a lifecycle item.
+
+Send requires `send` scope and decision requires `answer` scope; both shared
+services additionally require an `operate` token for operator authority. Every
+command rechecks the current token file and scopes while serializing admission
+with revocation. A removed/replaced token gets `auth_revoked`; its ack is flushed
+before all sockets for that token close 4403. Scope shrink instead returns
+`scope` and keeps the socket and allowed reads alive. Already admitted work is
+not cancelled by revocation. Deleting a token alone does not proactively close
+an idle read-only socket; the next command or reconnect detects it.
+
+Only `agent.send` and `agent.decide` are implemented on this wire surface.
+Other verbs, including `agent.interrupt`, receive `server_version_gap` (exit 78)
+before allocating a command task, owner request or permission check. Command
+IDs above 128 bytes receive `invalid_params`. Four pending commands are allowed
+per socket; a fifth receives `session_busy`, leaving the socket open. Writer
+backpressure still applies to refusal acks, including the existing 64 KiB
+encoded-message cap and 45-second blocked-writer ceiling.
+
+The app owner has independent 32-entry send and decision mailboxes. Full
+admission returns `session_busy`, including a race between the connection's
+capacity check and enqueue. It does not disconnect a healthy socket. At most
+32 durable-send receipts remain pending; decision admission is serviced first
+and does not consume receipt capacity. Each owner turn handles at most 32
+requests from each lane. The per-socket limit still applies to both verbs.
+
+Permission-book contention also refuses admission with `session_busy` (retry
+`later`, exit 1) before reserving a decision or writing harness input. The owner
+never waits on the transport's lock. The GUI displays the ack's refusal message
+and does not automatically resend it; this is not an accepted or lost decision.
+
+Duplicate detection is keyed by `(principal, cmd_id)` across that principal's
+sockets. Pending send keys remain pinned until the receipt resolves, even if
+the original socket disconnects. The owner also retains the last 1024 completed
+admissions across all principals, evicting the oldest completed key in FIFO
+order. Refused commands do not claim a key. A retained duplicate returns
+`session_unconfirmed` after authorization, without dispatch. This is a bounded
+in-memory fence, not a recovery journal: eviction, restart and handoff can
+forget completed keys. Clients must never repeat a first send; uncertain
+resends must use `resume_only: true`, which cannot dispatch even if its key is
+absent. There is no cached outcome lookup in this slice. The cross-principal
+completed-key eviction and oversized echoed-ID follow-ups remain in #2296.
+
+An unknown local agent receives `agent_not_found`; an advertised remote agent
+or a known terminal target receives `unsupported_for_agent`. Neither creates a
+runtime or lifecycle item. The decision `message` is currently bounded by the
+frame limit; its separate field limit is tracked in #2249.
+
+This slice implements first sends, not the durable command journal of ADR-0036
+section 5a. `resume_only: true` always returns `session_unconfirmed` without
+dispatch, even within the advertised recovery window. There is no cached ack
+lookup or automatic resend. After uncertain delivery, inspect the queue and
+permission state; never manufacture another first-send command to force a
+retry. Disconnecting a waiter does not cancel input already durably admitted.
+Structured process launch remains separate from this adapter.
 
 Application JSON pings run every 15 seconds independently of other traffic. Each
 nonce is unique to its epoch/socket and sequence. Keep at most three outstanding
@@ -39,18 +133,26 @@ No valid pong for 45 seconds ends the socket and releases its resources. The
 initial baseline is the successful welcome. A supplied monotonic clock governs
 handshake, write and heartbeat deadlines; wall-clock changes grant no liveness.
 
-There are at most 32 HTTP connections before upgrade, plus at most 16 upgraded
-sockets. HTTP overflow closes the accepted I/O before reading a request. The entire HTTP connection has a five-second ceiling, including headers,
-body receipt, response writes and keepalive. Expiry closes its I/O. Successful
-upgrades leave that HTTP lifetime and use the core's independent deadlines. Only
-four unverified
-hello/recheck attempts may be in flight at once; a verified token principal may
-register at most four sockets. Pending overload refuses upgrade with 503; principal overload closes
-1001. Existing authenticated connections retain capacity when slow hellos fill
-the probation slots. This bounds ownership; repeated local connection spam can
-still delay a new connection. It does not grant per-process fairness before
-credentials are known. Each connection has an eight-message
-data queue and a four-message priority queue.
+Each TCP or Unix listener owns at most 32 incomplete HTTP connections and four
+separate overload-response writers. An available response writer sends typed
+503 `preauth_capacity` without parsing another header, then half-closes and
+drains within the same absolute five-second deadline. When that response budget
+is also full, additional over-cap connections close without allocating work.
+Refusals never block normal acceptance. The HTTP deadline includes headers,
+body receipt, response writes and keepalive. Successful upgrades leave that
+lifetime and use the core's independent deadlines.
+
+The two transports share at most 16 upgraded sockets. Each has four pending
+hello/recheck reservations. Each sealed credential digest may register four
+sockets across both transports, including pending welcome. Renewed app mints
+have independent budgets even when they share an operator principal. Pending
+overload refuses upgrade with typed 503; per-credential overload after upgrade
+closes 1001. Existing authenticated connections retain capacity when slow hellos
+fill the probation slots. Management-lock waits use a separate eight-worker budget and retain their
+original hello deadline. They do not reserve the four shared credential-I/O
+workers needed by established subscriptions. These bounds do not promise
+per-process fairness.
+Each connection has an eight-message data queue and a four-message priority queue.
 The writer checks priority between data writes. Frames and reassembled messages
 are capped at 64 KiB, and outgoing serialization stops at that cap rather than
 first allocating an arbitrarily large JSON string. Compression is never
@@ -58,18 +160,16 @@ negotiated. A blocked write fails within 45 seconds; missing pongs retain their
 independent original ceiling. Saturated internal queues end the connection
 rather than growing a backlog. Oversized server output also ends the socket.
 
-The core owns verified token-to-socket identities until teardown. The future
-command slice calls its 4403 fan-out only after the triggering auth_revoked ack
-has been written, within the existing write/liveness bound. The primitive closes
-all registered sockets for that principal, leaving other principals alone.
-A verified socket registers before welcome and rechecks current token storage
-after registration; revocation in that gap closes 4403 without welcome. A
-store failure or handshake deadline, during either verification, instead closes 1001,
-keeping the credential eligible for reconnect. A failed welcome encode or send drops the
-transport without another send or an auth close. Neither failure proves token
-revocation (ADR-0036 §5a). No
-filesystem watcher or automatic command-time revocation route is added
-here; the command slice must recheck storage before dispatch as ADR-0036 requires.
+The core owns verified token-to-socket identities until teardown. Command
+revocation flushes its triggering `auth_revoked` acknowledgement before 4403,
+within the existing write/liveness bound. Fan-out closes registered sockets of
+that credential, leaving other credentials alone. A refused hello before
+registration closes 4401 without welcome. After registration, storage recheck or
+process-exit revocation closes 4403, including before welcome. A store failure or
+handshake deadline instead closes 1001, preserving the credential for reconnect.
+A failed welcome encode or send drops the transport without another send or an
+authentication close; neither proves revocation (ADR-0036 §5a). Commands recheck
+storage before dispatch under the admission/revocation fence.
 Closing the core cancels pending hellos and authenticated sockets. Explicit
 shutdown waits up to five seconds for connection leases and reports failure to
 release them; it never treats that ceiling as evidence of success.
@@ -94,14 +194,32 @@ bound IPv4 authority (normalizing HTTP's default port only). API routes require
 Origin; top-level GUI navigation may omit it. Forwarded headers grant nothing.
 The GUI index carries CSP with self-only default, script and style sources,
 self plus the exact WebSocket URL for connections, and no objects, base URL,
-framing or form actions. There is no generated configuration script.
+framing or form actions; every other response carries a deny-all policy
+(see [GUI bundle hosting](structured-gui-hosting.md#document-security-policy),
+#1848). There is no generated configuration script.
 
-Startup runs `tailscale serve status --json` off the async executor, bounded at
-five seconds and 64 KiB. Any serve or funnel configuration targeting the bound
-port, unsuccessful or malformed status, and an unavailable probe refuse the
-configured listener and server startup; there is no silent fallback. Exit status
-is checked before parsing JSON. Forwarding changes after startup are not
-monitored. The operator must keep forwarding to this port disabled.
+Startup distinguishes three forwarding-probe outcomes off the async executor:
+
+- `NotInstalled`: no CLI on PATH or in the standard macOS app bundle, and no
+  LocalAPI socket at the platform's standard locations. Start the listener
+  and emit one INFO record listing the paths checked and why the forwarding
+  check was skipped. Inspection errors never establish absence.
+- `Status`: use the discovered PATH or app-bundle CLI for
+  `tailscale serve status --json`, bounded at five seconds and 64 KiB. Any
+  serve/funnel rule targeting the bound port still refuses startup.
+- `Unavailable`: installation evidence exists but status cannot be obtained,
+  including a socket with no CLI, failed execution, nonzero exit or malformed
+  JSON. Refuse startup, naming the evidence and failure. Exit status is checked
+  before parsing JSON; there is no fallback after an unsuccessful probe.
+
+On macOS the standard bundle CLI is
+`/Applications/Tailscale.app/Contents/MacOS/Tailscale` and the default daemon
+socket is `/var/run/tailscaled.socket`. Linux checks both
+`/var/run/tailscale/tailscaled.sock` and `/run/tailscale/tailscaled.sock`.
+Custom installation/socket locations outside those defaults are not inferred;
+make the CLI available on the server's PATH. Host/Origin checks, IPv4 loopback
+binding and all other admission rules are unchanged. Forwarding changes after
+startup are not monitored; the operator must keep this port unforwarded.
 
 Live handoff transfers the bound listening descriptor rather than rebinding its
 port after commit. The importer validates a listening socket and its configured

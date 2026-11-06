@@ -43,7 +43,7 @@ describe("live permission inbox", () => {
     expect(cards(root)).toHaveLength(1);
     expect(cards(root)[0]).toContain("Bash");
     expect(cards(root)[0]).toContain("true");
-    expect($$(root, "inbox-card")[0]?.getAttribute("data-request-seq")).toBe("1");
+    expect($$(root, "inbox-card")[0]?.getAttribute("data-request-seq")).toBe("3");
     raw("fixture", records[1] as object);
     expect(cards(root)).toEqual([]);
   });
@@ -127,13 +127,13 @@ describe("live permission inbox", () => {
     expect(cards(root).map((text) => (text.match(/second\.rs|third\.rs|first cmd/) ?? [""])[0])).toEqual(["first cmd", "second.rs", "third.rs"]);
   });
 
-  test("the phone headline counts waiting_on_human, like the badge, even after a closed record", () => {
+  test("the phone headline stays unknown without node counts, regardless of permission ids", () => {
     const { root, fleet, event, close } = mountInbox("phone");
     fleet("atlas", ["r1", "r2"]);
     event("atlas", "r1");
     close("atlas", "r1");
     expect(cards(root)).toHaveLength(1);
-    expect(root.querySelector('[data-testid="inbox-headline"]')?.textContent).toBe("2 blocked on you.");
+    expect(root.querySelector('[data-testid="inbox-headline"]')?.textContent).toBe("agents waiting: unknown; no nodes reporting");
   });
 
   test("a record that does not match the decided shape fails visibly, naming what is wrong", () => {
@@ -143,7 +143,9 @@ describe("live permission inbox", () => {
     raw("atlas", { type: "flk_permission_request", state: "open", request_id: "r1", request: { tool_name: "Bash", input: {}, tool_use_id: "t", subtype: "can_use_tool" } });
     expect(cards(root)).toHaveLength(1);
     expect(cards(root)[0]).toContain("permission r1");
-    expect(cards(root)[0]).toContain("Unusable permission record: request_seq is missing or not an integer");
+    const card = root.querySelector('[data-testid="inbox-card"]');
+    expect(card?.querySelector(".card__detail")?.textContent).toBe("This permission record could not be read, so it cannot be answered here.");
+    expect(card?.querySelector('[data-testid="details"]')?.textContent).toBe("Details request_seq is missing or not an integer");
     expect(cards(root)[0]).not.toContain("Loading details");
   });
 
@@ -157,7 +159,7 @@ describe("live permission inbox", () => {
     expect(cards(root)[2]).toContain("unreadable permission record");
     expect(cards(root)[2]).toContain("request_id is missing");
     raw("atlas", { type: "flk_permission_request", state: "open", request_id: "r1" });
-    expect(cards(root)[0]).toContain("Unusable permission record");
+    expect(cards(root)[0]).toContain("This permission record could not be read");
     event("atlas", "r1");
     expect(cards(root)[0]).toContain("just check");
   });

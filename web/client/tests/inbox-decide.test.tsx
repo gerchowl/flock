@@ -4,10 +4,12 @@
  */
 import { afterEach, describe, expect, test } from "bun:test";
 
+import type { AgentDecideErrorCode } from "../src/gen/AgentDecideErrorCode";
 import type { ServerFrame } from "../src/gen/ServerFrame";
 import type { OutboxStatus } from "../src/gen/OutboxStatus";
 import type { OutboxEntry } from "../src/wire/outbox";
-import { MESSAGE_MAX_BYTES, REFUSALS, decideState } from "../src/workbench/decide";
+import { decideState } from "../src/workbench/decide";
+import { MESSAGE_MAX_BYTES, REFUSALS, explain } from "../src/workbench/refusals";
 import { STATUS_LABELS } from "../src/workbench/Composer";
 import { WELCOME, sentFrames, step } from "./wire/harness";
 import { $$, cards, frames, mountInbox, unmountInbox, type App } from "./wire/inbox-app";
@@ -22,6 +24,7 @@ const button = (app: App, label: string): HTMLButtonElement => {
   return found;
 };
 const status = (app: App): string => app.root.querySelector('[data-testid="decide-status"]')?.textContent ?? "";
+const details = (app: App): string | null => app.root.querySelector('[data-testid="inbox-card"] [data-testid="details"]')?.textContent ?? null;
 const ack = (app: App, frame: Partial<Extract<ServerFrame, { t: "ack" }>> & { cmd_id: string; ok: boolean }): void => app.h.step(step({ step: "send", frame: { t: "ack", ...frame } as ServerFrame }));
 const refusal = (code: string) => ({ code, message: `server said ${code}`, exit: 1, retry: "never" as const });
 
@@ -65,7 +68,7 @@ for (const mode of ["desktop", "phone"] as const) {
       button(app, "Allow once").click();
       const id = cmds(app)[0]?.cmd_id ?? "";
       ack(app, { cmd_id: id, ok: false, error: refusal("permission_request_closed") });
-      expect(status(app)).toBe(REFUSALS.permission_request_closed);
+      expect(status(app)).toBe(`${REFUSALS.permission_request_closed.effect} ${REFUSALS.permission_request_closed.next}`);
       expect(cards(app.root)).toHaveLength(1);
       for (const label of ["Allow once", "Always allow", "Deny"]) expect(button(app, label).hasAttribute("disabled")).toBe(true);
       button(app, "Deny").click();
@@ -89,18 +92,30 @@ describe("the card's state is the outbox entry's", () => {
       (["pending", "sent", "uncertain", "unknown_outcome"] as const).map((status) => ({ kind: "inflight", line: STATUS_LABELS[status] })),
     );
     expect(decideState([entry("acked")], card)).toEqual({ kind: "answered" });
-    expect(decideState([entry("failed")], card)).toEqual({ kind: "refused", line: `${STATUS_LABELS.failed}: no reason given` });
+    const bare = explain({ code: "", message: STATUS_LABELS.failed });
+    expect(decideState([entry("failed")], card)).toEqual({ kind: "refused", line: bare.line, refusal: bare });
     expect(decideState([entry("failed", 40)], card)).toEqual({ kind: "idle" });
     expect(decideState([], card)).toEqual({ kind: "idle" });
   });
 });
 
 describe("answering a prompt", () => {
-  test("a refusal code outside AgentDecideErrorCode, like invalid_params, shows its message, is never retried, and waits for a new seq", () => {
+  test("invalid_params renders the trimmed UTF-8 message limit and control-byte guidance", () => {
+    const app = prompt();
+    button(app, "Deny").click();
+    ack(app, { cmd_id: cmds(app)[0]?.cmd_id ?? "", ok: false, error: refusal("invalid_params") });
+    expect(status(app)).toBe("The message is too long, or holds characters the server refuses. Shorten it and remove any control characters, then send it again.");
+    expect(details(app)).toBe("Detailsinvalid_params server said invalid_params");
+    expect(button(app, "Deny").hasAttribute("disabled")).toBe(true);
+    expect(cmds(app)).toHaveLength(1);
+  });
+
+  test("a refusal code outside the shared map, like future_refusal, gets its retry class's copy with the code behind Details, is never retried, and waits for a new seq", () => {
     const app = prompt();
     button(app, "Allow once").click();
-    ack(app, { cmd_id: cmds(app)[0]?.cmd_id ?? "", ok: false, error: refusal("invalid_params") });
-    expect(status(app)).toBe(`${STATUS_LABELS.failed}: server said invalid_params`);
+    ack(app, { cmd_id: cmds(app)[0]?.cmd_id ?? "", ok: false, error: refusal("future_refusal") });
+    expect(status(app)).toBe("The server refused this. Trying again will not help; check the details.");
+    expect(details(app)).toBe("Detailsfuture_refusal server said future_refusal");
     for (const label of ["Allow once", "Always allow", "Deny"]) expect(button(app, label).hasAttribute("disabled")).toBe(true);
     button(app, "Allow once").click();
     expect(cmds(app)).toHaveLength(1);
@@ -108,6 +123,57 @@ describe("answering a prompt", () => {
     button(app, "Review new request").click();
     expect(button(app, "Allow once").hasAttribute("disabled")).toBe(false);
   });
+
+  test("session_busy is visible and never resubmits a decision", () => {
+    const app = prompt();
+    button(app, "Allow once").click();
+    ack(app, { cmd_id: cmds(app)[0]?.cmd_id ?? "", ok: false, error: { code: "session_busy", message: "command refused: session_busy", exit: 1, retry: "later" } });
+    expect(status(app)).toBe("The server is busy. Try again in a moment.");
+    expect(status(app)).not.toContain("session_busy");
+    for (const label of ["Allow once", "Always allow", "Deny"]) expect(button(app, label).hasAttribute("disabled")).toBe(true);
+    button(app, "Allow once").click();
+    expect(cmds(app)).toHaveLength(1);
+  });
+
+  test("a request id that closes and reopens needs the review step before any button enables", () => {
+    const app = prompt();
+    app.close("atlas", "r1");
+    expect(cards(app.root)).toHaveLength(0);
+    // The server may reuse an id once it is outside its retained-closed window (permissions.rs).
+    app.event("atlas", "r1", "Bash", { command: "rm -rf build" }, 50);
+    expect(cards(app.root)).toHaveLength(1);
+    expect(status(app)).toBe("Request changed — review it.");
+    for (const label of ["Allow once", "Always allow", "Deny"]) expect(button(app, label).hasAttribute("disabled")).toBe(true);
+    button(app, "Allow once").click();
+    expect(cmds(app)).toHaveLength(0);
+    button(app, "Review new request").click();
+    expect(button(app, "Allow once").hasAttribute("disabled")).toBe(false);
+    button(app, "Allow once").click();
+    expect(cmds(app)).toHaveLength(1);
+    expect(cmds(app)[0]?.args).toMatchObject({ request_id: "r1", request_seq: 50 });
+  });
+
+  for (const closeWhileAway of [false, true]) {
+    test(`a closed id that reopens after leaving the phone Inbox tab still needs review (closed ${closeWhileAway ? "while away" : "before leaving"})`, () => {
+      const app = prompt("phone");
+      const tab = (label: string): HTMLButtonElement => {
+        const found = [...app.root.querySelectorAll<HTMLButtonElement>(".tabbar button")].find((b) => b.textContent?.startsWith(label));
+        if (found === undefined) throw new Error(`no ${label} tab`);
+        return found;
+      };
+      if (!closeWhileAway) app.close("atlas", "r1");
+      tab("Agents").click();
+      expect(cards(app.root)).toHaveLength(0);
+      if (closeWhileAway) app.close("atlas", "r1");
+      app.event("atlas", "r1", "Bash", { command: "rm -rf build" }, 50);
+      tab("Inbox").click();
+      expect(cards(app.root)).toHaveLength(1);
+      expect(status(app)).toBe("Request changed — review it.");
+      for (const label of ["Allow once", "Always allow", "Deny"]) expect(button(app, label).hasAttribute("disabled")).toBe(true);
+      button(app, "Review new request").click();
+      expect(button(app, "Allow once").hasAttribute("disabled")).toBe(false);
+    });
+  }
 
   test("a caught send error covers the status only until the status changes", () => {
     const app = prompt();
@@ -128,15 +194,17 @@ describe("answering a prompt", () => {
     const app = prompt();
     button(app, "Deny").click();
     ack(app, { cmd_id: cmds(app)[0]?.cmd_id ?? "", ok: false, error: refusal("not_authorized") });
-    expect(status(app)).toBe(REFUSALS.not_authorized);
-    expect(Object.keys(REFUSALS)).toEqual(["permission_request_unknown", "permission_request_closed", "not_authorized"]);
+    expect(status(app)).toBe(`${REFUSALS.not_authorized.effect} ${REFUSALS.not_authorized.next}`);
+    const decide: readonly AgentDecideErrorCode[] = ["permission_request_unknown", "permission_request_closed", "not_authorized", "invalid_params"];
+    for (const code of decide) expect(Object.hasOwn(REFUSALS, code)).toBe(true);
   });
 
-  test("an untyped refusal shows the server's message", () => {
+  test("an untyped refusal keeps the server's message behind Details, out of the status line", () => {
     const app = prompt();
     button(app, "Deny").click();
     ack(app, { cmd_id: cmds(app)[0]?.cmd_id ?? "", ok: false, error: refusal("something_new") });
-    expect(status(app)).toBe(`${STATUS_LABELS.failed}: server said something_new`);
+    expect(status(app)).not.toContain("something_new");
+    expect(details(app)).toBe("Detailssomething_new server said something_new");
   });
 
   test("across a reconnect the decision is never sent again as a first send, and the card still shows the outbox state with its buttons disabled", () => {
@@ -212,7 +280,7 @@ describe("answering a prompt", () => {
     expect(button(app, "Confirm always allow").hasAttribute("disabled")).toBe(true);
     button(app, "Confirm always allow").click();
     expect(cmds(app)).toHaveLength(0);
-    expect(status(app)).toContain("over the 2048-byte limit");
+    expect(status(app)).toBe("The message is too long. Shorten it to send your answer.");
   });
 
   test("a send error for one request never shows on the next", () => {
@@ -253,12 +321,12 @@ describe("answering a prompt", () => {
     const fits = "€".repeat(Math.floor(MESSAGE_MAX_BYTES / 3));
     type(app, `  ${fits}  `);
     expect(button(app, "Allow once").hasAttribute("disabled")).toBe(false);
-    expect($$(app.root, "decide-count")[0]?.textContent).toBe(`${MESSAGE_MAX_BYTES - (fits.length * 3)} bytes left`);
+    expect($$(app.root, "decide-count")[0]?.textContent).toBe(`About ${MESSAGE_MAX_BYTES - (fits.length * 3)} characters left`);
     type(app, `${fits}😀`);
     expect(fits.length + 2).toBeLessThan(MESSAGE_MAX_BYTES);
     expect(button(app, "Allow once").hasAttribute("disabled")).toBe(true);
-    expect($$(app.root, "decide-count")[0]?.textContent).toBe(`${fits.length * 3 + 4 - MESSAGE_MAX_BYTES} bytes over the limit`);
-    expect(status(app)).toBe(`The message is ${fits.length * 3 + 4 - MESSAGE_MAX_BYTES} bytes over the ${MESSAGE_MAX_BYTES}-byte limit.`);
+    expect($$(app.root, "decide-count")[0]?.textContent).toBe("The message is too long");
+    expect(status(app)).toBe("The message is too long. Shorten it to send your answer.");
     button(app, "Allow once").click();
     expect(cmds(app)).toHaveLength(0);
     type(app, fits);

@@ -25,7 +25,7 @@ pub(crate) struct Case {
     pub id: String,
     session: String,
     pub generation: u64,
-    leases: SessionLeases,
+    pub(crate) leases: SessionLeases,
 }
 impl Case {
     pub fn start(
@@ -75,13 +75,31 @@ impl Case {
             storage: Default::default(),
             mcp: fixture.mcp(),
             stall_after: STALL,
+            queue_rewrite_bytes: crate::config::Config::default()
+                .sessions
+                .queue_rewrite_bytes,
             lineage: None,
             admission: None,
         };
-        let f = fixture.clone();
-        let authority = leases.clone();
+        let case = Self {
+            fixture,
+            id,
+            session,
+            generation,
+            leases,
+        };
+        let factory = case.factory(mode, events);
+        (case, launch, factory)
+    }
+    pub(crate) fn factory(
+        &self,
+        mode: &str,
+        events: Vec<Value>,
+    ) -> impl FnOnce(&Record) -> Result<LaunchProfile, LaunchError> + Send + 'static {
+        let f = self.fixture.clone();
+        let authority = self.leases.clone();
         let mode = mode.to_owned();
-        let factory = move |record: &Record| {
+        move |record: &Record| {
             assert!(
                 authority.is_reserved(&record.session_id).unwrap(),
                 "reserve precedes profile factory"
@@ -112,18 +130,7 @@ impl Case {
                 0o600,
             );
             Ok(profile)
-        };
-        (
-            Self {
-                fixture,
-                id,
-                session,
-                generation,
-                leases,
-            },
-            launch,
-            factory,
-        )
+        }
     }
     pub(crate) fn assert_shutdown(&self, registry: &Registry, workers: &Workers) {
         assert!(workers.entries[&self.id].thread.is_none(), "worker joined");
@@ -174,6 +181,7 @@ impl Case {
         workers.entries.insert(
             case.id.clone(),
             Worker {
+                live: live::Source::default(),
                 generation: case.generation,
                 messages,
                 runtime: None,
@@ -182,6 +190,8 @@ impl Case {
                 finished: false,
                 events_closed: false,
                 stall_after: STALL,
+                queue_state: None,
+                queue_seq: 0,
                 lineage: None,
                 thread: Some(std::thread::spawn(|| {})),
             },
@@ -199,7 +209,17 @@ impl Case {
         worker.report = None;
     }
     pub fn submit(&self, workers: &Workers) {
-        workers.runtime(&self.id, self.generation).unwrap().try_submit(&json!({"type":"user","message":{"role":"user","content":"fixture turn"},"parent_tool_use_id":null,"session_id":""})).unwrap();
+        let mut item = crate::structured::queue::tests::item(&self.session);
+        item.body = "fixture turn".into();
+        workers
+            .runtime(&self.id, self.generation)
+            .unwrap()
+            .queue_enqueue(super::queue::Request {
+                item,
+                principal: crate::structured::queue::admission::Principal::Operator,
+                gate: crate::structured::queue::admission::Gate::Send,
+            })
+            .unwrap();
     }
     pub async fn ready(
         &self,
@@ -390,9 +410,24 @@ async fn explicit_stop_closes_open_request_and_releases_only_after_completion() 
     assert!(workers.runtime(&a.id, a.generation).is_none());
     registry.remove(&a.id, a.generation).unwrap();
     workers.poll(&mut registry, now, 1000);
+    let hub = crate::api::EventHub::default();
+    crate::app::queue_events::QueueEvents::default().poll(
+        &workers,
+        &registry,
+        &hub,
+        &mut Default::default(),
+    );
+    assert!(
+        hub.events_after(0)
+            .expect("fixture event history is retained")
+            .iter()
+            .any(|(_, event)| event.event == crate::api::schema::EventKind::QueueItemState),
+        "committed exit fact must precede retirement"
+    );
+    workers.poll(&mut registry, now, 1000);
     assert!(
         !workers.entries.contains_key(&a.id),
-        "removed agents cannot accumulate completed workers"
+        "removed agents cannot accumulate completed workers after their facts drain"
     );
 }
 
@@ -640,6 +675,7 @@ async fn missing_worker_completion_retains_uncertain_authority_and_refuses_resta
     workers.entries.insert(
         a.id.clone(),
         Worker {
+            live: live::Source::default(),
             generation: a.generation,
             messages,
             runtime: None,
@@ -648,6 +684,8 @@ async fn missing_worker_completion_retains_uncertain_authority_and_refuses_resta
             finished: false,
             events_closed: false,
             stall_after: STALL,
+            queue_state: None,
+            queue_seq: 0,
             lineage: None,
             thread: Some(std::thread::spawn(|| {})),
         },
@@ -932,7 +970,7 @@ async fn registry_worker_launch_uses_configured_blob_threshold() {
             .expect("configured threshold must project this block");
     let store = crate::structured::blobs::BlobStore::open(case.fixture.root.path()).unwrap();
     assert_eq!(reference.size, bytes.len() as u64);
-    assert_eq!(store.get(&reference.blob).unwrap(), bytes);
+    assert_eq!(store.get(&reference.blob, reference.size).unwrap(), bytes);
     assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), block);
 }
 
@@ -1220,6 +1258,7 @@ async fn owner_lease_acquisition_retires_pending_without_double_counting() {
     assert_eq!(count_after, Ok((1, 1)));
 }
 
+mod queue;
 /// A new lease generation must preserve ancestry even when the operator resumes.
 #[tokio::test]
 async fn operator_resume_preserves_original_lease_lineage() {
@@ -1228,6 +1267,9 @@ async fn operator_resume_preserves_original_lease_lineage() {
     launch.lineage = Some(("original-parent".into(), 2));
     let template = Launch {
         opening_turn: None,
+        queue_rewrite_bytes: crate::config::Config::default()
+            .sessions
+            .queue_rewrite_bytes,
         agent_id: case.id.clone(),
         generation: case.generation,
         leases: case.leases.clone(),
@@ -1289,3 +1331,12 @@ async fn finished_without_report_allows_retained_recovery() {
     worker.report = None;
     assert!(workers.history_recovery_allowed(&case.id));
 }
+
+mod recovery;
+
+pub(crate) mod global;
+
+mod send;
+
+#[path = "tests/live.rs"]
+mod live_feed;
