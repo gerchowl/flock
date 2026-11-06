@@ -51,7 +51,7 @@ pub(crate) struct RelaySend {
 #[derive(Debug)]
 pub(crate) struct RelayCompletion {
     pub send: RelaySend,
-    pub result: Result<bool, crate::peers::PeerMessageFailure>,
+    pub result: Result<crate::mesh::delivery::Acknowledged, crate::peers::PeerMessageFailure>,
     /// The recipient's signed terminal receipt carried by a refusal (#872).
     pub receipt: Option<crate::mesh::store::Envelope>,
 }
@@ -178,7 +178,10 @@ mod tests {
         let completion = || {
             AppEvent::MsgRelayCompleted(Box::new(RelayCompletion {
                 send: relay.clone(),
-                result: Ok(true),
+                result: Ok(crate::mesh::delivery::Acknowledged {
+                    delivered: true,
+                    item_id: None,
+                }),
                 receipt: None,
             }))
         };

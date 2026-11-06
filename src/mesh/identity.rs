@@ -26,12 +26,24 @@ struct StoredIdentity {
     public_key: [u8; 32],
 }
 
+static CACHE: std::sync::Mutex<Option<(std::path::PathBuf, NodeIdentity)>> =
+    std::sync::Mutex::new(None);
 impl NodeIdentity {
+    /// Reuse the already initialized server identity, never bootstrap a key.
+    /// Missing initialization is a refusal, including during recovery.
+    pub(crate) fn existing() -> io::Result<Self> {
+        CACHE
+            .lock()
+            .map_err(|_| io::Error::other("node identity cache poisoned"))?
+            .as_ref()
+            .filter(|(path, _)| path == &crate::config::state_dir())
+            .map(|(_, identity)| identity.clone())
+            .ok_or_else(|| io::Error::other("node identity not initialized"))
+    }
+
     pub(crate) fn load() -> io::Result<Self> {
         // A process keeps its validated key in memory. The path distinguishes
         // isolated test homes without repeatedly reading the private key.
-        static CACHE: std::sync::Mutex<Option<(std::path::PathBuf, NodeIdentity)>> =
-            std::sync::Mutex::new(None);
         let path = crate::config::state_dir();
         let mut cache = CACHE
             .lock()

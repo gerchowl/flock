@@ -140,7 +140,9 @@ impl RawInputFramer {
                     )));
                 }
                 extract_one_event(&chunk).map(|(event, _consumed)| {
-                    crate::logging::raw_input_event_parsed(&chunk, &format!("{:?}", event));
+                    crate::logging::raw_input_event_parsed(
+                        crate::logging::types::InputMetadata::raw(chunk.len(), &event),
+                    );
                     event
                 })
             })
@@ -216,7 +218,7 @@ impl RawInputByteFramer {
         }
 
         if self.buffer.as_slice() == [ESC] {
-            crate::logging::raw_input_flushing_lone_escape(&self.buffer);
+            crate::logging::raw_input_flushing_lone_escape(self.buffer.len());
             chunks.push(std::mem::take(&mut self.buffer));
             return chunks;
         }
@@ -229,17 +231,17 @@ impl RawInputByteFramer {
         }
 
         if starts_with_incomplete_utf8_char(&self.buffer) {
-            crate::logging::raw_input_waiting_utf8_continuation(&self.buffer);
+            crate::logging::raw_input_waiting_utf8_continuation(self.buffer.len());
             return chunks;
         }
 
         if self.buffer.first() == Some(&ESC) && starts_with_incomplete_utf8_char(&self.buffer[1..])
         {
-            crate::logging::raw_input_waiting_escaped_utf8_continuation(&self.buffer);
+            crate::logging::raw_input_waiting_escaped_utf8_continuation(self.buffer.len());
             return chunks;
         }
 
-        crate::logging::raw_input_dropping_incomplete_buffer(&self.buffer);
+        crate::logging::raw_input_dropping_incomplete_buffer(self.buffer.len());
         self.buffer.clear();
         chunks
     }
@@ -344,12 +346,15 @@ fn send_raw_input_events(events: Vec<RawInputEvent>, tx: &mpsc::Sender<RawInputE
 }
 
 #[cfg(test)]
-fn drain_buffer(buffer: &mut Vec<u8>, tx: &mpsc::Sender<RawInputEvent>) {
+pub(crate) fn drain_buffer(buffer: &mut Vec<u8>, tx: &mpsc::Sender<RawInputEvent>) {
     for bytes in drain_complete_input_bytes(buffer) {
         let Some((event, _consumed)) = extract_one_event(&bytes) else {
             continue;
         };
-        crate::logging::raw_input_event_parsed(&bytes, &format!("{:?}", event));
+        crate::logging::raw_input_event_parsed(crate::logging::types::InputMetadata::raw(
+            bytes.len(),
+            &event,
+        ));
         let _ = tx.blocking_send(event);
     }
 }
@@ -475,7 +480,7 @@ fn extract_one_event(buffer: &[u8]) -> Option<(RawInputEvent, usize)> {
             return Some((RawInputEvent::Key(key), seq_len));
         }
 
-        crate::logging::raw_input_unsupported_escape(seq);
+        crate::logging::raw_input_unsupported_escape(seq.len());
         return Some((RawInputEvent::Unsupported, seq_len));
     }
 

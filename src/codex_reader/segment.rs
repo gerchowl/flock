@@ -62,7 +62,7 @@ impl Capture {
 }
 
 /// Admission failures retain binding's launch-scoped fallback/trust distinction.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Error {
     Binding(Failure),
     Record(Reason),
@@ -316,15 +316,17 @@ fn seed(reader: &mut Reader, mut checkpoint: Checkpoint, copied: bool) -> Result
 impl Segment {
     /// Deliver only the current reader's verified suffix; source failure cannot
     /// leave a cached idle/working decision usable. Capability checks are #1857.
-    pub fn poll(&mut self, now: Instant) -> Result<(), Error> {
+    pub fn poll(&mut self, now: Instant) -> Result<Update, Error> {
         match self.reader.poll(now) {
-            Ok(update) => self.reducer.feed(&update.bytes, now),
+            Ok(update) => {
+                self.reducer.feed(&update.bytes, now);
+                Ok(update)
+            }
             Err(reason) => {
                 self.reducer.invalidate(reason);
-                return Err(Error::Record(reason));
+                Err(Error::Record(reason))
             }
         }
-        Ok(())
     }
     pub fn observe(&self, now: Instant) -> Observation<'_> {
         self.reducer.observe(now)
@@ -350,5 +352,7 @@ impl Segment {
         Ok(Handoff(Box::new(self)))
     }
 }
+pub(crate) mod worker;
+
 #[cfg(test)]
 mod tests;

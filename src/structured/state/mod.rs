@@ -39,6 +39,9 @@ pub enum Input<'a> {
     /// Every stdout event, including unknown lines, counts as stream progress.
     /// Stream consumers must use `Received::state_input` to include host closes.
     Event(&'a SessionEvent),
+    /// A book-correlated stdout request with its flk-issued decision handle.
+    /// Only the transport adapter supplies this sequence, never harness JSON.
+    PermissionEvent(&'a SessionEvent, u64),
     /// Stdout progress whose tool request was already reserved by a grant.
     /// It never opens a needs-human entry.
     Progress,
@@ -64,6 +67,10 @@ pub struct Update {
     pub phase_changed: Option<(Phase, Phase)>,
     /// All currently open permission/question requests, in id order.
     pub needs_human: Vec<(String, HumanReason)>,
+    /// Open book-issued `(request_id, request_seq)` handles for operator decisions.
+    /// S7 slice 5 must carry both fields unchanged end to end. Legacy stdout with
+    /// no authenticated sequence can request attention but cannot authorize a decide.
+    pub permission_requests: Vec<(String, u64)>,
     /// Last stdout or accepted input's Unix ms, once per silent interval.
     pub stalled_since_ms: Option<u64>,
     /// Next monotonic observation boundary, if silence or settling needs one.
@@ -85,6 +92,7 @@ pub struct SessionState {
     turn_since: Option<Instant>,
     lifecycle: Lifecycle,
     controls: BTreeMap<String, HumanReason>,
+    permission_requests: BTreeMap<String, u64>,
     tools: BTreeSet<String>,
     limit: Option<Option<u64>>,
     crashed: bool,
@@ -104,6 +112,7 @@ impl SessionState {
             turn_since: None,
             lifecycle: Lifecycle::Live,
             controls: BTreeMap::new(),
+            permission_requests: BTreeMap::new(),
             tools: BTreeSet::new(),
             limit: None,
             crashed: false,
@@ -148,10 +157,15 @@ impl SessionState {
                 self.progress = Some((at, at_ms));
                 self.stalled = false;
             }
-            Input::Event(event) => {
+            Input::Event(event) | Input::PermissionEvent(event, _) => {
                 self.progress = Some((now, unix_ms));
                 self.stalled = false;
                 self.event(event, now);
+                if let (Input::PermissionEvent(_, seq), SessionEvent::CanUseTool(e)) =
+                    (&input, event)
+                {
+                    self.permission_requests.insert(e.request_id.clone(), *seq);
+                }
             }
             Input::Progress => {
                 self.progress = Some((now, unix_ms));
@@ -171,6 +185,8 @@ impl SessionState {
             }
             Input::Observe => (),
         }
+        self.permission_requests
+            .retain(|id, _| self.controls.contains_key(id));
         let attention = if let Some(reset) = self.limit {
             Attention::Blocked {
                 reason: BlockedReason::ProviderLimit,
@@ -260,6 +276,11 @@ impl SessionState {
                 .iter()
                 .map(|(id, reason)| (id.clone(), *reason))
                 .collect(),
+            permission_requests: self
+                .permission_requests
+                .iter()
+                .map(|(id, seq)| (id.clone(), *seq))
+                .collect(),
             stalled_since_ms,
             observe_at,
         }
@@ -327,6 +348,7 @@ impl SessionState {
                 self.result(now)
             }
             SessionEvent::CanUseTool(e) => {
+                self.permission_requests.remove(&e.request_id);
                 self.controls.insert(
                     e.request_id.clone(),
                     if e.request.tool_name == "AskUserQuestion" {

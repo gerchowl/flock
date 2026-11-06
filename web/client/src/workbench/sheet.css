@@ -1,0 +1,37 @@
+/* The shortcut sheet (#2904). The browser centres a modal <dialog>; tokens only, layout from the primitives. */
+
+.sheet {
+  min-inline-size: calc(var(--space-12) * 8);
+  padding: var(--space-4);
+  border: var(--border-width-thin) solid var(--color-separator);
+  border-radius: var(--radius-large);
+  background: var(--color-background-window);
+  color: var(--color-label-primary);
+}
+
+.sheet__title {
+  font-size: var(--font-size-15);
+  font-weight: var(--font-weight-semibold);
+}
+
+.shortcuts {
+  padding: 0;
+  list-style: none;
+}
+
+/* A shortcut is written in the system font, as a menu writes it. */
+.shortcuts__keys {
+  color: var(--color-label-secondary);
+  font: inherit;
+}
+
+.sheet__done {
+  min-block-size: var(--size-control);
+  padding-inline: var(--space-3);
+  border: var(--border-width-thin) solid var(--color-separator);
+  border-radius: var(--radius-small);
+  background: var(--color-background-window);
+  color: var(--color-label-primary);
+  font: inherit;
+  cursor: pointer;
+}
