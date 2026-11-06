@@ -370,3 +370,29 @@ for (const name of ["sidebar", "inspector"] as const) {
     await done(page);
   }, LIMIT);
 }
+
+for (const name of ["sidebar", "inspector"] as const) {
+  for (const path of ["toolbar", "palette", "palette after removal"] as const) {
+    test(`${name}: ${path} restores the region's last focus or its toggle fallback`, async () => {
+      const page = await open();
+      const control = name === "sidebar" ? page.getByTestId("agent-row").first() : page.locator(REQUEST);
+      const toggle = page.getByRole("button", { name: `Toggle ${name}`, exact: true });
+      const invoke = async (): Promise<void> => {
+        if (path === "toolbar") { await toggle.click(); return; }
+        await page.keyboard.press("ControlOrMeta+k");
+        await palette(page).getByRole("combobox").fill(`Toggle ${name}`);
+        if (path === "palette") await palette(page).getByRole("option").click();
+        else await page.keyboard.press("Enter");
+      };
+      await control.focus();
+      await invoke();
+      expect(await control.isVisible()).toBe(false);
+      if (path === "palette after removal") await control.evaluate(element => element.remove());
+      else expect(await toggle.evaluate(element => element === document.activeElement)).toBe(true);
+      await invoke();
+      const expected = path === "palette after removal" ? toggle : control;
+      expect(await expected.evaluate(element => element === document.activeElement)).toBe(true);
+      await done(page);
+    }, LIMIT);
+  }
+}

@@ -90,20 +90,22 @@ export function Palette(props: PaletteProps): JSX.Element {
     setSelected(0);
     queueMicrotask(() => input?.focus());
   };
-  /** Closes the palette; a dismissal returns focus where it was, a choice to the trigger. */
-  const hide = (dismissed = true): void => {
+  /** Dismissal restores the opener; a choice preserves its command target, or returns to the trigger. */
+  const hide = (dismissed = true, chosen?: HTMLElement): void => {
     closeLayer?.();
     closeLayer = undefined;
     setOpen(false);
     setQuery("");
-    (dismissed && opener?.isConnected ? opener : trigger)?.focus();
+    (chosen?.isConnected ? chosen : dismissed && opener?.isConnected ? opener : trigger)?.focus();
   };
   const choose = (item: Item | undefined): void => {
     if (item === undefined || item.disabled) return;
-    // A command runs after the palette closed, so it may move focus itself.
+    // Leave the transient input before running a command, then preserve the focus it chooses.
     if (item.run !== undefined) {
-      hide(false);
+      trigger?.focus();
       item.run();
+      const target = document.activeElement;
+      hide(false, target instanceof HTMLElement && target !== document.body ? target : trigger);
       return;
     }
     props.onOpen(item.id);

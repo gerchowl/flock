@@ -10,6 +10,7 @@ export function Split(props: {
   readonly change: (value: SplitState) => void;
   readonly children: JSX.Element;
   readonly rail?: JSX.Element;
+  readonly onContentFocus?: (element: HTMLElement) => void;
 }): JSX.Element {
   const [target, setTarget] = createSignal<SplitPreset>();
   const measures = new Map<SplitPreset, HTMLSpanElement>();
@@ -38,7 +39,7 @@ export function Split(props: {
   onCleanup(cancel);
   return (
     <div class="l-split" data-region={props.region} data-split={props.value.preset} data-collapsed={props.value.collapsed} data-target={target()}>
-      <div class="l-split__content" id={`split-${props.region}`} inert={props.value.collapsed}><div class="l-split__full">{props.children}</div><div class="l-split__rail">{props.rail}</div></div>
+      <div class="l-split__content" id={`split-${props.region}`} onFocusIn={event => { if (event.target instanceof HTMLElement) props.onContentFocus?.(event.target); }} inert={props.value.collapsed}><div class="l-split__full">{props.children}</div><div class="l-split__rail">{props.rail}</div></div>
       <div class="l-split__separator" role="separator" tabindex="0" aria-label={`${label()} width`} aria-orientation="vertical"
         aria-controls={`split-${props.region}`} aria-valuemin={0} aria-valuemax={3}
         aria-valuenow={props.value.collapsed ? 0 : PRESETS.indexOf(props.value.preset) + 1}

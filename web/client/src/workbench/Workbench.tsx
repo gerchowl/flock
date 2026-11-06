@@ -172,16 +172,15 @@ export function Workbench(props: WorkbenchProps): JSX.Element {
   const changeRegion = (region: "sidebar" | "inspector", value: SplitState): void => {
     const wasCollapsed = regionState(region).collapsed;
     const focused = document.activeElement;
-    if (value.collapsed && !wasCollapsed && focused instanceof HTMLElement && document.getElementById(`split-${region}`)?.contains(focused)) {
-      regionFocus.set(region, focused);
+    const invoking = focused === document.body || focused === regionToggles.get(region) || (focused instanceof HTMLElement && focused.closest('[role="dialog"], [role="menu"], [data-testid="palette-trigger"]') !== null);
+    if (value.collapsed && !wasCollapsed && (invoking || document.getElementById(`split-${region}`)?.contains(focused))) {
       regionToggles.get(region)?.focus();
     }
     manager.state.regions = { sidebar: DEFAULT_SPLIT, inspector: DEFAULT_SPLIT, ...manager.state.regions, [region]: value };
     publish();
     if (!value.collapsed && wasCollapsed) {
       const previous = regionFocus.get(region);
-      regionFocus.delete(region);
-      if (previous?.isConnected) previous.focus();
+      (previous?.isConnected ? previous : regionToggles.get(region))?.focus();
     }
   };
   const toggleRegion = (region: "sidebar" | "inspector"): void => changeRegion(region, { ...regionState(region), collapsed: !regionState(region).collapsed });
@@ -280,7 +279,7 @@ export function Workbench(props: WorkbenchProps): JSX.Element {
         </Cluster>
       </Cluster>
       {banners()}
-      <Split region="sidebar" value={regionState("sidebar")} change={value => changeRegion("sidebar", value)} rail={
+      <Split region="sidebar" onContentFocus={element => regionFocus.set("sidebar", element)} value={regionState("sidebar")} change={value => changeRegion("sidebar", value)} rail={
         <nav class="sidebar" aria-label="Agents" data-testid="compact-rail" ref={element => ((compactNav = element), onCleanup(bindKeys(element, moves)))}>
           <ul class="agent-list"><For each={[...attention(), ...scoped().filter(row => !needsYou(row))]}>{row => <li><AgentRowButton row={row} focused={focusedAgent() === row.id} onFocus={() => openAgent(row.id)} testid="compact-agent-row" /></li>}</For></ul>
         </nav>
@@ -319,7 +318,7 @@ export function Workbench(props: WorkbenchProps): JSX.Element {
           )}
         </Show>
       </main>
-      <Split region="inspector" value={regionState("inspector")} change={value => changeRegion("inspector", value)}>
+      <Split region="inspector" onContentFocus={element => regionFocus.set("inspector", element)} value={regionState("inspector")} change={value => changeRegion("inspector", value)}>
         <aside class="inbox" aria-label="Inbox" data-testid="inbox">
           <h2 class="inbox__title">Inbox</h2>
           <InboxCards cards={cards()} closed={closed} source={props.source} sender={props.sender} preview={preview()} />
