@@ -59,6 +59,8 @@ struct ClientState {
     reported_cell_size: (u32, u32),
     /// Client-local sound playback config, refreshed on server request.
     sound_config: crate::config::SoundConfig,
+    /// Last title received from the active slot, retained even during a veto.
+    last_window_title: Option<String>,
     /// Whether this client may write Kitty graphics bytes to its host terminal.
     kitty_graphics_enabled: bool,
     /// Direct attach prefix escape state. None for full-app clients.
@@ -932,13 +934,14 @@ fn carried_fleet_snapshot() -> Option<protocol::FleetSnapshot> {
     }
 }
 
-fn requested_keybindings() -> ClientKeybindings {
+/// Every Hello uses one client snapshot, including background slot dials.
+/// Requiring it here prevents a handshake from reloading the config file.
+fn requested_keybindings(local_config: &crate::config::Config) -> ClientKeybindings {
     match std::env::var(crate::remote::REMOTE_KEYBINDINGS_ENV_VAR)
         .ok()
         .as_deref()
     {
-        Some("local") => crate::config::Config::load()
-            .config
+        Some("local") => local_config
             .local_keybindings_profile_toml()
             .map(|keys_toml| ClientKeybindings::Local { keys_toml })
             .unwrap_or(ClientKeybindings::Server),
@@ -977,6 +980,7 @@ fn do_handshake(
     // (the origin carries no snapshot), so without this a switch to a spoke
     // hands it `fleet: None` and the spoke loses its servers band/home row.
     fleet_override: Option<&protocol::FleetSnapshot>,
+    local_config: &crate::config::Config,
 ) -> Result<RenderEncoding, ClientError> {
     let handshake_t0 = Instant::now();
     stream
@@ -991,7 +995,7 @@ fn do_handshake(
         cell_width_px,
         cell_height_px,
         requested_encoding,
-        keybindings: requested_keybindings(),
+        keybindings: requested_keybindings(local_config),
         launch_mode: if direct_attach_requested {
             ClientLaunchMode::TerminalAttach
         } else {
@@ -1704,6 +1708,7 @@ fn run_attach_attempt(
     attach_t0: Instant,
     hold_on_transport_loss: bool,
     signal: &AttachSignal,
+    local_config: &mut crate::config::Config,
 ) -> Result<(), AttachAttemptError> {
     let mut stream = UnixStream::connect(socket_path)
         .map_err(|err| AttachAttemptError::Handshake(ClientError::ConnectionFailed(err)))?;
@@ -1732,6 +1737,7 @@ fn run_attach_attempt(
         attach_request.is_some(),
         host_theme,
         None, // initial attach: the launcher-carried snapshot (env) is correct
+        local_config,
     )
     .map_err(AttachAttemptError::Handshake)?;
 
@@ -1797,6 +1803,7 @@ fn run_attach_attempt(
         initial_input,
         stdin_rx,
         attach_t0,
+        local_config,
     ));
 
     finish_attach_session(_guard, result, hold_on_transport_loss, should_quit)
@@ -1910,7 +1917,7 @@ fn run_client_with_mode(
     // still held — ctrl-c/signal, error return, or the `std::process::exit`
     // paths below that skip TerminalGuard::drop (#69). Disarmed only when this
     // leg hands the held terminal off to a real next leg.
-    let loaded_config = crate::config::Config::load();
+    let mut loaded_config = crate::config::Config::load();
     HOST_WINDOW_TITLE_ALLOWED.store(loaded_config.config.title.enabled, Ordering::Release);
     let held_restore = HeldRestoreGuard::new();
     // Whether, and how, this leg redials a dropped transport (#436).
@@ -1920,7 +1927,7 @@ fn run_client_with_mode(
     );
     let mouse_scroll_lines = loaded_config.config.ui.mouse_scroll_lines();
     let redraw_on_focus_gained = loaded_config.config.ui.redraw_on_focus_gained;
-    let sound_config = loaded_config.config.ui.sound;
+    let sound_config = loaded_config.config.ui.sound.clone();
     let direct_attach_requested = attach_request.is_some();
     let kitty_graphics_enabled =
         loaded_config.config.experimental.kitty_graphics && !direct_attach_requested;
@@ -2011,6 +2018,7 @@ fn run_client_with_mode(
                 attach_t0,
                 reconnect_plan.is_some(),
                 &attach_signal,
+                &mut loaded_config.config,
             )
         },
         &attach_signal,
@@ -2139,6 +2147,7 @@ async fn run_client_loop(
     initial_input: Option<Vec<u8>>,
     stdin_rx: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
     attach_t0: Instant,
+    local_config: &mut crate::config::Config,
 ) -> Result<(), ClientError> {
     let (cols, rows, _, _) = initial_geometry;
     let Some((_, _, initial_cell_width, initial_cell_height)) = resolve_terminal_geometry(
@@ -2154,8 +2163,6 @@ async fn run_client_loop(
     };
     // `ui.file_drop` gate (#79): whether a dropped local file is ferried to the
     // server. Read once per attach leg (cheap; file-drops are rare).
-    let local_config = crate::config::Config::load().config;
-    HOST_WINDOW_TITLE_ALLOWED.store(local_config.title.enabled, Ordering::Release);
     let file_drop_mode = local_config.ui.file_drop;
     // One-shot guard for the first-paint trace event so subsequent frames are
     // a single cheap bool check.
@@ -2166,6 +2173,7 @@ async fn run_client_loop(
     let mut switch_timing: Option<(Instant, String, bool)> = None;
     let mut state = ClientState {
         blit_encoder: render_ansi::BlitEncoder::new(),
+        last_window_title: None,
         mouse_capture_active,
         reported_size: (cols, rows),
         reported_cell_size: (initial_cell_width, initial_cell_height),
@@ -2234,11 +2242,12 @@ async fn run_client_loop(
     // writer still isolates the loop from a stalled transport. The reader was
     // already spawned from its own clone above; `stream` (the write half) is
     // moved into the writer thread here.
-    let (mut slot_manager, mut active_writer) = build_active_writer_and_manager(stream, &event_tx)
-        .map_err(ClientError::ConnectionFailed)?;
+    let (mut slot_manager, mut active_writer) =
+        build_active_writer_and_manager(stream, &event_tx, local_config)
+            .map_err(ClientError::ConnectionFailed)?;
     // Whether the warm sweep pre-warms cold ssh peers by building their bridge
     // ahead of time (#139), not just home + the active leg. Read once at start.
-    let prewarm_ssh_peers = crate::config::Config::load().config.slots.prewarm_ssh_peers;
+    let prewarm_ssh_peers = local_config.slots.prewarm_ssh_peers;
 
     // Bytes consumed from stdin during the pre-handshake theme capture:
     // forward them as the session's first input so no keystroke is lost. The
@@ -2670,6 +2679,7 @@ async fn run_client_loop(
                                         target.clone(),
                                         geometry,
                                         negotiated_encoding,
+                                        local_config.clone(),
                                         fleet.clone(),
                                         proxy_jump.clone(),
                                         event_tx.clone(),
@@ -2746,6 +2756,7 @@ async fn run_client_loop(
                         // from a slot that is no longer active. The local
                         // client still has its own veto at the output boundary.
                         set_host_window_title(&title);
+                        state.last_window_title = Some(title);
                     }
                     ServerMessage::Clipboard { data } => {
                         forward_clipboard(&data);
@@ -2755,6 +2766,8 @@ async fn run_client_loop(
                         reload_local_client_config(
                             &mut state.sound_config,
                             &mut state.redraw_on_focus_gained,
+                            state.last_window_title.as_deref(),
+                            local_config,
                         );
                     }
                     ServerMessage::MouseCapture { enabled } => {
@@ -3079,6 +3092,7 @@ async fn run_client_loop(
                                             socket_path,
                                             geometry,
                                             negotiated_encoding,
+                                            local_config.clone(),
                                             event_tx.clone(),
                                         );
                                     }
@@ -3099,6 +3113,7 @@ async fn run_client_loop(
                                             target.clone(),
                                             geometry,
                                             negotiated_encoding,
+                                            local_config.clone(),
                                             event_tx.clone(),
                                         );
                                     }
@@ -3269,6 +3284,7 @@ fn apply_slot_flip(
     // active writer becomes the new slot's writer handle — input now routes to
     // its dedicated writer thread (#176).
     *active_slot_key = new_key;
+    state.last_window_title = None;
     *active_writer = new_writer;
     // Re-assert geometry to the slot we just made active (#77).
     let (cur_cols, cur_rows) = state.reported_size;
@@ -3670,9 +3686,9 @@ fn slot_death_hook(
 fn build_active_writer_and_manager(
     active_stream: UnixStream,
     event_tx: &tokio::sync::mpsc::Sender<ClientLoopEvent>,
+    local_config: &crate::config::Config,
 ) -> io::Result<(Option<slots::SlotManager>, slots::SlotWriter)> {
-    let loaded = crate::config::Config::load();
-    let slots_config = loaded.config.slots.clone();
+    let slots_config = &local_config.slots;
 
     // The active slot is whatever leg launched this client: home for a local
     // attach, the ssh target for a remote leg (carried in REATTACH/remote env).
@@ -3691,8 +3707,7 @@ fn build_active_writer_and_manager(
     // Warm-all targets: locally-configured peers (a hub knows its fleet) plus
     // the carried snapshot's peers and origin (a spoke learns its fleet from
     // the down-gossip, #73). Home is always included.
-    let config_peers: Vec<String> = loaded
-        .config
+    let config_peers: Vec<String> = local_config
         .peers
         .iter()
         .map(|p| p.ssh_target().to_string())
@@ -3724,6 +3739,7 @@ fn spawn_warm_dial(
     socket_path: std::path::PathBuf,
     geometry: (u16, u16, u32, u32),
     requested_encoding: RenderEncoding,
+    local_config: crate::config::Config,
     event_tx: tokio::sync::mpsc::Sender<ClientLoopEvent>,
 ) {
     std::thread::spawn(move || {
@@ -3748,6 +3764,7 @@ fn spawn_warm_dial(
                 false,
                 None,
                 None,
+                &local_config,
             )?;
             Ok(stream)
         })();
@@ -3784,6 +3801,7 @@ fn spawn_warm_bridge_dial(
     target: slots::SlotTarget,
     geometry: (u16, u16, u32, u32),
     requested_encoding: RenderEncoding,
+    local_config: crate::config::Config,
     event_tx: tokio::sync::mpsc::Sender<ClientLoopEvent>,
 ) {
     spawn_switch_dial(
@@ -3791,6 +3809,7 @@ fn spawn_warm_bridge_dial(
         target,
         geometry,
         requested_encoding,
+        local_config,
         None,
         None,
         event_tx,
@@ -3810,6 +3829,7 @@ fn spawn_switch_dial(
     target: slots::SlotTarget,
     geometry: (u16, u16, u32, u32),
     requested_encoding: RenderEncoding,
+    local_config: crate::config::Config,
     // The hub's snapshot from the SwitchServer message -- carried into the
     // spoke's handshake so it renders the servers band / home row (#102).
     fleet: Option<protocol::FleetSnapshot>,
@@ -3853,6 +3873,7 @@ fn spawn_switch_dial(
                                 false,
                                 None,
                                 fleet.as_ref(),
+                                &local_config,
                             )
                         })?;
                         return Ok((stream, None));
@@ -3903,6 +3924,7 @@ fn spawn_switch_dial(
                                     false,
                                     None,
                                     fleet.as_ref(),
+                                    &local_config,
                                 )
                             })?;
                             Ok((stream, Some(bridge)))
@@ -4064,18 +4086,29 @@ fn write_to_server(stream: &mut UnixStream, msg: &ClientMessage) -> io::Result<(
 // Notifications
 // ---------------------------------------------------------------------------
 
+/// Replace the snapshot only after a successful load. Failed reloads keep the
+/// last valid configuration for later dials and reconnect attempts.
 fn reload_local_client_config(
     sound_config: &mut crate::config::SoundConfig,
     redraw_on_focus_gained: &mut bool,
+    last_window_title: Option<&str>,
+    local_config: &mut crate::config::Config,
 ) {
     match crate::config::load_live_config() {
         Ok(loaded) => {
             for diagnostic in loaded.config.ui.sound.diagnostics() {
                 crate::logging::client_config_sound_diagnostic(&diagnostic.to_string());
             }
-            HOST_WINDOW_TITLE_ALLOWED.store(loaded.config.title.enabled, Ordering::Release);
-            *sound_config = loaded.config.ui.sound;
+            let enabled = loaded.config.title.enabled;
+            let was_enabled = HOST_WINDOW_TITLE_ALLOWED.swap(enabled, Ordering::AcqRel);
+            if enabled && !was_enabled {
+                if let Some(title) = last_window_title {
+                    set_host_window_title(title);
+                }
+            }
+            *sound_config = loaded.config.ui.sound.clone();
             *redraw_on_focus_gained = loaded.config.ui.redraw_on_focus_gained;
+            *local_config = loaded.config;
             debug!("reloaded local client config");
         }
         Err(diagnostics) => {
@@ -4620,6 +4653,7 @@ mod tests {
             false,
             None,
             None,
+            &crate::config::Config::default(),
         )
         .unwrap_err();
         worker.join().unwrap();
@@ -5178,6 +5212,7 @@ mod tests {
             slots::SlotTarget::Home,
             (90, 30, 8, 16),
             RenderEncoding::SemanticFrame,
+            crate::config::Config::default(),
             Some(hub.clone()),
             None,
             event_tx,
@@ -5678,7 +5713,12 @@ mod tests {
         let mut sound_config = crate::config::SoundConfig::default();
         let mut redraw_on_focus_gained = true;
 
-        reload_local_client_config(&mut sound_config, &mut redraw_on_focus_gained);
+        reload_local_client_config(
+            &mut sound_config,
+            &mut redraw_on_focus_gained,
+            None,
+            &mut crate::config::Config::default(),
+        );
 
         assert!(!redraw_on_focus_gained);
         let _ = std::fs::remove_file(path);
@@ -6071,6 +6111,7 @@ mod tests {
         let mut active_writer = old_conn.writer();
         let mut state = ClientState {
             blit_encoder: render_ansi::BlitEncoder::new(),
+            last_window_title: Some("old-slot".into()),
             mouse_capture_active: false,
             reported_size: (80, 24),
             reported_cell_size: (10, 20),
@@ -6107,6 +6148,7 @@ mod tests {
 
         // Active slot key flipped to the new target.
         assert_eq!(active_slot_key, "kiln");
+        assert!(state.last_window_title.is_none());
         // The new stream is what we get; reading on the new peer should see
         // the Resize re-assert that apply_slot_flip just wrote.
         new_peer
@@ -6177,6 +6219,7 @@ mod tests {
         let mut active_reader_quit = Arc::new(AtomicBool::new(false));
         let mut state = ClientState {
             blit_encoder: render_ansi::BlitEncoder::new(),
+            last_window_title: Some("old-slot".into()),
             mouse_capture_active: false,
             reported_size: (100, 40),
             reported_cell_size: (9, 18),
@@ -6245,6 +6288,7 @@ mod tests {
         let mut active_reader_quit = Arc::new(AtomicBool::new(false));
         let mut state = ClientState {
             blit_encoder: render_ansi::BlitEncoder::new(),
+            last_window_title: Some("old-slot".into()),
             mouse_capture_active: false,
             reported_size: (80, 24),
             reported_cell_size: (10, 20),

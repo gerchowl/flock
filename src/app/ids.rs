@@ -80,7 +80,10 @@ impl App {
             .workspaces
             .iter()
             .enumerate()
-            .find_map(|(ws_idx, ws)| ws.pane_state(pane_id).map(|pane| (ws_idx, pane)))
+            .find_map(|(ws_idx, ws)| {
+                let tab = ws.find_tab_index_for_pane(pane_id)?;
+                ws.tabs[tab].panes.get(&pane_id).map(|pane| (ws_idx, pane))
+            })
     }
 
     pub(super) fn public_workspace_id(&self, ws_idx: usize) -> String {

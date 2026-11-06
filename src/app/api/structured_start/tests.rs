@@ -816,7 +816,7 @@ async fn public_structured_start_and_focus_reuse_native_placement() {
     assert_eq!(fixture.app.terminal_runtimes.len(), 0);
     assert!(fixture.app.state.terminals.is_empty());
     let pane = fixture.app.state.workspaces[0].tabs[0].root_pane;
-    assert!(fixture.app.state.workspaces[0].close_pane(pane));
+    assert_eq!(fixture.app.state.workspaces[0].close_pane(pane), Ok(true));
     fixture.app.state.workspaces.clear();
     fixture.app.state.active = None;
     assert!(fixture
