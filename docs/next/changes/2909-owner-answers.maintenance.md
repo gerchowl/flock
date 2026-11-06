@@ -1,0 +1,1 @@
+- Record the owner’s ADR-0049 decisions on default delegation, expiry, the shared checkpoint budget, workflow launch authority, initial shadow workflows and rerouted prompts, and clarify scoped sub-delegation.

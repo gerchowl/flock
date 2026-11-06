@@ -1,0 +1,104 @@
+{
+  "color": {
+    "$type": "color",
+    "label": {
+      "primary": {
+        "$value": {
+          "colorSpace": "srgb",
+          "components": [0.0, 0.0, 0.0],
+          "hex": "#000000"
+        }
+      },
+      "secondary": {
+        "$value": {
+          "colorSpace": "srgb",
+          "components": [0.227451, 0.227451, 0.235294],
+          "hex": "#3a3a3c"
+        }
+      },
+      "tertiary": {
+        "$value": {
+          "colorSpace": "srgb",
+          "components": [0.431373, 0.431373, 0.45098],
+          "hex": "#6e6e73"
+        }
+      }
+    },
+    "separator": {
+      "$value": {
+        "colorSpace": "srgb",
+        "components": [0.0, 0.0, 0.0],
+        "alpha": 0.35
+      }
+    },
+    "accent": {
+      "fill": {
+        "$value": {
+          "colorSpace": "srgb",
+          "components": [0.0, 0.313725, 0.709804],
+          "hex": "#0050b5"
+        }
+      }
+    },
+    "link": {
+      "$value": {
+        "colorSpace": "srgb",
+        "components": [0.0, 0.313725, 0.709804],
+        "hex": "#0050b5"
+      }
+    },
+    "selection": {
+      "active": {
+        "$value": {
+          "colorSpace": "srgb",
+          "components": [0.0, 0.313725, 0.709804],
+          "hex": "#0050b5"
+        }
+      },
+      "inactive": {
+        "$value": {
+          "colorSpace": "srgb",
+          "components": [0.862745, 0.862745, 0.882353],
+          "hex": "#dcdce1"
+        }
+      }
+    },
+    "focus-ring": {
+      "$value": {
+        "colorSpace": "srgb",
+        "components": [0.0, 0.313725, 0.709804],
+        "hex": "#0050b5"
+      }
+    },
+    "destructive": {
+      "$value": {
+        "colorSpace": "srgb",
+        "components": [0.678431, 0.0, 0.062745],
+        "hex": "#ad0010"
+      }
+    },
+    "status": {
+      "green": {
+        "$value": {
+          "colorSpace": "srgb",
+          "components": [0.058824, 0.415686, 0.164706],
+          "hex": "#0f6a2a"
+        }
+      },
+      "orange": {
+        "$value": {
+          "colorSpace": "srgb",
+          "components": [0.541176, 0.239216, 0.0],
+          "hex": "#8a3d00"
+        }
+      },
+      "red": {
+        "$value": {
+          "colorSpace": "srgb",
+          "components": [0.678431, 0.0, 0.062745],
+          "hex": "#ad0010"
+        }
+      }
+    }
+  }
+}

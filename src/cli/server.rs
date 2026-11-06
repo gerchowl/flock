@@ -65,23 +65,18 @@ fn server_live_handoff(args: &[String]) -> std::io::Result<i32> {
     // The binary the operator just upgraded to is this one.
     if let Some(exe) = params.import_exe.as_deref() {
         // The server resolves a relative path against its own cwd, not ours.
-        let resolved = match std::fs::canonicalize(exe) {
-            Ok(resolved) => resolved,
-            Err(err) => {
-                eprintln!("refusing live handoff: --import-exe {exe} cannot be resolved: {err}");
-                return Ok(super::exit::FAILURE);
-            }
-        };
+        let resolved =
+            crate::server::executable::resolve(Some(std::path::Path::new(exe)))?.into_path();
         if params.expected_version.is_none() {
             params.expected_version = probe_executable_version(&resolved);
         }
         params.import_exe = Some(resolved.display().to_string());
     } else {
-        let own_exe = own_executable();
+        let own_exe = own_executable()?;
         if let Some(refusal) = refuse_downgrade(
             before.as_deref(),
             &client_version,
-            own_exe.as_deref(),
+            Some(&own_exe),
             &socket_path,
         ) {
             eprintln!("{refusal}");
@@ -154,24 +149,19 @@ const HANDOFF_VERIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 /// This CLI's own binary, resolved through symlinks so the handoff targets the
 /// store path the profile points at right now, not a link that a later
 /// profile switch could repoint mid-handoff.
-fn own_executable() -> Option<std::path::PathBuf> {
-    let exe = std::env::current_exe().ok()?;
-    let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
-    exe.is_file().then_some(exe)
+fn own_executable() -> std::io::Result<std::path::PathBuf> {
+    crate::server::executable::resolve(None).map(|exe| exe.into_path())
 }
 
 /// Point the handoff at the invoking client's binary and pin its identity, so
 /// the importer refuses unless it really is this build. An explicit
-/// `--expected-*` flag is kept, and a client that cannot name its own binary
-/// leaves the server's fallback in place for [`judge_handoff`] to check.
+/// `--expected-*` flag is kept. The caller must resolve its binary first,
+/// refusing an unresolved target before sending a handoff request.
 fn fill_import_target_from_client(
     params: &mut ServerLiveHandoffParams,
-    own_exe: Option<std::path::PathBuf>,
+    own_exe: std::path::PathBuf,
 ) {
-    let Some(exe) = own_exe else {
-        return;
-    };
-    params.import_exe = Some(exe.display().to_string());
+    params.import_exe = Some(own_exe.display().to_string());
     params
         .expected_version
         .get_or_insert_with(crate::build_info::version);
@@ -534,7 +524,7 @@ mod tests {
 
         fill_import_target_from_client(
             &mut params,
-            Some(std::path::PathBuf::from("/nix/store/new-flock/bin/flk")),
+            std::path::PathBuf::from("/nix/store/new-flock/bin/flk"),
         );
 
         assert_eq!(
@@ -557,20 +547,10 @@ mod tests {
 
         fill_import_target_from_client(
             &mut params,
-            Some(std::path::PathBuf::from("/nix/store/new-flock/bin/flk")),
+            std::path::PathBuf::from("/nix/store/new-flock/bin/flk"),
         );
 
         assert_eq!(params.expected_version.as_deref(), Some("9.9.9"));
-    }
-
-    #[test]
-    fn default_handoff_without_an_own_binary_leaves_the_server_fallback() {
-        let mut params = ServerLiveHandoffParams::default();
-
-        fill_import_target_from_client(&mut params, None);
-
-        assert_eq!(params.import_exe, None);
-        assert_eq!(params.expected_version, None);
     }
 
     #[test]

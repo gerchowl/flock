@@ -116,6 +116,7 @@ mod tests {
 
         let (respond_to, answer) = mpsc::channel();
         app.handle_api_request_message(ApiRequestMessage {
+            scope: None,
             request: Request {
                 id: "install".into(),
                 method: Method::IntegrationInstall(IntegrationInstallParams {

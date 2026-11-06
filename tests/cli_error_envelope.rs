@@ -322,7 +322,7 @@ fn an_unreachable_server_is_a_transport_envelope() {
 #[test]
 fn an_unconfirmed_send_is_the_stdout_document_under_json() {
     fn unconfirmed(_: &Value) -> Value {
-        json!({"result":{"type":"pane_send","outcome":"unconfirmed","reason":"confirm_timeout"}})
+        json!({"result":{"type":"paste","outcome":"unconfirmed","reason":"confirm_timeout","evidence":{}}})
     }
     let (socket, _server) = scripted_server("envelope-effect", unconfirmed);
     let output = flk(
@@ -468,6 +468,29 @@ fn the_skew_envelope_says_the_exit_the_process_returns() {
     let output = flk(&socket, &["agent", "get", "w1", "--json"]);
     let value = envelope(&output, 78);
     assert_eq!(value["error"]["code"], "server_version_gap", "{value}");
+    assert_eq!(value["error"]["retry"], "after_handoff");
+}
+
+/// A protocol-32 client refuses a write to a protocol-31 server before sending
+/// it, preserving the typed handoff recovery path across the snapshot bump.
+#[test]
+fn protocol_32_client_refuses_protocol_31_server_with_handoff_recovery() {
+    fn old_server(request: &Value) -> Value {
+        assert_eq!(
+            request["method"], "ping",
+            "no mutation reaches the old server"
+        );
+        json!({"result":{"type":"pong","version":"3.1.0","protocol":31}})
+    }
+    let (socket, _server) = scripted_server("snapshot-skew", old_server);
+    let output = flk(
+        &socket,
+        &[
+            "--format", "json", "agent", "send", "--submit", "w1", "fixture",
+        ],
+    );
+    let value = envelope(&output, 78);
+    assert_eq!(value["error"]["code"], "server_version_gap");
     assert_eq!(value["error"]["retry"], "after_handoff");
 }
 

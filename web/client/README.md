@@ -5,10 +5,28 @@ pinned in `bun.lock`.
 
 ## Working on it
 
+Styling follows [`web/DESIGN.md`](../DESIGN.md): design tokens, the layout
+primitives in `src/layout/primitives/`, and the lint rules that enforce them
+(`just client-lint`).
+
 - `just client-check`: unit and DOM tests, the browser tests in `e2e/`, the
-  type check and the production build.
+  type check, the design rules and the production build.
+- `bun x vite` then `/gallery.html`: every layout primitive and control
+  state on one page, which the design-conformance suite checks
+  (`web/DESIGN.md` "Conformance").
 - `just client-preview`: a fixture-mode build (a replayed session, no server
   needed) served on the loopback address.
+- `just desktop-dev` / `just desktop-build`: the same bundle in the Tauri
+  desktop shell; see [`desktop/README.md`](../../desktop/README.md).
+
+The fixture screenshot tests wait for the pinned Playwright Chromium's first
+non-empty compositor frame at the requested viewport before one PNG capture.
+DOM visibility and `document.fonts.ready` alone do not prove that the compositor
+can supply pixels. The five-second capture deadline also bounds cleanup; page
+closure, crashes, wrong-size or empty frames fail explicitly. Capture errors are
+never retried. This barrier is for the Chromium-only preview harness and is not
+an application rendering signal. `tests/capture.test.ts` drives readiness and
+failure events with a controlled peer and an injected abort deadline.
 
 ## The production bundle in nix
 
