@@ -1041,7 +1041,7 @@ async fn failed_assertion_releases_the_mutation_gate() {
     let token = f.mint().await;
     let mut socket = f.open().await;
     socket.hello(1, &token.0).await;
-    let lock = crate::platform::client_token_lock::LockFile::new(management_lock(&f));
+    let lock = crate::platform::file_lock::LockFile::new(management_lock(&f));
     let (waiting, release) = gate_mutation_wait(&f);
     let session = f.server.core.shared.store.authenticate(&token).unwrap();
     f.server.core.shared.revoke(&session);
@@ -1071,7 +1071,7 @@ async fn failed_assertion_releases_the_mutation_gate() {
 #[tokio::test]
 async fn shutdown_deadline_stops_transports_even_when_revocation_is_held() {
     let f = Native::new().await;
-    let lock = crate::platform::client_token_lock::LockFile::new(management_lock(&f));
+    let lock = crate::platform::file_lock::LockFile::new(management_lock(&f));
     let (waiting, release) = gate_mutation_wait(&f);
     {
         let shutdown = f.server.core.shutdown();

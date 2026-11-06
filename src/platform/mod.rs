@@ -274,3 +274,5 @@ pub(crate) mod client_tokens;
 
 #[cfg(test)]
 pub(crate) mod socket_test_support;
+
+pub(crate) mod file_lock;

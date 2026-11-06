@@ -511,8 +511,8 @@ impl Workers {
         true
     }
     /// Inspect terminal evidence only after queued stream facts have been projected.
-    /// A report without retained authority confirms journal lock release as well
-    /// as process cleanup. Requesting [`Self::stop`] alone is not completion.
+    /// A report without retained authority follows journal disposal and process
+    /// cleanup. Explicit unlock failures are logged. Requesting [`Self::stop`] alone is not completion.
     pub fn report(&self, id: &str, generation: u64) -> Option<&Report> {
         self.entries
             .get(id)

@@ -1,4 +1,5 @@
 use super::*;
+use crate::platform::file_lock::inherited_holder;
 use crate::structured::launch::SessionConfigDir;
 use std::fs::{self, OpenOptions};
 use std::os::unix::fs::PermissionsExt;
@@ -11,7 +12,7 @@ fn executable() -> std::path::PathBuf {
         .unwrap()
         .join(format!("flk{}", std::env::consts::EXE_SUFFIX))
 }
-fn fixture() -> (SessionConfigDir, std::path::PathBuf, File) {
+fn fixture() -> (SessionConfigDir, std::path::PathBuf, LockFile) {
     let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
     let path = root.path().join("lock");
     let file = OpenOptions::new()
@@ -22,6 +23,7 @@ fn fixture() -> (SessionConfigDir, std::path::PathBuf, File) {
         .unwrap();
     file.set_permissions(fs::Permissions::from_mode(0o600))
         .unwrap();
+    let file = LockFile::new(file);
     file.lock().unwrap();
     (root, path, file)
 }
@@ -52,11 +54,11 @@ fn contended_worker_acquisition_keeps_the_parent_descriptor_locked() {
     let guard = pending.finish(Duration::from_secs(5)).unwrap();
     reaped(pid);
     assert!(matches!(
-        open(&path).try_lock(),
+        LockFile::new(open(&path)).try_lock(),
         Err(TryLockError::WouldBlock)
     ));
     drop(guard);
-    assert!(open(&path).try_lock().is_ok());
+    assert!(LockFile::new(open(&path)).try_lock().is_ok());
 }
 #[test]
 fn repeated_timeouts_and_abandonment_reap_every_owned_worker() {
@@ -129,7 +131,7 @@ fn parent_ipc_disconnection_terminates_the_waiter_without_lock_release() {
 }
 
 #[test]
-fn finished_and_abandoned_pending_locks_release_before_inherited_descriptors_close() {
+fn uncontended_finished_and_abandoned_pending_locks_release_before_inherited_descriptors_close() {
     for finish in [true, false] {
         let (_root, path, holder) = fixture();
         drop(holder);
@@ -342,4 +344,57 @@ fn real_socket_silence_and_early_eof_remain_distinct() {
         || Ok(()),
     );
     assert_eq!(result.unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
+}
+
+#[test]
+fn contended_handoff_keeps_lock_until_parent_drop_with_inherited_holder() {
+    let (_root, path, owner) = fixture();
+    let mut pending = PendingLock::begin(open(&path), &executable()).unwrap();
+    let child = &mut pending.helper.as_mut().expect("real contended helper").0;
+    let pid = child.id();
+    let mut inherited = inherited_holder::Holder::spawn(pending.file.as_ref().unwrap()).unwrap();
+    drop(owner);
+    // Observe natural helper exit without reaping it: cancellation can still
+    // kill only this owned child, whose pid cannot be reused before wait().
+    let (tx, rx) = std::sync::mpsc::channel();
+    let observer = std::thread::spawn(move || {
+        let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+        // SAFETY: observe this owned child and retain its waitable status.
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                info.as_mut_ptr(),
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        };
+        let _ = tx.send(result);
+    });
+    let exited = rx.recv_timeout(Duration::from_secs(5));
+    if exited.is_err() {
+        pending.helper.as_mut().unwrap().0.kill().unwrap();
+    }
+    observer.join().unwrap();
+    assert_eq!(
+        exited.unwrap(),
+        0,
+        "helper must exit after acknowledged transfer"
+    );
+    let guard = pending.finish(Duration::from_secs(5)).unwrap();
+    reaped(pid);
+    assert!(
+        matches!(
+            LockFile::new(open(&path)).try_lock(),
+            Err(TryLockError::WouldBlock)
+        ),
+        "worker must not unlock the parent's transferred lock"
+    );
+    inherited.verify().unwrap();
+    drop(guard);
+    let acquired = LockFile::new(open(&path)).try_lock();
+    inherited.verify().unwrap();
+    assert!(
+        acquired.is_ok(),
+        "parent drop must unlock despite the inherited holder"
+    );
 }

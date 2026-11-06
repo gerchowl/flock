@@ -1,7 +1,7 @@
 //! Worker-owned queue journal (ADR-0036 §3/§4). Never call on the server loop.
 //!
 //! One non-cloneable writer holds a stable sidecar OS lock across rename and
-//! handoff. Close/drop it before handing ownership to another process. Appends
+//! handoff. Drop explicitly unlocks before another process takes ownership. Appends
 //! and checkpoint publication require &mut self; replay returns an owned cut.
 //! A failed write/sync/rename poisons the handle: reopen under the lease to learn
 //! which bytes committed. No success or in-memory change precedes durability.
@@ -20,7 +20,7 @@ use readonly::corrupt;
 pub use readonly::{QueueJournalCorrupt, QueueJournalNewer, ReadOnly};
 use std::collections::HashSet;
 pub(crate) mod scheduler;
-use crate::platform::structured as private_fs;
+use crate::platform::{file_lock::LockFile, structured as private_fs};
 pub use model::{Change, Item, Record};
 use serde_json::{json, Value};
 use std::fs::{self, File};
@@ -74,17 +74,7 @@ pub struct Journal {
     opaque: HashSet<String>,
     poisoned: bool,
     rewrite: Option<RewritePolicy>,
-    _lease: WriterLease,
-}
-// Cover both a complete journal and fallible setup after lock acquisition.
-struct WriterLease(File);
-impl Drop for WriterLease {
-    fn drop(&mut self) {
-        // Close alone leaves flock held by descriptors inherited before exec.
-        if let Err(error) = self.0.unlock() {
-            crate::logging::structured_queue_unlock_failed(&error);
-        }
-    }
+    _lease: LockFile,
 }
 fn problem(message: &str) -> io::Error {
     io::Error::other(message)
@@ -179,12 +169,11 @@ impl Journal {
             .collect();
         let dir = sessions.join(component);
         directory(&dir)?;
-        let lease = open(&dir.join(".queue.lock"))?;
+        let lease = LockFile::new(open(&dir.join(".queue.lock"))?);
         lease.try_lock().map_err(|error| match error {
             fs::TryLockError::WouldBlock => io::Error::from(io::ErrorKind::WouldBlock),
             fs::TryLockError::Error(error) => error,
         })?;
-        let lease = WriterLease(lease);
         let path = dir.join("queue.jsonl");
         let file = open(&path)?;
         for path in [&root, &sessions, &dir] {
