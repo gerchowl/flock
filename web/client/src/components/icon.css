@@ -1,0 +1,31 @@
+/* The icon set (#2903): line glyphs in the text colour. Tokens only; layout comes from the primitives. */
+
+.icon {
+  flex: none;
+  vertical-align: middle;
+  fill: none;
+  stroke: currentColor;
+}
+
+/* A button that shows only a glyph: a square regular control. */
+.icon-button {
+  min-inline-size: var(--size-control);
+  min-block-size: var(--size-control);
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-small);
+  background: transparent;
+  color: var(--color-label-secondary);
+  font: inherit;
+  cursor: pointer;
+}
+
+/* The phone layout keeps 44 px touch targets at any width. */
+.phone .icon-button {
+  min-inline-size: var(--size-touch);
+  min-block-size: var(--size-touch);
+}
+
+.icon-button:hover:enabled {
+  background: var(--color-selection-inactive);
+}

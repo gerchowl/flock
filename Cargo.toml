@@ -1,6 +1,6 @@
 [package]
 name = "flock-ai"
-version = "3.1.0"
+version = "3.3.0"
 edition = "2021"
 build = "build.rs"
 description = "terminal workspace manager for AI coding agents"
@@ -31,13 +31,17 @@ dbg_macro = "deny"
 # `flock web`: xterm.js <-> flock PTY bridge (gerchowl/flock#131). Kept behind a
 # feature so axum/futures-util/rust-embed stay out of a default `flock` build.
 # tokio/net + tokio/io-util are the runtime drivers axum needs for `axum::serve`.
-web = ["dep:anyhow", "dep:axum", "dep:futures-util", "dep:rust-embed", "tokio/net", "tokio/io-util"]
+web = ["dep:anyhow", "dep:axum", "dep:hyper", "dep:hyper-util", "dep:futures-util", "dep:rust-embed", "tokio/net", "tokio/io-util"]
 
 ts = ["dep:ts-rs"]
 
 [dependencies]
 anyhow = { version = "1", optional = true }
 axum = { version = "0.8", features = ["ws"], optional = true }
+# Own HTTP/1 connection tasks and configure header/half-close policy for the mounted client.
+# Both packages are already transitive dependencies of axum; no new package versions.
+hyper = { version = "1", features = ["server", "http1"], optional = true }
+hyper-util = { version = "0.1", features = ["tokio", "service"], optional = true }
 base64 = "0.23.0"
 bincode = { version = "2", features = ["serde"] }
 bytes = "1"
@@ -46,13 +50,13 @@ bytes = "1"
 crossterm = { version = "0.29", features = ["serde"] }
 ctrlc = { version = "3", features = ["termination"] }
 # Persistent mesh node keys (ADR-0026), independent of SSH credentials.
-ed25519-dalek = "2.2"
+ed25519-dalek = "3.0"
 futures-util = { version = "0.3", optional = true }
 libc = "0.2"
 # OS entropy for mesh node keys, server-minted ULIDs and collection capabilities.
 getrandom = "0.4"
 # Timed lease-table reads: short contention must not deny all API callers.
-parking_lot = "0.12"
+parking_lot = "0.13"
 portable-pty = "0.9"
 # Debug builds must exercise the same embedded bytes as release builds.
 rust-embed = { version = "8", optional = true, features = ["debug-embed", "deterministic-timestamps"] }
@@ -62,6 +66,8 @@ regex = "1"
 serde = { version = "1", features = ["derive"] }
 # Detect unknown config fields using the deserializer, including aliases and dynamic maps.
 serde_ignored = "0.1"
+# Report structural config error paths without value-bearing deserializer messages.
+serde_path_to_error = "0.1"
 serde_json = { version = "1", features = ["raw_value"] }
 sha2 = "0.11"
 ts-rs = { version = "=12.0.1", optional = true, features = ["serde-json-impl"] }
@@ -70,21 +76,26 @@ toml = "1"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 unicode-width = "0.2"
-sysinfo = "0.39.3"
-rusqlite = { version = "0.40.2", features = ["bundled"] }
+unicode-segmentation = "1.13.3"
+# Reuse termwiz's locked Unicode 17 categories for identity-format validation.
+finl_unicode = "1.4"
+sysinfo = "0.40.0"
+rusqlite = { version = "0.41.1", features = ["bundled"] }
 toml_edit = "0.25.15"
 
 # Wipe node-key seeds and serialized private-key buffers after use.
 zeroize = { version = "1.9", features = ["serde"] }
+# Pin the reviewed streaming and entity-decoding behavior used by the display boundary.
+pulldown-cmark = { version = "=0.13.6", default-features = false }
 
 [dev-dependencies]
 # Await fixture FIFO reports and bound scripted CLI subprocess lifetimes.
 tokio = { version = "1", features = ["net", "io-util", "process"] }
 # Count SQLite VM operations in store complexity regression tests.
-rusqlite = { version = "0.40.2", features = ["hooks"] }
+rusqlite = { version = "0.41.1", features = ["hooks"] }
 
-# Parse adapter declarations for the optional-field coverage drift test.
-syn = { version = "2", features = ["full"] }
+# Parse adapter declarations and CLI match patterns for coverage drift tests.
+syn = { version = "3", features = ["full", "visit"] }
 
 [build-dependencies]
 # Use SDK declarations for Darwin kinfo_proc rather than copying its ABI.

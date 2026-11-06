@@ -2,6 +2,7 @@ use crate::config::{Keybinds, NewTerminalCwdConfig, ToastConfig, ToastDelivery};
 use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::layout::{Direction, Rect};
 use ratatui::style::Color;
+use std::collections::HashMap;
 
 use crate::detect::AgentState;
 use crate::layout::{PaneId, PaneInfo, SplitBorder};
@@ -722,6 +723,22 @@ pub enum RemotePeerRef {
     Origin,
 }
 
+/// Which independently-verified band row a hub-pushed claim folds into
+/// (#2998). Two hubs dialing the same peers each have their own view; a
+/// claim about a node the viewer already pins (its own, home, or a
+/// configured peer with a bound identity) annotates that verified row
+/// rather than crowding the band with a duplicate "unverified" row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ClaimFoldTarget {
+    /// The viewer's own node — annotates the local (self) server row.
+    SelfNode,
+    /// The carried home identity — annotates the home band slot.
+    Home,
+    /// A pinned configured peer at this `peer_summaries` index — annotates
+    /// that peer's band row.
+    PinnedPeer { peer_idx: usize },
+}
+
 impl RemotePeerRef {
     /// The switch request selecting one of this peer's WORKSPACE rows emits:
     /// switch to that server AND land on that space. Every source carries the
@@ -1306,6 +1323,7 @@ pub struct ViewState {
     /// lie about where it came from.
     pub session_warning_lines: Vec<String>,
     pub pane_infos: Vec<PaneInfo>,
+    pub(crate) structured: HashMap<PaneId, crate::ui::structured::Prepared>,
     pub split_borders: Vec<SplitBorder>,
 }
 
@@ -2251,6 +2269,13 @@ pub(crate) struct SectionGroupingMemo {
 pub struct AppState {
     /// Pane-free agent records and S4 reducers, independent of terminal runtime.
     pub structured_agents: crate::structured::registry::Registry,
+    /// Immutable presentation data only; subscriptions and tasks belong to App.
+    pub(crate) native_control: Option<(crate::structured::view::Target, usize)>,
+    /// Pure draft authorities, each scoped to one App-owned driver lifetime.
+    pub(crate) native_editors: HashMap<String, crate::structured::view::editor::EditorState>,
+    /// Checked App-wide counter shared by editor creation and actual text changes.
+    pub(crate) native_text_revision: u64,
+    pub(crate) native_frames: HashMap<String, crate::structured::view::driver::Published>,
     pub terminals:
         std::collections::HashMap<crate::terminal::TerminalId, crate::terminal::TerminalState>,
     /// Terminal ids whose size is currently owned by a direct attach client.
@@ -2797,12 +2822,29 @@ impl AppState {
     /// Consolidate authenticated node IDs across sources. Legacy rows remain
     /// separate; matching display names never establish identity. Configured
     /// sources always win, then freshness breaks ties within the same tier.
+    ///
+    /// A hub-pushed claim about an identity we have independently verified
+    /// (self, home or a pinned peer) folds into that verified row rather
+    /// than appearing as its own (#2998) — Config and Origin rows stay,
+    /// because Config IS the verified source and Origin IS the home band
+    /// slot's own carrier. The claim adds no authority; the verified row
+    /// keeps its name, icon, metrics and dial target.
     pub(crate) fn remote_peers(&self) -> Vec<(RemotePeerRef, &crate::peers::PeerSummaryState)> {
         let mut ordered: Vec<(RemotePeerRef, &crate::peers::PeerSummaryState, u8)> = Vec::new();
         let mut nodes: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
         for (rank, entry_ref, peer) in self.remote_row_candidates() {
             let node = self.server_peer_node(peer);
             if node.is_some() && node == self.server_node.as_deref() {
+                continue;
+            }
+            // #2998: a claim about a verified identity folds as an
+            // annotation on that identity's row (see [`fold_hubs`]), never
+            // as a separate band row.
+            if !matches!(
+                entry_ref,
+                RemotePeerRef::Config { .. } | RemotePeerRef::Origin
+            ) && self.fold_claim_target(peer).is_some()
+            {
                 continue;
             }
             let key = (
@@ -2842,7 +2884,8 @@ impl AppState {
     }
 
     /// Only a local binding can authenticate a row's identity. Relayed claims
-    /// are proven only when their immediate enrolled source is that same node.
+    /// are proven only when their ingestion-bound source is that same node.
+    /// A current alias binding can revoke old proof, never manufacture it.
     /// Carried snapshots have no such proof and cannot borrow a local alias.
     pub(crate) fn server_peer_node<'a>(
         &'a self,
@@ -2856,6 +2899,7 @@ impl AppState {
             .values()
             .find(|entry| {
                 std::ptr::eq(&entry.peer, peer)
+                    && entry.source_node.as_deref() == Some(claimed)
                     && entry
                         .via
                         .as_ref()
@@ -2903,10 +2947,103 @@ impl AppState {
             peer.node_id
                 .as_deref()
                 .map(|id| id.chars().take(8).flat_map(char::escape_default).collect())
-                .unwrap_or_else(|| "legacy/unverified".to_string())
+                .unwrap_or_else(|| "unverified".to_string())
         } else {
             peer.display_name().to_string()
         }
+    }
+
+    /// A hub-pushed claim about a node this client has independently verified
+    /// (its own identity, home, or a pinned peer) folds into that verified
+    /// row as an annotation rather than occupying its own band row (#2998).
+    /// Matched on the row's `node_id` claim, regardless of whether the
+    /// claim itself is authenticated — folding adds no authority, the
+    /// verified row keeps its name/metrics/dial target.
+    pub(crate) fn fold_claim_target(
+        &self,
+        peer: &crate::peers::PeerSummaryState,
+    ) -> Option<ClaimFoldTarget> {
+        let claimed = peer.node_id.as_deref()?;
+        if Some(claimed) == self.server_node.as_deref() {
+            return Some(ClaimFoldTarget::SelfNode);
+        }
+        if let Some(home) = self
+            .fleet_snapshot
+            .as_ref()
+            .and_then(|s| s.origin_summary.as_ref())
+            .and_then(|o| o.node_id.as_deref())
+        {
+            if home == claimed {
+                return Some(ClaimFoldTarget::Home);
+            }
+        }
+        for (peer_name, node) in &self.server_nodes {
+            if node == claimed {
+                if let Some(peer_idx) = self
+                    .peer_summaries
+                    .iter()
+                    .position(|p| &p.peer == peer_name)
+                {
+                    return Some(ClaimFoldTarget::PinnedPeer { peer_idx });
+                }
+            }
+        }
+        None
+    }
+
+    /// Short hub label to annotate a folded claim (`+via <hub>`). None when
+    /// a Config row (not a claim) or a cache entry without a recorded hub.
+    pub(crate) fn fold_hub_label(&self, peer_ref: &RemotePeerRef) -> Option<String> {
+        match peer_ref {
+            RemotePeerRef::Snapshot { .. } | RemotePeerRef::Origin => self
+                .fleet_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.origin.clone())
+                .filter(|origin| !origin.is_empty()),
+            RemotePeerRef::Relayed { host_key } => self
+                .relayed_fleet_cache
+                .get(host_key)
+                .and_then(|entry| entry.via.clone())
+                .filter(|via| !via.is_empty()),
+            RemotePeerRef::Config { .. } => None,
+        }
+    }
+
+    /// Hub labels for every claim that folds into `target`, deduped and
+    /// lexicographically ordered so two band renders produce the same
+    /// annotation text. A hub whose label equals the folded identity's own
+    /// name is dropped: a row routed via itself is not a new route, just
+    /// noise ("home via home").
+    pub(crate) fn fold_hubs(&self, target: &ClaimFoldTarget) -> Vec<String> {
+        let own_name: Option<String> = match target {
+            ClaimFoldTarget::SelfNode => Some(crate::app::short_host_name()),
+            ClaimFoldTarget::Home => self
+                .fleet_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.origin.clone()),
+            ClaimFoldTarget::PinnedPeer { peer_idx } => self
+                .peer_summaries
+                .get(*peer_idx)
+                .map(|peer| peer.peer.clone()),
+        };
+        let mut hubs: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for (_rank, entry_ref, peer) in self.remote_row_candidates() {
+            if matches!(
+                entry_ref,
+                RemotePeerRef::Config { .. } | RemotePeerRef::Origin
+            ) {
+                continue;
+            }
+            if self.fold_claim_target(peer).as_ref() != Some(target) {
+                continue;
+            }
+            if let Some(hub) = self.fold_hub_label(&entry_ref) {
+                if own_name.as_deref() != Some(hub.as_str()) {
+                    hubs.insert(hub);
+                }
+            }
+        }
+        hubs.into_iter().collect()
     }
 
     /// Drop relay-cache rows that have aged out of usefulness (#101).
@@ -3201,6 +3338,16 @@ impl AppState {
     /// 4. **The label, verbatim** — for a row with no identifiable harness. A
     ///    name is still more use than a blank cell.
     pub fn agent_field_label(
+        &self,
+        mode: crate::config::AgentLabelConfig,
+        harness: Option<crate::detect::Agent>,
+        label: Option<&str>,
+    ) -> String {
+        crate::terminal::agent_name::display(&self.agent_field_label_raw(mode, harness, label))
+            .into_owned()
+    }
+
+    fn agent_field_label_raw(
         &self,
         mode: crate::config::AgentLabelConfig,
         harness: Option<crate::detect::Agent>,
@@ -3579,6 +3726,10 @@ impl AppState {
             issue_drop: None,
             issue_repo_cache: None,
             structured_agents: crate::structured::registry::Registry::default(),
+            native_control: None,
+            native_editors: HashMap::new(),
+            native_text_revision: 0,
+            native_frames: HashMap::new(),
             terminals: std::collections::HashMap::new(),
             direct_attach_resize_locks: std::collections::HashSet::new(),
             pane_id_aliases: std::collections::HashMap::new(),
@@ -3673,6 +3824,7 @@ impl AppState {
                 config_diagnostic_lines: Vec::new(),
                 session_warning_lines: Vec::new(),
                 pane_infos: Vec::new(),
+                structured: HashMap::new(),
                 split_borders: Vec::new(),
             },
             drag: None,
@@ -3805,6 +3957,24 @@ impl AppState {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn security_agent_name_panel_escapes_peer_labels_and_aliases() {
+        for (case, name) in crate::test_support::hostile_agent_names() {
+            let mut state = super::AppState::test_new();
+            let mode = crate::config::AgentLabelConfig::Name;
+            assert_ne!(
+                state.agent_field_label(mode, None, Some(&name)),
+                name,
+                "raw panel name: {case}"
+            );
+            state.agent_aliases.insert("fixture".into(), name.clone());
+            assert_ne!(
+                state.agent_field_label(mode, None, Some("fixture")),
+                name,
+                "raw alias: {case}"
+            );
+        }
+    }
 
     #[test]
     fn project_keys_reduce_to_github_slugs() {
@@ -3883,6 +4053,7 @@ mod tests {
     ) -> crate::peers::RelayedEntry {
         let mut entry =
             crate::peers::relayed_entry_from_wire(crate::api::schema::RelayedFleetPeer {
+                structured_agents: Vec::new(),
                 node_id: None,
                 dial: None,
                 name: host.into(),
@@ -3950,6 +4121,11 @@ mod tests {
             .get_mut("spoke2.invalid")
             .unwrap()
             .via = Some(local.peer.clone());
+        state
+            .relayed_fleet_cache
+            .get_mut("spoke2.invalid")
+            .unwrap()
+            .source_node = Some("fixture-node".into());
         state.peer_summaries = vec![local];
 
         let rows = state.remote_peers();

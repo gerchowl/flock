@@ -59,6 +59,8 @@ struct ClientState {
     reported_cell_size: (u32, u32),
     /// Client-local sound playback config, refreshed on server request.
     sound_config: crate::config::SoundConfig,
+    /// Last title received from the active slot, retained even during a veto.
+    last_window_title: Option<String>,
     /// Whether this client may write Kitty graphics bytes to its host terminal.
     kitty_graphics_enabled: bool,
     /// Direct attach prefix escape state. None for full-app clients.
@@ -585,6 +587,8 @@ pub fn take_switch_target(path: &std::path::Path) -> Option<RecordedSwitch> {
 pub enum ClientError {
     /// Could not connect to the server's client socket.
     ConnectionFailed(io::Error),
+    /// No usable startup terminal geometry was obtained within its budget.
+    TerminalGeometry(io::Error),
     /// Server rejected our handshake.
     HandshakeRejected { version: u32, error: String },
     /// Server shut down.
@@ -607,6 +611,7 @@ impl std::fmt::Display for ClientError {
                 write!(f, "\nIs flk server running? Start it with `flk server`.")?;
                 write!(f, "\nSocket path: {}", path.display())
             }
+            ClientError::TerminalGeometry(err) => write!(f, "terminal geometry: {err}"),
             ClientError::HandshakeRejected { version, error } => {
                 write!(f, "server rejected handshake (version {version}): {error}")
             }
@@ -655,7 +660,7 @@ impl std::fmt::Display for ClientError {
 impl std::error::Error for ClientError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            ClientError::ConnectionFailed(err) => Some(err),
+            ClientError::ConnectionFailed(err) | ClientError::TerminalGeometry(err) => Some(err),
             ClientError::ConnectionLost(err) => Some(err),
             ClientError::Protocol(err) => Some(err),
             _ => None,
@@ -836,6 +841,11 @@ impl HeldRestoreGuard {
         Self { armed: true }
     }
 
+    /// End a final leg and reclaim any remaining inherited terminal hold.
+    fn finish(self) {
+        drop(self);
+    }
+
     /// Disarm: this leg is exiting by handing the held terminal to the next
     /// leg (a recorded SwitchServer). The hold must survive process exit.
     fn into_handoff(mut self) {
@@ -924,13 +934,14 @@ fn carried_fleet_snapshot() -> Option<protocol::FleetSnapshot> {
     }
 }
 
-fn requested_keybindings() -> ClientKeybindings {
+/// Every Hello uses one client snapshot, including background slot dials.
+/// Requiring it here prevents a handshake from reloading the config file.
+fn requested_keybindings(local_config: &crate::config::Config) -> ClientKeybindings {
     match std::env::var(crate::remote::REMOTE_KEYBINDINGS_ENV_VAR)
         .ok()
         .as_deref()
     {
-        Some("local") => crate::config::Config::load()
-            .config
+        Some("local") => local_config
             .local_keybindings_profile_toml()
             .map(|keys_toml| ClientKeybindings::Local { keys_toml })
             .unwrap_or(ClientKeybindings::Server),
@@ -969,6 +980,7 @@ fn do_handshake(
     // (the origin carries no snapshot), so without this a switch to a spoke
     // hands it `fleet: None` and the spoke loses its servers band/home row.
     fleet_override: Option<&protocol::FleetSnapshot>,
+    local_config: &crate::config::Config,
 ) -> Result<RenderEncoding, ClientError> {
     let handshake_t0 = Instant::now();
     stream
@@ -983,7 +995,7 @@ fn do_handshake(
         cell_width_px,
         cell_height_px,
         requested_encoding,
-        keybindings: requested_keybindings(),
+        keybindings: requested_keybindings(local_config),
         launch_mode: if direct_attach_requested {
             ClientLaunchMode::TerminalAttach
         } else {
@@ -1039,6 +1051,8 @@ fn do_handshake(
 enum ClientLoopEvent {
     /// Raw input bytes from stdin.
     StdinInput(Vec<u8>),
+    /// Terminal geometry is unavailable, so detach without resizing any panes.
+    Detach,
     /// Terminal resize detected.
     Resize(u16, u16, u32, u32),
     /// Server message received. Carries the slot key of the reader that read
@@ -1682,6 +1696,7 @@ fn run_attach_attempt(
     attach_request: Option<&(String, bool)>,
     direct_attach: bool,
     kitty_graphics_enabled: bool,
+    mut geometry_probe: GeometryQuery,
     host_theme: Option<crate::terminal_theme::TerminalTheme>,
     pending_stdin: &mut Option<Vec<u8>>,
     stdin_rx: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
@@ -1693,6 +1708,7 @@ fn run_attach_attempt(
     attach_t0: Instant,
     hold_on_transport_loss: bool,
     signal: &AttachSignal,
+    local_config: &mut crate::config::Config,
 ) -> Result<(), AttachAttemptError> {
     let mut stream = UnixStream::connect(socket_path)
         .map_err(|err| AttachAttemptError::Handshake(ClientError::ConnectionFailed(err)))?;
@@ -1700,8 +1716,15 @@ fn run_attach_attempt(
     // Read the terminal geometry before the handshake, while still outside
     // raw mode. Re-read on every attempt so a resize that happens during a
     // handoff window is honored.
-    let (cols, rows, cell_width_px, cell_height_px) =
-        current_terminal_geometry(kitty_graphics_enabled);
+    let Some((cols, rows, cell_width_px, cell_height_px)) = wait_for_initial_geometry(
+        || geometry_probe(kitty_graphics_enabled),
+        Instant::now,
+        std::thread::park_timeout,
+    )
+    .map_err(|err| AttachAttemptError::Handshake(ClientError::TerminalGeometry(err)))?
+    else {
+        return Ok(());
+    };
 
     // Perform handshake while the stream is still in blocking mode.
     let negotiated_encoding = do_handshake(
@@ -1714,6 +1737,7 @@ fn run_attach_attempt(
         attach_request.is_some(),
         host_theme,
         None, // initial attach: the launcher-carried snapshot (env) is correct
+        local_config,
     )
     .map_err(AttachAttemptError::Handshake)?;
 
@@ -1766,8 +1790,8 @@ fn run_attach_attempt(
     let initial_input = pending_stdin.take();
     let result = rt.block_on(run_client_loop(
         stream,
-        cols,
-        rows,
+        (cols, rows, cell_width_px, cell_height_px),
+        geometry_probe,
         should_quit.clone(),
         sound_config.clone(),
         mouse_scroll_lines,
@@ -1779,11 +1803,21 @@ fn run_attach_attempt(
         initial_input,
         stdin_rx,
         attach_t0,
+        local_config,
     ));
 
-    // A remote leg whose transport dropped keeps its last frame up while it
-    // redials (#436): decide before the guard's restore runs. Everything else
-    // restores the terminal before the caller prints anything.
+    finish_attach_session(_guard, result, hold_on_transport_loss, should_quit)
+}
+
+/// Complete a guarded session, including early tty-loss exits from loop startup.
+fn finish_attach_session(
+    guard: TerminalGuard,
+    result: Result<(), ClientError>,
+    hold_on_transport_loss: bool,
+    should_quit: &AtomicBool,
+) -> Result<(), AttachAttemptError> {
+    // Only transport loss holds raw mode for redial. A clean tty-loss exit
+    // restores modes through the same guard drop as every other final exit.
     if hold_on_transport_loss
         && matches!(result, Err(ClientError::ConnectionLost(_)))
         && !should_quit.load(Ordering::Acquire)
@@ -1791,8 +1825,7 @@ fn run_attach_attempt(
     {
         RECONNECT_HOLD.store(true, Ordering::Release);
     }
-    drop(_guard);
-
+    drop(guard);
     result.map_err(AttachAttemptError::Session)
 }
 
@@ -1884,7 +1917,7 @@ fn run_client_with_mode(
     // still held — ctrl-c/signal, error return, or the `std::process::exit`
     // paths below that skip TerminalGuard::drop (#69). Disarmed only when this
     // leg hands the held terminal off to a real next leg.
-    let loaded_config = crate::config::Config::load();
+    let mut loaded_config = crate::config::Config::load();
     HOST_WINDOW_TITLE_ALLOWED.store(loaded_config.config.title.enabled, Ordering::Release);
     let held_restore = HeldRestoreGuard::new();
     // Whether, and how, this leg redials a dropped transport (#436).
@@ -1894,7 +1927,7 @@ fn run_client_with_mode(
     );
     let mouse_scroll_lines = loaded_config.config.ui.mouse_scroll_lines();
     let redraw_on_focus_gained = loaded_config.config.ui.redraw_on_focus_gained;
-    let sound_config = loaded_config.config.ui.sound;
+    let sound_config = loaded_config.config.ui.sound.clone();
     let direct_attach_requested = attach_request.is_some();
     let kitty_graphics_enabled =
         loaded_config.config.experimental.kitty_graphics && !direct_attach_requested;
@@ -1973,6 +2006,7 @@ fn run_client_with_mode(
                 attach_request.as_ref(),
                 direct_attach,
                 kitty_graphics_enabled,
+                terminal_geometry_query(),
                 host_theme,
                 &mut pending_stdin,
                 stdin_rx,
@@ -1984,6 +2018,7 @@ fn run_client_with_mode(
                 attach_t0,
                 reconnect_plan.is_some(),
                 &attach_signal,
+                &mut loaded_config.config,
             )
         },
         &attach_signal,
@@ -2080,9 +2115,9 @@ fn run_client_with_mode(
         });
     }
 
-    // Clean leg exit: the terminal is already fully restored. Disarm so the
-    // guard does not second-guess it.
-    held_restore.into_handoff();
+    // A pre-handshake tty-loss exit has no new TerminalGuard. Reclaim any
+    // inherited raw-mode hold rather than handing it to a nonexistent next leg.
+    held_restore.finish();
     rt.shutdown_timeout(Duration::from_millis(100));
     crate::logging::shutdown("client");
     Ok(())
@@ -2099,8 +2134,8 @@ fn run_client_with_mode(
 #[allow(clippy::too_many_arguments)]
 async fn run_client_loop(
     stream: UnixStream,
-    cols: u16,
-    rows: u16,
+    initial_geometry: TerminalGeometry,
+    mut geometry_probe: GeometryQuery,
     should_quit: Arc<AtomicBool>,
     sound_config: crate::config::SoundConfig,
     mouse_scroll_lines: usize,
@@ -2112,13 +2147,22 @@ async fn run_client_loop(
     initial_input: Option<Vec<u8>>,
     stdin_rx: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
     attach_t0: Instant,
+    local_config: &mut crate::config::Config,
 ) -> Result<(), ClientError> {
-    let (_, _, initial_cell_width, initial_cell_height) =
-        current_terminal_geometry(kitty_graphics_enabled);
+    let (cols, rows, _, _) = initial_geometry;
+    let Some((_, _, initial_cell_width, initial_cell_height)) = resolve_terminal_geometry(
+        Some(initial_geometry),
+        geometry_probe(kitty_graphics_enabled),
+        "loop_startup",
+    )
+    .map_err(ClientError::TerminalGeometry)?
+    else {
+        // Closing this connection detaches the observer if its terminal vanished
+        // between the handshake and starting the event loop.
+        return Ok(());
+    };
     // `ui.file_drop` gate (#79): whether a dropped local file is ferried to the
     // server. Read once per attach leg (cheap; file-drops are rare).
-    let local_config = crate::config::Config::load().config;
-    HOST_WINDOW_TITLE_ALLOWED.store(local_config.title.enabled, Ordering::Release);
     let file_drop_mode = local_config.ui.file_drop;
     // One-shot guard for the first-paint trace event so subsequent frames are
     // a single cheap bool check.
@@ -2129,6 +2173,7 @@ async fn run_client_loop(
     let mut switch_timing: Option<(Instant, String, bool)> = None;
     let mut state = ClientState {
         blit_encoder: render_ansi::BlitEncoder::new(),
+        last_window_title: None,
         mouse_capture_active,
         reported_size: (cols, rows),
         reported_cell_size: (initial_cell_width, initial_cell_height),
@@ -2153,7 +2198,13 @@ async fn run_client_loop(
     let resize_quit = should_quit.clone();
     let resize_tx = event_tx.clone();
     std::thread::spawn(move || {
-        resize_poll_loop(resize_tx, cols, rows, kitty_graphics_enabled, &resize_quit);
+        resize_poll_loop(
+            resize_tx,
+            initial_geometry,
+            kitty_graphics_enabled,
+            &resize_quit,
+            geometry_probe,
+        );
     });
 
     let max_frame_size = if kitty_graphics_enabled {
@@ -2191,11 +2242,12 @@ async fn run_client_loop(
     // writer still isolates the loop from a stalled transport. The reader was
     // already spawned from its own clone above; `stream` (the write half) is
     // moved into the writer thread here.
-    let (mut slot_manager, mut active_writer) = build_active_writer_and_manager(stream, &event_tx)
-        .map_err(ClientError::ConnectionFailed)?;
+    let (mut slot_manager, mut active_writer) =
+        build_active_writer_and_manager(stream, &event_tx, local_config)
+            .map_err(ClientError::ConnectionFailed)?;
     // Whether the warm sweep pre-warms cold ssh peers by building their bridge
     // ahead of time (#139), not just home + the active leg. Read once at start.
-    let prewarm_ssh_peers = crate::config::Config::load().config.slots.prewarm_ssh_peers;
+    let prewarm_ssh_peers = local_config.slots.prewarm_ssh_peers;
 
     // Bytes consumed from stdin during the pre-handshake theme capture:
     // forward them as the session's first input so no keystroke is lost. The
@@ -2285,6 +2337,7 @@ async fn run_client_loop(
         }
 
         match event {
+            ClientLoopEvent::Detach => break,
             ClientLoopEvent::StdinInput(data) => {
                 // Cancellable switch popup (#93): Esc is intercepted ONLY while
                 // a switch is pending. A chunk equal to exactly `[0x1b]` is the
@@ -2626,6 +2679,7 @@ async fn run_client_loop(
                                         target.clone(),
                                         geometry,
                                         negotiated_encoding,
+                                        local_config.clone(),
                                         fleet.clone(),
                                         proxy_jump.clone(),
                                         event_tx.clone(),
@@ -2702,6 +2756,7 @@ async fn run_client_loop(
                         // from a slot that is no longer active. The local
                         // client still has its own veto at the output boundary.
                         set_host_window_title(&title);
+                        state.last_window_title = Some(title);
                     }
                     ServerMessage::Clipboard { data } => {
                         forward_clipboard(&data);
@@ -2711,6 +2766,8 @@ async fn run_client_loop(
                         reload_local_client_config(
                             &mut state.sound_config,
                             &mut state.redraw_on_focus_gained,
+                            state.last_window_title.as_deref(),
+                            local_config,
                         );
                     }
                     ServerMessage::MouseCapture { enabled } => {
@@ -3035,6 +3092,7 @@ async fn run_client_loop(
                                             socket_path,
                                             geometry,
                                             negotiated_encoding,
+                                            local_config.clone(),
                                             event_tx.clone(),
                                         );
                                     }
@@ -3055,6 +3113,7 @@ async fn run_client_loop(
                                             target.clone(),
                                             geometry,
                                             negotiated_encoding,
+                                            local_config.clone(),
                                             event_tx.clone(),
                                         );
                                     }
@@ -3225,6 +3284,7 @@ fn apply_slot_flip(
     // active writer becomes the new slot's writer handle — input now routes to
     // its dedicated writer thread (#176).
     *active_slot_key = new_key;
+    state.last_window_title = None;
     *active_writer = new_writer;
     // Re-assert geometry to the slot we just made active (#77).
     let (cur_cols, cur_rows) = state.reported_size;
@@ -3626,9 +3686,9 @@ fn slot_death_hook(
 fn build_active_writer_and_manager(
     active_stream: UnixStream,
     event_tx: &tokio::sync::mpsc::Sender<ClientLoopEvent>,
+    local_config: &crate::config::Config,
 ) -> io::Result<(Option<slots::SlotManager>, slots::SlotWriter)> {
-    let loaded = crate::config::Config::load();
-    let slots_config = loaded.config.slots.clone();
+    let slots_config = &local_config.slots;
 
     // The active slot is whatever leg launched this client: home for a local
     // attach, the ssh target for a remote leg (carried in REATTACH/remote env).
@@ -3647,8 +3707,7 @@ fn build_active_writer_and_manager(
     // Warm-all targets: locally-configured peers (a hub knows its fleet) plus
     // the carried snapshot's peers and origin (a spoke learns its fleet from
     // the down-gossip, #73). Home is always included.
-    let config_peers: Vec<String> = loaded
-        .config
+    let config_peers: Vec<String> = local_config
         .peers
         .iter()
         .map(|p| p.ssh_target().to_string())
@@ -3680,6 +3739,7 @@ fn spawn_warm_dial(
     socket_path: std::path::PathBuf,
     geometry: (u16, u16, u32, u32),
     requested_encoding: RenderEncoding,
+    local_config: crate::config::Config,
     event_tx: tokio::sync::mpsc::Sender<ClientLoopEvent>,
 ) {
     std::thread::spawn(move || {
@@ -3704,6 +3764,7 @@ fn spawn_warm_dial(
                 false,
                 None,
                 None,
+                &local_config,
             )?;
             Ok(stream)
         })();
@@ -3740,6 +3801,7 @@ fn spawn_warm_bridge_dial(
     target: slots::SlotTarget,
     geometry: (u16, u16, u32, u32),
     requested_encoding: RenderEncoding,
+    local_config: crate::config::Config,
     event_tx: tokio::sync::mpsc::Sender<ClientLoopEvent>,
 ) {
     spawn_switch_dial(
@@ -3747,6 +3809,7 @@ fn spawn_warm_bridge_dial(
         target,
         geometry,
         requested_encoding,
+        local_config,
         None,
         None,
         event_tx,
@@ -3766,6 +3829,7 @@ fn spawn_switch_dial(
     target: slots::SlotTarget,
     geometry: (u16, u16, u32, u32),
     requested_encoding: RenderEncoding,
+    local_config: crate::config::Config,
     // The hub's snapshot from the SwitchServer message -- carried into the
     // spoke's handshake so it renders the servers band / home row (#102).
     fleet: Option<protocol::FleetSnapshot>,
@@ -3809,6 +3873,7 @@ fn spawn_switch_dial(
                                 false,
                                 None,
                                 fleet.as_ref(),
+                                &local_config,
                             )
                         })?;
                         return Ok((stream, None));
@@ -3859,6 +3924,7 @@ fn spawn_switch_dial(
                                     false,
                                     None,
                                     fleet.as_ref(),
+                                    &local_config,
                                 )
                             })?;
                             Ok((stream, Some(bridge)))
@@ -4020,18 +4086,29 @@ fn write_to_server(stream: &mut UnixStream, msg: &ClientMessage) -> io::Result<(
 // Notifications
 // ---------------------------------------------------------------------------
 
+/// Replace the snapshot only after a successful load. Failed reloads keep the
+/// last valid configuration for later dials and reconnect attempts.
 fn reload_local_client_config(
     sound_config: &mut crate::config::SoundConfig,
     redraw_on_focus_gained: &mut bool,
+    last_window_title: Option<&str>,
+    local_config: &mut crate::config::Config,
 ) {
     match crate::config::load_live_config() {
         Ok(loaded) => {
             for diagnostic in loaded.config.ui.sound.diagnostics() {
                 crate::logging::client_config_sound_diagnostic(&diagnostic.to_string());
             }
-            HOST_WINDOW_TITLE_ALLOWED.store(loaded.config.title.enabled, Ordering::Release);
-            *sound_config = loaded.config.ui.sound;
+            let enabled = loaded.config.title.enabled;
+            let was_enabled = HOST_WINDOW_TITLE_ALLOWED.swap(enabled, Ordering::AcqRel);
+            if enabled && !was_enabled {
+                if let Some(title) = last_window_title {
+                    set_host_window_title(title);
+                }
+            }
+            *sound_config = loaded.config.ui.sound.clone();
             *redraw_on_focus_gained = loaded.config.ui.redraw_on_focus_gained;
+            *local_config = loaded.config;
             debug!("reloaded local client config");
         }
         Err(diagnostics) => {
@@ -4279,44 +4356,206 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 // Resize polling
 // ---------------------------------------------------------------------------
 
-fn current_terminal_geometry(kitty_graphics_enabled: bool) -> (u16, u16, u32, u32) {
-    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-    if !kitty_graphics_enabled {
-        return (cols, rows, 0, 0);
+type TerminalGeometry = (u16, u16, u32, u32);
+use crate::platform::terminal_geometry::GeometryError;
+
+/// Startup may precede the first PTY resize (for example in an exec session).
+/// Wait at most two monotonic seconds for nonzero cells; never invent geometry.
+const INITIAL_GEOMETRY_TIMEOUT: Duration = Duration::from_secs(2);
+/// Share the established geometry polling cadence while waiting for startup.
+const GEOMETRY_POLL_INTERVAL: Duration = Duration::from_millis(100);
+type GeometryQuery = Box<dyn FnMut(bool) -> Result<TerminalGeometry, GeometryError> + Send>;
+
+fn terminal_geometry_query() -> GeometryQuery {
+    let mut probe = crate::platform::terminal_geometry::GeometryProbe::default();
+    Box::new(move |kitty| {
+        let (cols, rows, width, height) = probe.query()?;
+        let (cell_width, cell_height) = if !kitty {
+            (0, 0)
+        } else if width == 0 || height == 0 {
+            (8, 16)
+        } else {
+            (
+                (u32::from(width) / u32::from(cols)).max(1),
+                (u32::from(height) / u32::from(rows)).max(1),
+            )
+        };
+        Ok((cols, rows, cell_width, cell_height))
+    })
+}
+
+/// A registered startup refusal is also visible in the human error message.
+#[derive(Debug)]
+struct GeometryStartupError(crate::api::error_code::ErrorCode, &'static str);
+impl std::fmt::Display for GeometryStartupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.0, self.1)
     }
-    let Ok(size) = crossterm::terminal::window_size() else {
-        return (cols, rows, 8, 16);
+}
+impl std::error::Error for GeometryStartupError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+fn geometry_startup_error(no_tty: bool) -> io::Error {
+    use crate::api::error_code::ErrorCode;
+    let (kind, code, message) = if no_tty {
+        (
+            io::ErrorKind::NotConnected,
+            ErrorCode::TerminalUnavailable,
+            "no terminal is available; attach from a terminal",
+        )
+    } else {
+        (
+            io::ErrorKind::TimedOut,
+            ErrorCode::Timeout,
+            "terminal geometry did not become nonzero before the startup deadline",
+        )
     };
-    if size.columns == 0 || size.rows == 0 || size.width == 0 || size.height == 0 {
-        return (cols, rows, 8, 16);
+    io::Error::new(kind, GeometryStartupError(code, message))
+}
+
+fn wait_for_initial_geometry(
+    mut geometry: impl FnMut() -> Result<TerminalGeometry, GeometryError>,
+    now: impl Fn() -> Instant,
+    mut wait: impl FnMut(Duration),
+) -> io::Result<Option<TerminalGeometry>> {
+    let deadline = now() + INITIAL_GEOMETRY_TIMEOUT;
+    let mut last_failure = None;
+    loop {
+        match geometry() {
+            Ok(size) => return Ok(Some(size)),
+            Err(GeometryError::Gone(error)) => {
+                crate::logging::client_geometry_query_failed(
+                    "handshake",
+                    "tty_gone",
+                    "detached",
+                    &error,
+                );
+                return Ok(None);
+            }
+            Err(GeometryError::Unavailable(error)) => {
+                crate::logging::client_geometry_query_failed(
+                    "handshake",
+                    "no_tty",
+                    "startup_failed",
+                    &error,
+                );
+                return Err(geometry_startup_error(true));
+            }
+            Err(GeometryError::Transient(error)) => {
+                let key = (error.kind(), error.raw_os_error());
+                if last_failure != Some(key) {
+                    crate::logging::client_geometry_query_failed(
+                        "handshake",
+                        "transient_query_failure",
+                        "waiting_geometry",
+                        &error,
+                    );
+                    last_failure = Some(key);
+                }
+            }
+        }
+        let remaining = deadline.saturating_duration_since(now());
+        if remaining.is_zero() {
+            let error = geometry_startup_error(false);
+            crate::logging::client_geometry_query_failed(
+                "handshake",
+                "geometry_deadline",
+                "startup_failed",
+                &error,
+            );
+            return Err(error);
+        }
+        wait(remaining.min(GEOMETRY_POLL_INTERVAL));
     }
-    (
-        cols,
-        rows,
-        (size.width as u32 / size.columns as u32).max(1),
-        (size.height as u32 / size.rows as u32).max(1),
-    )
+}
+
+/// Resolve an established-session observation without inventing geometry.
+/// Initial measurements instead use the bounded startup wait above.
+fn resolve_terminal_geometry(
+    previous: Option<TerminalGeometry>,
+    observed: Result<TerminalGeometry, GeometryError>,
+    stage: &'static str,
+) -> io::Result<Option<TerminalGeometry>> {
+    match observed {
+        Ok(geometry) => Ok(Some(geometry)),
+        Err(GeometryError::Gone(error)) => {
+            crate::logging::client_geometry_query_failed(stage, "tty_gone", "detached", &error);
+            Ok(None)
+        }
+        Err(GeometryError::Transient(error)) => {
+            crate::logging::client_geometry_query_failed(
+                stage,
+                "transient_query_failure",
+                if previous.is_some() {
+                    "geometry_retained"
+                } else {
+                    "startup_failed"
+                },
+                &error,
+            );
+            previous.map(Some).ok_or(error)
+        }
+        Err(GeometryError::Unavailable(_)) => Err(geometry_startup_error(true)),
+    }
 }
 
 /// Polls the terminal size and sends resize events when it changes.
 fn resize_poll_loop(
     resize_tx: tokio::sync::mpsc::Sender<ClientLoopEvent>,
-    initial_cols: u16,
-    initial_rows: u16,
+    initial_geometry: TerminalGeometry,
     kitty_graphics_enabled: bool,
     should_quit: &Arc<AtomicBool>,
+    mut geometry_probe: GeometryQuery,
 ) {
-    let (_, _, initial_cell_width, initial_cell_height) =
-        current_terminal_geometry(kitty_graphics_enabled);
-    let mut last_size = (
-        initial_cols,
-        initial_rows,
-        initial_cell_width,
-        initial_cell_height,
+    resize_poll_loop_with(
+        resize_tx,
+        initial_geometry,
+        should_quit,
+        || geometry_probe(kitty_graphics_enabled),
+        || std::thread::sleep(GEOMETRY_POLL_INTERVAL),
     );
+}
+
+/// Poll geometry with supplied observations and cadence. Geometry loss takes the
+/// same detach path as a clean client exit, without inventing a replacement size.
+fn resize_poll_loop_with(
+    resize_tx: tokio::sync::mpsc::Sender<ClientLoopEvent>,
+    initial_geometry: TerminalGeometry,
+    should_quit: &Arc<AtomicBool>,
+    mut geometry: impl FnMut() -> Result<TerminalGeometry, GeometryError>,
+    mut wait: impl FnMut(),
+) {
+    let mut last_size = initial_geometry;
+    let mut last_failure = None;
     while !should_quit.load(Ordering::Acquire) {
-        std::thread::sleep(Duration::from_millis(100));
-        let new_size = current_terminal_geometry(kitty_graphics_enabled);
+        let new_size = match geometry() {
+            Ok(size) => {
+                last_failure = None;
+                size
+            }
+            Err(GeometryError::Gone(error) | GeometryError::Unavailable(error)) => {
+                crate::logging::client_geometry_query_failed(
+                    "poll", "tty_gone", "detached", &error,
+                );
+                let _ = resize_tx.blocking_send(ClientLoopEvent::Detach);
+                return;
+            }
+            Err(GeometryError::Transient(error)) => {
+                let key = (error.kind(), error.raw_os_error());
+                if last_failure != Some(key) {
+                    crate::logging::client_geometry_query_failed(
+                        "poll",
+                        "transient_query_failure",
+                        "geometry_retained",
+                        &error,
+                    );
+                    last_failure = Some(key);
+                }
+                last_size
+            }
+        };
         if new_size != last_size {
             last_size = new_size;
             if resize_tx
@@ -4328,6 +4567,7 @@ fn resize_poll_loop(
                 break; // Main loop gone.
             }
         }
+        wait();
     }
 }
 
@@ -4352,6 +4592,10 @@ fn init_logging() {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[path = "geometry_tests.rs"]
+mod geometry_tests;
 
 #[cfg(test)]
 mod tests {
@@ -4409,6 +4653,7 @@ mod tests {
             false,
             None,
             None,
+            &crate::config::Config::default(),
         )
         .unwrap_err();
         worker.join().unwrap();
@@ -4967,6 +5212,7 @@ mod tests {
             slots::SlotTarget::Home,
             (90, 30, 8, 16),
             RenderEncoding::SemanticFrame,
+            crate::config::Config::default(),
             Some(hub.clone()),
             None,
             event_tx,
@@ -5467,7 +5713,12 @@ mod tests {
         let mut sound_config = crate::config::SoundConfig::default();
         let mut redraw_on_focus_gained = true;
 
-        reload_local_client_config(&mut sound_config, &mut redraw_on_focus_gained);
+        reload_local_client_config(
+            &mut sound_config,
+            &mut redraw_on_focus_gained,
+            None,
+            &mut crate::config::Config::default(),
+        );
 
         assert!(!redraw_on_focus_gained);
         let _ = std::fs::remove_file(path);
@@ -5860,6 +6111,7 @@ mod tests {
         let mut active_writer = old_conn.writer();
         let mut state = ClientState {
             blit_encoder: render_ansi::BlitEncoder::new(),
+            last_window_title: Some("old-slot".into()),
             mouse_capture_active: false,
             reported_size: (80, 24),
             reported_cell_size: (10, 20),
@@ -5896,6 +6148,7 @@ mod tests {
 
         // Active slot key flipped to the new target.
         assert_eq!(active_slot_key, "kiln");
+        assert!(state.last_window_title.is_none());
         // The new stream is what we get; reading on the new peer should see
         // the Resize re-assert that apply_slot_flip just wrote.
         new_peer
@@ -5966,6 +6219,7 @@ mod tests {
         let mut active_reader_quit = Arc::new(AtomicBool::new(false));
         let mut state = ClientState {
             blit_encoder: render_ansi::BlitEncoder::new(),
+            last_window_title: Some("old-slot".into()),
             mouse_capture_active: false,
             reported_size: (100, 40),
             reported_cell_size: (9, 18),
@@ -6034,6 +6288,7 @@ mod tests {
         let mut active_reader_quit = Arc::new(AtomicBool::new(false));
         let mut state = ClientState {
             blit_encoder: render_ansi::BlitEncoder::new(),
+            last_window_title: Some("old-slot".into()),
             mouse_capture_active: false,
             reported_size: (80, 24),
             reported_cell_size: (10, 20),

@@ -1,4 +1,4 @@
-/* The MVP workbench (ADR-0038 §2a). Tokens come from styles.css. */
+/* The MVP workbench (ADR-0038 §2a). Tokens come from tokens.css. */
 
 /* One viewport-high column: the replay badge, if any, then the workbench. */
 #root {
@@ -11,55 +11,39 @@
 .workbench {
   display: grid;
   flex: 1;
-  grid-template: "top top top" auto "side focus inbox" minmax(0, 1fr) / 16rem minmax(0, 1fr) 20rem;
+  grid-template: "top top top" auto "banner banner banner" auto "side focus inbox" minmax(0, 1fr) / 16rem minmax(0, 1fr) 20rem;
   min-height: 0;
-}
-
-.topbar {
-  grid-area: top;
-  display: flex;
-  align-items: center;
-  gap: 1rem;
-  min-height: 48px;
-  padding: 0 1rem;
-  border-bottom: 1px solid var(--border);
-}
-
-.topbar__mark {
-  font-weight: 700;
-}
-
-.topbar__summary,
-.topbar__status {
-  color: var(--muted);
-}
-
-.topbar__status {
-  margin-left: auto;
 }
 
 .sidebar,
 .inbox {
   overflow-y: auto;
   padding: 0.5rem;
-  background: var(--surface);
+  background: var(--color-legacy-surface);
 }
 
 .sidebar {
   grid-area: side;
-  border-right: 1px solid var(--border);
+  border-right: var(--border-width-thin) solid var(--color-legacy-border);
 }
 
 .inbox {
   grid-area: inbox;
-  border-left: 1px solid var(--border);
+  border-left: var(--border-width-thin) solid var(--color-legacy-border);
 }
 
 .sidebar__note,
 .inbox__note,
 .focus__empty {
   margin: 0.5rem;
-  color: var(--muted);
+  color: var(--color-legacy-muted);
+}
+
+/* A group's rows touch each other, and keep one grid step from the headings around them. */
+.agent-list {
+  margin: 0;
+  padding: var(--space-1) 0;
+  list-style: none;
 }
 
 .agent-row {
@@ -67,10 +51,10 @@
   align-items: center;
   gap: 0.875rem;
   width: 100%;
-  min-height: 44px;
+  min-height: var(--size-control);
   padding: 0.375rem 0.5rem;
   border: 0;
-  border-radius: 6px;
+  border-radius: var(--radius-small);
   background: none;
   color: inherit;
   font: inherit;
@@ -78,26 +62,61 @@
   cursor: pointer;
 }
 
-.agent-row:hover,
-.agent-row[aria-current="true"] {
-  background: var(--bg);
+.agent-row:hover {
+  background: var(--color-legacy-bg);
 }
 
+/* The selected agent. In the active window it is an emphasised selection:
+   its content takes the alternate colours, status marks included. In an
+   inactive window it is unemphasised and keeps the ordinary labels (HIG;
+   web/DESIGN.md "Colour"; `data-window` comes from window-focus.ts). */
+.agent-row[aria-current="true"] {
+  background: var(--color-selection-inactive);
+  color: var(--color-label-primary);
+}
+
+[data-window="active"] .agent-row[aria-current="true"] {
+  background: var(--color-selection-active);
+  color: var(--color-label-on-selection);
+}
+
+/* One line (#2903): the name, then the activity, each cut short with an
+   ellipsis. The activity keeps at least --space-12 of the line, and the name
+   takes at most the rest, so a long name never hides the activity; the
+   activity grows only into space the name leaves, so it never hides the name. */
 .agent-row__text {
   display: flex;
-  flex-direction: column;
+  flex: 1;
+  align-items: baseline;
+  gap: var(--space-2);
   min-width: 0;
 }
 
 .agent-row__name {
-  font-weight: 600;
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: calc(100% - var(--space-12) - var(--space-2));
+  overflow: hidden;
+  font-weight: var(--font-weight-semibold);
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .agent-row__activity {
+  flex: 1 1 0;
+  min-width: var(--space-12);
   overflow: hidden;
-  color: var(--muted);
+  color: var(--color-legacy-muted);
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.agent-row[aria-current="true"] .agent-row__activity {
+  color: var(--color-label-secondary);
+}
+
+[data-window="active"] .agent-row[aria-current="true"] .agent-row__activity {
+  color: var(--color-label-on-selection-secondary);
 }
 
 .mark {
@@ -111,11 +130,12 @@
   stroke: currentColor;
 }
 
-.mark--working { color: var(--working); }
-.mark--needs { color: var(--needs); }
-.mark--idle { color: var(--idle); }
-.mark--done { color: var(--done); }
-.mark--failed { color: var(--failed); }
+.mark--working { color: var(--color-legacy-working); }
+.mark--needs { color: var(--color-legacy-needs); }
+.mark--idle { color: var(--color-legacy-idle); }
+.mark--done { color: var(--color-legacy-done); }
+.mark--failed { color: var(--color-legacy-failed); }
+[data-window="active"] .agent-row[aria-current="true"] .mark { color: var(--color-label-on-selection); }
 
 .mark__count {
   position: absolute;
@@ -124,8 +144,8 @@
   min-width: 1rem;
   padding: 0 0.25rem;
   border-radius: 0.5rem;
-  background: var(--needs);
-  color: var(--bg);
+  background: var(--color-legacy-needs);
+  color: var(--color-legacy-bg);
   font-size: 0.6875rem;
   font-weight: 700;
   line-height: 1rem;
@@ -146,7 +166,7 @@
   align-items: center;
   gap: 0.5rem 0.75rem;
   padding: 0.5rem 1rem;
-  border-bottom: 1px solid var(--border);
+  border-bottom: var(--border-width-thin) solid var(--color-legacy-border);
 }
 
 .focus__name {
@@ -171,23 +191,24 @@
   align-items: center;
   gap: 0.375rem;
   padding: 0.125rem 0.625rem;
-  border: 1px solid var(--border);
+  border: var(--border-width-thin) solid var(--color-legacy-border);
   border-radius: 999px;
 }
 
 .action {
-  min-height: 44px;
+  min-height: var(--size-control);
   padding: 0 0.875rem;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  background: var(--bg);
+  border: var(--border-width-thin) solid var(--color-legacy-border);
+  border-radius: var(--radius-small);
+  background: var(--color-legacy-bg);
   color: inherit;
   font: inherit;
   cursor: pointer;
 }
 
-.action[aria-disabled="true"] {
-  color: var(--muted);
+.action[aria-disabled="true"],
+.action:disabled {
+  color: var(--color-legacy-muted);
   cursor: not-allowed;
 }
 
@@ -200,7 +221,7 @@
 
 .waits__reason {
   margin: 0;
-  color: var(--muted);
+  color: var(--color-legacy-muted);
   font-size: 0.75rem;
 }
 
@@ -212,19 +233,26 @@
 .card {
   margin: 0.5rem 0;
   padding: 0.75rem;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  background: var(--bg);
+  border: var(--border-width-thin) solid var(--color-legacy-border);
+  border-radius: var(--radius-medium);
+  background: var(--color-legacy-bg);
 }
 
 .card--blocking {
-  border-left: 4px solid var(--needs);
+  border-left: 4px solid var(--color-legacy-needs);
 }
 
 .card__meta,
 .card__detail {
   margin: 0;
-  color: var(--muted);
+  color: var(--color-legacy-muted);
+}
+
+.card__stale {
+  margin: 0.25rem 0;
+  font-size: 0.8rem;
+  font-style: italic;
+  opacity: 0.8;
 }
 
 .card__title {
@@ -242,13 +270,13 @@
 .palette-trigger {
   display: inline-flex;
   align-items: center;
-  gap: 1.5rem;
-  min-height: 44px;
+  gap: var(--space-2);
+  min-height: var(--size-control);
   padding: 0 0.75rem;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  background: var(--surface);
-  color: var(--muted);
+  border: var(--border-width-thin) solid var(--color-legacy-border);
+  border-radius: var(--radius-small);
+  background: var(--color-legacy-surface);
+  color: var(--color-legacy-muted);
   font: inherit;
   cursor: pointer;
 }
@@ -256,20 +284,20 @@
 .palette-backdrop {
   position: fixed;
   inset: 0;
-  z-index: 10;
+  z-index: var(--layer-overlay);
   display: flex;
   justify-content: center;
   padding-top: 15vh;
-  background: rgb(0 0 0 / 0.35);
+  background: var(--color-legacy-scrim);
 }
 
 .palette {
   width: min(36rem, calc(100vw - 2rem));
   max-height: 60vh;
   overflow: hidden auto;
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  background: var(--bg);
+  border: var(--border-width-thin) solid var(--color-legacy-border);
+  border-radius: var(--radius-large);
+  background: var(--color-legacy-bg);
 }
 
 .palette__input {
@@ -277,7 +305,7 @@
   min-height: 48px;
   padding: 0 1rem;
   border: 0;
-  border-bottom: 1px solid var(--border);
+  border-bottom: var(--border-width-thin) solid var(--color-legacy-border);
   background: none;
   color: inherit;
   font: inherit;
@@ -295,10 +323,10 @@
   justify-content: space-between;
   gap: 1rem;
   width: 100%;
-  min-height: 44px;
+  min-height: var(--size-control);
   padding: 0 0.75rem;
   border: 0;
-  border-radius: 6px;
+  border-radius: var(--radius-small);
   background: none;
   color: inherit;
   font: inherit;
@@ -306,16 +334,34 @@
   cursor: pointer;
 }
 
-.palette__item[aria-selected="true"],
 .palette__item:hover {
-  background: var(--surface);
+  background: var(--color-legacy-surface);
+}
+
+/* The highlighted item is a selection, like a menu's: emphasised in the active window. */
+.palette__item[aria-selected="true"] {
+  background: var(--color-selection-inactive);
+  color: var(--color-label-primary);
+}
+
+[data-window="active"] .palette__item[aria-selected="true"] {
+  background: var(--color-selection-active);
+  color: var(--color-label-on-selection);
 }
 
 .palette__hint {
   overflow: hidden;
-  color: var(--muted);
+  color: var(--color-legacy-muted);
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.palette__item[aria-selected="true"] .palette__hint {
+  color: var(--color-label-secondary);
+}
+
+[data-window="active"] .palette__item[aria-selected="true"] .palette__hint {
+  color: var(--color-label-on-selection-secondary);
 }
 
 /* Phone (ADR-0038 §2a): inbox first, one screen at a time, tabs at the bottom. */
@@ -325,7 +371,7 @@
   flex-direction: column;
   min-height: 0;
   /* ADR-0038 §2a's phone body text, also when `?layout=phone` forces it on a wide window. */
-  font-size: 15px;
+  font-size: var(--font-size-15);
 }
 
 .phone__screen {
@@ -348,12 +394,22 @@
 
 .phone__headline {
   margin: 0 0 0.5rem;
-  color: var(--muted);
+  color: var(--color-legacy-muted);
 }
 
 .phone .card__choices .waits {
   flex: 1 1 100%;
   align-items: stretch;
+}
+
+/* The phone layout's controls are 44 px touch targets at any width,
+   `?layout=phone` on a wide window included (HIG Accessibility). */
+.phone .action,
+.phone .agent-row,
+.phone .transcript__fold,
+.phone .host__trigger,
+.phone details > summary {
+  min-height: var(--size-touch);
 }
 
 .phone .card__choices .action {
@@ -366,7 +422,7 @@
   align-items: center;
   gap: 0.5rem 0.75rem;
   padding: 0.5rem 1rem;
-  border-bottom: 1px solid var(--border);
+  border-bottom: var(--border-width-thin) solid var(--color-legacy-border);
 }
 
 .segmented {
@@ -389,8 +445,8 @@
 }
 
 .segmented [aria-pressed="true"] {
-  border-color: var(--fg);
-  font-weight: 600;
+  border-color: var(--color-legacy-fg);
+  font-weight: var(--font-weight-semibold);
 }
 
 .phone__body {
@@ -403,8 +459,8 @@
 .tabbar {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
-  border-top: 1px solid var(--border);
-  background: var(--surface);
+  border-top: var(--border-width-thin) solid var(--color-legacy-border);
+  background: var(--color-legacy-surface);
 }
 
 .tabbar > button {
@@ -412,7 +468,7 @@
   border: 0;
   border-radius: 0;
   background: none;
-  color: var(--muted);
+  color: var(--color-legacy-muted);
   font: inherit;
 }
 
@@ -423,131 +479,111 @@
 }
 
 .tabbar > .waits .action {
-  min-height: 44px;
+  min-height: var(--size-touch);
   border: 0;
   background: none;
 }
 
 .tabbar__tab[aria-current="page"] {
-  color: var(--fg);
+  color: var(--color-legacy-fg);
   font-weight: 700;
-  box-shadow: inset 0 3px 0 var(--working);
-}
-
-.connection-bar {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 0.25rem 0.75rem;
-  padding: 0.25rem 1rem;
-  border-bottom: 1px solid var(--border);
-  background: var(--surface);
-}
-
-.connection-bar__error {
-  color: var(--error);
-}
-
-.connection-bar__token {
-  display: flex;
-  gap: 0.5rem;
-}
-
-.connection-bar__token input {
-  min-height: 44px;
-  padding: 0 0.5rem;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  background: var(--bg);
-  color: inherit;
-  font: inherit;
-}
-
-.connection-bar__toggle {
-  margin-left: auto;
-}
-
-/* The composer (ADR-0038 §2a), at the bottom of the focus pane and the phone's agent screen. */
-.composer {
-  display: flex;
-  flex-direction: column;
-  gap: 0.5rem;
-  padding: 0.5rem 1rem 0.75rem;
-  border-top: 1px solid var(--border);
-}
-
-.composer__sent {
-  display: flex;
-  flex-direction: column;
-  gap: 0.25rem;
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-
-.sent {
-  display: flex;
-  justify-content: space-between;
-  gap: 1rem;
-}
-
-.sent__text {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.sent__status {
-  flex: none;
-  color: var(--muted);
-}
-
-.sent--failed .sent__status,
-.sent--uncertain .sent__status,
-.sent--unknown_outcome .sent__status {
-  color: var(--error);
-}
-
-.composer__input {
-  min-height: 44px;
-  padding: 0.5rem;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  background: var(--bg);
-  color: inherit;
-  font: inherit;
-  resize: vertical;
-}
-
-.composer__footer {
-  display: flex;
-  align-items: center;
-  gap: 1rem;
-}
-
-.composer__mode {
-  color: var(--muted);
-}
-
-.composer__hint {
-  color: var(--muted);
-  font-size: 0.75rem;
-  white-space: nowrap;
-}
-
-/* A keyboard shortcut means nothing on a touch screen. */
-.phone .composer__hint {
-  display: none;
-}
-
-.composer__footer .action {
-  flex-shrink: 0;
-  margin-left: auto;
+  box-shadow: inset 0 3px 0 var(--color-legacy-working);
 }
 
 .action--primary:enabled {
-  border-color: var(--working);
-  background: var(--working);
-  color: var(--bg);
+  border-color: var(--color-legacy-working);
+  background: var(--color-legacy-working);
+  color: var(--color-legacy-bg);
+}
+
+.decide {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  margin-top: 0.5rem;
+}
+
+.decide__message {
+  min-height: var(--size-control);
+  padding: 0 0.75rem;
+  border: var(--border-width-thin) solid var(--color-legacy-border);
+  border-radius: var(--radius-small);
+  background: var(--color-legacy-bg);
+  color: inherit;
+  font: inherit;
+}
+
+.decide__confirm p {
+  margin: 0;
+}
+
+.phone .decide__message {
+  min-height: 48px;
+}
+
+.decide__count {
+  margin: 0;
+  font-size: 0.8rem;
+  color: var(--color-legacy-muted);
+}
+
+.scope {
+  display: flex;
+  gap: 0.5rem;
+  padding: 0.25rem 0.5rem;
+}
+
+.scope .action[aria-pressed="true"] {
+  background: var(--color-legacy-bg);
+  font-weight: var(--font-weight-semibold);
+}
+
+.group__head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  width: 100%;
+  min-height: var(--size-control);
+  padding: 0.25rem 0.5rem;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.group--tree > .group__head {
+  font-weight: 700;
+}
+
+.group__name {
+  font-weight: var(--font-weight-semibold);
+}
+
+.group__body {
+  padding-left: 0.75rem;
+}
+
+.node-status {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  color: var(--color-legacy-muted);
+  font-size: 0.875em;
+  font-weight: 400;
+}
+
+.node-status__badge--online {
+  color: inherit;
+}
+
+.node-status__badge--offline,
+.node-status__error {
+  text-decoration: underline wavy;
+}
+
+[data-stale="true"] {
+  font-style: italic;
 }
