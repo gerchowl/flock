@@ -54,6 +54,58 @@
       "$value": { "value": 28, "unit": "px" },
       "$description": "Height of a regular control on desktop (HIG Buttons: https://developer.apple.com/design/human-interface-guidelines/buttons). phone.json raises it to the 44 px touch target."
     },
+    "split": {
+      "sidebar": {
+        "compact": {
+          "$value": { "value": 48, "unit": "px" },
+          "$description": "Compact icon rail: a 32 px row plus 8 px padding on each side. HIG Sidebars: https://developer.apple.com/design/human-interface-guidelines/sidebars"
+        },
+        "narrow": {
+          "$value": {
+            "value": 192,
+            "unit": "px"
+          },
+          "$description": "Sidebar narrow width. At a 1280 px canvas the defaults leave over 700 px for focused work before dividers. Narrow favours the canvas; wide favours long names and cards. HIG Split views: https://developer.apple.com/design/human-interface-guidelines/split-views"
+        },
+        "default": {
+          "$value": {
+            "value": 224,
+            "unit": "px"
+          },
+          "$description": "Sidebar default width. At a 1280 px canvas the defaults leave over 700 px for focused work before dividers. Narrow favours the canvas; wide favours long names and cards. HIG Split views: https://developer.apple.com/design/human-interface-guidelines/split-views"
+        },
+        "wide": {
+          "$value": {
+            "value": 272,
+            "unit": "px"
+          },
+          "$description": "Sidebar wide width. At a 1280 px canvas the defaults leave over 700 px for focused work before dividers. Narrow favours the canvas; wide favours long names and cards. HIG Split views: https://developer.apple.com/design/human-interface-guidelines/split-views"
+        }
+      },
+      "inspector": {
+        "narrow": {
+          "$value": {
+            "value": 240,
+            "unit": "px"
+          },
+          "$description": "Inspector narrow width. At a 1280 px canvas the defaults leave over 700 px for focused work before dividers. Narrow favours the canvas; wide favours long names and cards. HIG Split views: https://developer.apple.com/design/human-interface-guidelines/split-views"
+        },
+        "default": {
+          "$value": {
+            "value": 280,
+            "unit": "px"
+          },
+          "$description": "Inspector default width. At a 1280 px canvas the defaults leave over 700 px for focused work before dividers. Narrow favours the canvas; wide favours long names and cards. HIG Split views: https://developer.apple.com/design/human-interface-guidelines/split-views"
+        },
+        "wide": {
+          "$value": {
+            "value": 336,
+            "unit": "px"
+          },
+          "$description": "Inspector wide width. At a 1280 px canvas the defaults leave over 700 px for focused work before dividers. Narrow favours the canvas; wide favours long names and cards. HIG Split views: https://developer.apple.com/design/human-interface-guidelines/split-views"
+        }
+      }
+    },
     "touch": {
       "$value": { "value": 44, "unit": "px" },
       "$description": "The touch target of the phone layout's controls at any window width, so `?layout=phone` on a wide window keeps it (HIG Accessibility: https://developer.apple.com/design/human-interface-guidelines/accessibility)."
