@@ -67,10 +67,10 @@ describe("fixture mode", () => {
     const root = mount(() => <App config={{ ok: true, config }} />);
     await tick();
     expect($(root, "replay-badge")).not.toBeNull();
-    expect($$(root, "agent-row").map((row) => row.querySelector(".agent-row__name")?.textContent)).toEqual(["fixture", "atlas", "kite", "wren"]);
+    expect($$(root, "agent-row").map((row) => row.querySelector(".agent-row__name")?.textContent)).toEqual(["fixture", "kite", "atlas", "wren"]);
     expect($(root, "focus-pane")?.querySelector("h1")?.textContent).toBe("fixture");
     expect($(root, "transcript-synced")?.textContent).toMatch(/^End of recording · \d+ events$/);
-    expect($$(root, "inbox-card").map((card) => card.querySelector("h3")?.textContent)).toEqual(["Run Bash?", "Which fixture set should the replay use?"]);
+    expect($$(root, "inbox-card").map((card) => card.querySelector("h3")?.textContent)).toEqual(["Run Bash?", "Agent is blocked", "Which fixture set should the replay use?"]);
     expect(root.textContent).not.toMatch(/subject|placement/i);
   });
 
@@ -78,10 +78,10 @@ describe("fixture mode", () => {
     const config = { transport: "fixture", fixtureJsonl: "", source: "x" } as const;
     const root = mount(() => <App config={{ ok: true, config }} />);
     await tick();
-    ($$(root, "agent-row")[1] as HTMLButtonElement).click();
+    (root.querySelector('[data-testid="agent-row"][data-agent-id="atlas"]') as HTMLButtonElement).click();
     await tick();
     expect($(root, "focus-pane")?.querySelector("h1")?.textContent).toBe("atlas");
-    expect($$(root, "agent-row")[1]?.getAttribute("aria-current")).toBe("true");
+    expect(root.querySelector('[data-testid="agent-row"][data-agent-id="atlas"]')?.getAttribute("aria-current")).toBe("true");
     expect(root.querySelector('[role="alert"]')?.textContent).toContain("serves only agent/fixture");
     expect(localStorage.getItem("flock.layout:fixture")).toContain("agent/atlas");
   });
@@ -109,7 +109,7 @@ describe("fixture mode", () => {
       const id = button?.getAttribute("aria-describedby");
       return id ? document.getElementById(id)?.textContent : undefined;
     };
-    expect(buttonLabels(root).filter((label) => UNBUILT.includes(label))).toEqual(["Hide sidebar", "Needs you", "New agent", "Show inspector", "Diff", "Fork"]);
+    expect(buttonLabels(root).filter((label) => UNBUILT.includes(label))).toEqual(["Hide sidebar", "New agent", "Show inspector", "Diff", "Fork"]);
     const fork = [...root.querySelectorAll("button")].find((button) => button.textContent === "Fork");
     expect(fork?.getAttribute("aria-disabled")).toBe("true");
     expect(fork?.disabled).toBe(false);
@@ -132,7 +132,7 @@ describe("wire mode", () => {
     const root = mount(() => <App config={{ ok: true, config }} env={{ clock: h.clock, sockets: h.net.factory, random: () => 0, store: h.store }} />);
     expect(h.net.attempts[0]?.url).toBe("wss://fixture.invalid/v1/ws");
     expect($(root, "replay-badge")).toBeNull();
-    expect($(root, "sidebar")?.textContent).toBe("Loading the agent list…");
+    expect($(root, "sidebar")?.querySelector(":scope > .sidebar__note")?.textContent).toBe("Loading the agent list…");
     expect(health(root)).toBe("pending");
     h.step(step({ step: "open" }));
     h.step(step({ step: "send", frame: WELCOME }));
@@ -169,7 +169,7 @@ describe("wire mode", () => {
       };
       const root = mount(() => <Workbench fleet={fleet} transport={createFixtureTransport("")} inbox={[]} sender={null} layout={emptyLayout()} saveLayout={() => undefined} source="replay" />);
       await tick();
-      expect($(root, "sidebar")?.textContent).toBe(note);
+      expect($(root, "sidebar")?.querySelector(":scope > .sidebar__note")?.textContent).toBe(note);
       dispose?.();
     }
   });
@@ -187,7 +187,7 @@ describe("wire mode", () => {
       />
     ));
     await tick();
-    ($$(root, "agent-row")[1] as HTMLButtonElement).click();
+    (root.querySelector('[data-testid="agent-row"][data-agent-id="atlas"]') as HTMLButtonElement).click();
     const sub = sentFrames(h).at(-1) as { t: string; sub_id: string; stream: string };
     expect(sub).toMatchObject({ t: "sub", stream: "agent/atlas" });
     h.step(step({ step: "send", frame: { t: "ev", sub_id: sub.sub_id, stream: "agent/atlas", seq: 1, ts_ms: 0, ev: { type: "user", message: { role: "user", content: "hello from the wire" } } } }));
@@ -251,8 +251,8 @@ describe("phone", () => {
     const root = await phone();
     expect($(root, "workbench")).toBeNull();
     expect(tab(root, "Inbox")?.getAttribute("aria-current")).toBe("page");
-    expect($(root, "inbox-headline")?.textContent).toBe("1 blocked on you.");
-    expect($$(root, "inbox-card").length).toBe(2);
+    expect($(root, "inbox-headline")?.textContent).toBe("agents waiting: unknown; no nodes reporting");
+    expect($$(root, "inbox-card").length).toBe(3);
     expect([...root.querySelectorAll(".tabbar button")].map((button) => button.textContent)).toEqual(["Inbox", "Agents"]);
   });
 
@@ -283,7 +283,7 @@ describe("phone", () => {
       <Workbench fleet={createFixtureFleet([])} transport={createFixtureTransport("")} inbox={[]} sender={null} layout={emptyLayout()} saveLayout={() => undefined} mode="phone" source="live" />
     ));
     await tick();
-    expect($(root, "inbox-headline")?.textContent).toBe("Nothing is blocked on you.");
+    expect($(root, "inbox-headline")?.textContent).toBe("agents waiting: unknown; no nodes reporting");
     expect($$(root, "inbox-card")).toHaveLength(0);
     expect($(root, "phone")?.textContent).not.toMatch(/Sample|G5/);
   });
@@ -446,11 +446,11 @@ describe("command palette", () => {
     const waiting = $$(root, "palette-command") as HTMLElement[];
     // The keyboard layer's commands run now; the unbuilt actions follow them, dimmed.
     expect(waiting.map((item) => [item.textContent, item.getAttribute("aria-disabled")])).toEqual([
+      ["First agent needing you (? agents waiting on you; agents waiting: unknown; no nodes reporting)", null],
       ["Previous agent↑", null],
       ["Next agent↓", null],
       ["Keyboard shortcuts?", null],
       ["Hide sidebarWaits for collapsible panes", "true"],
-      ["Needs youWaits for the attention count", "true"],
       ["New agentWaits for the harness picker", "true"],
       ["Show inspectorWaits for the inspector", "true"],
     ]);
@@ -465,7 +465,7 @@ describe("command palette", () => {
     const input = $(root, "palette")?.querySelector("input") as HTMLInputElement;
     expect($$(root, "palette-item").length).toBe(4);
     // Unbuilt actions are hidden, so the palette lists the agents, then only the keyboard layer's commands.
-    expect($$(root, "palette-command").map((item) => item.firstElementChild?.textContent)).toEqual([...LAYER_COMMANDS]);
+    expect($$(root, "palette-command").map((item) => item.firstElementChild?.textContent)).toEqual(LAYER_COMMANDS.map((label) => label === "First agent needing you" ? `${label} (? agents waiting on you; agents waiting: unknown; no nodes reporting)` : label));
     input.value = "wr";
     input.dispatchEvent(new InputEvent("input", { bubbles: true }));
     expect($$(root, "palette-item").map((item) => item.textContent)).toEqual(["wrenTurn finished"]);
@@ -694,7 +694,7 @@ describe("composer", () => {
       texts.push($(root, "composer")?.textContent ?? "");
     }
     expect($$(root, "sent-message")).toHaveLength(0);
-    ($$(root, "agent-row")[0] as HTMLButtonElement).click();
+    (root.querySelector('[data-testid="agent-row"][data-agent-id="p0"]') as HTMLButtonElement).click();
     expect($$(root, "sent-message")).toHaveLength(statuses.length);
     texts.push($(root, "composer")?.textContent ?? "");
     // The focused agent leaves the list: its composer states the undefined row (`rowLine(undefined)`).
@@ -930,7 +930,7 @@ describe("wire mode, one transport per connection", () => {
   test("wire mode shows no sample inbox cards; with no listed prompts the inbox says so", () => {
     const { root } = liveApp();
     expect($$(root, "inbox-card")).toHaveLength(0);
-    expect($(root, "inbox")?.textContent).toContain("No open permission prompts.");
+    expect($(root, "inbox")?.textContent).toContain("No agents need you.");
     expect($(root, "inbox")?.textContent).not.toMatch(/Sample/);
   });
 });
@@ -958,7 +958,7 @@ describe("status marks", () => {
       const shape = mark?.querySelector("svg > *");
       return `${mark?.getAttribute("data-mark")}:${shape?.tagName.toLowerCase()}${shape?.getAttribute("fill") === "none" ? "-outline" : ""}`;
     });
-    expect(shapes).toEqual(["needs:circle", "working:circle", "failed:circle-outline", "idle:rect"]);
+    expect(shapes).toEqual(["needs:circle", "failed:circle-outline", "working:circle", "idle:rect"]);
     expect($$(root, "agent-row")[0]?.querySelector(".mark__count")?.textContent).toBe("1");
     expect($(root, "focus-pane")?.querySelector(".chip svg > *")).toBeNull();
     ($$(root, "agent-row")[0] as HTMLButtonElement).click();
