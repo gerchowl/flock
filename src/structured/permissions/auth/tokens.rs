@@ -1,8 +1,8 @@
 //! Client bearer verification and revocation-serialized admission (ADR-0036 §5a).
 use super::VerifiedToken;
 use crate::app::LocalOperator;
-use crate::platform::client_token_lock::{LockFile, PendingLock};
 use crate::platform::client_tokens::{Entry, Namespace};
+use crate::platform::{client_token_lock::PendingLock, file_lock::LockFile};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;

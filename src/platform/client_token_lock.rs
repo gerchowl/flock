@@ -39,39 +39,7 @@ impl WaitBudget {
         }
     }
 }
-/// Owned advisory-lock description whose scope ends independently of child fds.
-///
-/// Close alone waits for every fork/dup reference to disappear. Explicit unlock
-/// keeps admission and revocation bounded to their operation (ADR-0036 §5a).
-/// An unlocked instance is also valid while an owned helper waits to acquire it.
-/// Do not clone the descriptor; [`PendingLock`] is the sole transfer path.
-pub(crate) struct LockFile(File);
-impl LockFile {
-    /// Own the description and release any lock on it when this guard drops.
-    pub(crate) fn new(file: File) -> Self {
-        Self(file)
-    }
-    /// Attempt admission without waiting; active contention retains its refusal.
-    pub(crate) fn try_lock(&self) -> Result<(), TryLockError> {
-        self.0.try_lock()
-    }
-    /// Share admission ownership without waiting; token mutation remains exclusive.
-    pub(crate) fn try_lock_shared(&self) -> Result<(), TryLockError> {
-        self.0.try_lock_shared()
-    }
-}
-impl AsRawFd for LockFile {
-    fn as_raw_fd(&self) -> std::os::fd::RawFd {
-        self.0.as_raw_fd()
-    }
-}
-impl Drop for LockFile {
-    fn drop(&mut self) {
-        if let Err(error) = self.0.unlock() {
-            crate::logging::client_token_unlock_failed(&error);
-        }
-    }
-}
+use super::file_lock::LockFile;
 
 /// A pending lock owns its helper until acquisition, cancellation or timeout.
 pub(crate) struct PendingLock {

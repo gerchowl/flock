@@ -7,10 +7,6 @@ const CEILING: Duration = Duration::from_secs(5);
 pub(crate) struct Holder {
     /// Owned child process, never reaped until Drop.
     pub(crate) pid: libc::pid_t,
-    /// Descriptor number in that child, independent of reuse in the parent.
-    pub(crate) descriptor: i32,
-    /// Inode checked by the child before every acknowledgment.
-    pub(crate) inode: u64,
     control: UnixStream,
 }
 impl Holder {
@@ -39,8 +35,6 @@ impl Holder {
         drop(child);
         let mut holder = Self {
             pid,
-            descriptor,
-            inode: stat.st_ino,
             control: parent,
         };
         holder.control.set_read_timeout(Some(CEILING))?;

@@ -190,15 +190,6 @@ pub(crate) fn structured_queue_record_skipped(sequence: Option<u64>, reason: &'s
     );
 }
 
-/// Report an OS unlock failure without exposing journal paths or contents.
-pub(crate) fn structured_queue_unlock_failed(error: &std::io::Error) {
-    tracing::error!(
-        event = "structured.queue.unlock_failed",
-        errno = error.raw_os_error(),
-        "queue journal unlock failed"
-    );
-}
-
 /// Report startup settlement failure without logging input; reopen fences the item.
 pub(crate) fn structured_queue_opening_settlement_failed(code: crate::api::error_code::ErrorCode) {
     tracing::error!(
@@ -5273,12 +5264,12 @@ pub(crate) fn mesh_custody_failed(operation: &'static str, code: &'static str) {
 }
 
 /// Unexpected scope-release failure, with no token, path or bearer contents.
-pub(crate) fn client_token_unlock_failed(error: &std::io::Error) {
-    tracing::warn!(
-        event = "client_token.lock.release_failed",
+pub(crate) fn file_lock_unlock_failed(error: &std::io::Error) {
+    tracing::error!(
+        event = "file_lock.release_failed",
         error = %error,
         errno = error.raw_os_error(),
-        "client-token lock release failed"
+        "file lock release failed"
     );
 }
 
