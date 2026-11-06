@@ -167,13 +167,26 @@ export function Workbench(props: WorkbenchProps): JSX.Element {
     props.saveLayout(snapshot);
   };
   const regionState = (region: "sidebar" | "inspector"): SplitState => splitState(layout().regions?.[region]);
+  const regionToggles = new Map<string, HTMLButtonElement>();
+  const regionFocus = new Map<string, HTMLElement>();
   const changeRegion = (region: "sidebar" | "inspector", value: SplitState): void => {
+    const wasCollapsed = regionState(region).collapsed;
+    const focused = document.activeElement;
+    if (value.collapsed && !wasCollapsed && focused instanceof HTMLElement && document.getElementById(`split-${region}`)?.contains(focused)) {
+      regionFocus.set(region, focused);
+      regionToggles.get(region)?.focus();
+    }
     manager.state.regions = { sidebar: DEFAULT_SPLIT, inspector: DEFAULT_SPLIT, ...manager.state.regions, [region]: value };
     publish();
+    if (!value.collapsed && wasCollapsed) {
+      const previous = regionFocus.get(region);
+      regionFocus.delete(region);
+      if (previous?.isConnected) previous.focus();
+    }
   };
   const toggleRegion = (region: "sidebar" | "inspector"): void => changeRegion(region, { ...regionState(region), collapsed: !regionState(region).collapsed });
   onCleanup(bindKeys(document.body, { "sidebar.toggle": () => toggleRegion("sidebar"), "inspector.toggle": () => toggleRegion("inspector") }));
-  const toggleButton = (region: "sidebar" | "inspector"): JSX.Element => <button type="button" class="action" aria-label={`Toggle ${region}`} aria-expanded={!regionState(region).collapsed} aria-controls={`split-${region}`} onClick={() => toggleRegion(region)}>{region === "sidebar" ? "Sidebar" : "Inspector"}</button>;
+  const toggleButton = (region: "sidebar" | "inspector"): JSX.Element => <button type="button" class="action" ref={element => regionToggles.set(region, element)} aria-label={`Toggle ${region}`} aria-expanded={!regionState(region).collapsed} aria-controls={`split-${region}`} onClick={() => toggleRegion(region)}>{region === "sidebar" ? "Sidebar" : "Inspector"}</button>;
   const focusedAgent = createMemo(() => {
     const current = layout();
     return agentOf(current.focused === null ? undefined : current.tiles[current.focused]?.subject);

@@ -50,9 +50,33 @@ for (const [name, widths] of [["Sidebar", [192, 224, 272]], ["Inspector", [240, 
     expect(await pane.getAttribute("data-split")).toBe("wide");
     const restored = (await split.boundingBox())!;
     await page.mouse.move(restored.x + restored.width / 2, restored.y + 60); await page.mouse.down();
+    await page.mouse.move(restored.x + restored.width / 2 + (name === "Sidebar" ? -100 : 100), restored.y + 60);
+    expect(await pane.getAttribute("data-target")).toBe("narrow");
     await split.dispatchEvent("pointercancel", { pointerId: 1 });
+    expect(await pane.getAttribute("data-target")).toBeNull();
     expect(await pane.getAttribute("data-split")).toBe("wide");
     await page.mouse.up();
+    expect(await pane.getAttribute("data-split")).toBe("wide");
+    await done(page);
+  }, 30_000);
+  test(`${name}: Escape cancels an active drag before release`, async () => {
+    const page = await open(), split = separator(page, name), pane = region(page, name.toLowerCase());
+    const box = (await split.boundingBox())!;
+    await page.mouse.move(box.x + box.width / 2, box.y + 60);
+    await page.mouse.down();
+    await page.mouse.move(box.x + box.width / 2 + (name === "Sidebar" ? 45 : -50), box.y + 60);
+    expect(await pane.getAttribute("data-target")).toBe("wide");
+    await page.keyboard.press("Escape");
+    const captured = await split.evaluate(element => element.hasPointerCapture(1));
+    const target = await pane.getAttribute("data-target");
+    await page.mouse.up();
+    expect(await pane.getAttribute("data-split")).toBe("default");
+    expect(target).toBeNull();
+    expect(captured).toBe(false);
+    await page.reload();
+    expect(await pane.getAttribute("data-split")).toBe("default");
+    await split.focus(); await page.keyboard.press("ArrowRight");
+    expect(await pane.getAttribute("data-split")).toBe("wide");
     await done(page);
   }, 30_000);
   test(`${name}: toolbar, shortcut, palette, Enter, double click and reload restore`, async () => {

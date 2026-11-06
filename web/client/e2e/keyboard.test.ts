@@ -352,3 +352,21 @@ describe("the key guard catches each bypass of the keyboard layer", () => {
     await page.close();
   }, LIMIT);
 });
+
+for (const name of ["sidebar", "inspector"] as const) {
+  test(`${name}: View collapse focuses its toggle and expand restores the hidden control`, async () => {
+    const page = await open();
+    const control = name === "sidebar" ? page.getByTestId("agent-row").first() : page.locator(REQUEST);
+    const apple = await page.evaluate(() => /Mac|iPhone|iPad|iPod/.test(navigator.platform));
+    const combo = name === "sidebar" ? (apple ? "Control+Meta+s" : "Control+s") : "Alt+ControlOrMeta+i";
+    await control.focus();
+    await page.keyboard.press(combo);
+    expect(await control.isVisible()).toBe(false);
+    const toggle = page.getByRole("button", { name: `Toggle ${name}`, exact: true });
+    expect(await toggle.evaluate(element => element === document.activeElement)).toBe(true);
+    await page.keyboard.press(combo);
+    expect(await control.isVisible()).toBe(true);
+    expect(await control.evaluate(element => element === document.activeElement)).toBe(true);
+    await done(page);
+  }, LIMIT);
+}
