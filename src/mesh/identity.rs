@@ -26,12 +26,24 @@ struct StoredIdentity {
     public_key: [u8; 32],
 }
 
+static CACHE: std::sync::Mutex<Option<(std::path::PathBuf, NodeIdentity)>> =
+    std::sync::Mutex::new(None);
 impl NodeIdentity {
+    /// Reuse the already initialized server identity, never bootstrap a key.
+    /// Missing initialization is a refusal, including during recovery.
+    pub(crate) fn existing() -> io::Result<Self> {
+        CACHE
+            .lock()
+            .map_err(|_| io::Error::other("node identity cache poisoned"))?
+            .as_ref()
+            .filter(|(path, _)| path == &crate::config::state_dir())
+            .map(|(_, identity)| identity.clone())
+            .ok_or_else(|| io::Error::other("node identity not initialized"))
+    }
+
     pub(crate) fn load() -> io::Result<Self> {
         // A process keeps its validated key in memory. The path distinguishes
         // isolated test homes without repeatedly reading the private key.
-        static CACHE: std::sync::Mutex<Option<(std::path::PathBuf, NodeIdentity)>> =
-            std::sync::Mutex::new(None);
         let path = crate::config::state_dir();
         let mut cache = CACHE
             .lock()
@@ -72,10 +84,23 @@ impl NodeIdentity {
     }
 
     fn load_at(state_dir: &Path, machine: io::Result<String>) -> io::Result<Self> {
+        Self::load_at_with_lock(state_dir, machine, |_| {})
+    }
+
+    /// Observe the actual acquired lock before identity loading or generation.
+    fn load_at_with_lock(
+        state_dir: &Path,
+        machine: io::Result<String>,
+        on_lock: impl FnOnce(&dyn std::os::fd::AsRawFd),
+    ) -> io::Result<Self> {
         let dir = state_dir.join("mesh");
         create_private_dir(&dir)?;
-        let lock = private_file(&dir.join("identity.lock"), true)?;
+        let lock = crate::platform::file_lock::LockFile::new(private_file(
+            &dir.join("identity.lock"),
+            true,
+        )?);
         lock.lock()?;
+        on_lock(&lock);
         let path = dir.join("identity.json");
         let (binding, unavailable_reason) = match machine {
             Ok(machine) => (Some(digest_hex(machine.as_bytes())), None),
@@ -252,6 +277,44 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn inherited_identity_lock_does_not_stall_reload() {
+        let fixture = Fixture::new();
+        let mut holder = None;
+        let identity =
+            NodeIdentity::load_at_with_lock(&fixture.0, Ok("fixture-binding".into()), |lock| {
+                holder = Some(
+                    crate::platform::file_lock::inherited_holder::Holder::spawn(lock).unwrap(),
+                );
+            })
+            .unwrap();
+        let mut holder = holder.unwrap();
+        let path = fixture.0.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = NodeIdentity::load_at(&path, Ok("fixture-binding".into()));
+            let _ = tx.send(result);
+        });
+        let loaded = rx.recv_timeout(std::time::Duration::from_secs(2));
+        let holder_identity = (holder.pid, holder.descriptor, holder.inode);
+        let alive = holder.verify();
+        // Release only the owned child before joining a regressed blocking load.
+        drop(holder);
+        if loaded.is_err() {
+            rx.recv_timeout(std::time::Duration::from_secs(5))
+                .expect("owned holder exit must unblock identity loading")
+                .unwrap();
+        }
+        worker.join().unwrap();
+        alive.unwrap();
+        assert!(
+            loaded.is_ok(),
+            "identity load stalled behind child/fd/inode={holder_identity:?}: {:?}",
+            loaded.as_ref().err()
+        );
+        assert_eq!(loaded.unwrap().unwrap().node_id(), identity.node_id());
     }
 
     #[test]

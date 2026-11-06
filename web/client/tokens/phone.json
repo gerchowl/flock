@@ -1,0 +1,9 @@
+{
+  "size": {
+    "$type": "dimension",
+    "control": {
+      "$value": { "value": 44, "unit": "px" },
+      "$description": "The minimum touch target below the phone breakpoint (HIG Accessibility: https://developer.apple.com/design/human-interface-guidelines/accessibility)."
+    }
+  }
+}

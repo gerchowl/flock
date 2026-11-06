@@ -58,6 +58,8 @@
           flock-web = pkgs.callPackage ./nix/package.nix {
             buildCommit = self.rev or self.dirtyRev or null;
             withWeb = true;
+            # Until #1731 lands, missing assets receive the typed HTTP 503.
+            guiDist = self.packages.${system}.flock-client or null;
           };
           # The web client's production bundle (web/client/dist), built offline
           # from a fixed-output fetch of bun.lock (#1731). Only the bundle:
@@ -67,6 +69,9 @@
         {
           inherit flock flock-web flock-client;
           default = flock;
+        }
+        // lib.optionalAttrs pkgs.stdenv.hostPlatform.isDarwin {
+          flock-desktop = pkgs.callPackage ./nix/desktop.nix { inherit flock-client; };
         }
       );
 
@@ -141,12 +146,16 @@
           default = self.checks.${system}.flock;
         }
         // lib.optionalAttrs pkgs.stdenv.hostPlatform.isDarwin {
-          macos-process-facts = pkgs.runCommand "flock-process-c-toolchain-check" {
-            nativeBuildInputs = self.packages.${system}.default.nativeBuildInputs;
-            SDKROOT = self.packages.${system}.default.SDKROOT;
-          } ''
-            "$CC" -Werror -c ${./src/platform/macos_process.c} -o "$out"
-          '';
+          flock-desktop = self.packages.${system}.flock-desktop;
+          macos-process-facts =
+            pkgs.runCommand "flock-process-c-toolchain-check"
+              {
+                nativeBuildInputs = self.packages.${system}.default.nativeBuildInputs;
+                SDKROOT = self.packages.${system}.default.SDKROOT;
+              }
+              ''
+                "$CC" -Werror -c ${./src/platform/macos_process.c} -o "$out"
+              '';
         }
       );
 
@@ -155,34 +164,46 @@
         let
           pkgs = pkgsFor system;
           stableSccache = stableSccacheFor pkgs;
+          lintTools = with pkgs; [
+            cargo
+            clippy
+            cmake
+            # Maintenance tests exercise Git fixtures and workflow/doc scripts.
+            git
+            jq
+            just
+            ninja
+            nodejs
+            bun
+            perl
+            pkg-config
+            rustc
+            rustfmt
+            # Maintenance tests parse hook YAML with Ruby’s standard library.
+            ruby
+            zig_0_15
+          ];
+          ghosttyHook = ''
+            export LIBGHOSTTY_VT_OPTIMIZE=Debug
+            export LIBGHOSTTY_VT_SIMD=true
+          '';
         in
         {
           # guardrails brings the governance toolbelt (prek/gitleaks/cargo-deny/
           # …) and auto-installs the pre-commit hooks; `extra` carries flock's
           # own build toolchain. SDKROOT comes from the darwin stdenv for free,
           # so the only env we restore is the libghostty-vt build tuning.
+          # Lint never runs nextest or uses the patched sccache daemon. Both
+          # are source builds outside nixpkgs' binary cache and dominated CI
+          # shell startup (#2970). Keep the same Rust/JS tools and Zig settings.
+          ci-lint = guardrails.lib.${system}.mkDevShell {
+            inherit pkgs;
+            extra = lintTools;
+            hook = ghosttyHook;
+          };
           default = guardrails.lib.${system}.mkDevShell {
             inherit pkgs;
-            extra = with pkgs; [
-              cargo
-              (callPackage ./nix/nextest.nix { })
-              clippy
-              cmake
-              # Maintenance tests exercise Git fixtures and workflow/doc scripts.
-              git
-              jq
-              just
-              ninja
-              nodejs
-              bun
-              perl
-              pkg-config
-              rustc
-              rustfmt
-              # Maintenance tests parse hook YAML with Ruby’s standard library.
-              ruby
-              zig_0_15
-            ];
+            extra = lintTools ++ [ (pkgs.callPackage ./nix/nextest.nix { }) ];
             # Leave sccache's platform artifact cache unchanged and give the daemon a
             # persistent TMPDIR and its own socket (#1325). A wrapper covers
             # lazy startup and idle restarts without changing the shell TMPDIR.
@@ -198,9 +219,8 @@
                   export RUSTC_WRAPPER="${stableSccache}/bin/sccache"
                   ;;
               esac
-              export LIBGHOSTTY_VT_OPTIMIZE=Debug
-              export LIBGHOSTTY_VT_SIMD=true
-            '';
+            ''
+            + ghosttyHook;
           };
         }
       );

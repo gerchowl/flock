@@ -4,20 +4,30 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "vite build",
-    "build:fixture": "vite build --mode fixture",
-    "preview": "vite preview"
+    "build": "bun scripts/lint-build.ts",
+    "build:fixture": "bun scripts/lint-build.ts --fixture",
+    "preview": "vite preview",
+    "tokens": "bun scripts/tokens.ts",
+    "tokens:check": "bun scripts/tokens.ts --check",
+    "lint": "bun scripts/tokens.ts --check && stylelint \"**/*.{css,pcss}\" --config stylelint.config.js --config-basedir . --ignore-disables --ignore-path .gitignore && eslint . --config eslint.config.js && bun run types:design && bun run build",
+    "types:design": "bun scripts/check-design-types.ts"
   },
   "dependencies": {
     "solid-js": "1.9.15"
   },
   "devDependencies": {
     "@babel/core": "7.29.7",
+    "@babel/eslint-parser": "7.29.9",
     "@babel/preset-typescript": "7.29.7",
     "@happy-dom/global-registrator": "20.14.5",
     "@types/bun": "1.3.13",
+    "axe-core": "4.13.0",
     "babel-preset-solid": "1.9.15",
+    "eslint": "9.39.5",
     "playwright": "1.63.0",
+    "style-dictionary": "5.6.1",
+    "stylelint": "17.16.0",
+    "stylelint-declaration-strict-value": "1.12.1",
     "typescript": "7.0.2",
     "vite": "8.3.2",
     "vite-plugin-solid": "2.11.14"

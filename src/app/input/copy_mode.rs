@@ -201,6 +201,7 @@ impl AppState {
             copy_mode.cursor_col,
             metrics,
         ));
+        self.pin_selection_content(terminal_runtimes);
         if let Some(copy_mode) = self.copy_mode.as_mut() {
             copy_mode.selection = Some(CopyModeSelection::Character);
         }
@@ -216,12 +217,11 @@ impl AppState {
         let end_col = info.inner_rect.width.saturating_sub(1);
         let metrics = self.pane_scroll_metrics(terminal_runtimes, copy_mode.pane_id);
         let anchor_row = Selection::absolute_row_for_viewport(copy_mode.cursor_row, metrics);
-        self.selection = Some(Selection::line_range(
-            copy_mode.pane_id,
-            anchor_row,
-            anchor_row,
-            end_col,
-        ));
+        self.selection = Some(
+            Selection::line_range(copy_mode.pane_id, anchor_row, anchor_row, end_col)
+                .with_viewport_origin(metrics),
+        );
+        self.pin_selection_content(terminal_runtimes);
         copy_mode.selection = Some(CopyModeSelection::Linewise { anchor_row });
         self.copy_mode = Some(copy_mode);
     }
@@ -516,12 +516,30 @@ impl AppState {
                 let metrics = self.pane_scroll_metrics(terminal_runtimes, copy_mode.pane_id);
                 let cursor_row =
                     Selection::absolute_row_for_viewport(copy_mode.cursor_row, metrics);
-                self.selection = Some(Selection::line_range(
+                let revision = self.selection.as_ref().and_then(|s| s.content_revision);
+                let anchor_row = self
+                    .selection
+                    .as_ref()
+                    .and_then(|s| {
+                        self.runtime_for_pane_in_workspace(
+                            terminal_runtimes,
+                            self.active?,
+                            s.pane_id,
+                        )?
+                        .resolve_selection(s)
+                    })
+                    .map(|s| s.endpoints()[0].0)
+                    .unwrap_or(anchor_row);
+                let mut selection = Selection::line_range(
                     copy_mode.pane_id,
                     anchor_row,
                     cursor_row,
                     info.inner_rect.width.saturating_sub(1),
-                ));
+                );
+                selection = selection.with_viewport_origin(metrics);
+                selection.content_revision = revision;
+                self.selection = Some(selection);
+                self.pin_selection_content(terminal_runtimes);
             }
         }
     }
