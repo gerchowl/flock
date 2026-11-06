@@ -53,6 +53,11 @@ export type Scope = "anywhere" | "outside-text" | "within" | "focused" | "layer"
 
 /** Every shortcut's id. */
 export type ShortcutId =
+  | "sidebar.toggle"
+  | "inspector.toggle"
+  | "split.previous"
+  | "split.next"
+  | "split.toggle"
   | "attention.first"
   | "agent.previous"
   | "agent.next"
@@ -80,6 +85,11 @@ export type Shortcut = { readonly id: ShortcutId; readonly label: string; readon
 
 /** The registry, in the order the shortcut sheet lists it. */
 export const SHORTCUTS: readonly Shortcut[] = [
+  { id: "sidebar.toggle", label: "Toggle sidebar", combo: { key: "s", ctrl: true, mod: true }, scope: "anywhere", command: true },
+  { id: "inspector.toggle", label: "Toggle inspector", combo: { key: "i", alt: true, mod: true }, scope: "anywhere", command: true },
+  { id: "split.previous", label: "Narrower pane", combo: { key: "ArrowLeft" }, scope: "focused", unlisted: true },
+  { id: "split.next", label: "Wider pane", combo: { key: "ArrowRight" }, scope: "focused", unlisted: true },
+  { id: "split.toggle", label: "Collapse or restore pane", combo: { key: "Enter" }, scope: "focused", unlisted: true },
   { id: "attention.first", label: "First agent needing you", scope: "outside-text", command: true, unlisted: true },
   // A focused list widget's own arrows; before the page's ↑/↓, so the focused list wins.
   { id: "listbox.next", label: "Next item in a list", combo: { key: "ArrowDown" }, scope: "focused", unlisted: true },

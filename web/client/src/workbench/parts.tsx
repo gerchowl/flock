@@ -47,6 +47,7 @@ export function AgentRowButton(props: { readonly row: AgentRow; readonly focused
     <button
       type="button"
       class="agent-row"
+      title={props.row.label}
       aria-current={props.focused ? "true" : undefined}
       aria-labelledby={name}
       aria-describedby={`${mark} ${activity}`}
