@@ -62,6 +62,7 @@ export function ShortcutSheet(): JSX.Element {
         <h2 id={title} class="sheet__title">
           Keyboard shortcuts
         </h2>
+        <p>View commands work from anywhere, including text fields.</p>
         <ShortcutList />
         <Cluster justify="flex-end" space={SPACE[2]}>
           <button type="button" class="sheet__done" onClick={() => dialog?.close()}>
