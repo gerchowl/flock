@@ -193,9 +193,10 @@
           # …) and auto-installs the pre-commit hooks; `extra` carries flock's
           # own build toolchain. SDKROOT comes from the darwin stdenv for free,
           # so the only env we restore is the libghostty-vt build tuning.
-          # Lint never runs nextest or uses the patched sccache daemon. Both
-          # are source builds outside nixpkgs' binary cache and dominated CI
-          # shell startup (#2970). Keep the same Rust/JS tools and Zig settings.
+          # Lint and archive consumers do not need source-built nextest or the
+          # patched sccache daemon. Both dominated CI shell startup (#2970,
+          # #3024). Shards install prebuilt nextest at the shared pin separately.
+          # Keep the same Rust/JS runtime tools and Zig settings.
           ci-lint = guardrails.lib.${system}.mkDevShell {
             inherit pkgs;
             extra = lintTools;

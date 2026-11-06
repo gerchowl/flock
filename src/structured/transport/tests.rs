@@ -2415,17 +2415,24 @@ fn single_permission_response(transport: &Transport, input: &mut File) -> Value 
 }
 
 #[test]
-fn permission_session_survives_two_thousand_prompt_close_cycles() {
+fn permission_session_survives_closed_window_eviction() {
     let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
     let (transport, mut output, mut input) = start(&root);
+    // #1813 removed a 1024-request lifetime cap. Drive the real transport
+    // through a full closed-handle window and its first eviction.
+    let cycles = permissions::CLOSED_PERMISSION_REQUEST_WINDOW + 1;
+    let mut first_request_seq = 0;
     let mut last_request_seq = 0;
-    for n in 0..2000 {
+    for n in 0..cycles {
         let id = format!("cycle-{n}");
         permission(&mut output, &id);
         assert_eq!(receive(&transport).record.origin, RecordOrigin::Claude);
         let open: Value = serde_json::from_str(&receive(&transport).record.raw).unwrap();
         assert_eq!(open["state"], "open");
         last_request_seq = open["request_seq"].as_u64().unwrap();
+        if n == 0 {
+            first_request_seq = last_request_seq;
+        }
         call_decide(
             &transport,
             &owner(),
@@ -2438,6 +2445,16 @@ fn permission_session_survives_two_thousand_prompt_close_cycles() {
         let response = single_permission_response(&transport, &mut input);
         assert_eq!(response["response"]["request_id"], id);
         assert_eq!(response["response"]["response"]["behavior"], "deny");
+        if n + 1 == permissions::CLOSED_PERMISSION_REQUEST_WINDOW {
+            assert_eq!(
+                call_decide(
+                    &transport,
+                    &owner(),
+                    &decide("cycle-0", permissions::Decision::Deny, first_request_seq)
+                ),
+                Err(ErrorCode::PermissionRequestClosed)
+            );
+        }
     }
     assert!(matches!(
         transport.try_completion(),
@@ -2447,7 +2464,11 @@ fn permission_session_survives_two_thousand_prompt_close_cycles() {
         call_decide(
             &transport,
             &owner(),
-            &decide("cycle-1999", permissions::Decision::Deny, last_request_seq)
+            &decide(
+                &format!("cycle-{}", cycles - 1),
+                permissions::Decision::Deny,
+                last_request_seq
+            )
         ),
         Err(ErrorCode::PermissionRequestClosed)
     );
@@ -2455,7 +2476,7 @@ fn permission_session_survives_two_thousand_prompt_close_cycles() {
         call_decide(
             &transport,
             &owner(),
-            &decide("cycle-0", permissions::Decision::Deny, 1)
+            &decide("cycle-0", permissions::Decision::Deny, first_request_seq)
         ),
         Err(ErrorCode::PermissionRequestUnknown)
     );
