@@ -1432,6 +1432,75 @@ mod tests {
     use super::*;
 
     #[test]
+    fn placement_lookup_checks_only_the_indexed_layout() {
+        for panes_per_tab in [1, 16, 128] {
+            let mut ws = Workspace::test_new("lookup-cost");
+            for _ in 0..3 {
+                ws.test_add_tab(None);
+            }
+            let mut probes = vec![];
+            for tab_idx in 0..ws.tabs.len() {
+                ws.active_tab = tab_idx;
+                for _ in 1..panes_per_tab {
+                    ws.test_split(Direction::Horizontal);
+                }
+                let tab = &mut ws.tabs[tab_idx];
+                for (ordinal, id) in tab.layout.pane_ids().into_iter().enumerate() {
+                    if ordinal % 2 == 0 {
+                        tab.panes.remove(&id);
+                        tab.native_views.insert(
+                            id,
+                            crate::structured::view::placement::View::Ready(
+                                crate::structured::view::Target {
+                                    agent_id: format!("fixture-agent-{ordinal}"),
+                                    generation: 1,
+                                },
+                            ),
+                        );
+                    }
+                    probes.push((id, Some(tab_idx)));
+                }
+                assert!(tab.membership_valid());
+                tab.layout.take_tree_read_count();
+            }
+            probes.push((PaneId::alloc(), None));
+            for (pane, expected) in probes {
+                assert_eq!(ws.find_tab_index_for_pane(pane), expected);
+                for (tab_idx, tab) in ws.tabs.iter().enumerate() {
+                    assert_eq!(
+                        tab.layout.take_tree_read_count(),
+                        usize::from(expected == Some(tab_idx)),
+                        "lookup must validate only its indexed candidate, with {panes_per_tab} panes per tab"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn close_layout_only_pane_reports_membership_without_mutation() {
+        for tabs in [1, 2] {
+            let mut ws = Workspace::test_new("layout-only");
+            if tabs == 2 {
+                ws.test_add_tab(None);
+            }
+            let root = ws.tabs[0].root_pane;
+            ws.tabs[0].panes.remove(&root);
+            let ids = ws.tabs[0].layout.pane_ids();
+            let focused = ws.tabs[0].layout.focused();
+            let number = ws.public_pane_number(root);
+            assert_eq!(
+                ws.close_pane(root),
+                Err(crate::structured::view::PlacementError::Membership)
+            );
+            assert_eq!(ws.tabs.len(), tabs);
+            assert_eq!(ws.tabs[0].layout.pane_ids(), ids);
+            assert_eq!(ws.tabs[0].layout.focused(), focused);
+            assert_eq!(ws.public_pane_number(root), number);
+        }
+    }
+
+    #[test]
     fn placement_lookup_rejects_invalid_stored_content() {
         use crate::structured::view::{placement::View, PlacementError, Target};
         let mut ws = Workspace::test_new("placement-lookup");
