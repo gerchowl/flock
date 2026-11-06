@@ -934,7 +934,7 @@ fn carried_fleet_snapshot() -> Option<protocol::FleetSnapshot> {
     }
 }
 
-/// Every Hello uses the attach snapshot, including background slot dials.
+/// Every Hello uses one client snapshot, including background slot dials.
 /// Requiring it here prevents a handshake from reloading the config file.
 fn requested_keybindings(local_config: &crate::config::Config) -> ClientKeybindings {
     match std::env::var(crate::remote::REMOTE_KEYBINDINGS_ENV_VAR)
@@ -1708,7 +1708,7 @@ fn run_attach_attempt(
     attach_t0: Instant,
     hold_on_transport_loss: bool,
     signal: &AttachSignal,
-    local_config: &crate::config::Config,
+    local_config: &mut crate::config::Config,
 ) -> Result<(), AttachAttemptError> {
     let mut stream = UnixStream::connect(socket_path)
         .map_err(|err| AttachAttemptError::Handshake(ClientError::ConnectionFailed(err)))?;
@@ -1917,7 +1917,7 @@ fn run_client_with_mode(
     // still held — ctrl-c/signal, error return, or the `std::process::exit`
     // paths below that skip TerminalGuard::drop (#69). Disarmed only when this
     // leg hands the held terminal off to a real next leg.
-    let loaded_config = crate::config::Config::load();
+    let mut loaded_config = crate::config::Config::load();
     HOST_WINDOW_TITLE_ALLOWED.store(loaded_config.config.title.enabled, Ordering::Release);
     let held_restore = HeldRestoreGuard::new();
     // Whether, and how, this leg redials a dropped transport (#436).
@@ -2018,7 +2018,7 @@ fn run_client_with_mode(
                 attach_t0,
                 reconnect_plan.is_some(),
                 &attach_signal,
-                &loaded_config.config,
+                &mut loaded_config.config,
             )
         },
         &attach_signal,
@@ -2147,7 +2147,7 @@ async fn run_client_loop(
     initial_input: Option<Vec<u8>>,
     stdin_rx: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
     attach_t0: Instant,
-    local_config: &crate::config::Config,
+    local_config: &mut crate::config::Config,
 ) -> Result<(), ClientError> {
     let (cols, rows, _, _) = initial_geometry;
     let Some((_, _, initial_cell_width, initial_cell_height)) = resolve_terminal_geometry(
@@ -2767,6 +2767,7 @@ async fn run_client_loop(
                             &mut state.sound_config,
                             &mut state.redraw_on_focus_gained,
                             state.last_window_title.as_deref(),
+                            local_config,
                         );
                     }
                     ServerMessage::MouseCapture { enabled } => {
@@ -4085,10 +4086,13 @@ fn write_to_server(stream: &mut UnixStream, msg: &ClientMessage) -> io::Result<(
 // Notifications
 // ---------------------------------------------------------------------------
 
+/// Replace the snapshot only after a successful load. Failed reloads keep the
+/// last valid configuration for later dials and reconnect attempts.
 fn reload_local_client_config(
     sound_config: &mut crate::config::SoundConfig,
     redraw_on_focus_gained: &mut bool,
     last_window_title: Option<&str>,
+    local_config: &mut crate::config::Config,
 ) {
     match crate::config::load_live_config() {
         Ok(loaded) => {
@@ -4102,8 +4106,9 @@ fn reload_local_client_config(
                     set_host_window_title(title);
                 }
             }
-            *sound_config = loaded.config.ui.sound;
+            *sound_config = loaded.config.ui.sound.clone();
             *redraw_on_focus_gained = loaded.config.ui.redraw_on_focus_gained;
+            *local_config = loaded.config;
             debug!("reloaded local client config");
         }
         Err(diagnostics) => {
@@ -5708,7 +5713,12 @@ mod tests {
         let mut sound_config = crate::config::SoundConfig::default();
         let mut redraw_on_focus_gained = true;
 
-        reload_local_client_config(&mut sound_config, &mut redraw_on_focus_gained, None);
+        reload_local_client_config(
+            &mut sound_config,
+            &mut redraw_on_focus_gained,
+            None,
+            &mut crate::config::Config::default(),
+        );
 
         assert!(!redraw_on_focus_gained);
         let _ = std::fs::remove_file(path);
