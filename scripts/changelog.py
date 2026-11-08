@@ -1188,9 +1188,18 @@ def cmd_verify_release_state(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_check_fragments(args: argparse.Namespace) -> int:
+    collect_fragments(Path(args.fragments))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Prepare and extract changelog release notes")
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    check_fragments = subparsers.add_parser("check-fragments", help="Validate unreleased changelog fragments")
+    check_fragments.add_argument("--fragments", default="docs/next/changes")
+    check_fragments.set_defaults(func=cmd_check_fragments)
 
     prepare = subparsers.add_parser("prepare", help="Move Unreleased into a versioned section")
     prepare.add_argument("--path", default="CHANGELOG.md")
