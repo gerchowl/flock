@@ -24,19 +24,19 @@ The fully relay-dependent `mesh_step1`, `mesh_forwarding`, `mesh_routes` and
 `mcp_fleet_messaging` crates also have file-level gates, so their imports,
 helpers and copies of shared support tests are omitted from release builds.
 Mixed crates gate only relay-dependent helpers and imports. Across the 13
-affected binaries, debug retains 485 cases and release retains 227: the
-difference is these 182 relay tests plus 76 shared support-test copies from
+affected binaries, debug retains 488 cases and release retains 229: the
+difference is these 183 relay tests plus 76 shared support-test copies from
 the four gated crates. The same shared support tests still run in the
 release-enabled crates.
 Single-node and unrelated tests remain available in release, including the
 actual detached-daemon reaping and cleanup matcher tests.
 
-The debug-only relay inventory is 182 tests (#1715):
+The debug-only relay inventory is 183 tests (#1715):
 
 | Binary | Debug-only tests |
 | --- | ---: |
 | `fleet_gossip` | 5 |
-| `mesh_step2` | 31 |
+| `mesh_step2` | 32 |
 | `mesh_collection` | 17 |
 | `mesh_delivery` | 10 |
 | `mesh_enrollment` | 22 |
@@ -48,7 +48,7 @@ The debug-only relay inventory is 182 tests (#1715):
 | `mcp_fleet_messaging` | 17 |
 
 Run the affected binaries with `cargo nextest run --release --retries 0`; the
-remaining tests must pass. The debug inventory retains these 182 tests. This
+remaining tests must pass. The debug inventory retains these 183 tests. This
 restriction is a fixture limit, not a platform gate or a product release override.
 
 ## Six original release failures

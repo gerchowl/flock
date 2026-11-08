@@ -2114,6 +2114,8 @@ fn custody_completion_peer_message_not_found_retains_custody() {
     once(c.fleet.node("nodeb"), "question");
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn corrupt_row_at_each_hop_does_not_block_healthy_mail_or_strand_leases() {
     let mut c = Conversation::to(fleet::CHAIN_ABC, "nodec");
