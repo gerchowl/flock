@@ -224,7 +224,19 @@ fn agent_owner_hint_survives_restart_as_offline() {
         json!({"to":{"type":"agent","agent":agent}, "from_agent":"agent_nodea_routeprobe", "body":"offline owner probe"}),
     );
     assert_eq!(response["result"]["state"], "queued", "{response}");
-    assert_eq!(response["result"]["to_host"], "nodeb");
+    assert_eq!(response["result"]["to_host"], "renamed.example");
+    let key = &response["result"]["message_key"];
+    let recipient_node: String = connection
+        .query_row(
+            "SELECT recipient_node FROM envelopes WHERE origin=?1 AND id=?2",
+            rusqlite::params![
+                key["origin_node"].as_str().unwrap(),
+                key["message_id"].as_str().unwrap()
+            ],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(recipient_node, id(fleet.node("nodeb")));
 }
 
 // Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
