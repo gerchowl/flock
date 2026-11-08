@@ -18,6 +18,7 @@ enum SessionCase {
     ConflictingRecord,
     ConflictingResult,
     ConflictAtReady,
+    AmbiguousClaude,
     Protocol32,
 }
 
@@ -60,11 +61,15 @@ impl Fixture {
             .join("delegates")
             .join(support::paths::server_key(&socket));
         std::fs::create_dir_all(&registry).unwrap();
-        let session =
-            json!({"source":"flock:codex","agent":"codex","kind":"id","value":"session-2993"});
+        let harness = if case == SessionCase::AmbiguousClaude {
+            "claude"
+        } else {
+            "codex"
+        };
+        let session = json!({"source":format!("flock:{harness}"),"agent":harness,"kind":"id","value":"session-2993"});
         let mut entry = json!({"name":"fixture", "terminal_id":"term_old", "pane_id":"w1:p1",
             "root_pane":"w1:p0", "workspace_id":"w1", "mode":"cwd", "worktree":null,
-            "branch":null,"harness":"codex","model":null,"round":1,"brief":"brief.md",
+            "branch":null,"harness":harness,"model":null,"round":1,"brief":"brief.md",
             "submitted_at_ms":1,"created_at_ms":1,"cursor":"term_old:0:0:0:i",
             "agent_id":"agent_fixture.example_2993","session":if evidence {session.clone()} else {Value::Null}});
         if legacy {
@@ -86,6 +91,24 @@ impl Fixture {
                 "{\"type\":\"session_meta\",\"payload\":{\"id\":\"session-replacement\"}}\n",
             )
             .unwrap();
+        }
+        if case == SessionCase::AmbiguousClaude {
+            let profile = home.join("profile");
+            let records = home
+                .join("state")
+                .join(support::paths::app_dir_name())
+                .join("claude-config-dirs");
+            std::fs::create_dir_all(&records).unwrap();
+            std::fs::write(records.join("session-2993"), profile.to_str().unwrap()).unwrap();
+            for store in [profile, home.join(".claude")] {
+                let project = store.join("projects/fixture");
+                std::fs::create_dir_all(&project).unwrap();
+                std::fs::write(
+                    project.join("session-2993.jsonl"),
+                    "{\"sessionId\":\"session-2993\"}\n",
+                )
+                .unwrap();
+            }
         }
         std::fs::write(home.join("brief.md"), "Finish this round.").unwrap();
         let listener = UnixListener::bind(&socket).unwrap();
@@ -338,4 +361,15 @@ fn send_conflict_at_readiness_does_not_advance_the_round() {
     let entry: Value = serde_json::from_slice(&std::fs::read(registry).unwrap()).unwrap();
     assert_eq!(entry["round"], 1);
     assert_eq!(entry["session"]["value"], "session-2993");
+}
+
+#[test]
+fn ambiguous_claude_profile_and_default_session_is_unbound() {
+    for verb in ["wait", "result", "send"] {
+        Fixture::case(true, false, false, false, SessionCase::AmbiguousClaude).assert(
+            verb,
+            12,
+            "session_unbound",
+        );
+    }
 }

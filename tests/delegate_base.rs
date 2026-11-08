@@ -10,7 +10,7 @@ fn peer(request: &serde_json::Value) -> serde_json::Value {
             serde_json::json!({"result":{"type":"pong", "version":"fixture", "protocol":support::PROTOCOL_VERSION,"capabilities":{"pane_input_write_ack":true,"live_handoff":false}}})
         }
         "agent.get" => serde_json::json!({"result":{"agent":{
-            "terminal_id":"term_fixture", "pane_id":"w1:p1", "agent_status":"idle",
+            "agent_id":"agent_fixture.example_base", "agent_session":{"source":"flock:opencode","agent":"opencode","kind":"id","value":"base-session"}, "terminal_id":"term_fixture", "pane_id":"w1:p1", "agent_status":"idle",
             "turn_cursor":"term_fixture:0:0:0:i"
         }}}),
         "pane.submit" => {
@@ -34,7 +34,7 @@ fn send(round: u64, sha: Option<&str>, json: bool) -> std::process::Output {
     fs::write(
         registry.join("fixture.json"),
         serde_json::json!({
-            "name":"fixture", "terminal_id":"term_fixture", "pane_id":"w1:p1",
+            "name":"fixture", "agent_id":"agent_fixture.example_base", "session":{"source":"flock:opencode","agent":"opencode","kind":"id","value":"base-session"}, "terminal_id":"term_fixture", "pane_id":"w1:p1",
             "root_pane":"w1:p0", "workspace_id":"w1", "mode":"worktree", "worktree":root,
             "branch":"fixture", "harness":"opencode", "model":null, "round":round,
             "brief":brief, "submitted_at_ms":0, "cursor":"term_fixture:0:0:0:i", "created_at_ms":0,

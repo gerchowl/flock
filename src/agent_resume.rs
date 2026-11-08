@@ -236,7 +236,8 @@ pub fn branch_plan(
 /// A session launched under an account profile (`CLAUDE_CONFIG_DIR`) keeps
 /// its transcripts under that directory instead of `~/.claude`. The
 /// `SessionStart` hook records which one (see `record_claude_config_dir`),
-/// so the recorded profile is searched first and `~/.claude` after it (#977).
+/// so both the recorded profile and `~/.claude` are searched (#977). A session
+/// id must have exactly one matching transcript across those stores.
 pub fn claude_transcript_path(home: &Path, session_id: &str) -> Option<std::path::PathBuf> {
     claude_transcript_path_in(home, &claude_config_dir_records_dir(), session_id)
 }
@@ -252,15 +253,27 @@ fn claude_transcript_path_in(
     let profile = claude_config_dir_for_session_in(records_dir, session_id)
         .map(std::path::PathBuf::from)
         .filter(|dir| dir.is_absolute());
+    let mut stores = std::collections::HashSet::new();
+    let mut found = None;
     for config_dir in profile
         .into_iter()
         .chain(std::iter::once(home.join(".claude")))
     {
+        let canonical = match std::fs::canonicalize(&config_dir) {
+            Ok(path) => path,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return None,
+        };
+        if !stores.insert(canonical) {
+            continue;
+        }
         if let Some(path) = claude_transcript_in_config_dir(&config_dir, session_id).ok()? {
-            return Some(path);
+            if found.replace(path).is_some() {
+                return None;
+            }
         }
     }
-    None
+    found
 }
 
 fn claude_transcript_in_config_dir(
@@ -859,6 +872,37 @@ mod tests {
             "a relative record names no directory flock can trust"
         );
         let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn claude_transcript_path_rejects_reused_id_across_profile_and_default() {
+        let root = crate::test_support::TempDir::socket();
+        let home = root.path().join("home");
+        let records = root.path().join("records");
+        let profile = root.path().join("profile");
+        for config in [&profile, &home.join(".claude")] {
+            let project = config.join("projects/fixture");
+            std::fs::create_dir_all(&project).unwrap();
+            std::fs::write(project.join("reused-session.jsonl"), "{}\n").unwrap();
+        }
+        record_claude_config_dir_in(&records, "reused-session", profile.to_str().unwrap());
+        assert!(claude_transcript_path_in(&home, &records, "reused-session").is_none());
+    }
+
+    #[test]
+    fn claude_transcript_path_counts_an_aliased_default_store_once() {
+        let root = crate::test_support::TempDir::socket();
+        let home = root.path().join("home");
+        let records = root.path().join("records");
+        let config = home.join(".claude");
+        let project = config.join("projects/fixture");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("only-session.jsonl"), "{}\n").unwrap();
+        record_claude_config_dir_in(&records, "only-session", config.to_str().unwrap());
+        assert_eq!(
+            claude_transcript_path_in(&home, &records, "only-session"),
+            Some(project.join("only-session.jsonl"))
+        );
     }
 
     #[test]
