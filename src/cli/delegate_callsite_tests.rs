@@ -360,22 +360,19 @@ fn entry_for(name: &str) -> Entry {
         base_sha: None,
         agent_id: None,
         lock_resolution: None,
-        session: None,
     }
 }
 
 #[test]
-fn w7_require_decide_a_found_record_with_matching_identity_is_ours() {
-    let mut entry = entry_for("d1");
-    entry.agent_id = Some("agent_a".into());
-    let record = json!({"terminal_id": "t", "agent_id":"agent_a"});
+fn w7_require_decide_a_found_record_with_matching_terminal_is_ours() {
+    let entry = entry_for("d1");
+    let record = json!({"terminal_id": "t"});
     assert!(require_decide(entry, AgentFetch::Found(record)).is_ok());
 }
 
 #[test]
-fn w7_require_decide_a_mismatched_identity_is_not_a_delegate() {
-    let mut entry = entry_for("d1");
-    entry.agent_id = Some("agent_a".into());
+fn w7_require_decide_a_mismatched_terminal_is_not_a_delegate() {
+    let entry = entry_for("d1");
     let record = json!({"terminal_id": "someone_else"});
     assert!(matches!(
         require_decide(entry, AgentFetch::Found(record)),
@@ -407,41 +404,28 @@ fn require_decide_another_agent_on_a_new_terminal_is_not_a_delegate() {
 }
 
 #[test]
-fn require_decide_no_recorded_identity_cannot_backfill_from_a_terminal() {
+fn require_decide_backfills_the_agent_id_on_a_terminal_match() {
     let entry = entry_for("d1");
     let record = json!({"terminal_id": "t", "agent_id": "agent_a"});
-    assert!(matches!(
-        require_decide(entry, AgentFetch::Found(record)),
-        Err(RequireFailure::SessionUnbound(_, _))
-    ));
+    let live = require_decide(entry, AgentFetch::Found(record)).expect("same terminal");
+    assert_eq!(live.agent_id.as_deref(), Some("agent_a"));
 }
 
 #[test]
-fn require_decide_a_legacy_worktree_cannot_authorize_recovery() {
+fn require_decide_a_legacy_worktree_entry_survives_a_restart_in_its_worktree() {
+    // An entry written before agent ids were recorded (the #975 report): the
+    // agent still runs in the delegate's own worktree under its name.
     let mut entry = entry_for("d1");
     entry.worktree = Some("/wt/d1".to_string());
-    for cwd in ["/wt/d1", "/elsewhere"] {
-        let record = json!({"terminal_id":"t2", "pane_id":"p2", "agent_id":"agent_a", "cwd":cwd,
-            "agent_session":{"source":"flock:codex","agent":"codex","kind":"id","value":"other-session"}});
-        let Err(RequireFailure::SessionUnbound(saved, _)) =
-            require_decide(entry.clone(), AgentFetch::Found(record))
-        else {
-            panic!("a directory is not identity evidence");
-        };
-        assert!(saved.agent_id.is_none());
-        assert!(saved.session.is_none());
-    }
-}
+    let record =
+        json!({"terminal_id": "t2", "pane_id": "p2", "agent_id": "agent_a", "cwd": "/wt/d1"});
+    let live = require_decide(entry.clone(), AgentFetch::Found(record)).expect("same worktree");
+    assert_eq!(live.terminal_id, "t2");
+    assert_eq!(live.agent_id.as_deref(), Some("agent_a"));
 
-#[test]
-fn require_decide_a_terminal_match_cannot_override_a_conflicting_agent_id() {
-    let mut entry = entry_for("d1");
-    entry.agent_id = Some("agent_a".into());
+    let elsewhere = json!({"terminal_id": "t2", "agent_id": "agent_a", "cwd": "/elsewhere"});
     assert!(matches!(
-        require_decide(
-            entry,
-            AgentFetch::Found(json!({"terminal_id":"t","agent_id":"agent_b"}))
-        ),
+        require_decide(entry, AgentFetch::Found(elsewhere)),
         Err(RequireFailure::NotDelegate)
     ));
 }
@@ -496,11 +480,9 @@ fn recorded_decide_a_renamed_agent_is_still_not_a_delegate() {
 
 #[test]
 fn recorded_decide_a_live_agent_skips_the_terminal_lookup() {
-    let mut entry = entry_for("d1");
-    entry.agent_id = Some("agent_a".into());
     let out = recorded_decide(
-        entry,
-        AgentFetch::Found(json!({"terminal_id": "t", "agent_id":"agent_a"})),
+        entry_for("d1"),
+        AgentFetch::Found(json!({"terminal_id": "t"})),
         || panic!("a name that resolves needs no second lookup"),
     );
     assert!(matches!(out, Ok(Recorded::Live(_))), "{out:?}");

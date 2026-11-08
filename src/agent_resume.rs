@@ -273,7 +273,7 @@ fn claude_transcript_path_in(
             }
         }
     }
-    found
+    found.filter(|path| path.metadata().is_ok_and(|meta| meta.len() > 0))
 }
 
 fn claude_transcript_in_config_dir(
@@ -287,11 +287,10 @@ fn claude_transcript_in_config_dir(
     };
     let file_name = format!("{session_id}.jsonl");
     let mut found = None;
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = entry.map_err(|_| ())?;
         let candidate = entry.path().join(&file_name);
-        if candidate
-            .metadata()
-            .is_ok_and(|meta| meta.is_file() && meta.len() > 0)
+        if candidate.metadata().is_ok_and(|meta| meta.is_file())
             && found.replace(candidate).is_some()
         {
             return Err(());
@@ -887,6 +886,11 @@ mod tests {
         }
         record_claude_config_dir_in(&records, "reused-session", profile.to_str().unwrap());
         assert!(claude_transcript_path_in(&home, &records, "reused-session").is_none());
+        std::fs::write(profile.join("projects/fixture/reused-session.jsonl"), "").unwrap();
+        assert!(
+            claude_transcript_path_in(&home, &records, "reused-session").is_none(),
+            "an empty stale file still makes the session id ambiguous"
+        );
     }
 
     #[test]

@@ -66,7 +66,6 @@ impl ErrorCode {
         match self {
             ErrorCode::RequestOutcomeUnknown => exit::REQUEST_OUTCOME_UNKNOWN,
             ErrorCode::Timeout => exit::TIMEOUT,
-            ErrorCode::SessionUnbound => exit::SESSION_UNBOUND,
             ErrorCode::CodexConversationLocked => exit::AGENT_BLOCKED,
             ErrorCode::CodexLockUnconfirmed => exit::UNCONFIRMED,
             ErrorCode::InputWriteCancelled
@@ -429,7 +428,6 @@ mod tests {
             let want = match code {
                 ErrorCode::RequestOutcomeUnknown => 14,
                 ErrorCode::Timeout => 124,
-                ErrorCode::SessionUnbound => 12,
                 ErrorCode::CodexConversationLocked => crate::cli::exit::AGENT_BLOCKED,
                 ErrorCode::CodexLockUnconfirmed => crate::cli::exit::UNCONFIRMED,
                 ErrorCode::InputWriteCancelled

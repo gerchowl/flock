@@ -6409,7 +6409,7 @@ mod tests {
             r#"{"id":"recovery","error":{"code":"session_unbound","message":"missing launch evidence"}}"#,
         ).unwrap();
         assert_eq!(error.error.code, "session_unbound");
-        assert_eq!(crate::cli::error_code_exit(&error.error.code, false), 12);
+        assert_eq!(crate::cli::error_code_exit(&error.error.code, false), 1);
         // JSON error codes stay strings. Clients without a code in their local
         // registry retain its text and apply the generic unknown-error exit.
         let future: ErrorResponse = serde_json::from_str(
