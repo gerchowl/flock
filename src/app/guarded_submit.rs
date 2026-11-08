@@ -284,7 +284,9 @@ fn codex_hint_prefix(rows: &[&str]) -> bool {
 
 /// Read only the editor, without the idle and safety gates used to authorize Enter.
 pub(crate) fn composer_contents(agent: Agent, screen: &str, unfaint: &str) -> Option<String> {
-    composer_rows(agent, screen, unfaint).map(|(rows, _, _)| rows.join("\n"))
+    let screen = crate::detect::readiness_text(agent, screen);
+    let unfaint = crate::detect::readiness_text(agent, unfaint);
+    composer_rows(agent, &screen, &unfaint).map(|(rows, _, _)| rows.join("\n"))
 }
 
 /// Classify a live pane's editor from one styled read of its detection text.
@@ -320,6 +322,10 @@ fn composer_unfaint_with_width(
     text: &str,
     cols: Option<u16>,
 ) -> Composer {
+    let screen = crate::detect::readiness_text(agent, screen);
+    let unfaint = crate::detect::readiness_text(agent, unfaint);
+    let screen = screen.as_ref();
+    let unfaint = unfaint.as_ref();
     let Some((rows, body_start, body_end)) =
         composer_rows_with_width(agent, screen, unfaint, cols, Some(text))
     else {
@@ -395,6 +401,8 @@ fn editor_rows_for_text(
     expected: Option<&str>,
 ) -> Option<Vec<String>> {
     let (screen, unfaint) = runtime.detection_text_and_unfaint();
+    let screen = crate::detect::readiness_text(agent, &screen);
+    let unfaint = crate::detect::readiness_text(agent, &unfaint);
     let (rows, _, _) = composer_rows_with_width(
         agent,
         &screen,

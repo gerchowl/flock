@@ -5,6 +5,9 @@
 
 mod agents;
 pub(crate) mod provider_limit;
+mod readiness;
+
+pub(crate) use readiness::readiness_text;
 
 /// The detected state of a terminal pane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -359,7 +362,8 @@ pub fn detect_agent(agent: Option<Agent>, screen_content: &str) -> AgentDetectio
             question: None,
         };
     };
-    agents::detect(agent, screen_content)
+    let screen_content = readiness_text(agent, screen_content);
+    agents::detect(agent, &screen_content)
 }
 
 /// Whether the agent's input box is on screen and EMPTY — `None` when this
@@ -390,7 +394,8 @@ pub(crate) fn claude_composer(screen: &str) -> Option<String> {
 
 /// Read the Codex prompt and footer bounds from the unscrolled snapshot.
 pub(crate) fn codex_composer_region(screen: &str) -> Option<(usize, usize)> {
-    agents::codex::composer_region(screen)
+    let screen = readiness_text(Agent::Codex, screen);
+    agents::codex::composer_region(&screen)
 }
 
 /// Read Codex's composer with the terminal width needed to verify clipped controls.
@@ -398,9 +403,10 @@ pub(crate) fn codex_composer_region_with_width(
     screen: &str,
     cols: Option<u16>,
 ) -> Option<(usize, usize)> {
+    let screen = readiness_text(Agent::Codex, screen);
     match cols {
-        Some(_) => agents::codex::composer_region_with_width(screen, cols),
-        None => codex_composer_region(screen),
+        Some(_) => agents::codex::composer_region_with_width(&screen, cols),
+        None => codex_composer_region(&screen),
     }
 }
 
@@ -457,9 +463,10 @@ pub fn codex_waiting_on_folder_trust(screen_content: &str) -> bool {
 /// limit warning, an update notice) was printed between the echo and the
 /// composer. A Working row with a different or no echo above it proves nothing.
 pub(crate) fn live_turn_follows_submitted(agent: Agent, screen: &str, text: &str) -> bool {
+    let screen = readiness_text(agent, screen);
     match agent {
-        Agent::Codex => agents::codex::live_turn_follows_echo(screen, text),
-        Agent::Claude => agents::claude_code::live_turn_follows_echo(screen, text),
+        Agent::Codex => agents::codex::live_turn_follows_echo(&screen, text),
+        Agent::Claude => agents::claude_code::live_turn_follows_echo(&screen, text),
         _ => false,
     }
 }

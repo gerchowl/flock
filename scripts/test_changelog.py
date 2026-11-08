@@ -53,6 +53,23 @@ FOREIGN_REPO = "example.invalid/another-project"
 
 
 class ChangelogScriptTests(unittest.TestCase):
+    def test_check_fragments_rejects_prose_and_accepts_bullets(self) -> None:
+        script = Path(__file__).with_name("changelog.py")
+        with tempfile.TemporaryDirectory() as tmp:
+            fragment = Path(tmp) / "1.changed.md"
+            for body, expected_code in (("The web client explains refusals.\n", 1),
+                                        ("- The web client explains refusals.\n", 0)):
+                with self.subTest(body=body):
+                    fragment.write_text(body, encoding="utf-8")
+                    result = subprocess.run(
+                        ["python3", str(script), "check-fragments", "--fragments", tmp],
+                        capture_output=True, text=True, check=False,
+                    )
+                    self.assertEqual(result.returncode, expected_code, result.stderr)
+                    if expected_code:
+                        self.assertIn("fragment must contain Markdown bullets", result.stderr)
+                    self.assertEqual(fragment.read_text(encoding="utf-8"), body)
+
     def test_prepare_release_moves_unreleased_into_versioned_section(self) -> None:
         original = """# Changelog\n\n## Unreleased\n\n### Fixed\n- Smoothed Claude flapping.\n\n## [0.1.0] - 2026-03-27\n\n### Added\n- Initial release.\n"""
 

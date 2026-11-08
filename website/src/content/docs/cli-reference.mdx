@@ -7,7 +7,46 @@ Flock’s CLI talks to the running server over the same local socket API used by
 
 Most commands print JSON responses. Use them from scripts when you want deterministic automation.
 
-When an existing status ping, submission guard, or failed command reveals a different server protocol, the CLI prints one warning to stderr per invocation. Read-only commands add no status probe; a state-changing command adds one ping per invocation, cached for the rest of it (see below). Unknown-method errors from older-protocol servers become `server_version_gap`, with the server version, protocol, required client protocol, and recovery command: `flk server live-handoff` (or restart the server). Surfaced failures return **exit code 78**; optional lookups that consume the error preserve the command's successful exit. Equal or newer protocols retain the original API error. Every state-changing command (`delegate start` and `send`, `agent start`, `restart` and `send`, `pane send-*` and `submit`, `worktree create`, `msg send` and `reply`, and the rest) checks the server protocol before its first state-changing request and refuses an older server with `server flk X (protocol N) is incompatible with client flk Y (protocol M)` and exit 78, so nothing is half-created. That check costs one ping per invocation. Read-only commands, `flk status` and `flk server` (including `live-handoff` and `stop`) still reach an older server, since handing it off is the fix. Diagnosis probes have a 500 ms timeout and reuse a server identity already obtained during the invocation. An unavailable probe leaves the original error intact. MCP tools return the same skew message with `error.data.refusal: "server_version_gap"`.
+When an existing status ping, submission guard, or failed command reveals a different server protocol, the CLI prints one warning to stderr per invocation. Read-only commands add no status probe; a state-changing command adds one ping per invocation, cached for the rest of it (see below). Unknown-method errors from older-protocol servers become `server_version_gap`, with the server version, protocol, required client protocol, and recovery command: `flk server live-handoff` (or restart the server). Surfaced failures return **exit code 78**; optional lookups that consume the error preserve the command's successful exit. Equal or newer protocols retain the original API error. Every state-changing command (`delegate start` and `send`, `agent start`, `restart` and `send`, `pane send-*` and `submit`, `worktree create`, `msg send` and `reply`, and the rest) checks the server protocol before its first state-changing request and refuses an older server with `server flk X (protocol N) is incompatible with client flk Y (protocol M)` and exit 78, so nothing is half-created. That check costs one ping per invocation. Read-only commands, `flk status` and `flk server` (including `live-handoff` and `stop`) still reach an older server, since handing it off is the fix. Diagnosis probes have a 500 ms timeout and reuse a server identity already obtained during the invocation. An unavailable probe leaves the original error intact; an expired probe reports a typed timeout before a mutation is dispatched. MCP tools return the same skew message with `error.data.refusal: "server_version_gap"`.
+
+## Socket deadlines
+
+Ordinary API exchanges have a 10-second monotonic deadline covering connect,
+write and reply, including partial replies and transient `EAGAIN`/`EINTR` reads.
+`flk status` uses its status-ping cap; compatibility probes use 500 ms.
+A listening server that stops replying reports a timeout, not “server not running”.
+Errors name the socket and elapsed time.
+
+Blocking output/reply/event waits and long polls use at least their requested
+operation timeout plus a fixed 5-second transport margin, rather than the
+ordinary cap. An omitted output/reply/event wait timeout has a finite 24-hour
+transport cap plus that margin. Explicit caller deadlines can be shorter.
+Worktree create/kill, workspace create/close and agent start have a shared
+60-second total client allowance, also used by delegate. This is client patience,
+not a server execution limit: server work can continue after a dispatched
+request expires with `request_outcome_unknown` (exit 14). Server cancellation
+and partial-state cleanup are tracked in
+[#2209](https://github.com/gerchowl/flock/issues/2209).
+Completed input writes retain their capability-bound client budget and reply
+margin: raw writes use 10 seconds and guarded submit reserves the server's
+complete submit wait bound plus capability and reply margins. Lost replies
+report `input_write_unknown` (exit 8); inspect the pane before retrying.
+Live handoff reserves the server's shutdown,
+pane-drain, import-startup, commit and rollback phase budgets plus the margin:
+the handler replies only after those synchronous phases finish.
+
+A timeout before dispatch, or on an explicitly read-only/idempotent request,
+returns `timeout`, exit **124** (`retry: yes`). After a mutation has written any
+bytes, expiry outside the completed input-write contract instead returns `request_outcome_unknown`, exit **14**
+(`retry: after_inspecting`): the operation may have been applied. Inspect server
+state before repeating it. These mutations are never automatically resent.
+Unclassified API calls default to mutating; callers must declare safe reads.
+
+This covers the shared request client and ordinary CLI send path. Peer relay
+and subscription lifecycle deadlines follow in
+[#2180](https://github.com/gerchowl/flock/issues/2180); session, update and
+standalone probe paths and their typed exit propagation follow in
+[#2181](https://github.com/gerchowl/flock/issues/2181).
 
 CLI text arguments must be valid UTF-8. Invalid encoding is refused before command
 execution with `invalid_params` and usage exit 2, rather than panicking. This early
@@ -174,6 +213,13 @@ failing relay are refused with a concrete reason. Version refusals include
 
 ## Server
 
+Starting `flk server`, automatic server startup from `flk`, and monolithic
+`flk --no-session` bootstrap the per-user mesh identity. If another live or
+stopped process holds its bootstrap lock for two seconds, acquisition ends with
+the typed `session_busy` refusal (`retry: "later"`, exit 1). Retry after that
+operation finishes or its owner releases the lock. Flock preserves the existing
+identity and lock paths.
+
 ```bash
 flk server
 flk server stop
@@ -184,6 +230,18 @@ flk server reload-config
 `flk server` runs the headless server explicitly. Use it for supervised or service-style setups. `reload-config` applies reloadable settings without restarting panes.
 
 `live-handoff` moves every live pane to a new server process without stopping it, which is how an upgrade reaches a running session. The new server is the binary of the `flk` you ran, resolved through symlinks to its real path, and the importer must report that binary's version and protocol or the handoff rolls back and the old server keeps the panes. On a versioned install (Nix, or any `/store/<hash>-flock-<version>/bin/flk` layout) the old server's own path stays valid after an upgrade, so re-executing it would only restart the old version. When it finishes, the command prints both versions (`live handoff complete: server flk A -> flk B`) after the new server answers with the target version. It exits 1, rather than reporting success, when the new server is not the requested version, or when it is the same version the old server ran while the client is a different one. A client older than the running server (a stale `flk` earlier on `PATH`) refuses the default handoff instead of downgrading the server to itself, naming both versions and the client's path.
+
+Auto-detected daemons and handoff replacements use the same executable resolver.
+It resolves symlinks once before constructing each server launch, so the daemon's
+recorded executable and `argv[0]` use the canonical path even if the launch alias
+is later removed or repointed. If the current binary or an explicit `--import-exe`
+cannot be resolved to a regular file, startup refuses with
+`server_executable_unresolved` (`retry: after_inspecting`, exit 1). Restore the
+binary or select an existing target before retrying. There is no fallback to the
+alias, `PATH`, or the old server's image. A handoff refuses this condition before
+stopping structured workers or transferring panes. Resolution pins a pathname,
+not file contents: removal afterwards remains a spawn failure, and version and
+protocol checks still protect the handoff.
 
 The JSON socket API reports `server.live_handoff` failures with `error.code: "handoff_failed"` and a stable `error.data.kind`: `import_refused`, `broken_pipe`, `connection_reset`, `invalid_input`, or `other`. `error.message` remains diagnostic prose and must not be parsed to classify failures. `other` includes timeouts and unexpected control messages. `invalid_input` alone does not prove peer closure; a caller needs evidence of the operation and stage. Clients should treat unknown kinds as failures. The kind describes the cause, not whether ownership committed. Existing clients can ignore this additive field.
 
@@ -406,6 +464,8 @@ Arm a self-compaction of your own context:
 ```bash
 flk pane arm-self-compact [--pane <pane_id>] [--abort] [--instructions <text> | --instructions-file <path>] <handoff prompt>
 ```
+
+Omitting `--pane` resolves the calling pane from its attested process identity. If that identity cannot be resolved, the call fails with `caller_pane_unresolved` (exit 1), names the missing evidence and suggests `--pane <id>` (MCP: `pane: "<id>"`). A pane imported from a pre-3.3 handoff may lack the original process-birth evidence; switching `CLAUDE_CONFIG_DIR` does not supply it. Naming a pane explicitly selects the existing target-resolution path; it does not restore attestation or inbox authority. An explicit unknown pane still returns `pane_not_found`.
 
 The one thing flock types into a pane on an agent's own instruction, and the reason it is a verb rather than a `send-text` is that it is not typing *at* the agent — it is the agent asking to be allowed to shorten its context and carry on. The prompt is the agent's own handoff to its next self: the text an operator otherwise copies out of the transcript and pastes back in.
 
@@ -836,6 +896,31 @@ The delegate runs in a workspace it created and **never requests focus**, so you
 
 **The brief is only typed into an agent that is at its prompt.** `start` and `send` both wait out a permission prompt rather than answering it, and time out with the status named (`delegate <name> is blocked`) rather than typing into a dialog. That wait also covers readiness — a pane that has painted nothing yet reports `unknown`, which is a booting TUI, not a crash. Claude Code asks `Quick safety check: Is this a project you created or one you trust?` the first time it starts in a directory, and a `--worktree` checkout is always such a directory: that dialog has no input box, so the delegate names it (`delegate <name>: Claude Code is waiting on its folder-trust dialog (see #605)`) and refuses instead of typing at it. When the directory is a linked worktree of a repository already trusted in that Claude profile, flock records the worktree as trusted before starting `claude`, so the dialog does not appear (#605, `[worktrees] pretrust_claude`); anywhere else accepting it stays a human action. Codex has its own `Trust this folder?` dialog for a repository it has never trusted; the delegate names it `codex_folder_trust` and refuses the same way. Codex records trust for the repository root, so accepting it once in the main checkout covers every later worktree of that repository. `delegate status` names a startup dialog the agent is blocked on (`startup_dialog` in `--json`).
 
+Claude's folder-trust variant with `This folder pre-approves N tool permissions`
+is named `claude_folder_trust_with_permissions`. Recognition requires the
+permission notice and live folder-trust controls. Both known question/answer
+variants are recognised, including `No, exit` and `No, continue without these
+permissions`; counts, workspace paths and cancel labels do not select the dialog.
+Flock never answers it.
+`delegate start`, including `start --await`, returns `agent_blocked` (exit 6,
+`cli::exit::AGENT_BLOCKED`) and
+keeps the pane, checkout and delegate record at round 0 without requiring
+`--keep-on-failure`. No brief has been submitted. `delegate status` and
+`delegate wait` report the same `startup_dialog` name. JSON outcome reports always
+include that field (null when absent). After the operator
+answers in the pane and the agent settles, `delegate send` can submit round 1.
+The usual recent-operator-input guard still applies: an immediate send within
+120 ms of the answer can refuse with `operator_active` (exit 10), without typing
+a brief. `flk agent wait <name> --status settled` observes readiness after that
+input. If recording the block
+or syncing its registry directory fails, start returns typed `write_failed`
+(exit 1) while retaining the pane. Under `--json`, the error envelope includes
+`data.pane_id` and `data.pane_retained: true`; the human diagnostic also names
+the pane. This path never consults `--keep-on-failure`. Failed publication leaves
+the prior registry entry untouched and removes its temporary file. A directory
+sync failure after the atomic rename can leave a complete new entry visible,
+but its durability has not been confirmed. No failure publishes a partial entry.
+
 Codex's live conversation-lock screen is named `codex_conversation_locked`,
 including when it appears after a capacity stop and restart. Flock never chooses
 retry or fork automatically. `delegate start` keeps the pane and delegate record
@@ -871,7 +956,7 @@ A Codex that is still starting can swallow the typed brief: the composer stays e
 
 `--await` stays and reports the round's outcome. Settling is not finishing: an agent goes quiet between tool calls, so the await settles and then waits a further grace for a reply recorded at or after this round's submit. A round is therefore only reported when the agent entered `working` after that round's cursor **and** a reply exists from after the submit — a fix round is not reported from the quiet that preceded it, and not from the previous round's reply. A settle is never reported as `no_result` while the store records a turn begun at or after the submit that has not ended (`turn_open_at_ms` on `agent.result`, Claude only): the screen can read idle inside a running turn, so the await settles again from the same cursor and asks the store again, and the round ends only on a reply, a turn the transcript records as over, or the usual blocked, gone, stalled and timeout outcomes (#1257). A turn the transcript closes without a `turn_duration` entry — a resumed session's `No response requested.`, an interrupt, a local command — counts as over (the rules are under `agent.result` in the socket API), so such a round ends as usual, typically `no_sentinel` or `no_result` (exit 5), and the caller re-waits or re-sends. Against an older server, which never reports an open turn, the grace behaves as before. Codex delegates are not covered: a Codex reply ending on `VERDICT:` reported as `no_result` is [#1268](https://github.com/gerchowl/flock/issues/1268). `--timeout` bounds the await only and starts after the submit (for `wait`, at command entry); `--settle` defaults to 5000; `--max-chars` pages the reply.
 
-Exit codes: **0** a finished reply ending on `DONE:` / `VERDICT:` · **3** a `BLOCKED:` reply · **4** the agent's pane closed, hibernated or restarted · **5** a finished reply with no sentinel, or none inside the grace · **6** the agent sitting on a prompt (`blocked`) for the settle window · **7** a stalled round · **11** `not_started` (8 before #1025; continuously idle with an empty composer for the startup window and no new turn since the submit cursor) · **75** `server_unavailable`: the server stopped answering inside the reply grace for 5 minutes, which says nothing about the agent · **78** server protocol mismatch · **124** the timeout · **2** a usage error, or a name that is not a delegate · **10** the composer refused the brief before typing (`delegate send` restores the registry; `start` only when it rolled back) · **1** any other failure. With `--json`, exits 0, 3, 4, 5, 6, 7, 11, 75 and 124 print the same object (a usage error, exit 2, and failures other than readiness expiry, exit 1, print nothing on stdout, only the error on stderr), and its `turn_cursor` is the cursor that await started from — so a timed-out caller resumes with `--after <turn_cursor>` and gets the same round. Without `--json`, stdout is the reply's text and stderr is one summary line.
+Exit codes: **0** a finished reply ending on `DONE:` / `VERDICT:` · **3** a `BLOCKED:` reply · **4** the agent's pane closed, hibernated or restarted · **5** a finished reply with no sentinel, or none inside the grace · **6** the agent sitting on a prompt (`blocked`) for the settle window · **7** a stalled round · **11** `not_started` (8 before #1025; continuously idle with an empty composer for the startup window and no new turn since the submit cursor) · **75** `server_unavailable`: the server stopped answering inside the reply grace for 5 minutes, which says nothing about the agent · **78** server protocol mismatch · **124** the timeout · **2** a usage error, or a name that is not a delegate · **10** the composer refused the brief before typing (`delegate send` restores the registry; `start` only when it rolled back) · **1** any other failure. With `--json`, exits 0, 3, 4, 5, 6, 7, 11, 75 and 124 print the same object (a usage error, exit 2, and failures other than readiness expiry or retained-block registry errors, exit 1, print nothing on stdout, only the error on stderr), and its `turn_cursor` is the cursor that await started from — so a timed-out caller resumes with `--after <turn_cursor>` and gets the same round. Without `--json`, stdout is the reply's text and stderr is one summary line.
 
 Write the brief so the agent ends its reply on a final `DONE: …`, `BLOCKED: …` or `VERDICT: …` line: that line is the whole result contract, and a good reply ending on anything else is `no_sentinel` (exit 5). A trailing `※ recap` line after it is fine.
 
@@ -879,7 +964,7 @@ When `start` runs inside an agent's pane, the server records that agent as the d
 
 `list` reads those records back from the server, grouped per architect: `--mine` (the default) is the agent whose pane runs the command, `--architect <id>` names one, and `--all` shows every architect, one block each. `--branch <b>` returns the edge that owns that branch. Each row carries the delegate's name, its edge state, `agent_status` and how long it has held it, harness, branch, the PR the poller last saw (number and state), the edge's age and its label. The state is `live`, `hibernated, awaiting merge` (hibernated with an open PR), `gone` (removed), `gone, worktree retained` (removed, its worktree still on disk), `orphaned` (its architect is gone), or `closed, not merged`, which a PR closed without merging shows whatever else holds, including a batch-landed `landed-in-batch` PR. Everything comes from state the server already holds, so `list` runs no git or `gh` command and the PR can lag GitHub by one poll. Architect presence includes local terminal records and the cached fleet directory, including direct and relayed gossip. A remote architect in that directory does not make its delegates orphaned merely because it runs elsewhere or is temporarily unreachable. Relayed presence expires when its carried age (the origin-reported age plus time in the local cache) exceeds about 10 × the effective `gossip.stale_after_secs`, on the next expiry tick. Direct peer summaries have no time-based eviction: while the peer remains configured, an unreachable or dead architect can keep its delegates reading `live` indefinitely, until a successful summary omits it or the peer is removed from configuration. Once the architect is absent from both local records and cached gossip, the edge reads as `orphaned`. This is a display-only presence check, not proof of reachability or teardown authority. Orphaned edges are retained and never reaped automatically, whatever their reap policy (ADR-0027 §1a and §5). `--mine` from the operator's own terminal, which runs in no agent pane, fails with `no_caller_pane` and names `--all`. `--json` prints the verb's result as is, the same object MCP `flock_delegate_list` returns.
 
-A start that fails once its agent exists (readiness timed out, a startup dialog, a composer that refused the brief with `input_not_empty`) prints the agent pane's last 20 lines on stderr, each behind `  | `, read before anything is torn down, so a rolled-back start still shows what the agent was showing. It then rolls back the workspace and checkout as before; a composer refusal that rolled back cleanly exits 10 (1 before #1025), since nothing was typed and nothing persists. With `--keep-on-failure` it keeps them instead, with the agent and the delegate's record, and exits 1: `delegate status` reads it, `delegate send` types the brief once the composer is clear (a start refused before typing ran no round, so that is round 1), and `delegate reap` removes it. `--keep-on-failure` also keeps the workspace and checkout when the server refuses to start the agent at all; there is no agent pane then, so no lines are printed, `delegate status` reports it as `not_started`, `delegate send` refuses it as `gone`, and `delegate reap` removes the workspace and checkout. Under `--json` the same lines are structured: a start that failed once its agent existed, including one whose brief submission could not be confirmed, prints one `start_failed` outcome (`reason`, `kept`, `pane_id`, `data.pane_tail`), and a `ready_timeout` outcome carries `data.pane_tail` too. Every failure exits non-zero.
+A start that fails once its agent exists (readiness timed out, another startup dialog, a composer that refused the brief with `input_not_empty`) prints the agent pane's last 20 lines on stderr, each behind `  | `, read before anything is torn down, so a rolled-back start still shows what the agent was showing. It then rolls back the workspace and checkout as before; a composer refusal that rolled back cleanly exits 10 (1 before #1025), since nothing was typed and nothing persists. With `--keep-on-failure` it keeps them instead, with the agent and the delegate's record, and exits 1: `delegate status` reads it, `delegate send` types the brief once the composer is clear (a start refused before typing ran no round, so that is round 1), and `delegate reap` removes it. `--keep-on-failure` also keeps the workspace and checkout when the server refuses to start the agent at all; there is no agent pane then, so no lines are printed, `delegate status` reports it as `not_started`, `delegate send` refuses it as `gone`, and `delegate reap` removes the workspace and checkout. Under `--json` the same lines are structured: a start that failed once its agent existed, including one whose brief submission could not be confirmed, prints one `start_failed` outcome (`reason`, `kept`, `pane_id`, `data.pane_tail`), and a `ready_timeout` outcome carries `data.pane_tail` too. Every failure exits non-zero.
 
 If the agent exits before it takes the brief (a harness that dies at launch, say on a failed login), `start` and `send` report `gone` and exit 4 rather than a submitted round, whether the pane was already gone when the brief was sent or died while it was being confirmed, and keep the delegate's record so `reap` can remove what is left. A known limit: a harness that accepts the brief and exits right after it is still a submitted round, so `start` without `--await` prints `submitted` and exits 0; `status` then shows `gone`, and `--await` reports it as `gone` (exit 4).
 
