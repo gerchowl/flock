@@ -2135,6 +2135,7 @@ mod tests {
             tokio::sync::mpsc::unbounded_channel().1,
             crate::api::EventHub::default(),
             crate::app::AppRuntimeConfig {
+                structured_mcp: None,
                 uid_policy: Default::default(),
                 merge_gate: crate::worktree::MergeGateContext {
                     gh_program: crate::test_support::unique_temp_path("missing-gh"),
@@ -3501,7 +3502,11 @@ mod tests {
             std::env::temp_dir().join(format!("flock-tui-home-{}-{nanos}", std::process::id()));
         let project = home.join(".claude/projects/-repo-flock");
         std::fs::create_dir_all(&project).unwrap();
-        std::fs::write(project.join(format!("{session_id}.jsonl")), "{}\n").unwrap();
+        std::fs::write(
+            project.join(format!("{session_id}.jsonl")),
+            format!("{}\n", serde_json::json!({"sessionId":session_id})),
+        )
+        .unwrap();
         std::env::set_var("HOME", &home);
         home
     }

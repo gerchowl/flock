@@ -139,3 +139,10 @@ async fn unknown_accept_errors_back_off_with_the_supplied_clock() {
     recover(Some(libc::EIO), true).await;
     recover(None, true).await;
 }
+
+#[tokio::test]
+async fn unsupported_accept_operations_back_off_with_the_supplied_clock() {
+    for errno in [libc::EOPNOTSUPP, libc::ENOPROTOOPT] {
+        recover(Some(errno), true).await;
+    }
+}

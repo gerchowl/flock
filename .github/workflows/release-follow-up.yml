@@ -113,7 +113,7 @@ jobs:
             sleep 30
           done
 
-      - uses: actions/create-github-app-token@v2
+      - uses: actions/create-github-app-token@v3
         if: steps.release.outputs.release == 'true'
         id: app-token
         with:

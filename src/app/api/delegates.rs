@@ -16,6 +16,24 @@ use crate::worktree::{PrState, PrStateInfo};
 use super::responses::{encode_error, encode_success};
 
 impl App {
+    pub(super) fn delegate_recovery_allowed(&mut self, delegate: &str) -> bool {
+        if self.caller_unattested_or_relayed() {
+            return false;
+        }
+        match self.spawn_caller() {
+            SpawnCaller::Operator { .. } => true,
+            SpawnCaller::Agent { agent_id, .. }
+            | SpawnCaller::Structured {
+                agent_id: Some(agent_id),
+                ..
+            } => self
+                .delegations
+                .get(delegate)
+                .is_some_and(|edge| edge.architect == agent_id),
+            SpawnCaller::Structured { agent_id: None, .. } => false,
+        }
+    }
+
     pub(super) fn handle_delegate_list(
         &mut self,
         id: String,
@@ -33,9 +51,12 @@ impl App {
                     return encode_error(
                         id,
                         "no_caller_pane",
-                        "`self` is the agent whose pane runs the caller, and this caller \
-                         runs in no agent pane, so it has no delegates of its own: use \
-                         --all (architect \"all\") or --architect <agent id>",
+                        format!(
+                            "`self` could not be resolved from the caller's attested identity: \
+                             {}. Use --all (MCP architect: \"all\") or --architect <id> \
+                             (MCP architect: \"<id>\")",
+                            self.caller_pane_refusal_reason(),
+                        ),
                     )
                 }
             },
@@ -475,6 +496,7 @@ mod handler_tests {
                 peer: "hub.example".into(),
                 stream_error: None,
                 result: Ok(crate::peers::PeerSummaryPayload {
+                    structured_agents: Vec::new(),
                     node_id: None,
                     outbound_pending: false,
                     host: if relayed {

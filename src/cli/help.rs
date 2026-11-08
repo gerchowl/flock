@@ -58,6 +58,7 @@ const HELP_FLAGS: [&str; 2] = ["--help", "-h"];
 /// `pane` is the group to watch when adding rows here: `src/cli/pane.rs` owns
 /// those parsers and its own help text, and this table mirrors them.
 const VERBS: &[(&str, &str, &str)] = &[
+    ("structured", "grants", super::grants::USAGE),
     ("server", "stop", "flk server stop"),
     (
         "server",
@@ -182,8 +183,8 @@ const VERBS: &[(&str, &str, &str)] = &[
         "reply",
         "flk msg reply <correlation_id> <text...> [--intent fyi|needs-reply|blocking] [-- <text starting with dashes>]",
     ),
-    ("msg", "list", "flk msg list [--pane TARGET]"),
-    ("msg", "read", "flk msg read [--pane TARGET]"),
+    ("msg", "list", "flk msg list [--pane TARGET]   peek at your structured inbox or the operator global list"),
+    ("msg", "read", "flk msg read [--pane TARGET]   consume your attested pane or structured inbox"),
     ("msg", "status", "flk msg status <correlation_id>"),
     (
         "msg",
@@ -638,6 +639,7 @@ mod tests {
             "fleet" => include_str!("fleet.rs"),
             "owner" => include_str!("owner.rs"),
             "goal" => include_str!("goal.rs"),
+            "structured" => include_str!("grants.rs"),
             "events" => include_str!("events.rs"),
             "adapter" => include_str!("adapter.rs"),
             // `wait park` shares the `events` parser.
@@ -748,6 +750,7 @@ mod tests {
                         }
                     }
                     syn::Pat::Paren(pattern) => self.pattern(&pattern.pat),
+                    syn::Pat::Guard(pattern) => self.pattern(&pattern.pat),
                     syn::Pat::TupleStruct(pattern) if pattern.path.is_ident("Some") => {
                         for element in &pattern.elems {
                             self.pattern(element);
@@ -784,16 +787,23 @@ mod tests {
                 }
                 match optional {
                     Some("list" | "show") => (),
+                    Some("guarded") if optional == Some("guard-expression-only") => (),
                     _ => (),
                 }
             }
         "#,
         );
-        assert_eq!(verbs.len(), 5);
-        for verb in ["get", "status", "stop", "list", "show"] {
+        assert_eq!(verbs.len(), 6);
+        for verb in ["get", "status", "stop", "list", "show", "guarded"] {
             assert!(verbs.contains(verb), "missing routed verb {verb}");
         }
-        for verb in ["comment-only", "string-only", "body-only", "deleted"] {
+        for verb in [
+            "comment-only",
+            "string-only",
+            "body-only",
+            "deleted",
+            "guard-expression-only",
+        ] {
             assert!(!verbs.contains(verb), "invented routed verb {verb}");
         }
     }
@@ -814,6 +824,9 @@ mod tests {
                         include_str!("delegate_list.rs"),
                     ],
                     "wait" => vec![DISPATCH_SOURCE, include_str!("events.rs")],
+                    "session" => vec![DISPATCH_SOURCE, include_str!("retained.rs")],
+                    // The group routes grants inline; its nested parser owns flags.
+                    "structured" => vec![DISPATCH_SOURCE, group_parser_source(group)],
                     _ => vec![group_parser_source(group)],
                 };
                 sources

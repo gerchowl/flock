@@ -1,4 +1,4 @@
-//! Typed structured read/control routes; public launch stays gated until #1843 part 3.
+//! Typed structured read/control routes (ADR-0036 S3a-3).
 use super::{
     responses::{encode_error, encode_success},
     spawn::SpawnCaller,
@@ -57,19 +57,18 @@ impl App {
         }
         Ok(found)
     }
-    pub(super) fn structured_info(&self, id: &str) -> Option<StructuredAgentInfo> {
-        let (record, projection, _) = self.state.structured_agents.get(id)?;
+    pub(in crate::app) fn structured_info(
+        &self,
+        id: &str,
+    ) -> Result<StructuredAgentInfo, ErrorCode> {
+        let (record, projection, generation) = self
+            .state
+            .structured_agents
+            .get(id)
+            .ok_or(ErrorCode::InternalError)?;
         let state = projection.update.state.clone();
-        let status = match state.phase {
-            Phase::Gone | Phase::Offline => AgentStatus::Offline,
-            Phase::Hibernated => AgentStatus::Hibernated,
-            Phase::LimitReached | Phase::Blocked | Phase::NeedsHuman => AgentStatus::Blocked,
-            Phase::Working => AgentStatus::Working,
-            Phase::WaitingOnEvent | Phase::Settling => AgentStatus::Idle,
-            Phase::FinishedWithBackground | Phase::Finished => AgentStatus::Done,
-            Phase::Unknown => AgentStatus::Unknown,
-        };
-        Some(StructuredAgentInfo {
+        let status = structured_status(state.phase);
+        Ok(StructuredAgentInfo {
             runtime: record.runtime,
             agent_id: record.agent_id.clone(),
             name: record.name.clone(),
@@ -81,18 +80,18 @@ impl App {
             cwd: record.cwd.to_string_lossy().into_owned(),
             model: record.model.clone(),
             lease_state: self.session_leases.state(id, &record.session_id),
-            view: None,
+            view: self.structured_placement(&crate::structured::view::Target {
+                agent_id: record.agent_id.clone(),
+                generation,
+            })?,
         })
     }
-    pub(super) fn structured_infos(&self) -> Vec<StructuredAgentInfo> {
+    pub(super) fn structured_infos(&self) -> Result<Vec<StructuredAgentInfo>, ErrorCode> {
         self.state
             .structured_agents
             .records()
             .iter()
-            .map(|r| {
-                self.structured_info(&r.agent_id)
-                    .expect("registry iteration retains its record")
-            })
+            .map(|r| self.structured_info(&r.agent_id))
             .collect()
     }
     pub(super) fn handle_structured_stop(&mut self, id: String, target: AgentTarget) -> String {
@@ -118,15 +117,7 @@ impl App {
                 };
             }
         };
-        let allowed = match self.spawn_caller() {
-            SpawnCaller::Operator { .. } => true,
-            SpawnCaller::Agent { agent_id, .. }
-            | SpawnCaller::Structured {
-                agent_id: Some(agent_id),
-                ..
-            } => agent_id == agent,
-            _ => false,
-        };
+        let allowed = may_stop(self.spawn_caller(), &agent);
         if !allowed {
             return encode_error(
                 id,
@@ -134,9 +125,10 @@ impl App {
                 "only the operator or owning agent may stop this session",
             );
         }
-        let info = self
-            .structured_info(&agent)
-            .expect("resolved registered record");
+        let info = match self.structured_info(&agent) {
+            Ok(info) => info,
+            Err(code) => return encode_error(id, code.as_str(), "structured metadata unavailable"),
+        };
         if info.lifecycle == Lifecycle::Unknown
             || (!self.structured_workers.stop(&agent, generation)
                 && info.lifecycle != Lifecycle::Offline)
@@ -151,5 +143,28 @@ impl App {
         encode_success(id, ResponseResult::StructuredAgentInfo { agent: info })
     }
 }
+// Stop authority is caller identity, never placement or delegation ancestry.
+fn may_stop(caller: SpawnCaller, agent: &str) -> bool {
+    match caller {
+        SpawnCaller::Operator { .. } => true,
+        SpawnCaller::Structured {
+            agent_id: Some(id), ..
+        } => id == agent,
+        _ => false,
+    }
+}
+/// The same phase projection for local structured metadata and peer discovery.
+pub(in crate::app) fn structured_status(phase: Phase) -> AgentStatus {
+    match phase {
+        Phase::Gone | Phase::Offline => AgentStatus::Offline,
+        Phase::Hibernated => AgentStatus::Hibernated,
+        Phase::LimitReached | Phase::Blocked | Phase::NeedsHuman => AgentStatus::Blocked,
+        Phase::Working => AgentStatus::Working,
+        Phase::WaitingOnEvent | Phase::Settling => AgentStatus::Idle,
+        Phase::FinishedWithBackground | Phase::Finished => AgentStatus::Done,
+        Phase::Unknown => AgentStatus::Unknown,
+    }
+}
+
 #[cfg(test)]
 mod tests;

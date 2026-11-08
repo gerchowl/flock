@@ -1,3 +1,4 @@
+use std::io;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -236,9 +237,18 @@ pub fn branch_plan(
 /// A session launched under an account profile (`CLAUDE_CONFIG_DIR`) keeps
 /// its transcripts under that directory instead of `~/.claude`. The
 /// `SessionStart` hook records which one (see `record_claude_config_dir`),
-/// so the recorded profile is searched first and `~/.claude` after it (#977).
+/// so both the recorded profile and `~/.claude` are searched (#977). A session
+/// id must have exactly one matching transcript across those stores.
 pub fn claude_transcript_path(home: &Path, session_id: &str) -> Option<std::path::PathBuf> {
     claude_transcript_path_in(home, &claude_config_dir_records_dir(), session_id)
+}
+
+/// Locate a unique transcript while retaining store read failures for recovery callers.
+pub(crate) fn claude_transcript_path_checked(
+    home: &Path,
+    session_id: &str,
+) -> io::Result<Option<std::path::PathBuf>> {
+    claude_transcript_path_checked_in(home, &claude_config_dir_records_dir(), session_id)
 }
 
 fn claude_transcript_path_in(
@@ -246,34 +256,28 @@ fn claude_transcript_path_in(
     records_dir: &Path,
     session_id: &str,
 ) -> Option<std::path::PathBuf> {
-    if session_id.is_empty() || session_id.contains(['/', '\\']) || !valid_session_id(session_id) {
-        return None;
-    }
-    let profile = claude_config_dir_for_session_in(records_dir, session_id)
-        .map(std::path::PathBuf::from)
-        .filter(|dir| dir.is_absolute());
-    profile
-        .into_iter()
-        .chain(std::iter::once(home.join(".claude")))
-        .find_map(|config_dir| claude_transcript_in_config_dir(&config_dir, session_id))
+    claude_transcript_path_checked_in(home, records_dir, session_id)
+        .ok()
+        .flatten()
 }
 
-fn claude_transcript_in_config_dir(
-    config_dir: &Path,
+fn claude_transcript_path_checked_in(
+    home: &Path,
+    records_dir: &Path,
     session_id: &str,
-) -> Option<std::path::PathBuf> {
-    let entries = std::fs::read_dir(config_dir.join("projects")).ok()?;
-    let file_name = format!("{session_id}.jsonl");
-    for entry in entries.flatten() {
-        let candidate = entry.path().join(&file_name);
-        if candidate
-            .metadata()
-            .is_ok_and(|meta| meta.is_file() && meta.len() > 0)
-        {
-            return Some(candidate);
-        }
+) -> io::Result<Option<std::path::PathBuf>> {
+    if session_id.is_empty() || session_id.contains(['/', '\\']) || !valid_session_id(session_id) {
+        return Ok(None);
     }
-    None
+    let profile = crate::session_evidence::store::recorded_profile(&records_dir.join(session_id))?;
+    crate::session_evidence::store::lookup(
+        profile
+            .into_iter()
+            .chain(std::iter::once(home.join(".claude")))
+            .map(|config| config.join("projects")),
+        crate::session_evidence::store::Layout::Claude,
+        session_id,
+    )
 }
 
 /// The session id a Claude fork plan resumes, if `plan` is one (#178).
@@ -785,7 +789,7 @@ mod tests {
         let home = std::env::temp_dir().join(format!("flock-home-{}-{nanos}", std::process::id()));
         let project = home.join(".claude/projects/-tmp-repo");
         std::fs::create_dir_all(&project).unwrap();
-        std::fs::write(project.join("sess-1.jsonl"), "{}\n").unwrap();
+        std::fs::write(project.join("sess-1.jsonl"), "{\"sessionId\":\"sess-1\"}\n").unwrap();
         std::fs::write(project.join("empty.jsonl"), "").unwrap();
 
         assert_eq!(
@@ -822,8 +826,16 @@ mod tests {
         let default_project = home.join(".claude/projects/-tmp-repo");
         std::fs::create_dir_all(&profile_project).unwrap();
         std::fs::create_dir_all(&default_project).unwrap();
-        std::fs::write(profile_project.join("sess-profile.jsonl"), "{}\n").unwrap();
-        std::fs::write(default_project.join("sess-default.jsonl"), "{}\n").unwrap();
+        std::fs::write(
+            profile_project.join("sess-profile.jsonl"),
+            "{\"sessionId\":\"sess-profile\"}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            default_project.join("sess-default.jsonl"),
+            "{\"sessionId\":\"sess-default\"}\n",
+        )
+        .unwrap();
 
         assert_eq!(
             claude_transcript_path_in(&home, &records, "sess-profile"),
@@ -848,6 +860,128 @@ mod tests {
             "a relative record names no directory flock can trust"
         );
         let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn claude_transcript_path_rejects_reused_id_across_profile_and_default() {
+        let root = crate::test_support::TempDir::socket();
+        let home = root.path().join("home");
+        let records = root.path().join("records");
+        let profile = root.path().join("profile");
+        for config in [&profile, &home.join(".claude")] {
+            let project = config.join("projects/fixture");
+            std::fs::create_dir_all(&project).unwrap();
+            std::fs::write(
+                project.join("reused-session.jsonl"),
+                "{\"sessionId\":\"reused-session\"}\n",
+            )
+            .unwrap();
+        }
+        record_claude_config_dir_in(&records, "reused-session", profile.to_str().unwrap());
+        assert!(claude_transcript_path_in(&home, &records, "reused-session").is_none());
+        std::fs::write(profile.join("projects/fixture/reused-session.jsonl"), "").unwrap();
+        assert!(
+            claude_transcript_path_in(&home, &records, "reused-session").is_none(),
+            "an empty stale file still makes the session id ambiguous"
+        );
+    }
+
+    #[test]
+    fn claude_transcript_path_counts_an_aliased_default_store_once() {
+        let root = crate::test_support::TempDir::socket();
+        let home = root.path().join("home");
+        let records = root.path().join("records");
+        let config = home.join(".claude");
+        let project = config.join("projects/fixture");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join("only-session.jsonl"),
+            "{\"sessionId\":\"only-session\"}\n",
+        )
+        .unwrap();
+        record_claude_config_dir_in(&records, "only-session", config.to_str().unwrap());
+        assert_eq!(
+            claude_transcript_path_in(&home, &records, "only-session"),
+            Some(project.join("only-session.jsonl"))
+        );
+    }
+
+    fn assert_unreadable_claude_project_refuses(hidden_match: bool) {
+        use std::os::unix::fs::PermissionsExt;
+        let root = crate::test_support::TempDir::socket();
+        let home = root.path().join("home");
+        let records = root.path().join("records");
+        let projects = home.join(".claude/projects");
+        let visible = projects.join("visible");
+        let blocked = projects.join("blocked");
+        std::fs::create_dir_all(&visible).unwrap();
+        std::fs::create_dir_all(&blocked).unwrap();
+        std::fs::write(
+            visible.join("unique-session.jsonl"),
+            "{\"sessionId\":\"unique-session\"}\n",
+        )
+        .unwrap();
+        if hidden_match {
+            std::fs::write(
+                blocked.join("unique-session.jsonl"),
+                "{\"sessionId\":\"unique-session\"}\n",
+            )
+            .unwrap();
+        } else {
+            std::fs::write(
+                blocked.join("unrelated-session.jsonl"),
+                "{\"sessionId\":\"unrelated-session\"}\n",
+            )
+            .unwrap();
+        }
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let result = claude_transcript_path_in(&home, &records, "unique-session");
+        let checked = claude_transcript_path_checked_in(&home, &records, "unique-session");
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            result.is_none(),
+            "an unreadable project cannot establish uniqueness: {result:?}"
+        );
+        let error = checked.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(
+            error.to_string().contains(blocked.to_str().unwrap()),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn claude_transcript_path_rejects_an_unreadable_matching_project() {
+        assert_unreadable_claude_project_refuses(true);
+    }
+
+    #[test]
+    fn claude_transcript_path_rejects_an_unreadable_unrelated_project() {
+        assert_unreadable_claude_project_refuses(false);
+    }
+
+    #[test]
+    fn claude_transcript_path_skips_only_proven_non_directory_projects() {
+        let root = crate::test_support::TempDir::socket();
+        let home = root.path().join("home");
+        let records = root.path().join("records");
+        let projects = home.join(".claude/projects");
+        std::fs::create_dir_all(projects.join("visible")).unwrap();
+        let transcript = projects.join("visible/unique-session.jsonl");
+        std::fs::write(&transcript, "{\"sessionId\":\"unique-session\"}\n").unwrap();
+        std::fs::write(projects.join("ordinary-file"), "not a directory").unwrap();
+        assert_eq!(
+            claude_transcript_path_checked_in(&home, &records, "unique-session").unwrap(),
+            Some(transcript)
+        );
+        let loop_path = projects.join("loop");
+        std::os::unix::fs::symlink(&loop_path, &loop_path).unwrap();
+        let error =
+            claude_transcript_path_checked_in(&home, &records, "unique-session").unwrap_err();
+        assert!(
+            error.to_string().contains(loop_path.to_str().unwrap()),
+            "{error}"
+        );
     }
 
     #[test]

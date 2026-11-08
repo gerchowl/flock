@@ -705,7 +705,7 @@ fn pending(batch_id: &str, since_ms: u64, cause: PendingCause) -> Offer {
 }
 
 #[test]
-fn queue_silent_reports_stable_pending_without_a_second_write() {
+fn queue_silent_reports_stable_pending_without_mutating_the_journal() {
     let mut run = QueueRun::mode("queue-silent");
     run.send(0, Producer::Human);
     assert_eq!(run.offer().unwrap(), Some(id(0)));
@@ -731,7 +731,8 @@ fn queue_silent_reports_stable_pending_without_a_second_write() {
         serde_json::to_value(run.outcome_at(400).unwrap()).unwrap(),
         json!({"outcome":"pending", "detail":{"batch_id":id(0), "since_ms":100, "cause":"awaiting_result"}})
     );
-    assert_eq!(run.barrier(1), 1);
+    // A socket barrier cannot prove the asynchronous stdin writer has flushed.
+    // The typed early returns and unchanged journal below guard repeated offers.
     assert!(matches!(
         run.running.result.try_recv(),
         Err(mpsc::TryRecvError::Empty)
@@ -826,6 +827,56 @@ fn turn_end_unknown_refusal_rolls_back_intact_instead_of_holding() {
         run.lifecycle("started");
         run.result();
     }
+}
+
+#[test]
+fn refused_pending_id_describes_the_attempt_even_when_the_queued_batch_changes() {
+    let mut run = QueueRun::new();
+    let external = json!({"type":"user","uuid":"external","message":{"role":"user","content":[{"type":"text","text":"owned fixture input"}]}});
+    run.running.runtime.try_submit(&external).unwrap();
+    run.input();
+    run.send(0, Producer::Human);
+    run.loss();
+    let refused = pending(&id(0), 101, PendingCause::TurnEndUnknown);
+    assert_eq!(run.outcome_at(101).unwrap(), refused);
+    run.send(1, Producer::Human);
+    let before = run.q().journal().items().to_vec();
+    let through = run.q().journal().replay(0).unwrap().through;
+    for now_ms in [201, 301] {
+        assert_eq!(run.outcome_at(now_ms).unwrap(), refused);
+        assert_eq!(
+            run.q().status(&run.running.runtime),
+            Some(Pending {
+                batch_id: Some(id(0)),
+                since_ms: 101,
+                cause: PendingCause::TurnEndUnknown,
+            })
+        );
+    }
+    assert_eq!(run.q().journal().items(), before);
+    assert_eq!(run.q().journal().replay(0).unwrap().through, through);
+    run.result();
+    assert!(run.q().status(&run.running.runtime).is_none());
+    let batch = run.offer_at(401).unwrap().unwrap();
+    assert_ne!(batch, id(0));
+    let input = run.input();
+    assert_eq!(input["input"]["uuid"], batch);
+    assert_eq!(
+        input["input"]["message"]["content"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        run.q().status(&run.running.runtime),
+        Some(Pending {
+            batch_id: Some(batch),
+            since_ms: 401,
+            cause: PendingCause::AwaitingResult,
+        })
+    );
+    run.result();
 }
 
 #[test]
@@ -986,7 +1037,7 @@ fn readonly_runtime(mode: &str) {
             status.cause,
             PendingCause::QueueJournalNewer {
                 found: 999,
-                supported: 2
+                supported: crate::structured::queue::FORMAT_VERSION
             }
         );
         assert_eq!(
@@ -1013,4 +1064,65 @@ fn readonly_runtime(mode: &str) {
     }
     assert_eq!(scheduler.status(&run.running.runtime).unwrap(), status);
     assert_eq!(fs::read(path).unwrap(), bytes);
+}
+
+#[test]
+fn fresh_generation_durably_fails_reserved_unresolved_items_and_delivers_later_input() {
+    for kind in [Kind::Finding, Kind::DelegateResult, Kind::ReloadNotice] {
+        let mut run = QueueRun::new();
+        drop(run.scheduler.take());
+        let mut journal = Journal::open(run.fixture.root.path(), "fixture-agent").unwrap();
+        let mut pending = item(0);
+        pending.kind = kind.clone();
+        pending.state = State::Delivered;
+        pending
+            .metadata
+            .insert("awaiting_result".into(), json!(true));
+        journal
+            .append(Change::Upsert {
+                item: Box::new(pending.clone()),
+                position: 0,
+            })
+            .unwrap();
+        let mut later = item(1);
+        later
+            .metadata
+            .insert("gate".into(), json!({"decision":"send"}));
+        journal
+            .append(Change::Upsert {
+                item: Box::new(later),
+                position: 1,
+            })
+            .unwrap();
+        drop(journal);
+        let journal = Journal::open(run.fixture.root.path(), "fixture-agent").unwrap();
+        let scheduler = Scheduler::new(Admission::new(journal, MAX_BATCH).unwrap())
+            .expect("retained reserved kind must not prevent scheduler construction");
+        let failed = &scheduler.journal().items()[0];
+        assert_eq!(failed.kind, kind);
+        assert_eq!(failed.body, pending.body);
+        assert_eq!(failed.state, State::Failed);
+        assert_eq!(failed.metadata["refusal"], "queue_kind_reserved");
+        assert!(!failed.metadata.contains_key("awaiting_result"));
+        let cut = scheduler.journal().replay(2).unwrap();
+        assert_eq!(cut.records.len(), 1);
+        assert_eq!(cut.records[0]["kind"], "fail");
+        assert_eq!(cut.records[0]["item_id"], id(0));
+        assert_eq!(cut.records[0]["reason"], "queue_kind_reserved");
+        drop(scheduler);
+        let journal = Journal::open(run.fixture.root.path(), "fixture-agent").unwrap();
+        assert_eq!(journal.items()[0].state, State::Failed);
+        let scheduler = Scheduler::new(Admission::new(journal, MAX_BATCH).unwrap()).unwrap();
+        assert_eq!(scheduler.journal().replay(0).unwrap().through, cut.through);
+        run.scheduler = Some(scheduler);
+        assert_eq!(run.offer().unwrap(), Some(id(1)));
+        let observed = run.input();
+        assert_eq!(observed["input"]["uuid"], id(1));
+        assert!(observed["input"]["message"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("input 1"));
+        run.lifecycle("started");
+        run.result();
+    }
 }

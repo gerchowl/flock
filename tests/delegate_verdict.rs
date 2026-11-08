@@ -131,7 +131,7 @@ impl Pane {
                             None => (frames[frame].0.as_str(), false),
                         };
                         let cursor = &frames[frame].2;
-                        let mut record = json!({"agent": {"name": "fixture", "terminal_id": "term_fixture", "pane_id": "ws_fixture:p1",
+                        let mut record = json!({"agent": {"name": "fixture", "agent_id":"agent_fixture.example_verdict", "agent_session":{"source":"flock:opencode","agent":"opencode","kind":"id","value":"verdict-session"}, "terminal_id": "term_fixture", "pane_id": "ws_fixture:p1",
                         "agent_status": status, "turn_cursor": cursor, "revision": 0}});
                         if server_shells {
                             record["agent"]["settled_with_background_shells"] = json!(true);
@@ -166,7 +166,7 @@ impl Pane {
                         continue;
                     }
                     "agent.result" => {
-                        json!({"result": {"finished": true, "at_ms": 2, "status": "done", "text": "DONE: recovered"}})
+                        json!({"result": {"finished": true, "at_ms": 2, "status": "done", "text": "DONE: recovered", "session_id":"verdict-session"}})
                     }
                     "ping" if evented => {
                         json!({"type": "pong", "version": "1.2.0", "protocol": 28})
@@ -220,7 +220,7 @@ impl Pane {
             .join(support::paths::server_key(&socket));
         std::fs::create_dir_all(&registry).unwrap();
         std::fs::write(registry.join("fixture.json"), json!({
-            "name": "fixture", "terminal_id": "term_fixture", "pane_id": "ws_fixture:p1", "root_pane": "ws_fixture:p0",
+            "name": "fixture", "agent_id":"agent_fixture.example_verdict", "session":{"source":"flock:opencode","agent":"opencode","kind":"id","value":"verdict-session"}, "terminal_id": "term_fixture", "pane_id": "ws_fixture:p1", "root_pane": "ws_fixture:p0",
             "workspace_id": "ws_fixture", "mode": "cwd", "worktree": null, "branch": null,
             "harness": "opencode", "model": null, "round": 1, "brief": "fixture.md", "submitted_at_ms": 1,
             "cursor": "term_fixture:0:0:0:i", "created_at_ms": 1,

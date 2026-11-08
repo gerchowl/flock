@@ -20,6 +20,7 @@
 //! Harness suggestions are never interpreted or forwarded. No settings are written.
 //! [`MAX_GRANTS`] bounds distinct exact grants, including pending grants.
 pub mod auth;
+pub mod grants;
 
 /// Maximum live permission requests, including reserved answers awaiting their
 /// durable close and completed stdin write. The harness normally blocks per
@@ -29,6 +30,9 @@ pub const MAX_OPEN_PERMISSION_REQUESTS: usize = 16;
 /// and session grants. Beyond this FIFO window, late decisions are unknown.
 pub const CLOSED_PERMISSION_REQUEST_WINDOW: usize = 1024;
 pub(super) const MAX_GRANTS: usize = 16;
+/// Maximum UTF-8 bytes in an operator decision message after CRLF normalization
+/// and trimming. Invalid messages are refused before reserving any request.
+pub const MAX_PERMISSION_DECISION_MESSAGE_BYTES: usize = 2048;
 
 use super::claude::ToolRequest;
 use crate::api::error_code::ErrorCode;
@@ -80,7 +84,10 @@ pub struct AgentDecide {
     pub request_seq: u64,
     /// One of the three permission decisions.
     pub decision: Decision,
-    /// Optional reason, carried verbatim in a deny response and audit.
+    /// Optional reason, normalized from CRLF to LF and trimmed before delivery.
+    /// At most [`MAX_PERMISSION_DECISION_MESSAGE_BYTES`] UTF-8 bytes. Uses
+    /// `prompt_control_bytes` rules: newlines and tabs survive; other controls
+    /// are refused with `invalid_params` before reserving the request.
     #[serde(default)]
     pub message: Option<String>,
 }
@@ -95,6 +102,9 @@ enum Stage {
 }
 #[derive(Clone)]
 struct Grant {
+    epoch: u64,
+    tool: String,
+    installed_ms: u64,
     request_seq: u64,
     subject: String,
     request_id: String,
@@ -111,7 +121,8 @@ pub(super) struct Answer {
     pub request_seq: u64,
     pub response: Value,
     pub audit: Box<PermissionRecord>,
-    grant: Option<(String, Grant)>,
+    // Keep the bounded transport queue entries compact as grant metadata grows.
+    grant: Option<(String, Box<Grant>)>,
 }
 pub(super) struct Closing {
     pub id: String,
@@ -127,6 +138,7 @@ pub(super) struct Book {
     closed_fifo: VecDeque<u64>,
     last_request_seq: u64,
     grants: BTreeMap<String, Grant>,
+    grant_epochs: BTreeMap<String, u64>,
 }
 pub(super) fn open_record(id: &str, request_seq: u64, request: &ToolRequest) -> PermissionRecord {
     PermissionRecord::new(
@@ -148,6 +160,7 @@ impl Book {
             last_request_seq: 0,
             closed_fifo: VecDeque::new(),
             grants: BTreeMap::new(),
+            grant_epochs: BTreeMap::new(),
         }
     }
     // The durable stream cursor bounds every issued handle. Seed before stdout
@@ -272,11 +285,22 @@ impl Book {
         if args.agent != self.agent {
             return Err(ErrorCode::AgentNotFound);
         }
+        let normalized = args
+            .message
+            .as_deref()
+            .map(|text| text.replace("\r\n", "\n"));
+        let message = normalized.as_deref().map(str::trim);
+        if message.is_some_and(|text| {
+            text.len() > MAX_PERMISSION_DECISION_MESSAGE_BYTES
+                || crate::control_bytes::carries_any(text)
+        }) {
+            return Err(ErrorCode::InvalidParams);
+        }
         self.answer(
             &args.request_id,
             args.request_seq,
             args.decision,
-            args.message.as_deref(),
+            message,
             subject,
             "token",
         )
@@ -331,12 +355,15 @@ impl Book {
                     return Err(ErrorCode::PermissionGrantLimit);
                 }
                 grant = Some((
-                    k,
-                    Grant {
+                    k.clone(),
+                    Box::new(Grant {
+                        epoch: self.grant_epochs.get(&k).copied().unwrap_or(0),
+                        tool: open.request.tool_name.clone(),
+                        installed_ms: 0,
                         request_seq,
                         subject: subject.into(),
                         request_id: id.into(),
-                    },
+                    }),
                 ));
             }
             response
@@ -411,7 +438,7 @@ impl Book {
             false
         }
     }
-    pub fn audited(&mut self, answer: &Answer) {
+    pub fn audited(&mut self, answer: &Answer, installed_ms: u64) {
         let Some(open) = self.open.get_mut(&answer.id).filter(|r| {
             r.request_seq == answer.request_seq && r.stage == Stage::Auditing && self.active
         }) else {
@@ -419,8 +446,14 @@ impl Book {
         };
         open.stage = Stage::Closed;
         open.grant = None;
-        if let Some((key, grant)) = &answer.grant {
-            self.grants.insert(key.clone(), grant.clone());
+        if let Some((key, grant)) = answer
+            .grant
+            .as_ref()
+            .filter(|(key, grant)| self.grant_epochs.get(key).copied().unwrap_or(0) == grant.epoch)
+        {
+            let mut grant = (**grant).clone();
+            grant.installed_ms = installed_ms;
+            self.grants.insert(key.clone(), grant);
         }
         self.remember_closed(&answer.id, answer.request_seq);
     }
@@ -516,12 +549,15 @@ impl Book {
             }
         }
     }
+    /// Agent identity for diagnostics emitted after the caller releases the book.
+    pub fn agent(&self) -> &str {
+        &self.agent
+    }
     // Called only after observe rejected a valid, uncorrelated ID at capacity.
     // No live slot or grant is reserved; the stream owner durably closes the ID.
     pub fn capacity_refusal(&mut self, id: &str) -> Result<Answer, ErrorCode> {
         let request_seq = self.next_request_seq()?;
         let code = ErrorCode::PermissionRequestLimit.as_str();
-        crate::logging::structured_permission_request_refused(&self.agent, id, request_seq, code);
         let mut fields = PermissionAnswer::new(
             Decision::Deny,
             Some(code.into()),

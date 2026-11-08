@@ -1248,6 +1248,36 @@ fn batch_entropy_failure_keeps_the_journal_and_items_unchanged() {
                 count as usize,
                 "normal entropy recovers without poisoning"
             );
+            let records = q.journal().replay(through).unwrap().records;
+            if leading_invalid {
+                let invalid = q
+                    .journal()
+                    .items()
+                    .iter()
+                    .find(|i| i.item_id == id(9))
+                    .unwrap();
+                assert_eq!(invalid.state, State::Failed);
+                assert_eq!(
+                    invalid.metadata["refusal"],
+                    ErrorCode::InvalidRequest.as_str()
+                );
+                assert_eq!(
+                    records,
+                    vec![json!({
+                        "seq":through + 1, "kind":"fail", "item_id":id(9),
+                        "reason":ErrorCode::InvalidRequest.as_str(),
+                    })]
+                );
+            } else {
+                assert!(records.is_empty());
+            }
+            let recovered_through = q.journal().replay(0).unwrap().through;
+            assert_eq!(q.batch(100).unwrap().unwrap().items.len(), count as usize);
+            assert_eq!(
+                q.journal().replay(0).unwrap().through,
+                recovered_through,
+                "formation must not fail the same item twice"
+            );
         }
     }
 }
@@ -1460,4 +1490,275 @@ fn assert_review_readonly_admission(mode: &str) {
         Some(ReadOnly::Corrupt(_))
     ));
     assert_eq!(fs::read(root.path()).unwrap(), bytes);
+}
+
+#[test]
+fn reserved_kinds_refuse_every_producer_before_any_mutation() {
+    let root = Root::new();
+    let mut q = queue(&root);
+    let before = fs::read(root.path()).unwrap();
+    for kind in [Kind::Finding, Kind::DelegateResult, Kind::ReloadNotice] {
+        for producer in [
+            Producer::Human,
+            Producer::Agent("sender".into()),
+            Producer::Channel {
+                binding: "fixture".into(),
+                user: "user".into(),
+            },
+            Producer::System("source".into()),
+            Producer::Fork("child".into()),
+            Producer::Unknown(json!("future_source")),
+        ] {
+            for operator in [true, false] {
+                for gate in [
+                    Gate::Send,
+                    Gate::Hold,
+                    Gate::Stash("later".into()),
+                    Gate::Drop,
+                ] {
+                    let mut candidate = input(2364);
+                    candidate.kind = kind.clone();
+                    let principal = if operator {
+                        Principal::Operator
+                    } else {
+                        Principal::Origin(producer.clone())
+                    };
+                    let failure = q.enqueue(candidate, principal, gate).unwrap_err();
+                    assert_eq!(failure.code.as_str(), "queue_kind_reserved");
+                    assert!(failure.source.is_none());
+                    assert!(q.journal().items().is_empty());
+                    assert_eq!(q.journal().replay(0).unwrap().through, 0);
+                    assert_eq!(fs::read(root.path()).unwrap(), before);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn retained_reserved_heads_fail_without_blocking_supported_input() {
+    let root = Root::new();
+    let mut journal = root.open();
+    let mut reserved = Vec::new();
+    for (n, kind) in [Kind::Finding, Kind::DelegateResult, Kind::ReloadNotice]
+        .into_iter()
+        .enumerate()
+    {
+        let mut candidate = input(n as u64);
+        candidate.kind = kind;
+        candidate
+            .metadata
+            .insert("gate".into(), json!({"decision":"send"}));
+        reserved.push(candidate.clone());
+        journal
+            .append(Change::Upsert {
+                item: Box::new(candidate),
+                position: n,
+            })
+            .unwrap();
+    }
+    let mut q = Admission::new(journal, MAX_BATCH).unwrap();
+    send(&mut q, 100, Producer::Human);
+    let batch = q.batch(100).unwrap().unwrap();
+    assert_eq!(batch.items.len(), 1);
+    assert_eq!(batch.items[0].item_id, id(100));
+    for (actual, original) in q.journal().items().to_vec().iter().zip(&reserved) {
+        assert_eq!(actual.state, State::Failed);
+        assert_eq!(actual.kind, original.kind);
+        assert_eq!(actual.body, original.body);
+        assert_eq!(actual.metadata["refusal"], "queue_kind_reserved");
+        let mut edited = actual.clone();
+        edited.state = State::Queued;
+        assert_eq!(
+            q.replace(vec![edited]).unwrap_err().code,
+            ErrorCode::QueueKindReserved
+        );
+    }
+    drop(q);
+    let reopened = root.open();
+    assert!(reopened.items()[..3]
+        .iter()
+        .all(|i| i.state == State::Failed));
+}
+
+#[test]
+fn reserved_kinds_round_trip_through_durable_replay_json() {
+    let root = Root::new();
+    let mut journal = root.open();
+    let variants = [
+        (Kind::Finding, "finding"),
+        (Kind::DelegateResult, "delegate_result"),
+        (Kind::ReloadNotice, "reload_notice"),
+    ];
+    for (n, (kind, _)) in variants.iter().enumerate() {
+        let mut candidate = input(n as u64);
+        candidate.kind = kind.clone();
+        journal
+            .append(Change::Upsert {
+                item: Box::new(candidate),
+                position: n,
+            })
+            .unwrap();
+    }
+    let cut = journal.replay(0).unwrap();
+    assert_eq!(cut.records.len(), variants.len());
+    for (raw, (kind, name)) in cut.records.iter().zip(variants) {
+        assert_eq!(raw["item"]["kind"], name);
+        let wire = serde_json::to_vec(raw).unwrap();
+        let record: Record = serde_json::from_slice(&wire).unwrap();
+        assert_eq!(serde_json::to_value(&record).unwrap(), *raw);
+        let Change::Upsert { item, .. } = record.change else {
+            panic!("expected upsert")
+        };
+        assert_eq!(item.kind, kind);
+        assert!(!item.has_unknown());
+    }
+    drop(journal);
+    let reopened = root.open();
+    assert_eq!(reopened.items().len(), 3);
+    assert!(reopened.items().iter().all(|i| !i.has_unknown()));
+}
+
+#[test]
+fn relay_idempotent_enqueue_survives_custody_gc_and_journal_pruning() {
+    use crate::mesh::{
+        delivery::Deliver,
+        store::{Store, CUSTODY_TTL_MS, DAY_MS},
+    };
+    let root = Root::new();
+    let envelope = crate::mesh::sign::tests::signed();
+    let key = envelope.key.clone();
+    let delivery = Deliver {
+        envelope,
+        remaining_ms: CUSTODY_TTL_MS,
+        hops_left: 1,
+        visited: vec![],
+    };
+    let mut store = Store::open(&root.0.join("custody.sqlite"), 0).unwrap();
+    store
+        .accept_bound_delivery(&delivery, ("fixture-agent", "fixture-session"), false, 0)
+        .unwrap();
+    let mut original = input(2554);
+    original.item_id = key.lifecycle_id();
+    original.kind = Kind::Message;
+    original.metadata.insert("message_key".into(), json!(key));
+    let producer = Producer::NodeAsserted {
+        sender: delivery.envelope.sender.clone(),
+        origin: key.origin_node.clone(),
+    };
+    let mut q = queue(&root);
+    q.enqueue(
+        original.clone(),
+        Principal::Origin(producer.clone()),
+        Gate::Send,
+    )
+    .unwrap();
+    complete(&mut q);
+    drop(q);
+    store.settle_queue_admission(&key, None, 0).unwrap();
+    let beyond_retention = CUSTODY_TTL_MS + 2 * DAY_MS;
+    assert_eq!(store.maintain(beyond_retention).unwrap(), 1);
+    assert!(
+        store.get(&key).unwrap().is_none(),
+        "custody dedupe no longer protects this key"
+    );
+    let old_bytes = fs::read(root.path()).unwrap().len();
+    let mut journal = root.open();
+    let cut = journal.checkpoint().unwrap();
+    assert!(
+        fs::read(root.path()).unwrap().len() < old_bytes,
+        "prune actual history, retaining the durable admission identity"
+    );
+    drop(journal);
+    let mut reopened = queue(&root);
+    reopened
+        .enqueue(
+            original.clone(),
+            Principal::Origin(producer.clone()),
+            Gate::Send,
+        )
+        .unwrap();
+    assert_eq!(reopened.subscription().unwrap().through, cut.through);
+    assert_eq!(reopened.journal().items().len(), 1);
+    assert_eq!(reopened.journal().items()[0].state, State::Done);
+    assert!(reopened.batch(100).unwrap().is_none());
+    original.body.push_str(" changed");
+    assert_eq!(
+        reopened
+            .enqueue(original, Principal::Origin(producer), Gate::Send)
+            .unwrap_err()
+            .code,
+        ErrorCode::QueueItemConflict
+    );
+}
+
+#[test]
+fn native_inbox_survives_queue_pruning_and_custody_collection_until_ack() {
+    use crate::mesh::store::{Store, CUSTODY_TTL_MS, DAY_MS};
+    let root = Root::new();
+    let e = crate::mesh::sign::tests::signed();
+    let path = root.0.join("custody.sqlite");
+    let mut s = Store::open(&path, 0).unwrap();
+    s.accept_local(&e, CUSTODY_TTL_MS, "fixture-agent", "fixture-session", 0)
+        .unwrap();
+    s.settle_queue_admission(&e.key, None, 0).unwrap();
+    let mut q = queue(&root);
+    let mut original = input(2363);
+    original.item_id = e.key.lifecycle_id();
+    q.enqueue(original, Principal::Operator, Gate::Send)
+        .unwrap();
+    complete(&mut q);
+    drop(q);
+    s.native_inbox_delivered(&e.key, 2 * DAY_MS as u64, CUSTODY_TTL_MS - 1)
+        .unwrap();
+    let old_bytes = fs::metadata(root.path()).unwrap().len();
+    root.open().checkpoint().unwrap();
+    assert!(fs::metadata(root.path()).unwrap().len() < old_bytes);
+    assert_eq!(
+        s.maintain(8 * DAY_MS + 1).unwrap(),
+        0,
+        "unread body pins storage"
+    );
+    drop(s);
+    let mut s = Store::open(&path, 8 * DAY_MS + 1).unwrap();
+    let (read, expired) = s
+        .native_inbox(
+            Some(("fixture-agent", "fixture-session")),
+            true,
+            8 * DAY_MS + 1,
+        )
+        .unwrap();
+    assert_eq!(read, vec![e]);
+    assert!(expired.is_empty());
+    assert_eq!(
+        s.maintain(8 * DAY_MS + 1).unwrap(),
+        1,
+        "ack releases normal GC"
+    );
+    assert!(
+        queue(&root).batch(100).unwrap().is_none(),
+        "read never re-admits input"
+    );
+}
+
+#[test]
+fn shell2494_stamp_is_server_owned_and_persisted() {
+    let root = Root::new();
+    let mut q = queue(&root);
+    let mut forged = input(2494);
+    forged
+        .metadata
+        .insert("operator_via_pane".into(), serde_json::json!(99));
+    assert_eq!(
+        q.enqueue(forged, Principal::Operator, Gate::Send)
+            .unwrap_err()
+            .code,
+        ErrorCode::InvalidRequest
+    );
+    q.enqueue(input(2494), Principal::OperatorViaPane(42), Gate::Send)
+        .unwrap();
+    let batch = q.batch(100).unwrap().unwrap();
+    assert!(batch.envelope.to_string().contains("operator via pane 42"));
+    drop(q);
+    assert_eq!(root.open().items()[0].metadata["operator_via_pane"], 42);
 }

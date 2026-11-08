@@ -35,6 +35,15 @@ pub(crate) fn live_scope() -> (SessionLeases, Lease, Scope, Credentials) {
     Arc::get_mut(&mut scope.0).unwrap().probe = false;
     (leases, lease, scope, peer)
 }
+/// A transport scope with an unknown credential and the same real peer evidence.
+pub(crate) fn unknown_credential(scope: &Scope) -> Scope {
+    let mut data = (*scope.0).clone();
+    let lease = SessionLeases::default()
+        .reserve("unknown-agent", "unknown-session", None)
+        .unwrap();
+    data.credential = Some(lease.credential());
+    Scope(Arc::new(data))
+}
 fn request() -> Request {
     Request {
         id: "scope-fixture".into(),

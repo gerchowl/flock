@@ -118,6 +118,7 @@ fn session_started_with(app: &mut App, pane: &str, source: &str) {
     app.handle_api_request(Request {
         id: "req".into(),
         method: Method::PaneReportAgentSession(PaneReportAgentSessionParams {
+            rebind_agent_id: None,
             pane_id: pane.to_string(),
             source: "flock:claude".into(),
             agent: "claude".into(),

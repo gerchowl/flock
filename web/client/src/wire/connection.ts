@@ -3,10 +3,19 @@
  * `/v1/ws`, for what S7-min serves (G3a, #1747).
  *
  * **Connection states:** Disconnected, Connecting, Hello, Syncing, Live,
- * Stale, Reconnecting and NeedsToken, with §3's tables as the contract and
- * ADR-0036 §5a's parameters: connect 10 s, handshake 5 s, liveness 45 s,
- * subscription progress 30 s, command ack 30 s, backoff 500 ms × 2ⁿ capped
- * at 30 s with equal jitter and reset after 60 s of continuous Live.
+ * ReadOnly, Stale, Reconnecting and NeedsToken, with §3's tables as the
+ * contract and ADR-0036 §5a's parameters: connect 10 s, handshake 5 s,
+ * liveness 45 s, subscription progress 30 s, command ack 30 s, backoff
+ * 500 ms × 2ⁿ capped at 30 s with equal jitter and reset after 60 s of
+ * continuous Live or ReadOnly.
+ *
+ * **ReadOnly** (ADR-0038 §3, "Hello" and "ReadOnly"): a `welcome` whose
+ * protocol is older than the client's. Streams, heartbeats, Stale and
+ * Resyncing run as in Live, but the connection never moves to Syncing or
+ * Live on it, and the outbox is held: queued commands stay `pending`, never
+ * sent and never dropped, because the server may not know their verbs.
+ * {@link WireConnection.readOnly} names the version gap. A lost socket
+ * reconnects as usual, and the next `welcome` decides again.
  *
  * **Stream states:** Replaying, Resyncing, Current and Refused, per `sub`.
  * A history stream's `gap` hands its consumer a missing-range marker and
@@ -29,8 +38,17 @@
  * **The outbox:** see `outbox.ts`. Commands go out only in Live.
  *
  * Every timer runs on the injected {@link Clock}; every socket comes from the
- * injected {@link SocketFactory}. The connection is synchronous: each socket
- * or timer callback runs to completion, with no microtasks of its own.
+ * injected {@link SocketFactory}, or, bridged, from the shell. The connection
+ * is synchronous: each socket or timer callback runs to completion, with no
+ * microtasks of its own.
+ *
+ * **Bridged** (ADR-0038 §6, #2500): the shell's native side carries `/v1/ws`
+ * and holds the bearer, so `hello` carries no token, and each attempt runs on
+ * a session the shell opened: {@link WireConnection.setSocket} hands one over,
+ * open, and an attempt without one waits for it in Connecting under the
+ * connect deadline ({@link WireConnection.awaitingSession}). Everything after
+ * the socket is the same code: a 1006 or 1008 close is Socket lost, and 4401
+ * or 4403 is NeedsToken.
  *
  * Reading of S7a's scripts where ADR-0038 §3 is silent: a `sub` that has
  * not yet settled on this connection takes a Live connection back to
@@ -39,12 +57,11 @@
  * The ADR wording is tracked in #1752.
  *
  * Left for G3 #1595 (G3b), as seams: resume-only resends and window expiry
- * (`unknown_outcome`), persisted resync markers, ReadOnly, `*\/live`
- * streams, `operator_only` refusals, and cursor persistence (cursors are kept
- * in memory until the entity store is persisted with them). A re-`sub`
- * during Resyncing drops the unfinished snapshot: the cursor has not moved,
- * so the server starts it again. A server with an older protocol stops the
- * connection, because the client cannot yet enter ReadOnly.
+ * (`unknown_outcome`), persisted resync markers, `*\/live` streams,
+ * `operator_only` refusals, and cursor persistence (cursors are kept in
+ * memory until the entity store is persisted with them). A re-`sub` during
+ * Resyncing drops the unfinished snapshot: the cursor has not moved, so the
+ * server starts it again.
  *
  * @module
  */
@@ -55,9 +72,18 @@ import type { WireClient } from "../gen/WireClient";
 import type { WireError } from "../gen/WireError";
 import type { WireEvent } from "../gen/WireEvent";
 import type { JsonValue } from "../gen/serde_json/JsonValue";
+import type { BridgeSocket } from "../config";
 import { decodeServerFrame } from "./decode";
-import { backoffDelay, uuidv7, type Clock, type KeyValueStore, type SocketFactory, type SocketLike, type TimerHandle } from "./env";
+import { backoffDelay, bridgeSocket, uuidv7, type Clock, type KeyValueStore, type SocketFactory, type SocketLike, type TimerHandle } from "./env";
 import { Outbox, type OutboxEntry } from "./outbox";
+
+// Only this module can name the connection's internal handoff method.
+const providerSessionHandoff = Symbol("provider session handoff");
+
+/** Public handoff helper; CI's source scan restricts its use to provider.ts. */
+export function replaceProviderSession(connection: WireConnection, install: () => void): void {
+  connection[providerSessionHandoff](install);
+}
 
 /**
  * The JSON wire version this client speaks: `WIRE_JSON_VERSION` in
@@ -75,13 +101,14 @@ export const DEADLINES = {
   healthy: 60_000,
 } as const;
 
-/** ADR-0038 §3's connection states that G3a reaches. */
+/** ADR-0038 §3's connection states. */
 export type ConnectionState =
   | "Disconnected"
   | "Connecting"
   | "Hello"
   | "Syncing"
   | "Live"
+  | "ReadOnly"
   | "Stale"
   | "Reconnecting"
   | "NeedsToken";
@@ -111,6 +138,9 @@ export function isHistoryStream(stream: string): boolean {
   return stream.startsWith("agent/") || stream === "events";
 }
 
+/** One snapshot line and its frame's `ts_ms`, as `event` receives a live event's. */
+export type SnapshotLine = { readonly ev: WireEvent; readonly tsMs: number };
+
 /**
  * Receives one stream's progress. Each callback runs synchronously, and may
  * close its own subscription ({@link Subscription.close}); nothing of that
@@ -127,7 +157,7 @@ export interface StreamHandler {
    * A completed snapshot: these lines are now every entity of the stream,
    * and anything not among them is gone. Snapshot streams only.
    */
-  snapshot(lines: readonly WireEvent[]): void;
+  snapshot(lines: readonly SnapshotLine[]): void;
   /** Drop every entity of the stream: `cursor_ahead`. */
   reset(): void;
   /** The stream is Refused and ends here. */
@@ -137,20 +167,29 @@ export interface StreamHandler {
 /** One subscription, as {@link WireConnection.streams} reports it. */
 export type StreamStatus = { readonly stream: string; readonly state: StreamState; readonly cursor: number | null };
 
+/** Where each attempt's socket comes from. */
+export type Endpoint =
+  | {
+      readonly url: string;
+      /** The token for `hello`; null connects straight into NeedsToken. */
+      readonly token: string | null;
+      readonly sockets: SocketFactory;
+    }
+  /** The shell's bridge: sessions arrive through {@link WireConnection.setSocket}, and `hello` has no token. */
+  | { readonly bridged: true };
+
 /** What the connection was created with. */
-export type ConnectionOptions = {
-  readonly url: string;
-  /** The token for `hello`; null connects straight into NeedsToken. */
-  readonly token: string | null;
+export type ConnectionOptions = Endpoint & {
   readonly client: WireClient;
   readonly clock: Clock;
-  readonly sockets: SocketFactory;
   readonly random: () => number;
   readonly store: KeyValueStore;
   /** Applied cursors by stream, to resume from (in memory only, see above). */
   readonly cursors?: { readonly [stream: string]: number };
   /** Mints `cmd_id`s; UUIDv7 from the wall clock by default. */
   readonly newCommandId?: () => string;
+  /** The wire protocol this client speaks in `hello`; {@link WIRE_PROTOCOL} by default. */
+  readonly protocol?: number;
 };
 
 type Sub = {
@@ -163,6 +202,8 @@ type Sub = {
   /** Reached Current or Refused on the current connection. */
   settled: boolean;
   progress: TimerHandle | null;
+  /** Automatic contention retries since the last synced barrier, capped at three. */
+  busyRetries: number;
   refusal: Refusal | null;
   /** The snapshot being received while Resyncing. */
   snapshot: Snapshot | null;
@@ -176,7 +217,7 @@ type Snapshot = {
   readonly end: number;
   /** The last seq received so far. */
   last: number;
-  readonly lines: WireEvent[];
+  readonly lines: SnapshotLine[];
   /** The state to return to at the end: Replaying, or Current. */
   readonly resume: StreamState;
 };
@@ -195,8 +236,13 @@ export class WireConnection {
   #state: ConnectionState = "Disconnected";
   #token: string | null;
   #socket: SocketLike | null = null;
+  /** Bridged: a session the shell opened for the next attempt. */
+  #pending: SocketLike | null = null;
+  /** Bridged: the attempt in Connecting waits for the shell's session. */
+  #awaiting = false;
   #generation = 0;
   #attempt = 0;
+  #acks = 0;
   #timers = new Map<Timer, TimerHandle>();
   #subs = new Map<string, Sub>();
   /** The last sub id allocated: ids are `s<n>`, and n only grows (ADR-0038 §3). */
@@ -208,12 +254,13 @@ export class WireConnection {
   #error: string | null = null;
   #listeners = new Set<() => void>();
   #transitions = new Set<(state: ConnectionState) => void>();
+  #userConnects = new Set<() => void>();
   readonly #options: ConnectionOptions;
   readonly #outbox: Outbox;
 
   constructor(options: ConnectionOptions) {
     this.#options = options;
-    this.#token = options.token;
+    this.#token = "bridged" in options ? null : options.token;
     this.#cursors = new Map(Object.entries(options.cursors ?? {}));
     this.#outbox = new Outbox(options.store, () => this.#changed());
   }
@@ -223,14 +270,48 @@ export class WireConnection {
     return this.#state;
   }
 
+  /** Bridged: an attempt waits in Connecting for the shell to open a session. */
+  get awaitingSession(): boolean {
+    return this.#awaiting;
+  }
+
   /** The latest failure, shown while reconnecting or stopped; never a token. */
   get error(): string | null {
     return this.#error;
   }
 
+  /** How many commands an ok `ack` settled on this connection: it only grows, whatever the outbox drops. */
+  get acks(): number {
+    return this.#acks;
+  }
+
+  /** What a changed principal dropped from the outbox, until dismissed or the next ok `ack`. */
+  get outboxDropped(): string | null {
+    return this.#outbox.dropped;
+  }
+
+  /** The person has seen {@link outboxDropped}. */
+  dismissOutboxDropped(): void {
+    this.#outbox.dismissDropped();
+  }
+
   /** What restoring the stored outbox had to drop, or null (shown, never fatal). */
   get outboxProblem(): string | null {
     return this.#outbox.problem;
+  }
+
+  /**
+   * In ReadOnly, why: the version gap, for the banner and the disabled
+   * composer and answer controls (ADR-0038 §3). Null in every other state.
+   */
+  get readOnly(): string | null {
+    return this.versionGap === null ? null : "This server runs an older version, so sending waits until it is updated.";
+  }
+
+  /** In ReadOnly, the version gap itself, for Details; null in every other state. */
+  get versionGap(): string | null {
+    if (this.#state !== "ReadOnly" || this.#welcome === null) return null;
+    return `The server speaks wire protocol ${this.#welcome.protocol}; this client speaks ${this.#protocol()}.`;
   }
 
   /** The principal of the last `welcome`, or of the restored outbox. */
@@ -260,14 +341,35 @@ export class WireConnection {
     return () => this.#transitions.delete(listener);
   }
 
+  /** User Connect actions before their attempt; internal session replacement never emits this. */
+  onUserConnect(listener: () => void): () => void {
+    this.#userConnects.add(listener);
+    return () => this.#userConnects.delete(listener);
+  }
+
   /** The user's `connect`: from Disconnected only. */
   connect(): void {
-    if (this.#state === "Disconnected") this.#attemptNow();
+    if (this.#state !== "Disconnected") return;
+    for (const listener of this.#userConnects) listener();
+    this.#attemptNow();
+  }
+
+  /**
+   * Install a replacement credential/session while Disconnected, then resume.
+   * This internal handoff preserves the provider's auth budget: it is not a
+   * user Connect. If installation throws, the connection stays Disconnected.
+   */
+  [providerSessionHandoff](install: () => void): void {
+    this.disconnect();
+    install();
+    this.#attemptNow();
   }
 
   /** The user's `disconnect`: closes any socket, cancels retries, holds the outbox. */
   disconnect(): void {
     this.#abandon(NORMAL, "disconnect");
+    this.#pending?.close(NORMAL, "disconnect");
+    this.#pending = null;
     this.#clear("backoff");
     this.#enter("Disconnected");
   }
@@ -279,6 +381,33 @@ export class WireConnection {
   setToken(token: string): void {
     this.#token = token;
     if (this.#state === "NeedsToken") this.#attemptNow();
+  }
+
+  /**
+   * Bridged: a session the shell opened, for the attempt waiting on one or,
+   * from NeedsToken, the attempt it starts. Otherwise it is held for the
+   * next attempt, until it closes or a Disconnect closes it.
+   */
+  setSocket(socket: BridgeSocket): void {
+    const held = bridgeSocket(socket);
+    held.onclose = () => {
+      if (this.#pending === held) this.#pending = null;
+    };
+    this.#pending?.close(NORMAL, "replaced");
+    this.#pending = held;
+    if (this.#awaiting || this.#state === "NeedsToken") this.#attemptNow();
+  }
+
+  /**
+   * Bridged: the shell could not open a session (a refusal, never an
+   * outage): NeedsToken, until {@link setSocket}. A session the person
+   * stopped, or one already in NeedsToken, stays as it is.
+   */
+  sessionRefused(): void {
+    if (!("bridged" in this.#options) || this.#state === "Disconnected" || this.#state === "NeedsToken") return;
+    this.#abandon(NORMAL, "the shell refused the session");
+    this.#clear("backoff");
+    this.#enter("NeedsToken");
   }
 
   /** A network change: ends a backoff wait with one immediate attempt. */
@@ -296,6 +425,7 @@ export class WireConnection {
       case "Hello":
       case "Syncing":
       case "Live":
+      case "ReadOnly":
         this.#abandon(NORMAL, "foreground");
         this.#enter("Reconnecting");
         this.#attemptNow();
@@ -328,7 +458,7 @@ export class WireConnection {
    */
   subscribe(stream: StreamName, handler: StreamHandler, after?: number | null): Subscription {
     const cursor = after === undefined ? (this.#cursors.get(stream) ?? null) : after;
-    const sub: Sub = { id: this.#allocate(), stream, handler, state: "Replaying", cursor, settled: false, progress: null, refusal: null, snapshot: null };
+    const sub: Sub = { id: this.#allocate(), stream, handler, state: "Replaying", cursor, settled: false, progress: null, busyRetries: 0, refusal: null, snapshot: null };
     this.#subs.set(sub.id, sub);
     if (this.#connected()) this.#sendSub(sub);
     this.#settle();
@@ -361,11 +491,11 @@ export class WireConnection {
    *   principal that queued it, so none can be queued before a first
    *   `welcome`.
    */
-  command(verb: string, args: JsonValue, cmdId?: string, echoAfter?: number | null): string {
+  command(verb: string, args: JsonValue, cmdId?: string, echoAfter?: number): string {
     const principal = this.principal;
     if (principal === null) throw new Error("no principal yet: connect once before sending commands");
     const id = cmdId ?? this.#options.newCommandId?.() ?? uuidv7(this.#options.clock.wallNow());
-    this.#outbox.add({ cmd_id: id, verb, args, principal, created_ms: this.#options.clock.wallNow(), status: "pending", ...(echoAfter == null ? {} : { echo_after: echoAfter }) });
+    this.#outbox.add({ cmd_id: id, verb, args, principal, created_ms: this.#options.clock.wallNow(), status: "pending", ...(echoAfter === undefined ? {} : { echo_after: echoAfter }) });
     this.#flush();
     return id;
   }
@@ -373,17 +503,22 @@ export class WireConnection {
   // --- lifecycle --------------------------------------------------------
 
   #connected(): boolean {
-    return this.#state === "Syncing" || this.#state === "Live";
+    return this.#state === "Syncing" || this.#state === "Live" || this.#state === "ReadOnly";
+  }
+
+  #protocol(): number {
+    return this.#options.protocol ?? WIRE_PROTOCOL;
   }
 
   #enter(state: ConnectionState): void {
     if (state === this.#state) return;
-    if (this.#state === "Live") this.#clear("healthy");
+    if (this.#state === "Live" || this.#state === "ReadOnly") this.#clear("healthy");
     this.#state = state;
     for (const listener of this.#transitions) listener(state);
-    if (state === "Live") {
+    if (state === "Live" || state === "ReadOnly") {
       this.#error = null;
       this.#arm("healthy", DEADLINES.healthy, () => (this.#attempt = 0));
+      // ReadOnly holds the outbox: `#flush` sends in Live only.
       this.#flush();
     }
     this.#changed();
@@ -412,20 +547,36 @@ export class WireConnection {
 
   #attemptNow(): void {
     this.#clear("backoff");
+    const endpoint = this.#options;
+    if ("bridged" in endpoint) {
+      // The shell opened it already: the attempt starts on it, open, or waits for one.
+      const session = this.#pending;
+      this.#pending = null;
+      this.#begin(() => session, session === null);
+      if (session !== null) this.#opened();
+      return;
+    }
     if (this.#token === null) {
       this.#enter("NeedsToken");
       return;
     }
+    this.#begin(() => endpoint.sockets(endpoint.url), false);
+  }
+
+  /** Enters Connecting under the connect deadline, on the socket `open` gives, or `awaiting` the shell's session. */
+  #begin(open: () => SocketLike | null, awaiting: boolean): void {
     const generation = ++this.#generation;
+    this.#awaiting = awaiting;
     this.#enter("Connecting");
-    const socket = this.#options.sockets(this.#options.url);
+    const socket = open();
+    this.#arm("connect", DEADLINES.connect, () => this.#lost(NORMAL, "the connect deadline (10 s) elapsed"));
+    if (socket === null) return;
     this.#socket = socket;
     const current = (): boolean => generation === this.#generation;
     socket.onopen = () => current() && this.#opened();
     socket.onmessage = (event) => current() && this.#frame(event.data);
     socket.onclose = (event) => current() && this.#closed(event.code, event.reason);
     socket.onerror = () => undefined;
-    this.#arm("connect", DEADLINES.connect, () => this.#lost(NORMAL, "the connect deadline (10 s) elapsed"));
   }
 
   #opened(): void {
@@ -433,7 +584,7 @@ export class WireConnection {
     this.#clear("connect");
     this.#enter("Hello");
     const token = this.#token;
-    this.#send({ t: "hello", protocol: WIRE_PROTOCOL, client: this.#options.client, ...(token === null ? {} : { token }) });
+    this.#send({ t: "hello", protocol: this.#protocol(), client: this.#options.client, ...(token === null ? {} : { token }) });
     this.#arm("handshake", DEADLINES.handshake, () => this.#lost(NORMAL, "no welcome within the handshake deadline (5 s)"));
   }
 
@@ -466,6 +617,7 @@ export class WireConnection {
   /** Leaves the current socket: its later callbacks are discarded. */
   #abandon(closeCode: number | null, reason: string): void {
     this.#generation++;
+    this.#awaiting = false;
     for (const timer of ["connect", "handshake", "liveness"] as const) this.#clear(timer);
     for (const sub of this.#subs.values()) this.#stopProgress(sub);
     this.#outbox.socketLost();
@@ -511,17 +663,12 @@ export class WireConnection {
 
   #welcomed(frame: Welcome): void {
     this.#clear("handshake");
-    if (frame.protocol < WIRE_PROTOCOL) {
-      this.#abandon(NORMAL, "server too old");
-      this.#error = `The server speaks wire protocol ${frame.protocol}; this client needs ${WIRE_PROTOCOL} until read-only mode lands (#1595).`;
-      this.#enter("Disconnected");
-      return;
-    }
     const previous = this.#welcome;
     this.#welcome = frame;
     this.#outbox.adoptPrincipal(frame.principal);
     this.#renewLiveness();
-    this.#enter("Syncing");
+    // Only a client newer than the server is read-only; an older one works normally (ADR-0036 §5).
+    this.#enter(frame.protocol < this.#protocol() ? "ReadOnly" : "Syncing");
     for (const sub of this.#subs.values()) {
       sub.settled = false;
       if (sub.refusal === null || this.#cures(sub.refusal, previous, frame)) this.#sendSub(sub);
@@ -540,9 +687,12 @@ export class WireConnection {
         return before.principal !== after.principal || before.capabilities.join() !== after.capabilities.join();
       case "operator_only":
         return before.principal !== after.principal;
+      case "invalid_agent":
+        return false;
       case "unknown_stream":
         return before.server_version !== after.server_version;
       case "cursor_ahead":
+      case "session_busy":
         return true;
     }
   }
@@ -587,9 +737,9 @@ export class WireConnection {
     sub.progress = null;
   }
 
-  /** Syncing ⇄ Live: Live once every subscription has settled. */
+  /** Syncing ⇄ Live: Live once every subscription has settled. ReadOnly stays ReadOnly. */
   #settle(): void {
-    if (!this.#connected()) return this.#changed();
+    if (!this.#connected() || this.#state === "ReadOnly") return this.#changed();
     const settled = [...this.#subs.values()].every((sub) => sub.settled);
     this.#enter(settled ? "Live" : "Syncing");
     this.#changed();
@@ -606,7 +756,7 @@ export class WireConnection {
       case "ev": {
         if (frame.stream !== sub.stream) return this.#protocolError(`ev for ${frame.stream} on ${sub.stream}'s subscription`);
         if (frame.seq === undefined) return this.#protocolError(`ev without seq on ${sub.stream}`);
-        if (sub.snapshot !== null) return this.#snapshotLine(sub, sub.snapshot, frame.seq, frame.ev);
+        if (sub.snapshot !== null) return this.#snapshotLine(sub, sub.snapshot, frame.seq, frame.ev, frame.ts_ms);
         if (sub.cursor !== null && frame.seq <= sub.cursor) return;
         sub.handler.event(frame.seq, frame.ev, frame.ts_ms);
         if (this.#subs.get(sub.id) !== sub) return this.#changed();
@@ -620,10 +770,12 @@ export class WireConnection {
         if (sub.snapshot !== null) return this.#protocolError(`synced before ${sub.stream}'s snapshot ended`);
         this.#stopProgress(sub);
         sub.state = "Current";
+        sub.busyRetries = 0;
         sub.settled = true;
         sub.handler.synced();
         return this.#settle();
       case "lagged":
+        // `skipped_to` is diagnostic only. Resume from the applied cursor.
         // `lagged` closes the id on the server, like `subfail`.
         this.#resub(sub, false);
         return this.#changed();
@@ -671,10 +823,10 @@ export class WireConnection {
   }
 
   /** Lines are contiguous from the gap's `to + 1`; a repeat is dropped. */
-  #snapshotLine(sub: Sub, snapshot: Snapshot, seq: number, ev: WireEvent): void {
+  #snapshotLine(sub: Sub, snapshot: Snapshot, seq: number, ev: WireEvent, tsMs: number): void {
     if (seq <= snapshot.last) return;
     if (seq !== snapshot.last + 1) return this.#protocolError(`snapshot line ${seq} on ${sub.stream} after ${snapshot.last}`);
-    snapshot.lines.push(ev);
+    snapshot.lines.push({ ev, tsMs });
     snapshot.last = seq;
     if (seq === snapshot.end) return this.#endSnapshot(sub, snapshot);
     this.#startProgress(sub);
@@ -699,6 +851,20 @@ export class WireConnection {
        */
       const reason = `The server refused sub id ${sub.id} as already used on this connection, so this stream is not retried. Server: ${message}`;
       return this.#refuse(sub, { code, message: reason });
+    }
+    if (code === "session_busy") {
+      this.#refuse(sub, { code, message });
+      if (this.#subs.get(sub.id) !== sub || !this.#connected() || sub.busyRetries === 3) return;
+      // Three per-stream retries: 250, 500, 1000 ms, reset only by synced.
+      // Reuse the cancellable progress timer; never touch sibling subscriptions.
+      const delay = 250 * 2 ** sub.busyRetries++;
+      sub.progress = this.#options.clock.setTimeout(() => {
+        sub.progress = null;
+        sub.settled = false;
+        this.#resub(sub, false);
+        this.#settle();
+      }, delay);
+      return;
     }
     if (code !== "cursor_ahead") return this.#refuse(sub, { code, message });
     sub.handler.reset();
@@ -732,5 +898,6 @@ export class WireConnection {
     const error: WireError | null = frame.error ?? null;
     if (frame.ok === (error !== null)) return this.#protocolError(`ack ${frame.cmd_id} with ok=${frame.ok} and ${error === null ? "no" : "an"} error`);
     if (!this.#outbox.settle(frame.cmd_id, error)) return this.#protocolError(`ack for ${frame.cmd_id}, which is not awaiting one on this socket`);
+    if (error === null) this.#acks++;
   }
 }

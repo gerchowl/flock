@@ -13,9 +13,13 @@ changes affect subsequent launches.
 
 The shared content store stores bytes only, without content type or other metadata.
 `put(reader,max_bytes)` hashes exactly the bytes it writes and enforces a per-call
-cap independently of the persistence threshold. `get(hash)` verifies the digest
-and distinguishes Missing from Corrupt; `stat(hash)` returns size without reading
-content. References resolve to the encoded JSON block, preserving its values.
+cap independently of the persistence threshold. `get(hash,max_bytes)` stats the
+opened descriptor first and refuses an oversized object before reading content.
+Its bounded read also handles growth after stat, reading at most the cap plus one
+detection byte. `TooLarge` takes precedence over digest verification; within the
+cap, `get` verifies the digest and distinguishes Missing from Corrupt.
+`stat(hash)` returns size without reading content. References resolve to the encoded
+JSON block, preserving its values.
 Only projected messages are reserialized; unmodified lines retain exact spelling.
 Previews are lossy UTF-8, bounded to 80 characters, and are not complete content.
 
@@ -45,8 +49,9 @@ repair event; fallback can emit duplicate repair diagnostics. Direct filesystem
 writes that do not take the lock are outside this coordination.
 The transport continues streaming after a successful repair. A read still returns
 Corrupt for damaged content; unsafe entries and read/write/sync failures remain
-explicit errors. A crash before rename leaves the old entry and an owned temp
-file, never a partially overwritten blob. Crash-temp sweeping is tracked in #1824.
+explicit errors. A real OS permission denial is `Io`; owner, mode and entry-type
+validation failures are `UnsafePath`. A crash before rename leaves the old entry and an owned temp
+file, never a partially overwritten blob. Coordinated crash-temp cleanup is tracked in #1712.
 A failed directory sync may leave a complete object published;
 retrying the same content verifies it and syncs the directory again.
 
@@ -57,6 +62,11 @@ the transport recognizes their top-level type header in its bounded prefix.
 This slice does not enable public structured-session start. Retention, shared roots
 and concurrent GC are undecided in §4 and tracked in #1712; there is no GC or
 public delete-by-hash API.
+
+Crash-leftover `.tmp-*` files are kept. Opening the store does not sweep them:
+another writer may still be publishing. Coordinated cleanup requires the
+shared-writer/exclusive-cleanup fence deferred to #1712 (ADR-0036 §4), which owns
+cleanup. This store does not implement that fence or automatic temp-file cleanup.
 
 ## Stored history and publication
 

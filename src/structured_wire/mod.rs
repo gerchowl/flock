@@ -18,8 +18,8 @@ mod permission;
 // Later wire slices consume these exact payload re-exports.
 #[cfg_attr(feature = "web", allow(unused_imports))]
 pub use minimal::{
-    AgentDecide, AgentDecideErrorCode, AgentDecideResult, FleetAgentRow, FleetDelta,
-    PermissionDecision,
+    AgentDecide, AgentDecideErrorCode, AgentDecideResult, AgentSendResult, FleetAgentRow,
+    FleetDelta, FleetNodeRow, FleetProjectRow, PermissionDecision,
 };
 pub use permission::{
     IgnoredPermissionReason, IgnoredPermissionSuggestions, PermissionAnswer, PermissionClose,
@@ -37,7 +37,8 @@ pub const WIRE_JSON_VERSION: u32 = 1;
 #[cfg_attr(feature = "web", allow(dead_code))]
 pub const CONNECT_DEADLINE_MS: u64 = 10_000;
 /// WebSocket-open to authenticated welcome ceiling, on both peers.
-pub const HANDSHAKE_DEADLINE_MS: u64 = 5_000;
+pub const HANDSHAKE_DEADLINE_MS: u64 =
+    crate::structured::permissions::auth::tokens::server::HANDSHAKE_DEADLINE_MS;
 /// Server application ping cadence, independent of other traffic.
 pub const HEARTBEAT_INTERVAL_MS: u64 = 15_000;
 /// Missing valid frame/pong ceiling; unrelated streams do not renew progress.
@@ -140,6 +141,8 @@ pub enum ClientFrame {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum SubfailCode {
+    /// Unsafe or reserved agent namespace. Select a valid subject, never retry unchanged.
+    InvalidAgent,
     /// Clear only this stream's state/cursor and bootstrap without after.
     CursorAhead,
     /// Stop until the principal changes.
@@ -148,6 +151,8 @@ pub enum SubfailCode {
     UnknownStream,
     /// Stop until read authorization changes.
     Scope,
+    /// Token mutation is pending; registered session_busy retries later on a fresh ID.
+    SessionBusy,
     /// Subscription identity was already used on this connection; allocate a fresh one.
     SubIdReused,
 }

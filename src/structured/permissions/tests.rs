@@ -40,6 +40,77 @@ fn book() -> Book {
 }
 
 #[test]
+fn permission_message_over_limit_refuses_without_mutating() {
+    assert_eq!(MAX_PERMISSION_DECISION_MESSAGE_BYTES, 2048);
+    for decision in [Decision::AllowOnce, Decision::AllowAlways, Decision::Deny] {
+        for message in ["a".repeat(2049), "é".repeat(1025)] {
+            let mut b = book();
+            let mut request = args(&b, "request-example", decision);
+            request.message = Some(message);
+            let waiting = b.waiting();
+            assert_eq!(
+                b.prepare(&token(), &request).err(),
+                Some(ErrorCode::InvalidParams)
+            );
+            assert_eq!(b.waiting(), waiting);
+            assert!(b.grants.is_empty());
+            assert!(b.closed_ids.is_empty());
+            assert!(b
+                .open
+                .values()
+                .all(|r| r.stage == Stage::Open && r.grant.is_none()));
+            request.message = Some("corrected".into());
+            assert!(b.prepare(&token(), &request).is_ok());
+        }
+    }
+}
+
+#[test]
+fn permission_message_is_trimmed_at_utf8_boundary() {
+    for expected in [
+        "a".repeat(2048),
+        "é".repeat(1024),
+        String::new(),
+        "line one\n\tline two".into(),
+    ] {
+        let mut b = book();
+        let mut request = args(&b, "request-example", Decision::Deny);
+        request.message = Some(format!(" \t{}\r\n ", expected.replace('\n', "\r\n")));
+        let answer = b.prepare(&token(), &request).unwrap();
+        assert_eq!(answer.response["response"]["response"]["message"], expected);
+        assert_eq!(
+            serde_json::to_value(answer.audit).unwrap()["message"],
+            expected
+        );
+    }
+}
+
+#[test]
+fn permission_message_rejects_prompt_control_bytes_without_mutating() {
+    for message in [
+        "before\rafter",
+        "before\0after",
+        "before\u{7}after",
+        "before\u{7f}after",
+        "before\u{85}after",
+        "before\x1b[31mafter",
+        "before\x1b]0;title\x07after",
+    ] {
+        let mut b = book();
+        let mut request = args(&b, "request-example", Decision::Deny);
+        request.message = Some(message.into());
+        assert_eq!(
+            b.prepare(&token(), &request).err(),
+            Some(ErrorCode::InvalidParams),
+            "{message:?}"
+        );
+        assert_eq!(b.waiting(), vec![("request-example".into(), 1)]);
+        request.message = None;
+        assert!(b.prepare(&token(), &request).is_ok());
+    }
+}
+
+#[test]
 fn only_an_authenticated_operate_token_can_decide() {
     for principal in [
         Principal::Operator,
@@ -90,7 +161,7 @@ fn unknown_and_closed_requests_are_distinct_and_never_retry() {
         Some(ErrorCode::PermissionRequestClosed)
     );
     assert!(b.begin_answer(&answer.id, answer.request_seq));
-    b.audited(&answer);
+    b.audited(&answer, 100);
     assert!(b.waiting().is_empty());
     assert!(
         b.blocked(),
@@ -163,7 +234,7 @@ fn session_grants_reserve_distinct_keys_and_abort_releases_capacity() {
             .prepare(&token(), &args(&b, &id, Decision::AllowAlways))
             .unwrap();
         assert!(b.begin_answer(&answer.id, answer.request_seq));
-        b.audited(&answer);
+        b.audited(&answer, 100);
         b.written(answer);
     }
     b.observe("deny", request()).unwrap();
@@ -205,11 +276,11 @@ fn grant_is_installed_only_after_audit_and_cleared_on_runtime_end() {
         .unwrap();
     assert!(b.grants.is_empty());
     assert!(b.begin_answer(&answer.id, answer.request_seq));
-    b.audited(&answer);
+    b.audited(&answer, 100);
     assert_eq!(b.grants.len(), 1);
     b.end();
     assert!(b.grants.is_empty());
-    b.audited(&answer);
+    b.audited(&answer, 100);
     assert!(
         b.grants.is_empty(),
         "a late audit cannot resurrect a terminated runtime grant"
@@ -232,7 +303,7 @@ fn cancelled_grant_reservation_cannot_install_a_grant_after_its_close() {
         b.closed(&close.id, close.request_seq);
     }
     assert!(!b.begin_answer(&answer.id, answer.request_seq));
-    b.audited(&answer);
+    b.audited(&answer, 100);
     assert!(b.grants.is_empty());
     b.observe("following-request", request()).unwrap();
     assert!(b.automatic("following-request").unwrap().is_none());
@@ -248,7 +319,7 @@ fn automatic_reservations_hold_input_without_requesting_human_attention() {
         )
         .unwrap();
     assert!(b.begin_answer(&grant.id, grant.request_seq));
-    b.audited(&grant);
+    b.audited(&grant, 100);
     b.written(grant);
     b.observe("automatic-request", request()).unwrap();
     let answer = b.automatic("automatic-request").unwrap().unwrap();
@@ -282,7 +353,7 @@ fn exact_grants_preserve_numeric_representation_and_unicode() {
         .prepare(&token(), &args(&b, "grant", Decision::AllowAlways))
         .unwrap();
     assert!(b.begin_answer(&grant.id, grant.request_seq));
-    b.audited(&grant);
+    b.audited(&grant, 100);
     b.written(grant);
     let mut float = original.clone();
     float.input.insert("number".into(), json!(1.0));
@@ -372,7 +443,7 @@ fn session_grant_survives_eviction_of_its_originating_request_id() {
         .prepare(&token(), &args(&b, "grant-origin", Decision::AllowAlways))
         .unwrap();
     assert!(b.begin_answer(&answer.id, answer.request_seq));
-    b.audited(&answer);
+    b.audited(&answer, 100);
     b.written(answer);
     for n in 0..CLOSED_PERMISSION_REQUEST_WINDOW {
         let id = format!("retired-{n}");
@@ -502,11 +573,11 @@ fn queued_answer_for_an_evicted_handle_cannot_mutate_its_replacement() {
         .unwrap();
     assert!(current.request_seq > stale.request_seq);
     assert!(!b.begin_answer(&stale.id, stale.request_seq));
-    b.audited(&stale);
+    b.audited(&stale, 100);
     assert!(b.grants.is_empty());
     b.written(stale);
     assert!(b.begin_answer(&current.id, current.request_seq));
-    b.audited(&current);
+    b.audited(&current, 100);
     b.written(current);
     assert!(b.grants.is_empty());
     assert!(!b.blocked());
@@ -577,4 +648,65 @@ fn future_permission_shapes_remain_lossless_unknown_events() {
         SessionEvent::parse(raw, "fixture"),
         SessionEvent::Unknown { .. }
     ));
+}
+
+#[test]
+fn revoke_between_prepare_and_audited_cannot_reinstall_a_grant() {
+    for auditing in [false, true] {
+        let mut b = book();
+        let answer = b
+            .prepare(
+                &token(),
+                &args(&b, "request-example", Decision::AllowAlways),
+            )
+            .unwrap();
+        if auditing {
+            assert!(b.begin_answer(&answer.id, answer.request_seq));
+        }
+        b.revoke(&grants::GrantHandle {
+            request_id: answer.id.clone(),
+            request_seq: answer.request_seq,
+        })
+        .unwrap();
+        if !auditing {
+            assert!(b.begin_answer(&answer.id, answer.request_seq));
+        }
+        b.audited(&answer, 1234);
+        assert_eq!(answer.response["response"]["response"]["behavior"], "allow");
+        b.written(answer);
+        assert!(
+            b.grants(false).is_empty(),
+            "revoke must beat the pending install"
+        );
+        b.observe("next", request()).unwrap();
+        assert!(b.automatic("next").unwrap().is_none());
+    }
+}
+
+#[test]
+fn installed_grants_are_listed_and_revoke_makes_the_next_request_prompt() {
+    let mut b = book();
+    let answer = b
+        .prepare(
+            &token(),
+            &args(&b, "request-example", Decision::AllowAlways),
+        )
+        .unwrap();
+    assert!(b.begin_answer(&answer.id, answer.request_seq));
+    b.audited(&answer, 1234);
+    b.written(answer);
+    let grants = b.grants(false);
+    assert_eq!(grants.len(), 1);
+    assert_eq!(grants[0].tool, "Bash");
+    assert!(grants[0].canonical_input_key.is_none());
+    assert_eq!(grants[0].canonical_input_key_hash, "b409bdea0bbeb2fd");
+    assert_eq!(grants[0].canonical_input_key_bytes, 27);
+    assert_eq!(
+        b.grants(true)[0].canonical_input_key.as_deref(),
+        Some(r#"["Bash",{"command":"true"}]"#)
+    );
+    assert_eq!(grants[0].installed_ms, 1234);
+    b.revoke(&grants[0].handle).unwrap();
+    b.observe("next", request()).unwrap();
+    assert!(b.automatic("next").unwrap().is_none());
 }

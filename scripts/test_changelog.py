@@ -27,7 +27,10 @@ from scripts.changelog import (
     ensure_manifest_is_outdated,
     ensure_manifest_matches_expected,
     ensure_version_is_releasable,
+    build_release_pr_body,
+    cmd_pr_body,
     extract_section_body,
+    release_pr_preamble,
     foreign_release_entries,
     infer_protocol_from_notes,
     load_json,
@@ -50,6 +53,23 @@ FOREIGN_REPO = "example.invalid/another-project"
 
 
 class ChangelogScriptTests(unittest.TestCase):
+    def test_check_fragments_rejects_prose_and_accepts_bullets(self) -> None:
+        script = Path(__file__).with_name("changelog.py")
+        with tempfile.TemporaryDirectory() as tmp:
+            fragment = Path(tmp) / "1.changed.md"
+            for body, expected_code in (("The web client explains refusals.\n", 1),
+                                        ("- The web client explains refusals.\n", 0)):
+                with self.subTest(body=body):
+                    fragment.write_text(body, encoding="utf-8")
+                    result = subprocess.run(
+                        ["python3", str(script), "check-fragments", "--fragments", tmp],
+                        capture_output=True, text=True, check=False,
+                    )
+                    self.assertEqual(result.returncode, expected_code, result.stderr)
+                    if expected_code:
+                        self.assertIn("fragment must contain Markdown bullets", result.stderr)
+                    self.assertEqual(fragment.read_text(encoding="utf-8"), body)
+
     def test_prepare_release_moves_unreleased_into_versioned_section(self) -> None:
         original = """# Changelog\n\n## Unreleased\n\n### Fixed\n- Smoothed Claude flapping.\n\n## [0.1.0] - 2026-03-27\n\n### Added\n- Initial release.\n"""
 
@@ -737,7 +757,17 @@ class CheckedInManifestTests(unittest.TestCase):
         version = manifest["version"]
         self.assertNotEqual(version, NO_STABLE_RELEASE_VERSION)
         self.assertTrue(manifest["assets"])
-        for name, url in manifest["assets"].items():
+        for name, asset in manifest["assets"].items():
+            # A string is a bare URL; an object is {url, sha256} (#2081).
+            if isinstance(asset, str):
+                url = asset
+            else:
+                self.assertIsInstance(asset, dict, name)
+                url = asset.get("url")
+                self.assertIsInstance(url, str, name)
+                digest = asset.get("sha256")
+                self.assertIsInstance(digest, str, name)
+                self.assertRegex(digest, r"^[0-9a-f]{64}$", name)
             self.assertIn(f"/releases/download/v{version}/", url, name)
 
 
@@ -971,6 +1001,40 @@ class VersionCheckTests(unittest.TestCase):
 
         ensure_version_is_releasable(plan, "0.0.1", set())
         ensure_version_is_releasable(plan, "1.0.0", set())
+
+
+class ReleasePrBodyTests(unittest.TestCase):
+    def test_small_notes_are_inlined_unchanged(self) -> None:
+        notes = "### Fixed\n- One.\n"
+
+        body = build_release_pr_body("1.2.3", notes)
+
+        self.assertEqual(body, release_pr_preamble("1.2.3") + notes)
+
+    def test_oversized_notes_become_a_pointer_under_the_limit(self) -> None:
+        notes = "### Added\n" + "- Entry with é and 日本語.\n" * 4000 + "### Fixed\n- Only.\n"
+        self.assertGreater(len(release_pr_preamble("1.2.3") + notes), 65536)
+
+        body = build_release_pr_body("1.2.3", notes)
+
+        self.assertLess(len(body), 65536)
+        self.assertIn("https://github.com/gerchowl/flock/blob/release/v1.2.3/CHANGELOG.md", body)
+        self.assertIn(release_pr_preamble("1.2.3").rstrip("\n"), body)
+        self.assertIn("- Added: 4000 entries", body)
+        self.assertIn("- Fixed: 1 entry", body)
+        self.assertNotIn("Entry with", body)
+
+    def test_command_writes_the_body_from_the_changelog(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            changelog = Path(tmp) / "CHANGELOG.md"
+            changelog.write_text("# Changelog\n\n## [1.2.3] - 2026-01-01\n\n### Fixed\n- " + "x" * 2000 + "\n")
+            out = Path(tmp) / "body.md"
+
+            cmd_pr_body(argparse.Namespace(path=str(changelog), version="1.2.3", limit=100000, output=str(out)))
+            self.assertIn("x" * 2000, out.read_text())
+            cmd_pr_body(argparse.Namespace(path=str(changelog), version="1.2.3", limit=1500, output=str(out)))
+            self.assertNotIn("x" * 2000, out.read_text())
+            self.assertIn("- Fixed: 1 entry", out.read_text())
 
 
 if __name__ == "__main__":

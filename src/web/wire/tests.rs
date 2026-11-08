@@ -34,7 +34,15 @@ impl TestClock {
         }))
     }
     pub(crate) fn advance(&self, ms: u64) {
-        self.0.elapsed.fetch_add(ms, Ordering::SeqCst);
+        self.0
+            .elapsed
+            .fetch_add(ms.saturating_mul(1_000_000), Ordering::SeqCst);
+        self.0.signal.send_modify(|generation| *generation += 1);
+    }
+    /// Move to an actual producer capture instant without losing submillisecond precision.
+    pub(crate) fn advance_to(&self, at: Instant) {
+        let nanos = u64::try_from(at.saturating_duration_since(self.0.base).as_nanos()).unwrap();
+        self.0.elapsed.fetch_max(nanos, Ordering::SeqCst);
         self.0.signal.send_modify(|generation| *generation += 1);
     }
     pub(crate) async fn deadline(&self, ms: u64) {
@@ -49,7 +57,7 @@ impl TestClock {
             .filter(|&&d| d == self.0.base + Duration::from_millis(ms))
             .count()
     }
-    async fn deadline_count(&self, ms: u64, count: usize) {
+    pub(crate) async fn deadline_count(&self, ms: u64, count: usize) {
         let mut signal = self.0.signal.subscribe();
         within(async {
             loop {
@@ -73,7 +81,7 @@ impl TestClock {
 }
 impl Clock for TestClock {
     fn now(&self) -> Instant {
-        self.0.base + Duration::from_millis(self.0.elapsed.load(Ordering::SeqCst))
+        self.0.base + Duration::from_nanos(self.0.elapsed.load(Ordering::SeqCst))
     }
     fn until(&self, deadline: Instant) -> BoxFuture<'_, ()> {
         let mut signal = self.0.signal.subscribe();
@@ -89,31 +97,61 @@ impl Clock for TestClock {
         })
     }
 }
-struct Server {
-    core: Arc<Core>,
+pub(crate) struct Server {
+    pub(crate) core: Arc<Core>,
     bind: std::net::SocketAddr,
     task: tokio::task::JoinHandle<()>,
-    clock: TestClock,
-    _root: crate::structured::launch::SessionConfigDir,
+    pub(crate) clock: TestClock,
+    pub(crate) _root: crate::structured::launch::SessionConfigDir,
+    pub(crate) wake: Arc<tokio::sync::Notify>,
 }
 impl Server {
-    async fn new() -> Self {
+    pub(crate) async fn new() -> Self {
         Self::with_clock(|clock| Arc::new(clock)).await
     }
     async fn with_clock(wrap: impl FnOnce(TestClock) -> Arc<dyn Clock>) -> Self {
+        Self::with_setup(wrap, |_| ()).await
+    }
+    async fn with_setup(
+        wrap: impl FnOnce(TestClock) -> Arc<dyn Clock>,
+        setup: impl FnOnce(&mut Core),
+    ) -> Self {
         let root =
             crate::structured::launch::SessionConfigDir::create(&std::env::temp_dir()).unwrap();
         let dir = root.path().join("client-tokens");
         fs::create_dir(&dir).unwrap();
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
-        for (name, token, principal) in [("one", "a", "c"), ("two", "d", "e")] {
+        for (name, token, principal) in [
+            ("one", "a", "c"),
+            ("two", "d", "e"),
+            ("three", "b", "f"),
+            ("four", "1", "2"),
+        ] {
             let path = dir.join(format!("{name}.token"));
             fs::write(&path, json!({"token":token.repeat(64),"principal":principal.repeat(32),"scopes":["read","send","answer","operate"]}).to_string()).unwrap();
             fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
         }
+        let store = TokenStore::open(root.path()).unwrap();
+        Self::from_store_with_setup(root, store, wrap, setup).await
+    }
+    /// Serve an actual issued store; root owns its isolated filesystem lifetime.
+    async fn from_store(
+        root: crate::structured::launch::SessionConfigDir,
+        store: TokenStore,
+        wrap: impl FnOnce(TestClock) -> Arc<dyn Clock>,
+    ) -> Self {
+        Self::from_store_with_setup(root, store, wrap, |_| ()).await
+    }
+    async fn from_store_with_setup(
+        root: crate::structured::launch::SessionConfigDir,
+        store: TokenStore,
+        wrap: impl FnOnce(TestClock) -> Arc<dyn Clock>,
+        setup: impl FnOnce(&mut Core),
+    ) -> Self {
         let clock = TestClock::new();
-        let core =
-            Core::with_clock(TokenStore::open(root.path()).unwrap(), wrap(clock.clone())).unwrap();
+        let wake = Arc::new(tokio::sync::Notify::new());
+        let mut core = Core::with_clock(store, wrap(clock.clone()), wake.clone()).unwrap();
+        setup(&mut core);
         let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let bind = socket.local_addr().unwrap();
         let router = core.router();
@@ -126,9 +164,10 @@ impl Server {
             task,
             clock,
             _root: root,
+            wake,
         }
     }
-    async fn finish(mut self) {
+    pub(crate) async fn finish(mut self) {
         self.core.shutdown().await.unwrap();
         assert!(self.core.shared.clients.lock().unwrap().is_empty());
         assert_eq!(
@@ -145,15 +184,15 @@ impl Drop for Server {
         self.task.abort();
     }
 }
-struct Socket(tokio::net::TcpStream);
+pub(crate) struct Socket<S = tokio::net::TcpStream>(pub(crate) S);
 #[derive(Debug)]
-enum Received {
+pub(crate) enum Received {
     Text(Value),
     Close(u16),
     End,
 }
 impl Socket {
-    async fn open(server: &Server) -> Self {
+    pub(crate) async fn open(server: &Server) -> Self {
         let (socket, headers) = Self::upgrade(server).await;
         assert!(headers.starts_with("HTTP/1.1 101"), "{headers}");
         assert!(!headers
@@ -174,7 +213,9 @@ impl Socket {
         })
         .await
     }
-    async fn send(&mut self, value: Value) {
+}
+impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> Socket<S> {
+    pub(crate) async fn send(&mut self, value: Value) {
         self.raw(value.to_string().as_bytes(), 0x81).await;
     }
     async fn raw(&mut self, data: &[u8], flags: u8) {
@@ -196,7 +237,7 @@ impl Socket {
         })
         .await;
     }
-    async fn receive(&mut self) -> Received {
+    pub(crate) async fn receive(&mut self) -> Received {
         within(async {
             loop {
                 let flags = match self.0.read_u8().await {
@@ -232,12 +273,12 @@ impl Socket {
             other => panic!("expected frame, got {other:?}"),
         }
     }
-    async fn hello(&mut self, protocol: u32, token: &str) -> Value {
+    pub(crate) async fn hello(&mut self, protocol: u32, token: &str) -> Value {
         self.send(json!({"t":"hello","protocol":protocol,"client":{"name":"fixture","version":"1"},"token":token})).await;
         self.text().await
     }
 }
-fn runtime(work: impl Future<Output = ()>) {
+pub(crate) fn runtime(work: impl Future<Output = ()>) {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -252,7 +293,10 @@ fn hello_uses_generated_contracts_epoch_identity_and_read_only_metadata() {
         let welcome = first.hello(WIRE_JSON_VERSION, &"a".repeat(64)).await;
         assert_eq!(welcome["protocol"], WIRE_JSON_VERSION);
         assert_eq!(welcome["principal"], "c".repeat(32));
-        assert_eq!(welcome["capabilities"], json!([]));
+        assert_eq!(
+            welcome["capabilities"],
+            json!(["read", "send", "answer", "operate"])
+        );
         assert_eq!(welcome["idempotency_window_ms"], 86_400_000);
         assert!(!welcome["server_version"].as_str().unwrap().is_empty());
         assert_eq!(welcome["server_epoch"].as_str().unwrap().len(), 32);
@@ -262,7 +306,7 @@ fn hello_uses_generated_contracts_epoch_identity_and_read_only_metadata() {
         ));
         let mut newer = Socket::open(&server).await;
         let newer_welcome = newer.hello(WIRE_JSON_VERSION + 1, &"d".repeat(64)).await;
-        assert_eq!(newer_welcome["capabilities"], json!([]));
+        assert_eq!(newer_welcome["capabilities"], json!(["read"]));
         assert_eq!(newer_welcome["server_epoch"], welcome["server_epoch"]);
         server.clock.deadline(15_000).await;
         {
@@ -271,6 +315,60 @@ fn hello_uses_generated_contracts_epoch_identity_and_read_only_metadata() {
             assert_eq!(clients.values().filter(|c| c.read_only).count(), 1);
         }
         server.finish().await;
+    });
+}
+fn assert_welcome_grants(scopes: Value, expected: Value) {
+    runtime(async {
+        let server = Server::new().await;
+        let path = server._root.path().join("client-tokens/one.token");
+        let mut token: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        token["scopes"] = scopes;
+        fs::write(path, serde_json::to_vec(&token).unwrap()).unwrap();
+        let mut socket = Socket::open(&server).await;
+        let welcome = socket.hello(WIRE_JSON_VERSION, &"a".repeat(64)).await;
+        server.finish().await;
+        assert_eq!(welcome["capabilities"], expected);
+    });
+}
+#[test]
+fn welcome_grants_read_only() {
+    assert_welcome_grants(json!(["read"]), json!(["read"]));
+}
+#[test]
+fn welcome_grants_read_and_send() {
+    assert_welcome_grants(json!(["send", "read"]), json!(["read", "send"]));
+}
+#[test]
+fn welcome_grants_all_scopes_in_enum_order() {
+    assert_welcome_grants(
+        json!(["operate", "answer", "send", "read"]),
+        json!(["read", "send", "answer", "operate"]),
+    );
+}
+#[test]
+fn welcome_grants_operate_does_not_imply_other_scopes() {
+    assert_welcome_grants(json!(["operate"]), json!(["operate"]));
+}
+#[test]
+fn newer_protocol_welcome_advertises_only_explicit_read() {
+    runtime(async {
+        for (scopes, expected) in [
+            (
+                json!(["read", "send", "answer", "operate"]),
+                json!(["read"]),
+            ),
+            (json!(["send", "answer", "operate"]), json!([])),
+        ] {
+            let server = Server::new().await;
+            let path = server._root.path().join("client-tokens/one.token");
+            let mut token: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            token["scopes"] = scopes;
+            fs::write(path, serde_json::to_vec(&token).unwrap()).unwrap();
+            let mut socket = Socket::open(&server).await;
+            let welcome = socket.hello(WIRE_JSON_VERSION + 1, &"a".repeat(64)).await;
+            server.finish().await;
+            assert_eq!(welcome["capabilities"], expected);
+        }
     });
 }
 #[test]
@@ -407,7 +505,7 @@ fn fanout_closes_only_the_verified_principal_and_cleanup_is_owned() {
             .unwrap()
             .session
             .clone();
-        server.core.revoke(&session);
+        server.core.shared.revoke(&session);
         assert!(matches!(
             one.receive().await,
             Received::Close(AUTH_REVOKED_CLOSE)
@@ -422,11 +520,11 @@ fn fanout_closes_only_the_verified_principal_and_cleanup_is_owned() {
     });
 }
 #[test]
-fn sixteen_pending_hellos_bound_slots_and_shutdown_refuses_new_upgrades() {
+fn pending_hellos_reserve_authenticated_capacity_and_shutdown_refuses_upgrades() {
     runtime(async {
         let server = Server::new().await;
         let mut sockets = Vec::new();
-        for _ in 0..16 {
+        for _ in 0..PENDING_HELLOS {
             sockets.push(Socket::open(&server).await);
         }
         let (_, refusal) = Socket::upgrade(&server).await;
@@ -532,14 +630,14 @@ fn writer_prioritizes_ping_between_bounded_data_writes() {
         let (sink, release, ready, mut received, _) = gated_sink();
         let (priority, high) = mpsc::channel(4);
         let (data, low) = mpsc::channel(8);
-        data.try_send(data_frame("first")).unwrap();
+        data.try_send(data_frame("first").into()).unwrap();
         let task = tokio::spawn(output::writer(sink, Arc::new(clock), high, low));
         within(ready).await.unwrap();
         for _ in 0..8 {
-            data.try_send(data_frame("backlog")).unwrap();
+            data.try_send(data_frame("backlog").into()).unwrap();
         }
         assert!(matches!(
-            data.try_send(data_frame("overflow")),
+            data.try_send(data_frame("overflow").into()),
             Err(mpsc::error::TrySendError::Full(_))
         ));
         priority
@@ -576,7 +674,7 @@ fn live_silent_writer_expires_at_its_original_ceiling_and_is_dropped() {
         let (sink, _alive, ready, _received, dropped) = gated_sink();
         let (_priority, high) = mpsc::channel(4);
         let (data, low) = mpsc::channel(8);
-        data.try_send(data_frame("stuck")).unwrap();
+        data.try_send(data_frame("stuck").into()).unwrap();
         let task = tokio::spawn(output::writer(sink, Arc::new(clock.clone()), high, low));
         within(ready).await.unwrap();
         clock.deadline(LIVENESS_WINDOW_MS).await;
@@ -592,7 +690,7 @@ fn dead_writer_fails_without_waiting_for_liveness_expiry() {
         let (sink, dead, ready, _received, dropped) = gated_sink();
         let (_priority, high) = mpsc::channel(4);
         let (data, low) = mpsc::channel(8);
-        data.try_send(data_frame("dead")).unwrap();
+        data.try_send(data_frame("dead").into()).unwrap();
         let task = tokio::spawn(output::writer(sink, Arc::new(clock.clone()), high, low));
         within(ready).await.unwrap();
         drop(dead);
@@ -699,6 +797,7 @@ fn covers_selected_fixture_handshake_vectors_run_against_the_core() {
             }
             let server = Server::new().await;
             let mut client = Socket::open(&server).await;
+            let newer_protocol = matches!(&hello, ClientFrame::Hello { protocol, .. } if *protocol > WIRE_JSON_VERSION);
             client.send(serde_json::to_value(hello).unwrap()).await;
             if auth_refusal {
                 assert!(matches!(
@@ -712,14 +811,20 @@ fn covers_selected_fixture_handshake_vectors_run_against_the_core() {
                 assert_eq!(welcome["protocol"], WIRE_JSON_VERSION);
                 assert_eq!(
                     welcome["capabilities"],
-                    json!([]),
-                    "later slices advertise stream/command capabilities"
+                    if newer_protocol {
+                        json!(["read"])
+                    } else {
+                        json!(["read", "send", "answer", "operate"])
+                    },
+                    "welcome advertises the authenticated token grants with protocol gating"
                 );
                 if script.iter().any(|line| {
                     matches!(
                         line.step,
                         FixtureStep::Send {
-                            frame: ServerFrame::Ping { .. },
+                            frame: crate::structured_wire::fixture::FixtureServerFrame::Literal(
+                                ServerFrame::Ping { .. }
+                            ),
                             ..
                         }
                     )
@@ -786,7 +891,6 @@ fn unknown_post_hello_operations_and_binary_frames_execute_nothing() {
     runtime(async {
         let server = Server::new().await;
         for frame in [
-            json!({"t":"cmd","cmd_id":"fixture","verb":"agent.send","args":{"agent":"fiction","text":"no-dispatch","submit":true},"resume_only":false}),
             json!({"t":"new-operation"}),
             json!({"t":"hello","protocol":1,"client":{"name":"f","version":"1"},"token":"a".repeat(64)}),
         ] {
@@ -807,7 +911,7 @@ fn unknown_post_hello_operations_and_binary_frames_execute_nothing() {
 }
 
 #[test]
-fn held_management_lock_does_not_block_valid_or_junk_hello_verification() {
+fn held_management_lock_refuses_junk_and_welcomes_valid_hello_after_bounded_wait() {
     runtime(async {
         let server = Server::new().await;
         let lock = fs::OpenOptions::new()
@@ -816,8 +920,12 @@ fn held_management_lock_does_not_block_valid_or_junk_hello_verification() {
             .open(server._root.path().join("client-tokens/.lock"))
             .unwrap();
         lock.lock().unwrap();
-        let mut valid = Socket::open(&server).await;
-        assert_eq!(valid.hello(1, &"a".repeat(64)).await["t"], "welcome");
+        assert!(server
+            .core
+            .shared
+            .store
+            .authenticate(&Bearer("a".repeat(64)))
+            .is_ok());
         let mut junk = Socket::open(&server).await;
         junk.send(
             json!({"t":"hello","protocol":1,"client":{"name":"f","version":"1"},"token":"invalid"}),
@@ -827,7 +935,18 @@ fn held_management_lock_does_not_block_valid_or_junk_hello_verification() {
             junk.receive().await,
             Received::Close(AUTH_REFUSED_CLOSE)
         ));
-        drop(lock);
+        let waited = Arc::new(AtomicBool::new(false));
+        let observed = waited.clone();
+        server.core.shared.store.on_peer_stage(
+            crate::structured::permissions::auth::tokens::server::PeerStage::Waiting,
+            move || {
+                observed.store(true, Ordering::SeqCst);
+                drop(lock);
+            },
+        );
+        let mut valid = Socket::open(&server).await;
+        assert_eq!(valid.hello(1, &"a".repeat(64)).await["t"], "welcome");
+        assert!(waited.load(Ordering::SeqCst));
         server.finish().await;
     });
 }
@@ -836,12 +955,16 @@ fn normal_constructor_opens_the_store_once_and_reports_startup_failure() {
     runtime(async {
         let root =
             crate::structured::launch::SessionConfigDir::create(&std::env::temp_dir()).unwrap();
-        let core = Core::new(root.path().into()).await.unwrap();
+        let core = Core::new(root.path().into(), Arc::new(tokio::sync::Notify::new()))
+            .await
+            .unwrap();
         assert_eq!(core.shared.slots.available_permits(), 16);
         core.shutdown().await.unwrap();
         let file = root.path().join("not-directory");
         fs::write(&file, b"fixture").unwrap();
-        assert!(Core::new(file).await.is_err());
+        assert!(Core::new(file, Arc::new(tokio::sync::Notify::new()))
+            .await
+            .is_err());
     });
 }
 
@@ -863,7 +986,7 @@ fn abandoned_writer_releases_the_sink_without_waiting_for_the_peer() {
         let (sink, _alive, ready, _received, dropped) = gated_sink();
         let (_priority, high) = mpsc::channel(4);
         let (data, low) = mpsc::channel(8);
-        data.try_send(data_frame("abandoned")).unwrap();
+        data.try_send(data_frame("abandoned").into()).unwrap();
         let task = tokio::spawn(output::writer(sink, Arc::new(clock.clone()), high, low));
         within(ready).await.unwrap();
         task.abort();
@@ -912,7 +1035,8 @@ fn revocation_between_verification_and_registration_never_welcomes() {
 }
 #[test]
 fn revocation_after_storage_recheck_never_welcomes() {
-    runtime(revoke_during_hello(3, 1));
+    // The registration deadline precedes the final storage recheck deadline.
+    runtime(revoke_during_hello(4, 1));
 }
 async fn revoke_during_hello(at: u64, registered: usize) {
     let action = Arc::new(Mutex::new(None));
@@ -943,17 +1067,46 @@ async fn revoke_during_hello(at: u64, registered: usize) {
             "revocation must fire at the requested handshake stage"
         );
         fs::remove_file(path).unwrap();
-        core.revoke(&session);
+        core.shared.revoke(&session);
         observed.fetch_add(1, Ordering::SeqCst);
     }));
     let mut client = Socket::open(&server).await;
     client.send(json!({"t":"hello","protocol":1,"client":{"name":"fixture","version":"1"},"token":"a".repeat(64)})).await;
-    assert!(matches!(
-        client.receive().await,
-        Received::Close(AUTH_REVOKED_CLOSE)
-    ));
+    let expected = if registered == 0 {
+        AUTH_REFUSED_CLOSE
+    } else {
+        AUTH_REVOKED_CLOSE
+    };
+    assert!(matches!(client.receive().await, Received::Close(code) if code == expected));
     assert_eq!(fired.load(Ordering::SeqCst), 1);
     server.finish().await;
+}
+
+#[test]
+fn per_credential_quota_preserves_siblings_and_global_sixteen_socket_limit() {
+    runtime(async {
+        let server = Server::new().await;
+        let mut sockets = Vec::new();
+        for token in ["a", "d", "b", "1"] {
+            for _ in 0..CREDENTIAL_CONNECTIONS {
+                let mut client = Socket::open(&server).await;
+                client.hello(1, &token.repeat(64)).await;
+                sockets.push(client);
+            }
+            if token == "a" {
+                let mut excess = Socket::open(&server).await;
+                excess.send(json!({"t":"hello","protocol":1,"client":{"name":"fixture","version":"1"},"token":token.repeat(64)})).await;
+                assert!(matches!(
+                    excess.receive().await,
+                    Received::Close(GOING_AWAY_CLOSE)
+                ));
+            }
+        }
+        assert_eq!(sockets.len(), CONNECTIONS as usize);
+        let (_, refusal) = Socket::upgrade(&server).await;
+        assert!(refusal.starts_with("HTTP/1.1 503"));
+        server.finish().await;
+    });
 }
 
 #[test]
@@ -964,7 +1117,7 @@ fn registered_recheck_deadline_preserves_the_token_with_a_non_auth_close() {
         .build().unwrap().block_on(async {
             let action = Arc::new(Mutex::new(None));
             let server = Server::with_clock(|clock| Arc::new(RevokeClock {
-                clock, calls: AtomicU64::new(0), at: 1, action: action.clone(),
+                clock, calls: AtomicU64::new(0), at: 2, action: action.clone(),
             })).await;
             let (started, ready) = tokio::sync::oneshot::channel();
             let (release, wait) = std::sync::mpsc::channel();
@@ -979,7 +1132,7 @@ fn registered_recheck_deadline_preserves_the_token_with_a_non_auth_close() {
             let mut client = Socket::open(&server).await;
             client.send(json!({"t":"hello","protocol":1,"client":{"name":"fixture","version":"1"},"token":"a".repeat(64)})).await;
             within(ready).await.unwrap();
-            server.clock.deadline_count(HANDSHAKE_DEADLINE_MS, 4).await;
+            server.clock.deadline_count(HANDSHAKE_DEADLINE_MS, 5).await;
             assert_eq!(server.core.shared.clients.lock().unwrap().len(), 1);
             server.clock.advance(HANDSHAKE_DEADLINE_MS);
             let result = client.receive().await;
@@ -1151,3 +1304,282 @@ fn failed_welcome_encode_drops_without_any_close_send() {
         assert!(received.try_recv().is_err());
     });
 }
+
+#[test]
+fn token_scope_refusal_closes_hello_with_4401() {
+    assert_eq!(
+        HandshakeFailure::from(TokenError::Scope).hello_code(),
+        Some(AUTH_REFUSED_CLOSE)
+    );
+}
+
+#[test]
+fn closed_subscription_discards_queued_output_without_harming_sibling_or_ping() {
+    runtime(async {
+        let (sink, release, started, mut frames, _) = gated_sink();
+        let (priority, high) = mpsc::channel(4);
+        let (data, low) = mpsc::channel(8);
+        data.try_send(data_frame("in-flight").into()).unwrap();
+        let task = tokio::spawn(output::writer(sink, Arc::new(TestClock::new()), high, low));
+        within(started).await.unwrap();
+        let closed = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let sibling = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mut acknowledgements = Vec::new();
+        for (id, fence) in [
+            ("closed", &closed),
+            ("sibling", &sibling),
+            ("closed", &closed),
+        ] {
+            let (delivered, acknowledgement) = tokio::sync::oneshot::channel();
+            data.try_send(output::Delivery {
+                frame: data_frame(id),
+                active: Some(fence.clone()),
+                delivered: Some(delivered),
+            })
+            .unwrap();
+            acknowledgements.push((id, acknowledgement));
+        }
+        closed.store(false, Ordering::Release);
+        priority
+            .try_send(
+                output::encode(ServerFrame::Ping {
+                    nonce: "priority".into(),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        release.send(()).unwrap();
+        for expected in [
+            json!({"t":"synced","sub_id":"in-flight","seq":0}),
+            json!({"t":"ping","nonce":"priority"}),
+            json!({"t":"synced","sub_id":"sibling","seq":0}),
+        ] {
+            let Message::Text(actual) = within(frames.recv()).await.unwrap() else {
+                panic!("text required")
+            };
+            assert_eq!(serde_json::from_str::<Value>(&actual).unwrap(), expected);
+        }
+        for (id, ack) in acknowledgements {
+            assert_eq!(within(ack).await.unwrap(), id == "sibling");
+        }
+        assert!(frames.try_recv().is_err());
+        assert!(sibling.load(Ordering::Acquire));
+        drop(priority);
+        within(task).await.unwrap();
+    });
+}
+#[test]
+fn owner_lookup_replay_consumes_real_storage_and_the_verified_socket_writer() {
+    use crate::structured::{
+        history::{owner, Item},
+        registry::{Record, Registry, StructuredRuntime},
+        workers::Workers,
+    };
+    use std::io::Write;
+    runtime(async {
+        let server = Server::new().await;
+        let mut socket = Socket::open(&server).await;
+        socket.hello(1, &"a".repeat(64)).await;
+        server.clock.deadline(15_000).await;
+        let root = server._root.path();
+        let mut registry = Registry::default();
+        registry
+            .register(Record {
+                runtime: StructuredRuntime::Structured,
+                agent_id: "fixture-agent".into(),
+                name: None,
+                harness: "claude".into(),
+                session_id: "history".into(),
+                cwd: root.to_owned(),
+                model: None,
+            })
+            .unwrap();
+        let sessions = root.join("sessions");
+        crate::platform::structured::ensure_private_dir(&sessions).unwrap();
+        let directory = sessions.join("fixture-agent");
+        crate::platform::structured::ensure_private_dir(&directory).unwrap();
+        let mut file =
+            crate::platform::structured::create_private_file(&directory.join("history.jsonl"))
+                .unwrap();
+        writeln!(file,"{}",json!({"seq":1,"known":true,"received_at_ms":1,"origin":"claude","result_subtype":null,"raw":"{\"type\":\"assistant\",\"message\":{}}"})).unwrap();
+        file.sync_all().unwrap();
+        let wake = Arc::new(tokio::sync::Notify::new());
+        let mut workers = Workers::new(wake.clone());
+        let (consumer, mut owner) = owner::channel(wake.clone());
+        let mut lookup = tokio::spawn(async move { consumer.lookup("fixture-agent".into()).await });
+        within(wake.notified()).await;
+        // A stalled owner lookup must not freeze the independent heartbeat writer.
+        server.clock.advance(15_000);
+        let Received::Text(ping) = socket.receive().await else {
+            panic!("ping required")
+        };
+        assert_eq!(ping["t"], "ping");
+        socket.send(json!({"t":"pong","nonce":ping["nonce"]})).await;
+        let source=within(async {
+            loop {
+                owner.service(&registry,&mut workers,root);
+                tokio::select! { result=&mut lookup=>break result.unwrap().unwrap().unwrap(),_=wake.notified()=>() }
+            }
+        }).await;
+        let mut cut = source.subscribe(None).unwrap();
+        let Item::Record(record) = cut.page().unwrap() else {
+            panic!("stored record required")
+        };
+        let frame = ServerFrame::Ev {
+            sub_id: "history-consumer".into(),
+            stream: "agent/fixture-agent".into(),
+            seq: Some(record.seq),
+            ts_ms: 1,
+            ev: WireEvent::Session(Box::new(serde_json::from_str(&record.raw).unwrap())),
+        };
+        let sender = server
+            .core
+            .shared
+            .clients
+            .lock()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap()
+            .data
+            .clone();
+        let (delivered, ack) = tokio::sync::oneshot::channel();
+        sender
+            .try_send(output::Delivery {
+                frame,
+                active: Some(Arc::new(std::sync::atomic::AtomicBool::new(true))),
+                delivered: Some(delivered),
+            })
+            .unwrap();
+        assert!(within(ack).await.unwrap());
+        let Received::Text(event) = socket.receive().await else {
+            panic!("event required")
+        };
+        assert_eq!(event["seq"], 1);
+        assert_eq!(event["ev"], json!({"type":"assistant","message":{}}));
+        assert!(matches!(cut.page().unwrap(), Item::Synced(1)));
+        server.finish().await;
+    });
+}
+#[test]
+fn subscriptions_are_accepted_on_the_actual_socket() {
+    runtime(async {
+        let server = Server::new().await;
+        let mut socket = Socket::open(&server).await;
+        socket.hello(1, &"a".repeat(64)).await;
+        socket
+            .send(json!({"t":"sub","sub_id":"s1","stream":"unknown"}))
+            .await;
+        let Received::Text(frame) = socket.receive().await else {
+            panic!("sub must receive a typed refusal, not a socket close")
+        };
+        assert_eq!(frame["t"], "subfail");
+        assert_eq!(frame["code"], "unknown_stream");
+        server.finish().await;
+    });
+}
+
+mod subscriptions;
+
+mod fleet;
+mod fleet_nodes;
+
+mod commands;
+
+mod conformance;
+
+/// Controlled read/read overlap: the bearer and its scopes never change.
+#[test]
+fn overlapping_read_admissions_keep_subscriptions_and_socket_alive() {
+    use crate::structured::permissions::auth::tokens::Scope;
+    runtime(async {
+        let mut server = Server::new().await;
+        let registry = crate::structured::registry::Registry::default();
+        let mut workers = crate::structured::workers::Workers::new(server.wake.clone());
+        Arc::get_mut(&mut server.core).unwrap().service(
+            &registry,
+            &mut workers,
+            server._root.path(),
+        );
+        let mut socket = Socket::open(&server).await;
+        socket.hello(1, &"a".repeat(64)).await;
+        server.clock.deadline(15_000).await;
+        let store = server.core.shared.store.clone();
+        let session = store.authenticate(&Bearer("a".repeat(64))).unwrap();
+        let (ready, entered) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let held = tokio::task::spawn_blocking({
+            let store = store.clone();
+            let session = session.clone();
+            move || {
+                store.admit(&session, Scope::Read, |_| {
+                    ready.send(()).unwrap();
+                    released.recv_timeout(Duration::from_secs(5)).unwrap();
+                })
+            }
+        });
+        within(entered).await.unwrap();
+        assert!(store.admit(&session, Scope::Read, |_| ()).is_ok());
+        socket
+            .send(json!({"t":"sub","sub_id":"contended","stream":"fleet"}))
+            .await;
+        let contended = socket.receive().await;
+        release.send(()).unwrap();
+        within(held).await.unwrap().unwrap();
+        assert!(matches!(contended, Received::Text(frame) if frame["t"] == "gap"));
+        assert!(matches!(socket.receive().await, Received::Text(frame) if frame["t"] == "synced"));
+        assert!(store.admit(&session, Scope::Read, |_| ()).is_ok());
+        let mut fresh = Socket::open(&server).await;
+        fresh.hello(1, &"a".repeat(64)).await;
+        fresh
+            .send(json!({"t":"sub","sub_id":"uncontended","stream":"fleet"}))
+            .await;
+        assert!(matches!(fresh.receive().await, Received::Text(frame) if frame["t"] == "gap"));
+        assert!(matches!(fresh.receive().await, Received::Text(frame) if frame["t"] == "synced"));
+        server.finish().await;
+    });
+}
+
+pub(crate) mod app_sessions;
+
+mod native;
+
+pub(crate) fn lease_counter(core: &Core) -> Arc<Semaphore> {
+    core.shared.slots.clone()
+}
+
+#[test]
+fn poisoned_client_map_still_retires_a_lease() {
+    runtime(async {
+        let server = Server::new().await;
+        let shared = server.core.shared.clone();
+        let live = Arc::new(AtomicBool::new(true));
+        let lease = Lease {
+            shared: shared.clone(),
+            id: 99,
+            live: live.clone(),
+            _permit: shared.slots.clone().try_acquire_owned().unwrap(),
+        };
+        let poisoning = shared.clone();
+        assert!(std::thread::spawn(move || {
+            let _guard = poisoning.clients.lock().unwrap();
+            panic!("fixture poisons only its owned client map");
+        })
+        .join()
+        .is_err());
+        drop(lease);
+        assert!(!live.load(Ordering::Acquire));
+        assert!(shared.clients.lock().err().unwrap().into_inner().is_empty());
+        assert_eq!(shared.slots.available_permits(), CONNECTIONS as usize);
+        shared.clients.clear_poison();
+        server.finish().await;
+    });
+}
+
+mod trace_auth;
+
+mod trace_protocol;
+
+mod trace_ping;
+
+mod trace_revocation;

@@ -27,7 +27,9 @@
  * and its window expiry (`unknown_outcome`) are G3b's. A restored `sent` or
  * `uncertain` command is held the same way; it is never sent again as a
  * first send. A `welcome` with another principal drops every command queued
- * under the old one (commands must not run under another identity).
+ * under the old one (commands must not run under another identity), and
+ * {@link Outbox.dropped} says so until the person dismisses it or the next
+ * command is acked.
  *
  * @module
  */
@@ -93,6 +95,7 @@ export class Outbox {
   readonly #store: KeyValueStore;
   readonly #changed: () => void;
   #problem: string | null = null;
+  #dropped: string | null = null;
 
   /** Restores the persisted outbox from `store`, dropping what it cannot read. */
   constructor(store: KeyValueStore, changed: () => void) {
@@ -127,6 +130,17 @@ export class Outbox {
     return this.#problem;
   }
 
+  /** What the last principal change dropped, or null. */
+  get dropped(): string | null {
+    return this.#dropped;
+  }
+
+  /** The person has seen {@link dropped}. */
+  dismissDropped(): void {
+    this.#dropped = null;
+    this.#changed();
+  }
+
   /** The principal the stored commands were queued under. */
   get principal(): string | null {
     return this.#principal;
@@ -149,15 +163,18 @@ export class Outbox {
     this.#commit();
   }
 
-  /** A `welcome` named `principal`: drops commands queued under another. */
+  /** A `welcome` named `principal`: drops commands queued under another, and says so. */
   adoptPrincipal(principal: string): void {
     if (this.#principal === principal) return;
+    let dropped = 0;
     for (const [id, live] of this.#commands) {
       if (live.entry.principal !== principal) {
+        if (UNSETTLED.has(live.entry.status)) dropped++;
         this.#cancel(live);
         this.#commands.delete(id);
       }
     }
+    if (dropped > 0) this.#dropped = `Dropped ${dropped} unsent ${dropped === 1 ? "command" : "commands"}: the server now names another identity, and commands never run under another.`;
     this.#principal = principal;
     this.#commit();
   }
@@ -189,6 +206,8 @@ export class Outbox {
     this.#cancel(live);
     live.onSocket = false;
     live.entry = error === null ? { ...live.entry, status: "acked" } : { ...live.entry, status: "failed", error };
+    // A command went through again: the drop notice has done its job.
+    if (error === null) this.#dropped = null;
     this.#commit();
     return true;
   }
