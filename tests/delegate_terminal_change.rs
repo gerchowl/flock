@@ -20,6 +20,9 @@ struct Fixture {
 }
 impl Fixture {
     fn new(evidence: bool, during_wait: bool) -> Self {
+        Self::serve(evidence, during_wait, false)
+    }
+    fn serve(evidence: bool, during_wait: bool, empty_result: bool) -> Self {
         let dir = support::socket_dir::SocketDir::reserve("d2993");
         let socket = dir.path().join("s");
         let home = dir.path().join("home");
@@ -51,7 +54,7 @@ impl Fixture {
         let stopped = stop.clone();
         let worker = std::thread::spawn(move || {
             let mut first = true;
-            let mut bound = false;
+            let mut bound = empty_result;
             while !stopped.load(Ordering::SeqCst) {
                 let Ok((mut stream, _)) = listener.accept() else {
                     std::thread::sleep(Duration::from_millis(5));
@@ -78,7 +81,7 @@ impl Fixture {
                         first = false;
                         json!({"result":{"agent":{"name":"fixture","agent_id":"agent_fixture.example_2993",
                             "terminal_id":if old {"term_old"} else {"term_new"},"pane_id":"w1:p1",
-                            "agent_status":"done","turn_cursor":if old {"term_old:0:0:0:i"} else {"term_new:0:1:2:i"},
+                            "agent_status":if empty_result {"working"} else {"done"},"turn_cursor":if old {"term_old:0:0:0:i"} else {"term_new:0:1:2:i"},
                             "agent_session":if bound {session.clone()} else {Value::Null}}}})
                     }
                     "pane.get" => {
@@ -88,6 +91,9 @@ impl Fixture {
                         assert_eq!(request["params"]["agent_session_id"], "session-2993");
                         bound = true;
                         json!({"result":{}})
+                    }
+                    "agent.result" if empty_result => {
+                        json!({"error":{"code":"no_result","message":"turn still running"}})
                     }
                     "agent.result" if bound => json!({"result":{"result":{"finished":true,
                         "at_ms":2,"status":"done","text":"DONE: rebound","session_id":"session-2993"}}}),
@@ -181,4 +187,9 @@ fn result_rebinds_exact_codex_session() {
 #[test]
 fn send_rebinds_before_submission() {
     Fixture::new(true, false).assert("send", 0, "\"round\":2");
+}
+
+#[test]
+fn result_liveness_follows_identity_when_terminal_changes_after_lookup() {
+    Fixture::serve(true, true, true).assert("result", 0, "running");
 }

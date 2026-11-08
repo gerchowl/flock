@@ -768,7 +768,8 @@ impl App {
                 .terminal_for_pane(ws_idx, pane_id)
                 .is_some_and(|terminal| {
                     terminal.agent_id.to_string() == *expected
-                        && super::super::creation::terminal_agent_session_info(terminal).is_none()
+                        && super::super::creation::terminal_agent_session_info(terminal)
+                            .is_none_or(|current| current == session)
                 })
                 || crate::session_evidence::path(&session).is_none()
             {

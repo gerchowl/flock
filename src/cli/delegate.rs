@@ -2945,10 +2945,9 @@ fn delegate_start(args: &[String]) -> io::Result<i32> {
     entry.round = 1;
     entry.submitted_at_ms = submitted_at_ms;
     entry.cursor = cursor.clone();
-    entry.session = settled_record
-        .get("agent_session")
-        .filter(|v| !v.is_null())
-        .cloned();
+    if let Some(session) = settled_record.get("agent_session").filter(|v| !v.is_null()) {
+        entry.session = Some(session.clone());
+    }
     if let Err(err) = write_entry(&entry) {
         // The write failed, so THIS process did not create the entry.
         // Removing `entry_path(name)` would delete a pre-existing (and
@@ -4548,7 +4547,10 @@ fn delegate_result(args: &[String]) -> io::Result<i32> {
             // turn is still running. An unreachable server here is a FAILURE
             // (W13 / G5): "running"/"unknown" at exit 0 would make a dead
             // socket indistinguishable from a healthy running turn.
-            let fetched = agent_record(&entry.terminal_id, None);
+            let fetched = agent_record(
+                entry.agent_id.as_deref().unwrap_or(&entry.terminal_id),
+                None,
+            );
             let (outcome, code) = match no_result_verdict(&fetched) {
                 NoResultVerdict::Running => ("running", exit::OK),
                 NoResultVerdict::NoResult => ("no_result", exit::OK),
@@ -4776,8 +4778,11 @@ fn require_delegate(name: &str, deadline: Option<Instant>) -> Result<Recorded, R
     }
     let before = entry.clone();
     let by_name = agent_record(name, deadline);
-    let terminal_id = entry.terminal_id.clone();
-    let recorded = recorded_decide(entry, by_name, || agent_record(&terminal_id, deadline))?;
+    let identity = entry
+        .agent_id
+        .clone()
+        .unwrap_or_else(|| entry.terminal_id.clone());
+    let recorded = recorded_decide(entry, by_name, || agent_record(&identity, deadline))?;
     if let Recorded::Live(live) = &recorded {
         persist_reidentified(&before, live);
     }

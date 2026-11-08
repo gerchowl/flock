@@ -27,35 +27,30 @@ pub(super) fn prepare(entry: &mut Entry, deadline: Option<Instant>) -> Result<()
     if session.agent != entry.harness || crate::session_evidence::path(&session).is_none() {
         return Err("the recorded session id has no unique matching harness session".into());
     }
-    if record
-        .get("agent_session")
-        .is_none_or(|value| value.is_null())
+    let response = bounded(
+        Method::PaneReportAgentSession(crate::api::schema::PaneReportAgentSessionParams {
+            rebind_agent_id: entry.agent_id.clone(),
+            pane_id: entry.pane_id.clone(),
+            source: session.source.clone(),
+            agent: session.agent.clone(),
+            seq: None,
+            agent_session_id: Some(session.value.clone()),
+            agent_session_path: None,
+            session_start_source: None,
+        }),
+        deadline,
+    )
+    .map_err(|err| err.to_string())?;
+    if let Some(error) = response.get("error") {
+        return Err(server_error(error));
+    }
+    let AgentFetch::Found(rebound) = agent_record(target, deadline) else {
+        return Err("the rebound session could not be verified".into());
+    };
+    if rebound.get("agent_session")
+        != Some(&serde_json::to_value(&session).map_err(|err| err.to_string())?)
     {
-        let response = bounded(
-            Method::PaneReportAgentSession(crate::api::schema::PaneReportAgentSessionParams {
-                rebind_agent_id: entry.agent_id.clone(),
-                pane_id: entry.pane_id.clone(),
-                source: session.source.clone(),
-                agent: session.agent.clone(),
-                seq: None,
-                agent_session_id: Some(session.value.clone()),
-                agent_session_path: None,
-                session_start_source: None,
-            }),
-            deadline,
-        )
-        .map_err(|err| err.to_string())?;
-        if let Some(error) = response.get("error") {
-            return Err(server_error(error));
-        }
-        let AgentFetch::Found(rebound) = agent_record(target, deadline) else {
-            return Err("the rebound session could not be verified".into());
-        };
-        if rebound.get("agent_session")
-            != Some(&serde_json::to_value(&session).map_err(|err| err.to_string())?)
-        {
-            return Err("the current agent did not accept the recorded session".into());
-        }
+        return Err("the current agent did not accept the recorded session".into());
     }
     entry.session = serde_json::to_value(session).ok();
     persist_reidentified(&before, entry);

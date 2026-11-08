@@ -1176,6 +1176,54 @@ mod tests {
     }
 
     #[test]
+    fn cached_claude_session_is_confirmed_by_exact_recovery_and_replay_is_safe() {
+        let root = crate::test_support::TempDir::socket();
+        std::env::set_var("HOME", root.path());
+        std::env::set_var("XDG_STATE_HOME", root.path().join("state"));
+        let project = root.path().join(".claude/projects/fixture");
+        std::fs::create_dir_all(&project).unwrap();
+        let body = format!(
+            "{}\n{}",
+            serde_json::json!({"type":"user","sessionId":"claude-rebind",
+            "message":{"role":"user","content":"continue"}}),
+            assistant_line("DONE: recovered")
+        );
+        std::fs::write(project.join("claude-rebind.jsonl"), body).unwrap();
+        let mut app = test_app();
+        let terminal_id = focused_terminal_id(&app);
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "flock:claude".into(),
+            agent: "claude".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("claude-rebind").unwrap(),
+        });
+        let agent_id = terminal.agent_id.to_string();
+        let before: serde_json::Value =
+            serde_json::from_str(&result(&mut app, &agent_id, None, None)).unwrap();
+        assert_eq!(before["error"]["code"], "session_unconfirmed");
+        let params = crate::api::schema::PaneReportAgentSessionParams {
+            pane_id: app
+                .public_pane_id(0, app.state.workspaces[0].focused_pane_id().unwrap())
+                .unwrap(),
+            rebind_agent_id: Some(agent_id.clone()),
+            source: "flock:claude".into(),
+            agent: "claude".into(),
+            seq: None,
+            agent_session_id: Some("claude-rebind".into()),
+            agent_session_path: None,
+            session_start_source: None,
+        };
+        for _ in 0..2 {
+            let response = app.handle_pane_report_agent_session("bind".into(), params.clone());
+            assert!(!response.contains("\"error\""), "{response}");
+        }
+        assert_eq!(
+            result_info(&result(&mut app, &agent_id, None, None)).text,
+            "DONE: recovered"
+        );
+    }
+
+    #[test]
     fn codex_result_reports_not_yet_codes_and_reads_the_reported_session() {
         let mut app = test_app();
         let home = std::env::temp_dir().join(format!("flock-codex-api-{}", std::process::id()));
