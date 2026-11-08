@@ -61,13 +61,16 @@ class SharedPin(unittest.TestCase):
                     found.append((path.name, name))
                     with self.subTest(workflow=path.name, job=name):
                         self.assert_install_pin(steps, index)
-        self.assertEqual(found, [("ci-leg.yml", "build"), ("preview.yml", "preflight")])
+        self.assertEqual(found, [("ci-leg.yml", "build"), ("ci-leg.yml", "test"), ("preview.yml", "preflight")])
 
-    def test_archive_consumer_uses_the_nix_shared_pin(self):
+    def test_archive_consumer_uses_prebuilt_shared_pin(self):
         steps = workflow("ci-leg.yml")["jobs"]["test"]["steps"]
         run = next(s["run"] for s in steps if s.get("name") == "Run shard")
-        self.assertTrue(run.startswith("nix develop -c just ci-shard "))
-        self.test_nix_reads_the_shared_pin()
+        self.assertTrue(run.startswith("nix develop .#ci-lint -c just ci-shard "))
+        index = next(i for i, step in enumerate(steps)
+                     if "cargo-nextest" in step.get("with", {}).get("tool", ""))
+        self.assert_install_pin(steps, index)
+        self.assertLess(index, next(i for i, step in enumerate(steps) if step.get("name") == "Run shard"))
 
     def test_unpinned_literal_and_wrong_output_versions_fail(self):
         steps = workflow("ci-leg.yml")["jobs"]["build"]["steps"]
@@ -98,7 +101,7 @@ class SharedPin(unittest.TestCase):
 
     def test_workflow_output_matches_the_nix_pin(self):
         expected = read_version()
-        for filename, job in [("ci-leg.yml", "build"), ("preview.yml", "preflight")]:
+        for filename, job in [("ci-leg.yml", "build"), ("ci-leg.yml", "test"), ("preview.yml", "preflight")]:
             reader = next(s for s in workflow(filename)["jobs"][job]["steps"] if s.get("id") == "nextest-version")
             with tempfile.TemporaryDirectory() as directory:
                 output = Path(directory) / "output"

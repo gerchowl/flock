@@ -280,27 +280,38 @@ fn default_policy(_: &Case) -> NonZeroU64 {
 
 #[tokio::test]
 async fn stop_releases_journal_during_concurrent_fork_before_exec() {
-    for iteration in 0..200 {
-        let mut r = Run::new(2966, "queue", default_policy).await;
-        // The existing bounded platform fixture forks with all CLOEXEC files
-        // still open, including this worker's journal. Keep it alive across stop.
-        let mut window =
-            crate::platform::client_token_lock::inherited_holder::Holder::spawn(&r.driver).unwrap();
-        r.stop().await;
-        let reopened = Journal::open(r.case.fixture.root.path(), &r.case.id)
-            .unwrap_or_else(|error| panic!("iteration {iteration}: reopen after stop: {error}"));
-        window.verify().unwrap();
-        // The new owner's lock must survive closure of the inherited old fd.
-        drop(window);
+    let mut r = Run::new(2966, "queue", default_policy).await;
+    let assert_locked = || {
         assert_eq!(
             Journal::open(r.case.fixture.root.path(), &r.case.id)
                 .err()
-                .unwrap()
+                .expect("worker must own the journal before stop")
                 .kind(),
             io::ErrorKind::WouldBlock
         );
-        drop(reopened);
-    }
+    };
+    assert_locked();
+    // spawn waits for the child's readiness byte after fork. It inherits every
+    // descriptor, including the locked journal, and waits on bounded IPC without
+    // exec. The worker stays alive until stop, so this forces the fork window.
+    let mut window =
+        crate::platform::client_token_lock::inherited_holder::Holder::spawn(&r.driver).unwrap();
+    assert_locked();
+    window.verify().unwrap();
+    r.stop().await;
+    let reopened = Journal::open(r.case.fixture.root.path(), &r.case.id)
+        .expect("stop must unlock even while the pre-exec child retains the journal");
+    window.verify().unwrap();
+    // The new owner's lock must survive closure of the inherited old fd.
+    drop(window);
+    assert_eq!(
+        Journal::open(r.case.fixture.root.path(), &r.case.id)
+            .err()
+            .unwrap()
+            .kind(),
+        io::ErrorKind::WouldBlock
+    );
+    drop(reopened);
 }
 fn path(case: &Case) -> std::path::PathBuf {
     case.fixture
