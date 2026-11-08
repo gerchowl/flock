@@ -2,6 +2,7 @@
 
 use caseless::Caseless;
 use unicode_general_category::{get_general_category, GeneralCategory};
+use unicode_normalization::UnicodeNormalization;
 use unicode_security::{general_security_profile::IdentifierType, GeneralSecurityProfile};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -14,7 +15,7 @@ fn invisible(ch: char) -> bool {
         || ch.identifier_type() == Some(IdentifierType::Default_Ignorable)
 }
 
-/// Two comparison keys after removing invisible/whitespace scalars (ADR-0026).
+/// Two comparison keys after NFKC and removing invisible/whitespace scalars (ADR-0026).
 /// K1 is skeleton(fold(x)); K2 starts at fold(skeleton(x)) and repeats that
 /// composition to its fixed point, with at most eight further steps. If that
 /// backstop is exhausted, the last value is used. Folding first preserves case
@@ -22,7 +23,7 @@ fn invisible(ch: char) -> bool {
 /// Keys are never displayed, persisted, or used to bind routing identities.
 pub(crate) fn comparison_keys(name: &str) -> (String, String) {
     let stripped: String = name
-        .chars()
+        .nfkc()
         .filter(|ch| !invisible(*ch) && !ch.is_whitespace())
         .collect();
     let folded: String = stripped.chars().default_case_fold().collect();
@@ -140,6 +141,30 @@ pub(crate) fn fit(label: &str, width: usize) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn security2261_compatibility_names_collide_before_case_and_skeleton_folding() {
+        for (claim, alias) in [
+            ("ｔｒｕｓｔｅｄ.example", "trusted.example"),
+            ("ＴＲＵＳＴＥＤ.example", "trusted.example"),
+            ("truﬆed.example", "trusted.example"),
+            ("trusted①.example", "trusted1.example"),
+            ("ｔｒuѕｔｅｄ.example\u{200b}", "trusted.example"),
+            ("trusted.example", "ｔｒｕｓｔｅｄ.example"),
+        ] {
+            assert_eq!(comparison_keys(claim), comparison_keys(alias), "{claim:?}");
+            assert_eq!(
+                claimed(claim, Some("abcdefgh"), [alias].into_iter()),
+                "[unverified] abcdefgh",
+                "{claim:?}"
+            );
+            assert_eq!(
+                claimed(claim, None, std::iter::empty()),
+                format!("[unverified] {}", escaped(claim)),
+                "normalization is comparison-only"
+            );
+        }
+    }
 
     #[test]
     fn security2166_r3_capital_i_in_a_lowercase_alias_collides() {

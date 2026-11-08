@@ -3800,7 +3800,7 @@ fn render_sidebar_toggle(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::super::status::state_dot;
     use super::*;
     use crate::{detect::Agent, workspace::Workspace};
@@ -4031,6 +4031,50 @@ mod tests {
     }
 
     #[test]
+    fn security2261_hub_claims_keep_badges_on_sidebar_and_navigator_surfaces() {
+        for name in [
+            "node-trusted.example",
+            "ｎｏｄｅ-ｔｒｕｓｔｅｄ.example",
+            "node-truﬆed.example",
+            "ｎоde-truѕted.example\u{200b}",
+        ] {
+            let mut app = security2166_alias_fixture();
+            let mut peer = app.fleet_snapshot.take().unwrap().peers.remove(0);
+            peer.host = Some(name.into());
+            app.relayed_fleet_cache.insert(
+                "hub-claim".into(),
+                crate::peers::RelayedEntry {
+                    peer,
+                    via: Some("node-hub.example".into()),
+                    hub_pushed: true,
+                    source_node: None,
+                },
+            );
+            let member = remote_entry_label(
+                &app,
+                &crate::app::state::RemotePeerRef::Relayed {
+                    host_key: "hub-claim".into(),
+                },
+                0,
+                true,
+            );
+            let band = security2166_band_text(&app);
+            let navigator = app.navigator_rows();
+            let agents = remote_agent_panel_entries(&app);
+            assert_eq!(navigator.len(), 1);
+            assert_eq!(agents.len(), 1);
+            for shown in [&band, &member, &navigator[0].label, &agents[0].server] {
+                assert!(
+                    shown.contains(crate::peer_name::BADGE),
+                    "{name:?}: {shown:?}"
+                );
+                assert!(!shown.contains(name), "{name:?}: {shown:?}");
+                assert!(!shown.contains("node-trusted.example"), "{shown:?}");
+            }
+        }
+    }
+
+    #[test]
     fn security2166_band_never_renders_a_spoofed_configured_alias() {
         let text = security2166_band_text(&security2166_alias_fixture());
         assert!(!text.contains("node-trusted.example"), "{text}");
@@ -4175,7 +4219,7 @@ mod tests {
         assert!(text.contains("+via node-hub.example"), "{text}");
     }
 
-    fn pin_server_identity_host(self_host: &str) {
+    pub(in crate::ui) fn pin_server_identity_host(self_host: &str) {
         // Reuse just's hostname pin after the caller's config-env scrub.
         // Isolate config lookup because a file's name overrides the env pin.
         let root =

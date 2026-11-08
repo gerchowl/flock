@@ -564,6 +564,63 @@ mod trust_tests {
         assert!(!detail.contains("node-trusted.example"), "{detail}");
         assert!(detail.contains("unverified"), "{detail}");
     }
+
+    #[test]
+    fn security2261_hub_detail_cannot_claim_a_configured_alias() {
+        let (_lock, _scrub) = crate::config::test_config_env_guard();
+        super::super::sidebar::tests::pin_server_identity_host("host");
+        let mut app = AppState::test_new();
+        app.peers.push(crate::config::PeerConfig {
+            name: "node-trusted.example".into(),
+            ..Default::default()
+        });
+        let mut peer = crate::peers::PeerSummaryState::new(&crate::config::PeerConfig {
+            name: "node-trusted.example".into(),
+            ..Default::default()
+        });
+        peer.host = Some("node-trusted.example".into());
+        peer.node_id = Some("claimed-node".into());
+        peer.workspaces = vec![serde_json::from_value(serde_json::json!({
+            "workspace":"project", "status":"working"
+        }))
+        .unwrap()];
+        app.relayed_fleet_cache.insert(
+            "hub-claim".into(),
+            crate::peers::RelayedEntry {
+                peer,
+                via: Some("node-hub.example".into()),
+                hub_pushed: true,
+                source_node: None,
+            },
+        );
+        let detail = remote_workspace_detail(
+            &app,
+            &crate::app::state::RemotePeerRef::Relayed {
+                host_key: "hub-claim".into(),
+            },
+            0,
+        );
+        assert!(!detail.contains("node-trusted.example"), "{detail}");
+        assert!(detail.contains("unverified"), "{detail}");
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 12)).unwrap();
+        terminal
+            .draw(|frame| {
+                render_rows(&app, frame, Rect::new(0, 0, 120, 6));
+                render_detail(&app, frame, Rect::new(0, 6, 120, 6));
+            })
+            .unwrap();
+        for area in [Rect::new(0, 0, 120, 6), Rect::new(0, 6, 120, 6)] {
+            let mut text = String::new();
+            for y in area.y..area.bottom() {
+                for x in area.x..area.right() {
+                    text.push_str(terminal.backend().buffer()[(x, y)].symbol());
+                }
+            }
+            assert!(text.contains(crate::peer_name::BADGE), "{text}");
+            assert!(!text.contains("node-trusted.example"), "{text}");
+        }
+    }
 }
 
 #[cfg(test)]

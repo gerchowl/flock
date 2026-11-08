@@ -209,7 +209,9 @@ name.
 Configured names and locally pinned/enrolled bindings are authoritative;
 reported node IDs and carried snapshot names are claims. One shared
 claimed-name presentation function owns comparison and escaping. Comparison
-first removes format, bidi, control, default-ignorable and whitespace scalars.
+first applies Unicode compatibility normalization (NFKC), then removes format,
+bidi, control, default-ignorable and whitespace scalars. This catches full-width
+letters and compatibility forms before casefolding and confusable comparison.
 One function returns two keys for each claim and each configured/pinned alias:
 `K1 = skeleton(fold(x))`, and `K2 = fold(skeleton(x))`, repeating the latter
 composition until its fixed point. Two names collide exactly when their K1
@@ -229,8 +231,9 @@ The maintained
 [`unicode-security`](https://docs.rs/unicode-security/0.1.2/unicode_security/)
 0.1.2 implementation supplies the skeleton and default-ignorable properties;
 `caseless` 0.2.2 supplies full casefolding and `unicode-general-category` 1.1.0
-supplies format categories. These dependencies pass the existing cargo-deny
-license and advisory policy without exceptions. No local confusables table is
+supplies format categories. `unicode-normalization` 0.1.26, already locked by
+transitive dependencies, supplies NFKC. These dependencies pass the existing
+cargo-deny license and advisory policy without exceptions. No local confusables table is
 used. These keys are local comparison forms, never display text, persisted
 metadata, or routing keys.
 

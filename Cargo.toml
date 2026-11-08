@@ -87,6 +87,8 @@ toml_edit = "0.25.15"
 zeroize = { version = "1.9", features = ["serde"] }
 # Escape claimed peer names and compare their Unicode confusable skeletons.
 unicode-security = "0.1.2"
+# Reuse the locked normalizer for compatibility-equivalent alias comparisons.
+unicode-normalization = "0.1.26"
 caseless = "0.2.2"
 unicode-general-category = "1.1.0"
 # Pin the reviewed streaming and entity-decoding behavior used by the display boundary.

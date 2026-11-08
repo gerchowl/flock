@@ -2797,6 +2797,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn security2261_hub_compatibility_aliases_remain_unverified_in_status() {
+        for host in [
+            "ｎｏｄｅ-ｈｕｂ.example",
+            "node-ℎub.example",
+            "ｎоde-hub.example\u{200b}",
+        ] {
+            let destination = security2252_hub_destination(host);
+            assert_eq!(destination, "[unverified] unknown destination", "{host:?}");
+        }
+    }
+
+    #[tokio::test]
     async fn security2252_configured_destination_behind_hub_has_a_nonempty_label() {
         let destination = security2252_hub_destination("node-destination.example");
         let label = destination.strip_prefix(crate::peer_name::BADGE).unwrap();
