@@ -10,6 +10,8 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 mod agents;
+#[cfg(test)]
+mod caller_pane_tests;
 mod channels;
 mod checks;
 mod client_tokens;
