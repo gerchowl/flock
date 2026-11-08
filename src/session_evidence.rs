@@ -57,6 +57,14 @@ impl Submission {
             agent: session.agent.clone(),
         })
     }
+    /// Record the transcript boundary immediately before the first Enter.
+    pub(crate) fn at_current_end(&self) -> Option<Self> {
+        Some(Self {
+            offset: std::fs::metadata(&self.path).ok()?.len(),
+            ..self.clone()
+        })
+    }
+
     pub(crate) fn started(&self, text: &str) -> bool {
         let Some(mut file) = File::open(&self.path).ok() else {
             return false;

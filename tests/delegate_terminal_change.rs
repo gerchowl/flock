@@ -18,6 +18,7 @@ enum SessionCase {
     ConflictingRecord,
     ConflictingResult,
     ConflictAtReady,
+    ConflictAtSubmit,
     AmbiguousClaude,
     Protocol32,
     CachedGrace,
@@ -216,6 +217,10 @@ impl Fixture {
                         json!({"result":{"type":"pong","version":"3.3.0","protocol":if case == SessionCase::Protocol32 {32} else {support::PROTOCOL_VERSION},"capabilities":{"pane_input_write_ack":true}}})
                     }
                     "events.read" => json!({"result":{"events":[],"next_after":0}}),
+                    "pane.submit" if case == SessionCase::ConflictAtSubmit => {
+                        assert_eq!(request["params"]["if_session"], "session-2993");
+                        json!({"error":{"code":"session_mismatch","message":"session changed before typing"}})
+                    }
                     "pane.submit" if !bound => {
                         json!({"result":{"type":"guarded_submit","retried":false,"pane_id":"w1:p1","outcome":"unconfirmed","reason":"owned_composer_not_visible"}})
                     }
@@ -452,4 +457,21 @@ fn mid_grace_no_result_does_not_compare_terminal_counters() {
 #[test]
 fn mid_grace_turn_check_restarts_on_a_different_terminal() {
     assert_mid_grace_recovery(SessionCase::TurnCheckGrace);
+}
+
+#[test]
+fn send_session_change_at_submission_is_unbound_and_preserves_round() {
+    let fixture = Fixture::case(true, false, false, false, SessionCase::ConflictAtSubmit);
+    let registry = fixture
+        .dir
+        .path()
+        .join("home/state")
+        .join(support::paths::app_dir_name())
+        .join("delegates")
+        .join(support::paths::server_key(&fixture.socket))
+        .join("fixture.json");
+    fixture.assert("result", 0, "DONE: rebound");
+    let before = std::fs::read(&registry).unwrap();
+    fixture.assert("send", 12, "session_unbound");
+    assert_eq!(std::fs::read(&registry).unwrap(), before);
 }

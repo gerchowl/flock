@@ -4176,6 +4176,11 @@ fn submit_send_brief(entry: &Entry, original: &Entry, sentence: &str, json: bool
                 "delegate {name}: the brief was not submitted: {reason}"
             )));
         }
+        if matches!(&reason, SubmitFailure::Refused(error)
+            if error.code == crate::api::error_code::ErrorCode::SessionMismatch.as_str())
+        {
+            return Some(session::unbound(original, session::CONFLICT, json));
+        }
         eprintln!("delegate {name}: the brief was not submitted: {reason}");
         return Some(match &reason {
             // Nothing typed and the registry restored: nothing changed (#1025).

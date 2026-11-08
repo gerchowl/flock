@@ -960,7 +960,11 @@ impl App {
         let reported_text = crate::control_bytes::strip(&attempt.text);
         let reported = terminal.prompt_report_generation > attempt.prompt_generation
             && terminal.last_prompt.as_deref() == Some(reported_text.trim());
-        if !attempt.sent && (started || reported) {
+        let transcript_started = attempt
+            .transcript_submit
+            .as_ref()
+            .is_some_and(|proof| proof.started(&reported_text));
+        if !attempt.sent && (started || reported || transcript_started) {
             return Some(Outcome::Abandoned("turn_started_before_enter"));
         }
         if attempt
@@ -973,12 +977,7 @@ impl App {
         if attempt.sent && reported {
             return Some(Outcome::Accepted);
         }
-        if attempt.sent
-            && attempt
-                .transcript_submit
-                .as_ref()
-                .is_some_and(|proof| proof.started(&reported_text))
-        {
+        if attempt.sent && transcript_started {
             return Some(Outcome::ObservedAccepted);
         }
         if attempt.sent && started {
@@ -1064,6 +1063,12 @@ impl App {
             )
             .into(),
         );
+        if !attempt.sent {
+            attempt.transcript_submit = attempt
+                .transcript_submit
+                .as_ref()
+                .and_then(crate::session_evidence::Submission::at_current_end);
+        }
         if runtime.try_send_flock_authored(Bytes::from(enter)).is_err() {
             return Some(Outcome::Abandoned("write_failed"));
         }

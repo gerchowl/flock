@@ -1226,5 +1226,138 @@ async fn rebound_codex_session_confirms_submission_without_cursor_or_composer_ev
     std::env::remove_var("CODEX_HOME");
 }
 
+#[tokio::test]
+async fn rebound_codex_session_rejects_transcript_before_enter() {
+    let root = crate::test_support::TempDir::socket();
+    std::env::set_var("CODEX_HOME", root.path());
+    let sessions = root.path().join("sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let path = sessions.join("rollout-fixture-rebound-session.jsonl");
+    let header = "{\"type\":\"session_meta\",\"payload\":{\"id\":\"rebound-session\"}}\n";
+    std::fs::write(&path, header).unwrap();
+    let Rig {
+        mut app,
+        pane,
+        mut pty,
+    } = lock_rig(&CODEX);
+    let agent_id = terminal(&mut app).agent_id.to_string();
+    terminal(&mut app).set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+        source: "flock:codex".into(),
+        agent: "codex".into(),
+        session_ref: crate::agent_resume::AgentSessionRef::id("rebound-session").unwrap(),
+    });
+    app.current_api_peer_pid = Some(std::process::id());
+    let response = app.handle_api_request(Request {
+        id: "rebind".into(),
+        method: Method::PaneReportAgentSession(crate::api::schema::PaneReportAgentSessionParams {
+            pane_id: pane.clone(),
+            source: "flock:codex".into(),
+            agent: "codex".into(),
+            seq: None,
+            agent_session_id: Some("rebound-session".into()),
+            agent_session_path: None,
+            session_start_source: None,
+            rebind_agent_id: Some(agent_id),
+        }),
+    });
+    assert!(!response.contains("\"error\""), "{response}");
+    let now = Instant::now();
+    let cursor = terminal(&mut app).turn_cursor();
+    let mut attempt = app
+        .begin_guarded_submit(
+            &pane,
+            "hello",
+            Some("rebound-session"),
+            Duration::ZERO,
+            now,
+            false,
+        )
+        .unwrap();
+    drain(&mut pty);
+    paint(&app, &CODEX, "hello");
+    let enter = now + STEP;
+    std::fs::write(&path, format!("{header}{}", concat!(
+        "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"new-turn\"}}\n",
+        "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"hello\"}]}}\n"))).unwrap();
+    let outcome = app
+        .advance_guarded_submit(&pane, &mut attempt, enter)
+        .or_else(|| app.advance_guarded_submit(&pane, &mut attempt, enter + POLL));
+    assert_eq!(terminal(&mut app).turn_cursor(), cursor);
+    assert_eq!(outcome, Some(Outcome::Unconfirmed("paste_written")));
+    assert!(!attempt.sent);
+    assert!(drain(&mut pty).is_empty(), "no Enter was written");
+    std::env::remove_var("CODEX_HOME");
+}
+
+#[tokio::test]
+async fn rebound_codex_session_pre_enter_start_does_not_confirm_post_enter_echo() {
+    let root = crate::test_support::TempDir::socket();
+    std::env::set_var("CODEX_HOME", root.path());
+    let sessions = root.path().join("sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let path = sessions.join("rollout-fixture-rebound-session.jsonl");
+    let header = "{\"type\":\"session_meta\",\"payload\":{\"id\":\"rebound-session\"}}\n";
+    std::fs::write(&path, header).unwrap();
+    let Rig {
+        mut app,
+        pane,
+        mut pty,
+    } = lock_rig(&CODEX);
+    let agent_id = terminal(&mut app).agent_id.to_string();
+    terminal(&mut app).set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+        source: "flock:codex".into(),
+        agent: "codex".into(),
+        session_ref: crate::agent_resume::AgentSessionRef::id("rebound-session").unwrap(),
+    });
+    app.current_api_peer_pid = Some(std::process::id());
+    let response = app.handle_api_request(Request {
+        id: "rebind".into(),
+        method: Method::PaneReportAgentSession(crate::api::schema::PaneReportAgentSessionParams {
+            pane_id: pane.clone(),
+            source: "flock:codex".into(),
+            agent: "codex".into(),
+            seq: None,
+            agent_session_id: Some("rebound-session".into()),
+            agent_session_path: None,
+            session_start_source: None,
+            rebind_agent_id: Some(agent_id),
+        }),
+    });
+    assert!(!response.contains("\"error\""), "{response}");
+    let now = Instant::now();
+    let cursor = terminal(&mut app).turn_cursor();
+    let mut attempt = app
+        .begin_guarded_submit(
+            &pane,
+            "hello",
+            Some("rebound-session"),
+            Duration::ZERO,
+            now,
+            false,
+        )
+        .unwrap();
+    drain(&mut pty);
+    paint(&app, &CODEX, "hello");
+    let enter = now + STEP;
+    std::fs::write(
+        &path,
+        format!(
+            "{header}{}\n",
+            serde_json::json!({"type":"event_msg","payload":{"type":"task_started"}})
+        ),
+    )
+    .unwrap();
+    assert_eq!(app.advance_guarded_submit(&pane, &mut attempt, enter), None);
+    assert!(attempt.sent);
+    paint(&app, &CODEX, "");
+    std::fs::write(&path, format!("{header}{}\n{}", serde_json::json!({"type":"event_msg","payload":{"type":"task_started"}}),         "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"hello\"}]}}\n")).unwrap();
+    assert_eq!(terminal(&mut app).turn_cursor(), cursor);
+    assert_eq!(
+        app.advance_guarded_submit(&pane, &mut attempt, enter + POLL),
+        None
+    );
+    std::env::remove_var("CODEX_HOME");
+}
+
 #[path = "injection_lock_tests/braille_2990_tests.rs"]
 mod braille_2990_tests;
