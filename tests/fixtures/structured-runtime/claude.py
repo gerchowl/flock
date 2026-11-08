@@ -133,6 +133,12 @@ if mode.startswith("queue"):
                     sys.exit(7)
                 if request["op"] == "event":
                     emit(request["event"])
+                elif request["op"] == "burst":
+                    events = request["events"]
+                    sys.stdout.write("".join(json.dumps(e) + "\n" for e in events))
+                    sys.stdout.flush()
+                    if request.get("exit"):
+                        sys.exit(7)
                 elif request["op"] == "lifecycle":
                     event = dict(find("command_lifecycle"))
                     event["state"] = request["state"]
@@ -158,6 +164,12 @@ if mode.startswith("queue"):
                 if not line:
                     sys.exit(0)
                 message = json.loads(line)
+                if message["type"] == "control_response":
+                    if mode == "queue-permission":
+                        driver.sendall((json.dumps(message) + "\n").encode())
+                    else:
+                        emit({"type": "fixture_control_input", "input": message})
+                    continue
                 assert message["type"] == "user", "queue writes only user turns"
                 current_uuid = message["uuid"]
                 count += 1
@@ -206,6 +218,12 @@ if mode.startswith("init-socket"):
     else:
         init["messaging_socket_path"] = 42 if mode.endswith("wrong-type") else None
 emit(init)
+if mode == "init-restricted":
+    # Positive placement tests need a compliant init and a persistent producer.
+    # A post-init status proves the runtime inspector accepted the preceding init.
+    emit(find("system", "status"))
+    sys.stdin.read()
+    sys.exit(0)
 if mode == "mcp-lease-calls":
     # Execute precisely the registration received via --mcp-config.
     env = dict(os.environ)

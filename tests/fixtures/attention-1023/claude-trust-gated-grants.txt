@@ -1,0 +1,10 @@
+╭─ Accessing workspace: ───╮
+│ Quick safety check: Is this a project you created or one you trust?
+│
+│ This folder pre-approves 3 tool permissions in
+ .claude/settings.json:
+│   Bash(npm run test)
+│
+❯ Yes, I trust this folder
+│   No, continue without these permissions
+╰──────╯

@@ -3,9 +3,9 @@
 //! One fresh runtime generation owns this scheduler and all stdin submissions.
 //! Feed persisted events in order, publish cuts only after successful operations,
 //! and drain final events before exited(). No disk work runs on the server loop.
-use super::admission::{Admission, Failure, Gate, Principal};
+use super::admission::{validate_kind, Admission, Failure, Gate, Principal};
 use super::model::State;
-use super::{Item, Journal};
+use super::{Item, Journal, QueueJournalCorrupt, ReadOnly};
 use crate::api::agent_state::{AgentState, Attention, Lifecycle, Turn};
 use crate::api::error_code::ErrorCode;
 use crate::structured::{claude::SessionEvent, runtime::Runtime};
@@ -19,6 +19,18 @@ pub(crate) enum PendingCause {
     /// An accepted batch still needs its real result; runtime exit/restart also
     /// ends the wait, holding unresolved items instead of resending them.
     AwaitingResult,
+    /// A malformed known record or unknown data preventing a required checkpoint
+    /// require operator recovery, never a retry or automatic journal rewrite.
+    /// State is inspectable only until recovery.
+    QueueJournalCorrupt(QueueJournalCorrupt),
+    /// Journal downgrade refused. Only upgrading to a compatible writer permits
+    /// mutations; a real harness result or a queue retry cannot recover it.
+    QueueJournalNewer {
+        /// Persisted format version.
+        found: u64,
+        /// Highest version understood by this writer.
+        supported: u64,
+    },
     /// Loss obscured the boundary. The transport guard remains closed until a
     /// real result, or runtime exit/restart; no input is written across it.
     TurnEndUnknown,
@@ -33,9 +45,12 @@ pub(crate) enum PendingCause {
 /// Status of an accepted batch or a candidate refused without any stdin write.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct Pending {
-    /// Accepted/refused batch UUID, or none when no candidate was formed.
+    /// Accepted batch UUID or the candidate UUID at refusal time; none when no
+    /// candidate was formed. A refusal ID is historical, not the current head:
+    /// later edits, removal, cancellation or admission do not update it.
     pub batch_id: Option<String>,
     /// Reservation/first-refusal time, or observation time for an S4/S6 gate.
+    /// Zero for journal read-only refusal, which has no reservation clock.
     pub since_ms: u64,
     /// Explicit blocking cause; age never triggers queue recovery.
     pub cause: PendingCause,
@@ -72,15 +87,17 @@ pub(crate) struct Scheduler {
 impl Scheduler {
     /// Start a fresh runtime generation; unresolved old offers become held.
     /// Unknown result-flag encodings are unresolved, never treated as idle.
+    /// Reserved kinds fail durably instead of re-entering admission through hold.
     pub fn new(admission: Admission) -> Result<Self, Failure> {
-        let pending = admission
+        let pending: Vec<_> = admission
             .journal()
             .items()
             .iter()
             .filter(|i| {
-                i.metadata
-                    .get("awaiting_result")
-                    .is_some_and(|v| v != &Value::Bool(false))
+                !admission.journal().opaque.contains(&i.item_id)
+                    && i.metadata
+                        .get("awaiting_result")
+                        .is_some_and(|v| v != &Value::Bool(false))
             })
             .cloned()
             .collect();
@@ -90,21 +107,85 @@ impl Scheduler {
             refused: None,
             virgin: true,
         };
-        this.hold(pending, ErrorCode::SessionUnconfirmed)?;
+        if this.journal().read_only().is_none() {
+            let mut supported = Vec::new();
+            for item in pending {
+                if let Err(failure) = validate_kind(&item.kind) {
+                    this.admission.fail_item(item.item_id, failure.code)?;
+                } else {
+                    supported.push(item);
+                }
+            }
+            this.hold(supported, ErrorCode::SessionUnconfirmed)?;
+        }
         Ok(this)
     }
     /// Durable producer admission through the same worker and gate.
     pub fn enqueue(&mut self, item: Item, principal: Principal, gate: Gate) -> Result<(), Failure> {
         self.admission.enqueue(item, principal, gate)
     }
+    /// Settle known unaccepted openings before a resumed generation gains input authority.
+    /// Opaque future entries remain uninterpreted and byte-preserved (ADR-0028 §3a).
+    pub(in crate::structured) fn fail_stale_openings(&mut self) -> Result<(), Failure> {
+        let stale: Vec<_> = self
+            .journal()
+            .items()
+            .iter()
+            .filter(|item| {
+                item.state == State::Queued
+                    && !self.journal().opaque.contains(&item.item_id)
+                    && item.metadata.get("opening_turn") == Some(&Value::Bool(true))
+            })
+            .map(|item| item.item_id.clone())
+            .collect();
+        for id in stale {
+            self.fail_item(id, ErrorCode::AgentStartFailed)?;
+        }
+        Ok(())
+    }
+    /// Terminally refuse a launch-owned input; it cannot become eligible on resume.
+    pub(in crate::structured) fn fail_item(
+        &mut self,
+        item_id: String,
+        reason: ErrorCode,
+    ) -> Result<(), Failure> {
+        self.admission.fail_item(item_id, reason)
+    }
+    pub(in crate::structured) fn take_facts(
+        &mut self,
+    ) -> Vec<crate::api::queue_event::QueueItemState> {
+        self.admission.take_facts()
+    }
     /// Committed state and owned replay cuts for serialized publication.
     pub fn journal(&self) -> &Journal {
         self.admission.journal()
     }
-    /// Current accepted-turn blocker or unconfirmed refused candidate. Status and
-    /// deliver report the same cause/time. No status observation writes a record;
+    /// Current journal/accepted-turn blocker or unconfirmed refused candidate. Status and
+    /// deliver report the same cause/time. A refused candidate retains its ID
+    /// and time from that attempt until a real result or runtime exit clears it
+    /// (ADR-0036 §3). It does not identify the current queue head or batch.
+    /// No status observation writes a record.
     /// S4/S6 gates and no-eligible-input are reported by deliver when unreserved.
     pub fn status(&self, runtime: &Runtime) -> Option<Pending> {
+        self.status_on(runtime.input_handle())
+    }
+    pub(in crate::structured) fn status_on(
+        &self,
+        runtime: &crate::structured::transport::InputHandle,
+    ) -> Option<Pending> {
+        if let Some(reason) = self.journal().read_only() {
+            return Some(Pending {
+                batch_id: None,
+                since_ms: 0,
+                cause: match reason {
+                    ReadOnly::Newer(reason) => PendingCause::QueueJournalNewer {
+                        found: reason.found,
+                        supported: reason.supported,
+                    },
+                    ReadOnly::Corrupt(reason) => PendingCause::QueueJournalCorrupt(reason),
+                },
+            });
+        }
         self.reserved
             .as_ref()
             .map(|reservation| Pending {
@@ -129,12 +210,20 @@ impl Scheduler {
         state: &AgentState,
         now_ms: u64,
     ) -> Result<Offer, Failure> {
-        self.journal().healthy()?;
-        if let Some(pending) = self.status(runtime) {
+        self.deliver_on(runtime.input_handle(), state, now_ms)
+    }
+    pub(in crate::structured) fn deliver_on(
+        &mut self,
+        runtime: &crate::structured::transport::InputHandle,
+        state: &AgentState,
+        now_ms: u64,
+    ) -> Result<Offer, Failure> {
+        self.journal().writable()?;
+        if let Some(pending) = self.status_on(runtime) {
             return Ok(Offer::Pending(pending));
         }
         let open = runtime
-            .waiting_on_human()
+            .queue_waiting_on_human()
             .map_err(|code| Failure { code, source: None })?;
         let cause = if !open.is_empty() {
             Some(PendingCause::WaitingOnHuman)
@@ -169,7 +258,7 @@ impl Scheduler {
             since_ms: now_ms,
             cancelled: false,
         });
-        if let Err(error) = runtime.try_submit(&batch.envelope) {
+        if let Err(error) = runtime.queue_submit(&batch.envelope) {
             // Refused input never owns result processing, even if undo fails.
             self.reserved = None;
             if error
@@ -204,6 +293,14 @@ impl Scheduler {
         self.virgin = false;
         Ok(Offer::Submitted { batch_id: batch.id })
     }
+    /// Capture a bootstrapped subscription under this sole writer's ownership.
+    pub(crate) fn subscription(&mut self) -> Result<super::Cut, Failure> {
+        self.admission.subscription()
+    }
+    /// Check configured rewrite policy under the scheduler's sole write ownership.
+    pub(crate) fn checkpoint_if_required(&mut self) -> Result<Option<super::Cut>, Failure> {
+        self.admission.checkpoint_if_required()
+    }
     fn members(&self) -> Vec<Item> {
         self.admission
             .journal()
@@ -232,6 +329,7 @@ impl Scheduler {
     /// nested results cannot release the reservation. completed/cancelled still
     /// wait for the top-level result before any subsequent offer.
     pub fn observe(&mut self, event: &SessionEvent) -> Result<(), Failure> {
+        self.journal().writable()?;
         let target = match event {
             SessionEvent::CommandLifecycle(e)
                 if self
@@ -255,6 +353,9 @@ impl Scheduler {
             let mut items = self.members();
             for item in &mut items {
                 if matches!(item.state, State::Queued | State::Delivered) {
+                    if target == State::Delivered {
+                        super::inbox::started(item)?;
+                    }
                     item.state = target.clone();
                 }
             }
@@ -266,19 +367,7 @@ impl Scheduler {
                 }
             }
         }
-        let result = match event {
-            SessionEvent::Success(e) => e
-                .parent_tool_use_id
-                .as_ref()
-                .and_then(Option::as_ref)
-                .is_none(),
-            SessionEvent::ExecutionError(e) => e
-                .parent_tool_use_id
-                .as_ref()
-                .and_then(Option::as_ref)
-                .is_none(),
-            _ => false,
-        };
+        let result = ends_turn(event);
         if result {
             let mut items = self.members();
             for item in &mut items {
@@ -297,10 +386,28 @@ impl Scheduler {
     /// No result means held, even if the stdin writer completed or a lifecycle
     /// completed arrived. Call after draining durable events on any process exit.
     pub fn exited(&mut self) -> Result<(), Failure> {
+        self.journal().writable()?;
         self.hold(self.members(), ErrorCode::NoResult)?;
         self.reserved = None;
         self.refused = None;
         self.virgin = false;
         Ok(())
+    }
+}
+
+/// Only known top-level results establish the next S4 coverage boundary.
+pub(in crate::structured) fn ends_turn(event: &SessionEvent) -> bool {
+    match event {
+        SessionEvent::Success(e) => e
+            .parent_tool_use_id
+            .as_ref()
+            .and_then(Option::as_ref)
+            .is_none(),
+        SessionEvent::ExecutionError(e) => e
+            .parent_tool_use_id
+            .as_ref()
+            .and_then(Option::as_ref)
+            .is_none(),
+        _ => false,
     }
 }

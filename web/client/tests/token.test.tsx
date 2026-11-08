@@ -93,7 +93,8 @@ function mountApp(options: { code?: string | null; session?: () => SessionLike |
   return { h, root };
 }
 
-const status = (root: HTMLElement): string => root.querySelector(".topbar__status")?.textContent ?? "";
+/** The connection's state line, in the toolbar's popover. */
+const status = (root: HTMLElement): string => root.querySelector('[data-testid="host-detail"]')?.textContent ?? "";
 const hello = (h: Harness): { token?: string } | undefined => sentFrames(h).find((frame) => (frame as { t: string }).t === "hello") as { token?: string } | undefined;
 
 describe("the fragment code", () => {
@@ -175,7 +176,7 @@ describe("codes", () => {
       const { h, root } = mountApp({ code, request });
       await tick();
       expect(request.calls).toHaveLength(0);
-      expect(status(root)).toBe(`NeedsToken · ${EXCHANGE_FAILED}`);
+      expect(status(root)).toBe(`Sign-in needed. ${EXCHANGE_FAILED}`);
       expect(h.net.attempts).toHaveLength(0);
     });
   }
@@ -215,6 +216,80 @@ describe("codes", () => {
   });
 });
 
+describe("pasted codes during an exchange", () => {
+  /** An exchange request whose replies the test settles by hand, in any order. */
+  function held() {
+    const replies: ((reply: { status: number; token?: string }) => void)[] = [];
+    const request: ExchangeRequest = () =>
+      new Promise((resolve) => {
+        replies.push((reply) => resolve({ status: reply.status, json: async () => ({ token: reply.token }) }));
+      });
+    return { replies, request };
+  }
+
+  test("a malformed code pasted during a good exchange does not discard it", async () => {
+    const storage = session();
+    const at = page("");
+    const { replies, request } = held();
+    const { h, root } = mountApp({ session: () => storage, page: at, request });
+    at.paste(`#code=${CODE}`);
+    at.paste("#code=zz");
+    expect(at.location.hash).toBe("");
+    expect(replies).toHaveLength(1);
+    expect(status(root)).toBe("Signing in…");
+    replies[0]?.({ status: 200, token: "good" });
+    await tick();
+    expect(storage.entries.get(TOKEN_KEY)).toBe("good");
+    expect(root.querySelector('[data-testid="exchange-notice"]')).toBeNull();
+    h.step(step({ step: "open" }));
+    expect(hello(h)?.token).toBe("good");
+  });
+
+  test("a malformed code pasted when nothing is in flight is a failure, with no request", async () => {
+    const at = page("");
+    const request = exchange({ status: 200, body: { token: "tok" } });
+    const { root } = mountApp({ page: at, request });
+    at.paste("#code=zz");
+    expect(request.calls).toHaveLength(0);
+    expect(status(root)).toBe(`Sign-in needed. ${EXCHANGE_FAILED}`);
+  });
+
+  test("a malformed code in the loaded page is a failure, not an endless sign-in", () => {
+    const { root } = mountApp({ code: "zz" });
+    expect(status(root)).toBe(`Sign-in needed. ${EXCHANGE_FAILED}`);
+  });
+
+  test("the last paste wins even when the older exchange settles last; the status stays Signing in until then", async () => {
+    const storage = session();
+    const at = page("");
+    const { replies, request } = held();
+    const { h, root } = mountApp({ session: () => storage, page: at, request });
+    at.paste(`#code=${CODE}`);
+    at.paste(`#code=${PASTED}`);
+    replies[0]?.({ status: 200, token: "first" });
+    await tick();
+    expect(storage.entries.has(TOKEN_KEY)).toBe(false);
+    expect(status(root)).toBe("Signing in…");
+    expect(h.net.attempts).toHaveLength(0);
+    replies[1]?.({ status: 200, token: "second" });
+    await tick();
+    expect(storage.entries.get(TOKEN_KEY)).toBe("second");
+    expect(h.net.attempts).toHaveLength(1);
+  });
+
+  test("a failed older exchange settling after the latest began cannot end the latest's sign-in", async () => {
+    const at = page("");
+    const { replies, request } = held();
+    const { root } = mountApp({ page: at, request });
+    at.paste(`#code=${CODE}`);
+    at.paste(`#code=${PASTED}`);
+    replies[0]?.({ status: 401 });
+    await tick();
+    expect(status(root)).toBe("Signing in…");
+    expect(root.querySelector('[data-testid="exchange-notice"]')).toBeNull();
+  });
+});
+
 describe("no config script: same-origin defaults", () => {
   test("the app mounts, exchanges at the page's origin and connects to its /v1/ws", async () => {
     const shell = readShellConfig({ location: { origin: "http://flk.invalid:7777" } });
@@ -251,7 +326,7 @@ describe("the exchange", () => {
       const request = exchange(reply);
       const { h, root } = mountApp({ code: CODE, session: () => session(), request });
       await tick();
-      expect(status(root)).toBe(`NeedsToken · ${EXCHANGE_FAILED}`);
+      expect(status(root)).toBe(`Sign-in needed. ${EXCHANGE_FAILED}`);
       h.clock.advanceTo(h.clock.now() + 120_000);
       await tick();
       expect(request.calls).toHaveLength(1);
@@ -288,7 +363,7 @@ describe("the exchange", () => {
       const request = browser(refuses);
       const { h, root } = mountApp({ code: CODE, session: () => storage, request });
       await tick();
-      expect(status(root)).toBe(`NeedsToken · ${EXCHANGE_FAILED}`);
+      expect(status(root)).toBe(`Sign-in needed. ${EXCHANGE_FAILED}`);
       expect(storage.entries.has(TOKEN_KEY)).toBe(false);
       expect(request.calls).toBe(1);
       expect(h.net.attempts).toHaveLength(0);
@@ -319,7 +394,7 @@ describe("a pasted link in a connected tab", () => {
     const fleet = (sentFrames(h).find((frame) => (frame as { stream?: string }).stream === "fleet") as { sub_id: string }).sub_id;
     h.step(step({ step: "send", frame: { t: "gap", sub_id: fleet, from: 1, to: 0, snapshot_to: 0 } }));
     h.step(step({ step: "send", frame: { t: "synced", sub_id: fleet, seq: 0 } }));
-    expect(status(root)).toBe("Live");
+    expect(status(root)).toBe("Connected.");
     return { h, root, storage, at, request };
   }
 
@@ -329,7 +404,7 @@ describe("a pasted link in a connected tab", () => {
     expect(storage.entries.get(TOKEN_KEY)).toBe("old");
     await tick();
     expect(storage.entries.get(TOKEN_KEY)).toBe("old");
-    expect(status(root)).toBe("Live");
+    expect(status(root)).toBe("Connected.");
     expect(h.net.attempts).toHaveLength(1);
     const notice = root.querySelector('[data-testid="exchange-notice"]');
     expect(notice?.textContent).toContain(EXCHANGE_FAILED);
@@ -353,13 +428,33 @@ describe("a pasted link in a connected tab", () => {
     at.paste(`#code=${FRESH}`);
     // While the exchange runs, the working session is untouched.
     expect(storage.entries.get(TOKEN_KEY)).toBe("old");
-    expect(status(root)).toBe("Live");
+    expect(status(root)).toBe("Connected.");
     await tick();
     expect(storage.entries.get(TOKEN_KEY)).toBe("new");
     expect(h.net.attempts).toHaveLength(2);
     h.step(step({ step: "open" }));
     expect(sentFrames(h).filter((frame) => (frame as { t: string }).t === "hello").map((frame) => (frame as { token?: string }).token)).toEqual(["old", "new"]);
     expect([...storage.entries.values()]).toEqual(["new"]);
+  });
+});
+
+describe("a failed link's message", () => {
+  test("does not outlive its link: a later refused token asks for a new one, with no stale notice", async () => {
+    const storage = session();
+    storage.setItem(TOKEN_KEY, "old");
+    const { h, root } = mountApp({ code: USED, session: () => storage, request: exchange({ status: 401 }) });
+    await tick();
+    expect(root.querySelector('[data-testid="exchange-notice"]')?.textContent).toContain(EXCHANGE_FAILED);
+    h.step(step({ step: "open" }));
+    h.step(step({ step: "token_refused", code: 4401 }));
+    expect(status(root)).toBe(`Sign-in needed. The server refused the token. ${RUN_CLIENT_OPEN}`);
+    expect(root.querySelector('[data-testid="exchange-notice"]')).toBeNull();
+  });
+
+  test("still shows while the failed link is what left the tab without a token", async () => {
+    const { root } = mountApp({ code: USED, request: exchange({ status: 401 }) });
+    await tick();
+    expect(status(root)).toBe(`Sign-in needed. ${EXCHANGE_FAILED}`);
   });
 });
 
@@ -374,7 +469,7 @@ describe("the stored token", () => {
     storage.entries.clear();
     const second = mountApp({ session: () => storage });
     expect(second.h.net.attempts).toHaveLength(0);
-    expect(status(second.root)).toBe(`NeedsToken · ${RUN_CLIENT_OPEN}`);
+    expect(status(second.root)).toBe(`Sign-in needed. ${RUN_CLIENT_OPEN}`);
   });
 
   test("NeedsToken clears it", () => {
@@ -384,7 +479,7 @@ describe("the stored token", () => {
     h.step(step({ step: "open" }));
     h.step(step({ step: "token_refused", code: 4401 }));
     expect(storage.entries.has(TOKEN_KEY)).toBe(false);
-    expect(status(root)).toBe(`NeedsToken · The server refused the token. ${RUN_CLIENT_OPEN}`);
+    expect(status(root)).toBe(`Sign-in needed. The server refused the token. ${RUN_CLIENT_OPEN}`);
   });
 
   test("a sessionStorage that throws falls back to memory, quietly", async () => {
@@ -444,6 +539,43 @@ test("the token appears only in hello: never in the page, the URL, a log, an err
     });
     history.replaceState = replace;
     history.pushState = push;
+  }
+});
+
+test("a pasted link leaves neither its code nor the token in the page, the notices, the URL or a log", async () => {
+  const sentinel = "paste-sentinel-token";
+  const logged: string[] = [];
+  const methods = ["log", "info", "warn", "error", "debug"] as const;
+  const originals = methods.map((name) => console[name]);
+  methods.forEach((name) => {
+    console[name] = (...args: unknown[]) => void logged.push(args.map(String).join(" "));
+  });
+  try {
+    const storage = session();
+    const at = page("");
+    const replies = [{ status: 200, body: { token: sentinel } }, { status: 401 }];
+    const request: ExchangeRequest = async () => {
+      const reply = replies.shift() ?? { status: 500 };
+      return { status: reply.status, json: async () => ("body" in reply ? reply.body : undefined) };
+    };
+    const { h, root } = mountApp({ session: () => storage, page: at, request });
+    const seen = (): string[] => [root.innerHTML, document.title, at.location.hash, at.location.pathname, at.location.search, ...logged, ...Object.keys(localStorage).map((key) => localStorage.getItem(key) ?? "")];
+    at.paste(`#view&code=${CODE}`);
+    await tick();
+    expect(at.location.hash).toBe("#view");
+    expect(seen().filter((text) => text.includes(sentinel) || text.includes(CODE))).toEqual([]);
+    h.step(step({ step: "open" }));
+    // The failure notice: a used code, then a malformed one.
+    at.paste(`#code=${USED}`);
+    await tick();
+    expect(root.querySelector('[data-testid="exchange-notice"]')?.textContent).toBe(`${EXCHANGE_FAILED}Dismiss`);
+    at.paste("#code=not-a-code");
+    await tick();
+    expect(seen().filter((text) => text.includes(USED) || text.includes("not-a-code") || text.includes(sentinel))).toEqual([]);
+  } finally {
+    methods.forEach((name, i) => {
+      console[name] = originals[i] as (typeof console)[typeof name];
+    });
   }
 });
 

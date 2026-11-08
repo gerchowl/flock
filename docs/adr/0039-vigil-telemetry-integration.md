@@ -76,8 +76,11 @@ The event names and their meaning carry over unchanged. **The fields do not: thi
 
   Character keys never carry their character. Paste events have only `input_len` and `input_class=paste` beyond the fixed event envelope. Pending UTF-8, incomplete input and unsupported escape diagnostics carry only `input_len` beyond their envelope. Terminal-key records use the same key metadata, with no character, raw encoding, key state or codepoint. Resize belongs to the closed schema but the raw byte parser does not produce resize events. Named media and modifier keys collapse their subtypes. The report allowlist excludes all input metadata, and also excludes legacy `raw_bytes`, `parsed`, `key`, `code`, `bytes`, `sequence` and `encoded` fields.
 
-  Non-input payload sizes on self-compaction, clipboard-image staging and handoff
-  events use `byte_count`. Structured worker shutdown uses `failure_code` for
+  Diagnostic payload sizes on self-compaction, clipboard-image staging and handoff
+  events use `byte_count`. Specifically, `self_compact_continued.byte_count` is
+  the UTF-8 byte length of flock-authored continuation text typed into the pane,
+  not user keystrokes. Neither the continuation text nor input characters or bytes
+  are logged. Structured worker shutdown uses `failure_code` for
   its typed flk error code, not a process exit status. Reports allow these
   unambiguous diagnostic names while continuing to exclude all input metadata
   and the legacy `code`/`bytes` fields, including in existing log files.

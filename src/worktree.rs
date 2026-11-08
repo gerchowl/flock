@@ -1,3 +1,4 @@
+use crate::process::CommandFailure;
 use std::path::{Path, PathBuf};
 
 pub(crate) mod processes;
@@ -383,13 +384,13 @@ pub(crate) fn remove_worktree_unattended(
     let Some(refusal) = classify_worktree_remove_error(&err) else {
         // Not one `--force` clears: a locked worktree, a missing registration,
         // anything else. Git's own words are the answer.
-        return WorktreeRemoveOutcome::Failed(err);
+        return WorktreeRemoveOutcome::Failed(err.into());
     };
     // Already forced and still refused: the operator spent their confirmation
     // and it was not enough (#351's rule, unchanged). Forcing again would just
     // be the same command twice.
     if force || !may_force_unattended(path, refusal) {
-        return WorktreeRemoveOutcome::Failed(err);
+        return WorktreeRemoveOutcome::Failed(err.into());
     }
     match attempt(true) {
         // Logged only once the retry has actually worked — a record of a
@@ -404,7 +405,7 @@ pub(crate) fn remove_worktree_unattended(
         }
         // Report the forced attempt's words: the first refusal is no longer the
         // news, whatever it was.
-        Err(forced_err) => WorktreeRemoveOutcome::Failed(forced_err),
+        Err(forced_err) => WorktreeRemoveOutcome::Failed(forced_err.into()),
     }
 }
 
@@ -445,24 +446,34 @@ pub(crate) fn build_worktree_add_new_branch_command(
 /// Only the default base is rewritten: `invalid reference: <some-branch>` for
 /// an explicit base is a genuinely different problem (a typo, or a branch that
 /// isn't there) and git already names it.
-pub(crate) fn explain_worktree_add_failure(base: &str, message: &str) -> String {
+pub(crate) fn explain_worktree_add_failure(
+    base: &str,
+    message: impl Into<CommandFailure>,
+) -> CommandFailure {
+    let message = message.into();
+    if message.data.is_some() {
+        return message;
+    }
     if base == "HEAD" && message.contains("invalid reference: HEAD") {
-        return format!("{message}\nno commits yet — make one, then branch a worktree.");
+        let text = format!("{message}\nno commits yet — make one, then branch a worktree.");
+        return message.with_message(text);
     }
     if message.contains("not a git repository") {
         // git's parenthetical ("or any of the parent directories") is dropped:
         // it doubles the length and the remedy is the same either way.
-        return "fatal: not a git repository\nrun `git init` and commit, then branch a worktree."
-            .to_string();
+        return message.with_message(
+            "fatal: not a git repository\nrun `git init` and commit, then branch a worktree."
+                .to_string(),
+        );
     }
-    message.to_string()
+    message
 }
 
-pub(crate) fn run_worktree_command(command: &WorktreeCommand) -> Result<(), String> {
+pub(crate) fn run_worktree_command(command: &WorktreeCommand) -> Result<(), CommandFailure> {
     let output = crate::process::TracedCommand::new(&command.program, "worktree")
         .args(&command.args)
         .output_traced()
-        .map_err(|err| err.to_string())?;
+        .map_err(CommandFailure::from)?;
 
     if output.status.success() {
         // A worktree add/remove/move relocates repo paths on disk, so every
@@ -478,7 +489,8 @@ pub(crate) fn run_worktree_command(command: &WorktreeCommand) -> Result<(), Stri
         format!("{} failed with status {}", command.program, output.status)
     } else {
         message
-    })
+    }
+    .into())
 }
 
 /// Evidence-gated decision for deleting a worktree's local branch.
@@ -513,7 +525,7 @@ pub(crate) fn run_command_capture(
     program: &str,
     args: &[&str],
     cwd: Option<&std::path::Path>,
-) -> Result<String, String> {
+) -> Result<String, CommandFailure> {
     run_command_capture_with_cadence(program, args, cwd, crate::process::ExecCadence::Lifecycle)
 }
 
@@ -527,7 +539,7 @@ fn run_command_capture_periodic(
     program: &str,
     args: &[&str],
     cwd: Option<&std::path::Path>,
-) -> Result<String, String> {
+) -> Result<String, CommandFailure> {
     run_command_capture_with_cadence(program, args, cwd, crate::process::ExecCadence::Periodic)
 }
 
@@ -536,7 +548,7 @@ fn run_command_capture_with_cadence(
     args: &[&str],
     cwd: Option<&std::path::Path>,
     cadence: crate::process::ExecCadence,
-) -> Result<String, String> {
+) -> Result<String, CommandFailure> {
     let mut command = crate::process::TracedCommand::new(program, "worktree");
     command.args(args);
     if cadence == crate::process::ExecCadence::Periodic {
@@ -545,7 +557,7 @@ fn run_command_capture_with_cadence(
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
-    let output = command.output_traced().map_err(|err| err.to_string())?;
+    let output = command.output_traced().map_err(CommandFailure::from)?;
     finished_output(program, output)
 }
 
@@ -563,10 +575,10 @@ fn run_command_capture_with_timeout(
     args: &[&str],
     cwd: Option<&std::path::Path>,
     timeout: std::time::Duration,
-) -> Result<String, String> {
+) -> Result<String, CommandFailure> {
     let output = network_command(program, args, cwd)
         .output_traced_with_timeout(timeout)
-        .map_err(|err| err.to_string())?;
+        .map_err(CommandFailure::from)?;
     finished_output(program, output)
 }
 
@@ -588,16 +600,17 @@ fn network_command(
     command
 }
 
-/// Turn a finished child into this module's `Result<String, String>`: stderr on
+/// Turn a finished child into this module's `Result<String, CommandFailure>`: stderr on
 /// failure, trimmed stdout on success.
-fn finished_output(program: &str, output: std::process::Output) -> Result<String, String> {
+fn finished_output(program: &str, output: std::process::Output) -> Result<String, CommandFailure> {
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         return Err(if stderr.is_empty() {
             format!("{program} failed with status {}", output.status)
         } else {
             stderr
-        });
+        }
+        .into());
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
@@ -1267,7 +1280,9 @@ fn remote_has_branch(
     .map_err(|err| err.to_string())?;
     match output.status.code() {
         Some(2) => Ok(false),
-        _ => finished_output("git", output).map(|_| true),
+        _ => finished_output("git", output)
+            .map(|_| true)
+            .map_err(Into::into),
     }
 }
 
@@ -2344,7 +2359,9 @@ pub(crate) fn delete_local_branch(repo_root: &std::path::Path, branch: &str) -> 
         return Err(format!("refusing to delete protected branch '{branch}'"));
     }
     let root = repo_root.to_string_lossy().to_string();
-    run_command_capture("git", &["-C", &root, "branch", "-D", branch], None).map(|_| ())
+    run_command_capture("git", &["-C", &root, "branch", "-D", branch], None)
+        .map(|_| ())
+        .map_err(Into::into)
 }
 
 /// Everything the kill path decides about ONE checkout, resolved in one place.
@@ -2811,13 +2828,15 @@ pub(crate) fn parse_worktree_list_porcelain(output: &str) -> Vec<ExistingWorktre
     entries
 }
 
-pub(crate) fn list_existing_worktrees(repo_root: &Path) -> Result<Vec<ExistingWorktree>, String> {
+pub(crate) fn list_existing_worktrees(
+    repo_root: &Path,
+) -> Result<Vec<ExistingWorktree>, CommandFailure> {
     let output = crate::process::TracedCommand::new("git", "worktree")
         .arg("-C")
         .arg(repo_root)
         .args(["worktree", "list", "--porcelain"])
         .output_traced()
-        .map_err(|err| err.to_string())?;
+        .map_err(CommandFailure::from)?;
 
     if output.status.success() {
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -2829,7 +2848,8 @@ pub(crate) fn list_existing_worktrees(repo_root: &Path) -> Result<Vec<ExistingWo
         format!("git worktree list failed with status {}", output.status)
     } else {
         stderr
-    })
+    }
+    .into())
 }
 
 /// #175 S2 — the atomic move a scheduled reap performs when the classified

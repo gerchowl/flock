@@ -63,11 +63,17 @@ pub(crate) const REFUSED: i32 = 10;
 /// Delegate start / wait: the delegate did not start.
 pub(crate) const DELEGATE_NOT_STARTED: i32 = 11;
 
+/// Delegate: authoritative session identity could not be rebound.
+pub(crate) const SESSION_UNBOUND: i32 = 12;
+
 /// Msg: the receiver refused the message.
 pub(crate) const MSG_REFUSED: i32 = 13;
 
 /// Refused by policy: an operator-only verb called from an agent (ADR-0014), an agent widening a delegate's question policy, or a goal write the caller may not make (ADR-0030 §1).
 pub(crate) const POLICY_REFUSED: i32 = 13;
+
+/// A dispatched mutation timed out: inspect its outcome before retrying.
+pub(crate) const REQUEST_OUTCOME_UNKNOWN: i32 = 14;
 
 /// Client gave up reconnecting to its server (EX_TEMPFAIL).
 pub(crate) const RECONNECT_GAVE_UP: i32 = 75;

@@ -25,7 +25,7 @@ phase = 'verify' if pin['hash'] else 'probe'
 if os.environ.get('BLOCK_PHASE') == phase:
     signal.signal(signal.SIGINT, signal.SIG_DFL)
     signal.signal(signal.SIGTERM, signal.SIG_DFL)
-    os.write(int(os.environ['READY_FD']), b'ready\\n')
+    os.write(int(os.environ['READY_FD']), f'ready {os.getpid()}\\n'.encode())
     signal.pause()
 if os.environ.get('FAIL_PHASE') == phase:
     print('fixture fetch failure', file=sys.stderr)
@@ -129,25 +129,30 @@ fi' DEBUG
                     try:
                         ready, _, _ = select.select([read_fd], [], [], 10)
                         self.assertTrue(ready, 'fake fetch failed to reach the requested stage')
-                        self.assertEqual(os.read(read_fd, 64), b'ready\n')
-                        os.killpg(child.pid, sig)
+                        notice = os.read(read_fd, 64)
+                        self.assertRegex(notice, rb'\Aready [0-9]+\n\Z')
+                        if gate_restore:
+                            # Fail only the ready fetch so Bash enters EXIT naturally.
+                            # Signalling the group here lets just's forwarded TERM
+                            # re-enter restore before its DEBUG gate can announce it.
+                            os.kill(int(notice.split()[1]), sig)
+                        else:
+                            os.killpg(child.pid, sig)
                         if gate_restore:
                             ready, _, _ = select.select([restore_read], [], [], 10)
                             self.assertTrue(ready, 'recipe never entered its restore callback')
-                            notice = os.read(restore_read, 64)
-                            self.assertIn(notice, [b'restore\n', b''])
-                            if notice:
-                                # A group TERM also reaches just, which forwards it to Bash.
-                                # Deliver the duplicate while EXIT is active, then proceed.
-                                os.killpg(child.pid, signal.SIGTERM)
-                                try:
-                                    os.write(release_write, b'continue\n')
-                                except BrokenPipeError:
-                                    # A reentrant handler may finish before this gate opens.
-                                    # The manifest assertion still requires restoration.
-                                    pass
-                            # EOF means the signal handler restored directly and exited,
-                            # without entering EXIT's callback. Both paths must restore.
+                            self.assertEqual(os.read(restore_read, 64), b'restore\n',
+                                             'restore gate must fire before the duplicate TERM')
+                            # A group TERM also reaches just, which forwards it to Bash.
+                            # Deliver the duplicate while EXIT is active, then proceed.
+                            os.killpg(child.pid, signal.SIGTERM)
+                            try:
+                                os.write(release_write, b'continue\n')
+                            except BrokenPipeError:
+                                # Only gate release may race the duplicate TERM closing
+                                # its reader after reentrant restoration. communicate below
+                                # must still prove exit and the original manifest.
+                                pass
                         stdout, stderr = child.communicate(timeout=10)
                         self.assertNotEqual(child.returncode, 0, stdout + stderr)
                         self.assertEqual((root / 'nix/client-deps.json').read_bytes(), original)

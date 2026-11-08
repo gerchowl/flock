@@ -25,19 +25,28 @@ pub(crate) struct Routes {
     tick_at: Option<Instant>,
 }
 
-struct Retry {
+pub(super) struct Retry {
     enrollment: u64,
     generation: u64,
     attempts: u32,
-    at: Instant,
+    pub(super) at: Instant,
+    /// Repeated failure wakes from one owner never bypass this floor.
+    pub(super) wake_at: Instant,
+    /// A failed post-expiry custody settlement must honor its scheduled backoff.
+    pub(super) custody_correction: bool,
 }
 
 impl Retry {
-    fn superseded(&self, enrollment: u64, generation: u64, awakened: bool) -> bool {
+    pub(super) fn superseded(&self, enrollment: u64, generation: u64, awakened: bool) -> bool {
         awakened || self.enrollment != enrollment || self.generation != generation
     }
 
-    fn failed(previous: Option<&Self>, enrollment: u64, generation: u64, now: Instant) -> Self {
+    pub(super) fn failed(
+        previous: Option<&Self>,
+        enrollment: u64,
+        generation: u64,
+        now: Instant,
+    ) -> Self {
         let attempts = previous
             .filter(|r| r.enrollment == enrollment && r.generation == generation)
             .map_or(0, |r| r.attempts.saturating_add(1));
@@ -59,6 +68,8 @@ impl Retry {
             generation,
             attempts,
             at: now + delay,
+            wake_at: now + Duration::from_secs(4),
+            custody_correction: false,
         }
     }
 }

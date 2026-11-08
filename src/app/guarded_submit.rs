@@ -15,6 +15,17 @@ pub(crate) const INJECTION_LEASE: Duration = Duration::from_secs(5 + CONFIRM_WIN
 /// How long clearing a draft, or reading it back, may take before flock stops
 /// and keeps the draft in the pane's stash.
 const DRAFT_STEP: Duration = Duration::from_secs(1);
+/// Conservative configured wait bound: draft clear, restore-ready and restore-read
+/// (3 steps), paste write and two Enter confirmations (3 windows), the post-write
+/// Enter gap, and one poll overshoot per wait. This is 9470 ms, independent of
+/// the shorter injection lease. OS/app scheduling stalls can exceed these waits
+/// and must still be reported as unknown if the client loses the final receipt.
+pub(crate) const SUBMIT_WAIT_BOUND: Duration = DRAFT_STEP
+    .saturating_mul(3)
+    .saturating_add(CONFIRM_WINDOW.saturating_mul(3))
+    .saturating_add(crate::cli::pane::PANE_RUN_SUBMIT_GAP)
+    .saturating_add(POLL.saturating_mul(7));
+
 /// Backspaces past the draft's visible length, for whitespace the composer
 /// read trims. Extra ones on an empty composer do nothing.
 const CLEAR_SLACK: usize = 8;
@@ -36,6 +47,7 @@ pub(crate) struct Attempt {
     pub(crate) retried: bool,
     wake: bool,
     session: Option<String>,
+    transcript_submit: Option<crate::session_evidence::Submission>,
     settle: Duration,
     /// The operator's draft, moved aside for this injection (#850).
     pub(crate) stash: Option<DraftStash>,
@@ -273,7 +285,9 @@ fn codex_hint_prefix(rows: &[&str]) -> bool {
 
 /// Read only the editor, without the idle and safety gates used to authorize Enter.
 pub(crate) fn composer_contents(agent: Agent, screen: &str, unfaint: &str) -> Option<String> {
-    composer_rows(agent, screen, unfaint).map(|(rows, _, _)| rows.join("\n"))
+    let screen = crate::detect::readiness_text(agent, screen);
+    let unfaint = crate::detect::readiness_text(agent, unfaint);
+    composer_rows(agent, &screen, &unfaint).map(|(rows, _, _)| rows.join("\n"))
 }
 
 /// Classify a live pane's editor from one styled read of its detection text.
@@ -309,6 +323,10 @@ fn composer_unfaint_with_width(
     text: &str,
     cols: Option<u16>,
 ) -> Composer {
+    let screen = crate::detect::readiness_text(agent, screen);
+    let unfaint = crate::detect::readiness_text(agent, unfaint);
+    let screen = screen.as_ref();
+    let unfaint = unfaint.as_ref();
     let Some((rows, body_start, body_end)) =
         composer_rows_with_width(agent, screen, unfaint, cols, Some(text))
     else {
@@ -384,6 +402,8 @@ fn editor_rows_for_text(
     expected: Option<&str>,
 ) -> Option<Vec<String>> {
     let (screen, unfaint) = runtime.detection_text_and_unfaint();
+    let screen = crate::detect::readiness_text(agent, &screen);
+    let unfaint = crate::detect::readiness_text(agent, &unfaint);
     let (rows, _, _) = composer_rows_with_width(
         agent,
         &screen,
@@ -851,6 +871,10 @@ impl App {
             retried: false,
             wake,
             session: session.map(str::to_owned),
+            transcript_submit: super::creation::terminal_agent_session_info(terminal)
+                .as_ref()
+                .filter(|info| session == Some(info.value.as_str()))
+                .and_then(crate::session_evidence::Submission::capture),
             settle,
             stash: draft.map(|draft| DraftStash {
                 draft,
@@ -934,9 +958,15 @@ impl App {
             Err(reason) => return Some(Outcome::Abandoned(reason)),
         };
         let reported_text = crate::control_bytes::strip(&attempt.text);
-        let reported = terminal.prompt_report_generation > attempt.prompt_generation
-            && terminal.last_prompt.as_deref() == Some(reported_text.trim());
-        if !attempt.sent && (started || reported) {
+        let prompt_reported = terminal.prompt_report_generation > attempt.prompt_generation;
+        let reported =
+            prompt_reported && terminal.last_prompt.as_deref() == Some(reported_text.trim());
+        let transcript = attempt
+            .transcript_submit
+            .as_ref()
+            .map(|proof| proof.evidence(&reported_text))
+            .unwrap_or(crate::session_evidence::Evidence::Quiet);
+        if !attempt.sent && (started || prompt_reported || transcript.active()) {
             return Some(Outcome::Abandoned("turn_started_before_enter"));
         }
         if attempt
@@ -948,6 +978,9 @@ impl App {
         }
         if attempt.sent && reported {
             return Some(Outcome::Accepted);
+        }
+        if attempt.sent && transcript.confirmed() {
+            return Some(Outcome::ObservedAccepted);
         }
         if attempt.sent && started {
             return Some(Outcome::ObservedAccepted);
@@ -1032,6 +1065,12 @@ impl App {
             )
             .into(),
         );
+        if !attempt.sent {
+            attempt.transcript_submit = attempt
+                .transcript_submit
+                .as_ref()
+                .and_then(crate::session_evidence::Submission::at_current_end);
+        }
         if runtime.try_send_flock_authored(Bytes::from(enter)).is_err() {
             return Some(Outcome::Abandoned("write_failed"));
         }
@@ -1507,6 +1546,7 @@ impl Attempt {
             retried: false,
             wake: false,
             session: None,
+            transcript_submit: None,
             settle: Duration::ZERO,
             stash: None,
         }

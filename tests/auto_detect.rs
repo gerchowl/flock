@@ -71,11 +71,11 @@ fn cleanup_spawned_flock(spawned: SpawnedFlock, base: PathBuf) {
     cleanup_test_base(&base);
 }
 
-fn wait_for_socket(path: &Path, timeout: Duration) {
+fn wait_for_socket(path: &Path, timeout: Duration, client: Option<u32>) {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         if path.exists() && UnixStream::connect(path).is_ok() {
-            support::sandboxes::record_socket(path);
+            support::sandboxes::record_socket(path, client);
             return;
         }
         thread::sleep(Duration::from_millis(25));
@@ -177,6 +177,22 @@ fn spawn_flock_auto(
     api_socket_path: &Path,
     _client_socket_path: &Path,
 ) -> SpawnedFlock {
+    spawn_flock_auto_executable(
+        Path::new(env!("CARGO_BIN_EXE_flk")),
+        config_home,
+        runtime_dir,
+        api_socket_path,
+        _client_socket_path,
+    )
+}
+
+fn spawn_flock_auto_executable(
+    executable: &Path,
+    config_home: &Path,
+    runtime_dir: &Path,
+    api_socket_path: &Path,
+    _client_socket_path: &Path,
+) -> SpawnedFlock {
     fs::create_dir_all(config_home.join(support::paths::app_dir_name())).unwrap();
     fs::create_dir_all(runtime_dir).unwrap();
     register_runtime_dir(runtime_dir);
@@ -197,7 +213,7 @@ fn spawn_flock_auto(
         })
         .unwrap();
 
-    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_flk"));
+    let mut cmd = CommandBuilder::new(executable);
     // No subcommand, no --no-session → auto-detect launch
     for (key, value) in support::environment::isolated_env(config_home, runtime_dir) {
         cmd.env(key, value);
@@ -274,6 +290,104 @@ fn spawn_flock_no_session(
         _master: pair.master,
         child,
     }
+}
+
+/// Scope cleanup also runs when an identity assertion fails.
+struct ExecutableSandbox(PathBuf);
+impl Drop for ExecutableSandbox {
+    fn drop(&mut self) {
+        cleanup_test_base(&self.0);
+    }
+}
+
+#[test]
+fn auto_detect_symlink_daemon_has_canonical_identity_after_alias_removal() {
+    use std::io::Read;
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    fs::create_dir_all(&base).unwrap();
+    let _sandbox = ExecutableSandbox(base.clone());
+    let canonical = fs::canonicalize(env!("CARGO_BIN_EXE_flk")).unwrap();
+    let alias = base.join("flk-alias");
+    std::os::unix::fs::symlink(&canonical, &alias).unwrap();
+    let runtime = base.join("runtime");
+    let flock = spawn_flock_auto_executable(
+        &alias,
+        &base.join("config"),
+        &runtime,
+        &base.join("api.sock"),
+        &base.join("client.sock"),
+    );
+    let mut output = flock._master.try_clone_reader().unwrap();
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let reader = thread::spawn(move || {
+        let result = (|| -> std::io::Result<()> {
+            let mut seen = Vec::new();
+            let mut bytes = [0; 4096];
+            // This query is emitted by the thin client only AFTER auto-detect
+            // has spawned the daemon and observed its listening socket.
+            while seen.len() < 128 * 1024 {
+                let n = output.read(&mut bytes)?;
+                if n == 0 {
+                    return Err(std::io::ErrorKind::UnexpectedEof.into());
+                }
+                seen.extend_from_slice(&bytes[..n]);
+                if seen.windows(6).any(|w| w == b"\x1b]10;?") {
+                    return Ok(());
+                }
+            }
+            Err(std::io::Error::other(
+                "client output exceeded the readiness bound",
+            ))
+        })();
+        let _ = tx.send(result);
+    });
+    rx.recv_timeout(Duration::from_secs(10))
+        .expect("auto-detect never reached client attach")
+        .expect("auto-detect exited before attach");
+    reader.join().unwrap();
+    let pids = support::flock_server_pids_for_runtime_dir(&runtime).unwrap();
+    assert_eq!(pids.len(), 1, "one isolated daemon must own the runtime");
+    let identity = support::process_table::process_info(pids[0]).unwrap();
+    assert_eq!(
+        identity.exe_path.as_deref(),
+        Some(canonical.as_path()),
+        "recorded executable"
+    );
+    assert_eq!(
+        identity.argv.first().map(String::as_str),
+        canonical.to_str(),
+        "daemon argv[0]"
+    );
+    fs::remove_file(alias).unwrap();
+    assert_eq!(
+        support::flock_server_pids_for_runtime_dir(&runtime).unwrap(),
+        pids,
+        "ownership proof survives removal of the launch alias"
+    );
+    drop(flock);
+}
+
+#[test]
+fn handoff_unresolvable_executable_is_a_typed_failure_without_fallback() {
+    let base = unique_test_dir();
+    fs::create_dir_all(&base).unwrap();
+    let _sandbox = ExecutableSandbox(base.clone());
+    let mut command = Command::new(env!("CARGO_BIN_EXE_flk"));
+    for (key, value) in
+        support::environment::isolated_env(&base.join("config"), &base.join("runtime"))
+    {
+        command.env(key, value);
+    }
+    let output = command
+        .args(["--json", "server", "live-handoff", "--import-exe"])
+        .arg(base.join("removed-binary"))
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let response: Value = serde_json::from_slice(&output.stdout).expect("typed failure envelope");
+    assert_eq!(response["error"]["code"], "server_executable_unresolved");
+    assert_eq!(response["error"]["retry"], "after_inspecting");
 }
 
 fn ping_socket(socket_path: &Path) -> String {
@@ -381,7 +495,11 @@ fn auto_detect_daemon_is_reaped_by_the_runtime_dir_sweep() {
     let flock = spawn_flock_auto(&config_home, &runtime_dir, &api_socket, &client_socket);
     let client_pid = flock.child.process_id().expect("client should have PID");
 
-    wait_for_socket(&api_socket, Duration::from_secs(10));
+    wait_for_socket(
+        &api_socket,
+        Duration::from_secs(10),
+        flock.child.process_id(),
+    );
 
     // Finding the daemon is itself the capability under test: on macOS the
     // sweep used to enumerate nothing, so nothing here could ever have reaped
@@ -415,6 +533,10 @@ fn auto_detect_daemon_is_reaped_by_the_runtime_dir_sweep() {
     for pid in &daemon_pids {
         assert_durable_server_record(&base, *pid);
     }
+    assert!(
+        !base.join(format!(".server-{client_pid}.json")).exists(),
+        "attached client must not be recorded as a daemon"
+    );
     cleanup_spawned_flock(flock, base);
 
     // `terminate_pid` escalates SIGTERM to SIGKILL and then waits, but a
@@ -463,8 +585,16 @@ fn auto_detect_no_server_spawns_server_and_attaches() {
     let flock = spawn_flock_auto(&config_home, &runtime_dir, &api_socket, &client_socket);
 
     // Wait for both sockets to appear (server was spawned).
-    wait_for_socket(&api_socket, Duration::from_secs(10));
-    wait_for_socket(&client_socket, Duration::from_secs(10));
+    wait_for_socket(
+        &api_socket,
+        Duration::from_secs(10),
+        flock.child.process_id(),
+    );
+    wait_for_socket(
+        &client_socket,
+        Duration::from_secs(10),
+        flock.child.process_id(),
+    );
 
     // Verify the API socket responds to ping (server is running).
     let response = ping_socket(&api_socket);
@@ -506,8 +636,8 @@ fn auto_detect_server_running_attaches_directly() {
             server.child.process_id().unwrap()
         ))
         .is_file());
-    wait_for_socket(&api_socket, Duration::from_secs(10));
-    wait_for_socket(&client_socket, Duration::from_secs(10));
+    wait_for_socket(&api_socket, Duration::from_secs(10), None);
+    wait_for_socket(&client_socket, Duration::from_secs(10), None);
 
     let server_pid = server.child.process_id().expect("server should have PID");
 
@@ -562,8 +692,16 @@ fn auto_detect_socket_path_consistency() {
     let flock = spawn_flock_auto(&config_home, &runtime_dir, &api_socket, &client_socket);
 
     // Wait for both sockets to appear at the custom paths.
-    wait_for_socket(&api_socket, Duration::from_secs(10));
-    wait_for_socket(&client_socket, Duration::from_secs(10));
+    wait_for_socket(
+        &api_socket,
+        Duration::from_secs(10),
+        flock.child.process_id(),
+    );
+    wait_for_socket(
+        &client_socket,
+        Duration::from_secs(10),
+        flock.child.process_id(),
+    );
 
     // Verify sockets exist at the specified paths.
     assert!(
@@ -605,7 +743,7 @@ fn no_session_flag_runs_monolithically() {
     let flock = spawn_flock_no_session(&config_home, &runtime_dir, &api_socket);
 
     // Wait for the API socket (monolithic mode creates it).
-    wait_for_socket(&api_socket, Duration::from_secs(10));
+    wait_for_socket(&api_socket, Duration::from_secs(10), None);
 
     // Verify the API socket exists and responds.
     let response = ping_socket(&api_socket);
@@ -678,8 +816,8 @@ fn cli_subcommands_work_through_server() {
 
     // Start a server.
     let server = spawn_server(&config_home, &runtime_dir, &api_socket, &client_socket);
-    wait_for_socket(&api_socket, Duration::from_secs(10));
-    wait_for_socket(&client_socket, Duration::from_secs(10));
+    wait_for_socket(&api_socket, Duration::from_secs(10), None);
+    wait_for_socket(&client_socket, Duration::from_secs(10), None);
 
     // Test `flock workspace list` through the server's API socket.
     let output = run_cli(&api_socket, &["workspace", "list"]);
@@ -724,8 +862,16 @@ fn auto_detect_server_persists_and_reattaches() {
 
     // Run `flock` — auto-detect spawns server + attaches client.
     let mut client1 = spawn_flock_auto(&config_home, &runtime_dir, &api_socket, &client_socket);
-    wait_for_socket(&api_socket, Duration::from_secs(10));
-    wait_for_socket(&client_socket, Duration::from_secs(10));
+    wait_for_socket(
+        &api_socket,
+        Duration::from_secs(10),
+        client1.child.process_id(),
+    );
+    wait_for_socket(
+        &client_socket,
+        Duration::from_secs(10),
+        client1.child.process_id(),
+    );
 
     // Verify API responds.
     let response = ping_socket(&api_socket);
@@ -837,8 +983,8 @@ fn auto_detect_default_socket_path_from_config_dir() {
     };
 
     // Wait for sockets to appear at the default config-dir paths.
-    wait_for_socket(&api_socket, Duration::from_secs(10));
-    wait_for_socket(&client_socket, Duration::from_secs(10));
+    wait_for_socket(&api_socket, Duration::from_secs(10), None);
+    wait_for_socket(&client_socket, Duration::from_secs(10), None);
 
     // Verify both sockets exist.
     assert!(api_socket.exists(), "API socket should exist in config dir");
@@ -867,8 +1013,8 @@ fn auto_detect_writes_client_and_server_logs_to_separate_files() {
     let client_socket = runtime_dir.join("flock-client.sock");
 
     let spawned = spawn_flock_auto(&config_home, &runtime_dir, &api_socket, &client_socket);
-    wait_for_socket(&api_socket, Duration::from_secs(10));
-    wait_for_socket(&client_socket, Duration::from_secs(10));
+    wait_for_socket(&api_socket, Duration::from_secs(10), None);
+    wait_for_socket(&client_socket, Duration::from_secs(10), None);
 
     let app_dir_name = support::paths::app_dir_name();
     let log_dir = config_home.join(app_dir_name);
@@ -917,7 +1063,7 @@ fn no_session_writes_startup_logs_to_monolith_file() {
     let api_socket = runtime_dir.join("flock.sock");
 
     let spawned = spawn_flock_no_session(&config_home, &runtime_dir, &api_socket);
-    wait_for_socket(&api_socket, Duration::from_secs(10));
+    wait_for_socket(&api_socket, Duration::from_secs(10), None);
 
     let app_dir_name = support::paths::app_dir_name();
     let log_dir = config_home.join(app_dir_name);
@@ -948,8 +1094,8 @@ fn auto_detect_respects_nested_guard_before_auto_attach() {
     let client_socket = runtime_dir.join("flock-client.sock");
 
     let server = spawn_server(&config_home, &runtime_dir, &api_socket, &client_socket);
-    wait_for_socket(&api_socket, Duration::from_secs(10));
-    wait_for_socket(&client_socket, Duration::from_secs(10));
+    wait_for_socket(&api_socket, Duration::from_secs(10), None);
+    wait_for_socket(&client_socket, Duration::from_secs(10), None);
 
     let baseline = read_json_line({
         let mut stream = UnixStream::connect(&api_socket).unwrap();

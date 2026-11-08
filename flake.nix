@@ -70,6 +70,9 @@
           inherit flock flock-web flock-client;
           default = flock;
         }
+        // lib.optionalAttrs pkgs.stdenv.hostPlatform.isDarwin {
+          flock-desktop = pkgs.callPackage ./nix/desktop.nix { inherit flock-client; };
+        }
       );
 
       apps = forAllSystems (system: {
@@ -143,12 +146,16 @@
           default = self.checks.${system}.flock;
         }
         // lib.optionalAttrs pkgs.stdenv.hostPlatform.isDarwin {
-          macos-process-facts = pkgs.runCommand "flock-process-c-toolchain-check" {
-            nativeBuildInputs = self.packages.${system}.default.nativeBuildInputs;
-            SDKROOT = self.packages.${system}.default.SDKROOT;
-          } ''
-            "$CC" -Werror -c ${./src/platform/macos_process.c} -o "$out"
-          '';
+          flock-desktop = self.packages.${system}.flock-desktop;
+          macos-process-facts =
+            pkgs.runCommand "flock-process-c-toolchain-check"
+              {
+                nativeBuildInputs = self.packages.${system}.default.nativeBuildInputs;
+                SDKROOT = self.packages.${system}.default.SDKROOT;
+              }
+              ''
+                "$CC" -Werror -c ${./src/platform/macos_process.c} -o "$out"
+              '';
         }
       );
 
@@ -157,34 +164,47 @@
         let
           pkgs = pkgsFor system;
           stableSccache = stableSccacheFor pkgs;
+          lintTools = with pkgs; [
+            cargo
+            clippy
+            cmake
+            # Maintenance tests exercise Git fixtures and workflow/doc scripts.
+            git
+            jq
+            just
+            ninja
+            nodejs
+            bun
+            perl
+            pkg-config
+            rustc
+            rustfmt
+            # Maintenance tests parse hook YAML with Ruby’s standard library.
+            ruby
+            zig_0_15
+          ];
+          ghosttyHook = ''
+            export LIBGHOSTTY_VT_OPTIMIZE=Debug
+            export LIBGHOSTTY_VT_SIMD=true
+          '';
         in
         {
           # guardrails brings the governance toolbelt (prek/gitleaks/cargo-deny/
           # …) and auto-installs the pre-commit hooks; `extra` carries flock's
           # own build toolchain. SDKROOT comes from the darwin stdenv for free,
           # so the only env we restore is the libghostty-vt build tuning.
+          # Lint and archive consumers do not need source-built nextest or the
+          # patched sccache daemon. Both dominated CI shell startup (#2970,
+          # #3024). Shards install prebuilt nextest at the shared pin separately.
+          # Keep the same Rust/JS runtime tools and Zig settings.
+          ci-lint = guardrails.lib.${system}.mkDevShell {
+            inherit pkgs;
+            extra = lintTools;
+            hook = ghosttyHook;
+          };
           default = guardrails.lib.${system}.mkDevShell {
             inherit pkgs;
-            extra = with pkgs; [
-              cargo
-              (callPackage ./nix/nextest.nix { })
-              clippy
-              cmake
-              # Maintenance tests exercise Git fixtures and workflow/doc scripts.
-              git
-              jq
-              just
-              ninja
-              nodejs
-              bun
-              perl
-              pkg-config
-              rustc
-              rustfmt
-              # Maintenance tests parse hook YAML with Ruby’s standard library.
-              ruby
-              zig_0_15
-            ];
+            extra = lintTools ++ [ (pkgs.callPackage ./nix/nextest.nix { }) ];
             # Leave sccache's platform artifact cache unchanged and give the daemon a
             # persistent TMPDIR and its own socket (#1325). A wrapper covers
             # lazy startup and idle restarts without changing the shell TMPDIR.
@@ -200,9 +220,8 @@
                   export RUSTC_WRAPPER="${stableSccache}/bin/sccache"
                   ;;
               esac
-              export LIBGHOSTTY_VT_OPTIMIZE=Debug
-              export LIBGHOSTTY_VT_SIMD=true
-            '';
+            ''
+            + ghosttyHook;
           };
         }
       );

@@ -25,9 +25,10 @@ impl Server {
         Self::with(router_for::<A>).await
     }
     async fn with(make: impl FnOnce(SocketAddr) -> io::Result<Router>) -> Self {
-        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-            .await
-            .unwrap();
+        Self::on("127.0.0.1:0".parse().unwrap(), make).await
+    }
+    async fn on(bind: SocketAddr, make: impl FnOnce(SocketAddr) -> io::Result<Router>) -> Self {
+        let listener = tokio::net::TcpListener::bind(bind).await.unwrap();
         let address = listener.local_addr().unwrap();
         let app = make(address).unwrap();
         let task = tokio::spawn(async move {
@@ -335,4 +336,75 @@ async fn non_vite_suffix_lookalike_revalidates_over_http() {
 #[test]
 fn authority_without_http1_host_is_refused() {
     assert!(!origin_allowed(&HeaderMap::new(), "127.0.0.1:80"));
+}
+
+#[tokio::test]
+async fn index_csp_is_exact_on_get_head_and_304_and_absent_on_other_paths() {
+    let server = Server::start::<Fixture>().await;
+    let expected = format!(
+        "default-src 'self'; script-src 'self'; style-src 'self'; \
+         connect-src 'self' ws://{}/v1/ws; object-src 'none'; base-uri 'none'; \
+         frame-ancestors 'none'; form-action 'none'",
+        server.address
+    );
+    for path in ["/", "/index.html", "/index.html?policy=1"] {
+        let (status, headers, _) = server.request("GET", path, "").await;
+        assert_eq!(status, 200, "{path}");
+        assert_eq!(
+            headers
+                .get_all(header::CONTENT_SECURITY_POLICY)
+                .iter()
+                .count(),
+            1
+        );
+        assert_eq!(headers[header::CONTENT_SECURITY_POLICY], expected, "{path}");
+        let conditional = format!(
+            "If-None-Match: {}\r\n",
+            headers[header::ETAG].to_str().unwrap()
+        );
+        for (method, extra, status) in [("HEAD", "", 200), ("GET", conditional.as_str(), 304)] {
+            let (actual, headers, body) = server.request(method, path, extra).await;
+            assert_eq!(actual, status, "{method} {path}");
+            assert_eq!(
+                headers[header::CONTENT_SECURITY_POLICY],
+                expected,
+                "{method} {path}"
+            );
+            assert!(body.is_empty());
+        }
+    }
+    // Only the entry document is a policy-bearing page; the mounting
+    // listener owns the policy for every other response.
+    for path in [
+        "/assets/main-AbCd-E_1.js",
+        "/assets/style-1234ABcd.css",
+        "/missing",
+        "/v1/ws",
+    ] {
+        let (_, headers, _) = server.request("GET", path, "").await;
+        assert!(
+            !headers.contains_key(header::CONTENT_SECURITY_POLICY),
+            "{path}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn ipv6_index_csp_uses_self_without_invalid_literal_or_wildcard_sources() {
+    let server = Server::on("[::1]:0".parse().unwrap(), router_for::<Fixture>).await;
+    let (status, headers, _) = server.request("GET", "/", "").await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        headers[header::CONTENT_SECURITY_POLICY],
+        "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; \
+         object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'"
+    );
+}
+
+#[test]
+fn resource_policy_grants_nothing() {
+    assert_eq!(
+        RESOURCE_POLICY,
+        "default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+    );
 }

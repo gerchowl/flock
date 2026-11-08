@@ -21,14 +21,17 @@ use super::{process_lifetime, process_table};
 pub struct ServerRecord {
     /// Server PID returned by spawn, never a process-group selector.
     pub pid: u32,
-    /// Executable path, including a probe's sandbox-local copy.
+    /// Launch executable path; proof does not require that file to survive.
     pub binary: PathBuf,
     /// HOME passed to the server, beneath the sandbox.
     pub home: PathBuf,
     /// XDG_STATE_HOME passed to the server, beneath the sandbox.
     pub state: PathBuf,
-    /// Native birth identity when available to the launcher.
+    /// Native birth identity; a missing value never authorizes recovery.
     pub start_time: Option<u64>,
+    /// Exact launch argv; older records without it remain unproven.
+    #[serde(default)]
+    pub argv: Vec<String>,
 }
 
 impl ServerRecord {
@@ -53,7 +56,7 @@ impl ServerRecord {
 
     fn inspect(&self, base: &Path) -> Option<bool> {
         let before = process_lifetime::birth(self.pid)?;
-        if self.start_time.is_some_and(|expected| expected != before) {
+        if self.start_time != Some(before) {
             return Some(false);
         }
         let base = base.canonicalize().ok()?;
@@ -63,17 +66,20 @@ impl ServerRecord {
                 .filter(|p| p != &base && p.starts_with(&base))
         };
         let (home, state) = (inside(&self.home)?, inside(&self.state)?);
-        let binary = self.binary.canonicalize().ok()?;
-        if !matches!(
-            binary.file_name().and_then(|v| v.to_str()),
-            Some("flk" | "flock")
-        ) {
+        if !self.binary.is_absolute()
+            || !matches!(
+                self.binary.file_name().and_then(|v| v.to_str()),
+                Some("flk" | "flock")
+            )
+            || !server_argv(&self.argv)
+            || self.argv.first().map(Path::new) != Some(self.binary.as_path())
+        {
             return Some(false);
         }
+        // Birth, exact launch argv and private environment remain stable after
+        // a rebuild. A deleted executable path alone never proves identity.
         let info = process_table::process_info(self.pid).ok()?;
-        if info.exe_path.and_then(|p| p.canonicalize().ok()).as_ref() != Some(&binary)
-            || !server_argv(&info.argv)
-        {
+        if info.argv != self.argv {
             return Some(false);
         }
         let env = process_table::process_environment(self.pid).ok()?;
@@ -97,6 +103,15 @@ pub fn server_argv(argv: &[String]) -> bool {
 
 /// Record a direct child only in a sandbox owned by this test process.
 pub fn record_spawn(pid: u32, config: &Path, runtime: &Path) {
+    record_invocation(
+        pid,
+        config,
+        runtime,
+        vec![env!("CARGO_BIN_EXE_flk").into(), "server".into()],
+    );
+}
+
+fn record_invocation(pid: u32, config: &Path, runtime: &Path, argv: Vec<String>) {
     let Some(base) = runtime
         .parent()
         .filter(|base| owner(base) == Some(std::process::id()))
@@ -105,10 +120,11 @@ pub fn record_spawn(pid: u32, config: &Path, runtime: &Path) {
     };
     let record = ServerRecord {
         pid,
-        binary: PathBuf::from(env!("CARGO_BIN_EXE_flk")),
+        binary: PathBuf::from(&argv[0]),
         home: config.join("home"),
         state: config.join("state"),
         start_time: process_lifetime::birth(pid),
+        argv,
     };
     if let Err(error) = record.write(base) {
         eprintln!("sandbox server record {pid} retained: {error}");
@@ -118,30 +134,46 @@ pub fn record_spawn(pid: u32, config: &Path, runtime: &Path) {
 /// Record detached servers after the auto-detect startup path announces readiness.
 /// Discovery records candidates only while this process owns the sandbox; it
 /// never authorizes signals, which always recheck the durable record's identity.
-pub fn record_runtime(config: &Path, runtime: &Path) {
+pub fn record_runtime(config: &Path, runtime: &Path, client: Option<u32>) {
+    let Ok(pids) = super::flock_server_pids_for_runtime_dir(runtime) else {
+        return;
+    };
+    record_runtime_candidates(config, runtime, client, pids);
+}
+
+/// Apply runtime discovery's ownership and client exclusion to its candidates.
+pub fn record_runtime_candidates(
+    config: &Path,
+    runtime: &Path,
+    client: Option<u32>,
+    pids: impl IntoIterator<Item = u32>,
+) {
     let Some(base) = runtime
         .parent()
         .filter(|base| owner(base) == Some(std::process::id()))
     else {
         return;
     };
-    let Ok(pids) = super::flock_server_pids_for_runtime_dir(runtime) else {
-        return;
-    };
     for pid in pids {
-        if !base.join(format!(".server-{pid}.json")).exists() {
-            record_spawn(pid, config, runtime);
+        if Some(pid) == client {
+            continue;
+        }
+        let Ok(info) = process_table::process_info(pid) else {
+            continue;
+        };
+        if server_argv(&info.argv) && !base.join(format!(".server-{pid}.json")).exists() {
+            record_invocation(pid, config, runtime, info.argv);
         }
     }
 }
 
 /// Locate an owned sandbox from either its runtime or default config socket.
-pub fn record_socket(socket: &Path) {
+pub fn record_socket(socket: &Path, client: Option<u32>) {
     if let Some(base) = socket
         .ancestors()
         .find(|base| owner(base) == Some(std::process::id()))
     {
-        record_runtime(&base.join("config"), &base.join("runtime"));
+        record_runtime(&base.join("config"), &base.join("runtime"), client);
     }
 }
 
