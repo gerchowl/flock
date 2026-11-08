@@ -1,6 +1,6 @@
 //! Codex rollout records used by agent.result, checked against Codex 0.160.1.
 
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -19,41 +19,12 @@ pub(crate) fn rollout_path(home: &Path, session: &str) -> Result<Option<PathBuf>
     {
         return Ok(None);
     }
-    find_rollout(&home.join("sessions"), &format!("-{session}.jsonl"), 4)
-}
-
-fn find_rollout(
-    dir: &Path,
-    suffix: &str,
-    depth: usize,
-) -> Result<Option<PathBuf>, TranscriptError> {
-    let entries = match fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(_) => return Err(TranscriptError::Unreadable),
-    };
-    let mut found = None;
-    for entry in entries {
-        let entry = entry.map_err(|_| TranscriptError::Unreadable)?;
-        let kind = entry.file_type().map_err(|_| TranscriptError::Unreadable)?;
-        if kind.is_file() {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if name.starts_with("rollout-")
-                && name.ends_with(suffix)
-                && found.replace(entry.path()).is_some()
-            {
-                return Err(TranscriptError::Unreadable);
-            }
-        } else if kind.is_dir() && depth > 0 {
-            if let Some(path) = find_rollout(&entry.path(), suffix, depth - 1)? {
-                if found.replace(path).is_some() {
-                    return Err(TranscriptError::Unreadable);
-                }
-            }
-        }
-    }
-    Ok(found)
+    crate::session_evidence::store::lookup(
+        [home.join("sessions")],
+        crate::session_evidence::store::Layout::Codex,
+        session,
+    )
+    .map_err(|_| TranscriptError::Unreadable)
 }
 
 pub(crate) fn read_tail(path: &Path) -> Result<(Vec<TranscriptEvent>, bool), TranscriptError> {
@@ -181,6 +152,7 @@ fn parse_lines(bytes: &[u8]) -> Result<(Vec<TranscriptEvent>, bool), TranscriptE
 mod tests {
     use super::*;
     use crate::agent_transcript::turn_result;
+    use std::fs;
 
     const FINISHED: &str = include_str!("../tests/fixtures/codex/finished.jsonl");
     const IN_PROGRESS: &str = include_str!("../tests/fixtures/codex/in-progress.jsonl");
@@ -280,7 +252,11 @@ mod tests {
         let dir = home.join("sessions/2026/01/01");
         fs::create_dir_all(&dir).unwrap();
         let rollout = dir.join("rollout-2026-01-01T00-00-00-sess-codex.jsonl");
-        fs::write(&rollout, FINISHED).unwrap();
+        fs::write(
+            &rollout,
+            FINISHED.replace("00000000-0000-4000-8000-000000000613", "sess-codex"),
+        )
+        .unwrap();
         assert_eq!(rollout_path(home, "sess-codex").unwrap(), Some(rollout));
         assert_eq!(rollout_path(home, "missing").unwrap(), None);
         assert_eq!(rollout_path(home, "../rollout").unwrap(), None);

@@ -18,6 +18,12 @@ pub(crate) mod structured;
 pub(crate) mod suspend_clock;
 pub(crate) mod terminal_geometry;
 
+/// Identity shared by hard links and symlink aliases to one filesystem object.
+pub(crate) fn file_identity(metadata: &std::fs::Metadata) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    (metadata.dev(), metadata.ino())
+}
+
 /// A same-device observation is only a possible unmounted-mount hint, not proof.
 pub(crate) fn same_device_as_parent(path: &std::path::Path) -> Option<bool> {
     use std::os::unix::fs::MetadataExt;
