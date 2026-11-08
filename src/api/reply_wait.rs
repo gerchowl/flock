@@ -424,6 +424,8 @@ pub(super) fn wait_for_reply(
 
 // Shared continuation policy for the active socket wait.
 fn reply_events(hub: &EventHub, cursor: u64) -> Result<Vec<(u64, EventEnvelope)>, ErrorBody> {
+    #[cfg(test)]
+    tracing::info!(event = "test.reply_wait.poll", cursor);
     match hub.events_after(cursor) {
         Ok(events) => Ok(events),
         // A reply wait folds retained facts into its existing message state.
@@ -498,12 +500,14 @@ mod tests {
         injected_gap: std::sync::atomic::AtomicBool,
         injected_reply: std::sync::atomic::AtomicBool,
         completed: Arc<std::sync::Mutex<Vec<String>>>,
+        cursors: Arc<std::sync::Mutex<Vec<u64>>>,
     }
 
     #[derive(Default)]
     struct ReplyLoopFields {
         event: String,
         outcome: String,
+        cursor: u64,
     }
     impl tracing::field::Visit for ReplyLoopFields {
         fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
@@ -514,6 +518,11 @@ mod tests {
             }
         }
         fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+            if field.name() == "cursor" {
+                self.cursor = value;
+            }
+        }
     }
     impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for ReplyLoopEvents {
         fn on_event(
@@ -525,6 +534,9 @@ mod tests {
             let mut fields = ReplyLoopFields::default();
             event.record(&mut fields);
             match fields.event.as_str() {
+                "test.reply_wait.poll" => {
+                    self.cursors.lock().unwrap().push(fields.cursor);
+                }
                 "mesh.custody.failed"
                     if self.retained_reply.is_some()
                         && !self.injected_gap.swap(true, Ordering::SeqCst) =>
@@ -565,12 +577,14 @@ mod tests {
         hub.set_ring_cap(2);
         hub.push(queued("q", None, "question"));
         let completed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let cursors = Arc::new(std::sync::Mutex::new(Vec::new()));
         let subscriber = tracing_subscriber::registry().with(ReplyLoopEvents {
             hub: hub.clone(),
             retained_reply,
             injected_gap: Default::default(),
             injected_reply: Default::default(),
             completed: completed.clone(),
+            cursors: cursors.clone(),
         });
         let running = Arc::new(AtomicBool::new(true));
         let stop = running.clone();
@@ -614,6 +628,16 @@ mod tests {
         if retained_reply.is_some() {
             assert_eq!(hub.current_sequence(), 5);
         }
+        let expected_cursors: &[u64] = match retained_reply {
+            Some(true) => &[1],
+            Some(false) => &[1, 4],
+            None => &[],
+        };
+        assert_eq!(
+            *cursors.lock().unwrap(),
+            expected_cursors,
+            "each poll must continue from the last sequence returned by the hub"
+        );
         response
     }
 
