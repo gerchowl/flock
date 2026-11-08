@@ -805,13 +805,23 @@ impl App {
                     .terminal_for_pane(ws_idx, pane_id)
                     .and_then(super::super::creation::terminal_agent_session_info)
                     .is_some_and(|current| current != session)
-                || crate::session_evidence::path(&session).is_none()
             {
                 return encode_error(
                     id,
                     "session_unbound",
                     "exact session recovery evidence no longer matches the agent",
                 );
+            }
+            match crate::session_evidence::checked_path(&session) {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    return encode_error(
+                        id,
+                        "session_unbound",
+                        "exact session recovery evidence no longer matches the agent",
+                    )
+                }
+                Err(error) => return encode_error(id, "session_unbound", error.to_string()),
             }
             // The caller selects an agent, never its session. Bind only the
             // identity retained by that agent's own hook or restore path.
@@ -2461,6 +2471,60 @@ mod tests {
         assert_eq!(get(&mut app)["error"]["code"], "pane_not_found");
         crate::test_support::attest_pane_caller(&mut app, pane_id);
         assert_eq!(get(&mut app)["result"]["pane"]["pane_id"], public.as_str());
+    }
+
+    #[tokio::test]
+    async fn recovery_refuses_unreadable_claude_project_and_names_store() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = crate::test_support::TempDir::socket();
+        let home = root.path().join("home");
+        std::env::set_var("HOME", &home);
+        std::env::set_var("XDG_STATE_HOME", root.path().join("state"));
+        let projects = home.join(".claude/projects");
+        let blocked = projects.join("blocked");
+        for project in [projects.join("visible"), blocked.clone()] {
+            std::fs::create_dir_all(&project).unwrap();
+            std::fs::write(
+                project.join("unreadable-session.jsonl"),
+                "{\"sessionId\":\"unreadable-session\"}\n",
+            )
+            .unwrap();
+        }
+        let (mut app, terminal_id, pane) = app_with_terminal();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.launch_argv = Some(vec!["claude".into()]);
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "flock:claude".into(),
+            agent: "claude".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("unreadable-session").unwrap(),
+        });
+        let agent_id = terminal.agent_id.to_string();
+        app.current_api_peer_pid = Some(std::process::id());
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let response = app.handle_pane_report_agent_session(
+            "recover".into(),
+            PaneReportAgentSessionParams {
+                pane_id: pane,
+                rebind_agent_id: Some(agent_id),
+                source: "flock:claude".into(),
+                agent: "claude".into(),
+                seq: None,
+                agent_session_id: Some("unreadable-session".into()),
+                agent_session_path: None,
+                session_start_source: None,
+            },
+        );
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["error"]["code"], "session_unbound", "{response}");
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains(blocked.to_str().unwrap()),
+            "{response}"
+        );
+        assert!(!app.state.terminals[&terminal_id].agent_session_hook_confirmed());
     }
 
     async fn recover_child_session(owner: bool) {
