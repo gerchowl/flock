@@ -18,6 +18,7 @@ enum SessionCase {
     ConflictingRecord,
     ConflictingResult,
     AmbiguousClaude,
+    UnreadableClaude,
     Protocol32,
     CachedGrace,
     EmptyGrace,
@@ -68,7 +69,10 @@ impl Fixture {
             .join("delegates")
             .join(support::paths::server_key(&socket));
         std::fs::create_dir_all(&registry).unwrap();
-        let harness = if case == SessionCase::AmbiguousClaude {
+        let harness = if matches!(
+            case,
+            SessionCase::AmbiguousClaude | SessionCase::UnreadableClaude
+        ) {
             "claude"
         } else {
             "codex"
@@ -99,7 +103,10 @@ impl Fixture {
             )
             .unwrap();
         }
-        if case == SessionCase::AmbiguousClaude {
+        if matches!(
+            case,
+            SessionCase::AmbiguousClaude | SessionCase::UnreadableClaude
+        ) {
             let profile = home.join("profile");
             let records = home
                 .join("state")
@@ -116,6 +123,14 @@ impl Fixture {
                 )
                 .unwrap();
             }
+        }
+        if case == SessionCase::UnreadableClaude {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                home.join("profile/projects/fixture"),
+                std::fs::Permissions::from_mode(0o000),
+            )
+            .unwrap();
         }
         std::fs::write(home.join("brief.md"), "Finish this round.").unwrap();
         let listener = UnixListener::bind(&socket).unwrap();
@@ -278,6 +293,11 @@ impl Fixture {
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let blocked = self.dir.path().join("home/profile/projects/fixture");
+        if blocked.exists() {
+            std::fs::set_permissions(blocked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
         self.stop.store(true, Ordering::SeqCst);
         self.worker.take().unwrap().join().unwrap();
     }
@@ -426,4 +446,29 @@ fn mid_grace_no_result_does_not_compare_terminal_counters() {
 #[test]
 fn mid_grace_turn_check_restarts_on_a_different_terminal() {
     assert_mid_grace_recovery(SessionCase::TurnCheckGrace);
+}
+
+#[test]
+fn unreadable_claude_store_is_unbound_and_names_the_store() {
+    for verb in ["wait", "result"] {
+        let fixture = Fixture::case(true, false, false, false, SessionCase::UnreadableClaude);
+        let output = fixture.cli(verb);
+        assert_eq!(output.status.code(), Some(12), "{output:?}");
+        let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(response["outcome"], "session_unbound");
+        let blocked = fixture.dir.path().join("home/profile/projects/fixture");
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains(blocked.to_str().unwrap()),
+            "{response}"
+        );
+        assert!(!fixture
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|r| r["method"] == "pane.report_agent_session"));
+    }
 }

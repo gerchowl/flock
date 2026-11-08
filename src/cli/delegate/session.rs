@@ -49,8 +49,15 @@ pub(super) fn prepare(entry: &mut Entry, deadline: Option<Instant>) -> Result<()
         })
         .and_then(|raw| serde_json::from_value::<crate::api::schema::AgentSessionInfo>(raw).ok())
         .ok_or("no harness-reported session id was recorded")?;
-    if session.agent != entry.harness || crate::session_evidence::path(&session).is_none() {
+    if session.agent != entry.harness {
         return Err("the recorded session id has no unique matching harness session".into());
+    }
+    match crate::session_evidence::checked_path(&session) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return Err("the recorded session id has no unique matching harness session".into())
+        }
+        Err(error) => return Err(error.to_string()),
     }
     let response = bounded(
         Method::PaneReportAgentSession(crate::api::schema::PaneReportAgentSessionParams {

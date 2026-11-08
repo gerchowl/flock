@@ -4,11 +4,13 @@ use std::fs::File;
 use std::io::Read;
 use std::path::PathBuf;
 
-pub(crate) fn path(session: &AgentSessionInfo) -> Option<PathBuf> {
+pub(crate) fn checked_path(session: &AgentSessionInfo) -> std::io::Result<Option<PathBuf>> {
     if session.kind != crate::agent_resume::AgentSessionRefKind::Id {
-        return None;
+        return Ok(None);
     }
-    let home = PathBuf::from(std::env::var_os("HOME")?);
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return Ok(None);
+    };
     let path = match (session.agent.as_str(), session.source.as_str()) {
         ("codex", "flock:codex") => crate::codex_transcript::rollout_path(
             &std::env::var_os("CODEX_HOME")
@@ -16,18 +18,24 @@ pub(crate) fn path(session: &AgentSessionInfo) -> Option<PathBuf> {
                 .unwrap_or_else(|| home.join(".codex")),
             &session.value,
         )
-        .ok()??,
+        .ok()
+        .flatten(),
         ("claude", "flock:claude") => {
-            crate::agent_resume::claude_transcript_path(&home, &session.value)?
+            crate::agent_resume::claude_transcript_path_checked(&home, &session.value)?
         }
-        _ => return None,
+        _ => return Ok(None),
+    };
+    let Some(path) = path else {
+        return Ok(None);
     };
     let mut header = Vec::new();
-    File::open(&path)
-        .ok()?
-        .take(65536)
-        .read_to_end(&mut header)
-        .ok()?;
+    let read = File::open(&path).and_then(|file| file.take(65536).read_to_end(&mut header));
+    read.map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!("cannot read session store {}: {error}", path.display()),
+        )
+    })?;
     let matches = String::from_utf8_lossy(&header)
         .lines()
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
@@ -38,7 +46,7 @@ pub(crate) fn path(session: &AgentSessionInfo) -> Option<PathBuf> {
                 row["sessionId"] == session.value
             }
         });
-    matches.then_some(path)
+    Ok(matches.then_some(path))
 }
 
 #[cfg(test)]
@@ -72,13 +80,13 @@ mod tests {
     fn recovery_rejects_wrong_metadata_and_duplicate_rollouts() {
         let (root, session, rollout) = setup("codex");
         std::env::set_var("CODEX_HOME", root.path());
-        assert_eq!(path(&session), Some(rollout.clone()));
+        assert_eq!(checked_path(&session).unwrap(), Some(rollout.clone()));
         std::fs::write(
             &rollout,
             "{\"type\":\"session_meta\",\"payload\":{\"id\":\"other\"}}\n",
         )
         .unwrap();
-        assert!(path(&session).is_none());
+        assert!(checked_path(&session).unwrap().is_none());
         std::fs::write(
             &rollout,
             format!(
@@ -93,7 +101,7 @@ mod tests {
                 .join("sessions/rollout-duplicate-session-evidence.jsonl"),
         )
         .unwrap();
-        assert!(path(&session).is_none());
+        assert!(checked_path(&session).unwrap().is_none());
         std::env::remove_var("CODEX_HOME");
     }
 }
