@@ -2032,6 +2032,17 @@ pub(crate) fn client_conn_hello_read_failed(client_id: u64, err: &str) {
     );
 }
 
+/// An observer exceeded its bounded reliable control backlog.
+pub(crate) fn client_conn_control_overflow(client_id: u64) {
+    tracing::warn!(
+        event = "client_conn.control_overflow",
+        subsystem = "client_conn",
+        outcome = "disconnected",
+        client_id,
+        "observer disconnected after exceeding its control backlog limit"
+    );
+}
+
 /// Structured tty-query failures distinguish confirmed loss from retention.
 pub(crate) fn client_geometry_query_failed(
     stage: &'static str,
