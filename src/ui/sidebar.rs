@@ -3807,6 +3807,36 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn server_identity1076_healthy_direct_reading_hides_via_until_failure() {
+        let (_lock, _scrub) = crate::config::test_config_env_guard();
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        let (mut app, node) = server_identity1076_fixture();
+        assert_eq!(app.state.relayed_fleet_cache.len(), 1);
+        let direct = &mut app.state.peer_summaries[0];
+        direct.bind_node(Some(node));
+        direct.last_ok = Some(std::time::Instant::now());
+        direct.protocol = Some(crate::protocol::PROTOCOL_VERSION);
+        direct.error = None;
+        let band = |state: &AppState| {
+            let area = Rect::new(0, 0, 120, 16);
+            let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+            terminal
+                .draw(|frame| render_servers_section(state, frame, area, false))
+                .unwrap();
+            (0..area.height)
+                .map(|y| buffer_row_text(terminal.backend().buffer(), area, y))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert_eq!(app.state.remote_peers().len(), 1);
+        assert!(!band(&app.state).contains("+via"));
+        app.state.peer_summaries[0].error = Some("Connection refused".into());
+        let text = band(&app.state);
+        assert!(text.contains("+via node-b.example"), "{text}");
+        assert_eq!(app.state.relayed_fleet_cache.len(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn server_identity1076_unproven_claim_cannot_replace_a_pinned_target() {
         // #1076 anti-spoof intent (updated by #2998): an unproven claim about
         // a PINNED peer's node_id can never change the shown name, icon or
