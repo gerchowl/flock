@@ -58,7 +58,11 @@ pub(crate) struct Key {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Failure {
     Route,
+    /// The transcript path could not be resolved or safely opened beneath home.
     Path,
+    /// The opened transcript has more than one directory entry.
+    HardLink,
+    /// Open-file metadata/I-O or session-header validation failed.
     Metadata,
     Writer,
     Version,
@@ -107,6 +111,9 @@ impl Validated {
 /// candidates must come from this local launch's process attribution, never hook
 /// JSON or a filename. No environment/default profile lookup occurs here.
 /// Version eligibility is supplied by S1, not re-probed for each claim.
+/// Multiply linked transcript inodes fail with `Failure::HardLink` (ADR-0028 §1a).
+/// Descriptor metadata failures are `Failure::Metadata`; resolution/open failures
+/// remain `Failure::Path`. None of these failures grants lifecycle authority.
 pub(crate) fn validate(
     key: &Key,
     launch: &Launch,
@@ -114,6 +121,28 @@ pub(crate) fn validate(
     writers: &[Writer],
     compatibility: &Compatibility,
     metadata_limit: u64,
+) -> Result<Validated, Failure> {
+    validate_with_link_count(
+        key,
+        launch,
+        transcript,
+        writers,
+        compatibility,
+        metadata_limit,
+        platform::structured::file_link_count,
+    )
+}
+
+/// Inject only the descriptor query; production and tests share path resolution,
+/// safe opening and all subsequent validation.
+fn validate_with_link_count(
+    key: &Key,
+    launch: &Launch,
+    transcript: Option<&Path>,
+    writers: &[Writer],
+    compatibility: &Compatibility,
+    metadata_limit: u64,
+    link_count: impl FnOnce(&File) -> std::io::Result<u64>,
 ) -> Result<Validated, Failure> {
     if key.owner != launch.owner || key.launch != launch.generation {
         return Err(Failure::Route);
@@ -140,6 +169,9 @@ pub(crate) fn validate(
     let relative = path.strip_prefix(&home).map_err(|_| Failure::Path)?;
     let file =
         platform::structured::open_regular_beneath(&home, relative).map_err(|_| Failure::Path)?;
+    if link_count(&file).map_err(|_| Failure::Metadata)? > 1 {
+        return Err(Failure::HardLink);
+    }
     let mut line = Vec::new();
     let mut reader = BufReader::new(file.take(metadata_limit.saturating_add(1)));
     reader

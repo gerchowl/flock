@@ -8,9 +8,12 @@ bind = "127.0.0.1:7682"
 ```
 
 The endpoint is off by default and separate from `[web]`, the terminal bridge.
-Only IPv4 `127.0.0.1` with a nonzero port is accepted. This slice supplies the
-exchange router; #1828 mounts it and the GUI on the configured listener.
-Until that listener is delivered, opening its URL cannot connect.
+Only IPv4 `127.0.0.1` is accepted. Port 0 selects a free port; `client open`
+reports the actual live endpoint even after configuration reload. The server
+mounts the GUI, exchange and WebSocket core on this listener. A working bounded
+`tailscale serve status --json` probe is required: active public funnel, unknown
+status or probe failure refuses startup. See `structured-client-transport.md`
+for CSP, connection quotas, shutdown and handoff behavior.
 
 Run these commands outside agent panes as the local operator:
 
@@ -65,6 +68,8 @@ no global failure budget: local processes can forge Host/Origin and could use
 such a gate to lock out the operator. Guessing a 256-bit, single-use code within
 60 seconds is infeasible. Codes and tokens never enter diagnostic
 logs; browser-launch argv redacts the code fragment. Tokens remain persisted
-until explicitly revoked. #1870 tracks admission/revocation lock fairness,
-waiter cleanup, and moving exchange token-store reads off the async executor.
-It must be fixed before #1828 exposes admission.
+until explicitly revoked. Token-store verification runs off the async executor
+with at most four active or queued blocking jobs, including cancelled waiters.
+An overload or I/O refusal consumes the single-use code; mint a new URL rather
+than retrying it. Admission gives pending operator revocation priority across
+handles and processes, and bounded lock helpers are reaped on timeout/cancellation.

@@ -80,7 +80,17 @@ impl Fixture {
         fs::set_permissions(&path, fs::Permissions::from_mode(mode)).expect("fixture mode");
         path
     }
+    pub(crate) fn mcp(&self) -> SessionMcp {
+        SessionMcp::new(
+            &self.root.path().join("claude"),
+            &self.root.path().join("api.sock"),
+        )
+        .expect("owned fixture endpoint")
+    }
     pub(crate) fn profile(&self, mode: &str, version: &str) -> LaunchProfile {
+        self.profile_at(mode, version, SESSION)
+    }
+    pub(crate) fn profile_at(&self, mode: &str, version: &str, session: &str) -> LaunchProfile {
         self.file(
             "case.json",
             serde_json::json!({"mode":mode,"version":version})
@@ -101,7 +111,7 @@ impl Fixture {
             LaunchProfile::prepare(
                 &config,
                 self.root.path(),
-                SESSION,
+                session,
                 binary,
                 |key| match key {
                     "HOME" | "TMPDIR" => Some(self.root.path().as_os_str().to_owned()),
@@ -142,6 +152,7 @@ impl Fixture {
         let state = self.root.path().to_owned();
         let location = StreamLocation {
             data_dir: state.clone(),
+            storage: Default::default(),
             agent: "fixture-agent".into(),
             session: session.into(),
         };
@@ -151,8 +162,9 @@ impl Fixture {
             .leases
             .reserve("fixture-agent", &location.session, None)
             .expect("lease");
+        let mcp = self.mcp();
         let worker = std::thread::spawn(move || {
-            let result = run(&state, profile, lease, location, |runtime| {
+            let result = run(&state, profile, lease, location, mcp, |runtime| {
                 let _ = ready_tx.send(runtime);
             });
             let _ = result_tx.send(result);
@@ -564,9 +576,11 @@ fn failed_model_spawn_removes_armed_files_and_preserves_profile() {
             .expect("lease"),
         StreamLocation {
             data_dir: fixture.root.path().to_owned(),
+            storage: Default::default(),
             agent: "fixture-agent".into(),
             session: SESSION.into(),
         },
+        fixture.mcp(),
         |_| panic!("failed spawn published a runtime"),
     )
     .expect_err("removed executable cannot spawn");
@@ -823,9 +837,11 @@ fn publication_panic_shuts_down_owned_process_and_retains_uncertain_files() {
             .expect("lease"),
         StreamLocation {
             data_dir: fixture.root.path().to_owned(),
+            storage: Default::default(),
             agent: "fixture-agent".into(),
             session: SESSION.into(),
         },
+        fixture.mcp(),
         |_| panic!("owned publication failure"),
     )
     .expect("worker result");
@@ -884,9 +900,11 @@ fn lease_profile_and_stream_must_name_the_same_agent_and_session() {
             lease,
             StreamLocation {
                 data_dir: fixture.root.path().to_owned(),
+                storage: Default::default(),
                 agent: "fixture-agent".into(),
                 session: session.into(),
             },
+            fixture.mcp(),
             |_| panic!("mismatched identity must never publish"),
         )
         .expect_err("mismatch");
@@ -896,6 +914,25 @@ fn lease_profile_and_stream_must_name_the_same_agent_and_session() {
         );
         assert!(fixture.leases.reserve(agent, session, None).is_ok());
     }
+}
+
+#[test]
+fn session_1441_fake_harness_receives_owned_flock_mcp_config() {
+    let fixture = Fixture::new();
+    let mut running = fixture.launch("mcp-config", "2.1.296").expect("launch");
+    running.submit();
+    let exit = running.finish();
+    assert_eq!(
+        exit.status.expect("reaped status").code(),
+        Some(0),
+        "{exit:?}"
+    );
+    let config: Value = serde_json::from_slice(
+        &fs::read(fixture.root.path().join("observed-mcp.json")).expect("observed MCP"),
+    )
+    .unwrap();
+    assert_eq!(config["mcpServers"].as_object().unwrap().len(), 1);
+    assert!(!running.generated.exists());
 }
 
 #[test]
@@ -1040,6 +1077,7 @@ fn scripted_stream_drives_session_state_through_the_keyed_sink() {
     assert_eq!(running.finish().outcome, Outcome::Stopped);
 }
 
+mod queue;
 #[test]
 fn accepted_stdin_then_silent_harness_reports_stall_without_started() {
     use crate::structured::claude::SessionEvent;
@@ -1111,6 +1149,324 @@ fn io_completion_cancellation_does_not_turn_a_rejected_submit_into_stop() {
     );
     assert_eq!(running.finish().outcome, Outcome::Exited);
     assert!(!child.alive());
+}
+
+#[test]
+fn registry_launch_metadata_reaches_the_child_and_events_wake_the_owner() {
+    let fixture = Fixture::new();
+    let cwd = fixture.root.path().join("project");
+    fs::create_dir(&cwd).unwrap();
+    let profile = fixture
+        .profile("idle", "2.1.296")
+        .for_agent(&cwd, Some("fixture-requested-model"))
+        .unwrap();
+    fixture.file(
+        "argv.json",
+        &serde_json::to_vec(
+            &profile
+                .args()
+                .iter()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap(),
+        0o600,
+    );
+    fixture.file(
+        "case.json",
+        &serde_json::to_vec(&serde_json::json!({
+            "mode":"idle", "version":"2.1.296", "cwd":cwd, "model":"fixture-requested-model"
+        }))
+        .unwrap(),
+        0o600,
+    );
+    let settings_index = profile
+        .args()
+        .iter()
+        .position(|arg| arg == "--settings")
+        .unwrap();
+    let generated = PathBuf::from(&profile.args()[settings_index + 1])
+        .parent()
+        .unwrap()
+        .to_owned();
+    let persistent = profile.config_dir().to_owned();
+    let state = fixture.root.path().to_owned();
+    let location = StreamLocation {
+        data_dir: state.clone(),
+        storage: Default::default(),
+        agent: "fixture-agent".into(),
+        session: SESSION.into(),
+    };
+    let lease = fixture
+        .leases
+        .reserve("fixture-agent", SESSION, None)
+        .unwrap();
+    assert!(fixture.leases.is_reserved(SESSION).unwrap());
+    let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+    let (result_tx, result_rx) = mpsc::sync_channel(1);
+    let (wake_tx, wake_rx) = mpsc::sync_channel(1);
+    let mcp = fixture.mcp();
+    let worker = std::thread::spawn(move || {
+        let result = run_notified(
+            &state,
+            profile,
+            lease,
+            location,
+            mcp,
+            |runtime| {
+                ready_tx.try_send(runtime).ok();
+            },
+            move || {
+                wake_tx.try_send(()).ok();
+            },
+        );
+        result_tx.try_send(result).ok();
+    });
+    let runtime = ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    let mut running = Running {
+        runtime,
+        result: result_rx,
+        worker: Some(worker),
+        finished: false,
+        generated,
+        persistent,
+    };
+    wake_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("queued stdout must wake its owner");
+    let received = running
+        .runtime
+        .try_receive()
+        .expect("notification follows event publication");
+    assert!(matches!(
+        received.event,
+        crate::structured::claude::SessionEvent::HookStarted { .. }
+    ));
+    let result = running.finish();
+    assert_eq!(result.outcome, Outcome::Exited, "{result:?}");
+    assert!(
+        !fixture.leases.is_reserved(SESSION).unwrap(),
+        "reaped runtime releases the lease"
+    );
+}
+
+#[test]
+fn launch_metadata_refuses_invalid_cwd_or_empty_model() {
+    let fixture = Fixture::new();
+    for (cwd, model) in [
+        (PathBuf::from("fixture-relative"), None),
+        (fixture.root.path().join("missing"), None),
+        (fixture.root.path().to_owned(), Some(" ")),
+    ] {
+        let result = fixture.profile("idle", "2.1.296").for_agent(&cwd, model);
+        assert!(matches!(result, Err(LaunchError::Io(_))));
+    }
+}
+
+#[tokio::test]
+async fn queue_stdin_failure_requests_stop_even_without_io_cancellation() {
+    use crate::structured::{
+        registry::Registry,
+        workers::{
+            tests::{wait, Case},
+            Workers,
+        },
+    };
+    let notify = std::sync::Arc::new(tokio::sync::Notify::new());
+    let mut registry = Registry::default();
+    let mut workers = Workers::new(notify.clone());
+    let case = Case::start(&mut registry, &mut workers, 245, "no-read", vec![]);
+    case.ready(&mut registry, &mut workers, &notify, Instant::now())
+        .await;
+    let runtime = workers.runtime(&case.id, case.generation).unwrap();
+    runtime.control.close_stdin();
+    assert!(
+        !runtime.control.cancelled(),
+        "the transport is closed, not cancelled"
+    );
+    case.submit(&workers);
+    let mut refused = false;
+    wait(&notify, || {
+        workers.poll(&mut registry, Instant::now(), 1000);
+        while let Some(update) = workers.queue_update(&registry, &case.id, case.generation) {
+            refused |= update
+                .offer
+                .as_ref()
+                .err()
+                .is_some_and(|e| e.code == crate::api::error_code::ErrorCode::InputWriteFailed);
+        }
+        workers.report(&case.id, case.generation).is_some()
+    })
+    .await;
+    assert!(refused);
+    assert_eq!(
+        workers
+            .report(&case.id, case.generation)
+            .unwrap()
+            .result
+            .as_ref()
+            .unwrap()
+            .outcome,
+        Outcome::Stopped
+    );
+    workers.shutdown(&mut registry).unwrap();
+}
+
+#[test]
+fn queue_cancelled_input_requests_stop_through_the_real_event_pump() {
+    use crate::structured::{
+        queue::admission::{Gate, Principal},
+        workers::queue,
+    };
+    use std::os::{fd::OwnedFd, unix::net::UnixStream};
+    let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+    let (stdout, _producer) = UnixStream::pair().unwrap();
+    let (_consumer, stdin) = UnixStream::pair().unwrap();
+    let transport = Transport::start(
+        File::from(OwnedFd::from(stdout)),
+        File::from(OwnedFd::from(stdin)),
+        StreamLocation {
+            data_dir: root.path().into(),
+            storage: Default::default(),
+            agent: "queue-cancel-fixture".into(),
+            session: "fixture-session".into(),
+        },
+        "fixture-version".into(),
+    )
+    .unwrap();
+    let (service, client) = queue::Service::open(
+        root.path(),
+        "queue-cancel-fixture",
+        std::num::NonZeroU64::new(u64::MAX).unwrap(),
+    )
+    .unwrap();
+    let mut idle = crate::api::agent_state::AgentState::unknown();
+    idle.lifecycle = crate::api::agent_state::Lifecycle::Live;
+    idle.turn = crate::api::agent_state::Turn::Idle;
+    idle.attention = crate::api::agent_state::Attention::None;
+    assert!(client.state(queue::Snapshot {
+        state: idle,
+        through: 0
+    }));
+    client
+        .enqueue(queue::Request {
+            item: crate::structured::queue::tests::item("00000000-0000-4000-8000-000000000001"),
+            principal: Principal::Operator,
+            gate: Gate::Send,
+        })
+        .unwrap();
+    let stop = StopRequest::default();
+    let control = transport.stop_handle();
+    control.cancel();
+    assert!(!transport.input_inflight());
+    let (tx, _rx) = mpsc::sync_channel(4);
+    let facts = collect(&transport, &stop, &control, tx, &|| {}, Some(service));
+    let mut outcomes = vec![];
+    let mut saw_write_failure = false;
+    while let Some(update) = client.update() {
+        outcomes.push(format!("{update:?}"));
+        saw_write_failure |= update.offer.as_ref().is_err_and(|e| {
+            e.code == crate::api::error_code::ErrorCode::InputWriteFailed
+                && e.source
+                    .as_ref()
+                    .is_some_and(|source| source.kind() == io::ErrorKind::BrokenPipe)
+        });
+    }
+    assert!(
+        saw_write_failure,
+        "queue never exercised cancelled stdin admission: {outcomes:?}, stop={}, error={:?}",
+        stop.requested(),
+        facts.error
+    );
+    assert!(
+        facts.error.is_none(),
+        "unexpected transport failure: {:?}",
+        facts.error
+    );
+    assert!(
+        stop.requested(),
+        "queue cancellation only closed pipes without requesting stop"
+    );
+}
+
+#[tokio::test]
+async fn queue_subscriptions_are_serviced_when_completion_channel_is_full() {
+    use crate::structured::{
+        publication::{Provider, Subscription},
+        queue::admission::{Gate, Principal},
+        workers::queue::{self, publication::Page},
+    };
+    use std::os::{fd::OwnedFd, unix::net::UnixStream};
+    let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+    let (stdout, _producer) = UnixStream::pair().unwrap();
+    let (_consumer, stdin) = UnixStream::pair().unwrap();
+    let transport = Transport::start(
+        File::from(OwnedFd::from(stdout)),
+        File::from(OwnedFd::from(stdin)),
+        StreamLocation {
+            data_dir: root.path().into(),
+            storage: Default::default(),
+            agent: "saturated-fixture".into(),
+            session: "fixture-session".into(),
+        },
+        "fixture-version".into(),
+    )
+    .unwrap();
+    let (mut service, client) = queue::Service::open(
+        root.path(),
+        "saturated-fixture",
+        std::num::NonZeroU64::new(u64::MAX).unwrap(),
+    )
+    .unwrap();
+    for n in 0..5 {
+        client
+            .enqueue(queue::Request {
+                item: crate::structured::queue::tests::item(&format!(
+                    "00000000-0000-4000-8000-{n:012}"
+                )),
+                principal: Principal::Operator,
+                gate: Gate::Send,
+            })
+            .unwrap();
+        service.tick(&transport.input_handle(), false, &|| {});
+        assert_eq!(service.flush(false, &|| {}), n < 4);
+    }
+    let mut reader = client.source.subscribe(None).unwrap();
+    let wake = reader.waker();
+    let control = transport.stop_handle();
+    let cancel = transport.stop_handle();
+    let (tx, _rx) = mpsc::sync_channel(4);
+    let worker = std::thread::spawn(move || {
+        collect(
+            &transport,
+            &StopRequest::default(),
+            &control,
+            tx,
+            &|| {},
+            Some(service),
+        )
+    });
+    let observed = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let notified = wake.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            match reader.page() {
+                Page::Synced(_) => break Ok(()),
+                Page::Pending => notified.await,
+                Page::Refused(code) => return Err(format!("subscription refused: {code:?}")),
+                Page::End | Page::Lagged(_) => return Err("subscription closed before sync".into()),
+                _ => (),
+            }
+        }
+    })
+    .await;
+    cancel.cancel();
+    worker.join().unwrap();
+    assert!(
+        matches!(observed, Ok(Ok(()))),
+        "completion saturation stranded the subscription: {observed:?}"
+    );
 }
 
 #[test]

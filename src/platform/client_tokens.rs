@@ -1,6 +1,6 @@
 //! Anchored private client-token namespace; no filesystem path follows a link.
 use std::ffi::{CString, OsStr, OsString};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
@@ -128,11 +128,62 @@ impl Namespace {
     }
     /// Remove only a temporary entry while the caller holds the writer lock.
     pub(crate) fn remove_temporary(&self, id: &str) -> io::Result<()> {
+        self.check()?;
         let bytes = Self::decode_entry(id)?;
         if !bytes.starts_with(b".tmp-") {
             return Err(io::ErrorKind::InvalidInput.into());
         }
+        let name = CString::new(bytes.clone()).map_err(|_| io::ErrorKind::InvalidInput)?;
+        if bytes.contains(&b'/') {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: terminated component and owned directory; no final symlink is followed.
+        if unsafe {
+            libc::fstatat(
+                self.directory.as_raw_fd(),
+                name.as_ptr(),
+                stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } < 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: successful fstatat initialized stat.
+        if unsafe { stat.assume_init() }.st_mode & libc::S_IFMT == libc::S_IFDIR {
+            return Err(io::ErrorKind::IsADirectory.into());
+        }
         self.unlink(OsStr::from_bytes(&bytes))
+    }
+    /// Remove a stale published intent only while owning its exclusive lock.
+    /// Publication never replaces an existing name. An unlinked descriptor must
+    /// be skipped: another sweeper may have removed it and a creator reused the
+    /// name for a new, locked inode. Compare the named inode too, since a staged
+    /// hard link may remain after a crash. Publication never replaces a name
+    /// while the matching inode remains exclusively locked here.
+    pub(crate) fn remove_unheld_intent(&self, name: &str) -> io::Result<()> {
+        let file = self.file(name, false)?;
+        match file.try_lock() {
+            Ok(()) => (),
+            Err(TryLockError::WouldBlock) => return Ok(()),
+            Err(TryLockError::Error(error)) => return Err(error),
+        }
+        let result = file.metadata().and_then(|meta| {
+            if meta.nlink() == 0 {
+                Ok(())
+            } else {
+                let current = self.file(name, false)?.metadata()?;
+                if (meta.dev(), meta.ino()) == (current.dev(), current.ino()) {
+                    self.remove(name)
+                } else {
+                    Ok(())
+                }
+            }
+        });
+        // Explicit unlock releases this operation even across inherited fds.
+        let unlock = file.unlock();
+        result.and(unlock)
     }
     pub(crate) fn publish(&self, from: &str, to: &str, replace: bool) -> io::Result<()> {
         self.check()?;

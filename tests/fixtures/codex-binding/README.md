@@ -19,6 +19,10 @@ overrides, first metadata identity, partial/malformed/oversized metadata, writer
 absence/PID reuse/ambiguity, and S1 version eligibility combined with actual
 metadata. The CLI hook tests drive the real planner from SessionStart payloads
 for startup/resume/clear/compact/fork, and reject rebind fields on other events.
+Forwarding Codex fork `source`/`transcript_path` provides unvalidated hints only.
+Their hook-to-reader authority integration belongs to
+[#1664](https://github.com/gerchowl/flock/issues/1664); this binding slice does not
+add server-side fork handling.
 
 Known duplicate thread claims poison both capabilities, including when the
 owners have different node identities. Retiring a claim or verifying its writer exit does not
@@ -31,9 +35,10 @@ identity models, not an implementation of cross-node ownership transport.
 
 ## Boundaries and failure modes
 
-This is the ADR-0028 §1a **binding foundation**. A validated binding establishes
-path/metadata/local-writer attribution only, not an idle/working decision. The
-launch-resolved absolute home and writer candidates must come from trusted local
+This is the ADR-0028 §1a **binding foundation**. A validated binding checks the
+path/metadata and that the launch-attributed writer is alive and unique. It does
+not prove that the writer has this file open or establish an idle/working decision.
+The launch-resolved absolute home and writer candidates must come from trusted local
 runtime attribution, never hook JSON, aliases, ambient cwd or another profile.
 The captured node/pane and launch generation must match the callback key before
 any path is opened. Late SessionStart claims from a retired launch are rejected
@@ -43,8 +48,11 @@ own version, so a deferred hook does not require a second writer probe.
 File validation runs on a worker with a caller-supplied metadata-byte budget.
 Oversize, incomplete or malformed first metadata fails validation; it never
 scans ahead for a better match. Directory-descriptor traversal rejects symlink
-redirection after path resolution. The returned file is the same opened handle,
-reset to byte zero for subsequent prefix/ordinal verification. Initial failure
+redirection after path resolution. Validation rejects a regular transcript whose
+opened inode has `nlink > 1` as `Failure::HardLink`, including aliases entirely
+inside the launch home. Link count is checked during validation; it does not
+prevent aliases from being created later. The returned file is the same opened
+handle, reset to byte zero for subsequent prefix/ordinal verification. Initial failure
 returns a diagnosed screen-fallback marker, without manufacturing idle. Once a
 launch has trusted a binding, failed claims or unexplained loss remain unknown.
 Only known launch/resume retirement resets that trust. Foreign routes do not

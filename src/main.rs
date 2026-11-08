@@ -47,6 +47,7 @@ mod codex_binding;
 #[allow(dead_code)]
 mod codex_reader;
 mod codex_transcript;
+mod session_evidence;
 // Version eligibility foundation; binding and runtime consumers follow in #1662/#1664.
 #[allow(dead_code)]
 mod codex_version;
@@ -99,7 +100,10 @@ mod release_notes;
 mod remote;
 mod render_prof;
 mod report;
-#[cfg(test)]
+#[cfg(any(test, feature = "web"))]
+mod structured_wire;
+#[cfg(not(any(test, feature = "web")))]
+#[path = "structured_wire/production.rs"]
 mod structured_wire;
 #[cfg(test)]
 mod test_support;
@@ -462,12 +466,26 @@ fn switch_failure_reason(err: &io::Error) -> String {
 fn main() {
     if let Err(error) = run() {
         eprintln!("Error: {error}");
-        std::process::exit(cli::exit::FAILURE);
+        let exit = if error
+            .get_ref()
+            .is_some_and(|inner| inner.is::<cli::argv::InvalidUtf8Argument>())
+        {
+            cli::exit::USAGE
+        } else {
+            cli::io_error_exit(&error)
+        };
+        std::process::exit(exit);
     }
 }
 
 fn run() -> io::Result<()> {
-    let raw_args: Vec<String> = std::env::args().collect();
+    let raw_args: Vec<_> = std::env::args_os().collect();
+    if raw_args.len() == 2
+        && (raw_args[1] == platform::client_token_lock::WORKER_ARG
+            || raw_args[1] == platform::client_token_lock::SHARED_WORKER_ARG)
+    {
+        return platform::client_token_lock::worker();
+    }
     let args = match session::configure_from_args(&raw_args) {
         Ok(args) => args,
         Err(err) => {
@@ -484,6 +502,13 @@ fn run() -> io::Result<()> {
             std::process::exit(cli::exit::USAGE);
         }
     };
+
+    // Decode only after global stripping: the importer must see this same argv,
+    // with its socket kept native and all remaining command text checked as UTF-8.
+    let cli::argv::Arguments {
+        text: args,
+        handoff_socket,
+    } = cli::argv::collect(args.into_iter())?;
 
     if remote_launch.is_some()
         && args.get(1).is_some()
@@ -517,7 +542,7 @@ fn run() -> io::Result<()> {
     }
 
     if args.get(1).map(|s| s.as_str()) == Some("server") {
-        return server::headless::run_server();
+        return server::headless::run_server(&args[2..], handoff_socket);
     }
 
     // Hidden client mode: connect to an existing server's client socket.
@@ -543,12 +568,12 @@ fn run() -> io::Result<()> {
         match update::self_update(options) {
             Ok(_) => return Ok(()),
             Err(e) => {
-                if e.starts_with("self-update is disabled") {
+                if e.message().starts_with("self-update is disabled") {
                     eprintln!("{e}");
                 } else {
                     eprintln!("update failed: {e}");
                 }
-                std::process::exit(cli::exit::FAILURE);
+                std::process::exit(e.exit());
             }
         }
     }
@@ -565,6 +590,7 @@ fn run() -> io::Result<()> {
         println!("       flk server stop");
         println!("       flk server reload-config");
         println!("       flk config <subcommand> ...");
+        println!("       flk structured grants <list|revoke> ...");
         println!("       flk channel <subcommand> ...");
         println!("       flk workspace <subcommand> ...");
         println!("       flk worktree <subcommand> ...");
@@ -754,7 +780,7 @@ fn run() -> io::Result<()> {
     if let Some(remote_launch) = remote_launch {
         if let Err(err) = run_attach_legs(AttachLeg::Remote(remote_launch)) {
             report_attach_chain_error(&err);
-            std::process::exit(cli::exit::FAILURE);
+            std::process::exit(cli::io_error_exit(&err));
         }
         return Ok(());
     }
@@ -768,7 +794,7 @@ fn run() -> io::Result<()> {
     if !no_session {
         if let Err(err) = run_attach_legs(AttachLeg::Local) {
             report_attach_chain_error(&err);
-            std::process::exit(cli::exit::FAILURE);
+            std::process::exit(cli::io_error_exit(&err));
         }
         return Ok(());
     }
@@ -781,7 +807,13 @@ fn run() -> io::Result<()> {
     let (api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
     let event_hub =
         api::EventHub::with_persistence(crate::session::data_dir().join("event-log.jsonl"));
-    let _api_server = match api::start_server_for_mode(api_tx, event_hub.clone(), false) {
+    let runtime_config = app::AppRuntimeConfig::for_config(&loaded_config.config);
+    let _api_server = match api::start_server_for_mode(
+        api_tx,
+        event_hub.clone(),
+        false,
+        runtime_config.uid_policy.clone(),
+    ) {
         Ok(server) => server,
         Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
             eprintln!("error: flk is already running");
@@ -854,12 +886,13 @@ fn run() -> io::Result<()> {
             std::io::stdout().flush()?;
         }
 
-        let mut app = app::App::new(
+        let mut app = app::App::new_with_runtime_config(
             config,
             true, // no_session — monolithic mode never saves/restores sessions
             config_diagnostic,
             api_rx,
             event_hub,
+            runtime_config,
         );
         let result = match app.initialize_mesh_mail(Some(&_api_server)) {
             Ok(()) => app.run(&mut terminal).await,

@@ -1,0 +1,17 @@
+{"add":"fixture-agent"}
+{"sub":{"sub_id":"s1","stream":"fleet"}}
+{"expect":{"t":"gap","sub_id":"s1","from":1,"to":1,"snapshot_to":2},"rows":[]}
+{"expect":{"t":"ev","sub_id":"s1","seq":2,"ev":{"type":"fleet.upsert","row":{"id":"fixture-agent","state":{"phase":"offline"}}}},"rows":["fixture-agent"]}
+{"expect":{"t":"synced","sub_id":"s1","seq":2},"rows":["fixture-agent"]}
+{"unsub":"s1"}
+{"remove":"fixture-agent"}
+{"add":"second-fixture-agent"}
+{"sub":{"sub_id":"s2","stream":"fleet","after":2}}
+{"expect":{"t":"gap","sub_id":"s2","from":3,"to":4,"snapshot_to":5},"rows":["fixture-agent"]}
+{"expect":{"t":"ev","sub_id":"s2","seq":5,"ev":{"type":"fleet.upsert","row":{"id":"second-fixture-agent","state":{"phase":"offline"}}}},"rows":["second-fixture-agent"]}
+{"expect":{"t":"synced","sub_id":"s2","seq":5},"rows":["second-fixture-agent"]}
+{"unsub":"s2"}
+{"remove":"second-fixture-agent"}
+{"sub":{"sub_id":"s3","stream":"fleet","after":5}}
+{"expect":{"t":"gap","sub_id":"s3","from":6,"to":6,"snapshot_to":6},"rows":[]}
+{"expect":{"t":"synced","sub_id":"s3","seq":6},"rows":[]}

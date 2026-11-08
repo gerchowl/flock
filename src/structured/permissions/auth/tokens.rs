@@ -2,16 +2,21 @@
 use super::VerifiedToken;
 use crate::app::LocalOperator;
 use crate::platform::client_tokens::{Entry, Namespace};
+use crate::platform::{client_token_lock::PendingLock, file_lock::LockFile};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fs::{File, TryLockError};
 use std::io::{self, Read, Write};
-use std::path::Path;
-use std::sync::{mpsc, Mutex};
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+pub(crate) mod app_sessions;
+mod priority;
+pub(crate) mod server;
 use std::time::Duration;
 use zeroize::Zeroize;
 
+use crate::api::client_tokens::operator_scopes;
 pub(crate) use crate::api::client_tokens::{Bearer, Issued, Listed, Scope, TokenInfo};
 /// Admission failures contain no bearer or file contents.
 #[derive(Debug)]
@@ -72,7 +77,7 @@ pub(crate) struct Session {
     digest: [u8; 32],
 }
 /// Store handles share a stable filesystem admission lock, including across processes.
-pub(crate) struct TokenStore(Namespace, Mutex<Box<dyn Entropy>>);
+pub(crate) struct TokenStore(std::sync::Arc<Namespace>, Mutex<Box<dyn Entropy>>, PathBuf);
 /// Injectable randomness; production uses the operating system, fixtures use a sequence.
 pub(crate) trait Entropy: Send {
     /// Fill the whole buffer or fail without issuing a credential.
@@ -89,19 +94,15 @@ type LoadedEntry = (Entry, Option<(String, Record)>);
 struct PendingRevoke<'a> {
     store: &'a TokenStore,
     entry: String,
-    guard: mpsc::Receiver<io::Result<File>>,
+    guard: PendingLock,
+    _intent: priority::Intent<&'a Namespace>,
 }
 impl PendingRevoke<'_> {
+    /// Allow five-second helper startup plus two-second contention before store I/O.
+    /// Filesystem sweep/removal and owned-helper cleanup are separate operations.
     fn finish(self) -> Result<(), TokenError> {
-        let _guard = self
-            .guard
-            .recv_timeout(Duration::from_secs(2))
-            .map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "client-token revocation lock deadline",
-                )
-            })??;
+        let _guard = self.guard.finish(Duration::from_secs(2))?;
+        priority::sweep(&self.store.0)?;
         self.store.0.remove_entry(&self.entry)?;
         Ok(())
     }
@@ -119,6 +120,7 @@ fn equal(a: &[u8; 32], b: &[u8; 32]) -> bool {
 }
 fn filename(name: &str) -> Result<String, TokenError> {
     if name.is_empty()
+        || name.starts_with('-')
         || name.len() > 64
         || !name
             .bytes()
@@ -138,18 +140,28 @@ impl TokenStore {
         data: &Path,
         entropy: impl Entropy + 'static,
     ) -> Result<Self, TokenError> {
-        let store = Self(Namespace::open(data)?, Mutex::new(Box::new(entropy)));
+        let store = Self(
+            std::sync::Arc::new(Namespace::open(data)?),
+            Mutex::new(Box::new(entropy)),
+            std::env::current_exe()?,
+        );
         // The writer lock protects active issue temporaries from the orphan sweep.
         let _guard = store.lock()?;
+        priority::sweep(&store.0)?;
         for entry in store.0.names()? {
             if entry.id.starts_with("2e746d702d") {
                 if let Err(error) = store.0.remove_temporary(&entry.id) {
-                    if error.kind() != io::ErrorKind::NotFound {
-                        return Err(error.into());
+                    match error.kind() {
+                        io::ErrorKind::NotFound => (),
+                        io::ErrorKind::IsADirectory => {
+                            crate::logging::client_token_entry_unsafe(&entry.id)
+                        }
+                        _ => return Err(error.into()),
                     }
                 }
             }
         }
+        store.0.check()?;
         Ok(store)
     }
     pub(crate) fn random<const N: usize>(&self) -> Result<String, TokenError> {
@@ -171,43 +183,57 @@ impl TokenStore {
         };
         Ok(file)
     }
-    fn lock(&self) -> Result<File, TokenError> {
-        let file = self.lock_file()?;
-        file.try_lock().map_err(|e| match e {
+    fn lock(&self) -> Result<LockFile, TokenError> {
+        self.lock_with(LockFile::try_lock)
+    }
+    fn lock_with(
+        &self,
+        acquire: fn(&LockFile) -> Result<(), TryLockError>,
+    ) -> Result<LockFile, TokenError> {
+        if priority::pending(&self.0)? {
+            return Err(TokenError::Busy);
+        }
+        let file = LockFile::new(self.lock_file()?);
+        acquire(&file).map_err(|e| match e {
             TryLockError::WouldBlock => TokenError::Busy,
             TryLockError::Error(e) => e.into(),
         })?;
+        if priority::pending(&self.0)? {
+            return Err(TokenError::Busy);
+        }
         Ok(file)
     }
-    // Only trusted operator revocation waits. The OS lock supplies the wakeup.
-    // no sleep, mutation retry or unverified hello can occupy this wait path.
-    fn revoke_lock(&self) -> Result<mpsc::Receiver<io::Result<File>>, TokenError> {
-        let file = self.lock_file()?;
-        let (tx, rx) = mpsc::sync_channel(1);
-        match file.try_lock() {
-            Ok(()) => {
-                let _ = tx.send(Ok(file));
-                return Ok(rx);
+    /// Hello alone waits for management ownership under its remaining handshake budget.
+    /// Dispatch still uses fail-fast shared admission and the existing retry class.
+    fn hello_lock(
+        &self,
+        budget: Duration,
+        mut on_wait: impl FnMut(),
+    ) -> Result<LockFile, TokenError> {
+        let deadline = std::time::Instant::now() + budget;
+        loop {
+            priority::wait(&self.0, &self.2, deadline, &mut on_wait)?;
+            let guard = PendingLock::begin_shared(self.lock_file()?, &self.2)?
+                .finish_until(deadline, &mut on_wait)?;
+            if !priority::pending(&self.0)? {
+                return Ok(guard);
             }
-            Err(TryLockError::Error(error)) => return Err(error.into()),
-            Err(TryLockError::WouldBlock) => (),
+            // A newly published revoker wins before this hello enters its callback.
+            drop(guard);
         }
-        std::thread::Builder::new()
-            .name("client-token-revoke".into())
-            .spawn(move || {
-                let result = file.lock().map(|()| file);
-                // After timeout the receiver is gone: a late guard is released here,
-                // and cannot remove a credential. Dispatch remains in the caller.
-                let _ = tx.send(result);
-            })?;
-        Ok(rx)
     }
-    fn begin_revoke(&self, name: &str) -> Result<PendingRevoke<'_>, TokenError> {
+    fn begin_revoke_entry(&self, entry: String) -> Result<PendingRevoke<'_>, TokenError> {
+        let intent = priority::Intent::begin(&*self.0, self.random::<16>()?)?;
+        let guard = PendingLock::begin(self.lock_file()?, &self.2)?;
         Ok(PendingRevoke {
             store: self,
-            entry: hex(filename(name)?.as_bytes()),
-            guard: self.revoke_lock()?,
+            entry,
+            guard,
+            _intent: intent,
         })
+    }
+    fn begin_revoke(&self, name: &str) -> Result<PendingRevoke<'_>, TokenError> {
+        self.begin_revoke_entry(hex(filename(name)?.as_bytes()))
     }
     fn load(&self, name: &str) -> Result<Record, TokenError> {
         let mut bytes = Vec::new();
@@ -232,6 +258,7 @@ impl TokenStore {
             name: name.into(),
             principal: r.principal.clone(),
             scopes: r.scopes.clone(),
+            expires_in_ms: None,
         }
     }
     fn save(&self, name: &str, record: &Record, replace: bool) -> Result<(), TokenError> {
@@ -276,7 +303,7 @@ impl TokenStore {
         &self,
         authority: &LocalOperator<'_>,
     ) -> Result<Bearer, TokenError> {
-        let scopes = BTreeSet::from([Scope::Read, Scope::Send, Scope::Answer, Scope::Operate]);
+        let scopes = operator_scopes();
         let guard = self.lock()?;
         match self.load("operator") {
             Ok(record) if record.scopes == scopes => Ok(record.token),
@@ -340,12 +367,7 @@ impl TokenStore {
         _: &LocalOperator<'_>,
         entry: &str,
     ) -> Result<(), TokenError> {
-        PendingRevoke {
-            store: self,
-            entry: entry.into(),
-            guard: self.revoke_lock()?,
-        }
-        .finish()
+        self.begin_revoke_entry(entry.into())?.finish()
     }
     /// Authenticate hello against current token files; address grants no identity.
     pub(crate) fn authenticate(&self, presented: &Bearer) -> Result<Session, TokenError> {
@@ -364,16 +386,20 @@ impl TokenStore {
         }
         Err(TokenError::Unauthorized)
     }
-    /// Recheck before dispatch and hold the revocation lock through bounded admission.
-    /// The callback cannot return the borrowed sealed capability. It must not wait
-    /// for model execution or call token management recursively; contention is Busy.
+    /// Recheck and hold a shared token-store lock through bounded dispatch (#2450).
+    /// Mutation remains exclusive; intent checks before and after acquisition give
+    /// pending revocation priority. Busy means a live revocation intent or an
+    /// exclusive store lock; concurrent readers and unlocked stale intents do not
+    /// contend. Startup and revocation reclaim stale intents under exclusive locks.
+    /// The callback cannot return the borrowed sealed capability, wait for model
+    /// execution, or call token management recursively.
     pub(crate) fn admit<T>(
         &self,
         session: &Session,
         required: Scope,
         dispatch: impl for<'a> FnOnce(VerifiedToken<'a>) -> T,
     ) -> Result<T, TokenError> {
-        let _guard = self.lock()?;
+        let _guard = self.lock_with(LockFile::try_lock_shared)?;
         let r = self.load(&session.info.name).map_err(|e| match e {
             TokenError::Io(e) if e.kind() == io::ErrorKind::NotFound => TokenError::Revoked,
             e => e,
