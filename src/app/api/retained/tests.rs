@@ -199,3 +199,54 @@ async fn retained_agent_token_without_operator_evidence_is_refused() {
         raw
     );
 }
+
+async fn relay_refused(method: Method, enrolled: bool) {
+    let mut app = operator();
+    let raw = json!([true, {"runtime":"future-runtime"}]);
+    app.state.structured_agents = serde_json::from_value(raw.clone()).unwrap();
+    let pid = std::process::id();
+    let started = crate::platform::process_start_time(pid).unwrap();
+    app.inbound
+        .attach(pid, started, crate::platform::process_start_time)
+        .unwrap();
+    let status = crate::mesh::hello::Enrollment {
+        peer: "relay.example".into(),
+        source: crate::mesh::store::PinSource::Inbound,
+        pin_origin: Default::default(),
+        node_id: Some("retained-relay-node".into()),
+        state: "pinned".into(),
+        reason: None,
+    };
+    if enrolled {
+        app.inbound
+            .enroll(pid, status, crate::platform::process_start_time)
+            .unwrap();
+    }
+    let response = request(&mut app, method);
+    assert_eq!(
+        serde_json::to_value(&app.state.structured_agents).unwrap(),
+        raw,
+        "refused maintenance must preserve every retained record"
+    );
+    assert_eq!(response["error"]["code"], "operator_only", "{response}");
+}
+
+#[tokio::test]
+async fn retained_enrolled_relay_cannot_list() {
+    relay_refused(list(), true).await;
+}
+
+#[tokio::test]
+async fn retained_enrolled_relay_cannot_purge() {
+    relay_refused(purge(Selection::All, true), true).await;
+}
+
+#[tokio::test]
+async fn retained_pending_relay_cannot_list() {
+    relay_refused(list(), false).await;
+}
+
+#[tokio::test]
+async fn retained_pending_relay_cannot_purge() {
+    relay_refused(purge(Selection::All, true), false).await;
+}

@@ -1,8 +1,5 @@
 //! Operator-only list/purge, with durable commit before live registry mutation.
-use super::{
-    responses::{encode_error, encode_success},
-    SpawnCaller,
-};
+use super::responses::{encode_error, encode_success};
 use crate::{
     api::{
         error_code::ErrorCode,
@@ -15,12 +12,10 @@ use crate::{
 
 impl App {
     pub(super) fn handle_retained(&mut self, id: String, method: Method) -> String {
-        if self.current_api_peer_pid.is_none()
-            || !self.current_api_peer_uid.flatten().is_some_and(|uid| {
-                self.runtime_config.uid_policy.classify(Some(uid))
-                    == crate::structured::identity::Principal::Operator
-            })
-            || !matches!(self.spawn_caller(), SpawnCaller::Operator { .. })
+        if !self.current_api_peer_uid.flatten().is_some_and(|uid| {
+            self.runtime_config.uid_policy.classify(Some(uid))
+                == crate::structured::identity::Principal::Operator
+        }) || !self.caller_is_local_operator()
         {
             return encode_error(id, ErrorCode::OperatorOnly.as_str(), "retained records require the operator principal; agent credentials cannot authorize maintenance");
         }

@@ -49,6 +49,15 @@ fn retained_doctor_text_reports_both_kinds_and_the_operator_purge_hint() {
 
 #[tokio::test]
 async fn retained_doctor_socket_round_trip_reports_the_actual_registry() {
+    doctor_socket_round_trip(false).await;
+}
+
+#[tokio::test]
+async fn retained_doctor_socket_refuses_an_enrolled_relay() {
+    doctor_socket_round_trip(true).await;
+}
+
+async fn doctor_socket_round_trip(relayed: bool) {
     use crate::api::client::{ApiClient, ConnectionTarget};
     use std::{
         os::{fd::AsRawFd, unix::net::UnixListener},
@@ -123,11 +132,37 @@ async fn retained_doctor_socket_round_trip_reports_the_actual_registry() {
     app.current_api_peer_pid = msg.peer_pid;
     app.current_api_peer_birth = Some(msg.peer_birth);
     app.current_api_peer_uid = Some(msg.peer_uid);
+    if relayed {
+        let pid = msg.peer_pid.unwrap();
+        let started = msg.peer_birth.unwrap();
+        app.inbound
+            .attach(pid, started, crate::platform::process_start_time)
+            .unwrap();
+        app.inbound
+            .enroll(
+                pid,
+                crate::mesh::hello::Enrollment {
+                    peer: "relay.example".into(),
+                    source: crate::mesh::store::PinSource::Inbound,
+                    pin_origin: Default::default(),
+                    node_id: Some("doctor-relay-node".into()),
+                    state: "pinned".into(),
+                    reason: None,
+                },
+                crate::platform::process_start_time,
+            )
+            .unwrap();
+    }
     msg.respond_to
         .send(app.handle_api_request(msg.request))
         .unwrap();
     let response = client.join().unwrap();
     server.join().unwrap();
+    assert_eq!(app.state.structured_agents.retained_count(), 3);
+    if relayed {
+        assert_eq!(response["error"]["code"], "operator_only", "{response}");
+        return;
+    }
     let result: ResponseResult = serde_json::from_value(response["result"].clone()).unwrap();
     let rendered = text(&result, true).unwrap();
     assert!(rendered.contains("FORWARD 2, DEAD 1"), "{rendered}");

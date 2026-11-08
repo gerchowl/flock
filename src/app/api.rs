@@ -1563,6 +1563,13 @@ impl App {
             return String::new();
         }
 
+        if matches!(
+            &request.method,
+            Method::SessionRetainedList(_) | Method::SessionRetainedPurge(_)
+        ) {
+            return self.handle_retained(request.id, request.method);
+        }
+
         if !matches!(
             &request.method,
             Method::MeshHello(_) | Method::PeersEnrollReset(_)
@@ -1699,9 +1706,6 @@ impl App {
             Method::AgentLineage(params) => return self.handle_agent_lineage(request.id, params),
             Method::DelegateList(params) => return self.handle_delegate_list(request.id, params),
             Method::MsgSend(params) => return self.handle_msg_send(request.id, params),
-            Method::SessionRetainedList(_) | Method::SessionRetainedPurge(_) => {
-                return self.handle_retained(request.id, request.method);
-            }
             Method::ClientTokenAdd(_)
             | Method::ClientTokenRemove(_)
             | Method::ClientTokenList(_)
