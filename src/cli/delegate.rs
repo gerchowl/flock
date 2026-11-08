@@ -5063,6 +5063,8 @@ impl Outcome {
 
 /// What one poll of the result store said.
 enum ResultPoll {
+    /// The terminal changed through recovery; discard the previous settle baseline.
+    Rebound,
     /// A reply from THIS round, with its sentinel read. The reply is CARRIED, not
     /// re-read at print time (R6): a second read can be a different reply, and an
     /// outcome whose text is not the reply it was decided from is a lie with the
@@ -5094,6 +5096,8 @@ enum ResultPoll {
 
 /// What the reply grace concluded.
 enum Grace {
+    /// The terminal changed through recovery; discard the previous settle baseline.
+    Rebound,
     /// A reply from this round, with the reply itself.
     Reply {
         outcome: Outcome,
@@ -5121,6 +5125,8 @@ enum Grace {
 
 /// What a settled outcome means for the delegate.
 enum SettledDecision {
+    /// The terminal changed through recovery; discard the previous settle baseline.
+    Rebound,
     /// Report this outcome and exit with its code.
     Report {
         outcome: Outcome,
@@ -5139,12 +5145,14 @@ enum SettledDecision {
 
 /// What `started_another_turn` concluded (W4).
 ///
-/// Four answers: a new turn ends the grace with `Grace::NewTurn`, no new
-/// turn keeps polling, a timeout ends the whole await as `Outcome::Timeout`,
+/// A replacement restarts settling, a new turn ends the grace with
+/// `Grace::NewTurn`, no new turn keeps polling, and a timeout ends the await as `Outcome::Timeout`,
 /// and a transport failure ends it as exit 1. Earlier revisions returned
 /// `bool`, which collapsed `Failed` into "no new turn" and spun silently
 /// against a dead server.
 enum TurnCheck {
+    /// The terminal changed through recovery; discard the previous settle baseline.
+    Rebound,
     NewTurn,
     NoNewTurn,
     Timeout,
@@ -5190,6 +5198,12 @@ struct Await<'a> {
     json: bool,
 }
 
+/// A result poll either reads the store or recovers a replacement terminal.
+enum ResultFetch {
+    Response(serde_json::Value),
+    Rebound,
+}
+
 /// What the round loop needs from outside: one settle, the result store, the
 /// agent record and the clock that times the reply grace (#1257).
 ///
@@ -5199,8 +5213,8 @@ trait RoundIo {
     /// Settle once from `after`. The flag is the start watch's "never started".
     fn settle(&mut self, after: Option<&str>)
         -> io::Result<(super::settled::SettledOutcome, bool)>;
-    /// One `agent.result` for the delegate's agent.
-    fn agent_result(&mut self) -> Result<serde_json::Value, BoundedError>;
+    /// Read the result store, or report recovery before reading it.
+    fn agent_result(&mut self) -> Result<ResultFetch, BoundedError>;
     /// One `agent.get` for the delegate's agent.
     fn agent_record(&mut self) -> AgentFetch;
     fn now(&self) -> Instant;
@@ -5248,6 +5262,8 @@ impl<'w, 'a> SocketRound<'w, 'a> {
         }
         persist_reidentified(&self.entry, &live);
         self.entry = live;
+        self.monitor.interrupted(Instant::now());
+        self.start_watch.interrupted();
         Ok(true)
     }
 
@@ -5379,7 +5395,7 @@ impl RoundIo for SocketRound<'_, '_> {
             );
             match fetched {
                 AgentFetch::Found(record) => match self.follow_record(&record) {
-                    Ok(true) => return self.settle(after),
+                    Ok(true) => return self.settle(None),
                     Ok(false) => {}
                     Err(reason) => {
                         self.unbound = Some(reason);
@@ -5401,7 +5417,7 @@ impl RoundIo for SocketRound<'_, '_> {
         Ok((settled, not_started))
     }
 
-    fn agent_result(&mut self) -> Result<serde_json::Value, BoundedError> {
+    fn agent_result(&mut self) -> Result<ResultFetch, BoundedError> {
         if let AgentFetch::Found(record) = agent_record(
             self.entry
                 .agent_id
@@ -5409,9 +5425,13 @@ impl RoundIo for SocketRound<'_, '_> {
                 .unwrap_or(&self.entry.terminal_id),
             self.wait.deadline,
         ) {
-            if let Err(reason) = self.follow_record(&record) {
-                self.unbound = Some(reason);
-                return Err(BoundedError::Transport(io::Error::other("session_unbound")));
+            match self.follow_record(&record) {
+                Ok(true) => return Ok(ResultFetch::Rebound),
+                Ok(false) => {}
+                Err(reason) => {
+                    self.unbound = Some(reason);
+                    return Err(BoundedError::Transport(io::Error::other("session_unbound")));
+                }
             }
         }
         let response = bounded(
@@ -5430,17 +5450,24 @@ impl RoundIo for SocketRound<'_, '_> {
             self.unbound = Some(session::CONFLICT.into());
             return Err(BoundedError::Transport(io::Error::other("session_unbound")));
         }
-        Ok(response)
+        Ok(ResultFetch::Response(response))
     }
 
     fn agent_record(&mut self) -> AgentFetch {
-        agent_record(
+        let fetched = agent_record(
             self.entry
                 .agent_id
                 .as_deref()
                 .unwrap_or(&self.entry.terminal_id),
             self.wait.deadline,
-        )
+        );
+        if let AgentFetch::Found(record) = &fetched {
+            if let Err(reason) = self.follow_record(record) {
+                self.unbound = Some(reason.clone());
+                return AgentFetch::Failed(reason);
+            }
+        }
+        fetched
     }
 
     fn now(&self) -> Instant {
@@ -5530,7 +5557,8 @@ impl Await<'_> {
 
     /// The round loop: settle, then wait for the reply, until the round ends.
     ///
-    /// It settles again in two cases. The agent took ANOTHER turn while the
+    /// Recovery on a new terminal restarts settling with that terminal's own
+    /// cursor state. It also settles again if the agent took ANOTHER turn while the
     /// reply grace ran: the reply that answers the round the caller asked about
     /// is then not the reply that arrives next, so the loop waits past the
     /// cursor it just settled on. Or the store records this round's turn as
@@ -5558,6 +5586,7 @@ impl Await<'_> {
                 }
                 SettledDecision::Usage(reason) => return Ok(RoundEnd::Usage(reason)),
                 SettledDecision::Failed(reason) => return Ok(RoundEnd::Failed(reason)),
+                SettledDecision::Rebound => after = None,
                 SettledDecision::WaitAgain => {
                     // Resume from the cursor that settled, not from the one this
                     // await started at: the new turn is what the round now means,
@@ -5648,6 +5677,7 @@ impl Await<'_> {
                 info: None,
             },
             Grace::Refused(reason) => SettledDecision::Failed(reason),
+            Grace::Rebound => SettledDecision::Rebound,
             Grace::NewTurn => SettledDecision::WaitAgain,
             Grace::Open => SettledDecision::SettleAgain,
             Grace::Timeout => SettledDecision::Report {
@@ -5696,6 +5726,7 @@ impl Await<'_> {
             let asked = io.now();
             match self.poll_result(io) {
                 ResultPoll::Fresh { outcome, info } => return Grace::Reply { outcome, info },
+                ResultPoll::Rebound => return Grace::Rebound,
                 ResultPoll::Open => return Grace::Open,
                 ResultPoll::Gone => return Grace::Gone,
                 ResultPoll::Refused(reason) => return Grace::Refused(reason),
@@ -5716,6 +5747,7 @@ impl Await<'_> {
             // is not the next one to land. Settle again instead. A transport
             // failure here is a FAILURE, not "no new turn" (W4).
             match self.started_another_turn(io, settled_cursor) {
+                TurnCheck::Rebound => return Grace::Rebound,
                 TurnCheck::NewTurn => return Grace::NewTurn,
                 TurnCheck::NoNewTurn => {}
                 TurnCheck::Timeout => return Grace::Timeout,
@@ -5758,6 +5790,9 @@ impl Await<'_> {
         let (Ok(now), Ok(before)) = (Cursor::parse(raw), Cursor::parse(settled_cursor)) else {
             return TurnCheck::NoNewTurn;
         };
+        if now.terminal_id != before.terminal_id {
+            return TurnCheck::Rebound;
+        }
         if now.epoch != before.epoch {
             return if now.epoch > before.epoch {
                 TurnCheck::NewTurn
@@ -5804,7 +5839,8 @@ impl Await<'_> {
     /// Ask the store for the newest reply, and say whether it is this round's.
     fn poll_result(&self, io: &mut dyn RoundIo) -> ResultPoll {
         match io.agent_result() {
-            Ok(response) => self.classify_result(&response),
+            Ok(ResultFetch::Rebound) => ResultPoll::Rebound,
+            Ok(ResultFetch::Response(response)) => self.classify_result(&response),
             Err(err) => match await_failure(&err, self.deadline, io.now()) {
                 AwaitFailure::Timeout => ResultPoll::Timeout,
                 AwaitFailure::NotYet => ResultPoll::Unanswered,

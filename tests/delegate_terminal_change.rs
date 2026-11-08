@@ -7,7 +7,7 @@ use std::os::unix::net::UnixListener;
 use std::process::Output;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 use std::time::Duration;
 use support::environment::Command;
@@ -19,12 +19,16 @@ enum SessionCase {
     ConflictingResult,
     AmbiguousClaude,
     Protocol32,
+    CachedGrace,
+    EmptyGrace,
+    TurnCheckGrace,
 }
 
 struct Fixture {
     dir: support::socket_dir::SocketDir,
     socket: std::path::PathBuf,
     stop: Arc<AtomicBool>,
+    requests: Arc<Mutex<Vec<Value>>>,
     worker: Option<std::thread::JoinHandle<()>>,
 }
 impl Fixture {
@@ -51,6 +55,10 @@ impl Fixture {
         case: SessionCase,
     ) -> Self {
         let conflict = case == SessionCase::ConflictingRecord;
+        let grace = matches!(
+            case,
+            SessionCase::CachedGrace | SessionCase::EmptyGrace | SessionCase::TurnCheckGrace
+        );
         let dir = support::socket_dir::SocketDir::reserve("d2993");
         let socket = dir.path().join("s");
         let home = dir.path().join("home");
@@ -114,9 +122,14 @@ impl Fixture {
         listener.set_nonblocking(true).unwrap();
         let stop = Arc::new(AtomicBool::new(false));
         let stopped = stop.clone();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let seen = requests.clone();
         let worker = std::thread::spawn(move || {
             let mut first = true;
-            let mut bound = empty_result || legacy || conflict;
+            let mut bound = empty_result || legacy || conflict || grace;
+            let mut old_sampled = false;
+            let mut result_polled = false;
+            let mut replaced = false;
             while !stopped.load(Ordering::SeqCst) {
                 let Ok((mut stream, _)) = listener.accept() else {
                     std::thread::sleep(Duration::from_millis(5));
@@ -133,8 +146,23 @@ impl Fixture {
                 let Ok(request) = serde_json::from_str::<Value>(&line) else {
                     continue;
                 };
+                seen.lock().unwrap().push(request.clone());
                 let target = request["params"]["target"].as_str().unwrap_or_default();
                 let result = match request["method"].as_str().unwrap() {
+                    "agent.get" if grace => {
+                        if target == "term_old" {
+                            old_sampled = true;
+                        } else if old_sampled
+                            && (case != SessionCase::TurnCheckGrace || result_polled)
+                        {
+                            replaced = true;
+                        }
+                        json!({"result":{"agent":{"name":"fixture","agent_id":"agent_fixture.example_2993",
+                            "terminal_id":if replaced {"term_new"} else {"term_old"},"pane_id":"w1:p1",
+                            "agent_status":if replaced {"working"} else {"done"},
+                            "turn_cursor":if replaced {"term_new:0:10:20:w"} else {"term_old:0:1:2:i"},
+                            "agent_session":session}}})
+                    }
                     "agent.get" if target == "other" => json!({"result":{"agent":{
                         "name":"other","agent_id":"agent_fixture.example_other", "cwd":home,
                         "terminal_id":"term_other","pane_id":"w1:p2","agent_session":session}}}),
@@ -168,6 +196,13 @@ impl Fixture {
                         bound = true;
                         json!({"result":{}})
                     }
+                    "agent.result"
+                        if case == SessionCase::EmptyGrace
+                            || case == SessionCase::TurnCheckGrace =>
+                    {
+                        result_polled = true;
+                        json!({"error":{"code":"no_result","message":"turn still running"}})
+                    }
                     "agent.result" if empty_result => {
                         json!({"error":{"code":"no_result","message":"turn still running"}})
                     }
@@ -200,6 +235,7 @@ impl Fixture {
             dir,
             socket,
             stop,
+            requests,
             worker: Some(worker),
         }
     }
@@ -346,4 +382,48 @@ fn ambiguous_claude_profile_and_default_session_is_unbound() {
             "session_unbound",
         );
     }
+}
+
+fn assert_mid_grace_recovery(case: SessionCase) {
+    let fixture = Fixture::case(true, false, false, false, case);
+    let registry = fixture
+        .dir
+        .path()
+        .join("home/state")
+        .join(support::paths::app_dir_name())
+        .join("delegates")
+        .join(support::paths::server_key(&fixture.socket))
+        .join("fixture.json");
+    let before: Value = serde_json::from_slice(&std::fs::read(&registry).unwrap()).unwrap();
+    fixture.assert("wait", 124, "timeout");
+    let after: Value = serde_json::from_slice(&std::fs::read(&registry).unwrap()).unwrap();
+    for key in ["round", "submitted_at_ms", "cursor", "session"] {
+        assert_eq!(after[key], before[key], "recovery changed {key}");
+    }
+    assert_eq!(after["terminal_id"], "term_new");
+    let requests = fixture.requests.lock().unwrap();
+    assert!(requests
+        .iter()
+        .any(|r| r["method"] == "pane.report_agent_session"));
+    assert!(
+        requests
+            .iter()
+            .any(|r| r["method"] == "agent.get" && r["params"]["target"] == "term_new"),
+        "the replacement must be sampled by settling"
+    );
+}
+
+#[test]
+fn mid_grace_cached_reply_waits_for_working_replacement_to_settle() {
+    assert_mid_grace_recovery(SessionCase::CachedGrace);
+}
+
+#[test]
+fn mid_grace_no_result_does_not_compare_terminal_counters() {
+    assert_mid_grace_recovery(SessionCase::EmptyGrace);
+}
+
+#[test]
+fn mid_grace_turn_check_restarts_on_a_different_terminal() {
+    assert_mid_grace_recovery(SessionCase::TurnCheckGrace);
 }
