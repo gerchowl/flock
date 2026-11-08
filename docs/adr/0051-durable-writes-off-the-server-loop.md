@@ -157,7 +157,9 @@ do not split transactions into ad hoc file writes or change `FULL` to `NORMAL`.
 1. A receipt means the operation's durability boundary succeeded. Event-log
    receipts require append and data sync, plus parent-directory sync on
    create/rotation. Snapshot receipts require temp sync, rename, directory
-   sync. A failed directory sync is a failed receipt, even if rename happened.
+   sync; snapshot/history deletion receipts require unlink (or confirmed
+   absence) followed by parent-directory sync, under the ordered clear contract
+   below. A failed directory sync is a failed receipt even after rename/unlink.
    The guarantee assumes the filesystem/device honors its sync contract; no
    new claim about hardware power-loss behavior is introduced.
 2. Reserve sequence numbers in submission order. The writer owns file handles,
@@ -169,6 +171,8 @@ do not split transactions into ad hoc file writes or change `FULL` to `NORMAL`.
    syncs fence dependent operations; do not recycle sequences in-process or
    publish them as durable. Restart follows the preserved log's highest sequence,
    including unknown kinds, with the existing gap rules.
+   Both cold-reader APIs must filter disk payloads against a captured committed
+   watermark, not merely cap their returned cursor (details below).
 3. Group adjacent log appends: at most 64 operations, 256 KiB encoded bytes,
    or 5 ms oldest-item age before starting sync. Under a backlog, drain an
    available batch immediately. One sync may acknowledge the batch only after
@@ -176,6 +180,8 @@ do not split transactions into ad hoc file writes or change `FULL` to `NORMAL`.
    success receipt for an unproved suffix; fence and recover the store.
    Never coalesce durable events. Coalesce only unsubmitted, replaceable
    session snapshots; a flush/explicit save pins its generation.
+   Rotation additionally waits for the retention/reissue fence below; a size
+   threshold alone never authorizes deleting a retained segment.
 4. The shared event/snapshot queue is FIFO across files. Explicit barriers
    connect the in-memory snapshot generation N to event watermark S for drain
    accounting only. Neither is a new persisted recovery field. Two renames
@@ -238,7 +244,9 @@ tokens, not a new on-disk consistency scheme. Recovery is concrete:
 
 1. Acquire writer ownership first. Parse `session.json` using the existing
    lenient entry-preserving loader; restore workspace/layout/structured registry
-   from that file alone. Ignore incomplete temp files as recovery authorities.
+   from that file alone. After an acknowledged empty-session clear, absence is
+   the saved empty state; do not resurrect it from history or orphan temp files.
+   Ignore incomplete temp files as recovery authorities.
 2. If history persistence is enabled, load `session-history.json` independently
    using its existing matching/restore rules. Missing/stale history must never
    discard a valid session or reconstruct a workspace absent from it. A crash
@@ -263,6 +271,140 @@ pre-commit importer. A future atomic session/history checkpoint or workspace
 event-replay design needs its own recovery algorithm and independently sized
 slices; it is outside this proposal.
 
+### Ordered empty-session clear and history deletion
+
+Today `App::save_session_now` calls `persist::clear()` when both registries are
+empty (`src/app/session.rs:57`); `clear_path`, `clear` and `clear_history`
+(`src/persist/io.rs:103–135`) unlink without syncing a directory and hide errors
+behind logging. Replacement receipts alone therefore cannot prove a saved
+empty session or durably disabled history.
+
+The snapshot owner accepts explicit FIFO commands `ClearSession(generation)`
+and `DeleteHistory(generation)`, alongside replacements. `ClearSession` deletes
+the configured session entry and history entry in that order; `DeleteHistory`
+deletes only history and is also required when saving without history. For
+each entry, unlink it (or observe `NotFound`), then sync its parent directory
+before completing that entry's receipt. Sync both parents if they differ.
+Missing files are an idempotent deletion case, **not** a reason to skip the
+directory sync: they may be missing because an earlier unlink succeeded but
+its directory sync failed. A missing/unopenable parent is a propagated failure;
+the owner must establish its private root durably before accepting operations.
+
+An explicit save/flush of empty state succeeds only after **both** deletion
+receipts complete. A save with history disabled waits for its history-delete
+receipt as well as its session-replacement receipt. Clear/delete commands pin
+their generation and cannot be coalesced away or overtaken by a later save.
+Autosave may coalesce an unsubmitted empty snapshot into the latest desired
+generation, but a submitted clear remains ordered and fully accounted.
+
+Propagate unlink/open/sync errors to the continuation as `persistence_failed`,
+`outcome=unknown`; the operation may have partially deleted its files. Do not
+report clean shutdown, completed handoff drain or successful flush from a
+logging-only `clear()` return. Retain dirty/failed status and fence dependent
+operations until recovery. A same-generation retry before reopening admission
+rechecks both target entries and syncs their parents, even if both are absent.
+It may complete the original deletion proof; it cannot assume the previous
+attempt's absent files are durable. A stale retry must never run after a newer
+replacement generation: return the known original receipt or an explicit stale/
+unknown result without unlinking the newer file. After restart, process-local
+generation deduplication is gone; inspect current state before retrying, and
+issue a new clear only if deleting the current state is still intended.
+
+Crashes before either directory sync may recover the corresponding old entry;
+that is an unacknowledged/partial operation. After a successful empty clear,
+recovery must find no old workspace/registry/history state. After successful
+history deletion, session state remains recoverable but deleted history must
+not reappear. There is no atomic multi-file deletion promise: failure after
+session deletion but before history deletion is surfaced as partial/unknown.
+
+### Committed publication through cold readers
+
+Current `EventHub::read` (`src/api/event_hub.rs:574–678`) caps its cursor but
+does not filter disk payloads by the committed watermark;
+`persisted_events_after` (`:716–765`) also returns parsed disk records directly.
+Once the writer releases the hub mutex during sync, a complete appended line
+can be readable while its receipt is still pending. Ring-only filtering cannot
+enforce the publication invariant.
+
+For **both** APIs, capture committed watermark H from the published in-memory
+state at read start, with the ring/path/rotation metadata. Parse disk outside
+the hub/writer lock and discard every record with `seq > H` before merging,
+sorting, selecting payloads or calculating scan progress, retention floors and
+gaps. Filter the ring merge by the same H. Newly reported progress and gaps
+must describe only the committed prefix; an uncommitted suffix is neither an
+event nor a retention gap. A commit occurring during the read becomes visible
+on a subsequent read rather than changing H midway through this one. Preserve
+existing handling of invalid/future input cursors and corruption in committed
+history. Rotation retries must retain H and remain bounded without holding the
+main-loop mutex over disk I/O. Startup establishes H from the recovered log
+under exclusive ownership before exposing either reader.
+
+Slice C's failing-first blocked-sync test forces a genuine cold path (evict
+older committed events from the ring), appends a full valid event line, and
+holds sync **after** bytes reach disk but before commitment. Concurrent calls
+to `read` and `persisted_events_after` must complete within a ceiling and omit
+the pending payload and progress past H, even when only that suffix matches
+the query filter. Releasing a successful sync exposes it on the next call;
+an injected sync failure exposes nothing and fences the writer. Also race
+rotation/commit with reader retries and verify no false gap or leaked suffix.
+
+### Retention and reissue fence before rotation
+
+Today rotation reissues are dispatched by the app loop
+(`src/server/headless.rs:790`, `src/app/delegation.rs:255–264`). An autonomous
+writer can rotate repeatedly before that loop schedules or admits reissues.
+Polling a rotation counter after deletion is therefore insufficient.
+
+Before **any** rename/delete rotation, the writer starts a retention epoch and
+closes ordinary durable admission at a defined FIFO cut. Seal all prior
+admissions, drain their commands and receipts in order, then ask the app to
+capture the complete recovery reissue set from its committed projection through
+that cut. This covers all log-backed state required by the existing recovery
+folds, including adopted policies. Admit that set and an end marker through
+reserved control capacity; append/sync it to the **still-active** log before
+rotating. The end marker acknowledges a complete set, including an empty one.
+Only after every reissue receipt succeeds may the writer rotate, delete an
+oldest segment and sync the directory. Reopen normal admission only after that
+rotation receipt succeeds. Startup uses the same fence before its first
+destructive rotation. The app no longer treats a counter change as permission
+to emit an independent, unordered reissue batch.
+
+Prevent a queue deadlock without bypassing FIFO: while sealing/draining the
+already-admitted prefix and the reserved reissue batch, suppress threshold
+rotation and allow a **bounded** active-file overshoot. Ordinary queued log
+payload is already capped at 4 MiB/256 commands (one event per append command).
+Reserve an additional 4 MiB/16,384 facts for one complete reissue set and its
+end marker, outside ordinary queue capacity. Thus one epoch adds at most 8 MiB
+and 16,640 events beyond the threshold-crossing batch; include that batch's
+maximum 256 KiB/64 events in the hard segment bound. No extra unbounded log
+segments or reordered normal commands are allowed. Reissue appends cannot
+recursively trigger a second epoch. Charge the reserved control bytes before
+copying/encoding; reject a new folded-state mutation before it would exceed
+the reissue-set bound. Oversized recovered state is preserved and readable but
+fences rotation/mutations pending explicit recovery; never truncate its set.
+Recovery and retries charge existing active-file overshoot against the same
+hard bound. If the remaining capacity cannot hold a complete fence, preserve
+the files and refuse further writes/rotation pending recovery; restarting may
+never reset the budget and accumulate another overshoot allowance.
+
+A delayed/backpressured app leaves the old retained files intact and new
+durable callers receive `persistence_busy`. Read-only state and attach remain
+available; a missing/failed reissue set or failed sync fences rotation instead
+of deleting the last copy. Epoch waiting has a 30 s failure ceiling; no timeout
+authorizes deletion. Shutdown/handoff must resolve the epoch or report a failed
+drain before ownership transfer. This preserves the latest durable copy without
+requiring app reissues to overtake a full ordinary queue.
+
+Slice C must force repeated would-be rotations with delayed reissue scheduling,
+full ordinary admission and blocked/failed reissue sync. Assert zero deletion
+before the complete-set receipt, bounded overshoot/memory, responsive readers
+and attach, and no clean handoff through an unresolved epoch. Then release
+reissues, rotate repeatedly and restart: every acknowledged surviving folded
+record must still be recoverable. Include empty sets, sets near the control
+budget, over-budget recovered sets, a crash between reissue sync and rotation,
+and closure/update events at the FIFO cut. Inject a removed fence to prove
+the delayed-reissue test fails against the unsafe rotation path.
+
 ### Back-pressure and errors
 
 Admission starts at ingress, not at the writer. Today startup constructs an
@@ -285,8 +427,10 @@ completion. Disconnect must neither cancel admitted effects nor bypass limits.
 The same limits must cover the handoff-import startup path and every transport
 that dispatches app requests. Per-connection limits alone are insufficient.
 
-Initial limits per owner: 256 queued operations and 4 MiB total owned payload,
-including the active batch; 256 waiting request continuations. Enforce bytes
+Initial ordinary-admission limits per owner: 256 queued operations and 4 MiB
+owned ordinary payload, including the active batch; 256 waiting request
+continuations. The retention fence's additional 4 MiB control reserve is
+accounted separately. Enforce bytes
 before cloning/serialization expansion. A single oversized snapshot goes
 through a separately bounded streaming/encoding slot (one, 32 MiB ceiling);
 oversize is an explicit error, not a limit bypass. Validate these starting
@@ -438,6 +582,13 @@ and stalled-disk attach **and first usable frame** tests. Run the regression
 against its pre-change build and show failure before candidate success. H is
 an aggregate audit and metrics slice, never permission to postpone those gates.
 Split any family further if production code would exceed 400 lines.
+All listed line budgets are unproved estimates, particularly B1's transport/
+decoding coverage and G0b's handoff/shutdown restructuring. Size the concrete
+diff before implementation; split them into dependent preparatory/activation
+PRs of at most 400 production lines if needed, preserving every admission and
+handoff prerequisite. The expanded reader/retention and clear/delete work in
+C/E must likewise be split if it does not fit. A budget is never a reason to
+drop a required safety path or acceptance test.
 
 | Order | Scope / estimated production lines | Acceptance tests |
 | --- | --- | --- |
@@ -446,8 +597,8 @@ Split any family further if production code would exceed 400 lines.
 | B2 | Dormant bounded writer commands, byte reservations, receipts and barriers, 250–350 | Stalled sink: saturation rejects before mutation, active bytes counted, dead writer resolves waiters, silent writer fails at a ceiling; no disk-held projection lock. No production caller activation. |
 | G0a | Import ownership before writable open/reissue, compatible negotiation/refusal, 200–350 | Failing-first real import test pauses before committed transfer: baseline writable log open is observed and fails; candidate performs read-only validation and opens/reissues only after ownership. Incompatible import refuses before transfer. |
 | G0b | Shutdown/handoff admission close, asynchronous drain and rollback with staged owner, 250–350 | Staged accepted write held before sync prevents transfer/clean exit, while refusal stays responsive. Release completes barrier before import opens. Inject absent drain to demonstrate failure; stuck writer, full queue, importer death and phase-budget tests. Must land before C/E/D activation. |
-| C | Event-log owner activation, one legacy adapter/allocator/FIFO and group commit, 250–350 | Batch thresholds and sync count, rotation order, mixed synchronous/asynchronous submissions, failed/partial sync and directory failure, unknown-kind highest sequence. Mandatory family crash/saturation/handoff/attach+frame gates; all event-hub groups. |
-| E | Session/history owner and process-local receipt generations, 250–350 | Explicit save reply → kill → restore from session, not events. Autosave latest-only coalescing and pinned save barrier; crash between replacements allows new session/old history; raw unknown rows and older-format load preserved; family gates and session group. |
+| C | Event-log owner, shared allocator/FIFO, group commit, cold-reader watermark filtering and retention/reissue fence; estimated 250–350, split before activation as needed | Both `read` and `persisted_events_after` omit appended disk payloads/progress past H during blocked/failed sync and expose them only after commit. Delay/backpressure reissues across repeated would-be rotations: no last-copy deletion, bounded overshoot, restart preserves folded state; removing the fence must fail. Batch/sync/rotation ordering, directory failures, unknown-kind highest sequence, all family gates and event-hub groups. |
+| E | Session/history replacement, ordered clear/delete receipts and process-local generations; estimated 250–350, split as needed | Real last-workspace/registry removal → explicit empty-save receipt → crash/restart must not restore old state. Crash before/after session unlink, its directory sync, history unlink and its directory sync; unacknowledged partial outcomes permitted, acknowledged deletion never resurrects files. History-disabled save and standalone history deletion, missing-file retry with failed prior directory sync, unlink/open/sync failures propagated, stale clear after newer save rejected. Retain replacement/coalescing/raw-row/older-format tests, all family gates and session group. |
 | D1 | Deferred workspace/pane/tab audit handlers and publication, ≤350 per family | Real create → audit receipt → reply → crash before autosave: event remains, workspace restoration uses previous snapshot. After explicit save receipt, restart restores the new workspace from session. Fault cuts, uncertain retry, family gates and full affected handler groups. |
 | D2 | Goal/work/owner/delegate/message continuations and lifecycle producers, ≤400 per family | Declare each family's actual recovery reducer/store; event-fold classes replay acknowledged state, audit-only classes retain facts without invented reconstruction. Drive real requests/ticks; family gates, bounded pending facts and every delegate integration binary when affected. |
 | F1 | SQLite custody/receipt/routing adapters, ≤400 per family | Stalled WAL cannot hold a main-loop mutex; recover from committed DB/WAL; quarantine-before-delete, native inbox and custody receipts remain ordered. Family gates and relevant mesh groups, including extension of G0 fences before activation. |
@@ -472,6 +623,24 @@ that reason. No requested review change is rejected. Linux measurement and
 first-frame enhancement remain explicit gates for the implementation work,
 not evidence claimed by this docs/test-script revision.
 
+## Revision decision log (round 2)
+
+All second pre-mortem requirements are accepted. Empty-session clear and
+history deletion are ordered, directory-synced operations with propagated
+partial/unknown failures and explicit missing-file/stale-retry semantics.
+Slice E now includes their real-entry crash cuts. Slice C gates both cold
+readers on a captured committed watermark, including their payloads, scan
+progress and gap calculations; its blocked-sync tests must cover both APIs.
+
+Rotation must complete a reissue fence **before** deleting any retained copy.
+Closing admission, draining its bounded FIFO prefix and reserving bounded
+control bytes prevents a delayed/backpressured app from either losing recovery
+state or creating an unbounded overflow. C's tests delay scheduling and sync,
+fill the queue, restart across rotation cuts and inject a removed fence.
+B1/G0b and expanded C/E estimates require further splitting wherever their
+concrete diff exceeds 400 production lines. No production or probe changes are
+made by this docs-only revision, and no second-review requirement is rejected.
+
 ## Pre-mortem
 
 - **Lost acknowledged fact:** enqueue returns success or a completion is sent
@@ -482,6 +651,16 @@ not evidence claimed by this docs/test-script revision.
 - **Cross-file reordering:** snapshot N lands after N+1 or references an unsynced
   blob. FIFO generations and explicit receipt dependencies prevent publication;
   crash-cut tests must not pretend two renames are atomic.
+- **Resurrected empty session/history:** unlink succeeds but directory sync
+  fails, or an absent-file retry reports success without syncing. Require clear/
+  delete receipts, propagated errors, missing-file retry and stale-clear tests.
+- **Cold-reader publication leak:** a full disk line is readable before sync,
+  while only the ring/cursor is filtered. Both cold APIs must filter payloads
+  and progress by captured H; block sync after append to prove invisibility.
+- **Retention outruns reissue:** the app has not scheduled its reissue batch
+  when the writer deletes the last old copy. Fence before rotation, reserve a
+  bounded complete set and pause admission; delayed/failed batches cannot
+  authorize deletion. Prove this across repeated rotation and restart.
 - **Unbounded memory during a stuck disk:** a bounded channel hides unbounded
   serialized bytes, pending replies, active batches or rejected retries. Account
   all four, reserve before copying, and test oversized history plus full queues.
