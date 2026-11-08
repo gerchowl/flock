@@ -108,6 +108,49 @@ in plugin and agent-definition metadata. The generated policy stays authoritativ
 Keep the previous verified bundle and adoption receipt for rollback; a human
 name moving to a new digest is never automatic authorization to run it.
 
+Bundle lifecycle is `staged → verified → adopted`, with a terminal **revoked**
+digest tombstone at the operator authority. Verification alone never authorizes
+execution. Revocation increments a durable policy revision and records reason,
+principal, operation ID and affected consumers. A revoked digest cannot be
+re-adopted, selected, resumed, imported for execution or used for rollback; retain
+its bytes only as non-executable quarantined evidence. A corrected bundle needs
+a new digest and fresh review. Garbage collection never discards tombstones.
+
+On revocation, fence admission first, then quarantine every consuming session:
+hold its input/mail, withdraw tool/MCP authority, terminate the harness and all
+supervised descendants, verify exit and publish a stopped/quarantined outcome.
+Notify the operator and affected session viewers; audit requested, acknowledged,
+expired, stopped and unreachable states separately. Retained transcripts are
+untrusted recovery evidence, not permission to resume. An operator may inspect or
+export them, but resuming historical malicious instructions requires a separately
+reviewed recovery path into a fresh session, never an ordinary rollback.
+
+**Fleet fence protocol (also applies to credentials and bindings).** One
+operator-owned authority serializes policy revisions and issues authenticated
+execution permits bound to node/runtime identity, session/lease generation,
+binding revision, bundle digest and credential generation. Permit lifetime is
+at most 60 seconds; renew at most every 15 seconds. A node accepts only current
+policy, persists the highest revision and tombstones, and rechecks at every
+start/resume/reload activation. Unknown state, clock uncertainty, restart or
+inability to renew refuses new admissions. Use a monotonic local deadline
+bounded by the signed expiry and measured request interval; reboot requires a
+fresh permit rather than reconstructing elapsed time from wall-clock guesses.
+
+Revocation commits immediately **at the authority** and pushes a fence to nodes;
+it cannot promise instantaneous delivery through a partition. A supervisor
+outside the harness's trust domain checks expiry, fences tools/input and kills
+consumers on expiry even without the server connection. Allow at most 10 seconds
+for forced process-tree termination after the deadline: an unreachable consumer
+must be stopped within 70 seconds of its last permit issuance. Test that bound
+with authority loss and an uncooperative child. If that independent watchdog or
+OS containment cannot establish the bound on a platform, profile execution is
+unsupported there. Revocation status remains pending/unreachable until an exit
+acknowledgment or trusted OS fence proof arrives; expiry is not fabricated proof
+of exit. Rejoining nodes synchronize tombstones before obtaining any new permit;
+stale snapshots never resurrect revoked authority. Compromise of the supervisor
+or recipient OS is outside this timing guarantee; provider credential revocation
+and operator recovery remain necessary.
+
 Use separate storage roots with separate lifetimes:
 
 - Immutable `bundles/<digest>/` and content-addressed context artifacts are
@@ -133,6 +176,11 @@ launcher, OS-enforced access separation between domains, protected credential an
 bundle roots, controlled tool-child environment, process ancestry/lease enforcement
 and sandboxed filesystem access. A single shared agent UID alone is insufficient.
 The operator-mode exception must remain explicit; no fallback from dedicated mode.
+Operator mode can read sibling credential files through the retained home and UID
+(`launch.rs` environment allowlist); API refusals cannot prevent that. It is
+restricted to the existing explicitly trusted single-account baseline and synthetic
+probe fixtures. New profile activation requires the numbered containment slices
+below; untrusted bundles or multi-account use must never use operator mode.
 
 ### 3. Claude delivery is explicit and probed
 
@@ -149,16 +197,51 @@ skills, explicit `--agents` for agent definitions, and one generated
 entry instead of replacing either side. Reserve the flock name, reject collisions
 and duplicate names, pin commands, and provide only approved environment fields.
 The flock entry retains its owning server endpoint and current lease credential;
-other MCP children never receive that credential. Slice 1 allows flock alone.
+other MCP children never receive that credential. Initial Claude probes allow
+flock alone except for explicit synthetic delivery fixtures.
 Do not use `--add-dir` as an implicit asset-loading escape hatch.
 
 Every delivery claim is gated by a discovery receipt for the exact absolute
-binary, version and binary digest, bundle digest, argv/settings digest and
-platform. A minimum version check is insufficient. A binary or flag change
-invalidates the receipt. Fail closed if required assets are absent or unexpected
+binary, version and binary digest, bundle digest, canonical launch-contract digest
+and platform/containment-policy digest. A minimum version check is insufficient.
+A binary or security-relevant launch-contract change invalidates the receipt.
+Fail closed if required assets are absent or unexpected
 ambient hooks, skills, plugins, servers or tools appear; enumerate and explicitly
 account for built-ins and managed policy. `system/init` names are evidence but
 must be supplemented by actual tool calls and skill/agent marker observations.
+
+**Receipt canonicalization, schema version 1.** Build a typed launch description,
+then hash deterministic JSON with sorted object keys and ordered argv tokens.
+Preserve argument presence, order, arity and every constant value; reject duplicate,
+unknown or unclassified flags. Do not hash a shell command or redact arbitrary
+substrings. The closed list of variable slots is:
+
+| Variable slot | Required validation before substituting a typed slot marker |
+| --- | --- |
+| `--session-id` or the ID operand of `--resume` | Valid UUID, equal to the admitted session and lease. Start and resume are distinct contract variants, each probed. |
+| Generated `--settings` / `--mcp-config` paths | Server-created regular files under this process generation's private root, no escaping symlinks; hash the parsed contents as specified below. |
+| `CLAUDE_CONFIG_DIR`, synthetic/contained `HOME`, generation temp root | Server-selected private roots with verified ownership, mode and containment domain; relative layout and root role stay bound by the contract. |
+| cwd and generated context-file paths | cwd must resolve to the bound repository/worktree within the authorized filesystem scope. Context bytes and layer hashes stay bound; only their validated storage-root prefix varies. |
+| Flock MCP endpoint and lease credential field | Endpoint must resolve to the owning node's attested server in its allowed socket root; credential must match this session/generation and be emitted only into flock's entry. Receipt stores the slot type, never secret bytes or their hash. |
+
+No other value is variable. In generated JSON, hash all typed settings, permission
+rules, tools, agent definitions, plugin layout, MCP names/commands/arguments and
+non-secret environment values. Replace only the exact schema fields for the slots
+above, after validation; bind executables/dependencies and bundle paths by content
+digest plus relative path. The account token is absent from the description:
+its transport and recipient policy are bound, its generation is checked against
+current authority separately. Pin the environment allowlist and resolved executable
+search paths; arbitrary PATH, external MCP endpoints or plugin paths cannot be
+normalized away. Node-specific contracts get separate probe receipts where their
+policy differs. Effective managed settings are included, not silently ignored.
+
+A probe and production session may differ in their validated identifiers/roots,
+but must have identical canonical descriptions. Keep non-secret slot-validation
+results and contract version in each launch record. Failing-first tests prove a
+fresh UUID/private path can reuse the receipt, while altered tool names, settings,
+plugin bytes, MCP command/endpoint ownership, escaping roots, missing flags or
+unrecognized slots cannot. A receipt proves discovery only; current grants,
+revocation, budgets and containment are checked independently on every activation.
 
 The sandboxed probe must:
 
@@ -200,15 +283,33 @@ account's compromise/revocation boundary. Never clone interactive access/refresh
 credentials (ADR-0036 E6). Rotation prepares a new generation for approved
 recipients, verifies availability, switches new admissions, drains or explicitly
 restarts old-generation sessions and revokes the old generation. Revocation fences
-new starts/resumes immediately and stops affected running sessions; provider-side
-revocation is also required because a leaked token can be used outside flock.
-Rollback may reuse an old bundle but never a revoked credential or grant.
+new starts/resumes at the authority immediately and stops affected running
+sessions through §2's acknowledged-or-expiring permit fence. Unreachable nodes
+have the same explicit 70-second bound, not an instantaneous guarantee.
+Provider-side revocation is also required because a leaked token can be used
+outside flock. Rollback may reuse an old bundle but never a revoked digest,
+credential or grant; it requires fresh permits under current policy.
 
 Use account-wide reservations, including starts, forks and resumes across nodes,
 with idempotent acquisition, lease generation and release after verified exit.
-Enforce delegated node quotas whose sum cannot exceed the account cap, or an
-authoritative shared allocator; never infer an account budget from node-local
-counts. Refuse admission when budget authority is unavailable. Allocation authority
+For the initial four-node fleet use the same authoritative owner for policy and
+budget allocation; a partition never elects a replacement allocator. Never infer
+account capacity from node-local counts or permit expiry. A missing exit proof
+keeps the slot charged until recovery or trusted OS fencing proves the writer
+cannot run. Refuse admission when budget authority is unavailable.
+
+**Reload at the cap uses a replacement ticket, not a second slot.** While the old
+writer runs, the allocator records an idempotent successor ticket on its existing
+account reservation, bound to the same session and expected old/new generations.
+The ticket cannot execute. After verified old process-tree exit, atomically mark
+the old generation spent and transfer that one slot to the successor, rechecking
+policy/permit before spawn. Old and new writers can never hold executable rights
+together. Refused preflight leaves the old writer/slot intact. A failed successor
+retains the ticket/slot for retry or an authorized rollback only after its own
+exit is verified; explicit cancellation releases it. Account changes require a
+separate reservation in the new account before shutdown and cannot borrow the
+old account's slot. Partition or uncertain exit leaves the transition pending,
+with no successor activation or capacity reuse. Allocation authority
 and aggregate usage-read authority remain distinct. Tool-child inheritance is
 unverified today; if the token reaches children, treat them as credential
 recipients and block rollout across trust domains until transport or OS controls
@@ -246,9 +347,12 @@ with a reason. This inventory is not a claim that every fleet node is identical.
 ### 6. Reload and context replenishment
 
 Authorize the proposed digest and credential generation **before shutting down**
-a healthy process. Verify bytes and reserve budget, then wait for idle (no started
-input or open control request), close stdin, verify writer and descendants exited,
-transfer the lease and resume the same session. Recheck binding revision, grants,
+a healthy process. Verify bytes and acquire §4's non-executable replacement
+ticket on the existing slot (or a separate new-account reservation), then wait
+for idle (no started input or open control request), close stdin, verify writer
+and descendants exited, transfer reservation and lease, and resume the same
+session. Revocation bypasses the idle wait and uses §2's forced-stop deadline.
+Recheck binding revision, grants,
 revocation and digest at activation; authorization may have changed while waiting.
 An unauthorized reload leaves the old process untouched. Activation failure keeps
 rollback records and does not publish a replacement as active.
@@ -301,33 +405,110 @@ and reject unexpected repository, home, administrator or bundled sources;
 resume and token/refresh concurrency independently. Migration requires its own
 native rollout importer. No Codex support is implied by the Claude slices.
 
+### 9. Operator command and recovery contract
+
+These are proposed CLI/API contracts, not commands available today. One operator
+controls the authority; ordinary relay or harness principals cannot invoke these
+mutations. Authenticated operator transport remains required on remote nodes.
+
+| Operation | CLI | API transaction |
+| --- | --- | --- |
+| Review adoption | `flk profile plan adopt --source <staged-dir>` | `profile.plan { action: adopt, source }` verifies pinned inputs and produces an immutable review plan |
+| Adopt reviewed bytes | `flk profile adopt --plan <plan-id> --expect <plan-digest>` | `profile.adopt` commits precisely the reviewed digest |
+| Bind target authority | `flk profile plan bind --repo <repo-id> --nodes <node-ids> --agents <agent-ids> --account <alias> --bundle <digest> --credential-ref <ref> --generation <n> --grants <grant-ids> --budget <allocation-id> --preset <ceiling>` then `flk profile bind --plan <id> --expect <digest>` | `profile.plan` / `profile.bind` records explicit targets, grants, ceilings and budget; never an inferred fleet-wide wildcard |
+| Rotate credential | `flk profile plan rotate --account <alias> --generation <n> --credential-ref <ref>` then `flk profile rotate --plan <id> --expect <digest>` | `profile.rotate` stages recipients and coordinates canary, drain, switch and old-generation revocation |
+| Roll back content | `flk profile plan rollback --binding <id> --bundle <previous-digest>` then `flk profile rollback --plan <id> --expect <digest>` | `profile.rollback` is a fresh authorized reload to an eligible retained digest, not restoration of old grants or credentials |
+| Emergency revoke | `flk profile revoke --bundle <digest> --reason <text>` or `--account <alias> --generation <n>` or `--binding <id>` | `profile.revoke` durably commits the tombstone/fence before dispatching stops; does not wait for a preview, reachable consumers or provider API availability |
+| Enable reviewed execution | `flk profile plan enable --nodes <node-ids>` then `flk profile enable --plan <id> --expect <digest>` | `profile.enable` requires the complete slice-13 readiness set and current permits; missing prerequisites refuse even for the operator |
+| Set account capacity | `flk profile plan budget --account <alias> --cap <n>` then `flk profile budget --plan <id> --expect <digest>` | `profile.budget` records the account cap and named allocations; a reduction below charged slots drains before new admission |
+| Fleet status | `flk profile status --fleet [--operation <id>] --format json` | `profile.status` shows revisions, digest/generation, permit expiry, slot/ticket, per-node acknowledgment and recovery phase |
+| Recover partial operation | `flk profile recover <operation-id> --retry` or `--cancel` | `profile.recover` reconciles observed writer/lease state before retrying or cancelling; it never clears a revocation |
+
+Plan output shows the exact content/policy diff, hook disposition, discovery and
+containment receipts, recipient set, affected sessions, capacity, predecessor
+revision and rollback eligibility. It contains secret-reference identifiers only,
+never token bytes or secret file contents. Plans expire after five minutes;
+commit verifies the plan digest, caller, staged bytes and expected policy revision
+with compare-and-swap. Changed or expired plans require a new preview. Every
+mutation returns a durable operation ID; repeats with that ID are idempotent,
+and all authority is rechecked at each effect fence. Reading the fleet-wide
+account fields requires the separate account-usage/read grant; unauthorized
+status projections omit those fields without disclosing sibling identities.
+
+For roughly ten agents on four nodes, adoption/preflight fans out concurrently
+without stopping agents; activation runs one canary, then one replacement at a
+time. The status command is the single progress view: prepared, draining,
+activating, verified, failed, unreachable or quarantined per consumer. Stop
+expansion on any failure. A distributed rollout is not falsely reported atomic:
+retain the verified predecessor on unaffected nodes, fence failed consumers, and
+show precisely which revision each node runs. Credential rotation does not revoke
+the predecessor until all old recipients acknowledge replacement or are fenced;
+excluded old recipients must be fenced too. An operator may instead emergency-revoke
+it with the explicit outage consequence.
+
+After a timeout or restart, `status --operation` reads the durable journal and
+`recover --retry` resumes only unfinished effects after process/lease inspection.
+Cancellation stops expansion; rollback of already activated consumers is an
+explicit reviewed operation subject to current revocations and replacement
+rules. An unreachable node remains pending and consumes its reserved capacity;
+recovery waits for exit/fence proof. Emergency revocation never rolls back on a
+partial failure. Status separately reports provider-side credential revocation
+pending/confirmed so a local tombstone is not mistaken for provider invalidation.
+
 ## Ordered implementation slices
 
 Every numbered row is a separate PR with **at most 400 production lines**,
-excluding tests and doc comments. Each begins with the stated failing test or
-probe against the prior build, then records the passing evidence. If the minimum
-implementation exceeds the cap, split it into additional ordered PRs at the same
-phase; do not remove an authority check to fit. Dependencies stay serial.
+excluding tests and doc comments, and the stated failing-first evidence against
+the prior build. Dependencies listed below are mandatory; later work cannot
+activate early.
+If a row still needs more than 400 production lines, split it into further
+inactive PRs before briefing implementation, preserving all dependency gates.
 
-| Slice | Bounded deliverable | Failing-first acceptance |
+**Inactive until proven safe.** Slice 1 adds an operator-only
+`structured_profiles.enabled` binding-state switch, default false, and a common
+admission guard. All new profile spawn/resume/reload, migration, GUI and adapter
+paths must use it before secret access, process creation or mailbox transfer.
+It cannot be enabled from agent-editable files. Slices 1–12 remain inactive in
+production; preparation APIs may verify/store reviewed data but cannot execute
+bundle assets. Synthetic probes use a separate test-only entry with no live
+credentials/server. Existing trusted single-account launch behavior stays on its
+existing path; profile operations never fall back to it on denial. Discovery alone
+cannot enable execution. Slice 13 is the only initial activation path; its
+readiness predicate is checked on enable and on every admission even when the
+switch is true. Disabling execution applies §2's runtime fence to existing
+consumers, rather than merely hiding entry points. Before slice 13 the readiness
+predicate is unconditionally false in production, with a test proving that even
+an operator cannot enable an incomplete build.
+
+| Slice | Prerequisites and bounded deliverable | Failing-first acceptance |
 | --- | --- | --- |
-| 1. Claude binding and discovery | Operator-adopted profile bindings, per-session writable storage, one credential reference and flock-only MCP; sandboxed discovery runbook/receipt under production flags. Candidate plugin/agents fixtures are probe-only until slice 3. | Real admission-path tests refuse relay access, sibling-profile selection, account usage disclosure, tampered bundles and unauthorized reload before secret access/shutdown. Two sessions share an account but no writable directory. Probe explicit tools/MCP, plugin/agents loading, changed/removed skills on resume, credential inheritance and transcript/sidecar import. Delivery remains disabled if the probe cannot establish it. |
-| 2. Bundle adoption | Canonical digest/manifest verification, reviewed operator adoption, atomic publication and retained previous version. | Traversal, escaping/swap symlinks, changed bytes, forbidden hook/env metadata and unpinned executables refuse adoption or launch; prior version survives failure. |
-| 3. Claude bundle delivery | Implement only probe-established plugin/agents flags, explicit tools and generated MCP merge with reserved flock entry. | Production-path discovery matches the manifest and rejects ambient assets, duplicate MCP names and tools outside the approved set. A real call reaches each authorized server without sharing flock's lease credential. |
-| 4. Credential/account admission | Recipient/generation fences, revocation/rotation and distributed budget reservations. | Concurrent cross-node starts cannot exceed cap; stale generation and revoked recipients fail; lost allocator fails closed and usage read remains separately scoped. |
-| 5. Server policy and hooks | Map the security hooks into permission/admission/attribution/audit evaluation; inventory receipt gates cutover. | A real control request hits the resolver, refuses out-of-scope deletion/managed-path writes and escalation, and emits attributed audit; unknown hooks block migration. |
-| 6. Reload/context | Authorized digest transition, hash diff, activation rollback and server replenishment. | Denied reload preserves the old writer; same-name edits are detected; removed tools fail on invocation; resume/compaction injects current context exactly once. |
-| 7. Migrate: import | Verified PTY writer shutdown, discovered project key, transcript/sidecar staging and durable journal. | An active writer, ambiguous transcript or interrupted copy cannot publish a partial import; sandbox native resume reads the imported conversation. |
-| 8. Migrate: activate | New lease activation, mailbox ownership commit and crash/rollback reconciliation. | Failure at each transaction boundary leaves exactly one owner/writer, preserves pending delivery IDs and can recover from retained data. |
-| 9. GUI start/restart (S17) | Existing GUI command/modal patterns resolve authorized bindings and show activation outcomes. | GUI-to-server start/restart selects only target-granted digests; stale/revoked selection is visibly refused without an orphan process. |
-| 10. Profile/usage display (S17) | Project resolved binding, digest, generation and authorized usage without secret paths/bytes. | Profile selection alone reveals no account aggregate or sibling usage; explicit account-read grant changes only the authorized projection. |
-| 11. Codex adapter | Private home, separate auth/refresh contract, generated config and thread resume, after a pinned discovery probe. | Unexpected skill sources and concurrent refresh ownership fail safely; actual app-server resume preserves the intended thread. Split the rollout importer into a following capped PR if needed. |
-| 12. Dogfood | Opt-in staged fleet cutover with inventory/discovery receipts, one session first and rollback drill before expansion. | Isolated end-to-end rehearsal demonstrates failed activation, revocation and recovery before any operator-authorized live cutover. |
+| 1. Disabled admission guard | Existing authority resolver. Add default-false operator switch and one guard used by profile lifecycle entry points; no new launch behavior. | Every entry, including GUI/API/relay routes, refuses while disabled before secret/process/mailbox effects; incomplete builds cannot be enabled even by the operator. Agent/relay cannot enable it or fall back to the legacy path. |
+| 2. Binding records | 1. Persist operator-only target binding records and revisions for one Claude credential reference; resolution returns data only. | Real request path rejects relay mutation, sibling-profile selection and usage disclosure. Resolution cannot spawn or read credentials even with an adopted name. |
+| 3. Per-session storage | 1–2. Allocate private native session roots and preserve durable session identity; no process launch. | Two same-account fixtures cannot share writable roots; failed allocation preserves prior state; disabled guard still blocks execution. |
+| 4. Discovery harness | 1 and 3. Hermetic probe/runbook with schema version 1 canonical receipts and synthetic plugin/agents/MCP/import fixtures; no production enablement. | Fresh identifiers reuse a canonical receipt; changed tools/settings/asset bytes or invalid roots do not. Probe changed/removed skills, native import and credential inheritance. Prove the fixture path cannot use live profiles/server. |
+| 5. Bundle verification | 1. Pure canonical manifest/path/content verification and staging only. | Traversal, escaping/swap symlinks, changed bytes, hooks/env injection and floating executable dependencies fail verification. Tampered staging cannot produce a verified receipt. |
+| 6. Adoption operations | 2 and 5. Plan/adopt transaction, retained predecessor and durable terminal digest tombstones; no execution. | Plan digest/CAS mismatch refuses; revoked digest cannot be re-adopted or selected for rollback, including after restart. |
+| 7. Dedicated-user launcher | 1 and 3. Privileged launch/cleanup and process identity seam, exercised only with harmless fixtures; no bundle activation. | Operator fallback is refused; wrong runtime identity/ancestry fails; descendants are verified reaped. Platform lacking the launcher remains unsupported. |
+| 8. OS containment | 4 and 7. Isolate trust domains, private home/mount access, protected binding/bundle/token roots and controlled tool-child environment. | A real tool/subagent/MCP child cannot read sibling credentials, operator home or grant state, write adopted assets or escape its authorized filesystem scope. Synthetic inheritance canary has only approved recipients. Failing platform stays disabled. |
+| 9. Fleet execution fences | 6–8. Authenticated permits, monotonic expiry watchdog, pushed revocation and tombstone synchronization outside harness authority. | Partitioned/uncooperative consumers stop within the 70-second bound; stale/restarted nodes cannot activate or roll back a revoked digest. Record pending versus proved exit. |
+| 10. Credentials and budgets | 2, 8–9. Recipient/generation admission, rotation/revocation and owner-held account reservations. | Cross-node starts stay within cap; stale credentials fail; partition/expiry without exit proof cannot free capacity; usage remains separately scoped. |
+| 11. Replacement tickets | 9–10. Same-account reservation transfer and bounded partial-operation recovery. | Reload at a full account cap transfers one slot only after verified old exit; partition, repeated request or failed successor never permits two executable generations. |
+| 12. Server hook policies | 4 and 8–10. Replace security hooks with permission/attribution/admission/audit enforcement, plus node inventory receipt. | Real auto-approved and prompted tool paths cannot bypass deletion/managed-file denial or ceilings; unknown hooks block cutover. Disabled switch still blocks production launch. |
+| 13. Minimal Claude activation | 1–12. Operator-reviewed enable plan checks all receipts; wire one verified baseline digest, one credential reference, per-session roots and flock-only MCP through guarded admission. | Disabled or missing prerequisite always refuses. Real admission rejects tampered bundle, relay/sibling access, usage disclosure and unauthorized reload before secret access/shutdown; revoked/expired policy cannot activate. Canary activation needs every receipt, not discovery alone. |
+| 14. Adopted bundle delivery | 13. Add only probe-established plugin/agents flags, explicit tools and generated MCP merge under the same gates. | Actual discovery/calls match approved contents and permissions; unexpected ambient sources, duplicate names or shared flock credentials refuse. Revoking a running bundle quarantines it. |
+| 15. Reload/context | 11–14. Authorized hash transition, rollback eligibility and once-per-boundary server replenishment. | Denied reload preserves the old writer; same-name edits diff; removed tools fail; revoked predecessor is never rollback; resume/compaction replenishes context once. |
+| 16. Migrate import | 13 and 15. Verified PTY writer exit, discovered project key, transcript/sidecar staging and durable journal. | Active/ambiguous writer or interrupted copy cannot publish partial import; sandbox native resume reads the imported conversation. |
+| 17. Migrate activation | 16. New lease, mailbox commit and crash/rollback reconciliation behind the same activation gate. | Every interrupted boundary preserves one writer/owner and pending delivery IDs; disabled/revoked state prevents activation and mailbox transfer. |
+| 18. GUI controls (S17) | 13–17. Existing command/modal patterns for authorized start/restart and operation status. | GUI-to-server selection honors target grants and all admission prerequisites; partial failure shows its recoverable operation ID without orphan processes. |
+| 19. Profile/usage projection (S17) | 10, 13 and 18. Display resolved binding/digest/generation and authorized usage. | Selection authority alone reveals no sibling/aggregate usage; account-read grant changes only its authorized projection. |
+| 20. Codex adapter | 8–13 and 15, plus independent pinned Codex auth/discovery receipts. Private home/config, refresh ownership and thread resume; inactive until its adapter-specific enable plan passes. | Unexpected skills, concurrent refresh ownership and missing containment fail; actual app-server resume preserves the intended thread. Native importer requires a separate capped successor PR. |
+| 21. Dogfood | 14–19, with 20 required only for Codex consumers. Opt-in staged cutover and recovery drill before expansion. | Isolated end-to-end rehearsal proves activation failure, partition expiry, bundle/credential revocation and rollback at the cap; then one operator-authorized canary before the remaining fleet. |
 
-This ADR's first PR is docs only. The first implementation slice establishes
-Claude admission and evidence; bundle rollout, fleet migration and GUI exposure
-follow those gates. Dedicated-user infrastructure is a prerequisite for claiming
-trust-domain isolation, regardless of which slice first needs it.
+This ADR's PR remains docs only. Preparation can land incrementally, but enabling
+profile execution requires the complete safety chain through slice 13. In
+particular, dedicated-user containment is a numbered, tested prerequisite before
+any untrusted bundle or multi-account execution; neither an API test nor an
+operator-mode discovery receipt can substitute for it.
 
 ## Alternatives and consequences
 
