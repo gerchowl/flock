@@ -9,3 +9,8 @@ here exercise the decoration captured in the issue body in that footer layout.
 `harness.py` runs only inside the isolated delegate test server. It paints the
 fixtures, records submitted lines, and accepts explicit stage commands so tests
 can check draft refusals without model access or timed screen transitions.
+
+`quoted-hint-draft.txt` and `multiline-braille-draft.txt` are the reviewer's
+verified non-empty composers. `hint-tail-draft.txt` adds a Braille draft whose
+last continuation line is the exact empty-composer hint. All three must be
+preserved byte for byte and refused before input is written.

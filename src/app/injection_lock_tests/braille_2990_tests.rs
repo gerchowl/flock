@@ -131,3 +131,44 @@ fn braille_2990_decorated_composer_keeps_live_turn_confirmation() {
         "hello"
     ));
 }
+
+fn refuses_review_draft(screen: &str) {
+    assert_eq!(crate::detect::readiness_text(Agent::Codex, screen), screen);
+    let Rig {
+        mut app,
+        pane,
+        mut pty,
+    } = lock_rig(&CODEX);
+    let now = Instant::now();
+    observe(&mut app, screen, now);
+    assert_eq!(
+        runtime_composer(Agent::Codex, runtime(&app), "hello"),
+        Composer::Other
+    );
+    let result = app.begin_guarded_submit(&pane, "hello", None, Duration::ZERO, now, false);
+    assert_eq!(result.unwrap_err(), "input_not_empty");
+    assert!(drain(&mut pty).is_empty());
+    let (ws, pane_id) = app.parse_pane_id(&pane).unwrap();
+    assert_eq!(app.raw_text_refusal(ws, pane_id), Some("input_not_empty"));
+}
+
+#[tokio::test]
+async fn braille_2990_review_quoted_hint_remains_a_draft() {
+    refuses_review_draft(include_str!(
+        "../../../tests/fixtures/codex-braille-2990/quoted-hint-draft.txt"
+    ));
+}
+
+#[tokio::test]
+async fn braille_2990_review_multiline_braille_remains_a_draft() {
+    refuses_review_draft(include_str!(
+        "../../../tests/fixtures/codex-braille-2990/multiline-braille-draft.txt"
+    ));
+}
+
+#[tokio::test]
+async fn braille_2990_review_last_draft_line_matching_hint_remains_input() {
+    refuses_review_draft(include_str!(
+        "../../../tests/fixtures/codex-braille-2990/hint-tail-draft.txt"
+    ));
+}

@@ -6,7 +6,7 @@ base = Path(sys.argv[1])
 
 
 def paint(stage):
-    if stage in ('start', 'send'):
+    if stage in ('start', 'send', 'quoted-hint-draft', 'multiline-braille-draft', 'hint-tail-draft'):
         body = (base / (stage + '.txt')).read_text()
     elif stage == 'draft':
         body = '› real ⠁draft⢀\n  ? for shortcuts\n'
@@ -33,7 +33,7 @@ with (base / 'bytes').open('ab', buffering=0) as received:
             continue
         text = line.decode('utf-8')
         line.clear()
-        if text in ('send', 'draft', 'braille'):
+        if text in ('send', 'draft', 'braille', 'quoted-hint-draft', 'multiline-braille-draft', 'hint-tail-draft'):
             paint(text)
         elif text.startswith('Read '):
             with (base / 'accepted').open('a') as accepted:

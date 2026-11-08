@@ -14,6 +14,18 @@ fn codex_braille_2990_delegate_start_send_and_draft_refusal() {
             include_str!("../fixtures/codex-braille-2990/send.txt"),
         ),
         (
+            "quoted-hint-draft.txt",
+            include_str!("../fixtures/codex-braille-2990/quoted-hint-draft.txt"),
+        ),
+        (
+            "multiline-braille-draft.txt",
+            include_str!("../fixtures/codex-braille-2990/multiline-braille-draft.txt"),
+        ),
+        (
+            "hint-tail-draft.txt",
+            include_str!("../fixtures/codex-braille-2990/hint-tail-draft.txt"),
+        ),
+        (
             "harness.py",
             include_str!("../fixtures/codex-braille-2990/harness.py"),
         ),
@@ -73,7 +85,13 @@ fn codex_braille_2990_delegate_start_send_and_draft_refusal() {
             expected_line(server.base.join("briefs/second.md").to_str().unwrap()),
         ]
     );
-    for stage in ["draft", "braille"] {
+    for stage in [
+        "draft",
+        "braille",
+        "quoted-hint-draft",
+        "multiline-braille-draft",
+        "hint-tail-draft",
+    ] {
         paint_braille_2990(&server, &pane, stage);
         let before = fs::read(server.base.join("bytes")).unwrap();
         let refused = send_braille_2990(&server, "refused.md");
