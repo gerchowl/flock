@@ -1,3 +1,6 @@
+// Fake SSH relay requires the debug-only ancestry override (#1715).
+#![cfg(debug_assertions)]
+
 //! Route discovery and withdrawal over real isolated one-way SSH edges.
 mod support;
 use serde_json::{json, Value};
@@ -37,6 +40,8 @@ fn route(node: &Node, target: &str) -> Value {
     })
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn quiet_healthy_edge_keeps_routes() {
     let fleet = fleet::spawn("routes-quiet", PAIR);
@@ -51,6 +56,8 @@ fn quiet_healthy_edge_keeps_routes() {
     assert!(routes(b).iter().any(|r| r["node"] == id(a)));
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn closed_edge_withdraws_routes_on_both_sides() {
     let fleet = fleet::spawn("routes-close", PAIR);
@@ -65,6 +72,8 @@ fn closed_edge_withdraws_routes_on_both_sides() {
     });
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn routes_learned_over_an_inbound_edge_are_usable_by_the_spoke() {
     let fleet = fleet::spawn("routes-inbound", HUB);
@@ -94,6 +103,8 @@ fn fault_fleet(tag: &str, source: &str) -> Fleet {
     })
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn forged_route_from_neighbor_is_rejected() {
     let fleet = fault_fleet(
@@ -118,6 +129,8 @@ fn forged_route_from_neighbor_is_rejected() {
     assert_eq!(route(a, &id(b))["hops"], 1);
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn summary_node_id_must_match_pinned_edge() {
     let fleet = fault_fleet(
@@ -146,6 +159,8 @@ fn summary_node_id_must_match_pinned_edge() {
     );
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn agent_owner_hint_survives_restart_as_offline() {
     let mut fleet = fleet::spawn("routes-owner", PAIR);
@@ -212,6 +227,8 @@ fn agent_owner_hint_survives_restart_as_offline() {
     assert_eq!(response["result"]["to_host"], "nodeb");
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn topology_change_on_acceptor_wakes_its_dialers() {
     let specs = [
@@ -237,6 +254,8 @@ fn topology_change_on_acceptor_wakes_its_dialers() {
     assert_eq!(found["hops"], 2);
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn failed_exchange_retries_then_success_stays_idle() {
     let fleet = fault_fleet(
@@ -266,6 +285,8 @@ fn failed_exchange_retries_then_success_stays_idle() {
     assert_eq!(count(), settled, "successful exchanges must remain idle");
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn paused_hub_learns_spoke_change_after_resume() {
     let specs = [

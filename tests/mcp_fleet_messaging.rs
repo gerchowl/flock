@@ -1,3 +1,6 @@
+// Fake SSH relay requires the debug-only ancestry override (#1715).
+#![cfg(debug_assertions)]
+
 //! E2E: an agent on one host discovers and messages an agent on ANOTHER host,
 //! using only MCP tools (#320).
 //!
@@ -331,6 +334,8 @@ fn fleet_row<'a>(listing: &'a Value, agent_id: &str) -> Option<&'a Value> {
 /// agent that can address another host but cannot learn its id has nothing to
 /// put in the field, and an agent that can list the fleet but not target it
 /// has nothing to do with the answer.
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn an_agent_discovers_and_messages_another_host_through_mcp_alone() {
     let fleet = fleet::spawn("mcp-fleet", fleet::CHAIN_ABC);
@@ -539,6 +544,8 @@ fn an_agent_discovers_and_messages_another_host_through_mcp_alone() {
 ///   that carried it is still being handled — the sender's server is at that
 ///   moment inside its own ssh hop to us. A deferral sent back synchronously
 ///   would wait on a server that is waiting on it.
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn a_mute_answers_a_sender_on_another_host() {
     let fleet = fleet::spawn("mcp-fleet-mute", fleet::CHAIN_ABC);
@@ -713,6 +720,8 @@ fn spoke_wait_mail(node: &fleet::Node, pane: &str) -> Value {
     })
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn spoke_custody_round_trip_uses_authenticated_origin_and_push_down() {
     let (fleet, mut alice, mut bob) = spoke_pair("h2rt", SPOKE_PAIR);
@@ -804,16 +813,22 @@ fn spoke_lost_ack_restart(restart: &str) {
     );
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn spoke_custody_lost_ack_survives_hub_restart() {
     spoke_lost_ack_restart("nodeb");
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn spoke_custody_lost_ack_survives_spoke_restart() {
     spoke_lost_ack_restart("nodea");
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn spoke_custody_offline_push_down_is_held_until_reenrollment() {
     let (fleet, mut alice, mut bob) = spoke_pair("h2off", SPOKE_PAIR);
@@ -842,6 +857,8 @@ fn spoke_custody_offline_push_down_is_held_until_reenrollment() {
     assert_eq!(answer[0]["body"], "held for spoke");
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn spoke_custody_allow_from_refuses_authenticated_spoke() {
     const DENIED: &[NodeSpec] = &[
@@ -870,6 +887,8 @@ fn spoke_custody_allow_from_refuses_authenticated_spoke() {
     );
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn spoke_custody_remote_target_beyond_hub_is_delivered_once() {
     let (fleet, mut alice, _) = spoke_pair("h2limit", HUB_SPOKES);
@@ -897,6 +916,8 @@ fn spoke_custody_remote_target_beyond_hub_is_delivered_once() {
     );
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn spoke_custody_hub_live_handoff_mid_conversation() {
     let (fleet, mut alice, bob) = spoke_pair("h2ho", SPOKE_PAIR);
@@ -1006,11 +1027,15 @@ fn slow_message_hop_keeps_api_responsive(specs: &[NodeSpec], recipient: &str, re
         .any(|message| message["correlation_id"] == "slow-hop-question"));
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn a_slow_direct_message_peer_does_not_stall_other_api_requests() {
     slow_message_hop_keeps_api_responsive(PAIR_AB, "nodeb", "nodea");
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn direct_message_delivers_before_topology_adverts_arrive() {
     let fleet = fleet::spawn_with_startup_probe("direct-before-routes", PAIR_AB, |fleet, _| {
@@ -1059,6 +1084,8 @@ fn direct_message_delivers_before_topology_adverts_arrive() {
     );
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn spoke_custody_twenty_unresolvable_targets_do_not_block_valid_mail() {
     let (fleet, mut alice, bob) = spoke_pair("h2bad", SPOKE_PAIR);
@@ -1088,6 +1115,8 @@ fn spoke_custody_twenty_unresolvable_targets_do_not_block_valid_mail() {
     assert_eq!(count, 0, "unknown owners were never admitted into custody");
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn spoke_custody_one_undecodable_record_does_not_discard_its_batch() {
     let (fleet, mut alice, bob) = spoke_pair("h2wire", SPOKE_PAIR);
@@ -1119,6 +1148,8 @@ fn spoke_custody_one_undecodable_record_does_not_discard_its_batch() {
     });
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn spoke_custody_offline_send_survives_missing_runtime_enrollment() {
     let (mut fleet, mut alice, bob) = spoke_pair("h2down", SPOKE_PAIR);
@@ -1142,6 +1173,8 @@ fn spoke_custody_offline_send_survives_missing_runtime_enrollment() {
     );
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn spoke_custody_lost_ack_while_muted_is_read_only_and_eventually_stops_offers() {
     let (fleet, mut alice, mut bob) = spoke_pair("h2mute", SPOKE_PAIR);
@@ -1237,6 +1270,8 @@ fn spoke_custody_lost_ack_while_muted_is_read_only_and_eventually_stops_offers()
     );
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn spoke_custody_idle_pinned_peer_does_not_poll_every_second() {
     let (fleet, _alice, _bob) = spoke_pair("h2idle", SPOKE_PAIR);
@@ -1253,6 +1288,8 @@ fn spoke_custody_idle_pinned_peer_does_not_poll_every_second() {
     }
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn spoke_custody_hub_busy_import_retries_without_refusal() {
     let (fleet, mut alice, bob) = spoke_pair("h2busy", SPOKE_PAIR);
