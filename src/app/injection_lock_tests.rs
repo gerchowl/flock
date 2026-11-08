@@ -1225,3 +1225,6 @@ async fn rebound_codex_session_confirms_submission_without_cursor_or_composer_ev
     );
     std::env::remove_var("CODEX_HOME");
 }
+
+#[path = "injection_lock_tests/braille_2990_tests.rs"]
+mod braille_2990_tests;
