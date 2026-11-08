@@ -137,7 +137,7 @@ pub(super) const WAIT_USAGE: &str = concat!(
     "  --silence DURATION  unchanged working screen; default 3m, 0 disables\n",
     "  not_started requires an empty idle composer for 30s + settle after submit, with no turn or queued/startup evidence\n",
     "  await exit codes: 0 settled reply, 3 BLOCKED reply, 4 gone, 5 no result/sentinel,\n",
-    "                    6 agent blocked, 7 stalled, 11 not started (was 8), 10 brief refused before typing (was 1), 75 server stopped answering, 78 server protocol mismatch, 124 timeout, 2 usage, 1 failure",
+    "                    6 agent blocked, 7 stalled, 11 not started (was 8), 12 session unbound, 10 brief refused before typing (was 1), 75 server stopped answering, 78 server protocol mismatch, 124 timeout, 2 usage, 1 failure",
 );
 
 pub(super) const RESULT_USAGE: &str = "flk delegate result <name> [--max-chars N] [--json]";
@@ -846,6 +846,9 @@ struct Entry {
     /// Latest explicit lock-resolution intent; false does not prove a key was sent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     lock_resolution: Option<serde_json::Value>,
+    /// Harness-reported session retained for exact recovery after terminal replacement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session: Option<serde_json::Value>,
 }
 
 impl Entry {
@@ -857,6 +860,7 @@ impl Entry {
 }
 
 mod refusal_guidance;
+mod session;
 pub(super) use refusal_guidance::enrich_draft_refusal;
 
 /// The directory holding this server's delegates: one file per name, under the
@@ -943,6 +947,7 @@ fn write_entry_at(entry: &Entry, path: &Path) -> io::Result<()> {
         let _ = std::fs::remove_file(&temp);
         return Err(err);
     }
+    std::fs::File::open(dir)?.sync_all()?;
     Ok(())
 }
 
@@ -2878,6 +2883,7 @@ fn delegate_start(args: &[String]) -> io::Result<i32> {
         base_sha: placement.base.as_ref().and_then(|fresh| fresh.sha.clone()),
         agent_id: field(&agent, "agent_id").map(str::to_string),
         lock_resolution: None,
+        session: agent.get("agent_session").filter(|v| !v.is_null()).cloned(),
     };
     let failed = |entry: &Entry, written: bool, reason: Option<&str>| {
         fail_started(entry, &cleanup, written, &flags, reason, None)
@@ -2939,6 +2945,12 @@ fn delegate_start(args: &[String]) -> io::Result<i32> {
     entry.round = 1;
     entry.submitted_at_ms = submitted_at_ms;
     entry.cursor = cursor.clone();
+    if entry.session.is_none() {
+        entry.session = settled_record
+            .get("agent_session")
+            .filter(|v| !v.is_null())
+            .cloned();
+    }
     if let Err(err) = write_entry(&entry) {
         // The write failed, so THIS process did not create the entry.
         // Removing `entry_path(name)` would delete a pre-existing (and
@@ -4192,7 +4204,7 @@ fn delegate_send(args: &[String]) -> io::Result<i32> {
         Err("busy") => return Ok(fail(format!("delegate {name} is busy"))),
         Err(reason) => return Ok(fail(format!("delegate {name}: {reason}"))),
     };
-    let mut entry = match require_delegate_no_deadline(name) {
+    let mut entry = match require_delegate_no_deadline(name, flags.json) {
         Ok(Recorded::Live(entry)) => entry,
         // Nothing to type into: the round is not started, and the record stays.
         Ok(Recorded::Gone(entry)) => {
@@ -4387,6 +4399,9 @@ fn delegate_wait(args: &[String]) -> io::Result<i32> {
             );
             return Ok(Outcome::Gone.exit_code());
         }
+        Err(RequireFailure::SessionUnbound(entry, reason)) => {
+            return Ok(session::unbound(&entry, reason, flags.json));
+        }
         Err(RequireFailure::NotDelegate) => return Ok(usage(format!("not a delegate: {name}"))),
         Err(RequireFailure::Failed(reason)) => {
             // The server was unreachable. Never "not a delegate" (W4): a
@@ -4462,7 +4477,7 @@ fn delegate_result(args: &[String]) -> io::Result<i32> {
         Ok(flags) => flags,
         Err(reason) => return Ok(usage(reason)),
     };
-    let entry = match require_delegate_no_deadline(name) {
+    let mut entry = match require_delegate_no_deadline(name, flags.json) {
         Ok(Recorded::Live(entry)) => entry,
         // No agent to ask for a reply: the same answer `delegate wait` gives.
         Ok(Recorded::Gone(entry)) => {
@@ -4478,9 +4493,17 @@ fn delegate_result(args: &[String]) -> io::Result<i32> {
         Err(code) => return Ok(code),
     };
 
+    if session::changed(&entry) {
+        if let Err(reason) = session::prepare(&mut entry, None) {
+            return Ok(session::unbound(&entry, &reason, flags.json));
+        }
+    }
     let bounded_res = bounded(
         Method::AgentResult(AgentResultParams {
-            target: entry.terminal_id.clone(),
+            target: entry
+                .agent_id
+                .clone()
+                .unwrap_or_else(|| entry.terminal_id.clone()),
             max_chars: flags.max_chars,
             offset: None,
         }),
@@ -4491,6 +4514,9 @@ fn delegate_result(args: &[String]) -> io::Result<i32> {
         Err(BoundedError::TimedOut) => return Ok(fail("timed out")),
         Err(BoundedError::Transport(e)) => return Ok(fail(e)),
     };
+    if session::result_conflicts(&entry, &response) {
+        return Ok(session::unbound(&entry, session::CONFLICT, flags.json));
+    }
     if let Some(error) = response.get("error") {
         let code = error
             .get("code")
@@ -4504,7 +4530,10 @@ fn delegate_result(args: &[String]) -> io::Result<i32> {
             // turn is still running. An unreachable server here is a FAILURE
             // (W13 / G5): "running"/"unknown" at exit 0 would make a dead
             // socket indistinguishable from a healthy running turn.
-            let fetched = agent_record(&entry.terminal_id, None);
+            let fetched = agent_record(
+                entry.agent_id.as_deref().unwrap_or(&entry.terminal_id),
+                None,
+            );
             let (outcome, code) = match no_result_verdict(&fetched) {
                 NoResultVerdict::Running => ("running", exit::OK),
                 NoResultVerdict::NoResult => ("no_result", exit::OK),
@@ -4516,6 +4545,13 @@ fn delegate_result(args: &[String]) -> io::Result<i32> {
             };
             emit_outcome(&entry, outcome, None, flags.json, &entry.cursor);
             return Ok(code);
+        }
+        if code == NO_SESSION_CODE {
+            return Ok(session::unbound(
+                &entry,
+                "no authoritative session binding is available",
+                flags.json,
+            ));
         }
         return Ok(fail(server_error(error)));
     }
@@ -4556,7 +4592,7 @@ fn delegate_status(args: &[String]) -> io::Result<i32> {
         Ok(flags) => flags,
         Err(reason) => return Ok(usage(reason)),
     };
-    let (entry, gone) = match require_delegate_no_deadline(name) {
+    let (entry, gone) = match require_delegate_no_deadline(name, flags.json) {
         Ok(Recorded::Live(entry)) => (entry, false),
         Ok(Recorded::Gone(entry)) => (entry, true),
         Err(code) => return Ok(code),
@@ -4669,15 +4705,14 @@ fn delegate_status(args: &[String]) -> io::Result<i32> {
     Ok(exit::OK)
 }
 
-/// The name resolves to a live delegate: an entry, and an agent of that name
-/// still on the terminal the entry recorded.
+/// The name resolves to a live delegate with the stable identity it recorded.
 ///
-/// The terminal check is what makes a rename visible. An agent renamed away from
+/// The identity check is what makes a rename visible. An agent renamed away from
 /// its delegate name is no longer addressable as that delegate, and a `send`
 /// that still worked would type into whatever inherited the name.
 /// Why `require_delegate` returned, when it did not return an `Entry`.
 ///
-/// The two failures are kept apart because they go to different exit codes:
+/// Failures are kept apart because they go to different exit codes:
 /// `NotDelegate` is a usage error (exit 2) with "not a delegate: {name}", and
 /// `TimedOut` carries the entry so the one caller that cares (`delegate wait`
 /// / `send --await`) can emit a `timeout` outcome object and exit 124 (K5).
@@ -4693,6 +4728,8 @@ enum RequireFailure {
     /// (K5). Boxed so this variant does not inflate every `NotDelegate`
     /// return by hundreds of bytes (clippy::result_large_err).
     TimedOut(Box<Entry>),
+    /// A legacy entry cannot authorize session recovery without a saved identity.
+    SessionUnbound(Box<Entry>, &'static str),
     /// The server was unreachable (dead socket, closed connection). This is
     /// never `NotDelegate` — a server that cannot answer has not proved the
     /// name is gone (W4). Caller exits 1 with the reason on stderr.
@@ -4723,10 +4760,19 @@ fn require_delegate(name: &str, deadline: Option<Instant>) -> Result<Recorded, R
         );
         return Ok(Recorded::Gone(entry));
     }
+    if entry.agent_id.is_none() {
+        return Err(RequireFailure::SessionUnbound(
+            Box::new(entry),
+            "no stable agent identity was recorded",
+        ));
+    }
     let before = entry.clone();
     let by_name = agent_record(name, deadline);
-    let terminal_id = entry.terminal_id.clone();
-    let recorded = recorded_decide(entry, by_name, || agent_record(&terminal_id, deadline))?;
+    let identity = entry
+        .agent_id
+        .clone()
+        .unwrap_or_else(|| entry.terminal_id.clone());
+    let recorded = recorded_decide(entry, by_name, || agent_record(&identity, deadline))?;
     if let Recorded::Live(live) = &recorded {
         persist_reidentified(&before, live);
     }
@@ -4734,7 +4780,7 @@ fn require_delegate(name: &str, deadline: Option<Instant>) -> Result<Recorded, R
 }
 
 /// Write back an entry that `require_decide` re-pointed at the delegate's new
-/// terminal after a restart, or backfilled with its agent id (#975).
+/// terminal after a restart (#975).
 ///
 /// Only the identity fields move, and onto a fresh read of the file, so a
 /// `send` that advanced the round meanwhile keeps its round. Best-effort: the
@@ -4744,6 +4790,7 @@ fn persist_reidentified(before: &Entry, live: &Entry) {
     if before.terminal_id == live.terminal_id
         && before.pane_id == live.pane_id
         && before.agent_id == live.agent_id
+        && before.session == live.session
     {
         return;
     }
@@ -4755,28 +4802,21 @@ fn persist_reidentified(before: &Entry, live: &Entry) {
     fresh.terminal_id = live.terminal_id.clone();
     fresh.pane_id = live.pane_id.clone();
     fresh.agent_id = live.agent_id.clone();
+    if fresh.session.is_none() {
+        fresh.session = live.session.clone();
+    }
     let _ = write_entry(&fresh);
 }
 
 /// Whether `record` is the agent `entry` was written for, and the entry
 /// re-pointed at it.
 ///
-/// The terminal id is the first proof, and backfills the agent id an older
-/// entry lacks. After a restart the terminal id is new, and the agent id is
-/// the proof (#975). An entry from before the agent id was recorded has one
-/// more: a worktree delegate whose agent still runs in that worktree under
-/// the same name, which is what an agent that merely inherited the name
-/// would not do. The cwd must equal the worktree path exactly: an agent that
-/// moved into a subdirectory stays "not a delegate", because a prefix match
-/// would also accept an agent in a nested checkout.
+/// A recorded stable agent id is the identity proof. Names, directories and
+/// terminal addresses cannot authorize a replacement agent's session binding.
 fn reidentify(mut entry: Entry, record: &serde_json::Value) -> Option<Entry> {
     let record_agent_id = field(record, "agent_id").map(str::to_string);
     let same_terminal = field(record, "terminal_id") == Some(entry.terminal_id.as_str());
-    let same_agent = entry.agent_id.is_some() && entry.agent_id == record_agent_id;
-    let legacy_same_worktree = entry.agent_id.is_none()
-        && entry.worktree.is_some()
-        && field(record, "cwd") == entry.worktree.as_deref();
-    if !(same_terminal || same_agent || legacy_same_worktree) {
+    if entry.agent_id.is_none() || entry.agent_id != record_agent_id {
         return None;
     }
     if !same_terminal {
@@ -4787,9 +4827,6 @@ fn reidentify(mut entry: Entry, record: &serde_json::Value) -> Option<Entry> {
             entry.pane_id = pane_id.to_string();
         }
     }
-    if entry.agent_id.is_none() {
-        entry.agent_id = record_agent_id;
-    }
     Some(entry)
 }
 
@@ -4797,7 +4834,20 @@ fn reidentify(mut entry: Entry, record: &serde_json::Value) -> Option<Entry> {
 /// and the agent-lookup outcome. The call-site tests (W7) exercise this.
 fn require_decide(entry: Entry, fetch: AgentFetch) -> Result<Entry, RequireFailure> {
     match fetch {
-        AgentFetch::Found(record) => reidentify(entry, &record).ok_or(RequireFailure::NotDelegate),
+        AgentFetch::Found(_) if entry.agent_id.is_none() => Err(RequireFailure::SessionUnbound(
+            Box::new(entry),
+            "no stable agent identity was recorded",
+        )),
+        AgentFetch::Found(record) => {
+            let live = reidentify(entry.clone(), &record).ok_or(RequireFailure::NotDelegate)?;
+            if session::conflicts(&entry, &record) {
+                return Err(RequireFailure::SessionUnbound(
+                    Box::new(live),
+                    session::CONFLICT,
+                ));
+            }
+            Ok(live)
+        }
         AgentFetch::Missing => Err(RequireFailure::NotDelegate),
         AgentFetch::TimedOut => Err(RequireFailure::TimedOut(Box::new(entry))),
         AgentFetch::Failed(reason) => Err(RequireFailure::Failed(reason)),
@@ -4807,9 +4857,12 @@ fn require_decide(entry: Entry, fetch: AgentFetch) -> Result<Entry, RequireFailu
 /// Map a `RequireFailure` into an exit code for callers that do not want to
 /// emit a `timeout` outcome object: `NotDelegate` is a usage error (exit 2),
 /// `TimedOut`/`Failed` print on stderr and exit 1.
-fn require_delegate_no_deadline(name: &str) -> Result<Recorded, i32> {
+fn require_delegate_no_deadline(name: &str, json: bool) -> Result<Recorded, i32> {
     match require_delegate(name, None) {
         Ok(recorded) => Ok(recorded),
+        Err(RequireFailure::SessionUnbound(entry, reason)) => {
+            Err(session::unbound(&entry, reason, json))
+        }
         Err(RequireFailure::NotDelegate) => Err(usage(format!("not a delegate: {name}"))),
         Err(RequireFailure::TimedOut(_)) => Err(fail(format!(
             "delegate {name}: timed out resolving the agent"
@@ -5010,6 +5063,8 @@ impl Outcome {
 
 /// What one poll of the result store said.
 enum ResultPoll {
+    /// The terminal changed through recovery; discard the previous settle baseline.
+    Rebound,
     /// A reply from THIS round, with its sentinel read. The reply is CARRIED, not
     /// re-read at print time (R6): a second read can be a different reply, and an
     /// outcome whose text is not the reply it was decided from is a lie with the
@@ -5041,6 +5096,8 @@ enum ResultPoll {
 
 /// What the reply grace concluded.
 enum Grace {
+    /// The terminal changed through recovery; discard the previous settle baseline.
+    Rebound,
     /// A reply from this round, with the reply itself.
     Reply {
         outcome: Outcome,
@@ -5068,6 +5125,8 @@ enum Grace {
 
 /// What a settled outcome means for the delegate.
 enum SettledDecision {
+    /// The terminal changed through recovery; discard the previous settle baseline.
+    Rebound,
     /// Report this outcome and exit with its code.
     Report {
         outcome: Outcome,
@@ -5086,12 +5145,14 @@ enum SettledDecision {
 
 /// What `started_another_turn` concluded (W4).
 ///
-/// Four answers: a new turn ends the grace with `Grace::NewTurn`, no new
-/// turn keeps polling, a timeout ends the whole await as `Outcome::Timeout`,
+/// A replacement restarts settling, a new turn ends the grace with
+/// `Grace::NewTurn`, no new turn keeps polling, and a timeout ends the await as `Outcome::Timeout`,
 /// and a transport failure ends it as exit 1. Earlier revisions returned
 /// `bool`, which collapsed `Failed` into "no new turn" and spun silently
 /// against a dead server.
 enum TurnCheck {
+    /// The terminal changed through recovery; discard the previous settle baseline.
+    Rebound,
     NewTurn,
     NoNewTurn,
     Timeout,
@@ -5137,6 +5198,12 @@ struct Await<'a> {
     json: bool,
 }
 
+/// A result poll either reads the store or recovers a replacement terminal.
+enum ResultFetch {
+    Response(serde_json::Value),
+    Rebound,
+}
+
 /// What the round loop needs from outside: one settle, the result store, the
 /// agent record and the clock that times the reply grace (#1257).
 ///
@@ -5146,8 +5213,8 @@ trait RoundIo {
     /// Settle once from `after`. The flag is the start watch's "never started".
     fn settle(&mut self, after: Option<&str>)
         -> io::Result<(super::settled::SettledOutcome, bool)>;
-    /// One `agent.result` for the delegate's agent.
-    fn agent_result(&mut self) -> Result<serde_json::Value, BoundedError>;
+    /// Read the result store, or report recovery before reading it.
+    fn agent_result(&mut self) -> Result<ResultFetch, BoundedError>;
     /// One `agent.get` for the delegate's agent.
     fn agent_record(&mut self) -> AgentFetch;
     fn now(&self) -> Instant;
@@ -5171,11 +5238,37 @@ enum RoundEnd {
 /// settle feeds: the stall monitor and the not-started watch.
 struct SocketRound<'w, 'a> {
     wait: &'w Await<'a>,
+    entry: Entry,
+    unbound: Option<String>,
+    // The post-result identity sample also answers the subsequent turn check.
+    result_record: Option<serde_json::Value>,
     monitor: super::delegate_verdict::Monitor,
     start_watch: start_watch::StartWatch,
 }
 
 impl<'w, 'a> SocketRound<'w, 'a> {
+    fn follow_record(&mut self, record: &serde_json::Value) -> Result<bool, String> {
+        let Some(mut live) = reidentify(self.entry.clone(), record) else {
+            return Ok(false);
+        };
+        if session::conflicts(&self.entry, record) {
+            self.entry = live;
+            return Err(session::CONFLICT.into());
+        }
+        if live.terminal_id == self.entry.terminal_id {
+            return Ok(false);
+        }
+        if let Err(reason) = session::prepare(&mut live, self.wait.deadline) {
+            self.entry = live;
+            return Err(reason);
+        }
+        persist_reidentified(&self.entry, &live);
+        self.entry = live;
+        self.monitor.interrupted(Instant::now());
+        self.start_watch.interrupted();
+        Ok(true)
+    }
+
     fn new(wait: &'w Await<'a>) -> Self {
         let monitor = super::delegate_verdict::Monitor::new(
             wait.silence_ms
@@ -5200,6 +5293,9 @@ impl<'w, 'a> SocketRound<'w, 'a> {
         );
         Self {
             wait,
+            entry: wait.entry.clone(),
+            unbound: None,
+            result_record: None,
             monitor,
             start_watch,
         }
@@ -5211,6 +5307,29 @@ impl RoundIo for SocketRound<'_, '_> {
         &mut self,
         after: Option<&str>,
     ) -> io::Result<(super::settled::SettledOutcome, bool)> {
+        if session::changed(&self.entry) {
+            if let Err(reason) = session::prepare(&mut self.entry, self.wait.deadline) {
+                self.unbound = Some(reason);
+                return Ok((
+                    super::settled::SettledOutcome::Error("session_unbound".into()),
+                    false,
+                ));
+            }
+        }
+        if after.is_some_and(|raw| {
+            Cursor::parse(raw).is_ok_and(|c| c.terminal_id != self.entry.terminal_id)
+                && raw != self.entry.cursor
+        }) {
+            self.unbound =
+                Some("the supplied cursor cannot be attributed to the recorded round".into());
+            return Ok((
+                super::settled::SettledOutcome::Error("session_unbound".into()),
+                false,
+            ));
+        }
+        let after = after.filter(|raw| {
+            Cursor::parse(raw).map_or(true, |c| c.terminal_id == self.entry.terminal_id)
+        });
         let wait = self.wait;
         let monitor = &mut self.monitor;
         let start_watch = &mut self.start_watch;
@@ -5221,8 +5340,8 @@ impl RoundIo for SocketRound<'_, '_> {
         let settled = super::settled::settled_wait_observed(
             "delegate",
             SettleTarget::Pinned(PinnedTarget {
-                terminal_id: wait.entry.terminal_id.clone(),
-                pane_id: wait.entry.pane_id.clone(),
+                terminal_id: self.entry.terminal_id.clone(),
+                pane_id: self.entry.pane_id.clone(),
             }),
             after,
             wait.settle_ms.unwrap_or(super::settled::DEFAULT_SETTLE_MS),
@@ -5272,22 +5391,97 @@ impl RoundIo for SocketRound<'_, '_> {
                 stalled
             },
         )?;
+        if matches!(settled, super::settled::SettledOutcome::Gone { .. }) {
+            let fetched = agent_record(
+                self.entry.agent_id.as_deref().unwrap_or(&self.entry.name),
+                wait.deadline,
+            );
+            match fetched {
+                AgentFetch::Found(record) => match self.follow_record(&record) {
+                    Ok(true) => return self.settle(None),
+                    Ok(false) => {}
+                    Err(reason) => {
+                        self.unbound = Some(reason);
+                        return Ok((
+                            super::settled::SettledOutcome::Error("session_unbound".into()),
+                            false,
+                        ));
+                    }
+                },
+                AgentFetch::Missing => {}
+                AgentFetch::TimedOut => {
+                    return Ok((super::settled::SettledOutcome::TimedOut, false))
+                }
+                AgentFetch::Failed(reason) => {
+                    return Ok((super::settled::SettledOutcome::Error(reason), false))
+                }
+            }
+        }
         Ok((settled, not_started))
     }
 
-    fn agent_result(&mut self) -> Result<serde_json::Value, BoundedError> {
-        bounded(
+    fn agent_result(&mut self) -> Result<ResultFetch, BoundedError> {
+        self.result_record = None;
+        let read_terminal = self.entry.terminal_id.clone();
+        let response = bounded(
             Method::AgentResult(AgentResultParams {
-                target: self.wait.entry.terminal_id.clone(),
+                // Resolve this read against the terminal we actually settled.
+                // The server resolves terminal and session in one request, so
+                // even older replies without terminal_id have a bound producer.
+                target: self.entry.terminal_id.clone(),
                 max_chars: self.wait.max_chars,
                 offset: None,
             }),
             self.wait.deadline,
-        )
+        )?;
+        if session::result_conflicts(&self.entry, &response) {
+            self.unbound = Some(session::CONFLICT.into());
+            return Err(BoundedError::Transport(io::Error::other("session_unbound")));
+        }
+        let producer_changed = response
+            .pointer("/result/result/terminal_id")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|terminal| terminal != self.entry.terminal_id);
+        // Revalidate after the read too: a replacement may have inherited a
+        // cached reply while its own terminal has never settled.
+        match self.agent_record() {
+            AgentFetch::Found(record) => {
+                if producer_changed || record["terminal_id"] != read_terminal {
+                    return Ok(ResultFetch::Rebound);
+                }
+                self.result_record = Some(record);
+            }
+            AgentFetch::TimedOut => return Err(BoundedError::TimedOut),
+            AgentFetch::Missing => {
+                return Err(BoundedError::Transport(io::Error::other(
+                    "agent missing after result read",
+                )))
+            }
+            AgentFetch::Failed(reason) => {
+                return Err(BoundedError::Transport(io::Error::other(reason)))
+            }
+        }
+        Ok(ResultFetch::Response(response))
     }
 
     fn agent_record(&mut self) -> AgentFetch {
-        agent_record(&self.wait.entry.terminal_id, self.wait.deadline)
+        if let Some(record) = self.result_record.take() {
+            return AgentFetch::Found(record);
+        }
+        let fetched = agent_record(
+            self.entry
+                .agent_id
+                .as_deref()
+                .unwrap_or(&self.entry.terminal_id),
+            self.wait.deadline,
+        );
+        if let AgentFetch::Found(record) = &fetched {
+            if let Err(reason) = self.follow_record(record) {
+                self.unbound = Some(reason.clone());
+                return AgentFetch::Failed(reason);
+            }
+        }
+        fetched
     }
 
     fn now(&self) -> Instant {
@@ -5308,13 +5502,17 @@ impl Await<'_> {
         let reported_cursor = self.after.clone().unwrap_or_default();
         let mut io = SocketRound::new(&self);
         let end = self.decide(&mut io)?;
+        if let Some(reason) = &io.unbound {
+            return Ok(session::unbound(&io.entry, reason, self.json));
+        }
+        let entry = &io.entry;
         let monitor = io.monitor;
         match end {
             RoundEnd::Report { outcome, info } => {
                 let code = outcome.exit_code();
                 let screen = without_retries(|| {
                     report_screen_with(self.deadline, &monitor.screen, |deadline| {
-                        detection_screen(&self.entry.pane_id, deadline)
+                        detection_screen(&entry.pane_id, deadline)
                     })
                 });
                 let verdict = matches!(outcome, Outcome::Stalled)
@@ -5333,7 +5531,7 @@ impl Await<'_> {
                     });
                 let observation =
                     event_observation(&self.entry.name, &screen, &verdict, self.deadline);
-                save_observation(self.entry, &observation);
+                save_observation(entry, &observation);
                 let mut info = info.unwrap_or_else(|| serde_json::json!({}));
                 for (key, value) in observation.as_object().into_iter().flatten() {
                     info[key] = value.clone();
@@ -5352,7 +5550,7 @@ impl Await<'_> {
                 info["settled_with_background_shells"] =
                     serde_json::json!(crate::detect::settled_with_background_shells(&screen));
                 emit_outcome(
-                    self.entry,
+                    entry,
                     outcome.as_str(),
                     Some(&info),
                     self.json,
@@ -5373,7 +5571,8 @@ impl Await<'_> {
 
     /// The round loop: settle, then wait for the reply, until the round ends.
     ///
-    /// It settles again in two cases. The agent took ANOTHER turn while the
+    /// Recovery on a new terminal restarts settling with that terminal's own
+    /// cursor state. It also settles again if the agent took ANOTHER turn while the
     /// reply grace ran: the reply that answers the round the caller asked about
     /// is then not the reply that arrives next, so the loop waits past the
     /// cursor it just settled on. Or the store records this round's turn as
@@ -5401,6 +5600,7 @@ impl Await<'_> {
                 }
                 SettledDecision::Usage(reason) => return Ok(RoundEnd::Usage(reason)),
                 SettledDecision::Failed(reason) => return Ok(RoundEnd::Failed(reason)),
+                SettledDecision::Rebound => after = None,
                 SettledDecision::WaitAgain => {
                     // Resume from the cursor that settled, not from the one this
                     // await started at: the new turn is what the round now means,
@@ -5491,6 +5691,7 @@ impl Await<'_> {
                 info: None,
             },
             Grace::Refused(reason) => SettledDecision::Failed(reason),
+            Grace::Rebound => SettledDecision::Rebound,
             Grace::NewTurn => SettledDecision::WaitAgain,
             Grace::Open => SettledDecision::SettleAgain,
             Grace::Timeout => SettledDecision::Report {
@@ -5539,6 +5740,7 @@ impl Await<'_> {
             let asked = io.now();
             match self.poll_result(io) {
                 ResultPoll::Fresh { outcome, info } => return Grace::Reply { outcome, info },
+                ResultPoll::Rebound => return Grace::Rebound,
                 ResultPoll::Open => return Grace::Open,
                 ResultPoll::Gone => return Grace::Gone,
                 ResultPoll::Refused(reason) => return Grace::Refused(reason),
@@ -5559,6 +5761,7 @@ impl Await<'_> {
             // is not the next one to land. Settle again instead. A transport
             // failure here is a FAILURE, not "no new turn" (W4).
             match self.started_another_turn(io, settled_cursor) {
+                TurnCheck::Rebound => return Grace::Rebound,
                 TurnCheck::NewTurn => return Grace::NewTurn,
                 TurnCheck::NoNewTurn => {}
                 TurnCheck::Timeout => return Grace::Timeout,
@@ -5601,6 +5804,9 @@ impl Await<'_> {
         let (Ok(now), Ok(before)) = (Cursor::parse(raw), Cursor::parse(settled_cursor)) else {
             return TurnCheck::NoNewTurn;
         };
+        if now.terminal_id != before.terminal_id {
+            return TurnCheck::Rebound;
+        }
         if now.epoch != before.epoch {
             return if now.epoch > before.epoch {
                 TurnCheck::NewTurn
@@ -5647,7 +5853,8 @@ impl Await<'_> {
     /// Ask the store for the newest reply, and say whether it is this round's.
     fn poll_result(&self, io: &mut dyn RoundIo) -> ResultPoll {
         match io.agent_result() {
-            Ok(response) => self.classify_result(&response),
+            Ok(ResultFetch::Rebound) => ResultPoll::Rebound,
+            Ok(ResultFetch::Response(response)) => self.classify_result(&response),
             Err(err) => match await_failure(&err, self.deadline, io.now()) {
                 AwaitFailure::Timeout => ResultPoll::Timeout,
                 AwaitFailure::NotYet => ResultPoll::Unanswered,
@@ -5935,6 +6142,9 @@ fn emit_outcome(
             serde_json::json!({
                 "name": entry.name,
                 "outcome": outcome,
+                "error": text("error"),
+                "agent_id": text("agent_id"),
+                "terminal_id": text("terminal_id"),
                 "status": text("status"),
                 "status_text": text("status_text"),
                 "startup_dialog": text("startup_dialog"),
