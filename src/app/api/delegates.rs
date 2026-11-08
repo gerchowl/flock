@@ -33,9 +33,12 @@ impl App {
                     return encode_error(
                         id,
                         "no_caller_pane",
-                        "`self` is the agent whose pane runs the caller, and this caller \
-                         runs in no agent pane, so it has no delegates of its own: use \
-                         --all (architect \"all\") or --architect <agent id>",
+                        format!(
+                            "`self` could not be resolved from the caller's attested identity: \
+                             {}. Use --all (MCP architect: \"all\") or --architect <id> \
+                             (MCP architect: \"<id>\")",
+                            self.caller_pane_refusal_reason(),
+                        ),
                     )
                 }
             },
