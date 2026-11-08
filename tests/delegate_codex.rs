@@ -459,6 +459,12 @@ fn write_reply(server: &Server, turn: &str, text: &str) {
         serde_json::json!({"timestamp": timestamp, "type": "event_msg", "payload": {"type":"task_complete", "turn_id":turn, "last_agent_message":text}}),
     ];
     let mut body = fs::read_to_string(&path).unwrap_or_default();
+    if body.is_empty() {
+        body.push_str(&format!(
+            "{}\n",
+            serde_json::json!({"type":"session_meta","payload":{"id":SES}})
+        ));
+    }
     for record in records {
         body.push_str(&format!("{record}\n"));
     }

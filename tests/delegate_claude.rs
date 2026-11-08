@@ -483,6 +483,7 @@ fn transcript_line(kind: &str, text: &str) -> String {
         "{}\n",
         serde_json::json!({
             "type": kind,
+            "sessionId": SES,
             "timestamp": timestamp_now(),
             "message": {"role": kind, "content": content},
         })
