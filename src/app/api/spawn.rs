@@ -471,6 +471,20 @@ impl App {
     /// one answer — a second classification over the same evidence is the
     /// drift #124 / #197 / #199-#210 are.
     pub(in crate::app) fn spawn_caller(&mut self) -> SpawnCaller {
+        // Neither pending nor enrolled relay processes carry local operator authority.
+        if self
+            .inbound
+            .edge(
+                self.current_api_peer_pid,
+                crate::platform::process_start_time,
+            )
+            .is_some()
+        {
+            return SpawnCaller::Structured {
+                agent_id: None,
+                depth: 0,
+            };
+        }
         match self.lease_caller() {
             crate::structured::lease::Caller::Agent { agent, depth } => {
                 return SpawnCaller::Structured {

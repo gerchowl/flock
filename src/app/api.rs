@@ -1480,6 +1480,29 @@ impl App {
                 "scoped caller authentication refused",
             ));
         }
+        // Relay origin outranks account identity, even before enrollment or UID evidence.
+        if matches!(
+            request.method,
+            Method::AgentStop(_)
+                | Method::AgentFork(_)
+                | Method::ServerStop(_)
+                | Method::ServerReloadConfig(_)
+                | Method::ServerLiveHandoff(_)
+        ) && self
+            .inbound
+            .edge(
+                self.current_api_peer_pid,
+                crate::platform::process_start_time,
+            )
+            .is_some()
+            && !self.caller_is_local_operator()
+        {
+            return Some(responses::encode_error(
+                request.id.clone(),
+                ErrorCode::OperatorOnly.as_str(),
+                "this operation requires local authority, not a mesh relay",
+            ));
+        }
         let uid = self.current_api_peer_uid?;
         let code = if matches!(
             request.method,

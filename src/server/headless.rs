@@ -5666,6 +5666,106 @@ mod tests {
         }
     }
 
+    fn relay_operator_headless(method: &str) {
+        let (_guard, _scrub) = crate::config::test_config_env_guard();
+        let root = crate::test_support::TempDir::socket();
+        let config = root.path().join("config.toml");
+        fs::write(
+            &config,
+            "[terminal]\ndefault_shell = \"relay-test-shell\"\n",
+        )
+        .unwrap();
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &config);
+        let mut violations = Vec::new();
+        {
+            for enrolled in [None, Some(true), Some(false)] {
+                let mut server = test_headless_server();
+                server.app.runtime_config.uid_policy = crate::structured::identity::UidPolicy {
+                    operator: 7,
+                    dedicated: Ok(None).into(),
+                };
+                if let Some(enrolled) = enrolled {
+                    server.app.test_attach_relay(enrolled);
+                }
+                let shell = server.app.state.default_shell.clone();
+                let params = match method {
+                    "server.live_handoff" => {
+                        serde_json::json!({"import_exe":root.path().join("absent-importer")})
+                    }
+                    "agent.stop" | "agent.fork" => {
+                        serde_json::json!({"target":"missing-fixture-agent"})
+                    }
+                    _ => serde_json::json!({}),
+                };
+                let (respond_to, response) = std::sync::mpsc::channel();
+                server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+                    scope: None,
+                    request: serde_json::from_value(
+                        serde_json::json!({"id":"relay-headless","method":method,"params":params}),
+                    )
+                    .unwrap(),
+                    respond_to,
+                    peer_pid: Some(std::process::id()),
+                    peer_birth: crate::platform::process_start_time(std::process::id()),
+                    peer_uid: Some(7),
+                });
+                let result: serde_json::Value =
+                    serde_json::from_str(&response.recv_timeout(Duration::from_secs(1)).unwrap())
+                        .unwrap();
+                if enrolled.is_some() {
+                    if result["error"]["code"] != "operator_only" {
+                        violations.push(format!("{method}, {enrolled:?}: {result}"));
+                        continue;
+                    }
+                    assert_eq!(server.app.state.default_shell, shell);
+                    assert!(!server.app.take_config_reloaded_from_disk());
+                    assert!(!server.app.state.should_quit);
+                    assert!(!server.shutting_down);
+                    assert!(server.handoff_skipped_undrained.is_empty());
+                } else {
+                    assert_ne!(
+                        result["error"]["code"], "operator_only",
+                        "{method}: {result}"
+                    );
+                    if method == "server.reload_config" {
+                        assert_eq!(server.app.state.default_shell, "relay-test-shell");
+                        assert!(result.get("result").is_some(), "{result}");
+                    } else if method == "server.live_handoff" {
+                        assert_eq!(
+                            result["error"]["code"], "server_executable_unresolved",
+                            "{result}"
+                        );
+                    } else if method == "server.stop" {
+                        assert!(server.app.state.should_quit);
+                    }
+                }
+                assert!(server.app.current_api_peer_uid.is_none());
+            }
+        }
+        assert!(violations.is_empty(), "{violations:#?}");
+    }
+
+    #[test]
+    fn relay_operator_headless_reload_config() {
+        relay_operator_headless("server.reload_config");
+    }
+    #[test]
+    fn relay_operator_headless_live_handoff() {
+        relay_operator_headless("server.live_handoff");
+    }
+    #[test]
+    fn relay_operator_headless_stop() {
+        relay_operator_headless("server.stop");
+    }
+    #[test]
+    fn relay_operator_headless_agent_stop() {
+        relay_operator_headless("agent.stop");
+    }
+    #[test]
+    fn relay_operator_headless_agent_fork() {
+        relay_operator_headless("agent.fork");
+    }
+
     #[test]
     fn headless_uid_boundary_precedes_live_handoff_fast_path() {
         let mut server = test_headless_server();
