@@ -208,3 +208,48 @@ fn retained_exact_forward_duplicates_and_non_objects_are_dead_and_pruned() {
     store.prepare_retained_save(43 + RETAINED_DEAD_MAX_AGE.as_millis() as u64, true);
     assert_eq!(serde_json::to_value(&store).unwrap(), json!([raw]));
 }
+
+#[test]
+fn retained_explicit_purge_respects_age_kind_missing_stamps_and_live_workers() {
+    let known = super::tests::record("agent_fixture_live");
+    let mut store = registry(json!([
+        serde_json::to_value(&known).unwrap(),
+        true,
+        forward()
+    ]));
+    assert_eq!(store.purge_retained(true, Some(0), 100), 0);
+    store.prepare_retained_save(42, true);
+    let generation = store.get(&known.agent_id).unwrap().2;
+    store
+        .apply(
+            &known.agent_id,
+            generation,
+            Input::Lifecycle(Lifecycle::Live),
+            Instant::now(),
+            42,
+            Duration::from_secs(60),
+        )
+        .unwrap();
+    assert_eq!(store.purge_retained(true, Some(10), 52), 0);
+    assert_eq!(store.purge_retained(false, Some(10), 53), 1);
+    assert_eq!(store.retained_records()[0].kind, RetainedKind::Forward);
+    assert_eq!(store.purge_retained(true, Some(10), 53), 1);
+    let (_, projection, unchanged_generation) = store.get(&known.agent_id).unwrap();
+    assert_eq!(generation, unchanged_generation);
+    assert_eq!(projection.update.state.lifecycle, Lifecycle::Live);
+    assert_eq!(store.records().len(), 1);
+}
+
+#[test]
+fn retained_purge_reclassifies_the_last_forward_copy_before_automatic_pruning() {
+    let raw = forward();
+    let mut store = registry(json!([raw, raw]));
+    store.prepare_retained_save(100, false);
+    let mut stamps = store.retained_stamps();
+    stamps[1]["first_seen_ms"] = json!(200);
+    store.restore_retained_stamps(&stamps);
+    assert_eq!(store.purge_retained(true, Some(50), 200), 1);
+    assert_eq!(store.retained_records()[0].kind, RetainedKind::Forward);
+    store.prepare_retained_save(u64::MAX, true);
+    assert_eq!(serde_json::to_value(&store).unwrap(), json!([raw]));
+}
