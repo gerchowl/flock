@@ -5240,6 +5240,8 @@ struct SocketRound<'w, 'a> {
     wait: &'w Await<'a>,
     entry: Entry,
     unbound: Option<String>,
+    // The post-result identity sample also answers the subsequent turn check.
+    result_record: Option<serde_json::Value>,
     monitor: super::delegate_verdict::Monitor,
     start_watch: start_watch::StartWatch,
 }
@@ -5293,6 +5295,7 @@ impl<'w, 'a> SocketRound<'w, 'a> {
             wait,
             entry: wait.entry.clone(),
             unbound: None,
+            result_record: None,
             monitor,
             start_watch,
         }
@@ -5418,22 +5421,7 @@ impl RoundIo for SocketRound<'_, '_> {
     }
 
     fn agent_result(&mut self) -> Result<ResultFetch, BoundedError> {
-        if let AgentFetch::Found(record) = agent_record(
-            self.entry
-                .agent_id
-                .as_deref()
-                .unwrap_or(&self.entry.terminal_id),
-            self.wait.deadline,
-        ) {
-            match self.follow_record(&record) {
-                Ok(true) => return Ok(ResultFetch::Rebound),
-                Ok(false) => {}
-                Err(reason) => {
-                    self.unbound = Some(reason);
-                    return Err(BoundedError::Transport(io::Error::other("session_unbound")));
-                }
-            }
-        }
+        self.result_record = None;
         let read_terminal = self.entry.terminal_id.clone();
         let response = bounded(
             Method::AgentResult(AgentResultParams {
@@ -5461,6 +5449,7 @@ impl RoundIo for SocketRound<'_, '_> {
                 if producer_changed || record["terminal_id"] != read_terminal {
                     return Ok(ResultFetch::Rebound);
                 }
+                self.result_record = Some(record);
             }
             AgentFetch::TimedOut => return Err(BoundedError::TimedOut),
             AgentFetch::Missing => {
@@ -5476,6 +5465,9 @@ impl RoundIo for SocketRound<'_, '_> {
     }
 
     fn agent_record(&mut self) -> AgentFetch {
+        if let Some(record) = self.result_record.take() {
+            return AgentFetch::Found(record);
+        }
         let fetched = agent_record(
             self.entry
                 .agent_id

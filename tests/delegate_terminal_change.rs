@@ -24,6 +24,7 @@ enum SessionCase {
     EmptyGrace,
     TurnCheckGrace,
     ResultReadRace,
+    QuietGrace,
 }
 
 struct Fixture {
@@ -63,6 +64,7 @@ impl Fixture {
                 | SessionCase::EmptyGrace
                 | SessionCase::TurnCheckGrace
                 | SessionCase::ResultReadRace
+                | SessionCase::QuietGrace
         );
         let dir = support::socket_dir::SocketDir::reserve("d2993");
         let socket = dir.path().join("s");
@@ -171,8 +173,10 @@ impl Fixture {
                     "agent.get" if grace => {
                         if target == "term_old" {
                             old_sampled = true;
-                        } else if case != SessionCase::ResultReadRace
-                            && old_sampled
+                        } else if !matches!(
+                            case,
+                            SessionCase::ResultReadRace | SessionCase::QuietGrace
+                        ) && old_sampled
                             && (case != SessionCase::TurnCheckGrace || result_polled)
                         {
                             replaced = true;
@@ -218,7 +222,8 @@ impl Fixture {
                     }
                     "agent.result"
                         if case == SessionCase::EmptyGrace
-                            || case == SessionCase::TurnCheckGrace =>
+                            || case == SessionCase::TurnCheckGrace
+                            || case == SessionCase::QuietGrace =>
                     {
                         result_polled = true;
                         json!({"error":{"code":"no_result","message":"turn still running"}})
@@ -487,4 +492,27 @@ fn unreadable_claude_store_is_unbound_and_names_the_store() {
 fn replacement_between_precheck_and_result_must_settle() {
     let fixture = Fixture::case(true, false, false, false, SessionCase::ResultReadRace);
     fixture.assert("wait", 124, "timeout");
+}
+
+#[test]
+fn reply_grace_checks_identity_once_per_result_read() {
+    let fixture = Fixture::case(true, false, false, false, SessionCase::QuietGrace);
+    fixture.assert("wait", 124, "timeout");
+    let requests = fixture.requests.lock().unwrap();
+    let reads: Vec<_> = requests
+        .iter()
+        .enumerate()
+        .filter_map(|(index, request)| (request["method"] == "agent.result").then_some(index))
+        .collect();
+    assert!(reads.len() >= 2, "the fixture must exercise reply grace");
+    for pair in reads.windows(2) {
+        let between = &requests[pair[0] + 1..pair[1]];
+        assert_eq!(
+            between.len(),
+            1,
+            "redundant requests during grace: {between:?}"
+        );
+        assert_eq!(between[0]["method"], "agent.get");
+        assert_eq!(between[0]["params"]["target"], "agent_fixture.example_2993");
+    }
 }
