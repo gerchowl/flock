@@ -15,12 +15,24 @@ pub(crate) const INJECTION_LEASE: Duration = Duration::from_secs(5 + CONFIRM_WIN
 /// How long clearing a draft, or reading it back, may take before flock stops
 /// and keeps the draft in the pane's stash.
 const DRAFT_STEP: Duration = Duration::from_secs(1);
+/// Conservative configured wait bound: draft clear, restore-ready and restore-read
+/// (3 steps), paste write and two Enter confirmations (3 windows), the post-write
+/// Enter gap, and one poll overshoot per wait. This is 9470 ms, independent of
+/// the shorter injection lease. OS/app scheduling stalls can exceed these waits
+/// and must still be reported as unknown if the client loses the final receipt.
+pub(crate) const SUBMIT_WAIT_BOUND: Duration = DRAFT_STEP
+    .saturating_mul(3)
+    .saturating_add(CONFIRM_WINDOW.saturating_mul(3))
+    .saturating_add(crate::cli::pane::PANE_RUN_SUBMIT_GAP)
+    .saturating_add(POLL.saturating_mul(7));
+
 /// Backspaces past the draft's visible length, for whitespace the composer
 /// read trims. Extra ones on an empty composer do nothing.
 const CLEAR_SLACK: usize = 8;
 
 #[derive(Debug, Clone)]
 pub(crate) struct Attempt {
+    scope: Option<crate::api::scoped::Scope>,
     pub(crate) evidence: crate::api::schema::DeliveryAttempt,
     pub(crate) text: String,
     cursor: Box<str>,
@@ -272,7 +284,9 @@ fn codex_hint_prefix(rows: &[&str]) -> bool {
 
 /// Read only the editor, without the idle and safety gates used to authorize Enter.
 pub(crate) fn composer_contents(agent: Agent, screen: &str, unfaint: &str) -> Option<String> {
-    composer_rows(agent, screen, unfaint).map(|(rows, _, _)| rows.join("\n"))
+    let screen = crate::detect::readiness_text(agent, screen);
+    let unfaint = crate::detect::readiness_text(agent, unfaint);
+    composer_rows(agent, &screen, &unfaint).map(|(rows, _, _)| rows.join("\n"))
 }
 
 /// Classify a live pane's editor from one styled read of its detection text.
@@ -308,6 +322,10 @@ fn composer_unfaint_with_width(
     text: &str,
     cols: Option<u16>,
 ) -> Composer {
+    let screen = crate::detect::readiness_text(agent, screen);
+    let unfaint = crate::detect::readiness_text(agent, unfaint);
+    let screen = screen.as_ref();
+    let unfaint = unfaint.as_ref();
     let Some((rows, body_start, body_end)) =
         composer_rows_with_width(agent, screen, unfaint, cols, Some(text))
     else {
@@ -383,6 +401,8 @@ fn editor_rows_for_text(
     expected: Option<&str>,
 ) -> Option<Vec<String>> {
     let (screen, unfaint) = runtime.detection_text_and_unfaint();
+    let screen = crate::detect::readiness_text(agent, &screen);
+    let unfaint = crate::detect::readiness_text(agent, &unfaint);
     let (rows, _, _) = composer_rows_with_width(
         agent,
         &screen,
@@ -831,6 +851,11 @@ impl App {
             ),
         };
         Ok(Attempt {
+            scope: if wake {
+                None
+            } else {
+                self.current_api_scope.clone()
+            },
             evidence,
             text: text.to_owned(),
             cursor: terminal.turn_cursor().into_boxed_str(),
@@ -859,6 +884,17 @@ impl App {
         attempt: &mut Attempt,
         now: Instant,
     ) -> Option<Outcome> {
+        if attempt
+            .scope
+            .as_ref()
+            .is_some_and(|scope| scope.caller() == crate::structured::lease::Caller::Uncertain)
+        {
+            return Some(self.conclude_guarded_attempt(
+                pane,
+                attempt,
+                &Outcome::Abandoned("caller_gone"),
+            ));
+        }
         let outcome = match attempt.stash.as_ref().map(|stash| stash.phase) {
             Some(StashPhase::Restoring { outcome, .. }) => {
                 self.advance_draft_restore(pane, attempt, outcome, now)
@@ -1282,7 +1318,7 @@ impl App {
                 .send(crate::events::AppEvent::AgentSubmit {
                     request_id,
                     pane_id,
-                    attempt,
+                    attempt: Box::new(attempt),
                     respond_to,
                 })
                 .await;
@@ -1475,6 +1511,7 @@ impl Attempt {
 impl Attempt {
     pub(crate) fn test_new() -> Self {
         Self {
+            scope: None,
             evidence: new_evidence("test-attempt".into(), "test-pane", false, Vec::new()),
             text: String::new(),
             cursor: "1:0:0:0:i".into(),
@@ -1498,6 +1535,26 @@ impl Attempt {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn scoped_parked_submit_rechecks_before_any_later_step() {
+        let (_leases, lease, scope, _) = crate::api::scoped::tests::live_scope();
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let app = App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            rx,
+            crate::api::EventHub::default(),
+        );
+        let mut attempt = Attempt::test_new();
+        attempt.scope = Some(scope);
+        drop(lease);
+        assert_eq!(
+            app.advance_guarded_submit("test-pane", &mut attempt, Instant::now()),
+            Some(Outcome::Abandoned("caller_gone"))
+        );
+    }
 
     // The idempotence guard hides duplicate calls from the event stream. Count
     // invocations so App-level lifecycle tests can enforce a single finalizer.

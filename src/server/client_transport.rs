@@ -52,6 +52,8 @@ const MAX_INPUT_PAYLOAD: usize = 1024 * 1024; // 1 MB
 /// Channels owned by the server side of a client writer thread.
 #[derive(Clone, Debug)]
 pub(crate) struct ClientWriter {
+    /// Kernel facts captured from the accepted socket, never from Hello.
+    pub(crate) peer: crate::platform::peer::Credentials,
     /// Ordered controls and coalesced state updates. Overflow disconnects the observer.
     pub(super) control: ObserverControl,
     /// Droppable render messages. Capacity is one so slow clients cannot build lag.
@@ -168,6 +170,7 @@ pub(crate) fn handle_client_handshake(
     server_event_tx: &mpsc::Sender<ServerEvent>,
     should_quit: &Arc<AtomicBool>,
 ) -> io::Result<()> {
+    let peer = crate::platform::peer::credentials(&stream);
     // Reset to blocking mode — the accept loop sets nonblocking but
     // the handshake thread needs blocking I/O for read_message/write_message.
     stream.set_nonblocking(false)?;
@@ -288,6 +291,7 @@ pub(crate) fn handle_client_handshake(
     let (control_tx, control_rx) = ObserverControl::channel(Some(stream.try_clone()?), client_id);
     let (render_tx, render_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(1);
     let writer = ClientWriter {
+        peer,
         control: control_tx,
         render: render_tx,
     };

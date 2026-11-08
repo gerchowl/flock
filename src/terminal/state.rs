@@ -233,7 +233,7 @@ pub struct TerminalState {
     /// so it must not be used to pick a transcript to render (#328).
     session_ref_hook_confirmed: bool,
     pub manual_label: Option<String>,
-    pub agent_name: Option<String>,
+    agent_name: Option<String>,
     /// The `FLOCK_RUN_ID` this pane's agent was spawned under (#332).
     ///
     /// Minted per scheduler- or agent-initiated spawn, stamped into the
@@ -659,6 +659,11 @@ impl TerminalState {
         seq: Option<u64>,
         now: Instant,
     ) -> Option<TerminalStateMutation> {
+        if super::agent_name::validate(&agent_label).is_err() {
+            crate::logging::agent_name_dropped("hook_identity");
+            return None;
+        }
+
         if !self.accept_hook_report(&source, seq) {
             return None;
         }
@@ -831,6 +836,11 @@ impl TerminalState {
         &mut self,
         session: crate::agent_resume::PersistedAgentSession,
     ) {
+        if super::agent_name::validate(&session.agent).is_err() {
+            crate::logging::agent_name_dropped("hook_identity");
+            return;
+        }
+
         self.persisted_agent_session = Some(session);
         self.codex_session_start = None;
         self.session_ref_hook_confirmed = false;
@@ -925,6 +935,11 @@ impl TerminalState {
         seq: Option<u64>,
         session_start_source: Option<String>,
     ) -> Option<TerminalStateMutation> {
+        if super::agent_name::validate(&agent_label).is_err() {
+            crate::logging::agent_name_dropped("hook_identity");
+            return None;
+        }
+
         self.header_reserved = true;
         let session_ref = session_ref?;
         if !self.accept_hook_report(&source, seq) {
@@ -1155,12 +1170,18 @@ impl TerminalState {
     /// form the per-frame path needs; `pane_details` keeps the owned one
     /// because it hands the value to a `String` field.
     pub fn display_agent_label(&self) -> Option<Cow<'_, str>> {
-        self.effective_display_agent().map(Cow::Owned).or_else(|| {
-            self.agent_name
-                .as_deref()
-                .or_else(|| self.effective_agent_label())
-                .map(Cow::Borrowed)
-        })
+        self.effective_display_agent()
+            .map(Cow::Owned)
+            .or_else(|| {
+                self.agent_name
+                    .as_deref()
+                    .or_else(|| self.effective_agent_label())
+                    .map(Cow::Borrowed)
+            })
+            .map(|name| match name {
+                Cow::Borrowed(name) => super::agent_name::display(name),
+                Cow::Owned(name) => Cow::Owned(super::agent_name::display(&name).into_owned()),
+            })
     }
 
     pub fn effective_agent_label(&self) -> Option<&str> {
@@ -1357,18 +1378,34 @@ impl TerminalState {
         }
     }
 
-    pub fn set_manual_label(&mut self, label: String) {
-        let label = label.trim().to_string();
+    /// Validate manual identity labels before trimming; refusal preserves the old label.
+    pub fn set_manual_label(
+        &mut self,
+        label: String,
+    ) -> Result<(), crate::api::error_code::ErrorCode> {
+        let label = super::agent_name::validate(&label)?.to_string();
         self.manual_label = (!label.is_empty()).then_some(label);
+        Ok(())
     }
 
     pub fn clear_manual_label(&mut self) {
         self.manual_label = None;
     }
 
-    pub fn set_agent_name(&mut self, name: String) {
-        let name = name.trim().to_string();
+    /// Reject unsafe or overlong raw names without changing identity (#317).
+    /// Empty, safe whitespace clears the name, preserving the rename contract.
+    pub fn set_agent_name(
+        &mut self,
+        name: String,
+    ) -> Result<(), crate::api::error_code::ErrorCode> {
+        let name = super::agent_name::validate(&name)?.to_string();
         self.agent_name = (!name.is_empty()).then_some(name);
+        Ok(())
+    }
+
+    /// Validated operator name, distinct from the detected harness label.
+    pub fn agent_name(&self) -> Option<&str> {
+        self.agent_name.as_deref()
     }
 
     pub fn clear_agent_name(&mut self) {
@@ -3215,14 +3252,14 @@ mod tests {
         assert_eq!(terminal.border_label(false), None);
         assert_eq!(terminal.border_label(true).as_deref(), Some("claude"));
 
-        terminal.set_manual_label(" reviewer ".into());
+        terminal.set_manual_label(" reviewer ".into()).unwrap();
         assert_eq!(terminal.border_label(false).as_deref(), Some("reviewer"));
         assert_eq!(terminal.border_label(true).as_deref(), Some("reviewer"));
 
-        terminal.set_manual_label("   ".into());
+        terminal.set_manual_label("   ".into()).unwrap();
         assert_eq!(terminal.border_label(true).as_deref(), Some("claude"));
 
-        terminal.set_manual_label("reviewer".into());
+        terminal.set_manual_label("reviewer".into()).unwrap();
         terminal.clear_manual_label();
         assert_eq!(terminal.border_label(true).as_deref(), Some("claude"));
     }
@@ -3783,10 +3820,44 @@ mod tests {
     }
 
     #[test]
+    fn security_agent_name_setter_rejects_without_mutating() {
+        let mut failures = Vec::new();
+        for (case, name) in crate::test_support::hostile_agent_names() {
+            let mut terminal = test_terminal();
+            terminal.set_agent_name("safe".into()).unwrap();
+            let _ = terminal.set_agent_name(name);
+            if terminal.agent_name.as_deref() != Some("safe") {
+                failures.push(case);
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "accepted hostile name cases: {failures:?}"
+        );
+    }
+
+    #[test]
+    fn security_agent_name_legacy_display_is_bounded_and_escaped() {
+        let mut failures = Vec::new();
+        for (case, name) in crate::test_support::hostile_agent_names() {
+            let mut terminal = test_terminal();
+            // Fault injection: simulate a broken ingress without invoking the setter.
+            terminal.agent_name = Some(name.clone());
+            if terminal.display_agent_label().as_deref() == Some(name.as_str()) {
+                failures.push(case);
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "rendered hostile name cases: {failures:?}"
+        );
+    }
+
+    #[test]
     fn respawn_cleanup_resets_restored_agent_status() {
         let mut terminal = test_terminal();
         terminal.respawn_shell_on_exit = true;
-        terminal.set_agent_name("codex".into());
+        terminal.set_agent_name("codex".into()).unwrap();
         terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
             source: "flock:codex".into(),
             agent: "codex".into(),

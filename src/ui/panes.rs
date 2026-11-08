@@ -304,6 +304,9 @@ pub(super) fn render_panes(
     let terminal_active = app.mode == Mode::Terminal;
 
     for info in &app.view.pane_infos {
+        if super::structured::render_native(app, frame, info) {
+            continue;
+        }
         if let Some(rt) = app.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, info.id) {
             {
                 let border_style =
@@ -366,8 +369,12 @@ pub(super) fn render_panes(
                 .as_ref()
                 .is_some_and(|s| s.source == crate::selection::SelectionSource::PromptPanel);
             if !is_panel_selection {
+                let selection = app
+                    .selection
+                    .as_ref()
+                    .and_then(|selection| rt.resolve_selection(selection));
                 render_selection_highlight(
-                    &app.selection,
+                    &selection,
                     frame,
                     info.id,
                     info.inner_rect,
@@ -1544,6 +1551,18 @@ fn render_empty(app: &AppState, frame: &mut Frame, area: Rect) {
         ),
         area,
     );
+}
+
+/// Native dispatch consumes computed geometry; S10d supplies placement and input routing.
+/// No PTY lookup, subscription reads or state mutation happens during this paint.
+pub(super) fn render_structured(frame: &mut Frame, pane: &super::structured::Pane) {
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(pane.border),
+        pane.area,
+    );
+    pane.paint_content(frame);
 }
 
 #[cfg(test)]

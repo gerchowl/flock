@@ -133,10 +133,15 @@ impl App {
     ) -> String {
         let agents = self.collect_agent_infos_at(clock());
         let fleet = self.collect_fleet_agents(&agents);
+        let structured_agents = match self.structured_infos() {
+            Ok(agents) => agents,
+            Err(code) => return encode_error(id, code.as_str(), "structured metadata unavailable"),
+        };
         encode_success(
             id,
             ResponseResult::AgentList {
                 agents,
+                structured_agents,
                 // #320: the same call answers "who is here" and "who can I
                 // reach". A separate fleet verb would have been a second
                 // listing to keep in step with this one.
@@ -146,6 +151,22 @@ impl App {
     }
 
     pub(super) fn handle_agent_get(&mut self, id: String, target: AgentTarget) -> String {
+        match self.structured_target(&target.target) {
+            Ok(Some((agent_id, _))) => {
+                return match self.structured_info(&agent_id) {
+                    Ok(agent) => encode_success(id, ResponseResult::StructuredAgentInfo { agent }),
+                    Err(code) => encode_error(id, code.as_str(), "structured metadata unavailable"),
+                };
+            }
+            Err(code) => {
+                return encode_error(
+                    id,
+                    code.as_str(),
+                    "target is ambiguous across runtimes; use an agent id",
+                )
+            }
+            Ok(None) => {}
+        }
         // This read supplies conservative bulk self-exclusion (#1010), not
         // authority: even an unproven pane must not hibernate itself mid-loop.
         if target.target == "self" {
@@ -166,6 +187,34 @@ impl App {
     }
 
     pub(super) fn handle_agent_focus(&mut self, id: String, target: AgentTarget) -> String {
+        match self.structured_target(&target.target) {
+            Ok(Some((agent_id, generation))) => {
+                let result = self
+                    .native_destination(Some(&agent_id))
+                    .and_then(|destination| {
+                        self.place_structured_view(
+                            crate::structured::view::Target {
+                                agent_id: agent_id.clone(),
+                                generation,
+                            },
+                            destination,
+                        )
+                    })
+                    .and_then(|()| self.structured_info(&agent_id));
+                return match result {
+                    Ok(agent) => encode_success(id, ResponseResult::StructuredAgentInfo { agent }),
+                    Err(code) => encode_error(id, code.as_str(), "structured focus refused"),
+                };
+            }
+            Err(code) => {
+                return encode_error(
+                    id,
+                    code.as_str(),
+                    "target is ambiguous across runtimes; use an agent id",
+                )
+            }
+            Ok(None) => (),
+        }
         let agent = match self.focus_agent_target(&target.target) {
             Ok(agent) => agent,
             Err(err) => return encode_error_body(id, self.agent_target_error_body(err)),
@@ -202,6 +251,19 @@ impl App {
                 )
             }
         };
+        if params.runtime == crate::api::schema::AgentRuntime::Structured {
+            return match self.start_structured(params, &caller) {
+                Ok(result) => encode_success(id, result),
+                Err(code) => encode_error(id, code.as_str(), "structured start refused"),
+            };
+        }
+        if params.model.is_some() {
+            return encode_error(
+                id,
+                "runtime_unsupported",
+                "--model requires structured runtime",
+            );
+        }
         let result = match self.start_agent(params, &caller, questions) {
             Ok(started) => started,
             Err(err) => return encode_error_body(id, self.agent_start_error_body(err)),
@@ -677,6 +739,11 @@ impl App {
     }
 
     pub(super) fn handle_agent_send(&mut self, id: String, params: AgentSendParams) -> String {
+        match self.structured_send_target(&params.target) {
+            Ok(Some(_)) => return self.handle_structured_send(id, params),
+            Err(code) => return encode_error(id, code.as_str(), "agent target is ambiguous"),
+            Ok(None) => (),
+        }
         if params.submit && params.write_timeout_ms.is_some() {
             return encode_error(
                 id,
@@ -823,7 +890,11 @@ mod tests {
             std::env::temp_dir().join(format!("flock-history-home-{}-{name}", std::process::id()));
         let project = home.join(".claude/projects/-repo");
         std::fs::create_dir_all(&project).expect("fixture project dir");
-        std::fs::write(project.join(format!("{session_id}.jsonl")), body).expect("transcript");
+        std::fs::write(
+            project.join(format!("{session_id}.jsonl")),
+            format!("{}\n{body}", serde_json::json!({"sessionId":session_id})),
+        )
+        .expect("transcript");
         std::env::set_var("HOME", &home);
         home
     }
@@ -1053,6 +1124,121 @@ mod tests {
     }
 
     #[test]
+    fn codex_rebound_session_reads_real_turn_and_rejects_wrong_identity() {
+        let mut app = test_app();
+        app.current_api_peer_pid = Some(std::process::id());
+        let root = crate::test_support::TempDir::socket();
+        std::env::set_var("CODEX_HOME", root.path());
+        let session_id = "00000000-0000-4000-8000-000000000613";
+        let sessions = root.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(
+            sessions.join(format!("rollout-fixture-{session_id}.jsonl")),
+            include_str!("../../../tests/fixtures/codex/finished.jsonl"),
+        )
+        .unwrap();
+        let terminal = focused_terminal_id(&app);
+        let agent_id = app.state.terminals[&terminal].agent_id.to_string();
+        app.state
+            .terminals
+            .get_mut(&terminal)
+            .unwrap()
+            .set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+                source: "flock:codex".into(),
+                agent: "codex".into(),
+                session_ref: crate::agent_resume::AgentSessionRef::id(session_id).unwrap(),
+            });
+        let pane = app
+            .public_pane_id(0, app.state.workspaces[0].focused_pane_id().unwrap())
+            .unwrap();
+        let mut params = crate::api::schema::PaneReportAgentSessionParams {
+            pane_id: pane,
+            source: "flock:codex".into(),
+            agent: "codex".into(),
+            seq: None,
+            agent_session_id: Some(session_id.into()),
+            agent_session_path: None,
+            session_start_source: None,
+            rebind_agent_id: Some("different-agent".into()),
+        };
+        assert!(Method::PaneReportAgentSession(params.clone()).needs_current_protocol());
+        let mut ordinary_hook = params.clone();
+        ordinary_hook.rebind_agent_id = None;
+        assert!(!Method::PaneReportAgentSession(ordinary_hook).needs_current_protocol());
+        let wrong: serde_json::Value = serde_json::from_str(
+            &app.handle_pane_report_agent_session("wrong".into(), params.clone()),
+        )
+        .unwrap();
+        assert_eq!(wrong["error"]["code"], "session_unbound");
+        params.rebind_agent_id = Some(agent_id.clone());
+        let response = app.handle_pane_report_agent_session("bind".into(), params);
+        assert!(!response.contains("\"error\""), "{response}");
+        let reply: serde_json::Value = serde_json::from_str(&app.handle_agent_result(
+            "reply".into(),
+            AgentResultParams {
+                target: agent_id,
+                max_chars: None,
+                offset: None,
+            },
+        ))
+        .unwrap();
+        assert_eq!(
+            reply["result"]["result"]["text"],
+            "The fixture is sound.\nDONE: checked"
+        );
+        std::env::remove_var("CODEX_HOME");
+    }
+
+    #[test]
+    fn cached_claude_session_is_confirmed_by_exact_recovery_and_replay_is_safe() {
+        let root = crate::test_support::TempDir::socket();
+        std::env::set_var("HOME", root.path());
+        std::env::set_var("XDG_STATE_HOME", root.path().join("state"));
+        let project = root.path().join(".claude/projects/fixture");
+        std::fs::create_dir_all(&project).unwrap();
+        let body = format!(
+            "{}\n{}",
+            serde_json::json!({"type":"user","sessionId":"claude-rebind",
+            "message":{"role":"user","content":"continue"}}),
+            assistant_line("DONE: recovered")
+        );
+        std::fs::write(project.join("claude-rebind.jsonl"), body).unwrap();
+        let mut app = test_app();
+        let terminal_id = focused_terminal_id(&app);
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "flock:claude".into(),
+            agent: "claude".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("claude-rebind").unwrap(),
+        });
+        let agent_id = terminal.agent_id.to_string();
+        app.current_api_peer_pid = Some(std::process::id());
+        let before: serde_json::Value =
+            serde_json::from_str(&result(&mut app, &agent_id, None, None)).unwrap();
+        assert_eq!(before["error"]["code"], "session_unconfirmed");
+        let params = crate::api::schema::PaneReportAgentSessionParams {
+            pane_id: app
+                .public_pane_id(0, app.state.workspaces[0].focused_pane_id().unwrap())
+                .unwrap(),
+            rebind_agent_id: Some(agent_id.clone()),
+            source: "flock:claude".into(),
+            agent: "claude".into(),
+            seq: None,
+            agent_session_id: Some("claude-rebind".into()),
+            agent_session_path: None,
+            session_start_source: None,
+        };
+        for _ in 0..2 {
+            let response = app.handle_pane_report_agent_session("bind".into(), params.clone());
+            assert!(!response.contains("\"error\""), "{response}");
+        }
+        assert_eq!(
+            result_info(&result(&mut app, &agent_id, None, None)).text,
+            "DONE: recovered"
+        );
+    }
+
+    #[test]
     fn codex_result_reports_not_yet_codes_and_reads_the_reported_session() {
         let mut app = test_app();
         let home = std::env::temp_dir().join(format!("flock-codex-api-{}", std::process::id()));
@@ -1082,14 +1268,19 @@ mod tests {
         assert_eq!(error.error.code, "transcript_unreadable");
         std::fs::write(
             &path,
-            include_str!("../../../tests/fixtures/codex/in-progress.jsonl"),
+            format!(
+                "{}\n{}",
+                serde_json::json!({"type":"session_meta","payload":{"id":"sess-codex"}}),
+                include_str!("../../../tests/fixtures/codex/in-progress.jsonl")
+            ),
         )
         .unwrap();
         let error: ErrorResponse = serde_json::from_str(&read(&mut app)).unwrap();
         assert_eq!(error.error.code, "no_result");
         std::fs::write(
             &path,
-            include_str!("../../../tests/fixtures/codex/finished.jsonl"),
+            include_str!("../../../tests/fixtures/codex/finished.jsonl")
+                .replace("00000000-0000-4000-8000-000000000613", "sess-codex"),
         )
         .unwrap();
         let response: serde_json::Value = serde_json::from_str(&read(&mut app)).unwrap();
@@ -1100,10 +1291,12 @@ mod tests {
         assert_eq!(result["at_ms"], 1_767_225_603_125_u64);
         std::fs::write(
             &path,
-            concat!(
+            format!(
+                "{}{}",
                 include_str!("../../../tests/fixtures/codex/finished.jsonl"),
                 include_str!("../../../tests/fixtures/codex/in-progress.jsonl")
-            ),
+            )
+            .replace("00000000-0000-4000-8000-000000000613", "sess-codex"),
         )
         .unwrap();
         let response: serde_json::Value = serde_json::from_str(&read(&mut app)).unwrap();

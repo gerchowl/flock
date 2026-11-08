@@ -228,6 +228,10 @@ mod tests {
             receiver.try_recv(),
             Err(TryRecvError::Disconnected)
         ));
+        let (sender, _receiver) = ObserverControl::channel(None, 1);
+        sender.send(vec![0; MAX_FRAME_SIZE]).unwrap();
+        sender.send(vec![1; MAX_FRAME_SIZE]).unwrap();
+        assert!(sender.send(vec![2]).is_err());
     }
 
     #[test]

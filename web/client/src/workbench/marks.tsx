@@ -61,9 +61,9 @@ const SHAPES: { readonly [M in Mark]: () => JSX.Element } = {
 };
 
 /** One status mark, with an optional count badge (the "needs you" count). */
-export function StatusMark(props: { readonly mark: Mark; readonly label: string; readonly count?: number }): JSX.Element {
+export function StatusMark(props: { readonly mark: Mark; readonly label: string; readonly count?: number; readonly id?: string }): JSX.Element {
   return (
-    <span class={`mark mark--${props.mark}`} role="img" aria-label={props.label} data-mark={props.mark}>
+    <span id={props.id} class={`mark mark--${props.mark}`} role="img" aria-label={props.label} data-mark={props.mark}>
       <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">
         {SHAPES[props.mark]()}
       </svg>

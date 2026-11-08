@@ -259,7 +259,11 @@ fn add_control_observer(
             None,
             client_id,
             RenderEncoding::TerminalAnsi,
-            Some(crate::server::client_transport::ClientWriter { control, render }),
+            Some(crate::server::client_transport::ClientWriter {
+                peer: crate::platform::peer::credentials(socket),
+                control,
+                render,
+            }),
         ),
     );
     let socket = socket.try_clone().unwrap();
