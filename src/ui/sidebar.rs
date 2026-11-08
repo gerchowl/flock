@@ -3726,7 +3726,7 @@ mod tests {
     use crate::{detect::Agent, workspace::Workspace};
     use ratatui::{backend::TestBackend, Terminal};
 
-    fn server_identity1076_fixture() -> (crate::app::App, String) {
+    fn server_identity1076_fixture(retained_claim: bool) -> (crate::app::App, String) {
         let identity = crate::mesh::identity::NodeIdentity::fixture([7; 32]);
         let node = identity.node_id();
         let peer = crate::config::PeerConfig {
@@ -3785,7 +3785,7 @@ mod tests {
             method: crate::api::schema::Method::PeersHubFleet(
                 crate::api::schema::PeersHubFleetParams {
                     hub: "node-b.example".into(),
-                    fleet: vec![relayed],
+                    fleet: vec![relayed.clone()],
                     hub_self: None,
                 },
             ),
@@ -3795,6 +3795,17 @@ mod tests {
             .get("error")
             .is_none());
         app.current_api_peer_pid = None;
+        assert!(app.state.relayed_fleet_cache.is_empty());
+        if retained_claim {
+            // The fold still protects cache entries admitted before filtering.
+            crate::peers::merge_hub_pushed_fleet(
+                &mut app.state.relayed_fleet_cache,
+                vec![relayed],
+                "node-b.example",
+                Some(&node),
+                std::time::Instant::now(),
+            );
+        }
         // Drive the real pin/path projection endpoint before building the band.
         let request = serde_json::from_value(serde_json::json!({
             "id":"fixture", "method":"peers.enrollment", "params":{}}))
@@ -3807,6 +3818,26 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn server_identity1076_direct_claim_is_dropped_without_a_via_annotation() {
+        let (_lock, _scrub) = crate::config::test_config_env_guard();
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        let (app, _) = server_identity1076_fixture(false);
+        assert!(app.state.relayed_fleet_cache.is_empty());
+        assert_eq!(app.state.remote_peers().len(), 1);
+        let area = Rect::new(0, 0, 120, 16);
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal
+            .draw(|frame| render_servers_section(&app.state, frame, area, false))
+            .unwrap();
+        let text = (0..area.height)
+            .map(|y| buffer_row_text(terminal.backend().buffer(), area, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("node-b-alias.example"), "{text}");
+        assert!(!text.contains("+via"), "{text}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn server_identity1076_unproven_claim_cannot_replace_a_pinned_target() {
         // #1076 anti-spoof intent (updated by #2998): an unproven claim about
         // a PINNED peer's node_id can never change the shown name, icon or
@@ -3815,7 +3846,7 @@ mod tests {
         // as a second "unverified" row — the fold adds no authority.
         let (_lock, _scrub) = crate::config::test_config_env_guard();
         let _store = crate::mesh::runtime_store::TestStore::new();
-        let (mut app, _) = server_identity1076_fixture();
+        let (mut app, _) = server_identity1076_fixture(true);
         // Capture the SPOOF's name/target BEFORE taking a shared ref to
         // app.state, so the assertions below can check the pinned row
         // against them without borrowing mutably twice.
@@ -3886,7 +3917,7 @@ mod tests {
     async fn server_identity1076_proven_self_reading_keeps_configured_target() {
         let (_lock, _scrub) = crate::config::test_config_env_guard();
         let _store = crate::mesh::runtime_store::TestStore::new();
-        let (mut app, _) = server_identity1076_fixture();
+        let (mut app, _) = server_identity1076_fixture(true);
         app.state
             .relayed_fleet_cache
             .values_mut()
@@ -3907,7 +3938,7 @@ mod tests {
     async fn server_identity1076_enrolled_direct_edge_does_not_render_via_itself() {
         let (_lock, _scrub) = crate::config::test_config_env_guard();
         let _store = crate::mesh::runtime_store::TestStore::new();
-        let (mut app, _) = server_identity1076_fixture();
+        let (mut app, _) = server_identity1076_fixture(true);
         // Isolate the route symptom from the separately tested alias duplicate.
         app.state.peer_summaries.clear();
         let area = Rect::new(0, 0, 120, 16);
@@ -4039,7 +4070,7 @@ mod tests {
     async fn server_identity1076_real_next_hop_replaces_gossip_supplier() {
         let (_lock, _scrub) = crate::config::test_config_env_guard();
         let _store = crate::mesh::runtime_store::TestStore::new();
-        let (mut app, node) = server_identity1076_fixture();
+        let (mut app, node) = server_identity1076_fixture(true);
         use crate::mesh::routes::{Adjacency, Advert};
         let local = crate::mesh::identity::NodeIdentity::load().unwrap();
         let middle = crate::mesh::identity::NodeIdentity::fixture([7; 32]);

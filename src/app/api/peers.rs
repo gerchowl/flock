@@ -257,7 +257,7 @@ impl App {
         }
         crate::peers::merge_hub_pushed_fleet(
             &mut self.state.relayed_fleet_cache,
-            fleet,
+            crate::peers::filter_direct_claims(&self.state.peers, fleet, &hub),
             &hub,
             hub_node.as_deref(),
             std::time::Instant::now(),
@@ -2753,6 +2753,85 @@ mod tests {
             now,
         );
     }
+    fn receive_claim_3030(direct: bool, hub_push: bool, legacy: bool, other_peer: bool) {
+        let mut app = test_app();
+        let sender = crate::mesh::identity::NodeIdentity::fixture([91; 32]).node_id();
+        let subject = crate::mesh::identity::NodeIdentity::fixture([92; 32]).node_id();
+        if direct {
+            let peer = crate::config::PeerConfig {
+                name: "direct-alias.example".into(),
+                ssh: "direct-dial.example".into(),
+                ..Default::default()
+            };
+            crate::peer_stream::test_enroll(&peer, &subject);
+            app.state.peers.push(peer);
+        }
+        if other_peer {
+            app.state.peers.push(crate::config::PeerConfig {
+                name: "other.example".into(),
+                ..Default::default()
+            });
+        }
+        if hub_push {
+            bind_relay(&mut app, "hub.example");
+            let mut row = hub_row("leaf.example", "direct-dial.example", 0);
+            row.node_id = (!legacy).then_some(subject.clone());
+            push_down(
+                &mut app,
+                crate::api::schema::PeersHubFleetParams {
+                    hub: "hub.example".into(),
+                    fleet: vec![row],
+                    hub_self: None,
+                },
+            );
+        } else {
+            let peer = relay_ingest_peer(&mut app);
+            crate::peer_stream::test_enroll(&peer, &sender);
+            ingest_relay_poll(
+                &mut app,
+                &peer,
+                &sender,
+                &subject,
+                std::time::Instant::now(),
+            );
+            crate::peer_stream::reset_enrollment(&peer.name);
+        }
+        assert_eq!(
+            app.state.relayed_fleet_cache.len(),
+            usize::from(!direct),
+            "direct={direct}, hub_push={hub_push}, legacy={legacy}"
+        );
+        assert_eq!(crate::mesh::hello::VERSION, 5);
+        if direct {
+            crate::peer_stream::reset_enrollment("direct-alias.example");
+        }
+    }
+
+    #[tokio::test]
+    async fn relay_3030_hub_drops_directly_dialed_claims_on_both_ingress_paths() {
+        let _guard = crate::config::test_config_env_guard();
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        receive_claim_3030(true, false, false, false);
+        receive_claim_3030(true, true, false, false);
+        receive_claim_3030(true, true, true, false);
+    }
+
+    #[tokio::test]
+    async fn relay_3030_spoke_keeps_pushed_claims() {
+        let _guard = crate::config::test_config_env_guard();
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        receive_claim_3030(false, true, false, false);
+        receive_claim_3030(false, true, true, false);
+    }
+
+    #[tokio::test]
+    async fn relay_3030_hub_keeps_non_dialed_partition_claims() {
+        let _guard = crate::config::test_config_env_guard();
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        receive_claim_3030(false, false, false, true);
+        receive_claim_3030(false, true, false, true);
+    }
+
     fn ingest_bindings(app: &mut App) {
         let request = serde_json::from_value(serde_json::json!({
             "id":"bindings", "method":"peers.enrollment", "params":{}}))
@@ -2778,12 +2857,9 @@ mod tests {
             &owner,
             std::time::Instant::now(),
         );
-        let entry = app.state.relayed_fleet_cache.values().next().unwrap();
-        assert_eq!(entry.source_node, None);
-        assert_eq!(
-            app.state.server_peer_node(&entry.peer),
-            None,
-            "rejected sender supplied proven relay rows"
+        assert!(
+            app.state.relayed_fleet_cache.is_empty(),
+            "a rejected sender cannot store claims about our dialed owner"
         );
     }
     #[tokio::test]
@@ -2810,10 +2886,25 @@ mod tests {
             "new source must evict old-source rows even on an empty delivery"
         );
         ingest_relay_poll(&mut app, &peer, &new, &new, std::time::Instant::now());
-        assert_eq!(app.state.relayed_fleet_cache.len(), 1);
-        let entry = app.state.relayed_fleet_cache.values().next().unwrap();
-        assert_eq!(app.state.server_peer_node(&entry.peer), Some(new.as_str()));
+        assert!(
+            app.state.relayed_fleet_cache.is_empty(),
+            "the newly dialed identity must no longer be cached as a claim"
+        );
     }
+    // Model a claim retained from before receiver filtering. Its identity
+    // proof must still be revoked by binding changes and rejected polls.
+    fn seed_mixed_version_self_claim(app: &mut App, peer: &crate::config::PeerConfig, node: &str) {
+        let mut row = hub_row("leaf.example", "leaf.example", 0);
+        row.node_id = Some(node.into());
+        crate::peers::merge_relayed_fleet(
+            &mut app.state.relayed_fleet_cache,
+            vec![row],
+            &peer.name,
+            Some(node),
+            std::time::Instant::now(),
+        );
+    }
+
     #[tokio::test]
     async fn missing_current_binding_revokes_ingested_relay_proof() {
         let _guard = crate::config::test_config_env_guard();
@@ -2823,7 +2914,7 @@ mod tests {
         let owner = crate::mesh::identity::NodeIdentity::fixture([81; 32]).node_id();
         crate::peer_stream::test_enroll(&peer, &owner);
         ingest_bindings(&mut app);
-        ingest_relay_poll(&mut app, &peer, &owner, &owner, std::time::Instant::now());
+        seed_mixed_version_self_claim(&mut app, &peer, &owner);
         let proven = |app: &App| {
             let entry = app.state.relayed_fleet_cache.values().next().unwrap();
             app.state.server_peer_node(&entry.peer).map(str::to_owned)
@@ -2851,7 +2942,7 @@ mod tests {
         let owner = crate::mesh::identity::NodeIdentity::fixture([81; 32]).node_id();
         crate::peer_stream::test_enroll(&peer, &owner);
         ingest_bindings(&mut app);
-        ingest_relay_poll(&mut app, &peer, &owner, &owner, std::time::Instant::now());
+        seed_mixed_version_self_claim(&mut app, &peer, &owner);
         let entry = app.state.relayed_fleet_cache.values().next().unwrap();
         assert_eq!(
             app.state.server_peer_node(&entry.peer),
@@ -2883,7 +2974,7 @@ mod tests {
         let impostor = crate::mesh::identity::NodeIdentity::fixture([82; 32]).node_id();
         crate::peer_stream::test_enroll(&peer, &owner);
         ingest_bindings(&mut app);
-        ingest_relay_poll(&mut app, &peer, &owner, &owner, std::time::Instant::now());
+        seed_mixed_version_self_claim(&mut app, &peer, &owner);
         assert_eq!(
             app.state
                 .relayed_fleet_cache
@@ -2937,7 +3028,8 @@ mod tests {
         let owner = crate::mesh::identity::NodeIdentity::fixture([81; 32]).node_id();
         crate::peer_stream::test_enroll(&peer, &owner);
         let now = std::time::Instant::now() + std::time::Duration::from_secs(100);
-        ingest_relay_poll(&mut app, &peer, &owner, &owner, now);
+        let subject = crate::mesh::identity::NodeIdentity::fixture([82; 32]).node_id();
+        ingest_relay_poll(&mut app, &peer, &owner, &subject, now);
         let relay = &app.state.relayed_fleet_cache.values().next().unwrap().peer;
         assert_eq!(relay.ingested_at, Some(now));
         assert_eq!(relay.last_ok, Some(now));

@@ -540,7 +540,11 @@ impl App {
                     }
                     crate::peers::merge_relayed_fleet(
                         &mut self.state.relayed_fleet_cache,
-                        payload.relayed_fleet,
+                        crate::peers::filter_direct_claims(
+                            &self.state.peers,
+                            payload.relayed_fleet,
+                            &fetch.peer,
+                        ),
                         &fetch.peer,
                         payload.node_id.as_deref(),
                         now,
