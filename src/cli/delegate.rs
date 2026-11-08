@@ -4729,15 +4729,14 @@ fn delegate_status(args: &[String]) -> io::Result<i32> {
     Ok(exit::OK)
 }
 
-/// The name resolves to a live delegate: an entry, and an agent of that name
-/// still on the terminal the entry recorded.
+/// The name resolves to a live delegate with the stable identity it recorded.
 ///
-/// The terminal check is what makes a rename visible. An agent renamed away from
+/// The identity check is what makes a rename visible. An agent renamed away from
 /// its delegate name is no longer addressable as that delegate, and a `send`
 /// that still worked would type into whatever inherited the name.
 /// Why `require_delegate` returned, when it did not return an `Entry`.
 ///
-/// The two failures are kept apart because they go to different exit codes:
+/// Failures are kept apart because they go to different exit codes:
 /// `NotDelegate` is a usage error (exit 2) with "not a delegate: {name}", and
 /// `TimedOut` carries the entry so the one caller that cares (`delegate wait`
 /// / `send --await`) can emit a `timeout` outcome object and exit 124 (K5).
@@ -4802,7 +4801,7 @@ fn require_delegate(name: &str, deadline: Option<Instant>) -> Result<Recorded, R
 }
 
 /// Write back an entry that `require_decide` re-pointed at the delegate's new
-/// terminal after a restart, or backfilled with its agent id (#975).
+/// terminal after a restart (#975).
 ///
 /// Only the identity fields move, and onto a fresh read of the file, so a
 /// `send` that advanced the round meanwhile keeps its round. Best-effort: the
