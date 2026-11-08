@@ -37,7 +37,7 @@ fn run(
         .join(support::paths::server_key(&socket));
     std::fs::create_dir_all(&registry).unwrap();
     let entry = serde_json::json!({
-        "name":"fixture", "terminal_id":"term_fixture", "pane_id":"w1:p1",
+        "name":"fixture", "agent_id":"agent_fixture.example_compat", "session":{"source":"flock:codex","agent":"codex","kind":"id","value":"compat-session"}, "terminal_id":"term_fixture", "pane_id":"w1:p1",
         "root_pane":"w1:p0", "workspace_id":"w1", "mode":"cwd", "worktree":null,
         "branch":null, "harness":"codex", "model":null, "round":1,
         "brief":brief, "submitted_at_ms":0, "cursor":"term_fixture:0:0:0:i", "created_at_ms":0
@@ -87,7 +87,7 @@ fn run(
                 serde_json::json!({"id":request["id"],"error":{"code":"agent_not_found","message":"no such agent"}})
             } else if method == "agent.get" {
                 serde_json::json!({"id":request["id"],"result":{"agent":{
-                    "terminal_id":"term_fixture", "pane_id":"w1:p1", "agent_status":"idle"
+                    "agent_id":"agent_fixture.example_compat", "agent_session":{"source":"flock:codex","agent":"codex","kind":"id","value":"compat-session"}, "terminal_id":"term_fixture", "pane_id":"w1:p1", "agent_status":"idle"
                 }}})
             } else {
                 serde_json::json!({"id":request["id"],"result":{"text":"fixture reply"}})

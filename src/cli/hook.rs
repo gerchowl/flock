@@ -592,6 +592,7 @@ fn plan_session(
     HookOutcome {
         reports: vec![Method::PaneReportAgentSession(
             PaneReportAgentSessionParams {
+                rebind_agent_id: None,
                 pane_id: pane_id.to_string(),
                 source: agent.source().to_string(),
                 agent: agent.agent().to_string(),
