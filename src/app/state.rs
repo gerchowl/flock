@@ -3108,7 +3108,12 @@ impl AppState {
         //
         // Snapshot identities are unproven claims. They cannot hide a row
         // obtained from an independently authenticated source.
-        let mut relayed: Vec<_> = self.relayed_fleet_cache.iter().collect();
+        let now = std::time::Instant::now();
+        let mut relayed: Vec<_> = self
+            .relayed_fleet_cache
+            .iter()
+            .filter(|(_, entry)| !self.relay_claim_is_redundant_at(&entry.peer, now))
+            .collect();
         relayed.sort_by_key(|(host_key, _)| *host_key);
         candidates.extend(relayed.into_iter().map(|(host_key, entry)| {
             (
