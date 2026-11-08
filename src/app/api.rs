@@ -2563,6 +2563,7 @@ mod tests {
         let response = app.handle_pane_report_agent_session(
             "stale".into(),
             crate::api::schema::PaneReportAgentSessionParams {
+                rebind_agent_id: None,
                 pane_id: route,
                 source: "flock:codex".into(),
                 agent: "codex".into(),

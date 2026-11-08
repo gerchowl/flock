@@ -137,7 +137,7 @@ pub(super) const WAIT_USAGE: &str = concat!(
     "  --silence DURATION  unchanged working screen; default 3m, 0 disables\n",
     "  not_started requires an empty idle composer for 30s + settle after submit, with no turn or queued/startup evidence\n",
     "  await exit codes: 0 settled reply, 3 BLOCKED reply, 4 gone, 5 no result/sentinel,\n",
-    "                    6 agent blocked, 7 stalled, 11 not started (was 8), 10 brief refused before typing (was 1), 75 server stopped answering, 78 server protocol mismatch, 124 timeout, 2 usage, 1 failure",
+    "                    6 agent blocked, 7 stalled, 11 not started (was 8), 12 session unbound, 10 brief refused before typing (was 1), 75 server stopped answering, 78 server protocol mismatch, 124 timeout, 2 usage, 1 failure",
 );
 
 pub(super) const RESULT_USAGE: &str = "flk delegate result <name> [--max-chars N] [--json]";
@@ -846,6 +846,9 @@ struct Entry {
     /// Latest explicit lock-resolution intent; false does not prove a key was sent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     lock_resolution: Option<serde_json::Value>,
+    /// Harness-reported session retained for exact recovery after terminal replacement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session: Option<serde_json::Value>,
 }
 
 impl Entry {
@@ -857,6 +860,7 @@ impl Entry {
 }
 
 mod refusal_guidance;
+mod session;
 pub(super) use refusal_guidance::enrich_draft_refusal;
 
 /// The directory holding this server's delegates: one file per name, under the
@@ -939,6 +943,7 @@ fn write_entry(entry: &Entry) -> io::Result<()> {
         let _ = std::fs::remove_file(&temp);
         return Err(err);
     }
+    std::fs::File::open(dir)?.sync_all()?;
     Ok(())
 }
 
@@ -2874,6 +2879,7 @@ fn delegate_start(args: &[String]) -> io::Result<i32> {
         base_sha: placement.base.as_ref().and_then(|fresh| fresh.sha.clone()),
         agent_id: field(&agent, "agent_id").map(str::to_string),
         lock_resolution: None,
+        session: agent.get("agent_session").filter(|v| !v.is_null()).cloned(),
     };
     let failed = |entry: &Entry, written: bool, reason: Option<&str>| {
         fail_started(entry, &cleanup, written, &flags, reason, None)
@@ -2935,6 +2941,10 @@ fn delegate_start(args: &[String]) -> io::Result<i32> {
     entry.round = 1;
     entry.submitted_at_ms = submitted_at_ms;
     entry.cursor = cursor.clone();
+    entry.session = settled_record
+        .get("agent_session")
+        .filter(|v| !v.is_null())
+        .cloned();
     if let Err(err) = write_entry(&entry) {
         // The write failed, so THIS process did not create the entry.
         // Removing `entry_path(name)` would delete a pre-existing (and
@@ -4093,7 +4103,25 @@ fn delegate_wait_for_ready(
 /// Submit a persisted send round without rolling uncertainty back to the prior round.
 fn submit_send_brief(entry: &Entry, original: &Entry, sentence: &str, json: bool) -> Option<i32> {
     let name = &entry.name;
-    if let Err(reason) = submit_brief(&entry.pane_id, sentence, None) {
+    let submitted =
+        if let Some(session) = entry.session.as_ref().and_then(|raw| field(raw, "value")) {
+            bounded_submit(
+                Method::PaneSubmit(PaneSubmitParams {
+                    self_submit_confirmed: None,
+                    pane_id: entry
+                        .agent_id
+                        .clone()
+                        .unwrap_or_else(|| entry.pane_id.clone()),
+                    text: sentence.to_owned(),
+                    if_session: Some(session.to_owned()),
+                    min_age_secs: 0,
+                }),
+                None,
+            )
+        } else {
+            submit_brief(&entry.pane_id, sentence, None)
+        };
+    if let Err(reason) = submitted {
         if matches!(reason, SubmitFailure::Gone) {
             // The round never started, so the record goes back to the last one
             // that did, which is what `status` and `reap` then answer from.
@@ -4182,6 +4210,11 @@ fn delegate_send(args: &[String]) -> io::Result<i32> {
     // The whole entry, kept. A round that fails to submit has to put the file
     // back the way it found it, and decrementing one field of a mutated copy is
     // how a brief path from the failed round ends up recorded as the live one.
+    if session::changed(&entry) {
+        if let Err(reason) = session::prepare(&mut entry, None) {
+            return Ok(session::unbound(&entry, &reason, flags.json));
+        }
+    }
     let original = entry.clone();
 
     let ready_timeout = flags
@@ -4270,7 +4303,10 @@ fn await_prompt(
 ) -> Result<serde_json::Value, ReadyFailure> {
     let mut last_status: Option<String> = None;
     loop {
-        match agent_record(&entry.terminal_id, Some(deadline)) {
+        match agent_record(
+            entry.agent_id.as_deref().unwrap_or(&entry.terminal_id),
+            Some(deadline),
+        ) {
             AgentFetch::Found(record) => {
                 // A missing cursor belongs to the compatibility diagnosis, which
                 // must run before any lock-screen I/O against an older server.
@@ -4434,7 +4470,7 @@ fn delegate_result(args: &[String]) -> io::Result<i32> {
         Ok(flags) => flags,
         Err(reason) => return Ok(usage(reason)),
     };
-    let entry = match require_delegate_no_deadline(name) {
+    let mut entry = match require_delegate_no_deadline(name) {
         Ok(Recorded::Live(entry)) => entry,
         // No agent to ask for a reply: the same answer `delegate wait` gives.
         Ok(Recorded::Gone(entry)) => {
@@ -4450,9 +4486,17 @@ fn delegate_result(args: &[String]) -> io::Result<i32> {
         Err(code) => return Ok(code),
     };
 
+    if session::changed(&entry) {
+        if let Err(reason) = session::prepare(&mut entry, None) {
+            return Ok(session::unbound(&entry, &reason, flags.json));
+        }
+    }
     let bounded_res = bounded(
         Method::AgentResult(AgentResultParams {
-            target: entry.terminal_id.clone(),
+            target: entry
+                .agent_id
+                .clone()
+                .unwrap_or_else(|| entry.terminal_id.clone()),
             max_chars: flags.max_chars,
             offset: None,
         }),
@@ -4488,6 +4532,13 @@ fn delegate_result(args: &[String]) -> io::Result<i32> {
             };
             emit_outcome(&entry, outcome, None, flags.json, &entry.cursor);
             return Ok(code);
+        }
+        if code == NO_SESSION_CODE {
+            return Ok(session::unbound(
+                &entry,
+                "no authoritative session binding is available",
+                flags.json,
+            ));
         }
         return Ok(fail(server_error(error)));
     }
@@ -4716,6 +4767,7 @@ fn persist_reidentified(before: &Entry, live: &Entry) {
     if before.terminal_id == live.terminal_id
         && before.pane_id == live.pane_id
         && before.agent_id == live.agent_id
+        && before.session == live.session
     {
         return;
     }
@@ -4727,6 +4779,7 @@ fn persist_reidentified(before: &Entry, live: &Entry) {
     fresh.terminal_id = live.terminal_id.clone();
     fresh.pane_id = live.pane_id.clone();
     fresh.agent_id = live.agent_id.clone();
+    fresh.session = live.session.clone();
     let _ = write_entry(&fresh);
 }
 
@@ -4761,6 +4814,9 @@ fn reidentify(mut entry: Entry, record: &serde_json::Value) -> Option<Entry> {
     }
     if entry.agent_id.is_none() {
         entry.agent_id = record_agent_id;
+    }
+    if let Some(session) = record.get("agent_session").filter(|v| !v.is_null()) {
+        entry.session = Some(session.clone());
     }
     Some(entry)
 }
@@ -5143,6 +5199,8 @@ enum RoundEnd {
 /// settle feeds: the stall monitor and the not-started watch.
 struct SocketRound<'w, 'a> {
     wait: &'w Await<'a>,
+    entry: Entry,
+    unbound: Option<String>,
     monitor: super::delegate_verdict::Monitor,
     start_watch: start_watch::StartWatch,
 }
@@ -5172,6 +5230,8 @@ impl<'w, 'a> SocketRound<'w, 'a> {
         );
         Self {
             wait,
+            entry: wait.entry.clone(),
+            unbound: None,
             monitor,
             start_watch,
         }
@@ -5183,6 +5243,29 @@ impl RoundIo for SocketRound<'_, '_> {
         &mut self,
         after: Option<&str>,
     ) -> io::Result<(super::settled::SettledOutcome, bool)> {
+        if session::changed(&self.entry) {
+            if let Err(reason) = session::prepare(&mut self.entry, self.wait.deadline) {
+                self.unbound = Some(reason);
+                return Ok((
+                    super::settled::SettledOutcome::Error("session_unbound".into()),
+                    false,
+                ));
+            }
+        }
+        if after.is_some_and(|raw| {
+            Cursor::parse(raw).is_ok_and(|c| c.terminal_id != self.entry.terminal_id)
+                && raw != self.entry.cursor
+        }) {
+            self.unbound =
+                Some("the supplied cursor cannot be attributed to the recorded round".into());
+            return Ok((
+                super::settled::SettledOutcome::Error("session_unbound".into()),
+                false,
+            ));
+        }
+        let after = after.filter(|raw| {
+            Cursor::parse(raw).map_or(true, |c| c.terminal_id == self.entry.terminal_id)
+        });
         let wait = self.wait;
         let monitor = &mut self.monitor;
         let start_watch = &mut self.start_watch;
@@ -5193,8 +5276,8 @@ impl RoundIo for SocketRound<'_, '_> {
         let settled = super::settled::settled_wait_observed(
             "delegate",
             SettleTarget::Pinned(PinnedTarget {
-                terminal_id: wait.entry.terminal_id.clone(),
-                pane_id: wait.entry.pane_id.clone(),
+                terminal_id: self.entry.terminal_id.clone(),
+                pane_id: self.entry.pane_id.clone(),
             }),
             after,
             wait.settle_ms.unwrap_or(super::settled::DEFAULT_SETTLE_MS),
@@ -5244,13 +5327,59 @@ impl RoundIo for SocketRound<'_, '_> {
                 stalled
             },
         )?;
+        if matches!(settled, super::settled::SettledOutcome::Gone { .. }) {
+            let fetched = agent_record(
+                self.entry.agent_id.as_deref().unwrap_or(&self.entry.name),
+                wait.deadline,
+            );
+            match fetched {
+                AgentFetch::Found(record) => {
+                    if let Some(live) = reidentify(self.entry.clone(), &record) {
+                        if live.terminal_id != self.entry.terminal_id {
+                            persist_reidentified(&self.entry, &live);
+                            self.entry = live;
+                            return self.settle(after);
+                        }
+                    }
+                }
+                AgentFetch::Missing => {}
+                AgentFetch::TimedOut => {
+                    return Ok((super::settled::SettledOutcome::TimedOut, false))
+                }
+                AgentFetch::Failed(reason) => {
+                    return Ok((super::settled::SettledOutcome::Error(reason), false))
+                }
+            }
+        }
         Ok((settled, not_started))
     }
 
     fn agent_result(&mut self) -> Result<serde_json::Value, BoundedError> {
+        if let AgentFetch::Found(record) = agent_record(
+            self.entry
+                .agent_id
+                .as_deref()
+                .unwrap_or(&self.entry.terminal_id),
+            self.wait.deadline,
+        ) {
+            if let Some(live) = reidentify(self.entry.clone(), &record)
+                .filter(|live| live.terminal_id != self.entry.terminal_id)
+            {
+                persist_reidentified(&self.entry, &live);
+                self.entry = live;
+                if let Err(reason) = session::prepare(&mut self.entry, self.wait.deadline) {
+                    self.unbound = Some(reason);
+                    return Err(BoundedError::Transport(io::Error::other("session_unbound")));
+                }
+            }
+        }
         bounded(
             Method::AgentResult(AgentResultParams {
-                target: self.wait.entry.terminal_id.clone(),
+                target: self
+                    .entry
+                    .agent_id
+                    .clone()
+                    .unwrap_or_else(|| self.entry.terminal_id.clone()),
                 max_chars: self.wait.max_chars,
                 offset: None,
             }),
@@ -5259,7 +5388,13 @@ impl RoundIo for SocketRound<'_, '_> {
     }
 
     fn agent_record(&mut self) -> AgentFetch {
-        agent_record(&self.wait.entry.terminal_id, self.wait.deadline)
+        agent_record(
+            self.entry
+                .agent_id
+                .as_deref()
+                .unwrap_or(&self.entry.terminal_id),
+            self.wait.deadline,
+        )
     }
 
     fn now(&self) -> Instant {
@@ -5280,13 +5415,17 @@ impl Await<'_> {
         let reported_cursor = self.after.clone().unwrap_or_default();
         let mut io = SocketRound::new(&self);
         let end = self.decide(&mut io)?;
+        if let Some(reason) = &io.unbound {
+            return Ok(session::unbound(&io.entry, reason, self.json));
+        }
+        let entry = &io.entry;
         let monitor = io.monitor;
         match end {
             RoundEnd::Report { outcome, info } => {
                 let code = outcome.exit_code();
                 let screen = without_retries(|| {
                     report_screen_with(self.deadline, &monitor.screen, |deadline| {
-                        detection_screen(&self.entry.pane_id, deadline)
+                        detection_screen(&entry.pane_id, deadline)
                     })
                 });
                 let verdict = matches!(outcome, Outcome::Stalled)
@@ -5305,7 +5444,7 @@ impl Await<'_> {
                     });
                 let observation =
                     event_observation(&self.entry.name, &screen, &verdict, self.deadline);
-                save_observation(self.entry, &observation);
+                save_observation(entry, &observation);
                 let mut info = info.unwrap_or_else(|| serde_json::json!({}));
                 for (key, value) in observation.as_object().into_iter().flatten() {
                     info[key] = value.clone();
@@ -5324,7 +5463,7 @@ impl Await<'_> {
                 info["settled_with_background_shells"] =
                     serde_json::json!(crate::detect::settled_with_background_shells(&screen));
                 emit_outcome(
-                    self.entry,
+                    entry,
                     outcome.as_str(),
                     Some(&info),
                     self.json,
@@ -5907,6 +6046,9 @@ fn emit_outcome(
             serde_json::json!({
                 "name": entry.name,
                 "outcome": outcome,
+                "error": text("error"),
+                "agent_id": text("agent_id"),
+                "terminal_id": text("terminal_id"),
                 "status": text("status"),
                 "status_text": text("status_text"),
                 "startup_dialog": text("startup_dialog"),

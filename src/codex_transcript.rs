@@ -32,22 +32,28 @@ fn find_rollout(
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(_) => return Err(TranscriptError::Unreadable),
     };
+    let mut found = None;
     for entry in entries {
         let entry = entry.map_err(|_| TranscriptError::Unreadable)?;
         let kind = entry.file_type().map_err(|_| TranscriptError::Unreadable)?;
         if kind.is_file() {
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if name.starts_with("rollout-") && name.ends_with(suffix) {
-                return Ok(Some(entry.path()));
+            if name.starts_with("rollout-")
+                && name.ends_with(suffix)
+                && found.replace(entry.path()).is_some()
+            {
+                return Err(TranscriptError::Unreadable);
             }
         } else if kind.is_dir() && depth > 0 {
             if let Some(path) = find_rollout(&entry.path(), suffix, depth - 1)? {
-                return Ok(Some(path));
+                if found.replace(path).is_some() {
+                    return Err(TranscriptError::Unreadable);
+                }
             }
         }
     }
-    Ok(None)
+    Ok(found)
 }
 
 pub(crate) fn read_tail(path: &Path) -> Result<(Vec<TranscriptEvent>, bool), TranscriptError> {

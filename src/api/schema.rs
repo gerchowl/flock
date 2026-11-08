@@ -406,6 +406,10 @@ impl Method {
     /// false because `flk server live-handoff` is how the skew is fixed.
     /// Exhaustive on purpose, so every new method has to take a side.
     pub(crate) fn needs_current_protocol(&self) -> bool {
+        if matches!(self, Self::PaneReportAgentSession(params) if params.rebind_agent_id.is_some())
+        {
+            return true;
+        }
         if self.is_allocation_preview() {
             return false;
         }
@@ -2287,6 +2291,9 @@ pub struct PaneReportReplyParams {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaneReportAgentSessionParams {
+    /// Recovery must still address the recorded agent at this pane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rebind_agent_id: Option<String>,
     pub pane_id: String,
     pub source: String,
     pub agent: String,
@@ -5548,6 +5555,7 @@ mod tests {
         let request = Request {
             id: "req_session".into(),
             method: Method::PaneReportAgentSession(PaneReportAgentSessionParams {
+                rebind_agent_id: None,
                 pane_id: "1-1".into(),
                 source: "flock:claude".into(),
                 agent: "claude".into(),

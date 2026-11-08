@@ -1120,6 +1120,62 @@ mod tests {
     }
 
     #[test]
+    fn codex_rebound_session_reads_real_turn_and_rejects_wrong_identity() {
+        let mut app = test_app();
+        let root = crate::test_support::TempDir::socket();
+        std::env::set_var("CODEX_HOME", root.path());
+        let session_id = "00000000-0000-4000-8000-000000000613";
+        let sessions = root.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(
+            sessions.join(format!("rollout-fixture-{session_id}.jsonl")),
+            include_str!("../../../tests/fixtures/codex/finished.jsonl"),
+        )
+        .unwrap();
+        let terminal = focused_terminal_id(&app);
+        let agent_id = app.state.terminals[&terminal].agent_id.to_string();
+        let pane = app
+            .public_pane_id(0, app.state.workspaces[0].focused_pane_id().unwrap())
+            .unwrap();
+        let mut params = crate::api::schema::PaneReportAgentSessionParams {
+            pane_id: pane,
+            source: "flock:codex".into(),
+            agent: "codex".into(),
+            seq: None,
+            agent_session_id: Some(session_id.into()),
+            agent_session_path: None,
+            session_start_source: None,
+            rebind_agent_id: Some("different-agent".into()),
+        };
+        assert!(Method::PaneReportAgentSession(params.clone()).needs_current_protocol());
+        let mut ordinary_hook = params.clone();
+        ordinary_hook.rebind_agent_id = None;
+        assert!(!Method::PaneReportAgentSession(ordinary_hook).needs_current_protocol());
+        let wrong: serde_json::Value = serde_json::from_str(
+            &app.handle_pane_report_agent_session("wrong".into(), params.clone()),
+        )
+        .unwrap();
+        assert_eq!(wrong["error"]["code"], "session_unbound");
+        params.rebind_agent_id = Some(agent_id.clone());
+        let response = app.handle_pane_report_agent_session("bind".into(), params);
+        assert!(!response.contains("\"error\""), "{response}");
+        let reply: serde_json::Value = serde_json::from_str(&app.handle_agent_result(
+            "reply".into(),
+            AgentResultParams {
+                target: agent_id,
+                max_chars: None,
+                offset: None,
+            },
+        ))
+        .unwrap();
+        assert_eq!(
+            reply["result"]["result"]["text"],
+            "The fixture is sound.\nDONE: checked"
+        );
+        std::env::remove_var("CODEX_HOME");
+    }
+
+    #[test]
     fn codex_result_reports_not_yet_codes_and_reads_the_reported_session() {
         let mut app = test_app();
         let home = std::env::temp_dir().join(format!("flock-codex-api-{}", std::process::id()));

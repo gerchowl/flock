@@ -84,6 +84,7 @@ exits! {
     ABANDONED, Yes, "send: effect abandoned, composer restored";
     REFUSED, Later, "refused before acting, nothing changed";
     DELEGATE_NOT_STARTED, AfterInspecting, "delegate start / wait: the delegate did not start";
+    SESSION_UNBOUND, AfterInspecting, "delegate: authoritative session identity unavailable";
     MSG_REFUSED, Never, "msg: the receiver refused the message";
     POLICY_REFUSED, Never, "refused by policy: an operator-only verb called from an agent (ADR-0014), an agent widening a delegate's question policy, or a goal write the caller may not make (ADR-0030 §1)";
     REQUEST_OUTCOME_UNKNOWN, AfterInspecting, "mutation timed out after dispatch; inspect before retrying";
@@ -172,6 +173,7 @@ pub(crate) mod tests {
             "9 ABANDONED yes",
             "10 REFUSED later",
             "11 DELEGATE_NOT_STARTED after_inspecting",
+            "12 SESSION_UNBOUND after_inspecting",
             "13 MSG_REFUSED never",
             "13 POLICY_REFUSED never",
             "14 REQUEST_OUTCOME_UNKNOWN after_inspecting",

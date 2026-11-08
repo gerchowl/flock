@@ -252,28 +252,39 @@ fn claude_transcript_path_in(
     let profile = claude_config_dir_for_session_in(records_dir, session_id)
         .map(std::path::PathBuf::from)
         .filter(|dir| dir.is_absolute());
-    profile
+    for config_dir in profile
         .into_iter()
         .chain(std::iter::once(home.join(".claude")))
-        .find_map(|config_dir| claude_transcript_in_config_dir(&config_dir, session_id))
+    {
+        if let Some(path) = claude_transcript_in_config_dir(&config_dir, session_id).ok()? {
+            return Some(path);
+        }
+    }
+    None
 }
 
 fn claude_transcript_in_config_dir(
     config_dir: &Path,
     session_id: &str,
-) -> Option<std::path::PathBuf> {
-    let entries = std::fs::read_dir(config_dir.join("projects")).ok()?;
+) -> Result<Option<std::path::PathBuf>, ()> {
+    let entries = match std::fs::read_dir(config_dir.join("projects")) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(()),
+    };
     let file_name = format!("{session_id}.jsonl");
+    let mut found = None;
     for entry in entries.flatten() {
         let candidate = entry.path().join(&file_name);
         if candidate
             .metadata()
             .is_ok_and(|meta| meta.is_file() && meta.len() > 0)
+            && found.replace(candidate).is_some()
         {
-            return Some(candidate);
+            return Err(());
         }
     }
-    None
+    Ok(found)
 }
 
 /// The session id a Claude fork plan resumes, if `plan` is one (#178).

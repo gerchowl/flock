@@ -117,6 +117,7 @@ fn report_harness_session(rig: &mut Rig, agent: &str, session: &str, seq: u64) {
     let response = rig.app.handle_api_request(Request {
         id: "session-report".into(),
         method: Method::PaneReportAgentSession(PaneReportAgentSessionParams {
+            rebind_agent_id: None,
             pane_id: rig.pane.clone(),
             source: format!("flock:{agent}"),
             agent: agent.into(),

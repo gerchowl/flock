@@ -757,6 +757,28 @@ impl App {
         else {
             return pane_not_found(id, &params.pane_id);
         };
+        if let Some(expected) = &params.rebind_agent_id {
+            let session = crate::api::schema::AgentSessionInfo {
+                source: params.source.clone(),
+                agent: params.agent.clone(),
+                kind: crate::agent_resume::AgentSessionRefKind::Id,
+                value: params.agent_session_id.clone().unwrap_or_default(),
+            };
+            if !self
+                .terminal_for_pane(ws_idx, pane_id)
+                .is_some_and(|terminal| {
+                    terminal.agent_id.to_string() == *expected
+                        && super::super::creation::terminal_agent_session_info(terminal).is_none()
+                })
+                || crate::session_evidence::path(&session).is_none()
+            {
+                return encode_error(
+                    id,
+                    "session_unbound",
+                    "exact session recovery evidence no longer matches the agent",
+                );
+            }
+        }
         let Some(agent_label) = normalize_reported_agent_label(&params.agent) else {
             return invalid_agent(id);
         };

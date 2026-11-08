@@ -123,7 +123,8 @@ use serde::{Deserialize, Serialize};
 /// v30 also adds `wait.park` (#1031), gated by #868.
 /// v31 adds local-operator client credentials and browser handoff (#1827).
 /// v32 preserves node identity in carried FleetPeer snapshots (#1076).
-pub const PROTOCOL_VERSION: u32 = 32;
+/// v33 adds identity-guarded authoritative delegate session recovery.
+pub const PROTOCOL_VERSION: u32 = 33;
 
 /// Refusal notice sent to clients while a live update handoff is in
 /// progress. Clients recognize this exact string (in a rejection `Welcome`
@@ -1924,7 +1925,7 @@ mod tests {
     // PINNED_PROTOCOL_VERSION and paste the refreshed GOLDEN table (the failing
     // test prints it paste-ready).
 
-    const PINNED_PROTOCOL_VERSION: u32 = 32;
+    const PINNED_PROTOCOL_VERSION: u32 = 33;
 
     fn fnv1a(bytes: &[u8]) -> u64 {
         let mut hash: u64 = 0xcbf2_9ce4_8422_2325;

@@ -47,6 +47,7 @@ mod codex_binding;
 #[allow(dead_code)]
 mod codex_reader;
 mod codex_transcript;
+mod session_evidence;
 // Version eligibility foundation; binding and runtime consumers follow in #1662/#1664.
 #[allow(dead_code)]
 mod codex_version;
