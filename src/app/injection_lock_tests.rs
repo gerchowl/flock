@@ -1161,3 +1161,6 @@ async fn a_submit_into_an_agent_pane_stashes_one_row_and_refuses_several() {
         );
     }
 }
+
+#[path = "injection_lock_tests/braille_2990_tests.rs"]
+mod braille_2990_tests;

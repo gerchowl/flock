@@ -1761,3 +1761,6 @@ fn codex_lock_silent_producer_fails_confirmation_without_resending() {
         "codex_conversation_locked"
     );
 }
+
+#[path = "delegate_codex/braille_2990.rs"]
+mod braille_2990;
