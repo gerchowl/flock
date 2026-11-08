@@ -1173,12 +1173,21 @@ impl App {
         params: PaneArmSelfCompactParams,
     ) -> String {
         let requested = params.pane.clone().unwrap_or_default();
-        let Some((ws_idx, pane_id)) =
-            self.parse_pane_id_or_peer(&requested, self.current_api_peer_pid)
-        else {
-            return pane_not_found(id, &requested);
-        };
-        let Some(pane) = self.public_pane_id(ws_idx, pane_id) else {
+        let pane = self
+            .parse_pane_id_or_peer(&requested, self.current_api_peer_pid)
+            .and_then(|(ws_idx, pane_id)| self.public_pane_id(ws_idx, pane_id));
+        let Some(pane) = pane else {
+            if requested.is_empty() {
+                return encode_error(
+                    id,
+                    "caller_pane_unresolved",
+                    format!(
+                        "the calling pane could not be resolved from the caller's attested \
+                         identity: {}. Pass pane: \"<id>\" (MCP) or --pane <id> (CLI)",
+                        self.caller_pane_refusal_reason(),
+                    ),
+                );
+            }
             return pane_not_found(id, &requested);
         };
         let answer = |state: SelfCompactState, detail: String, instructions: bool| {
