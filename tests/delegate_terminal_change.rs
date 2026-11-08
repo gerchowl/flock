@@ -25,6 +25,7 @@ enum SessionCase {
     CachedGrace,
     EmptyGrace,
     TurnCheckGrace,
+    ResultReadRace,
 }
 
 struct Fixture {
@@ -60,7 +61,10 @@ impl Fixture {
         let conflict = case == SessionCase::ConflictingRecord;
         let grace = matches!(
             case,
-            SessionCase::CachedGrace | SessionCase::EmptyGrace | SessionCase::TurnCheckGrace
+            SessionCase::CachedGrace
+                | SessionCase::EmptyGrace
+                | SessionCase::TurnCheckGrace
+                | SessionCase::ResultReadRace
         );
         let dir = support::socket_dir::SocketDir::reserve("d2993");
         let socket = dir.path().join("s");
@@ -170,14 +174,15 @@ impl Fixture {
                     "agent.get" if grace => {
                         if target == "term_old" {
                             old_sampled = true;
-                        } else if old_sampled
+                        } else if case != SessionCase::ResultReadRace
+                            && old_sampled
                             && (case != SessionCase::TurnCheckGrace || result_polled)
                         {
                             replaced = true;
                         }
                         json!({"result":{"agent":{"name":"fixture","agent_id":"agent_fixture.example_2993",
                             "terminal_id":if replaced {"term_new"} else {"term_old"},"pane_id":"w1:p1",
-                            "agent_status":if replaced {"working"} else {"done"},
+                            "agent_status":if replaced {if case == SessionCase::ResultReadRace {"unknown"} else {"working"}} else {"done"},
                             "turn_cursor":if replaced {"term_new:0:10:20:w"} else {"term_old:0:1:2:i"},
                             "agent_session":session}}})
                     }
@@ -225,6 +230,11 @@ impl Fixture {
                     }
                     "agent.result" if empty_result => {
                         json!({"error":{"code":"no_result","message":"turn still running"}})
+                    }
+                    "agent.result" if case == SessionCase::ResultReadRace => {
+                        replaced = true;
+                        json!({"result":{"result":{"terminal_id":"term_new", "finished":true,
+                            "at_ms":2,"status":"done","text":"DONE: cached replacement", "session_id":"session-2993"}}})
                     }
                     "agent.result" if bound => json!({"result":{"result":{"finished":true,
                         "at_ms":2,"status":"done","text":if conflict || case == SessionCase::ConflictingResult {"DONE: replacement"} else {"DONE: rebound"},"session_id":if conflict || case == SessionCase::ConflictingResult {"session-replacement"} else {"session-2993"}}}}),
@@ -519,4 +529,10 @@ fn unreadable_claude_store_is_unbound_and_names_the_store() {
             .iter()
             .any(|r| r["method"] == "pane.report_agent_session"));
     }
+}
+
+#[test]
+fn replacement_between_precheck_and_result_must_settle() {
+    let fixture = Fixture::case(true, false, false, false, SessionCase::ResultReadRace);
+    fixture.assert("wait", 124, "timeout");
 }
