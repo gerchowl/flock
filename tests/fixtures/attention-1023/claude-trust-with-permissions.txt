@@ -1,4 +1,4 @@
-Accessing workspace: …/.flock/worktrees/devkit-3c4e4016/bugfix-1860-resolve-sparse-path
+Accessing workspace: …/.flock/worktrees/fixture-project/fixture-task
 ⚠ This folder pre-approves 17 tool permissions in .claude/settings.json:
   Bash(git status*), Bash(git diff*), … and 9 more
 ❯ No, exit
