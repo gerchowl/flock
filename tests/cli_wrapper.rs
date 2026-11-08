@@ -667,17 +667,125 @@ fn read_request_line(stream: &UnixStream) -> String {
 }
 
 /// Answers the protocol check a state-changing verb sends first (#868) with
-/// this build's protocol, and says whether `line` was that check.
+/// this build's protocol and write capability, and says whether it was a ping.
 fn answer_protocol_check(stream: &mut UnixStream, line: &str) -> bool {
     let request: serde_json::Value = serde_json::from_str(line).unwrap();
     if request["method"] != "ping" {
         return false;
     }
     let pong = serde_json::json!({"id":request["id"],"result":{
-        "type":"pong","version":"fixture","protocol":support::PROTOCOL_VERSION
+        "type":"pong","version":"fixture","protocol":support::PROTOCOL_VERSION,
+        "capabilities":{"pane_input_write_ack":true,"live_handoff":false}
     }});
     writeln!(stream, "{pong}").unwrap();
     true
+}
+
+#[test]
+fn stop_hook_inbox_authority_notice_is_once_and_never_blocks_the_real_cli() {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    let root = support::socket_dir::SocketDir::reserve("hka");
+    let socket = root.path().join("api.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let done = Arc::new(AtomicBool::new(false));
+    let server_done = done.clone();
+    let server = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut wakes = 0;
+        while !server_done.load(Ordering::Acquire) {
+            assert!(
+                Instant::now() < deadline,
+                "hook fixture exceeded its failure ceiling"
+            );
+            let mut stream = match listener.accept() {
+                Ok((stream, _)) => stream,
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                Err(err) => panic!("accept: {err}"),
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let line = read_request_line(&stream);
+            if answer_protocol_check(&mut stream, &line) {
+                continue;
+            }
+            let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+            let response = if request["method"] == "msg.wake" {
+                wakes += 1;
+                if wakes == 3 {
+                    serde_json::json!({"id":request["id"], "result":{"type":"msg_wake", "count":2}})
+                } else {
+                    serde_json::json!({"id":request["id"], "error":{"code":"not_authorized", "message":"native inbox authority refused or unavailable"}})
+                }
+            } else {
+                serde_json::json!({"id":request["id"], "result":{"type":"ok"}})
+            };
+            writeln!(stream, "{response}").unwrap();
+        }
+        wakes
+    });
+    for turn in 0..4 {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_flk"))
+            .args(["hook", "claude", "stop"])
+            .envs(support::environment::isolated_env(root.path(), root.path()))
+            .env("FLOCK_ENV", "1")
+            .env("FLOCK_SOCKET_PATH", &socket)
+            .env("FLOCK_PANE_ID", "p_1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(
+                br#"{"session_id":"hook-authority-fixture","last_assistant_message":"done"}"#,
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while child.try_wait().unwrap().is_none() {
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("stop hook exceeded its failure ceiling");
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        if turn == 1 {
+            assert!(
+                output.stdout.is_empty(),
+                "a repeated refusal must stay silent"
+            );
+        } else {
+            let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            if turn == 2 {
+                assert_eq!(value["decision"], "block");
+                assert!(value["reason"]
+                    .as_str()
+                    .unwrap()
+                    .contains("2 unread messages"));
+            } else {
+                assert!(value.get("decision").is_none(), "{value}");
+                assert!(value["systemMessage"]
+                    .as_str()
+                    .unwrap()
+                    .contains("flk msg read"));
+            }
+        }
+    }
+    done.store(true, Ordering::Release);
+    assert_eq!(server.join().unwrap(), 4);
 }
 
 #[test]
@@ -1018,10 +1126,9 @@ fn pane_run_types_the_command_and_presses_enter_as_two_separated_requests() {
                     if answer_protocol_check(&mut stream, &line) {
                         continue;
                     }
-                    stream
-                        .write_all(br#"{"id":"cli:request","result":{"type":"ok"}}"#)
-                        .unwrap();
-                    stream.write_all(b"\n").unwrap();
+                    let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                    let response = serde_json::json!({"id":request["id"],"result":{"type":"ok"}});
+                    writeln!(stream, "{response}").unwrap();
                     stream.flush().unwrap();
                     requests.push((line, Instant::now()));
                 }
@@ -1050,7 +1157,7 @@ fn pane_run_types_the_command_and_presses_enter_as_two_separated_requests() {
     );
 
     let typed: serde_json::Value = serde_json::from_str(&requests[0].0).unwrap();
-    assert_eq!(typed["method"], "pane.send_input");
+    assert_eq!(typed["method"], "pane.write_input");
     assert_eq!(typed["params"]["pane_id"], "1-1");
     assert_eq!(typed["params"]["text"], "echo hello");
     // `keys` is skipped when empty, so its ABSENCE is the assertion: the
@@ -1061,7 +1168,7 @@ fn pane_run_types_the_command_and_presses_enter_as_two_separated_requests() {
     );
 
     let submitted: serde_json::Value = serde_json::from_str(&requests[1].0).unwrap();
-    assert_eq!(submitted["method"], "pane.send_keys");
+    assert_eq!(submitted["method"], "pane.write_keys");
     assert_eq!(submitted["params"]["pane_id"], "1-1");
     assert_eq!(submitted["params"]["keys"], serde_json::json!(["Enter"]));
 
@@ -1077,7 +1184,7 @@ fn pane_run_types_the_command_and_presses_enter_as_two_separated_requests() {
     cleanup_test_base(&base);
 }
 
-/// Run `flk pane run` against a fake server that answers `pane.send_input`
+/// Run `flk pane run` against a fake server that answers `pane.write_input`
 /// with `typed` and anything else with ok. Returns the exit code and the
 /// requests, in order.
 fn pane_run_requests(
@@ -1102,7 +1209,7 @@ fn pane_run_requests(
                         continue;
                     }
                     let request: serde_json::Value = serde_json::from_str(&line).unwrap();
-                    let mut response = if request["method"] == "pane.send_input" {
+                    let mut response = if request["method"] == "pane.write_input" {
                         typed.clone()
                     } else {
                         serde_json::json!({"result": {"type": "ok"}})
@@ -1145,7 +1252,7 @@ fn pane_run_into_an_empty_agent_composer_types_and_presses_enter_as_before() {
         serde_json::json!({"result": {"type": "ok"}}),
     );
     assert_eq!(code, Some(0));
-    assert_eq!(methods(&requests), ["pane.send_input", "pane.send_keys"]);
+    assert_eq!(methods(&requests), ["pane.write_input", "pane.write_keys"]);
     assert_eq!(requests[0]["params"]["text"], "/compact");
     assert!(
         requests[0]["params"].get("raw").is_none(),
@@ -1162,7 +1269,7 @@ fn pane_run_refused_onto_a_draft_exits_10_and_presses_no_enter() {
     let refused = serde_json::json!({"error": {"code": "input_not_empty", "message": "draft"}});
     let (code, requests) = pane_run_requests(&["1-1", "echo hello"], refused);
     assert_eq!(code, Some(10));
-    assert_eq!(methods(&requests), ["pane.send_input"]);
+    assert_eq!(methods(&requests), ["pane.write_input"]);
 }
 
 /// #1162: `--raw` tells the server to type onto whatever is there.
@@ -1173,7 +1280,7 @@ fn pane_run_raw_asks_the_server_to_type_anyway() {
         serde_json::json!({"result": {"type": "ok"}}),
     );
     assert_eq!(code, Some(0));
-    assert_eq!(methods(&requests), ["pane.send_input", "pane.send_keys"]);
+    assert_eq!(methods(&requests), ["pane.write_input", "pane.write_keys"]);
     assert_eq!(requests[0]["params"]["raw"], true);
 }
 
@@ -1387,7 +1494,7 @@ fn help_commands_exit_successfully() {
 }
 
 #[test]
-fn root_help_hides_explicit_client_command() {
+fn root_help_advertises_client_credentials_and_hides_internal_attachment() {
     let output = Command::new(env!("CARGO_BIN_EXE_flk"))
         .arg("--help")
         .output()
@@ -1395,9 +1502,12 @@ fn root_help_hides_explicit_client_command() {
 
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("flk client <token|open>"), "{stdout}");
     assert!(
-        !stdout.contains("flk client"),
-        "root help should not advertise the internal client command: {stdout}"
+        !stdout
+            .lines()
+            .any(|line| matches!(line.trim(), "flk client" | "client")),
+        "root help should not advertise the bare internal client command: {stdout}"
     );
 }
 

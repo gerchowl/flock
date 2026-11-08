@@ -185,30 +185,8 @@ impl Reducer {
     }
 
     fn reduce(&mut self, record: &Value, now: Instant) -> Result<(), Reason> {
-        let record_type = record
-            .get("type")
-            .and_then(Value::as_str)
-            .filter(|kind| !kind.is_empty())
-            .ok_or(Reason::MalformedRecord)?;
-        match (self.next_ordinal, record.get("ordinal")) {
-            (None, None) => (),
-            (Some(expected), Some(value)) if value.as_u64() == Some(expected) => {
-                self.next_ordinal = Some(
-                    expected
-                        .checked_add(1)
-                        .ok_or(Reason::OrdinalDiscontinuity)?,
-                );
-            }
-            _ => return Err(Reason::OrdinalDiscontinuity),
-        }
-        if matches!(
-            record_type,
-            "session_meta" | "response_item" | "compacted" | "turn_context" | "event_msg"
-        ) && !record.get("payload").is_some_and(Value::is_object)
-        {
-            return Err(Reason::MalformedRecord);
-        }
-        if record_type != "event_msg" {
+        verify_record(record, &mut self.next_ordinal)?;
+        if record["type"] != "event_msg" {
             return Ok(());
         }
         let payload = record.get("payload").ok_or(Reason::MalformedRecord)?;
@@ -262,6 +240,42 @@ impl Reducer {
         });
         Ok(())
     }
+}
+
+/// Verify one complete envelope and the format-defined ordinal sequence without
+/// interpreting historical lifecycle boundaries. Reader and reducer share this.
+pub(crate) fn verify_record(record: &Value, next_ordinal: &mut Option<u64>) -> Result<(), Reason> {
+    let record_type = record
+        .get("type")
+        .and_then(Value::as_str)
+        .filter(|kind| !kind.is_empty())
+        .ok_or(Reason::MalformedRecord)?;
+    match (*next_ordinal, record.get("ordinal")) {
+        (None, None) => (),
+        (Some(expected), Some(value)) if value.as_u64() == Some(expected) => {
+            *next_ordinal = Some(
+                expected
+                    .checked_add(1)
+                    .ok_or(Reason::OrdinalDiscontinuity)?,
+            );
+        }
+        _ => return Err(Reason::OrdinalDiscontinuity),
+    }
+    if matches!(
+        record_type,
+        "session_meta" | "response_item" | "compacted" | "turn_context" | "event_msg"
+    ) && !record.get("payload").is_some_and(Value::is_object)
+    {
+        return Err(Reason::MalformedRecord);
+    }
+    if record_type == "event_msg"
+        && record["payload"]["type"]
+            .as_str()
+            .is_none_or(|kind| kind.is_empty())
+    {
+        return Err(Reason::MalformedRecord);
+    }
+    Ok(())
 }
 
 #[cfg(test)]

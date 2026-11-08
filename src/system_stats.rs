@@ -105,44 +105,56 @@ pub fn spawn_sampler(
     std::thread::Builder::new()
         .name("system-stats".into())
         .spawn(move || {
-            let mut system = sysinfo::System::new();
-            let mut networks = sysinfo::Networks::new_with_refreshed_list();
-            let disks = sysinfo::Disks::new_with_refreshed_list();
+            let mut system = available_metric(sysinfo::System::new(), "cpu and memory");
+            let mut networks =
+                available_metric(sysinfo::Networks::new_with_refreshed_list(), "network");
+            let mut disks = available_metric(sysinfo::Disks::new_with_refreshed_list(), "disk");
             let disk_target = resolve_disk_target(disk_path.as_deref());
             // First CPU sample needs a baseline.
-            system.refresh_cpu_usage();
+            if let Some(system) = system.as_mut() {
+                system.refresh_cpu_usage();
+            }
             std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
 
-            let mut disks = disks;
             let mut thermal = ThermalSampler::new(thermal_command);
             let mut gpu_cmd = GpuCommandSampler::new(gpu_command);
             let mut tick: u32 = 0;
             loop {
-                system.refresh_cpu_usage();
-                system.refresh_memory();
-                disks.refresh(true);
+                if let Some(system) = system.as_mut() {
+                    system.refresh_cpu_usage();
+                    system.refresh_memory();
+                }
+                if let Some(disks) = disks.as_mut() {
+                    disks.refresh(true);
+                }
                 let elapsed = SAMPLE_INTERVAL.as_secs_f64();
-                networks.refresh(true);
+                if let Some(networks) = networks.as_mut() {
+                    networks.refresh(true);
+                }
 
-                let cpu_percent = Some(system.global_cpu_usage());
-                let mem_total = Some(system.total_memory());
-                let mem_used = Some(system.used_memory());
+                let cpu_percent = system.as_ref().map(sysinfo::System::global_cpu_usage);
+                let mem_total = system.as_ref().map(sysinfo::System::total_memory);
+                let mem_used = system.as_ref().map(sysinfo::System::used_memory);
 
                 let disk_free = disk_target.as_deref().and_then(|target| {
                     disks
+                        .as_ref()?
                         .iter()
                         .filter(|disk| target.starts_with(disk.mount_point()))
                         .max_by_key(|disk| disk.mount_point().as_os_str().len())
                         .map(|disk| disk.available_space())
                 });
 
-                let (mut rx, mut tx) = (0u64, 0u64);
-                for data in networks.values() {
-                    rx = rx.saturating_add(data.received());
-                    tx = tx.saturating_add(data.transmitted());
-                }
-                let net_rx_per_sec = Some((rx as f64 / elapsed) as u64);
-                let net_tx_per_sec = Some((tx as f64 / elapsed) as u64);
+                let throughput = networks.as_ref().map(|networks| {
+                    let (mut rx, mut tx) = (0u64, 0u64);
+                    for data in networks.values() {
+                        rx = rx.saturating_add(data.received());
+                        tx = tx.saturating_add(data.transmitted());
+                    }
+                    ((rx as f64 / elapsed) as u64, (tx as f64 / elapsed) as u64)
+                });
+                let net_rx_per_sec = throughput.map(|(rx, _)| rx);
+                let net_tx_per_sec = throughput.map(|(_, tx)| tx);
 
                 let (battery_percent, battery_charging) = read_battery();
                 // A configured `gpu_command` is the whole GPU reading on this
@@ -182,6 +194,16 @@ pub fn spawn_sampler(
             }
         })
         .expect("system stats sampler thread should spawn")
+}
+
+fn available_metric<T>(result: Result<T, sysinfo::Error>, metric: &'static str) -> Option<T> {
+    match result {
+        Ok(value) => Some(value),
+        Err(error) => {
+            crate::logging::system_information_unavailable(metric, &error);
+            None
+        }
+    }
 }
 
 /// Runs the node's configured `thermal_command` on a slow tick and turns its
@@ -465,6 +487,18 @@ pub fn human_bytes(bytes: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn unavailable_metrics_are_absent_rather_than_zero() {
+        for error in [
+            sysinfo::Error::Unsupported,
+            sysinfo::Error::Io(std::io::ErrorKind::PermissionDenied.into()),
+            sysinfo::Error::from("metric query failed"),
+        ] {
+            assert_eq!(super::available_metric::<u64>(Err(error), "test"), None);
+        }
+        assert_eq!(super::available_metric(Ok(0u64), "test"), Some(0));
+    }
+
     use super::*;
 
     #[test]

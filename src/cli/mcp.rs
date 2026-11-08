@@ -12,7 +12,12 @@
 
 pub(super) fn run_mcp_command(args: &[String]) -> std::io::Result<i32> {
     match args.first().map(String::as_str) {
-        Some("serve") => crate::mcp::serve_over_stdio(),
+        Some("serve") if args.len() == 1 => crate::mcp::serve_over_stdio(false),
+        Some("serve")
+            if args.get(1).is_some_and(|arg| arg == "--structured") && args.len() == 2 =>
+        {
+            crate::mcp::serve_over_stdio(true)
+        }
         Some("help" | "--help" | "-h") => {
             print_help();
             Ok(0)

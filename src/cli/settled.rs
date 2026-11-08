@@ -1296,6 +1296,19 @@ fn resolve_initial(
         if value.get("error").is_some() {
             return Err(InitialFailure::Refused(value.to_string()));
         }
+        if value
+            .pointer("/result/agent/runtime")
+            .and_then(serde_json::Value::as_str)
+            == Some("structured")
+        {
+            return Err(InitialFailure::Refused(
+                serde_json::json!({"error": {
+                    "code": crate::api::error_code::ErrorCode::RuntimeUnsupported.as_str(),
+                    "message": "settled wait requires a PTY placement"
+                }})
+                .to_string(),
+            ));
+        }
         return initial_record(&value, target)
             .ok_or_else(|| InitialFailure::Unusable("response did not include the record".into()));
     }
@@ -1423,6 +1436,7 @@ impl PinnedRequests for SocketRequests<'_> {
         timeout: Duration,
     ) -> Result<serde_json::Value, Unanswered> {
         self.client
+            .with_class(crate::api::client::RequestClass::ReadOrIdempotent)
             .request_value_with_timeout(
                 &Request {
                     id: "cli:settled:agent-get".into(),
@@ -1441,6 +1455,7 @@ impl PinnedRequests for SocketRequests<'_> {
         timeout: Duration,
     ) -> Result<serde_json::Value, Unanswered> {
         self.client
+            .with_class(crate::api::client::RequestClass::ReadOrIdempotent)
             .request_value_with_timeout(
                 &Request {
                     id: "cli:settled:pane-get".into(),
@@ -1468,6 +1483,7 @@ impl PinnedRequests for SocketRequests<'_> {
         // before it and costs a second round trip.
         let wait_ms = u64::try_from(wait.as_micros().div_ceil(1000)).unwrap_or(u64::MAX);
         self.client
+            .with_class(crate::api::client::RequestClass::ReadOrIdempotent)
             .request_value_with_timeout(
                 &Request {
                     id: "cli:settled:events-read".into(),
@@ -2539,6 +2555,31 @@ mod tests {
             Err(InitialFailure::TimedOut)
         ));
         assert!(requests.granted.is_empty());
+    }
+
+    /// Pane-free records cannot supply a PTY sample for settled waits.
+    #[test]
+    fn structured_initial_record_refuses_pane_only_settled_wait() {
+        let mut requests = Scripted::new(
+            vec![Ok(response(
+                r#"{"result":{"agent":{"runtime":"structured"}}}"#,
+            ))],
+            Duration::ZERO,
+        );
+        let mut interrupted = Interrupted::new(Some(UNREACHABLE_LIMIT));
+        match resolve_initial(
+            &mut requests,
+            InitialTarget::Agent("fixture"),
+            None,
+            "agent wait",
+            &mut interrupted,
+        ) {
+            Err(InitialFailure::Refused(raw)) => {
+                let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+                assert_eq!(value["error"]["code"], "runtime_unsupported");
+            }
+            other => panic!("structured wait must refuse explicitly: {other:?}"),
+        }
     }
 
     /// The same resolve, inside its budget: an error is still the server's own

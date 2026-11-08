@@ -169,6 +169,7 @@ pub(super) fn park(args: &[String]) -> std::io::Result<i32> {
 
 fn events_read(params: EventsReadParams, timeout: Duration) -> std::io::Result<Value> {
     ApiClient::local()
+        .with_class(crate::api::client::RequestClass::ReadOrIdempotent)
         .request_value_with_timeout(
             &Request {
                 id: "cli:events:read".into(),

@@ -189,7 +189,13 @@ where
 /// past it lie the launcher and `launchd`, which know even less. Stopping
 /// there keeps a missing answer a REFUSAL rather than a wrong answer.
 pub fn read_requester_env(start: u32, stop_before: u32) -> Option<BTreeMap<String, String>> {
-    let mut system = sysinfo::System::new();
+    let mut system = match sysinfo::System::new() {
+        Ok(system) => system,
+        Err(error) => {
+            crate::logging::system_information_unavailable("requester_environment", &error);
+            return None;
+        }
+    };
     let refresh = sysinfo::ProcessRefreshKind::nothing().with_environ(sysinfo::UpdateKind::Always);
     let mut current = start;
     for _ in 0..MAX_ANCESTRY {

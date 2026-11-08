@@ -104,7 +104,7 @@ fn git(common_dir: &Path, args: &[&str]) -> Result<String, String> {
     let full: Vec<&str> = std::iter::once(git_dir.as_str())
         .chain(args.iter().copied())
         .collect();
-    crate::worktree::run_command_capture("git", &full, None)
+    crate::worktree::run_command_capture("git", &full, None).map_err(Into::into)
 }
 
 /// Find `repo`'s default branch and the `.flk.toml` blob committed on it.

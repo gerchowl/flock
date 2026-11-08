@@ -494,6 +494,14 @@ pub fn validated_prompt_float_lines(lines: u16) -> u16 {
     lines.min(MAX_PROMPT_FLOAT_LINES)
 }
 
+/// Opt-in structured GUI endpoint; slice 2 owns the listener lifecycle.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ClientConfig {
+    /// IPv4 loopback address; port 0 selects an OS-assigned port reported by `client open`.
+    pub bind: Option<std::net::SocketAddr>,
+}
+
 /// Default bind for `flk web` — loopback only, xterm.js port.
 pub const DEFAULT_WEB_BIND: &str = "127.0.0.1:7681";
 
@@ -642,9 +650,48 @@ pub enum AgentAccount {
     None,
 }
 
+/// Default queue rewrite trigger: 8 MiB, independent of the per-record ceiling.
+pub const DEFAULT_QUEUE_REWRITE_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Session storage policy. Worker enforcement is wired by the next #1803 slice.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct SessionsConfig {
+    /// Replace eligible JSON blocks strictly larger than this many encoded bytes.
+    pub blob_min_bytes: usize,
+    /// Silence observation policy in milliseconds, inclusive range 5000..=3600000.
+    #[serde(deserialize_with = "crate::structured::blobs::stall_ms")]
+    pub stall_ms: u64,
+    /// Rewrite before the next append when committed bytes exceed this value.
+    /// Zero is invalid: checkpointing cannot be disabled for writable journals.
+    pub queue_rewrite_bytes: std::num::NonZeroU64,
+}
+impl Default for SessionsConfig {
+    fn default() -> Self {
+        Self {
+            blob_min_bytes: crate::structured::blobs::StorageConfig::default().blob_min_bytes,
+            stall_ms: crate::structured::blobs::StorageConfig::default().stall_ms,
+            queue_rewrite_bytes: std::num::NonZeroU64::new(DEFAULT_QUEUE_REWRITE_BYTES)
+                .expect("nonzero queue rewrite default"),
+        }
+    }
+}
+
+impl SessionsConfig {
+    /// Project the persistence and silence settings consumed by runtime workers.
+    pub fn storage(&self) -> crate::structured::blobs::StorageConfig {
+        crate::structured::blobs::StorageConfig {
+            blob_min_bytes: self.blob_min_bytes,
+            stall_ms: self.stall_ms,
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Config {
+    /// Per-session durable queue and blob storage policy.
+    pub sessions: SessionsConfig,
     /// Local socket identity policy (ADR-0036 §1a).
     pub security: SecurityConfig,
     /// Structured Claude launch policy (ADR-0036 §1); activation is #1439.
@@ -711,6 +758,8 @@ pub struct Config {
     /// `[title]` — host terminal window title publishing (#361).
     pub title: TitleConfig,
     pub web: WebSectionConfig,
+    /// Structured GUI loopback listener. Absent disables it; separate from the PTY bridge.
+    pub client: ClientConfig,
     pub gossip: GossipConfig,
     pub checks: crate::checks::ChecksConfig,
     /// `[fleet]` — limits on agent-initiated spawn (#329, ADR-0014).
@@ -766,9 +815,10 @@ pub enum KeyDiagnosticKind {
     Unknown,
 }
 
-/// A config diagnostic about one key. `key` is dotted and canonical
-/// (`msg.future`, `peers.summary_command`, `toast`), so the same key reported
-/// by the loader and by the source scan compares equal.
+/// A config diagnostic with a safe canonical schema location. Unknown names
+/// stop at the nearest declared container, map entries use `<key>`, arrays use
+/// `[]`, and unknown roots use `document root`. Removed historical keys keep
+/// their closed schema spelling so loader/source-scan warnings compare equal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeyDiagnostic {
     pub kind: KeyDiagnosticKind,
@@ -1409,6 +1459,9 @@ pub struct AdvancedConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct MsgConfig {
+    /// Native tool-inbox read window after first harness delivery, in milliseconds.
+    /// Defaults to the pane mailbox window (24 hours). Custody is independent.
+    pub inbox_retention_ms: u64,
     /// Accept agent-to-agent messages at all. Default: true.
     ///
     /// A node that sets this false still SENDS — this governs what it is
@@ -1486,6 +1539,7 @@ pub struct MsgConfig {
 impl Default for MsgConfig {
     fn default() -> Self {
         Self {
+            inbox_retention_ms: crate::app::mailboxes::UNDELIVERED_TTL_MS,
             enabled: true,
             allow_from: vec!["*".to_string()],
             mute_reason_max_chars: 200,

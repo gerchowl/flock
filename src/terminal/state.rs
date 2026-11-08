@@ -221,6 +221,11 @@ pub struct TerminalState {
     pub agent_metadata: HashMap<String, AgentMetadata>,
     /// Failed resume retains identity and mail while the process is offline.
     pub resume_failed: bool,
+    /// Latest accepted Codex report, still requiring local binding validation.
+    pub codex_session_start: Option<crate::agent_resume::CodexSessionStart>,
+    /// Unknown persisted pane runtime tag, retained across rollback saves.
+    /// It grants no agent resume authority.
+    pub(crate) persisted_runtime_tag: Option<serde_json::Value>,
     pub persisted_agent_session: Option<crate::agent_resume::PersistedAgentSession>,
     /// True when `persisted_agent_session` was established by a hook report
     /// from the process running in this pane, rather than restored from a
@@ -228,7 +233,7 @@ pub struct TerminalState {
     /// so it must not be used to pick a transcript to render (#328).
     session_ref_hook_confirmed: bool,
     pub manual_label: Option<String>,
-    pub agent_name: Option<String>,
+    agent_name: Option<String>,
     /// The `FLOCK_RUN_ID` this pane's agent was spawned under (#332).
     ///
     /// Minted per scheduler- or agent-initiated spawn, stamped into the
@@ -372,6 +377,8 @@ impl TerminalState {
             last_state_authority: StateAuthority::Screen,
             hook_authority: None,
             agent_metadata: HashMap::new(),
+            codex_session_start: None,
+            persisted_runtime_tag: None,
             persisted_agent_session: None,
             resume_failed: false,
             session_ref_hook_confirmed: false,
@@ -566,6 +573,7 @@ impl TerminalState {
             || detected_agent_changed_or_disappeared && persisted_agent_was_previously_detected
         {
             self.persisted_agent_session = None;
+            self.codex_session_start = None;
             self.session_ref_hook_confirmed = false;
         }
         self.update_stale_hook_idle_window(now);
@@ -651,6 +659,11 @@ impl TerminalState {
         seq: Option<u64>,
         now: Instant,
     ) -> Option<TerminalStateMutation> {
+        if super::agent_name::validate(&agent_label).is_err() {
+            crate::logging::agent_name_dropped("hook_identity");
+            return None;
+        }
+
         if !self.accept_hook_report(&source, seq) {
             return None;
         }
@@ -668,6 +681,7 @@ impl TerminalState {
                 .unwrap_or(session_ref)
         });
         self.persisted_agent_session = None;
+        self.codex_session_start = None;
         self.session_ref_hook_confirmed = false;
         self.header_reserved = true;
         let applied_session_ref = session_ref.clone();
@@ -822,7 +836,13 @@ impl TerminalState {
         &mut self,
         session: crate::agent_resume::PersistedAgentSession,
     ) {
+        if super::agent_name::validate(&session.agent).is_err() {
+            crate::logging::agent_name_dropped("hook_identity");
+            return;
+        }
+
         self.persisted_agent_session = Some(session);
+        self.codex_session_start = None;
         self.session_ref_hook_confirmed = false;
     }
 
@@ -880,9 +900,15 @@ impl TerminalState {
         agent_label: &str,
         session_start_source: Option<&str>,
     ) -> bool {
-        source == CLAUDE_HOOK_SOURCE
+        (source == CLAUDE_HOOK_SOURCE
             && agent_label == "claude"
-            && matches!(session_start_source, Some("clear" | "resume" | "compact"))
+            && matches!(session_start_source, Some("clear" | "resume" | "compact")))
+            || (source == "flock:codex"
+                && agent_label == "codex"
+                && matches!(
+                    session_start_source,
+                    Some("clear" | "resume" | "compact" | "fork")
+                ))
     }
 
     pub fn set_agent_session_ref(
@@ -895,8 +921,8 @@ impl TerminalState {
         self.set_agent_session_ref_for_session_start(source, agent_label, session_ref, seq, None)
     }
 
-    /// Same as [`Self::set_agent_session_ref`] but also honours the Claude Code
-    /// `SessionStart` `source` field. A startup-style report (no source, or
+    /// Same as [`Self::set_agent_session_ref`] but also honours harness
+    /// `SessionStart` sources, including Codex fork identity replacement. A startup-style report (no source, or
     /// `startup`) that would replace an existing restored Claude id is
     /// rejected — it's almost certainly a nested `claude -p` inheriting the
     /// pane environment. `clear`, `resume`, and `compact` are real identity
@@ -909,6 +935,11 @@ impl TerminalState {
         seq: Option<u64>,
         session_start_source: Option<String>,
     ) -> Option<TerminalStateMutation> {
+        if super::agent_name::validate(&agent_label).is_err() {
+            crate::logging::agent_name_dropped("hook_identity");
+            return None;
+        }
+
         self.header_reserved = true;
         let session_ref = session_ref?;
         if !self.accept_hook_report(&source, seq) {
@@ -928,6 +959,15 @@ impl TerminalState {
 
         let previous_session = self.current_session_identity_for_persistence();
         let applied_session_ref = session_ref.clone();
+        if source != "flock:codex"
+            || agent_label != "codex"
+            || self
+                .codex_session_start
+                .as_ref()
+                .is_some_and(|report| report.thread != session_ref.value)
+        {
+            self.codex_session_start = None;
+        }
         self.persisted_agent_session = Some(crate::agent_resume::PersistedAgentSession {
             source,
             agent: agent_label,
@@ -965,6 +1005,7 @@ impl TerminalState {
             .is_some_and(|session| &session.session_ref == session_ref)
         {
             self.persisted_agent_session = None;
+            self.codex_session_start = None;
             self.session_ref_hook_confirmed = false;
             changed = true;
         }
@@ -1038,6 +1079,7 @@ impl TerminalState {
         self.hook_authority = None;
         self.stale_hook_idle_since = None;
         self.persisted_agent_session = None;
+        self.codex_session_start = None;
         Some(TerminalStateMutation {
             effective_state_change: self.recompute_effective_state(
                 previous_agent_label,
@@ -1103,6 +1145,7 @@ impl TerminalState {
         self.hook_authority = None;
         self.stale_hook_idle_since = None;
         self.persisted_agent_session = None;
+        self.codex_session_start = None;
         Some(TerminalStateMutation {
             effective_state_change: self.recompute_effective_state(
                 previous_agent_label,
@@ -1127,12 +1170,18 @@ impl TerminalState {
     /// form the per-frame path needs; `pane_details` keeps the owned one
     /// because it hands the value to a `String` field.
     pub fn display_agent_label(&self) -> Option<Cow<'_, str>> {
-        self.effective_display_agent().map(Cow::Owned).or_else(|| {
-            self.agent_name
-                .as_deref()
-                .or_else(|| self.effective_agent_label())
-                .map(Cow::Borrowed)
-        })
+        self.effective_display_agent()
+            .map(Cow::Owned)
+            .or_else(|| {
+                self.agent_name
+                    .as_deref()
+                    .or_else(|| self.effective_agent_label())
+                    .map(Cow::Borrowed)
+            })
+            .map(|name| match name {
+                Cow::Borrowed(name) => super::agent_name::display(name),
+                Cow::Owned(name) => Cow::Owned(super::agent_name::display(&name).into_owned()),
+            })
     }
 
     pub fn effective_agent_label(&self) -> Option<&str> {
@@ -1329,18 +1378,34 @@ impl TerminalState {
         }
     }
 
-    pub fn set_manual_label(&mut self, label: String) {
-        let label = label.trim().to_string();
+    /// Validate manual identity labels before trimming; refusal preserves the old label.
+    pub fn set_manual_label(
+        &mut self,
+        label: String,
+    ) -> Result<(), crate::api::error_code::ErrorCode> {
+        let label = super::agent_name::validate(&label)?.to_string();
         self.manual_label = (!label.is_empty()).then_some(label);
+        Ok(())
     }
 
     pub fn clear_manual_label(&mut self) {
         self.manual_label = None;
     }
 
-    pub fn set_agent_name(&mut self, name: String) {
-        let name = name.trim().to_string();
+    /// Reject unsafe or overlong raw names without changing identity (#317).
+    /// Empty, safe whitespace clears the name, preserving the rename contract.
+    pub fn set_agent_name(
+        &mut self,
+        name: String,
+    ) -> Result<(), crate::api::error_code::ErrorCode> {
+        let name = super::agent_name::validate(&name)?.to_string();
         self.agent_name = (!name.is_empty()).then_some(name);
+        Ok(())
+    }
+
+    /// Validated operator name, distinct from the detected harness label.
+    pub fn agent_name(&self) -> Option<&str> {
+        self.agent_name.as_deref()
     }
 
     pub fn clear_agent_name(&mut self) {
@@ -1428,6 +1493,7 @@ impl TerminalState {
         self.provider_limit = None;
         self.hook_authority = None;
         self.persisted_agent_session = None;
+        self.codex_session_start = None;
         self.agent_metadata.clear();
         self.state = AgentState::Unknown;
         self.launch_argv = None;
@@ -3186,14 +3252,14 @@ mod tests {
         assert_eq!(terminal.border_label(false), None);
         assert_eq!(terminal.border_label(true).as_deref(), Some("claude"));
 
-        terminal.set_manual_label(" reviewer ".into());
+        terminal.set_manual_label(" reviewer ".into()).unwrap();
         assert_eq!(terminal.border_label(false).as_deref(), Some("reviewer"));
         assert_eq!(terminal.border_label(true).as_deref(), Some("reviewer"));
 
-        terminal.set_manual_label("   ".into());
+        terminal.set_manual_label("   ".into()).unwrap();
         assert_eq!(terminal.border_label(true).as_deref(), Some("claude"));
 
-        terminal.set_manual_label("reviewer".into());
+        terminal.set_manual_label("reviewer".into()).unwrap();
         terminal.clear_manual_label();
         assert_eq!(terminal.border_label(true).as_deref(), Some("claude"));
     }
@@ -3754,10 +3820,44 @@ mod tests {
     }
 
     #[test]
+    fn security_agent_name_setter_rejects_without_mutating() {
+        let mut failures = Vec::new();
+        for (case, name) in crate::test_support::hostile_agent_names() {
+            let mut terminal = test_terminal();
+            terminal.set_agent_name("safe".into()).unwrap();
+            let _ = terminal.set_agent_name(name);
+            if terminal.agent_name.as_deref() != Some("safe") {
+                failures.push(case);
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "accepted hostile name cases: {failures:?}"
+        );
+    }
+
+    #[test]
+    fn security_agent_name_legacy_display_is_bounded_and_escaped() {
+        let mut failures = Vec::new();
+        for (case, name) in crate::test_support::hostile_agent_names() {
+            let mut terminal = test_terminal();
+            // Fault injection: simulate a broken ingress without invoking the setter.
+            terminal.agent_name = Some(name.clone());
+            if terminal.display_agent_label().as_deref() == Some(name.as_str()) {
+                failures.push(case);
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "rendered hostile name cases: {failures:?}"
+        );
+    }
+
+    #[test]
     fn respawn_cleanup_resets_restored_agent_status() {
         let mut terminal = test_terminal();
         terminal.respawn_shell_on_exit = true;
-        terminal.set_agent_name("codex".into());
+        terminal.set_agent_name("codex".into()).unwrap();
         terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
             source: "flock:codex".into(),
             agent: "codex".into(),

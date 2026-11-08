@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ExitStatus};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -48,17 +48,75 @@ impl ProcessIdentity {
     }
 }
 
+fn snapshot_tree(tree: &mut Vec<ProcessIdentity>) {
+    tree.retain(|identity| identity.alive());
+    let processes: Vec<_> = platform::all_process_ids()
+        .into_iter()
+        .filter_map(|pid| {
+            Some((
+                ProcessIdentity::capture(pid).ok()?,
+                platform::process_parent_id(pid)?,
+            ))
+        })
+        .collect();
+    loop {
+        let before = tree.len();
+        for (child, parent) in &processes {
+            if !tree.contains(child)
+                && tree.iter().any(|p| p.pid == *parent && p.alive())
+                && child.alive()
+            {
+                tree.push(*child);
+            }
+        }
+        if tree.len() == before {
+            break;
+        }
+    }
+}
+
 /// Shared stop intent. Requesting it is nonblocking and precedes all signals.
 #[derive(Clone, Default)]
-pub struct StopRequest(Arc<AtomicBool>);
+pub struct StopRequest(Arc<StopState>);
+#[derive(Default)]
+struct StopState {
+    requested: AtomicBool,
+    forced: AtomicBool,
+    tree: Mutex<Vec<ProcessIdentity>>,
+}
 impl StopRequest {
     /// Record stop intent before the supervisor closes stdin or sends a signal.
     pub fn request(&self) {
-        self.0.store(true, Ordering::Release);
+        self.0.requested.store(true, Ordering::Release);
+    }
+    /// Escalate after the owner deadline, signalling only confirmed identities.
+    /// The latch also covers a child which has not reached supervision yet.
+    pub(crate) fn kill(&self) {
+        self.request();
+        self.0.forced.store(true, Ordering::Release);
+        if let Ok(mut tree) = self.0.tree.lock() {
+            snapshot_tree(&mut tree);
+            for identity in tree.iter().rev().filter(|identity| identity.alive()) {
+                platform::signal_processes(&[identity.pid], Signal::Kill);
+            }
+        }
+    }
+    pub(crate) fn track(&self, tree: &[ProcessIdentity]) {
+        if let Ok(mut tracked) = self.0.tree.lock() {
+            tracked.retain(|identity| identity.alive());
+            for identity in tree {
+                if !tracked.contains(identity) {
+                    tracked.push(*identity);
+                }
+            }
+        }
+        if self.0.forced.load(Ordering::Acquire) {
+            self.kill();
+        }
     }
     /// Read the recorded intent; exit codes never synthesize a stop request.
     pub fn requested(&self) -> bool {
-        self.0.load(Ordering::Acquire)
+        self.0.requested.load(Ordering::Acquire)
     }
 }
 
@@ -126,30 +184,7 @@ impl Owner {
         File::open(dir)?.sync_all()
     }
     fn snapshot(&mut self) {
-        self.tree.retain(|identity| identity.alive());
-        let processes: Vec<_> = platform::all_process_ids()
-            .into_iter()
-            .filter_map(|pid| {
-                Some((
-                    ProcessIdentity::capture(pid).ok()?,
-                    platform::process_parent_id(pid)?,
-                ))
-            })
-            .collect();
-        loop {
-            let before = self.tree.len();
-            for (child, parent) in &processes {
-                if !self.tree.contains(child)
-                    && self.tree.iter().any(|p| p.pid == *parent && p.alive())
-                    && child.alive()
-                {
-                    self.tree.push(*child);
-                }
-            }
-            if self.tree.len() == before {
-                break;
-            }
-        }
+        snapshot_tree(&mut self.tree);
     }
     fn refresh(&mut self, dir: &Path) -> io::Result<()> {
         let before = self.tree.clone();
@@ -255,16 +290,37 @@ pub fn supervise(
     if let Err(error) = owner.refresh(files.path()) {
         failure.get_or_insert(error);
     }
+    stop.track(&owner.tree);
     let mut status = None;
     let mut close = Some(close_stdin);
     let mut phase = 0;
     let mut deadline = (schedule.clock)();
     let mut snapshot = (schedule.clock)();
     loop {
+        if stop.0.forced.load(Ordering::Acquire) {
+            // Include descendants discovered by the deadline owner before root KILL.
+            let before = owner.tree.len();
+            if let Ok(tracked) = stop.0.tree.lock() {
+                for identity in tracked.iter() {
+                    if !owner.tree.contains(identity) {
+                        owner.tree.push(*identity);
+                    }
+                }
+            }
+            if owner.tree.len() != before {
+                if let Err(error) = owner.write(files.path()) {
+                    failure.get_or_insert(error);
+                }
+            }
+            if let Err(error) = owner.snapshot_and_signal(files.path(), Signal::Kill) {
+                failure.get_or_insert(error);
+            }
+        }
         if (schedule.clock)().saturating_duration_since(snapshot) >= schedule.snapshot_interval {
             if let Err(error) = owner.refresh(files.path()) {
                 failure.get_or_insert(error);
             }
+            stop.track(&owner.tree);
             snapshot = (schedule.clock)();
         }
         if status.is_none() {

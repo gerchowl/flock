@@ -157,6 +157,48 @@ The runtime half of #506 — `src/update.rs` refusing a manifest whose assets ar
 not this project's — is **not** in this ADR and not in this change. It is a
 product-behaviour change in `src/`, and it is still open.
 
+#### Stable asset checksum transition (#611)
+
+Each release build computes a SHA-256 sidecar for its final binary. The release
+publishes both, and `sync-latest-json` reads the sidecars to write each target as
+`{"url":"https://github.com/gerchowl/flock/releases/download/vX.Y.Z/flock-<target>","sha256":"<64 hexadecimal digits>"}`.
+Top-level assets and the current archived release mirror this object shape.
+The generator refuses incomplete or malformed checksum sidecars for new stable
+releases and preserves legacy archived URL strings. Ownership checks apply to
+the URL inside either shape.
+
+Local updates and remote bootstrap share the stable/preview asset parser and
+checksum verifier. A declared checksum is verified before chmod, replacement or
+remote installation. A mismatch or malformed digest is an `InvalidData` refusal,
+with the failed download removed. This checks bytes against the manifest, not an
+independent release signature. Legacy bare URL strings (and objects with an
+absent or JSON `null` checksum) remain unverified during the transition. Requiring checksums
+for all downloaded assets is deferred to #2076, gated on a stable release having
+shipped this metadata. Old published manifests are not rewritten. The local updater preserves
+verification failure as registered `checksum_mismatch` and CLI exit 10
+(`REFUSED`, ADR-0029), rather than an unclassified failure.
+
+Remote installs hash and rewind the same open handle that is streamed, so a
+source pathname replacement cannot change which bytes are sent. They verify
+the received temporary file before replacing the installed executable, for
+release downloads (including legacy manifests) and operator-supplied local
+binaries alike. This detects truncated transfers independently of manifest
+authentication. The remote shell uses `sha256sum` or `shasum -a 256`. If neither
+is available, `checksum_tool_missing` refuses with exit 10 and retry class
+`after_human`: install coreutils or Perl's shasum on the remote system.
+
+A transfer mismatch is `remote_checksum_mismatch`, exit 10, retry class `yes`:
+the existing remote binary is untouched, so a new transfer may be attempted.
+This differs from local verification against the manifest, whose
+`checksum_mismatch` remains retry class `never`. Both refusals remove the
+temporary upload. Private install-script statuses 30 (transfer mismatch) and 31
+(missing tool) map to the registered errors and never escape as CLI exits.
+These statuses are not collision-free: the remote login shell runs first and can exit with any status, and Perl `die` in shasum can return errno (Linux EROFS is 30).
+Source read errors take precedence over remote status decoding, preserving their original type rather than reporting transfer corruption. Write-side upload errors (including `BrokenPipe` on SSH stdin) yield to remote failures and their stderr tail; if the remote succeeded, the write error is returned.
+Ordinary shell/tool failures, including statuses 2, 126 and 127, remain generic
+install failures with their stderr tail. Registered I/O error codes survive the
+launcher boundary without interpreting stderr text.
+
 ### 4. The bump is derived and checked; the number stays a human's
 
 `just release-plan` reports the commits since the last `v*` tag grouped by

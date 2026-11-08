@@ -28,6 +28,7 @@ mod overlays;
 mod selection;
 mod settings;
 mod sidebar;
+mod structured;
 mod terminal;
 
 use self::modal::{
@@ -177,6 +178,9 @@ impl App {
         if self.state.mode != Mode::Terminal {
             return;
         }
+        if self.refuse_structured_paste() {
+            return;
+        }
         if let Some(rt) = self.terminal_input_runtime() {
             let _ = rt.send_paste(text).await;
         }
@@ -291,6 +295,10 @@ impl App {
             }
         }
 
+        if self.handle_structured_mouse(mouse) {
+            return;
+        }
+
         if self.handle_modified_url_click(mouse) {
             return;
         }
@@ -364,6 +372,20 @@ impl App {
         self.last_pane_click = None;
         if let Err(err) = crate::platform::open_url(&url) {
             crate::logging::pane_open_url_failed(&url, &err.to_string());
+            let previous_toast = self.state.toast.clone();
+            self.state.toast = Some(crate::app::state::ToastNotification {
+                kind: crate::app::state::ToastKind::NeedsAttention,
+                title: if matches!(&err, crate::platform::OpenUrlError::Refused(_)) {
+                    "link blocked"
+                } else {
+                    "link not opened"
+                }
+                .into(),
+                context: err.to_string(),
+                position: None,
+                target: None,
+            });
+            self.sync_toast_deadline(previous_toast);
         }
         true
     }
@@ -646,6 +668,10 @@ fn numbered_lines_bytes(count: usize) -> Vec<u8> {
 fn capture_snapshot(state: &AppState) -> crate::persist::SessionSnapshot {
     let terminal_runtimes = crate::terminal::TerminalRuntimeRegistry::new();
     crate::persist::capture(
+        crate::persist::RegistryCapture {
+            registry: &state.structured_agents,
+            now_ms: Some(42),
+        },
         &state.workspaces,
         &state.terminals,
         &terminal_runtimes,
@@ -673,3 +699,19 @@ fn root_layout_ratio(snapshot: &crate::persist::SessionSnapshot) -> Option<f32> 
 // quietly stops covering the other (#402).
 #[cfg(test)]
 use crate::test_support::{unique_temp_path, wait_for_file_stable};
+
+#[cfg(test)]
+#[tokio::test]
+async fn regression_composer_paste_keeps_float_and_pty_ownership() {
+    let (mut app, mut pane, mut float, _) = app_with_visible_float();
+    app.handle_raw_input_event(crate::raw_input::RawInputEvent::Paste("float-route".into()))
+        .await;
+    assert_eq!(float.try_recv().unwrap().as_ref(), b"float-route");
+    assert!(pane.try_recv().is_err());
+    app.state.hide_active_float();
+    app.handle_raw_input_event(crate::raw_input::RawInputEvent::Paste("pane-route".into()))
+        .await;
+    assert_eq!(pane.try_recv().unwrap().as_ref(), b"pane-route");
+    assert!(float.try_recv().is_err());
+    assert!(app.state.toast.is_none());
+}
