@@ -1,8 +1,7 @@
 //! Exact session-store evidence shared by delegate recovery and submission.
 use crate::api::schema::AgentSessionInfo;
-use std::fs::File;
-use std::io::Read;
 use std::path::PathBuf;
+pub(crate) mod store;
 
 pub(crate) fn checked_path(session: &AgentSessionInfo) -> std::io::Result<Option<PathBuf>> {
     if session.kind != crate::agent_resume::AgentSessionRefKind::Id {
@@ -11,42 +10,20 @@ pub(crate) fn checked_path(session: &AgentSessionInfo) -> std::io::Result<Option
     let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
         return Ok(None);
     };
-    let path = match (session.agent.as_str(), session.source.as_str()) {
-        ("codex", "flock:codex") => crate::codex_transcript::rollout_path(
-            &std::env::var_os("CODEX_HOME")
+    match (session.agent.as_str(), session.source.as_str()) {
+        ("codex", "flock:codex") => store::lookup(
+            [std::env::var_os("CODEX_HOME")
                 .map(PathBuf::from)
-                .unwrap_or_else(|| home.join(".codex")),
+                .unwrap_or_else(|| home.join(".codex"))
+                .join("sessions")],
+            store::Layout::Codex,
             &session.value,
-        )
-        .ok()
-        .flatten(),
+        ),
         ("claude", "flock:claude") => {
-            crate::agent_resume::claude_transcript_path_checked(&home, &session.value)?
+            crate::agent_resume::claude_transcript_path_checked(&home, &session.value)
         }
-        _ => return Ok(None),
-    };
-    let Some(path) = path else {
-        return Ok(None);
-    };
-    let mut header = Vec::new();
-    let read = File::open(&path).and_then(|file| file.take(65536).read_to_end(&mut header));
-    read.map_err(|error| {
-        std::io::Error::new(
-            error.kind(),
-            format!("cannot read session store {}: {error}", path.display()),
-        )
-    })?;
-    let matches = String::from_utf8_lossy(&header)
-        .lines()
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .any(|row| {
-            if session.agent == "codex" {
-                row["type"] == "session_meta" && row["payload"]["id"] == session.value
-            } else {
-                row["sessionId"] == session.value
-            }
-        });
-    Ok(matches.then_some(path))
+        _ => Ok(None),
+    }
 }
 
 #[cfg(test)]
@@ -101,7 +78,11 @@ mod tests {
                 .join("sessions/rollout-duplicate-session-evidence.jsonl"),
         )
         .unwrap();
-        assert!(checked_path(&session).unwrap().is_none());
+        assert!(checked_path(&session).is_err());
         std::env::remove_var("CODEX_HOME");
     }
 }
+
+#[cfg(test)]
+#[path = "session_evidence/store_tests.rs"]
+mod store_tests;
