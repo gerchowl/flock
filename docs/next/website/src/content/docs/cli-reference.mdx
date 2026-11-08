@@ -465,6 +465,8 @@ Arm a self-compaction of your own context:
 flk pane arm-self-compact [--pane <pane_id>] [--abort] [--instructions <text> | --instructions-file <path>] <handoff prompt>
 ```
 
+Omitting `--pane` resolves the calling pane from its attested process identity. If that identity cannot be resolved, the call fails with `caller_pane_unresolved` (exit 1), names the missing evidence and suggests `--pane <id>` (MCP: `pane: "<id>"`). A pane imported from a pre-3.3 handoff may lack the original process-birth evidence; switching `CLAUDE_CONFIG_DIR` does not supply it. Naming a pane explicitly selects the existing target-resolution path; it does not restore attestation or inbox authority. An explicit unknown pane still returns `pane_not_found`.
+
 The one thing flock types into a pane on an agent's own instruction, and the reason it is a verb rather than a `send-text` is that it is not typing *at* the agent — it is the agent asking to be allowed to shorten its context and carry on. The prompt is the agent's own handoff to its next self: the text an operator otherwise copies out of the transcript and pastes back in.
 
 The call **arms** and returns. Nothing is typed, because an agent calling it is mid-turn and its harness cannot compact inside a turn. Then, in order: the agent finishes the turn; once its pane is idle, settled and untouched by a human, flock types `/compact` and submits it; when the harness reports the compaction back through the session hook, flock types the handoff prompt in and submits it as the next turn. A harness that compacts on its own first — Claude Code does, exactly when the context fills up — is not a special case: the report still counts, and flock does not then compact a context that was just compacted.
