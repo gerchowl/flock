@@ -4,6 +4,8 @@ use serde_json::{json, Value};
 use std::time::Duration;
 use support::fleet::{self, Node, NodeSpec};
 
+// Used only by debug-only fake SSH relay tests (#1715).
+#[cfg(debug_assertions)]
 const PAIR: &[NodeSpec] = &[
     NodeSpec::new("nodea", "mesh-origin", &["nodeb"]),
     NodeSpec::new("nodeb", "mesh-recipient", &[]),
@@ -32,6 +34,8 @@ fn agent(node: &Node) -> Value {
     started["result"]["agent"].clone()
 }
 
+// Used only by debug-only fake SSH relay tests (#1715).
+#[cfg(debug_assertions)]
 fn discover(fleet: &fleet::Fleet, recipient: &Value) {
     fleet.wait_route("nodea", "nodeb", true);
     fleet::wait_until("recipient discovery", Duration::from_secs(90), || {
@@ -43,6 +47,8 @@ fn discover(fleet: &fleet::Fleet, recipient: &Value) {
     });
 }
 
+// Used only by debug-only fake SSH relay tests (#1715).
+#[cfg(debug_assertions)]
 fn send(fleet: &fleet::Fleet, recipient: &Value, correlation: &str) -> Value {
     request(
         fleet.node("nodea"),
@@ -61,6 +67,8 @@ fn read(node: &Node, pane: &Value) -> Value {
     response["result"]["messages"].clone()
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn cross_host_send_and_boot_projection_preserve_exactly_one_inbox_import() {
     let mut fleet = fleet::spawn("mesh-deliver", PAIR);
@@ -92,6 +100,8 @@ fn cross_host_send_and_boot_projection_preserve_exactly_one_inbox_import() {
     assert_eq!(read(fleet.node("nodeb"), &recipient["pane_id"]), json!([]));
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn origin_restart_redelivers_the_same_key_after_a_partition() {
     let mut fleet = fleet::spawn("mesh-outbox", PAIR);
@@ -111,6 +121,8 @@ fn origin_restart_redelivers_the_same_key_after_a_partition() {
     assert_eq!(messages[0]["correlation_id"], "offline-custody");
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn lost_receipt_then_receiver_restart_deduplicates_the_retry() {
     let mut fleet = fleet::spawn("mesh-receipt", PAIR);
@@ -129,6 +141,8 @@ fn lost_receipt_then_receiver_restart_deduplicates_the_retry() {
     assert_eq!(messages.as_array().unwrap().len(), 1, "{messages}");
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn refused_old_peer_rejects_new_acceptance_and_names_the_upgrade() {
     let fleet = fleet::spawn("mesh-old", PAIR);
@@ -158,6 +172,8 @@ fn refused_old_peer_rejects_new_acceptance_and_names_the_upgrade() {
     assert_eq!(read(fleet.node("nodeb"), &recipient["pane_id"]), json!([]));
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn repeated_correlation_ids_mint_distinct_keys_and_import_both_messages() {
     let fleet = fleet::spawn("mesh-correlation", PAIR);
@@ -261,6 +277,8 @@ fn database(node: &Node) -> rusqlite::Connection {
     db
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn allowed_neighbor_cannot_forge_a_disallowed_origin() {
     let fleet = fleet::spawn(
@@ -326,6 +344,8 @@ fn allowed_neighbor_cannot_forge_a_disallowed_origin() {
     assert_eq!(messages[0]["from_host"], "nodea");
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn receiver_mail_store_full_keeps_origin_custody_until_space_frees() {
     let fleet = fleet::spawn("mesh-quota", PAIR);
@@ -374,6 +394,8 @@ fn receiver_mail_store_full_keeps_origin_custody_until_space_frees() {
     );
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn receiver_mailbox_full_keeps_origin_custody_until_read() {
     let mut fleet = fleet::spawn("mesh-mailbox", PAIR);
@@ -429,6 +451,8 @@ fn receiver_mailbox_full_keeps_origin_custody_until_read() {
     );
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn another_authenticated_node_cannot_pre_register_the_real_origins_key() {
     let mut fleet = fleet::spawn_with_startup_probe(
@@ -538,6 +562,8 @@ fn another_authenticated_node_cannot_pre_register_the_real_origins_key() {
     );
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn live_handoff_resumes_pending_outbox_once() {
     let mut fleet = fleet::spawn("mesh-handoff", PAIR);

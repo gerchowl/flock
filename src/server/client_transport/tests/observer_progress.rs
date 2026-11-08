@@ -138,7 +138,6 @@ fn real_writer_deadline_disconnects_nonreading_observer_and_reaps_threads() {
             render_rx,
             events,
             TEST_STALL_TIMEOUT,
-            Instant::now,
         );
         exited.send(("writer", true)).unwrap();
     });
@@ -173,4 +172,15 @@ fn real_writer_deadline_disconnects_nonreading_observer_and_reaps_threads() {
         received_events.try_recv().unwrap(),
         ServerEvent::ClientDisconnected { client_id: 91 }
     ));
+}
+
+#[test]
+fn oversized_control_frame_disconnects_without_queueing() {
+    use std::io::Read;
+    let (socket, mut peer) = UnixStream::pair().unwrap();
+    peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let (control, queue) = ObserverControl::channel(Some(socket), 91);
+    assert!(control.send(vec![0; MAX_FRAME_SIZE + 5]).is_err());
+    assert_eq!(peer.read(&mut [0]).unwrap(), 0);
+    assert!(queue.try_recv().is_err());
 }

@@ -14,10 +14,18 @@ agent: string,
  */
 request_id: string,
 /**
+ * Required flk-issued handle from the open record, carried unchanged by S7
+ * slice 5. JSON number, exact in JavaScript below 2^53 like stream cursors.
+ */
+request_seq: number,
+/**
  * Permission choice admitted by S6-MVP.
  */
 decision: PermissionDecision,
 /**
- * Optional explanation supplied with the answer.
+ * Optional explanation: CRLF is normalized to LF, then trimmed.
+ * At most 2048 UTF-8 bytes, using prompt_control_bytes rules (newlines and
+ * tabs permitted). Invalid input returns invalid_params before reserving
+ * the request. Empty and absent messages are allowed.
  */
 message?: string, };

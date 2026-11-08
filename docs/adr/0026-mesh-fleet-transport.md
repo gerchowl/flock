@@ -274,14 +274,12 @@ The raw destination metadata remains unchanged.
 None of this rewrites cache keys, identity proofs, policy bindings or dial
 targets. Wire summaries remain observations, not authority to borrow aliases.
 
-An unproven row with a node ID has the badge `unverified`; an ID-less legacy
-row has `legacy/unverified`. Neither badge grants identity or routing trust.
-A hub-pushed observation claiming the carried origin's node ID is annotated
-as an `unverified home claim` under the Origin row instead of taking another
-server slot. This is a presentation association, not deduplication or proof:
-its independent observation and workspaces remain available, and the Home
-switch still uses the reserved local target. ID-less rows remain separate;
-name similarity never establishes this association.
+Every unproven row uses the same `unverified` wording. Existing identity
+folding associates a hub-pushed claim with the verified Self, Home or pinned
+peer row and renders its hub as a `+via` annotation. The claim cannot change
+the verified row's identity, metrics or dial target. Independent observations
+remain in the cache, and Home switching uses the reserved local target.
+Name similarity never establishes an identity association.
 
 `flk fleet pause` freezes custody completely on the paused node: no new send
 acceptance, retry, forwarding, collection/import, inbox delivery or expiry.

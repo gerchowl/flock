@@ -14,7 +14,7 @@ pub(crate) trait Clock: Send + Sync {
     fn until(&self, deadline: Instant) -> BoxFuture<'_, ()>;
 }
 /// Normal runtime clock; no wall-clock synchronization is involved.
-pub(super) struct SystemClock;
+pub(crate) struct SystemClock;
 impl Clock for SystemClock {
     fn now(&self) -> Instant {
         Instant::now()

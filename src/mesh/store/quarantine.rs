@@ -30,8 +30,8 @@ fn archive(
         [rowid],
         |row| {
             let mut columns = Map::new();
-            for (index, name) in row.as_ref().column_names().iter().enumerate() {
-                columns.insert((*name).into(), raw(row.get_ref(index)?));
+            for (index, name) in row.as_ref().column_names().enumerate() {
+                columns.insert(name.into(), raw(row.get_ref(index)?));
             }
             Ok(json!({
                 "format": 1,

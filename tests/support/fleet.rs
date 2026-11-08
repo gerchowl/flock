@@ -477,26 +477,23 @@ impl Fleet {
 
     pub fn set_allow_from(&self, node: &str, list: &[&str]) {
         let node = self.node(node);
-        {
-            let app = super::paths::app_dir_name();
-            let path = node.config_home.join(app).join("config.toml");
-            let mut config: toml::Value =
-                toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-            let table = config
-                .as_table_mut()
-                .unwrap()
-                .entry("msg")
-                .or_insert_with(|| toml::Value::Table(Default::default()));
-            table.as_table_mut().unwrap().insert(
-                "allow_from".into(),
-                toml::Value::Array(
-                    list.iter()
-                        .map(|s| toml::Value::String((*s).into()))
-                        .collect(),
-                ),
-            );
-            fs::write(path, toml::to_string(&config).unwrap()).unwrap();
-        }
+        let app = super::paths::app_dir_name();
+        let path = node.config_home.join(app).join("config.toml");
+        let mut config: toml::Value = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let table = config
+            .as_table_mut()
+            .unwrap()
+            .entry("msg")
+            .or_insert_with(|| toml::Value::Table(Default::default()));
+        table.as_table_mut().unwrap().insert(
+            "allow_from".into(),
+            toml::Value::Array(
+                list.iter()
+                    .map(|s| toml::Value::String((*s).into()))
+                    .collect(),
+            ),
+        );
+        fs::write(path, toml::to_string(&config).unwrap()).unwrap();
         let response: serde_json::Value = serde_json::from_str(
             &node.api(r#"{"id":"reload","method":"server.reload_config","params":{}}"#),
         )
@@ -650,12 +647,10 @@ pub fn spawn_with_startup_probe(
         }
         config.push_str(spec.extra_config);
         // Seed only the namespace used by the compiled CLI.
-        {
-            let app_dir = super::paths::app_dir_name();
-            let dir = path.config_home.join(app_dir);
-            fs::create_dir_all(&dir).unwrap();
-            fs::write(dir.join("config.toml"), &config).unwrap();
-        }
+        let app_dir = super::paths::app_dir_name();
+        let dir = path.config_home.join(app_dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("config.toml"), &config).unwrap();
     }
 
     // Construct the owner before starting children so startup failures clean up.

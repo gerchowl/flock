@@ -362,6 +362,7 @@ mod tests {
 
     fn peer_with_workspace(project_key: Option<&str>, branch: Option<&str>) -> PeerSummaryState {
         PeerSummaryState {
+            structured_agents: Vec::new(),
             node_id: None,
             dial: Default::default(),
             stream_error: None,

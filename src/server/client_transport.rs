@@ -36,9 +36,15 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(4);
 /// Disconnect an observer after this long without bytes accepted by its socket.
 /// Idle connections with no pending output are unaffected, and every partial
 /// write restarts the monotonic deadline, even within a single large frame.
-/// Known limit: trickling readers can retain up to this much control-message
-/// backlog per frame. This is a no-progress limit, not a total delivery deadline.
-const OBSERVER_WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(30);
+/// A trickling reader can delay delivery indefinitely, but the control queue
+/// has a separate queued-byte bound. This is not a total delivery deadline.
+pub(super) const OBSERVER_WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(30);
+
+mod control;
+use control::ControlMessages;
+#[cfg(test)]
+pub(super) use control::ControlReceiver;
+pub(super) use control::ObserverControl;
 
 /// Maximum input payload size (bytes) for a single `ClientMessage::Input`.
 const MAX_INPUT_PAYLOAD: usize = 1024 * 1024; // 1 MB
@@ -46,8 +52,10 @@ const MAX_INPUT_PAYLOAD: usize = 1024 * 1024; // 1 MB
 /// Channels owned by the server side of a client writer thread.
 #[derive(Clone, Debug)]
 pub(crate) struct ClientWriter {
-    /// Reliable control messages such as shutdown, notifications, and clipboard writes.
-    pub(crate) control: std::sync::mpsc::Sender<Vec<u8>>,
+    /// Kernel facts captured from the accepted socket, never from Hello.
+    pub(crate) peer: crate::platform::peer::Credentials,
+    /// Ordered controls and coalesced state updates. Overflow disconnects the observer.
+    pub(super) control: ObserverControl,
     /// Droppable render messages. Capacity is one so slow clients cannot build lag.
     pub(crate) render: std::sync::mpsc::SyncSender<Vec<u8>>,
 }
@@ -162,6 +170,7 @@ pub(crate) fn handle_client_handshake(
     server_event_tx: &mpsc::Sender<ServerEvent>,
     should_quit: &Arc<AtomicBool>,
 ) -> io::Result<()> {
+    let peer = crate::platform::peer::credentials(&stream);
     // Reset to blocking mode — the accept loop sets nonblocking but
     // the handshake thread needs blocking I/O for read_message/write_message.
     stream.set_nonblocking(false)?;
@@ -279,9 +288,10 @@ pub(crate) fn handle_client_handshake(
     stream.set_read_timeout(None)?;
 
     // Create separate channels for reliable control messages and droppable renders.
-    let (control_tx, control_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    let (control_tx, control_rx) = ObserverControl::channel(Some(stream.try_clone()?), client_id);
     let (render_tx, render_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(1);
     let writer = ClientWriter {
+        peer,
         control: control_tx,
         render: render_tx,
     };
@@ -323,7 +333,7 @@ pub(crate) fn handle_client_handshake(
 pub(super) fn client_writer_loop(
     stream: UnixStream,
     client_id: u64,
-    control_rx: std::sync::mpsc::Receiver<Vec<u8>>,
+    control_rx: impl ControlMessages,
     render_rx: std::sync::mpsc::Receiver<Vec<u8>>,
     server_event_tx: mpsc::Sender<ServerEvent>,
 ) {
@@ -334,19 +344,17 @@ pub(super) fn client_writer_loop(
         render_rx,
         server_event_tx,
         OBSERVER_WRITE_STALL_TIMEOUT,
-        Instant::now,
     );
 }
 
-/// Run the real socket writer with a supplied no-progress limit and clock.
+/// Run the real socket writer with a supplied no-progress limit.
 fn client_writer_loop_timed(
     stream: UnixStream,
     client_id: u64,
-    control_rx: std::sync::mpsc::Receiver<Vec<u8>>,
+    control_rx: impl ControlMessages,
     render_rx: std::sync::mpsc::Receiver<Vec<u8>>,
     server_event_tx: mpsc::Sender<ServerEvent>,
     timeout: Duration,
-    now: fn() -> Instant,
 ) {
     client_writer_loop_with(
         stream,
@@ -354,7 +362,7 @@ fn client_writer_loop_timed(
         control_rx,
         render_rx,
         server_event_tx,
-        |stream, data| write_framed_bytes(stream, data, client_id, timeout, now),
+        |stream, data| write_framed_bytes(stream, data, client_id, timeout, Instant::now),
     );
 }
 
@@ -362,7 +370,7 @@ fn client_writer_loop_timed(
 pub(super) fn client_writer_loop_with(
     mut stream: UnixStream,
     client_id: u64,
-    control_rx: std::sync::mpsc::Receiver<Vec<u8>>,
+    control_rx: impl ControlMessages,
     render_rx: std::sync::mpsc::Receiver<Vec<u8>>,
     server_event_tx: mpsc::Sender<ServerEvent>,
     mut write: impl FnMut(&mut UnixStream, &[u8]) -> bool,

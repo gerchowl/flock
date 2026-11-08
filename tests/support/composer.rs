@@ -24,7 +24,12 @@ impl Composer {
     /// Install the exit subscription BEFORE requesting workspace creation.
     /// The fixture must block on its gate before emitting READY.
     pub fn watch(socket: &Path) -> io::Result<Self> {
-        let stages = Stages::new(Duration::from_secs(120));
+        Self::watch_within(socket, Duration::from_secs(120))
+    }
+
+    /// Watch exits under the caller's existing condition-wait ceiling.
+    pub fn watch_within(socket: &Path, within: Duration) -> io::Result<Self> {
+        let stages = Stages::new(within);
         let exits = Self::subscribe(socket, json!([{"type":"pane.exited"}]), |stream| {
             read_socket_line(
                 stream,

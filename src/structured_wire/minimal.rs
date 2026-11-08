@@ -2,7 +2,11 @@
 
 use serde::{Deserialize, Serialize};
 
-pub use crate::structured::fleet_lite::wire::{FleetAgentRow, FleetDelta};
+pub use crate::structured::fleet_lite::wire::{
+    FleetAgentRow, FleetDelta, FleetNodeRow, FleetProjectRow,
+};
+
+pub use crate::api::schema::AgentSendResult;
 
 /// Successful agent.decide ack result, echoing the applied answer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -30,6 +34,8 @@ pub enum AgentDecideErrorCode {
     PermissionRequestClosed,
     /// The caller is not a token-authenticated client principal.
     NotAuthorized,
+    /// The message exceeds the byte bound or carries forbidden control bytes.
+    InvalidParams,
 }
 
 /// Arguments for a token-authenticated client's agent.decide command.
@@ -42,28 +48,22 @@ pub struct AgentDecide {
     pub agent: String,
     /// Harness request identity from the derived open-request record.
     pub request_id: String,
+    /// Required flk-issued handle from the open record, carried unchanged by S7
+    /// slice 5. JSON number, exact in JavaScript below 2^53 like stream cursors.
+    #[cfg_attr(feature = "ts", ts(type = "number"))]
+    pub request_seq: u64,
     /// Permission choice admitted by S6-MVP.
     pub decision: PermissionDecision,
-    /// Optional explanation supplied with the answer.
+    /// Optional explanation: CRLF is normalized to LF, then trimmed.
+    /// At most 2048 UTF-8 bytes, using prompt_control_bytes rules (newlines and
+    /// tabs permitted). Invalid input returns invalid_params before reserving
+    /// the request. Empty and absent messages are allowed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub message: Option<String>,
 }
 
-/// Closed permission vocabulary shared by the client and S6-MVP.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-#[serde(rename_all = "snake_case")]
-// Later wire slices consume this payload.
-#[cfg_attr(feature = "web", allow(dead_code))]
-pub enum PermissionDecision {
-    /// Permit only this request.
-    AllowOnce,
-    /// Permit this tool beyond the current request.
-    AllowAlways,
-    /// Refuse the request.
-    Deny,
-}
+pub use super::permission::PermissionDecision;
 
 #[cfg(test)]
 mod tests {
@@ -77,6 +77,14 @@ mod tests {
     fn state(phase: &str) -> Value {
         serde_json::to_value(serde_json::from_value::<AgentState>(json!({"phase":phase})).unwrap())
             .unwrap()
+    }
+
+    #[test]
+    fn structured_send_result_is_the_lifecycle_identity_contract() {
+        let value = json!({"item_id":"00000000-0000-4000-8000-000000001107"});
+        let result: crate::structured_wire::AgentSendResult =
+            serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(result).unwrap(), value);
     }
 
     #[test]
@@ -99,8 +107,7 @@ mod tests {
         ] {
             assert_eq!(serde_json::to_value(decision).unwrap(), choice);
             for message in [None, Some("Operator explanation")] {
-                let mut value =
-                    json!({"agent":"fixture-agent","request_id":"request-one","decision":choice});
+                let mut value = json!({"agent":"fixture-agent","request_id":"request-one","request_seq":1,"decision":choice});
                 if let Some(message) = message {
                     value["message"] = json!(message);
                 }
@@ -177,6 +184,7 @@ mod tests {
                 "permission_request_closed",
             ),
             (AgentDecideErrorCode::NotAuthorized, "not_authorized"),
+            (AgentDecideErrorCode::InvalidParams, "invalid_params"),
         ] {
             assert_eq!(serde_json::to_value(code).unwrap(), spelling);
             assert_eq!(
@@ -221,11 +229,31 @@ mod tests {
     }
 
     #[test]
+    fn generated_decide_message_documents_server_validation() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("web/client/src/gen");
+        let request = std::fs::read_to_string(root.join("AgentDecide.ts")).unwrap();
+        assert!(request.contains("2048 UTF-8 bytes"));
+        assert!(request.contains("trimmed"));
+        assert!(request.contains("invalid_params"));
+        assert!(request.contains("prompt_control_bytes"));
+    }
+
+    #[test]
     fn generated_minimal_roots_have_optional_strings_and_shared_agent_state() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("web/client/src/gen");
         let row = std::fs::read_to_string(root.join("FleetAgentRow.ts")).unwrap();
         assert!(row.contains("state: AgentState,"));
         assert!(row.contains("activity?: string,"));
+        assert!(row.contains("route?: Route,"));
+        let route = std::fs::read_to_string(root.join("Route.ts")).unwrap();
+        for field in [
+            "node: string",
+            "name: string",
+            "next_hop: string",
+            "hops: number",
+        ] {
+            assert!(route.contains(field), "{route}");
+        }
         assert!(row.contains("waiting_on_human: Array<string>,"));
         let request = std::fs::read_to_string(root.join("AgentDecide.ts")).unwrap();
         assert!(request.contains("message?: string,"));
