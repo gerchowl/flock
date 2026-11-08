@@ -36,6 +36,7 @@ fn entry(round: u64) -> Entry {
         base_sha: None,
         agent_id: None,
         lock_resolution: None,
+        session: None,
     }
 }
 
@@ -165,7 +166,7 @@ impl RoundIo for Scripted {
         Ok((settled, false))
     }
 
-    fn agent_result(&mut self) -> Result<serde_json::Value, BoundedError> {
+    fn agent_result(&mut self) -> Result<ResultFetch, BoundedError> {
         self.polled += 1;
         // The last answer stands until the script says otherwise.
         let answer = if self.results.len() > 1 {
@@ -173,7 +174,9 @@ impl RoundIo for Scripted {
         } else {
             self.results.front().cloned()
         };
-        Ok(answer.expect("the script has no agent.result answer"))
+        Ok(ResultFetch::Response(
+            answer.expect("the script has no agent.result answer"),
+        ))
     }
 
     fn agent_record(&mut self) -> AgentFetch {
