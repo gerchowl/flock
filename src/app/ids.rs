@@ -271,6 +271,34 @@ impl App {
         self.caller_pane_evidence().ok().flatten()
     }
 
+    // Explain a refusal only. Candidate ancestry never grants caller authority.
+    pub(super) fn caller_pane_refusal_reason(&self) -> &'static str {
+        if self.current_api_peer_pid.is_none() {
+            return "socket peer process identity is unavailable";
+        }
+        let Some((_, pane)) = self
+            .caller_pane_candidate()
+            .and_then(|(_, pane)| self.find_pane(pane))
+        else {
+            return "socket peer process ancestry does not identify a live pane";
+        };
+        let Some(runtime) = self.terminal_runtimes.get(&pane.attached_terminal_id) else {
+            return "the candidate pane has no live terminal runtime";
+        };
+        let Some(birth) = runtime.child_birth() else {
+            return "the candidate pane has no process-birth evidence, as can happen \
+                    with a pane imported from a pre-3.3 handoff";
+        };
+        if runtime
+            .child_pid()
+            .and_then(crate::platform::process_start_time)
+            != Some(birth)
+        {
+            return "the pane child's recorded process-birth identity could not be verified";
+        }
+        "the attested pane has no usable agent identity"
+    }
+
     fn caller_pane_evidence(&self) -> Result<Option<(usize, crate::layout::PaneId)>, ()> {
         self.pane_evidence_for(self.current_api_peer_pid)
     }
