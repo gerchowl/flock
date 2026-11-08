@@ -1,7 +1,7 @@
 //! Owned workers for ADR-0036 S3a-3; no public start/admission route until #1843.
 //!
 //! Lease locks, preparation and supervision run off the app loop. Each launch has
-//! two bounded owner messages (ready/end) and the runtime's bounded stream queue.
+//! three bounded owner messages (lease/ready/end) and the runtime's bounded stream queue.
 //! Only `Received::state_input` adapts stream records, including book closes.
 //! Polling drains four records per agent and rearms the shared wake when full.
 //! Exact S4 deadlines share the app scheduler; silence never kills a process.
@@ -10,8 +10,13 @@
 //! Unconfirmed cleanup retains lease
 //! authority and Unknown lifecycle, requiring explicit recovery rather than restart.
 #![deny(missing_docs)]
+/// Grace period for structured workers to stop before forced cleanup.
+pub(crate) const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+/// Bound on forced cleanup after the structured-worker grace period.
+pub(crate) const SHUTDOWN_CLEANUP: std::time::Duration = std::time::Duration::from_secs(10);
+
 use super::{
-    launch::{LaunchError, LaunchProfile},
+    launch::{LaunchError, LaunchProfile, SessionMcp},
     lease::SessionLeases,
     registry::{Record, Registry},
     runtime::{self, Exit, Runtime},
@@ -29,10 +34,18 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::sync::Notify;
+pub(crate) mod queue;
+// Consumed by the following S10b projection slice (#1430).
+#[allow(dead_code)]
+pub(crate) mod live;
 const BATCH: usize = 4;
+mod admission;
+pub(crate) use admission::Admission;
 
 /// Internal launch policy, supplied by authenticated admission in #1843.
 pub struct Launch {
+    /// Attested starter and validated, nonce-framed MCP opening turn; CLI starts stay idle.
+    pub opening_turn: Option<(String, crate::spawn::prompt::SpawnPrompt)>,
     /// Stable registered identity.
     pub agent_id: String,
     /// Current registry epoch; replaced atomically by a fresh launch epoch.
@@ -41,10 +54,18 @@ pub struct Launch {
     pub leases: SessionLeases,
     /// Durable stream/supervision directory.
     pub state: PathBuf,
+    /// Caller-supplied `[sessions]` storage policy, captured for this launch.
+    pub storage: super::blobs::StorageConfig,
+    /// Pinned flock executable and owning server socket for this session.
+    pub mcp: SessionMcp,
     /// Caller-supplied sessions stall policy, with no guessed default.
     pub stall_after: Duration,
+    /// Configured byte policy; changes require a server restart (#1975).
+    pub queue_rewrite_bytes: std::num::NonZeroU64,
     /// Optional authenticated delegation lineage.
     pub lineage: Option<(String, u32)>,
+    /// Agent-caller policy; None is the already-attested operator exemption.
+    pub(crate) admission: Option<Admission>,
 }
 /// Completion available only after preceding stream records have been reduced.
 #[derive(Debug)]
@@ -55,10 +76,13 @@ pub struct Report {
     pub authority_retained: bool,
 }
 enum Message {
-    Ready(Runtime),
+    Leased,
+    // Runtime owns transport and queue capabilities; keep control messages compact.
+    Ready(Box<Runtime>),
     End(Report),
 }
 struct Worker {
+    live: live::Source,
     generation: u64,
     messages: mpsc::Receiver<Message>,
     runtime: Option<Runtime>,
@@ -67,6 +91,9 @@ struct Worker {
     finished: bool,
     events_closed: bool,
     stall_after: Duration,
+    queue_state: Option<queue::Snapshot>,
+    queue_seq: u64,
+    lineage: Option<(String, u32)>,
     thread: Option<JoinHandle<()>>,
 }
 impl Worker {
@@ -110,7 +137,13 @@ impl Worker {
 /// Completed reports are bounded to the latest launch per agent. Removed records
 /// discard confirmed completions, while uncertain ownership remains recoverable.
 pub struct Workers {
+    recovery_slot: Option<(String, std::sync::Weak<()>)>,
+    retained_queues: BTreeMap<String, (u64, queue::publication::Source)>,
     entries: BTreeMap<String, Worker>,
+    history: BTreeMap<String, (u64, super::history::History)>,
+    pending: BTreeMap<String, Option<String>>,
+    #[cfg(test)]
+    before_reserve: Option<mpsc::Receiver<()>>,
     notify: Arc<Notify>,
     // Coalesced wake for teardown while the async server loop is quiescent.
     wake: mpsc::SyncSender<()>,
@@ -126,14 +159,23 @@ impl Workers {
             wake,
             wakes,
             shutdown_result: None,
+            recovery_slot: None,
+            retained_queues: BTreeMap::new(),
             entries: BTreeMap::new(),
+            history: BTreeMap::new(),
+            pending: BTreeMap::new(),
+            #[cfg(test)]
+            before_reserve: None,
             notify,
         }
     }
     /// Reserve before preparation, then bind the registered cwd/model before spawn.
     /// Preparation must be bounded by its owner. Stop during preparation is latched
-    /// and checked on both sides of the factory. Live/unconfirmed workers refuse
-    /// replacement. Failure may advance the observation epoch but never the record.
+    /// and checked on both sides of the factory. Live/unconfirmed workers and
+    /// unread terminal queue completions refuse replacement with session_busy.
+    /// Failure may advance the observation epoch but never the record.
+    /// The application drains terminal completions for lifecycle facts and send
+    /// acknowledgements. Internal adapters must likewise drain before relaunch.
     pub fn start(
         &mut self,
         registry: &mut Registry,
@@ -141,13 +183,25 @@ impl Workers {
         prepare: impl FnOnce(&Record) -> Result<LaunchProfile, LaunchError> + Send + 'static,
     ) -> Result<u64, ErrorCode> {
         let Launch {
+            opening_turn,
             agent_id,
             generation: current,
             leases,
             state,
+            storage,
+            mcp,
             stall_after,
+            queue_rewrite_bytes,
             lineage,
+            admission,
         } = launch;
+        if self
+            .recovery_slot
+            .as_ref()
+            .is_some_and(|(id, slot)| id == &agent_id && slot.strong_count() != 0)
+        {
+            return Err(ErrorCode::SessionBusy);
+        }
         if let Some(previous) = self.entries.get_mut(&agent_id) {
             previous.join_finished();
             if !previous.finished
@@ -156,27 +210,66 @@ impl Workers {
                     .report
                     .as_ref()
                     .is_some_and(|r| r.authority_retained)
+                || previous
+                    .runtime
+                    .as_ref()
+                    .is_some_and(Runtime::queue_updates_pending)
             {
                 return Err(ErrorCode::SessionBusy);
             }
         }
+        // Resume retains the original admission ancestry, including operator roots.
+        let lineage = self
+            .entries
+            .get(&agent_id)
+            .map_or(lineage, |w| w.lineage.clone());
+        let retained_lineage = lineage.clone();
         let record = registry
             .get(&agent_id)
             .filter(|(_, _, g)| *g == current)
             .map(|(r, _, _)| r.clone())
             .ok_or(ErrorCode::AgentNotFound)?;
-        let generation = registry
-            .begin_launch(&agent_id, current)
-            .map_err(|_| ErrorCode::AgentStartFailed)?;
-        let (tx, messages) = mpsc::sync_channel(2);
+        if registry
+            .get(&agent_id)
+            .is_some_and(|(_, p, _)| p.update.state.lifecycle == Lifecycle::Unknown)
+        {
+            return Err(ErrorCode::StructuredRecoveryRequired);
+        }
+        self.reserve_pending(
+            &agent_id,
+            lineage.as_ref().map(|(id, _)| id.as_str()),
+            &leases,
+            admission.as_ref(),
+        )?;
+        let generation = registry.begin_launch(&agent_id, current).map_err(|error| {
+            self.pending.remove(&agent_id);
+            match error {
+                super::registry::RegistryError::RecoveryRequired => {
+                    ErrorCode::StructuredRecoveryRequired
+                }
+                _ => ErrorCode::AgentStartFailed,
+            }
+        })?;
+        let (tx, messages) = mpsc::sync_channel(3);
         let stop = StopRequest::default();
         let cancelled = stop.clone();
         let notify = self.notify.clone();
         let wake = self.wake.clone();
+        #[cfg(test)]
+        let before_reserve = self.before_reserve.take();
         let thread = std::thread::Builder::new()
             .name("structured-launch".into())
             .spawn(move || {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    #[cfg(test)]
+                    if let Some(barrier) = before_reserve {
+                        barrier.recv_timeout(Duration::from_secs(10)).map_err(|_| {
+                            (
+                                ErrorCode::AgentStartFailed,
+                                "reservation barrier failed".into(),
+                            )
+                        })?;
+                    }
                     let lease = leases
                         .reserve(
                             &record.agent_id,
@@ -184,6 +277,9 @@ impl Workers {
                             lineage.as_ref().map(|(id, depth)| (id.as_str(), *depth)),
                         )
                         .map_err(|code| (code, code.as_str().to_owned()))?;
+                    let _ = tx.try_send(Message::Leased);
+                    notify.notify_one();
+                    let _ = wake.try_send(());
                     let prepare = || -> Result<_, LaunchError> {
                         if cancelled.requested() {
                             return Err(io::Error::new(
@@ -206,7 +302,7 @@ impl Workers {
                     let profile = prepare().map_err(|error| (error.code(), error.to_string()))?;
                     let location = StreamLocation {
                         data_dir: state.clone(),
-                        storage: Default::default(),
+                        storage,
                         agent: record.agent_id.clone(),
                         session: record.session_id.clone(),
                     };
@@ -214,14 +310,14 @@ impl Workers {
                     let event_wake = wake.clone();
                     runtime::run_controlled(
                         &state,
-                        profile,
+                        (profile, mcp),
                         lease,
                         location,
                         |runtime| {
                             if cancelled.requested() {
                                 runtime.stop();
                             }
-                            let _ = tx.try_send(Message::Ready(runtime));
+                            let _ = tx.try_send(Message::Ready(Box::new(runtime)));
                             notify.notify_one();
                             let _ = wake.try_send(());
                         },
@@ -229,7 +325,11 @@ impl Workers {
                             event_notify.notify_one();
                             let _ = event_wake.try_send(());
                         },
-                        cancelled.clone(),
+                        runtime::Control {
+                            stop: cancelled.clone(),
+                            queue_rewrite_bytes: Some(queue_rewrite_bytes),
+                            opening_turn,
+                        },
                     )
                     .map_err(|error| (error.code(), error.to_string()))
                 }))
@@ -247,11 +347,15 @@ impl Workers {
                 notify.notify_one();
                 let _ = wake.try_send(());
             })
-            .map_err(|_| ErrorCode::AgentStartFailed)?;
+            .map_err(|_| {
+                self.pending.remove(&agent_id);
+                ErrorCode::AgentStartFailed
+            })?;
         self.shutdown_result = None;
         self.entries.insert(
             agent_id,
             Worker {
+                live: live::Source::default(),
                 generation,
                 messages,
                 runtime: None,
@@ -260,6 +364,9 @@ impl Workers {
                 finished: false,
                 events_closed: false,
                 stall_after,
+                queue_state: None,
+                queue_seq: 0,
+                lineage: retained_lineage,
                 thread: Some(thread),
             },
         );
@@ -272,7 +379,130 @@ impl Workers {
             .filter(|w| w.generation == generation && !w.finished)
             .and_then(|w| w.runtime.as_ref())
     }
+    /// Registry-fenced stored stream, retained after runtime exit. This handle
+    /// lives with runtime ownership, never inside the pure registry/AppState.
+    pub fn history(&self, registry: &Registry, id: &str) -> Option<&super::history::History> {
+        let (generation, source) = self.history.get(id)?;
+        let (_, _, current) = registry.get(id)?;
+        (*generation == current).then_some(source)
+    }
+    /// Subscribe without runtime or permission authority; old generations cannot attach.
+    #[allow(dead_code)] // S10b (#1430) adds the native consumer.
+    pub(crate) fn live(&self, registry: &Registry, id: &str) -> Option<live::Subscription> {
+        let worker = self.entries.get(id)?;
+        let (_, _, generation) = registry.get(id)?;
+        (generation == worker.generation).then(|| worker.live.subscribe())
+    }
+    /// Cold recovery requires a joined producer without retained cleanup authority.
+    /// Existing canonical history remains readable while a worker is active.
+    /// A finished worker without a report can recover once its thread is joined.
+    /// An explicit report retaining authority still defers recovery.
+    pub(crate) fn history_recovery_allowed(&self, id: &str) -> bool {
+        self.entries.get(id).is_none_or(|worker| {
+            worker.finished
+                && worker.thread.is_none()
+                && worker
+                    .report
+                    .as_ref()
+                    .is_none_or(|report| !report.authority_retained)
+        })
+    }
+    /// Install a closed-file source recovered on an I/O worker. A changed epoch,
+    /// active producer or already installed source refuses stale recovery.
+    pub fn install_retained(
+        &mut self,
+        registry: &Registry,
+        id: &str,
+        generation: u64,
+        source: super::history::History,
+    ) -> Result<(), ErrorCode> {
+        if registry.get(id).is_none_or(|(record, _, g)| {
+            g != generation || !source.belongs_to(&record.agent_id, &record.session_id)
+        }) {
+            return Err(ErrorCode::AgentNotFound);
+        }
+        if self.history(registry, id).is_some() || self.entries.get(id).is_some_and(|w| !w.finished)
+        {
+            return Err(ErrorCode::SessionBusy);
+        }
+        self.history.insert(id.into(), (generation, source));
+        Ok(())
+    }
+    /// Nonblocking queue request for the exact current generation. Completion,
+    /// not buffer acceptance, acknowledges durable admission. Callers consume
+    /// queue updates to avoid backpressuring the bounded session event pump.
+    pub(crate) fn enqueue(
+        &self,
+        registry: &Registry,
+        id: &str,
+        generation: u64,
+        request: queue::Request,
+    ) -> Result<(), ErrorCode> {
+        if registry.get(id).is_none_or(|(_, _, g)| g != generation) {
+            return Err(ErrorCode::AgentNotFound);
+        }
+        self.runtime(id, generation)
+            .ok_or(ErrorCode::AgentNotFound)?
+            .queue_enqueue(request)
+    }
+
+    /// Positive proof from the sole journal owner, including keys loaded on reopen.
+    /// In-flight admission, opaque state or unavailable ownership is unknown,
+    /// never proof that a committed key is absent.
+    pub(crate) fn queue_custody_committed(
+        &self,
+        id: &str,
+        key: &crate::mesh::key::MessageKey,
+    ) -> Result<bool, crate::structured::queue::custody::Unknown> {
+        self.entries
+            .get(id)
+            .and_then(|entry| entry.runtime.as_ref())
+            .ok_or(crate::structured::queue::custody::Unknown::OwnerUnavailable)?
+            .queue_custody_committed(key)
+    }
+    /// Consume an immutable completion/cut from the current generation only.
+    /// Terminal cuts remain available after exit; drain before relaunch/removal.
+    /// A cancelled notification report requires durable replay through #1956.
+    pub(crate) fn queue_update(
+        &self,
+        registry: &Registry,
+        id: &str,
+        generation: u64,
+    ) -> Option<queue::Update> {
+        if registry.get(id).is_none_or(|(_, _, g)| g != generation) {
+            return None;
+        }
+        self.entries
+            .get(id)
+            .filter(|w| w.generation == generation)?
+            .runtime
+            .as_ref()?
+            .queue_update()
+    }
+    /// Drain the fixed notification capacity per owned generation, including a removed
+    /// registry row. Historical committed facts must outlive supervisor metadata.
+    /// Queue subscriptions remain fenced separately by queue_source.
+    pub(crate) fn queue_completions(&self, terminal: bool) -> Vec<(String, u64, queue::Update)> {
+        // After stop there can also be one peeked completion and one fact tail.
+        let budget = queue::COMPLETION_CAPACITY + if terminal { 2 } else { 0 };
+        self.entries
+            .iter()
+            .flat_map(|(id, worker)| {
+                let updates: Vec<_> = (0..budget)
+                    .map_while(|_| worker.runtime.as_ref()?.queue_update())
+                    .map(|update| (id.clone(), worker.generation, update))
+                    .collect();
+                if !terminal && updates.len() == budget {
+                    self.notify.notify_one();
+                }
+                updates
+            })
+            .collect()
+    }
     /// Latch cancellation without blocking on preparation, process or I/O cleanup.
+    /// Await the terminal [`Self::report`] through polling before reopening the
+    /// journal. Confirmed completion drops its owner and explicitly releases its
+    /// lock, even when a concurrent fork still holds an inherited descriptor.
     pub fn stop(&self, id: &str, generation: u64) -> bool {
         let Some(worker) = self.entries.get(id).filter(|w| w.generation == generation) else {
             return false;
@@ -281,6 +511,8 @@ impl Workers {
         true
     }
     /// Inspect terminal evidence only after queued stream facts have been projected.
+    /// A report without retained authority follows journal disposal and process
+    /// cleanup. Explicit unlock failures are logged. Requesting [`Self::stop`] alone is not completion.
     pub fn report(&self, id: &str, generation: u64) -> Option<&Report> {
         self.entries
             .get(id)
@@ -290,6 +522,9 @@ impl Workers {
     /// Drain bounded batches and due observations. Old generations are cancelled
     /// and fenced by the pure registry; terminal reports cannot overtake stdout.
     pub fn poll(&mut self, registry: &mut Registry, now: Instant, unix_ms: u64) -> bool {
+        self.retained_queues.retain(|id, (generation, _)| {
+            registry.get(id).is_some_and(|(_, _, g)| g == *generation)
+        });
         let mut changed = false;
         for (id, worker) in &mut self.entries {
             if worker.finished {
@@ -299,18 +534,24 @@ impl Workers {
                 .get(id)
                 .is_none_or(|(_, _, g)| g != worker.generation)
             {
+                worker.live.finish(live::End::Retired);
                 worker.stop();
             }
-            for _ in 0..2 {
+            for _ in 0..3 {
                 if worker.report.is_some() {
                     break;
                 }
                 match worker.messages.try_recv() {
+                    Ok(Message::Leased) => {
+                        self.pending.remove(id);
+                    }
                     Ok(Message::Ready(runtime)) => {
+                        self.history
+                            .insert(id.clone(), (worker.generation, runtime.history.clone()));
                         if worker.stop.requested() {
                             runtime.stop();
                         }
-                        worker.runtime = Some(runtime);
+                        worker.runtime = Some(*runtime);
                         changed |= worker.reduce(
                             registry,
                             id,
@@ -319,8 +560,12 @@ impl Workers {
                             unix_ms,
                         );
                     }
-                    Ok(Message::End(report)) => worker.report = Some(report),
+                    Ok(Message::End(report)) => {
+                        self.pending.remove(id);
+                        worker.report = Some(report);
+                    }
                     Err(mpsc::TryRecvError::Disconnected) => {
+                        self.pending.remove(id);
                         worker.stop();
                         worker.report = Some(Report {
                             result: Err((
@@ -339,6 +584,7 @@ impl Workers {
                 };
                 match runtime.try_receive() {
                     Ok(received) => {
+                        worker.queue_seq = received.record.seq;
                         if let Some(input) = received.state_input() {
                             changed |= worker.reduce(
                                 registry,
@@ -347,6 +593,12 @@ impl Workers {
                                 now,
                                 received.record.received_at_ms.min(u128::from(u64::MAX)) as u64,
                             );
+                        }
+                        if registry
+                            .get(id)
+                            .is_some_and(|(_, _, g)| g == worker.generation)
+                        {
+                            worker.live.observe(&received);
                         }
                         if index + 1 == BATCH {
                             self.notify.notify_one();
@@ -363,6 +615,21 @@ impl Workers {
                 g == worker.generation && view.update.observe_at.is_some_and(|at| at <= now)
             }) {
                 changed |= worker.reduce(registry, id, Input::Observe, now, unix_ms);
+            }
+            if let Some((_, view, _)) = registry.get(id).filter(|(_, _, g)| *g == worker.generation)
+            {
+                let state = queue::Snapshot {
+                    state: view.update.state.clone(),
+                    through: worker.queue_seq,
+                };
+                if worker.queue_state.as_ref() != Some(&state)
+                    && worker
+                        .runtime
+                        .as_ref()
+                        .is_some_and(|runtime| runtime.queue_state(state.clone()))
+                {
+                    worker.queue_state = Some(state);
+                }
             }
             if let Some(report) = worker
                 .report
@@ -388,17 +655,26 @@ impl Workers {
                     self.notify.notify_one();
                     continue;
                 }
+                worker.live.finish(live::End::ProducerEnded);
                 worker.finished = true;
-                worker.runtime = None;
+                // Retain bounded terminal cuts until the consumer drains or relaunches.
+                // Runtime authority is already closed; runtime() refuses finished entries.
                 changed = true;
             }
         }
-        // Removed records need no completed handle; uncertain ownership must survive.
+        self.history.retain(|id, (generation, _)| {
+            registry.get(id).is_some_and(|(_, _, g)| g == *generation)
+        });
+        // Keep worker entries with committed completions or uncertain ownership after metadata removal.
         self.entries.retain(|id, worker| {
             worker.join_finished();
             worker.thread.is_some()
                 || !worker.finished
                 || registry.get(id).is_some()
+                || worker
+                    .runtime
+                    .as_ref()
+                    .is_some_and(Runtime::retired_queue_facts)
                 || worker
                     .report
                     .as_ref()
@@ -412,7 +688,7 @@ impl Workers {
     /// cleanup interval. Diagnostics are cached and reported without vetoing handoff.
     /// Uncertain records cross handoff as Unknown; this call never retries teardown.
     pub fn shutdown(&mut self, registry: &mut Registry) -> Result<(), ShutdownError> {
-        self.shutdown_until(registry, Duration::from_secs(10), Duration::from_secs(10))
+        self.shutdown_until(registry, SHUTDOWN_GRACE, SHUTDOWN_CLEANUP)
     }
     fn shutdown_until(
         &mut self,

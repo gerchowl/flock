@@ -122,7 +122,12 @@ use serde::{Deserialize, Serialize};
 /// reason in a pane with one.
 /// v30 also adds `wait.park` (#1031), gated by #868.
 /// v31 adds local-operator client credentials and browser handoff (#1827).
-pub const PROTOCOL_VERSION: u32 = 31;
+/// v32 preserves node identity in carried FleetPeer snapshots (#1076).
+/// v33 adds `rebind_agent_id` to the JSON session-report API and the
+/// `session_unbound` error. A v32 server ignores the unknown guard field, so
+/// recovery mutations require a v33 server. TUI attachment requires an exact
+/// protocol match; JSON API hooks retain their separate skew exemptions.
+pub const PROTOCOL_VERSION: u32 = 33;
 
 /// Refusal notice sent to clients while a live update handoff is in
 /// progress. Clients recognize this exact string (in a rejection `Welcome`
@@ -212,6 +217,8 @@ pub struct FleetSnapshot {
 /// by an age in seconds at capture time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FleetPeer {
+    /// Stable mesh node identity; absent only for unverified legacy rows.
+    pub node_id: Option<String>,
     /// Peer name from the hub's config (display fallback).
     pub name: String,
     /// SSH destination for switch-on-select.
@@ -372,7 +379,7 @@ impl From<crate::api::schema::PeerAgentSummary> for FleetAgent {
         Self {
             agent_id: agent.agent_id,
             pane_id: agent.pane_id,
-            agent: agent.agent,
+            agent: crate::terminal::agent_name::received(agent.agent, "mesh"),
             status: agent.status,
         }
     }
@@ -387,7 +394,7 @@ impl From<crate::api::schema::PeerWorkspaceSummary> for FleetWorkspace {
             project_label: ws.project_label,
             branch: ws.branch,
             is_linked_worktree: ws.is_linked_worktree,
-            agent: ws.agent,
+            agent: crate::terminal::agent_name::received(ws.agent, "mesh"),
             status: ws.status,
             status_age_secs: ws.status_age_secs,
             activity: ws.activity,
@@ -401,7 +408,7 @@ impl From<FleetAgent> for crate::api::schema::PeerAgentSummary {
         Self {
             agent_id: agent.agent_id,
             pane_id: agent.pane_id,
-            agent: agent.agent,
+            agent: crate::terminal::agent_name::received(agent.agent, "mesh"),
             status: agent.status,
         }
     }
@@ -416,7 +423,7 @@ impl From<FleetWorkspace> for crate::api::schema::PeerWorkspaceSummary {
             project_label: ws.project_label,
             branch: ws.branch,
             is_linked_worktree: ws.is_linked_worktree,
-            agent: ws.agent,
+            agent: crate::terminal::agent_name::received(ws.agent, "mesh"),
             status: ws.status,
             status_age_secs: ws.status_age_secs,
             activity: ws.activity,
@@ -1073,7 +1080,7 @@ pub enum VersionCheck {
 ///
 /// Current rules:
 /// - Version 0 (pre-persistence client) is always rejected.
-/// - Matching major versions are accepted.
+/// - Exactly matching protocol versions are accepted.
 /// - A client with a newer version than the server is rejected.
 /// - A client with an older version than the server is rejected
 ///   (backward compatibility is not yet supported).
@@ -1107,6 +1114,53 @@ mod tests {
     use ratatui::style::{Color, Modifier};
 
     // ---- Round-trip: ClientMessage ----
+
+    #[test]
+    fn security_agent_name_binary_wire_keeps_layout_but_drops_bad_names() {
+        let mut failures = Vec::new();
+        for (case, name) in crate::test_support::hostile_agent_names() {
+            let raw = FleetAgent {
+                agent_id: "agent-fixture".into(),
+                pane_id: "pane-fixture".into(),
+                agent: Some(name),
+                status: crate::api::schema::AgentStatus::Idle,
+            };
+            let bytes = bincode::serde::encode_to_vec(&raw, bincode::config::standard()).unwrap();
+            let (decoded, _): (FleetAgent, usize) =
+                bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+            let summary: crate::api::schema::PeerAgentSummary = decoded.into();
+            if summary.agent.is_some() {
+                failures.push(case);
+            }
+            let workspace = FleetWorkspace {
+                id: "workspace-fixture".into(),
+                workspace: "fixture".into(),
+                project_key: None,
+                project_label: None,
+                branch: None,
+                is_linked_worktree: false,
+                agent: raw.agent.clone(),
+                status: crate::api::schema::AgentStatus::Idle,
+                status_age_secs: None,
+                activity: None,
+                agents: vec![raw],
+            };
+            let bytes =
+                bincode::serde::encode_to_vec(&workspace, bincode::config::standard()).unwrap();
+            let (decoded, _): (FleetWorkspace, usize) =
+                bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+            let workspace: crate::api::schema::PeerWorkspaceSummary = decoded.into();
+            if workspace.agent.is_some() || workspace.agents[0].agent.is_some() {
+                failures.push(case);
+            }
+            assert_eq!(summary.agent_id, "agent-fixture");
+        }
+        assert!(
+            failures.is_empty(),
+            "retained wire name cases: {failures:?}"
+        );
+        assert_eq!(crate::mesh::hello::VERSION, 5);
+    }
 
     #[test]
     fn client_hello_roundtrip() {
@@ -1235,6 +1289,7 @@ mod tests {
         FleetSnapshot {
             origin: "hopper".to_owned(),
             peers: vec![FleetPeer {
+                node_id: Some("0123456789abcdef".repeat(4)),
                 name: "kiln".to_owned(),
                 ssh_target: "operator@kiln".to_owned(),
                 host: Some("kiln".to_owned()),
@@ -1279,6 +1334,7 @@ mod tests {
                 icon: Some("anvil".to_owned()),
             }],
             origin_summary: Some(Box::new(FleetPeer {
+                node_id: Some("0123456789abcdef".repeat(4)),
                 name: "hopper".to_owned(),
                 ssh_target: HOME_SWITCH_TARGET.to_owned(),
                 host: Some("hopper".to_owned()),
@@ -1780,6 +1836,19 @@ mod tests {
         assert_eq!(msg, decoded);
     }
 
+    #[test]
+    fn server_identity1076_protocol_31_snapshot_is_refused() {
+        assert!(matches!(
+            check_client_version(31),
+            VersionCheck::Incompatible(_)
+        ));
+        assert!(matches!(
+            check_client_version(32),
+            VersionCheck::Incompatible(_)
+        ));
+        assert!(matches!(check_client_version(33), VersionCheck::Compatible));
+    }
+
     // ---- Version negotiation ----
 
     #[test]
@@ -1863,7 +1932,7 @@ mod tests {
     // PINNED_PROTOCOL_VERSION and paste the refreshed GOLDEN table (the failing
     // test prints it paste-ready).
 
-    const PINNED_PROTOCOL_VERSION: u32 = 31;
+    const PINNED_PROTOCOL_VERSION: u32 = 33;
 
     fn fnv1a(bytes: &[u8]) -> u64 {
         let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
@@ -2092,7 +2161,7 @@ mod tests {
             ("Clipboard", 0x40c41ce0c93f16c9),
             ("ReloadSoundConfig", 0xaf63ba4c8601b2c6),
             ("MouseCapture", 0x084db707b5028782),
-            ("SwitchServer", 0xbaea5f0b8386b93e),
+            ("SwitchServer", 0x56483359caf4ac4c),
             ("SetWindowTitle", 0x942464eba5877d51),
         ];
 

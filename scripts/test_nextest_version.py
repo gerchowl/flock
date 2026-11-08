@@ -29,7 +29,7 @@ class SharedPin(unittest.TestCase):
         source = (ROOT / "nix/nextest.nix").read_text()
         assignments = re.findall(r'^\s*version\s*=\s*(.+);', source, re.MULTILINE)
         self.assertEqual(assignments, [NIX_READ])
-        self.assertIn('(callPackage ./nix/nextest.nix { })', (ROOT / 'flake.nix').read_text())
+        self.assertIn('(pkgs.callPackage ./nix/nextest.nix { })', (ROOT / 'flake.nix').read_text())
 
     def test_nix_source_cache_identity_includes_version(self):
         source = (ROOT / "nix/nextest.nix").read_text()
@@ -62,6 +62,15 @@ class SharedPin(unittest.TestCase):
                     with self.subTest(workflow=path.name, job=name):
                         self.assert_install_pin(steps, index)
         self.assertEqual(found, [("ci-leg.yml", "build"), ("ci-leg.yml", "test"), ("preview.yml", "preflight")])
+
+    def test_archive_consumer_uses_prebuilt_shared_pin(self):
+        steps = workflow("ci-leg.yml")["jobs"]["test"]["steps"]
+        run = next(s["run"] for s in steps if s.get("name") == "Run shard")
+        self.assertTrue(run.startswith("nix develop .#ci-lint -c just ci-shard "))
+        index = next(i for i, step in enumerate(steps)
+                     if "cargo-nextest" in step.get("with", {}).get("tool", ""))
+        self.assert_install_pin(steps, index)
+        self.assertLess(index, next(i for i, step in enumerate(steps) if step.get("name") == "Run shard"))
 
     def test_unpinned_literal_and_wrong_output_versions_fail(self):
         steps = workflow("ci-leg.yml")["jobs"]["build"]["steps"]

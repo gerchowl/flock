@@ -6,18 +6,18 @@ use crate::structured::launch::SessionConfigDir;
 use serde_json::json;
 use std::{fs, io::Write};
 
-struct Fixture {
-    root: SessionConfigDir,
-    path: std::path::PathBuf,
+pub(super) struct Fixture {
+    pub(super) root: SessionConfigDir,
+    pub(super) path: std::path::PathBuf,
 }
 impl Fixture {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
         let path = root.path().join("rollout.jsonl");
         fs::write(&path, line(json!({"type":"session_meta","payload":{"id":"child","cli_version":TESTED_VERSION}}))).unwrap();
         Self { root, path }
     }
-    fn append(&self, bytes: &[u8]) {
+    pub(super) fn append(&self, bytes: &[u8]) {
         fs::OpenOptions::new()
             .append(true)
             .open(&self.path)
@@ -35,7 +35,7 @@ impl Fixture {
         }
         panic!("snapshot did not reach EOF");
     }
-    fn validated(&self, key: &Key) -> Result<Validated, Failure> {
+    pub(super) fn validated(&self, key: &Key) -> Result<Validated, Failure> {
         let writer = Writer {
             pid: std::process::id(),
             birth: crate::platform::process_start_time(std::process::id()).unwrap(),
@@ -59,29 +59,29 @@ impl Fixture {
         )
     }
 }
-fn limits() -> Limits {
+pub(super) fn limits() -> Limits {
     Limits {
         work_bytes: 1024 * 1024,
         record_bytes: 4096,
         turn_ids: 64,
     }
 }
-fn owner() -> Owner {
+pub(super) fn owner() -> Owner {
     Owner {
         node: "segment.example".into(),
         pane: "fixture".into(),
     }
 }
-fn key(b: &mut Binding) -> Key {
+pub(super) fn key(b: &mut Binding) -> Key {
     b.begin(&owner(), b.launch_generation(), "child".into())
         .unwrap()
 }
-fn line(value: Value) -> Vec<u8> {
+pub(super) fn line(value: Value) -> Vec<u8> {
     let mut bytes = serde_json::to_vec(&value).unwrap();
     bytes.push(b'\n');
     bytes
 }
-fn event(kind: &str, id: &str) -> Vec<u8> {
+pub(super) fn event(kind: &str, id: &str) -> Vec<u8> {
     line(json!({"type":"event_msg","payload":{"type":kind,"turn_id":id}}))
 }
 fn delimiter(thread: &str) -> Vec<u8> {

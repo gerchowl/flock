@@ -9,8 +9,10 @@
 //!
 //! Double-click copy also briefly highlights the selected word.
 //!
-//! Rows are stored in screen-buffer coordinates instead of viewport-relative
-//! coordinates. That keeps selection stable while the pane scrolls.
+//! Rows are captured in screen-buffer coordinates with a content revision.
+//! Runtime-owned grid references follow surviving content through scrolling
+//! and reflow. Copy re-reads those references and visibly refuses eviction
+//! (ADR-0040 §1).
 
 use ratatui::layout::Rect;
 use std::{ffi::OsStr, io::Write};
@@ -57,9 +59,37 @@ pub struct Selection {
     phase: Phase,
     /// Which surface this selection was anchored against.
     pub source: SelectionSource,
+    /// Runtime-owned content revision, never a borrowed terminal pointer.
+    pub(crate) content_revision: Option<u64>,
+    capture_origin: Option<u32>,
 }
 
 impl Selection {
+    /// Snapshot the directed endpoint coordinates.
+    pub(crate) fn endpoints(&self) -> [(u32, u16); 2] {
+        [self.anchor, self.cursor]
+    }
+
+    /// Install freshly resolved content coordinates.
+    pub(crate) fn set_endpoints(&mut self, points: [(u32, u16); 2]) {
+        [self.anchor, self.cursor] = points;
+        self.capture_origin = None;
+    }
+
+    /// Remember the viewport used to compute a pending capture.
+    pub(crate) fn with_viewport_origin(mut self, metrics: Option<ScrollMetrics>) -> Self {
+        self.capture_origin = Some(viewport_top_row(metrics));
+        self
+    }
+
+    /// Project a pending capture into the viewport under the parser lock.
+    pub(crate) fn rebase_capture(&mut self, origin: u32) {
+        if let Some(old) = self.capture_origin.take() {
+            self.anchor.0 = self.anchor.0.saturating_sub(old).saturating_add(origin);
+            self.cursor.0 = self.cursor.0.saturating_sub(old).saturating_add(origin);
+        }
+    }
+
     /// Start a potential selection. This records the anchor but doesn't
     /// make anything visible yet — the user might just be clicking.
     pub fn anchor(
@@ -75,6 +105,8 @@ impl Selection {
             cursor: anchor,
             phase: Phase::Anchored,
             source: SelectionSource::default(),
+            content_revision: None,
+            capture_origin: Some(viewport_top_row(metrics)),
         }
     }
 
@@ -101,6 +133,8 @@ impl Selection {
             cursor: (row, end_col),
             phase: Phase::Dragging,
             source: SelectionSource::default(),
+            content_revision: None,
+            capture_origin: Some(viewport_top_row(metrics)),
         }
     }
 
@@ -121,6 +155,8 @@ impl Selection {
             cursor: (cursor_row, cursor_col),
             phase: Phase::Dragging,
             source: SelectionSource::default(),
+            content_revision: None,
+            capture_origin: None,
         }
     }
 

@@ -34,6 +34,7 @@ struct Invocation {
     target: Option<PathBuf>,
     server: Option<ServerVersion>,
     probed: bool,
+    timeout_started: Option<std::time::Instant>,
     // Refuse state-changing requests to an older server (#868).
     gate: bool,
     warn: Option<fn(&ServerVersion)>,
@@ -85,17 +86,20 @@ fn cached(path: &Path) -> Option<Option<ServerVersion>> {
     })
 }
 
-fn probe(client: &ApiClient) -> Option<ServerVersion> {
+pub(super) fn probe(
+    client: &ApiClient,
+) -> Result<Option<ServerVersion>, super::client::ApiClientError> {
     let response = client
-        .request_value_with_timeout(
+        .with_class(crate::api::client::RequestClass::ReadOrIdempotent)
+        .request_value_retrying(
             &Request {
                 id: "api:compatibility".into(),
                 method: Method::Ping(PingParams::default()),
             },
             Duration::from_millis(500),
-        )
-        .ok()?;
-    parse_ping(&response)
+            Some(std::time::Instant::now() + Duration::from_millis(500)),
+        )?;
+    Ok(parse_ping(&response))
 }
 
 fn parse_ping(response: &Value) -> Option<ServerVersion> {
@@ -155,38 +159,102 @@ fn record_failure(path: &Path, server: &ServerVersion) {
 /// and the refusal lands before anything is allocated. Only a CLI invocation
 /// that asked for the gate is checked: `flk server` and `flk status` must keep
 /// reaching an older server, since handing it off is the fix, and a server
-/// whose version cannot be read is let through to fail as it would have.
-pub fn refuse_skew(client: &ApiClient, request: &Request) -> Option<Value> {
+/// whose version cannot be read is let through to fail as it would have,
+/// except that a transport deadline is surfaced before dispatching a mutation.
+pub fn refuse_skew(
+    client: &ApiClient,
+    request: &Request,
+) -> Result<Option<Value>, super::client::ApiClientError> {
     if !request.method.needs_current_protocol() {
-        return None;
+        return Ok(None);
     }
     let path = client.socket_path();
     let gated = INVOCATION.with_borrow(|state| state.gate && state.target.as_ref() == Some(&path));
     if !gated {
-        return None;
+        return Ok(None);
     }
-    let server = server_version(client)?;
+    let Some(server) = server_version_result(client)? else {
+        return Ok(None);
+    };
     if server.protocol >= crate::protocol::PROTOCOL_VERSION {
-        return None;
+        return Ok(None);
     }
     record_failure(&path, &server);
-    Some(serde_json::json!({
+    Ok(Some(serde_json::json!({
         "id": request.id,
         "error": {"code": ERROR_CODE, "message": server.message()},
-    }))
+    })))
 }
 
 pub fn server_version(client: &ApiClient) -> Option<ServerVersion> {
+    server_version_result(client).ok().flatten()
+}
+
+fn server_version_result(
+    client: &ApiClient,
+) -> Result<Option<ServerVersion>, super::client::ApiClientError> {
     let path = client.socket_path();
-    if let Some(server) = cached(&path) {
-        return server;
+    let timeout = INVOCATION.with_borrow(|state| {
+        (state.target.as_ref() == Some(&path))
+            .then_some(state.timeout_started)
+            .flatten()
+    });
+    if let Some(started) = timeout {
+        return Err(super::deadline::DeadlineStream::timeout_at(&path, started).into());
     }
-    let server = probe(client);
+    if let Some(server) = cached(&path) {
+        return Ok(server);
+    }
+    let started = std::time::Instant::now();
+    let server = match probe(client) {
+        Err(super::client::ApiClientError::Io(error))
+            if error.kind() == std::io::ErrorKind::TimedOut =>
+        {
+            INVOCATION.with_borrow_mut(|state| {
+                if state.target.as_ref() == Some(&path) {
+                    state.timeout_started = Some(started);
+                }
+            });
+            return Err(error.into());
+        }
+        // Optional version diagnosis keeps the original error without evidence
+        // of skew. A deadline, unlike unavailable evidence, must remain visible.
+        result => result.ok().flatten(),
+    };
     INVOCATION.with_borrow_mut(|state| {
         if state.target.as_ref() == Some(&path) {
             state.probed = true;
             state.server = server.clone();
         }
     });
-    server
+    Ok(server)
+}
+
+/// An absent or malformed capability never permits a structured selector.
+pub(crate) fn advertises_structured(pong: &Value) -> bool {
+    pong.pointer("/result/capabilities/structured_agents")
+        .and_then(Value::as_bool)
+        == Some(true)
+}
+
+#[cfg(test)]
+mod structured_tests {
+    #[test]
+    fn structured_capability_is_explicit_and_defaults_to_refusal() {
+        for caps in [
+            serde_json::json!({}),
+            serde_json::json!({"structured_agents":false}),
+            serde_json::json!({"structured_agents":"true"}),
+        ] {
+            assert!(!super::advertises_structured(
+                &serde_json::json!({"result":{"capabilities":caps}})
+            ));
+        }
+        assert!(super::advertises_structured(
+            &serde_json::json!({"result":{"capabilities":{"structured_agents":true}}})
+        ));
+        let legacy: crate::api::schema::ServerCapabilities =
+            serde_json::from_value(serde_json::json!({"live_handoff":false})).unwrap();
+        assert!(!legacy.structured_agents);
+    }
 }
