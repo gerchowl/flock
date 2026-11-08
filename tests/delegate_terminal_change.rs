@@ -17,6 +17,7 @@ enum SessionCase {
     Normal,
     ConflictingRecord,
     ConflictingResult,
+    ConflictAtReady,
     AmbiguousClaude,
     Protocol32,
 }
@@ -116,6 +117,7 @@ impl Fixture {
         let stopped = stop.clone();
         let worker = std::thread::spawn(move || {
             let mut first = true;
+            let mut gets = 0;
             let mut bound = empty_result || legacy || conflict;
             while !stopped.load(Ordering::SeqCst) {
                 let Ok((mut stream, _)) = listener.accept() else {
@@ -144,8 +146,10 @@ impl Fixture {
                     "agent.get" => {
                         let old = first && during_wait;
                         first = false;
+                        gets += 1;
                         let mut observed = session.clone();
-                        if conflict && !old {
+                        if (conflict && !old) || (case == SessionCase::ConflictAtReady && gets > 3)
+                        {
                             observed["value"] = json!("session-replacement");
                         }
                         json!({"result":{"agent":{"name":"fixture","agent_id":"agent_fixture.example_2993",
@@ -261,6 +265,11 @@ fn result_rebinds_exact_codex_session() {
     Fixture::new(true, false).assert("result", 0, "DONE: rebound");
 }
 #[test]
+fn send_rebinds_before_submission() {
+    Fixture::new(true, false).assert("send", 0, "\"round\":2");
+}
+
+#[test]
 fn result_liveness_follows_identity_when_terminal_changes_after_lookup() {
     Fixture::serve(true, true, true).assert("result", 0, "running");
 }
@@ -268,7 +277,7 @@ fn result_liveness_follows_identity_when_terminal_changes_after_lookup() {
 #[test]
 fn legacy_same_cwd_cannot_return_another_agents_reply() {
     let fixture = Fixture::scenario(false, false, false, true);
-    for verb in ["result", "wait"] {
+    for verb in ["result", "wait", "send"] {
         fixture.assert(verb, 12, "session_unbound");
         let home = fixture.dir.path().join("home");
         let registry = home
@@ -285,7 +294,7 @@ fn legacy_same_cwd_cannot_return_another_agents_reply() {
 
 #[test]
 fn conflicting_observed_session_preserves_launch_record() {
-    for verb in ["result", "wait"] {
+    for verb in ["result", "wait", "send"] {
         let fixture = Fixture::case(true, false, false, false, SessionCase::ConflictingRecord);
         let registry = fixture
             .dir
@@ -338,8 +347,25 @@ fn recovery_guard_requires_protocol_33_server() {
 }
 
 #[test]
+fn send_conflict_at_readiness_does_not_advance_the_round() {
+    let fixture = Fixture::case(true, false, false, false, SessionCase::ConflictAtReady);
+    fixture.assert("send", 12, "session_unbound");
+    let registry = fixture
+        .dir
+        .path()
+        .join("home/state")
+        .join(support::paths::app_dir_name())
+        .join("delegates")
+        .join(support::paths::server_key(&fixture.socket))
+        .join("fixture.json");
+    let entry: Value = serde_json::from_slice(&std::fs::read(registry).unwrap()).unwrap();
+    assert_eq!(entry["round"], 1);
+    assert_eq!(entry["session"]["value"], "session-2993");
+}
+
+#[test]
 fn ambiguous_claude_profile_and_default_session_is_unbound() {
-    for verb in ["wait", "result"] {
+    for verb in ["wait", "result", "send"] {
         Fixture::case(true, false, false, false, SessionCase::AmbiguousClaude).assert(
             verb,
             12,

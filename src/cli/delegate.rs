@@ -4133,7 +4133,25 @@ fn delegate_wait_for_ready(
 /// Submit a persisted send round without rolling uncertainty back to the prior round.
 fn submit_send_brief(entry: &Entry, original: &Entry, sentence: &str, json: bool) -> Option<i32> {
     let name = &entry.name;
-    if let Err(reason) = submit_brief(&entry.pane_id, sentence, None) {
+    let submitted =
+        if let Some(session) = entry.session.as_ref().and_then(|raw| field(raw, "value")) {
+            bounded_submit(
+                Method::PaneSubmit(PaneSubmitParams {
+                    self_submit_confirmed: None,
+                    pane_id: entry
+                        .agent_id
+                        .clone()
+                        .unwrap_or_else(|| entry.pane_id.clone()),
+                    text: sentence.to_owned(),
+                    if_session: Some(session.to_owned()),
+                    min_age_secs: 0,
+                }),
+                None,
+            )
+        } else {
+            submit_brief(&entry.pane_id, sentence, None)
+        };
+    if let Err(reason) = submitted {
         if matches!(reason, SubmitFailure::Gone) {
             // The round never started, so the record goes back to the last one
             // that did, which is what `status` and `reap` then answer from.
@@ -4222,6 +4240,11 @@ fn delegate_send(args: &[String]) -> io::Result<i32> {
     // The whole entry, kept. A round that fails to submit has to put the file
     // back the way it found it, and decrementing one field of a mutated copy is
     // how a brief path from the failed round ends up recorded as the live one.
+    if session::changed(&entry) {
+        if let Err(reason) = session::prepare(&mut entry, None) {
+            return Ok(session::unbound(&entry, &reason, flags.json));
+        }
+    }
     let original = entry.clone();
 
     let ready_timeout = flags
@@ -4255,6 +4278,9 @@ fn delegate_send(args: &[String]) -> io::Result<i32> {
         }
     };
 
+    if session::conflicts(&entry, &record) {
+        return Ok(session::unbound(&entry, session::CONFLICT, flags.json));
+    }
     let cursor = match cursor_of(&record) {
         Ok(cursor) => cursor,
         Err(reason) => return Ok(fail(reason)),
@@ -4310,7 +4336,10 @@ fn await_prompt(
 ) -> Result<serde_json::Value, ReadyFailure> {
     let mut last_status: Option<String> = None;
     loop {
-        match agent_record(&entry.terminal_id, Some(deadline)) {
+        match agent_record(
+            entry.agent_id.as_deref().unwrap_or(&entry.terminal_id),
+            Some(deadline),
+        ) {
             AgentFetch::Found(record) => {
                 // A missing cursor belongs to the compatibility diagnosis, which
                 // must run before any lock-screen I/O against an older server.

@@ -47,6 +47,7 @@ pub(crate) struct Attempt {
     pub(crate) retried: bool,
     wake: bool,
     session: Option<String>,
+    transcript_submit: Option<crate::session_evidence::Submission>,
     settle: Duration,
     /// The operator's draft, moved aside for this injection (#850).
     pub(crate) stash: Option<DraftStash>,
@@ -870,6 +871,10 @@ impl App {
             retried: false,
             wake,
             session: session.map(str::to_owned),
+            transcript_submit: super::creation::terminal_agent_session_info(terminal)
+                .as_ref()
+                .filter(|info| session == Some(info.value.as_str()))
+                .and_then(crate::session_evidence::Submission::capture),
             settle,
             stash: draft.map(|draft| DraftStash {
                 draft,
@@ -967,6 +972,14 @@ impl App {
         }
         if attempt.sent && reported {
             return Some(Outcome::Accepted);
+        }
+        if attempt.sent
+            && attempt
+                .transcript_submit
+                .as_ref()
+                .is_some_and(|proof| proof.started(&reported_text))
+        {
+            return Some(Outcome::ObservedAccepted);
         }
         if attempt.sent && started {
             return Some(Outcome::ObservedAccepted);
@@ -1526,6 +1539,7 @@ impl Attempt {
             retried: false,
             wake: false,
             session: None,
+            transcript_submit: None,
             settle: Duration::ZERO,
             stash: None,
         }
