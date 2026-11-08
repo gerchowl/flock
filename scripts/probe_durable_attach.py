@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import select
 import shutil
 import signal
 import socket
@@ -31,12 +32,60 @@ def wait_for(predicate, server, description, timeout=30):
     raise TimeoutError(f"silent producer: {description}")
 
 
-def request(path, method, params):
+def ready_until(peer, deadline, writing=False):
+    """Wait against one monotonic deadline, including after partial progress."""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("whole-response deadline expired")
+    readers, writers, _ = select.select(
+        [] if writing else [peer], [peer] if writing else [], [], remaining)
+    if time.monotonic() >= deadline or not (writers if writing else readers):
+        raise TimeoutError("whole-response deadline expired")
+
+
+def read_line_until(peer, deadline, limit=1024 * 1024):
+    """Read one bounded NDJSON response without an inactivity-timeout loophole."""
+    result = bytearray()
+    peer.setblocking(False)
+    while len(result) < limit:
+        ready_until(peer, deadline)
+        try:
+            data = peer.recv(min(65536, limit - len(result)))
+        except BlockingIOError:
+            continue
+        if time.monotonic() >= deadline:
+            raise TimeoutError("whole-response deadline expired")
+        if not data:
+            raise EOFError("response ended before newline")
+        result.extend(data)
+        if b"\n" in result:
+            return bytes(result).split(b"\n", 1)[0]
+    raise ValueError("response exceeds byte limit")
+
+
+def request(path, method, params, deadline):
     peer = socket.socket(socket.AF_UNIX)
-    peer.settimeout(20)
-    peer.connect(str(path))
-    peer.sendall((json.dumps({"id": "probe", "method": method, "params": params}) + "\n").encode())
-    return peer
+    try:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("request deadline expired before connect")
+        peer.settimeout(remaining)
+        peer.connect(str(path))
+        peer.setblocking(False)
+        data = memoryview((json.dumps({"id": "probe", "method": method, "params": params}) + "\n").encode())
+        while data:
+            ready_until(peer, deadline, writing=True)
+            try:
+                sent = peer.send(data)
+            except BlockingIOError:
+                continue
+            if sent == 0:
+                raise EOFError("request socket closed during send")
+            data = data[sent:]
+        return peer
+    except BaseException:
+        peer.close()
+        raise
 
 
 def attach(binary, env):
@@ -51,11 +100,10 @@ def attach(binary, env):
                              stderr=slave, start_new_session=True)
     os.close(slave)
     output = bytearray()
-    import select
     deadline = started + 7
     try:
         while time.monotonic() < deadline:
-            if select.select([master], [], [], 0.05)[0]:
+            if select.select([master], [], [], min(0.05, max(0, deadline - time.monotonic())))[0]:
                 try:
                     data = os.read(master, 65536)
                 except OSError:
@@ -63,6 +111,8 @@ def attach(binary, env):
                 if not data:
                     break
                 output.extend(data)
+                if time.monotonic() >= deadline:
+                    break
                 # Alternate-screen entry is after the Welcome handshake.
                 if b"\x1b[?1049h" in output:
                     return {"seconds": round(time.monotonic() - started, 3), "attached": True}
@@ -124,9 +174,10 @@ def main():
                 wait_for(lambda: list(root.rglob("flock.sock")), server, "API socket")
                 api = next(root.rglob("flock.sock"))
                 # Wait for the real API to answer, not merely a socket inode.
-                with request(api, "ping", {}) as peer:
-                    reply = peer.recv(65536)
-                    if not reply or b'"error"' in reply:
+                readiness_deadline = time.monotonic() + 20
+                with request(api, "ping", {}, readiness_deadline) as peer:
+                    reply = json.loads(read_line_until(peer, readiness_deadline))
+                    if "error" in reply:
                         raise RuntimeError("API readiness refused")
                 logs = list(root.rglob("event-log.jsonl"))
                 if len(logs) != 1 or str(logs[0]) != server_env["PROBE_SYNC_TARGET"]:
@@ -135,13 +186,16 @@ def main():
                 if not baseline["attached"]:
                     raise RuntimeError(f"control attach failed: {baseline}")
                 arm.touch()
-                trigger = request(api, "workspace.create", {"cwd": str(root), "focus": False})
                 started = time.monotonic()
+                trigger_deadline = started + 20
+                trigger = request(api, "workspace.create", {"cwd": str(root), "focus": False},
+                                  trigger_deadline)
                 wait_for(lambda: entered.exists() and entered.read_text() in ("main", "worker"),
-                         server, "interposed event-log fsync", timeout=15)
+                         server, "interposed event-log fsync",
+                         timeout=min(15, max(0, trigger_deadline - time.monotonic())))
                 stalled = attach(binary, env)
                 # Verify the trigger eventually finishes, even after a timeout.
-                response = trigger.makefile("rb").readline(1024 * 1024)
+                response = read_line_until(trigger, trigger_deadline)
                 if not response or "error" in json.loads(response):
                     raise RuntimeError("trigger closed without a response")
                 result = {"platform": platform.system(), "injected_sync_seconds": 8,
