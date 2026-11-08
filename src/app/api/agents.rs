@@ -508,6 +508,7 @@ impl App {
             id,
             ResponseResult::AgentResult {
                 result: AgentResultInfo {
+                    terminal_id: Some(resolved.terminal_id.clone()),
                     pane_id: self
                         .public_pane_id(resolved.ws_idx, resolved.pane_id)
                         .unwrap_or_else(|| params.target.clone()),
@@ -1377,6 +1378,7 @@ mod tests {
 
         let info = result_info(&result(&mut app, &target, None, None));
         assert_eq!(info.agent, "claude");
+        assert_eq!(info.terminal_id.as_deref(), Some(target.as_str()));
         assert!(info.finished);
         assert_eq!(info.status.as_deref(), Some("done"));
         assert_eq!(info.status_text.as_deref(), Some("PR #12 merged"));

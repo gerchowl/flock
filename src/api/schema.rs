@@ -1071,6 +1071,10 @@ pub const AGENT_RESULT_MAX_CHARS: u32 = 64 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentResultInfo {
     pub pane_id: String,
+    /// Terminal resolved together with the session used for this read.
+    /// Older servers omit this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_id: Option<String>,
     pub workspace_id: String,
     /// `claude` or `opencode`: whose store the reply was read from.
     pub agent: String,
@@ -6409,7 +6413,7 @@ mod tests {
             r#"{"id":"recovery","error":{"code":"session_unbound","message":"missing launch evidence"}}"#,
         ).unwrap();
         assert_eq!(error.error.code, "session_unbound");
-        assert_eq!(crate::cli::error_code_exit(&error.error.code, false), 1);
+        assert_eq!(crate::cli::error_code_exit(&error.error.code, false), 12);
         // JSON error codes stay strings. Clients without a code in their local
         // registry retain its text and apply the generic unknown-error exit.
         let future: ErrorResponse = serde_json::from_str(
