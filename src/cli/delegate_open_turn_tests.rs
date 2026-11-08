@@ -36,6 +36,7 @@ fn entry(round: u64) -> Entry {
         base_sha: None,
         agent_id: None,
         lock_resolution: None,
+        session: None,
     }
 }
 
