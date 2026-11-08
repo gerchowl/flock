@@ -136,7 +136,7 @@ class ActionsCachePolicy(unittest.TestCase):
         steps = job['steps']
         run, = [s for s in steps if s.get('name') == 'Run shard']
         self.assertEqual(run['run'],
-                         "nix develop -c just ci-shard '${{ inputs.leg }}' "
+                         "nix develop .#ci-lint -c just ci-shard '${{ inputs.leg }}' "
                          "'${{ matrix.shard.name }}' nextest-archive.tar.zst")
         self.assertNotIn('if', run)
         # The Nix installer otherwise points TMPDIR under the runner's HOME.
