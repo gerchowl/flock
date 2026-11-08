@@ -252,7 +252,7 @@ mod tests {
     use crate::server::client_transport::ClientWriter;
 
     fn app_client_with_writer() -> ClientConnection {
-        let (control, _c) = std::sync::mpsc::channel();
+        let (control, _c) = crate::server::client_transport::ObserverControl::channel(None, 0);
         let (render, _r) = std::sync::mpsc::sync_channel(1);
         ClientConnection::new(
             (80, 24),
