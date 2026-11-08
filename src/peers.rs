@@ -3108,4 +3108,3 @@ Last login: banner noise
 mod legacy_summary;
 
 mod direct_claims;
-pub(crate) use direct_claims::filter_direct_claims;

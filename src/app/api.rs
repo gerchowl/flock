@@ -542,11 +542,7 @@ impl App {
                     }
                     crate::peers::merge_relayed_fleet(
                         &mut self.state.relayed_fleet_cache,
-                        crate::peers::filter_direct_claims(
-                            &self.state.peers,
-                            payload.relayed_fleet,
-                            &fetch.peer,
-                        ),
+                        payload.relayed_fleet,
                         &fetch.peer,
                         payload.node_id.as_deref(),
                         now,
@@ -645,6 +641,7 @@ impl App {
             // rendering, and keeps riding outgoing snapshots to other servers.
             // Only meaningful now that carried freshness decays.
             self.note_mesh_owners();
+            self.state.trace_redundant_relay_claims(&fetch.peer, now);
             self.state.evict_expired_relayed_entries();
             self.sync_directory_events();
             self.render_dirty.store(true, Ordering::Release);
