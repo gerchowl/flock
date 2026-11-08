@@ -2,6 +2,85 @@
 
 ## Unreleased
 
+## [3.4.0] - 2026-11-08
+
+### Fixed
+- Claude’s folder-trust prompt that pre-approves tool permissions is named `claude_folder_trust_with_permissions` (both known question/answer variants and cancel labels). Delegate start preserves its pane, checkout and round-0 record with `agent_blocked` (exit 6), and status/wait report the same operator-only block without answering it.
+- `delegate wait` and `--await` outcomes now set `startup_dialog` for every recognized blocked startup dialog, including plain Claude folder trust and Codex dialogs; the field is null when absent.
+- Reject duplicate field names when expanding sealed input metadata into JSON logs, strengthen input-field exclusion tests, and clarify that self-compaction continuation byte counts describe flock-authored text.
+- Share the journal’s explicit-unlock lease with mesh identity, delegate and token locks so inherited descriptors cannot retain completed operations.
+- Bound mesh identity bootstrap lock acquisition to two seconds and report retryable `session_busy` contention instead of waiting indefinitely.
+- Restore the active server’s last received window title when the local client re-enables titles, and use one local config snapshot throughout attach.
+- Keep one local config snapshot across attach, warm-slot, and switch-slot handshakes, including local keybindings.
+- Remote installation preserves local source read errors instead of misreporting them as retryable transfer checksum failures, while retaining remote diagnostics for write-side upload failures.
+- Refresh the local config snapshot after a successful client reload so later slot dials use the updated keybindings, while failed reloads retain the last valid snapshot.
+- Retaining a delegate at an operator-only startup dialog reports registry durability errors as typed `write_failed` failures (exit 1), naming the retained pane. Atomic publication leaves either the prior entry or a complete new entry, never a partial one.
+- Server daemons and live-handoff replacements share a canonical executable identity, preserving ownership checks after launch aliases change. Unresolvable targets refuse with `server_executable_unresolved` instead of falling back.
+- Use terminal and native storage indices to narrow pane-to-tab lookup, then validate layout membership before exposing a placement to callers.
+- Clear tab zoom when attaching a new native view so both sides of the split remain visible.
+- Refuse invalid pane targets before split, move, focus, or close, and ignore orphan death events without changing live layouts or agent identity.
+- The web client's selected agent row and the command palette's highlighted item now draw their text and status marks in white on the accent selection, as macOS does, and the link, status and destructive colours were adjusted slightly so they reach WCAG AA contrast (4.5:1) on every background they render on, in light, dark and increased-contrast modes. The contrast test now checks every colour on every surface, the token generator rejects off-grid spacing, and stylelint rejects redeclaring a design token outside the generated `tokens.css`.
+- Enforce design-token categories through CSS aliases, reject unknown references and fallbacks, and strengthen declaration and layout fences for client styles.
+- Reject raw paint in imported JSX spreads and unreviewed standalone SVG assets; accept statically resolvable token sums and differences in strict CSS values.
+- Reject client HTML markup injection through JSX props and DOM parsing or writing APIs, closing SVG presentation-attribute paint bypasses.
+- Allow immediate queue journal reopen after a structured worker stops, including during concurrent process creation for restart or handoff.
+- The web client's composer no longer sends while an input method is still composing (CJK and other IME input); no shortcut acts until the composition ends.
+- Recognize Codex's empty composer through Braille particle decoration so delegate start and send can submit, while preserving quoted hints and multiline drafts, including Braille-only input.
+- Stop hooks no longer block turn completion demanding inbox reads that caller authority checks refuse. A nonblocking notice appears once per refusal episode, with the operator inbox-read workaround. Also addresses the Stop-hook loop reported in #2964; legacy process re-attestation remains tracked in #3000.
+- Self-compaction without a pane now reports `caller_pane_unresolved`, explains missing caller identity evidence and gives explicit MCP and CLI pane-selection syntax. Delegate listing explains the same identity refusal with architect-selection options. Legacy handoff attestation requirements remain unchanged.
+
+### Maintenance
+- Guard the operator resume retry test's shell cleanup during assertion failures and pin its thread-local log capture to the current-thread runtime.
+- Strengthen retained startup-dialog tests with a prior regular-file registry entry, panic-safe output cleanup, event-driven screen waits, and bounded log polling.
+- Pin pane lookup index filtering with structural tree-access checks while preserving layout membership validation.
+- Make native structured placement tests use a compliant persistent worker and wait for runtime-accepted init, eliminating races against an intentionally refused socket fixture (#2840).
+- Update 16 Cargo dependencies, adapting system information failures, queue locking, SQLite quarantine archival and guarded command syntax audits while preserving mesh identity and signature bytes.
+- The web client has design tokens (DTCG files compiled by Style Dictionary into `tokens.css` for light, dark and increased contrast), stylelint and ESLint rules that keep raw values, ad-hoc layout and inline styles out of new client code, and six typed layout primitives. The GUI looks the same; `web/DESIGN.md` documents the rules.
+- The web client has a design-conformance suite: a Playwright test that checks every rendered element of a new component gallery and of the workbench against nine measurable Apple HIG and WCAG rules (palette, type, contrast, hit size, the 4 px grid, materials, reduced motion, keyboard and structure) in light, dark and increased-contrast modes, with axe-core alongside. Esc on the command palette now returns focus to the control that had it.
+- `web/baseline/` measures the web client's design against public pages of well-designed productivity apps (type, spacing, colour counts, radii, control and row heights, focus styles, and two AIM-style complexity and alignment metrics), and its report proposes budget tests and token calibrations for the client's design gates. It is a hand-run measurement tool; nothing in the shipped client changes.
+- Record the owner’s ADR-0049 decisions on default delegation, expiry, the shared checkpoint budget, workflow launch authority, initial shadow workflows and rerouted prompts, and clarify scoped sub-delegation.
+- Audit CSS through the client build graph, expand source lint coverage, and reject runtime style and design gate suppression bypasses (#2933).
+- Reject ignored dependency stylesheets and indirect DOM styling through a restricted design type check; validate imported application modules and pin linter configuration (#2933).
+- Reject reserved design token writes from client source, including layout primitives (#2933).
+- Brand generated design-token values, preserve ordinary object APIs, and verify runtime injection with CSP and a CSSOM test guard (#2933).
+- Keep CI lint shell startup from rebuilding unused nextest and patched sccache tools, while retaining all macOS and Linux lint checks.
+- Restore macOS CI timeout headroom by using prebuilt nextest for archived test shards and deterministic journal-lock and permission-retention regression tests.
+- Validate changelog fragments during PR lint with the release validator, and correct the web client fragment that blocked the v3.4.0 release.
+
+### Security
+- Close process-log credential masking gaps for quoted URL userinfo, suffixed secret parameters, long flag aliases, and embedded Authorization headers. Executed arguments remain unchanged; ambiguous short flags such as `-t` still require callers to keep secrets off argv.
+- Keep masking through chained secret switches and cover API-key spellings, signed URL parameters, and credential header families in execution logs.
+- Verify remote upload bytes before replacing the installed binary, preserve typed local checksum refusals, and treat null checksums as absent during the manifest transition.
+- Mask malformed URL userinfo, mid-name credential parameters and spaced credential headers in process logs while preserving refspecs and terminal targets that are not headers. Secret-label parameter matching is conservative; the short `sig` alias remains exact-only so `design` stays visible. Executed argv is unchanged.
+- Mask compact credential headers such as `Authorization:Bearer` and `Cookie:sid=` while retaining non-header refspecs and terminal targets. Document malformed URL token boundaries and conservative parameter-name masking.
+- Recognize compact credential headers glued to curl's `-H` option while retaining generic credential words in refspecs and terminal targets.
+- Retain compact `Private-Token` masking and recognize credential headers glued to combined curl short flags such as `-sH` and `-sSLH`.
+- Mask credential headers glued to curl short-option clusters containing digits, `#` or `:`, including `-4H`, `-0sH`, `-#H` and `-:H`. Masking affects diagnostic logs only; executed arguments remain unchanged.
+- Mask ambiguous chained credential headers as whole arguments in process.exec logs, so an earlier header value cannot leak as part of a later label. Executed argv remains unchanged.
+- Update pulldown-cmark to 0.13.6 to address RUSTSEC-2026-0433.
+- Mask credential options, labelled argument values, JSON and compound credential headers, and additional URL parameters in process execution logs using shared credential rules. Detect credential-shaped option values through wrappers, executable aliases and nested command text while preserving ordinary git and sort arguments. Restore compound secret labels and explicit key/auth assignments in report and stderr scrubbing while keeping ordinary prose readable.
+
+### Changed
+- The web workbench hides controls that are not built yet (New agent, Diff, Fork, the phone's Activity tab and the agent screen's Summary and PR views, and a sample card's answers). Development builds show them disabled, each naming what it waits for; production builds never do, `?preview` included. The Terminal action and the phone's Terminal view are gone: structured agents replace terminal agents. No on-screen text names a design record or issue number.
+- The web workbench has one toolbar. The separate connection strip and the "flock" wordmark are gone: a status dot with the server's name opens a popover with the connection's state and *Disconnect* (or *Connect*), and ⌘K lists both as commands. A banner under the toolbar appears only when the connection needs attention (reconnecting, read-only, a token needed, a dropped stored command) or the saved layout could not be loaded. The agent count left the toolbar; the phone shows the status dot beside its Inbox title.
+- The web client words every server refusal and connection state from one plain-language map: each line says what happened, then what to do next. The composer, the inbox cards, the transcript, the toolbar's connection popover and the banner use it; raw codes and diagnoses sit behind a *Details* disclosure, and a transcript whose history could not load shows an empty state with *Retry*.
+- The web client is denser on desktop: 13 px body text and 28 px controls, while the phone layout keeps 44 px touch targets, also when forced on a wide window.
+- A selected agent or palette item shows the accent only while the window is active, and an unemphasised highlight when it is not.
+- The composer is one field: the send button is an icon inside it, ⌘↩ sends, and the hint sits under it.
+- The client has one icon set; every icon-only button carries an accessible label, and the design-conformance suite enforces it.
+- Shared CLI socket exchanges no longer wait indefinitely: safely retryable timeouts return exit 124; dispatched mutations report outcome unknown with exit 14 and require inspection before retrying. Status timeouts also return typed exit 124 instead of an untyped failure. These changes affect scripts that branch on exit codes. Creation and cleanup share delegate’s 60-second client allowance; expiry after dispatch remains outcome unknown, and server-side cancellation follows in #2209. Completed input writes keep their capability-bound deadlines and exit-8 unknown-effect policy; live handoff reserves its synchronous server phase budgets. Relay/subscription and remaining session/probe paths follow in #2180 and #2181.
+- Full Unix listener backlogs consume the existing client connection deadline and can recover when admission opens, rather than failing immediately with a retryable timeout.
+- Connection refusals use the server’s lifetime socket ownership lock to distinguish live backlog pressure from stale sockets. Stale and missing sockets still fail promptly with transport exit 1, while status reports not running with exit 0.
+
+### Added
+- The web client has a keyboard model: ↑/↓ move through the agents, ⌘↩ allows and ⌘⌫ denies the focused permission card (never a card that is not focused), Esc leaves the composer, `?` opens a sheet of every shortcut, and the ⌘K palette runs commands as well as finding agents. Shortcuts never take over a standard one: in a text field the keys keep editing text.
+- The GUI toolbar, window title, and desktop badge show the server-reported count of structured agents waiting on a person. Partial counts use `N+`, unknown counts use `?`, and a known zero clears the title prefix and badge and omits the toolbar number. macOS uses dock labels for partial and unknown counts; other desktop platforms show the known numeric count.
+- A Needs you section leads the sidebar with pending permissions, blocked agents, and agents that reached a limit. The toolbar and palette jump to its first item; the jump is unavailable for a known zero or when no item is listed. Blocked and limit-reached agents also appear in the inbox; their inclusion in the numeric badge awaits the server's attention stream. Native badge updates are serialized so older writes cannot overwrite newer counts, labels, or clears.
+- Resize the GUI sidebar and inspector with three saved width presets. Drag a divider to preview a preset and release to snap; use Left/Right on a focused divider to step through widths.
+- Collapse or restore either region from the toolbar or command palette, with Control-Command-S for the sidebar and Option-Command-I for the inspector on a Mac. Enter or double-click on a divider also toggles it. Reloading restores both width and visibility.
+- Narrow desktop windows show an icon rail for agents; widening restores the saved sidebar width. The phone layout keeps its existing navigation. Desktop View-menu actions require a follow-up shell menu bridge.
+- Escape cancels a divider drag. Collapsing a focused sidebar or inspector moves focus to its toolbar toggle; expanding restores the last focused control when it still exists, including through the toolbar and command palette, or focuses the toggle if that control was removed. View shortcuts also work from text fields.
+
 ## [3.3.0] - 2026-11-02
 
 ### Changed
