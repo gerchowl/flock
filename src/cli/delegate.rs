@@ -5434,13 +5434,13 @@ impl RoundIo for SocketRound<'_, '_> {
                 }
             }
         }
+        let read_terminal = self.entry.terminal_id.clone();
         let response = bounded(
             Method::AgentResult(AgentResultParams {
-                target: self
-                    .entry
-                    .agent_id
-                    .clone()
-                    .unwrap_or_else(|| self.entry.terminal_id.clone()),
+                // Resolve this read against the terminal we actually settled.
+                // The server resolves terminal and session in one request, so
+                // even older replies without terminal_id have a bound producer.
+                target: self.entry.terminal_id.clone(),
                 max_chars: self.wait.max_chars,
                 offset: None,
             }),
@@ -5449,6 +5449,28 @@ impl RoundIo for SocketRound<'_, '_> {
         if session::result_conflicts(&self.entry, &response) {
             self.unbound = Some(session::CONFLICT.into());
             return Err(BoundedError::Transport(io::Error::other("session_unbound")));
+        }
+        let producer_changed = response
+            .pointer("/result/result/terminal_id")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|terminal| terminal != self.entry.terminal_id);
+        // Revalidate after the read too: a replacement may have inherited a
+        // cached reply while its own terminal has never settled.
+        match self.agent_record() {
+            AgentFetch::Found(record) => {
+                if producer_changed || record["terminal_id"] != read_terminal {
+                    return Ok(ResultFetch::Rebound);
+                }
+            }
+            AgentFetch::TimedOut => return Err(BoundedError::TimedOut),
+            AgentFetch::Missing => {
+                return Err(BoundedError::Transport(io::Error::other(
+                    "agent missing after result read",
+                )))
+            }
+            AgentFetch::Failed(reason) => {
+                return Err(BoundedError::Transport(io::Error::other(reason)))
+            }
         }
         Ok(ResultFetch::Response(response))
     }
