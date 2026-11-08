@@ -750,7 +750,7 @@ impl App {
     pub(super) fn handle_pane_report_agent_session(
         &mut self,
         id: String,
-        params: PaneReportAgentSessionParams,
+        mut params: PaneReportAgentSessionParams,
     ) -> String {
         // Recovery addresses the delegate. Hook ancestry identifies the caller,
         // and remains the target authority only for ordinary harness reports.
@@ -777,19 +777,34 @@ impl App {
             return pane_not_found(id, &params.pane_id);
         };
         if let Some(expected) = &params.rebind_agent_id {
-            let session = crate::api::schema::AgentSessionInfo {
-                source: params.source.clone(),
-                agent: params.agent.clone(),
-                kind: crate::agent_resume::AgentSessionRefKind::Id,
-                value: params.agent_session_id.clone().unwrap_or_default(),
-            };
-            if !self
+            let recorded = self
                 .terminal_for_pane(ws_idx, pane_id)
-                .is_some_and(|terminal| {
-                    terminal.agent_id.to_string() == *expected
-                        && super::super::creation::terminal_agent_session_info(terminal)
-                            .is_none_or(|current| current == session)
-                })
+                .filter(|terminal| terminal.agent_id.to_string() == *expected)
+                .and_then(|terminal| terminal.persisted_agent_session.as_ref())
+                .map(|saved| crate::api::schema::AgentSessionInfo {
+                    source: saved.source.clone(),
+                    agent: saved.agent.clone(),
+                    kind: saved.session_ref.kind,
+                    value: saved.session_ref.value.clone(),
+                });
+            let Some(session) = recorded else {
+                return encode_error(
+                    id,
+                    "session_unbound",
+                    "the delegate has no server-side launch session record",
+                );
+            };
+            if params
+                .agent_session_id
+                .as_deref()
+                .is_some_and(|id| id != session.value)
+                || params.source != session.source
+                || params.agent != session.agent
+                || params.agent_session_path.is_some()
+                || self
+                    .terminal_for_pane(ws_idx, pane_id)
+                    .and_then(super::super::creation::terminal_agent_session_info)
+                    .is_some_and(|current| current != session)
                 || crate::session_evidence::path(&session).is_none()
             {
                 return encode_error(
@@ -798,6 +813,14 @@ impl App {
                     "exact session recovery evidence no longer matches the agent",
                 );
             }
+            // The caller selects an agent, never its session. Bind only the
+            // identity retained by that agent's own hook or restore path.
+            params.source = session.source;
+            params.agent = session.agent;
+            params.agent_session_id = Some(session.value);
+            params.agent_session_path = None;
+            params.seq = None;
+            params.session_start_source = None;
         }
         let Some(agent_label) = normalize_reported_agent_label(&params.agent) else {
             return invalid_agent(id);
@@ -2441,6 +2464,10 @@ mod tests {
     }
 
     async fn recover_child_session(owner: bool) {
+        recover_child_session_case(owner, false).await;
+    }
+
+    async fn recover_child_session_case(owner: bool, supply_parent_session: bool) {
         let (mut app, caller_terminal, _) = app_with_terminal();
         let root = crate::test_support::TempDir::socket();
         std::env::set_var("CODEX_HOME", root.path());
@@ -2456,6 +2483,13 @@ mod tests {
         let caller = app.state.terminals.get_mut(&caller_terminal).unwrap();
         caller.launch_argv = Some(vec!["codex".into()]);
         let architect = caller.agent_id.to_string();
+        if supply_parent_session {
+            caller.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+                source: "flock:codex".into(),
+                agent: "codex".into(),
+                session_ref: crate::agent_resume::AgentSessionRef::id(session_id).unwrap(),
+            });
+        }
         app.state.workspaces.push(Workspace::test_new("child"));
         app.state.ensure_test_terminals();
         let child_pane = app.state.workspaces[1].tabs[0].root_pane;
@@ -2464,6 +2498,26 @@ mod tests {
             .unwrap()
             .clone();
         let delegate = app.state.terminals[&child_terminal].agent_id.to_string();
+        if !supply_parent_session {
+            crate::test_support::attest_pane_caller(&mut app, child_pane);
+            let report = app.handle_pane_report_agent_session(
+                "launch".into(),
+                PaneReportAgentSessionParams {
+                    pane_id: app.public_pane_id(1, child_pane).unwrap(),
+                    rebind_agent_id: None,
+                    source: "flock:codex".into(),
+                    agent: "codex".into(),
+                    seq: None,
+                    agent_session_id: Some(session_id.into()),
+                    agent_session_path: None,
+                    session_start_source: None,
+                },
+            );
+            assert!(!report.contains("\"error\""), "{report}");
+            let child = app.state.terminals.get_mut(&child_terminal).unwrap();
+            let saved = child.persisted_agent_session.clone().unwrap();
+            child.set_persisted_agent_session(saved);
+        }
         app.delegations
             .insert(crate::app::delegation::DelegationEdge {
                 architect: if owner {
@@ -2496,20 +2550,36 @@ mod tests {
             },
         );
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();
-        assert_eq!(response.get("error").is_none(), owner, "{response}");
-        assert!(super::super::super::creation::terminal_agent_session_info(
-            &app.state.terminals[&caller_terminal]
-        )
-        .is_none());
+        assert_eq!(
+            response.get("error").is_none(),
+            owner && !supply_parent_session,
+            "{response}"
+        );
+        assert_eq!(
+            super::super::super::creation::terminal_agent_session_info(
+                &app.state.terminals[&caller_terminal]
+            )
+            .is_some(),
+            supply_parent_session
+        );
         let child_session = super::super::super::creation::terminal_agent_session_info(
             &app.state.terminals[&child_terminal],
         );
-        assert_eq!(child_session.is_some(), owner);
+        assert_eq!(child_session.is_some(), !supply_parent_session);
+        assert_eq!(
+            app.state.terminals[&child_terminal].agent_session_hook_confirmed(),
+            owner && !supply_parent_session
+        );
         if let Some(session) = child_session {
             assert_eq!(session.value, session_id);
         }
         crate::app::delegation::handler_tests::shutdown(app);
         std::env::remove_var("CODEX_HOME");
+    }
+
+    #[tokio::test]
+    async fn coordinator_cannot_bind_child_to_its_own_session() {
+        recover_child_session_case(true, true).await;
     }
 
     #[tokio::test]

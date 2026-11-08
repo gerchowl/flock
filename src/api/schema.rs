@@ -6404,6 +6404,23 @@ mod tests {
     }
 
     #[test]
+    fn session_unbound_uses_an_open_json_error_code_and_client_exit_mapping() {
+        let error: ErrorResponse = serde_json::from_str(
+            r#"{"id":"recovery","error":{"code":"session_unbound","message":"missing launch evidence"}}"#,
+        ).unwrap();
+        assert_eq!(error.error.code, "session_unbound");
+        assert_eq!(crate::cli::error_code_exit(&error.error.code, false), 12);
+        // JSON error codes stay strings. Clients without a code in their local
+        // registry retain its text and apply the generic unknown-error exit.
+        let future: ErrorResponse = serde_json::from_str(
+            r#"{"id":"recovery","error":{"code":"future_session_state","message":"new state"}}"#,
+        )
+        .unwrap();
+        assert_eq!(future.error.code, "future_session_state");
+        assert_eq!(crate::cli::error_code_exit(&future.error.code, false), 1);
+    }
+
+    #[test]
     fn error_response_round_trips() {
         let response = ErrorResponse {
             id: "req_1".into(),

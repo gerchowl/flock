@@ -1135,6 +1135,15 @@ mod tests {
         .unwrap();
         let terminal = focused_terminal_id(&app);
         let agent_id = app.state.terminals[&terminal].agent_id.to_string();
+        app.state
+            .terminals
+            .get_mut(&terminal)
+            .unwrap()
+            .set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+                source: "flock:codex".into(),
+                agent: "codex".into(),
+                session_ref: crate::agent_resume::AgentSessionRef::id(session_id).unwrap(),
+            });
         let pane = app
             .public_pane_id(0, app.state.workspaces[0].focused_pane_id().unwrap())
             .unwrap();

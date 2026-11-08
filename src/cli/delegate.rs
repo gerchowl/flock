@@ -2945,8 +2945,11 @@ fn delegate_start(args: &[String]) -> io::Result<i32> {
     entry.round = 1;
     entry.submitted_at_ms = submitted_at_ms;
     entry.cursor = cursor.clone();
-    if let Some(session) = settled_record.get("agent_session").filter(|v| !v.is_null()) {
-        entry.session = Some(session.clone());
+    if entry.session.is_none() {
+        entry.session = settled_record
+            .get("agent_session")
+            .filter(|v| !v.is_null())
+            .cloned();
     }
     if let Err(err) = write_entry(&entry) {
         // The write failed, so THIS process did not create the entry.
@@ -4275,6 +4278,9 @@ fn delegate_send(args: &[String]) -> io::Result<i32> {
         }
     };
 
+    if session::conflicts(&entry, &record) {
+        return Ok(session::unbound(&entry, session::CONFLICT, flags.json));
+    }
     let cursor = match cursor_of(&record) {
         Ok(cursor) => cursor,
         Err(reason) => return Ok(fail(reason)),
@@ -4422,12 +4428,8 @@ fn delegate_wait(args: &[String]) -> io::Result<i32> {
             );
             return Ok(Outcome::Gone.exit_code());
         }
-        Err(RequireFailure::SessionUnbound(entry)) => {
-            return Ok(session::unbound(
-                &entry,
-                "no stable agent identity was recorded",
-                flags.json,
-            ));
+        Err(RequireFailure::SessionUnbound(entry, reason)) => {
+            return Ok(session::unbound(&entry, reason, flags.json));
         }
         Err(RequireFailure::NotDelegate) => return Ok(usage(format!("not a delegate: {name}"))),
         Err(RequireFailure::Failed(reason)) => {
@@ -4541,6 +4543,9 @@ fn delegate_result(args: &[String]) -> io::Result<i32> {
         Err(BoundedError::TimedOut) => return Ok(fail("timed out")),
         Err(BoundedError::Transport(e)) => return Ok(fail(e)),
     };
+    if session::result_conflicts(&entry, &response) {
+        return Ok(session::unbound(&entry, session::CONFLICT, flags.json));
+    }
     if let Some(error) = response.get("error") {
         let code = error
             .get("code")
@@ -4753,7 +4758,7 @@ enum RequireFailure {
     /// return by hundreds of bytes (clippy::result_large_err).
     TimedOut(Box<Entry>),
     /// A legacy entry cannot authorize session recovery without a saved identity.
-    SessionUnbound(Box<Entry>),
+    SessionUnbound(Box<Entry>, &'static str),
     /// The server was unreachable (dead socket, closed connection). This is
     /// never `NotDelegate` — a server that cannot answer has not proved the
     /// name is gone (W4). Caller exits 1 with the reason on stderr.
@@ -4785,7 +4790,10 @@ fn require_delegate(name: &str, deadline: Option<Instant>) -> Result<Recorded, R
         return Ok(Recorded::Gone(entry));
     }
     if entry.agent_id.is_none() {
-        return Err(RequireFailure::SessionUnbound(Box::new(entry)));
+        return Err(RequireFailure::SessionUnbound(
+            Box::new(entry),
+            "no stable agent identity was recorded",
+        ));
     }
     let before = entry.clone();
     let by_name = agent_record(name, deadline);
@@ -4823,7 +4831,9 @@ fn persist_reidentified(before: &Entry, live: &Entry) {
     fresh.terminal_id = live.terminal_id.clone();
     fresh.pane_id = live.pane_id.clone();
     fresh.agent_id = live.agent_id.clone();
-    fresh.session = live.session.clone();
+    if fresh.session.is_none() {
+        fresh.session = live.session.clone();
+    }
     let _ = write_entry(&fresh);
 }
 
@@ -4846,9 +4856,6 @@ fn reidentify(mut entry: Entry, record: &serde_json::Value) -> Option<Entry> {
             entry.pane_id = pane_id.to_string();
         }
     }
-    if let Some(session) = record.get("agent_session").filter(|v| !v.is_null()) {
-        entry.session = Some(session.clone());
-    }
     Some(entry)
 }
 
@@ -4856,10 +4863,20 @@ fn reidentify(mut entry: Entry, record: &serde_json::Value) -> Option<Entry> {
 /// and the agent-lookup outcome. The call-site tests (W7) exercise this.
 fn require_decide(entry: Entry, fetch: AgentFetch) -> Result<Entry, RequireFailure> {
     match fetch {
-        AgentFetch::Found(_) if entry.agent_id.is_none() => {
-            Err(RequireFailure::SessionUnbound(Box::new(entry)))
+        AgentFetch::Found(_) if entry.agent_id.is_none() => Err(RequireFailure::SessionUnbound(
+            Box::new(entry),
+            "no stable agent identity was recorded",
+        )),
+        AgentFetch::Found(record) => {
+            let live = reidentify(entry.clone(), &record).ok_or(RequireFailure::NotDelegate)?;
+            if session::conflicts(&entry, &record) {
+                return Err(RequireFailure::SessionUnbound(
+                    Box::new(live),
+                    session::CONFLICT,
+                ));
+            }
+            Ok(live)
         }
-        AgentFetch::Found(record) => reidentify(entry, &record).ok_or(RequireFailure::NotDelegate),
         AgentFetch::Missing => Err(RequireFailure::NotDelegate),
         AgentFetch::TimedOut => Err(RequireFailure::TimedOut(Box::new(entry))),
         AgentFetch::Failed(reason) => Err(RequireFailure::Failed(reason)),
@@ -4872,11 +4889,9 @@ fn require_decide(entry: Entry, fetch: AgentFetch) -> Result<Entry, RequireFailu
 fn require_delegate_no_deadline(name: &str, json: bool) -> Result<Recorded, i32> {
     match require_delegate(name, None) {
         Ok(recorded) => Ok(recorded),
-        Err(RequireFailure::SessionUnbound(entry)) => Err(session::unbound(
-            &entry,
-            "no stable agent identity was recorded",
-            json,
-        )),
+        Err(RequireFailure::SessionUnbound(entry, reason)) => {
+            Err(session::unbound(&entry, reason, json))
+        }
         Err(RequireFailure::NotDelegate) => Err(usage(format!("not a delegate: {name}"))),
         Err(RequireFailure::TimedOut(_)) => Err(fail(format!(
             "delegate {name}: timed out resolving the agent"
@@ -5245,6 +5260,26 @@ struct SocketRound<'w, 'a> {
 }
 
 impl<'w, 'a> SocketRound<'w, 'a> {
+    fn follow_record(&mut self, record: &serde_json::Value) -> Result<bool, String> {
+        let Some(mut live) = reidentify(self.entry.clone(), record) else {
+            return Ok(false);
+        };
+        if session::conflicts(&self.entry, record) {
+            self.entry = live;
+            return Err(session::CONFLICT.into());
+        }
+        if live.terminal_id == self.entry.terminal_id {
+            return Ok(false);
+        }
+        if let Err(reason) = session::prepare(&mut live, self.wait.deadline) {
+            self.entry = live;
+            return Err(reason);
+        }
+        persist_reidentified(&self.entry, &live);
+        self.entry = live;
+        Ok(true)
+    }
+
     fn new(wait: &'w Await<'a>) -> Self {
         let monitor = super::delegate_verdict::Monitor::new(
             wait.silence_ms
@@ -5372,15 +5407,17 @@ impl RoundIo for SocketRound<'_, '_> {
                 wait.deadline,
             );
             match fetched {
-                AgentFetch::Found(record) => {
-                    if let Some(live) = reidentify(self.entry.clone(), &record) {
-                        if live.terminal_id != self.entry.terminal_id {
-                            persist_reidentified(&self.entry, &live);
-                            self.entry = live;
-                            return self.settle(after);
-                        }
+                AgentFetch::Found(record) => match self.follow_record(&record) {
+                    Ok(true) => return self.settle(after),
+                    Ok(false) => {}
+                    Err(reason) => {
+                        self.unbound = Some(reason);
+                        return Ok((
+                            super::settled::SettledOutcome::Error("session_unbound".into()),
+                            false,
+                        ));
                     }
-                }
+                },
                 AgentFetch::Missing => {}
                 AgentFetch::TimedOut => {
                     return Ok((super::settled::SettledOutcome::TimedOut, false))
@@ -5401,18 +5438,12 @@ impl RoundIo for SocketRound<'_, '_> {
                 .unwrap_or(&self.entry.terminal_id),
             self.wait.deadline,
         ) {
-            if let Some(live) = reidentify(self.entry.clone(), &record)
-                .filter(|live| live.terminal_id != self.entry.terminal_id)
-            {
-                persist_reidentified(&self.entry, &live);
-                self.entry = live;
-                if let Err(reason) = session::prepare(&mut self.entry, self.wait.deadline) {
-                    self.unbound = Some(reason);
-                    return Err(BoundedError::Transport(io::Error::other("session_unbound")));
-                }
+            if let Err(reason) = self.follow_record(&record) {
+                self.unbound = Some(reason);
+                return Err(BoundedError::Transport(io::Error::other("session_unbound")));
             }
         }
-        bounded(
+        let response = bounded(
             Method::AgentResult(AgentResultParams {
                 target: self
                     .entry
@@ -5423,7 +5454,12 @@ impl RoundIo for SocketRound<'_, '_> {
                 offset: None,
             }),
             self.wait.deadline,
-        )
+        )?;
+        if session::result_conflicts(&self.entry, &response) {
+            self.unbound = Some(session::CONFLICT.into());
+            return Err(BoundedError::Transport(io::Error::other("session_unbound")));
+        }
+        Ok(response)
     }
 
     fn agent_record(&mut self) -> AgentFetch {

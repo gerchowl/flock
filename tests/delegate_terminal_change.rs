@@ -12,6 +12,15 @@ use std::sync::{
 use std::time::Duration;
 use support::environment::Command;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SessionCase {
+    Normal,
+    ConflictingRecord,
+    ConflictingResult,
+    ConflictAtReady,
+    Protocol32,
+}
+
 struct Fixture {
     dir: support::socket_dir::SocketDir,
     socket: std::path::PathBuf,
@@ -26,6 +35,22 @@ impl Fixture {
         Self::scenario(evidence, during_wait, empty_result, false)
     }
     fn scenario(evidence: bool, during_wait: bool, empty_result: bool, legacy: bool) -> Self {
+        Self::case(
+            evidence,
+            during_wait,
+            empty_result,
+            legacy,
+            SessionCase::Normal,
+        )
+    }
+    fn case(
+        evidence: bool,
+        during_wait: bool,
+        empty_result: bool,
+        legacy: bool,
+        case: SessionCase,
+    ) -> Self {
+        let conflict = case == SessionCase::ConflictingRecord;
         let dir = support::socket_dir::SocketDir::reserve("d2993");
         let socket = dir.path().join("s");
         let home = dir.path().join("home");
@@ -55,6 +80,13 @@ impl Fixture {
             "{\"type\":\"session_meta\",\"payload\":{\"id\":\"session-2993\"}}\n",
         )
         .unwrap();
+        if conflict {
+            std::fs::write(
+                sessions.join("rollout-test-session-replacement.jsonl"),
+                "{\"type\":\"session_meta\",\"payload\":{\"id\":\"session-replacement\"}}\n",
+            )
+            .unwrap();
+        }
         std::fs::write(home.join("brief.md"), "Finish this round.").unwrap();
         let listener = UnixListener::bind(&socket).unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -62,7 +94,8 @@ impl Fixture {
         let stopped = stop.clone();
         let worker = std::thread::spawn(move || {
             let mut first = true;
-            let mut bound = empty_result || legacy;
+            let mut gets = 0;
+            let mut bound = empty_result || legacy || conflict;
             while !stopped.load(Ordering::SeqCst) {
                 let Ok((mut stream, _)) = listener.accept() else {
                     std::thread::sleep(Duration::from_millis(5));
@@ -90,16 +123,29 @@ impl Fixture {
                     "agent.get" => {
                         let old = first && during_wait;
                         first = false;
+                        gets += 1;
+                        let mut observed = session.clone();
+                        if (conflict && !old) || (case == SessionCase::ConflictAtReady && gets > 3)
+                        {
+                            observed["value"] = json!("session-replacement");
+                        }
                         json!({"result":{"agent":{"name":"fixture","agent_id":"agent_fixture.example_2993",
                             "terminal_id":if old {"term_old"} else {"term_new"},"pane_id":"w1:p1",
                             "agent_status":if empty_result {"working"} else {"done"},"turn_cursor":if old {"term_old:0:0:0:i"} else {"term_new:0:1:2:i"},
-                            "cwd":home,"agent_session":if bound {session.clone()} else {Value::Null}}}})
+                            "cwd":home,"agent_session":if bound || evidence {observed} else {Value::Null}}}})
                     }
                     "pane.get" => {
                         json!({"result":{"pane":{"terminal_id":"term_new","pane_id":"w1:p1"}}})
                     }
                     "pane.report_agent_session" => {
-                        assert_eq!(request["params"]["agent_session_id"], "session-2993");
+                        assert_eq!(
+                            request["params"]["agent_session_id"],
+                            if conflict {
+                                "session-replacement"
+                            } else {
+                                "session-2993"
+                            }
+                        );
                         bound = true;
                         json!({"result":{}})
                     }
@@ -107,9 +153,9 @@ impl Fixture {
                         json!({"error":{"code":"no_result","message":"turn still running"}})
                     }
                     "agent.result" if bound => json!({"result":{"result":{"finished":true,
-                        "at_ms":2,"status":"done","text":"DONE: rebound","session_id":"session-2993"}}}),
+                        "at_ms":2,"status":"done","text":if conflict || case == SessionCase::ConflictingResult {"DONE: replacement"} else {"DONE: rebound"},"session_id":if conflict || case == SessionCase::ConflictingResult {"session-replacement"} else {"session-2993"}}}}),
                     "ping" => {
-                        json!({"result":{"type":"pong","version":"3.3.0","protocol":support::PROTOCOL_VERSION,"capabilities":{"pane_input_write_ack":true}}})
+                        json!({"result":{"type":"pong","version":"3.3.0","protocol":if case == SessionCase::Protocol32 {32} else {support::PROTOCOL_VERSION},"capabilities":{"pane_input_write_ack":true}}})
                     }
                     "events.read" => json!({"result":{"events":[],"next_after":0}}),
                     "pane.submit" if !bound => {
@@ -221,4 +267,75 @@ fn legacy_same_cwd_cannot_return_another_agents_reply() {
         assert!(entry["agent_id"].is_null());
         assert!(entry["session"].is_null());
     }
+}
+
+#[test]
+fn conflicting_observed_session_preserves_launch_record() {
+    for verb in ["result", "wait", "send"] {
+        let fixture = Fixture::case(true, false, false, false, SessionCase::ConflictingRecord);
+        let registry = fixture
+            .dir
+            .path()
+            .join("home/state")
+            .join(support::paths::app_dir_name())
+            .join("delegates")
+            .join(support::paths::server_key(&fixture.socket))
+            .join("fixture.json");
+        let before = std::fs::read(&registry).unwrap();
+        fixture.assert(verb, 12, "session_unbound");
+        assert_eq!(std::fs::read(&registry).unwrap(), before);
+    }
+}
+
+#[test]
+fn wait_conflict_during_terminal_change_preserves_launch_record() {
+    let fixture = Fixture::case(true, true, false, false, SessionCase::ConflictingRecord);
+    let registry = fixture
+        .dir
+        .path()
+        .join("home/state")
+        .join(support::paths::app_dir_name())
+        .join("delegates")
+        .join(support::paths::server_key(&fixture.socket))
+        .join("fixture.json");
+    let before = std::fs::read(&registry).unwrap();
+    fixture.assert("wait", 12, "session_unbound");
+    assert_eq!(std::fs::read(&registry).unwrap(), before);
+}
+
+#[test]
+fn result_session_change_after_lookup_is_unbound() {
+    for verb in ["result", "wait"] {
+        Fixture::case(true, false, false, false, SessionCase::ConflictingResult).assert(
+            verb,
+            12,
+            "session_unbound",
+        );
+    }
+}
+
+#[test]
+fn recovery_guard_requires_protocol_33_server() {
+    Fixture::case(true, false, false, false, SessionCase::Protocol32).assert(
+        "result",
+        78,
+        "server_version_gap",
+    );
+}
+
+#[test]
+fn send_conflict_at_readiness_does_not_advance_the_round() {
+    let fixture = Fixture::case(true, false, false, false, SessionCase::ConflictAtReady);
+    fixture.assert("send", 12, "session_unbound");
+    let registry = fixture
+        .dir
+        .path()
+        .join("home/state")
+        .join(support::paths::app_dir_name())
+        .join("delegates")
+        .join(support::paths::server_key(&fixture.socket))
+        .join("fixture.json");
+    let entry: Value = serde_json::from_slice(&std::fs::read(registry).unwrap()).unwrap();
+    assert_eq!(entry["round"], 1);
+    assert_eq!(entry["session"]["value"], "session-2993");
 }

@@ -381,7 +381,7 @@ fn require_decide_no_recorded_identity_cannot_backfill_from_a_terminal() {
     let record = json!({"terminal_id": "t", "agent_id": "agent_a"});
     assert!(matches!(
         require_decide(entry, AgentFetch::Found(record)),
-        Err(RequireFailure::SessionUnbound(_))
+        Err(RequireFailure::SessionUnbound(_, _))
     ));
 }
 
@@ -392,7 +392,7 @@ fn require_decide_a_legacy_worktree_cannot_authorize_recovery() {
     for cwd in ["/wt/d1", "/elsewhere"] {
         let record = json!({"terminal_id":"t2", "pane_id":"p2", "agent_id":"agent_a", "cwd":cwd,
             "agent_session":{"source":"flock:codex","agent":"codex","kind":"id","value":"other-session"}});
-        let Err(RequireFailure::SessionUnbound(saved)) =
+        let Err(RequireFailure::SessionUnbound(saved, _)) =
             require_decide(entry.clone(), AgentFetch::Found(record))
         else {
             panic!("a directory is not identity evidence");

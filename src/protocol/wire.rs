@@ -123,7 +123,10 @@ use serde::{Deserialize, Serialize};
 /// v30 also adds `wait.park` (#1031), gated by #868.
 /// v31 adds local-operator client credentials and browser handoff (#1827).
 /// v32 preserves node identity in carried FleetPeer snapshots (#1076).
-/// v33 adds identity-guarded authoritative delegate session recovery.
+/// v33 adds `rebind_agent_id` to the JSON session-report API and the
+/// `session_unbound` error. A v32 server ignores the unknown guard field, so
+/// recovery mutations require a v33 server. TUI attachment requires an exact
+/// protocol match; JSON API hooks retain their separate skew exemptions.
 pub const PROTOCOL_VERSION: u32 = 33;
 
 /// Refusal notice sent to clients while a live update handoff is in
@@ -1077,7 +1080,7 @@ pub enum VersionCheck {
 ///
 /// Current rules:
 /// - Version 0 (pre-persistence client) is always rejected.
-/// - Matching major versions are accepted.
+/// - Exactly matching protocol versions are accepted.
 /// - A client with a newer version than the server is rejected.
 /// - A client with an older version than the server is rejected
 ///   (backward compatibility is not yet supported).
@@ -1839,7 +1842,11 @@ mod tests {
             check_client_version(31),
             VersionCheck::Incompatible(_)
         ));
-        assert!(matches!(check_client_version(32), VersionCheck::Compatible));
+        assert!(matches!(
+            check_client_version(32),
+            VersionCheck::Incompatible(_)
+        ));
+        assert!(matches!(check_client_version(33), VersionCheck::Compatible));
     }
 
     // ---- Version negotiation ----
