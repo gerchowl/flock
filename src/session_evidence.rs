@@ -49,6 +49,26 @@ pub(crate) fn checked_path(session: &AgentSessionInfo) -> std::io::Result<Option
     Ok(matches.then_some(path))
 }
 
+/// Evidence since a submission boundary. A start arms exactly one Codex user
+/// prompt. A foreign prompt consumes that start and completion disarms it.
+/// Claude user records start their own turn. A confirmed pair is conclusive
+/// even if that turn finishes before the next poll.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Evidence {
+    Quiet,
+    Activity,
+    Started,
+    Confirmed,
+}
+impl Evidence {
+    pub(crate) fn active(self) -> bool {
+        self != Self::Quiet
+    }
+    pub(crate) fn confirmed(self) -> bool {
+        self == Self::Confirmed
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct Submission {
     path: PathBuf,
@@ -73,14 +93,14 @@ impl Submission {
         })
     }
 
-    pub(crate) fn started(&self, text: &str) -> bool {
+    pub(crate) fn evidence(&self, text: &str) -> Evidence {
         let Some(mut file) = File::open(&self.path).ok() else {
-            return false;
+            return Evidence::Quiet;
         };
         if file.seek(SeekFrom::Start(self.offset)).is_err() {
-            return false;
+            return Evidence::Quiet;
         }
-        let mut started = self.agent == "claude";
+        let mut evidence = Evidence::Quiet;
         for line in BufReader::new(file.take(1024 * 1024))
             .lines()
             .map_while(Result::ok)
@@ -88,11 +108,13 @@ impl Submission {
             let Ok(row) = serde_json::from_str::<serde_json::Value>(&line) else {
                 continue;
             };
-            if self.agent == "codex"
-                && row["type"] == "event_msg"
-                && row["payload"]["type"] == "task_started"
-            {
-                started = true;
+            if self.agent == "codex" && row["type"] == "event_msg" {
+                evidence = match row["payload"]["type"].as_str() {
+                    Some("task_started") => Evidence::Started,
+                    Some("task_complete" | "task_failed" | "turn_aborted") => Evidence::Activity,
+                    _ => evidence,
+                };
+                continue;
             }
             let message = if self.agent == "codex" && row["type"] == "response_item" {
                 &row["payload"]
@@ -114,11 +136,14 @@ impl Submission {
                         .join("\n"),
                 )
             });
-            if started && content.as_deref() == Some(text) {
-                return true;
+            if (self.agent == "claude" || evidence == Evidence::Started)
+                && content.as_deref() == Some(text)
+            {
+                return Evidence::Confirmed;
             }
+            evidence = Evidence::Activity;
         }
-        false
+        evidence
     }
 }
 
@@ -176,12 +201,12 @@ mod tests {
             agent: "codex".into(),
         };
         assert!(
-            !proof.started("hello"),
+            !proof.evidence("hello").confirmed(),
             "an older identical prompt proves nothing"
         );
         append(&path, prompt("hello"));
         assert!(
-            !proof.started("hello"),
+            !proof.evidence("hello").confirmed(),
             "an echo without a turn start proves nothing"
         );
         append(
@@ -189,13 +214,13 @@ mod tests {
             json!({"type":"event_msg","payload":{"type":"task_started"}}),
         );
         append(&path, prompt("different"));
-        assert!(!proof.started("hello"));
+        assert!(!proof.evidence("hello").confirmed());
         append(
             &path,
             json!({"type":"event_msg","payload":{"type":"task_started"}}),
         );
         append(&path, prompt("hello"));
-        assert!(proof.started("hello"));
+        assert!(proof.evidence("hello").confirmed());
     }
 
     #[test]
@@ -225,5 +250,99 @@ mod tests {
         .unwrap();
         assert!(checked_path(&session).unwrap().is_none());
         std::env::remove_var("CODEX_HOME");
+    }
+    #[test]
+    fn completed_turn_cannot_confirm_later_echo() {
+        let (_root, _session, path) = setup("codex");
+        let proof = Submission {
+            offset: std::fs::metadata(&path).unwrap().len(),
+            path: path.clone(),
+            agent: "codex".into(),
+        };
+        append(
+            &path,
+            json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"old"}}),
+        );
+        append(&path, prompt("other prompt"));
+        append(
+            &path,
+            json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"old"}}),
+        );
+        append(&path, prompt("hello"));
+        assert!(
+            !proof.evidence("hello").confirmed(),
+            "a completed unrelated turn cannot confirm a later echo"
+        );
+    }
+    #[test]
+    fn evidence_transitions_consume_starts_and_preserve_confirmed_pairs() {
+        for closing_event in [
+            "task_complete",
+            "task_failed",
+            "turn_aborted",
+            "foreign_prompt",
+        ] {
+            let (_root, _session, path) = setup("codex");
+            let proof = Submission {
+                offset: std::fs::metadata(&path).unwrap().len(),
+                path: path.clone(),
+                agent: "codex".into(),
+            };
+            assert_eq!(proof.evidence("hello"), Evidence::Quiet);
+            append(
+                &path,
+                json!({"type":"event_msg","payload":{"type":"task_started"}}),
+            );
+            assert_eq!(proof.evidence("hello"), Evidence::Started);
+            if closing_event == "foreign_prompt" {
+                append(&path, prompt("other prompt"));
+            } else {
+                append(
+                    &path,
+                    json!({"type":"event_msg","payload":{"type":closing_event}}),
+                );
+            }
+            append(&path, prompt("hello"));
+            assert_eq!(
+                proof.evidence("hello"),
+                Evidence::Activity,
+                "{closing_event}"
+            );
+            append(
+                &path,
+                json!({"type":"event_msg","payload":{"type":"task_started"}}),
+            );
+            append(&path, prompt("hello"));
+            append(
+                &path,
+                json!({"type":"event_msg","payload":{"type":"task_complete"}}),
+            );
+            assert_eq!(proof.evidence("hello"), Evidence::Confirmed);
+        }
+    }
+
+    #[test]
+    fn claude_user_records_start_their_own_turn() {
+        let (_root, _session, path) = setup("claude");
+        let proof = Submission {
+            offset: std::fs::metadata(&path).unwrap().len(),
+            path: path.clone(),
+            agent: "claude".into(),
+        };
+        append(
+            &path,
+            json!({"type":"user","message":{"role":"user","content":"other prompt"}}),
+        );
+        assert_eq!(proof.evidence("hello"), Evidence::Activity);
+        append(
+            &path,
+            json!({"type":"user","isMeta":true,"message":{"role":"user","content":"hello"}}),
+        );
+        assert!(!proof.evidence("hello").confirmed());
+        append(
+            &path,
+            json!({"type":"user","message":{"role":"user","content":"hello"}}),
+        );
+        assert!(proof.evidence("hello").confirmed());
     }
 }

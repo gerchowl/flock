@@ -958,13 +958,15 @@ impl App {
             Err(reason) => return Some(Outcome::Abandoned(reason)),
         };
         let reported_text = crate::control_bytes::strip(&attempt.text);
-        let reported = terminal.prompt_report_generation > attempt.prompt_generation
-            && terminal.last_prompt.as_deref() == Some(reported_text.trim());
-        let transcript_started = attempt
+        let prompt_reported = terminal.prompt_report_generation > attempt.prompt_generation;
+        let reported =
+            prompt_reported && terminal.last_prompt.as_deref() == Some(reported_text.trim());
+        let transcript = attempt
             .transcript_submit
             .as_ref()
-            .is_some_and(|proof| proof.started(&reported_text));
-        if !attempt.sent && (started || reported || transcript_started) {
+            .map(|proof| proof.evidence(&reported_text))
+            .unwrap_or(crate::session_evidence::Evidence::Quiet);
+        if !attempt.sent && (started || prompt_reported || transcript.active()) {
             return Some(Outcome::Abandoned("turn_started_before_enter"));
         }
         if attempt
@@ -977,7 +979,7 @@ impl App {
         if attempt.sent && reported {
             return Some(Outcome::Accepted);
         }
-        if attempt.sent && transcript_started {
+        if attempt.sent && transcript.confirmed() {
             return Some(Outcome::ObservedAccepted);
         }
         if attempt.sent && started {
