@@ -1122,6 +1122,7 @@ mod tests {
     #[test]
     fn codex_rebound_session_reads_real_turn_and_rejects_wrong_identity() {
         let mut app = test_app();
+        app.current_api_peer_pid = Some(std::process::id());
         let root = crate::test_support::TempDir::socket();
         std::env::set_var("CODEX_HOME", root.path());
         let session_id = "00000000-0000-4000-8000-000000000613";
@@ -1198,6 +1199,7 @@ mod tests {
             session_ref: crate::agent_resume::AgentSessionRef::id("claude-rebind").unwrap(),
         });
         let agent_id = terminal.agent_id.to_string();
+        app.current_api_peer_pid = Some(std::process::id());
         let before: serde_json::Value =
             serde_json::from_str(&result(&mut app, &agent_id, None, None)).unwrap();
         assert_eq!(before["error"]["code"], "session_unconfirmed");

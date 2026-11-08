@@ -1177,6 +1177,7 @@ async fn rebound_codex_session_confirms_submission_without_cursor_or_composer_ev
         mut pty,
     } = lock_rig(&CODEX);
     let agent_id = terminal(&mut app).agent_id.to_string();
+    app.current_api_peer_pid = Some(std::process::id());
     let response = app.handle_api_request(Request {
         id: "rebind".into(),
         method: Method::PaneReportAgentSession(crate::api::schema::PaneReportAgentSessionParams {

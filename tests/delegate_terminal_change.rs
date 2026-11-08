@@ -23,6 +23,9 @@ impl Fixture {
         Self::serve(evidence, during_wait, false)
     }
     fn serve(evidence: bool, during_wait: bool, empty_result: bool) -> Self {
+        Self::scenario(evidence, during_wait, empty_result, false)
+    }
+    fn scenario(evidence: bool, during_wait: bool, empty_result: bool, legacy: bool) -> Self {
         let dir = support::socket_dir::SocketDir::reserve("d2993");
         let socket = dir.path().join("s");
         let home = dir.path().join("home");
@@ -34,11 +37,16 @@ impl Fixture {
         std::fs::create_dir_all(&registry).unwrap();
         let session =
             json!({"source":"flock:codex","agent":"codex","kind":"id","value":"session-2993"});
-        let entry = json!({"name":"fixture", "terminal_id":"term_old", "pane_id":"w1:p1",
+        let mut entry = json!({"name":"fixture", "terminal_id":"term_old", "pane_id":"w1:p1",
             "root_pane":"w1:p0", "workspace_id":"w1", "mode":"cwd", "worktree":null,
             "branch":null,"harness":"codex","model":null,"round":1,"brief":"brief.md",
             "submitted_at_ms":1,"created_at_ms":1,"cursor":"term_old:0:0:0:i",
             "agent_id":"agent_fixture.example_2993","session":if evidence {session.clone()} else {Value::Null}});
+        if legacy {
+            entry["agent_id"] = Value::Null;
+            entry["session"] = Value::Null;
+            entry["worktree"] = json!(home);
+        }
         std::fs::write(registry.join("fixture.json"), entry.to_string()).unwrap();
         let sessions = home.join(".codex/sessions");
         std::fs::create_dir_all(&sessions).unwrap();
@@ -54,7 +62,7 @@ impl Fixture {
         let stopped = stop.clone();
         let worker = std::thread::spawn(move || {
             let mut first = true;
-            let mut bound = empty_result;
+            let mut bound = empty_result || legacy;
             while !stopped.load(Ordering::SeqCst) {
                 let Ok((mut stream, _)) = listener.accept() else {
                     std::thread::sleep(Duration::from_millis(5));
@@ -73,6 +81,9 @@ impl Fixture {
                 };
                 let target = request["params"]["target"].as_str().unwrap_or_default();
                 let result = match request["method"].as_str().unwrap() {
+                    "agent.get" if target == "other" => json!({"result":{"agent":{
+                        "name":"other","agent_id":"agent_fixture.example_other", "cwd":home,
+                        "terminal_id":"term_other","pane_id":"w1:p2","agent_session":session}}}),
                     "agent.get" if target == "term_old" && !first => {
                         json!({"error":{"code":"agent_not_found","message":"old terminal replaced"}})
                     }
@@ -82,7 +93,7 @@ impl Fixture {
                         json!({"result":{"agent":{"name":"fixture","agent_id":"agent_fixture.example_2993",
                             "terminal_id":if old {"term_old"} else {"term_new"},"pane_id":"w1:p1",
                             "agent_status":if empty_result {"working"} else {"done"},"turn_cursor":if old {"term_old:0:0:0:i"} else {"term_new:0:1:2:i"},
-                            "agent_session":if bound {session.clone()} else {Value::Null}}}})
+                            "cwd":home,"agent_session":if bound {session.clone()} else {Value::Null}}}})
                     }
                     "pane.get" => {
                         json!({"result":{"pane":{"terminal_id":"term_new","pane_id":"w1:p1"}}})
@@ -192,4 +203,22 @@ fn send_rebinds_before_submission() {
 #[test]
 fn result_liveness_follows_identity_when_terminal_changes_after_lookup() {
     Fixture::serve(true, true, true).assert("result", 0, "running");
+}
+
+#[test]
+fn legacy_same_cwd_cannot_return_another_agents_reply() {
+    let fixture = Fixture::scenario(false, false, false, true);
+    for verb in ["result", "wait", "send"] {
+        fixture.assert(verb, 12, "session_unbound");
+        let home = fixture.dir.path().join("home");
+        let registry = home
+            .join("state")
+            .join(support::paths::app_dir_name())
+            .join("delegates")
+            .join(support::paths::server_key(&fixture.socket));
+        let entry: Value =
+            serde_json::from_slice(&std::fs::read(registry.join("fixture.json")).unwrap()).unwrap();
+        assert!(entry["agent_id"].is_null());
+        assert!(entry["session"].is_null());
+    }
 }

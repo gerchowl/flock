@@ -752,9 +752,28 @@ impl App {
         id: String,
         params: PaneReportAgentSessionParams,
     ) -> String {
-        let Some((ws_idx, pane_id)) =
+        // Recovery addresses the delegate. Hook ancestry identifies the caller,
+        // and remains the target authority only for ordinary harness reports.
+        let target = if let Some(agent_id) = &params.rebind_agent_id {
+            if !self.delegate_recovery_allowed(agent_id) {
+                return encode_error(
+                    id,
+                    "session_unbound",
+                    "only the delegate's supervisor or the operator may recover its session",
+                );
+            }
+            self.resolve_pane_target(agent_id).ok()
+        } else {
             self.parse_pane_id_or_peer(&params.pane_id, self.current_api_peer_pid)
-        else {
+        };
+        let Some((ws_idx, pane_id)) = target else {
+            if params.rebind_agent_id.is_some() {
+                return encode_error(
+                    id,
+                    "session_unbound",
+                    "the recorded agent has no current pane",
+                );
+            }
             return pane_not_found(id, &params.pane_id);
         };
         if let Some(expected) = &params.rebind_agent_id {
@@ -2410,6 +2429,88 @@ mod tests {
         assert_eq!(get(&mut app)["error"]["code"], "pane_not_found");
         crate::test_support::attest_pane_caller(&mut app, pane_id);
         assert_eq!(get(&mut app)["result"]["pane"]["pane_id"], public.as_str());
+    }
+
+    async fn recover_child_session(owner: bool) {
+        let (mut app, caller_terminal, _) = app_with_terminal();
+        let root = crate::test_support::TempDir::socket();
+        std::env::set_var("CODEX_HOME", root.path());
+        let sessions = root.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let session_id = "00000000-0000-4000-8000-000000000613";
+        std::fs::write(
+            sessions.join(format!("rollout-fixture-{session_id}.jsonl")),
+            include_str!("../../../tests/fixtures/codex/finished.jsonl"),
+        )
+        .unwrap();
+        let caller_pane = app.state.workspaces[0].tabs[0].root_pane;
+        let caller = app.state.terminals.get_mut(&caller_terminal).unwrap();
+        caller.launch_argv = Some(vec!["codex".into()]);
+        let architect = caller.agent_id.to_string();
+        app.state.workspaces.push(Workspace::test_new("child"));
+        app.state.ensure_test_terminals();
+        let child_pane = app.state.workspaces[1].tabs[0].root_pane;
+        let child_terminal = app.state.workspaces[1]
+            .terminal_id(child_pane)
+            .unwrap()
+            .clone();
+        let delegate = app.state.terminals[&child_terminal].agent_id.to_string();
+        app.delegations
+            .insert(crate::app::delegation::DelegationEdge {
+                architect: if owner {
+                    architect
+                } else {
+                    "agent_fixture.example_nonowner".into()
+                },
+                delegate: delegate.clone(),
+                via: crate::api::schema::DelegationVia::Start,
+                workspace: app.public_workspace_id(1),
+                worktree: None,
+                branch: None,
+                repo: None,
+                label: None,
+                state: crate::app::delegation::EdgeState::Live,
+                since_ms: 0,
+            });
+        crate::test_support::attest_pane_caller(&mut app, caller_pane);
+        let response = app.handle_pane_report_agent_session(
+            "recover".into(),
+            PaneReportAgentSessionParams {
+                pane_id: app.public_pane_id(1, child_pane).unwrap(),
+                rebind_agent_id: Some(delegate),
+                source: "flock:codex".into(),
+                agent: "codex".into(),
+                seq: None,
+                agent_session_id: Some(session_id.into()),
+                agent_session_path: None,
+                session_start_source: None,
+            },
+        );
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response.get("error").is_none(), owner, "{response}");
+        assert!(super::super::super::creation::terminal_agent_session_info(
+            &app.state.terminals[&caller_terminal]
+        )
+        .is_none());
+        let child_session = super::super::super::creation::terminal_agent_session_info(
+            &app.state.terminals[&child_terminal],
+        );
+        assert_eq!(child_session.is_some(), owner);
+        if let Some(session) = child_session {
+            assert_eq!(session.value, session_id);
+        }
+        crate::app::delegation::handler_tests::shutdown(app);
+        std::env::remove_var("CODEX_HOME");
+    }
+
+    #[tokio::test]
+    async fn coordinator_recovery_targets_owned_child_despite_caller_ancestry() {
+        recover_child_session(true).await;
+    }
+
+    #[tokio::test]
+    async fn coordinator_recovery_refuses_a_non_owner() {
+        recover_child_session(false).await;
     }
 
     #[test]

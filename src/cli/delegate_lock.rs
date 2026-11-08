@@ -59,7 +59,7 @@ pub(super) fn resolve(name: &str, choice: CodexLockChoice, flags: &SendFlags) ->
         Ok(lock) => lock,
         Err(reason) => return Ok(fail(format!("delegate {name}: {reason}"))),
     };
-    let mut entry = match require_delegate_no_deadline(name) {
+    let mut entry = match require_delegate_no_deadline(name, flags.json) {
         Ok(Recorded::Live(entry)) => entry,
         Ok(Recorded::Gone(entry)) => return Ok(emit_submit_gone(&entry, flags.json)),
         Err(code) => return Ok(code),

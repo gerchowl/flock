@@ -4219,7 +4219,7 @@ fn delegate_send(args: &[String]) -> io::Result<i32> {
         Err("busy") => return Ok(fail(format!("delegate {name} is busy"))),
         Err(reason) => return Ok(fail(format!("delegate {name}: {reason}"))),
     };
-    let mut entry = match require_delegate_no_deadline(name) {
+    let mut entry = match require_delegate_no_deadline(name, flags.json) {
         Ok(Recorded::Live(entry)) => entry,
         // Nothing to type into: the round is not started, and the record stays.
         Ok(Recorded::Gone(entry)) => {
@@ -4422,6 +4422,13 @@ fn delegate_wait(args: &[String]) -> io::Result<i32> {
             );
             return Ok(Outcome::Gone.exit_code());
         }
+        Err(RequireFailure::SessionUnbound(entry)) => {
+            return Ok(session::unbound(
+                &entry,
+                "no stable agent identity was recorded",
+                flags.json,
+            ));
+        }
         Err(RequireFailure::NotDelegate) => return Ok(usage(format!("not a delegate: {name}"))),
         Err(RequireFailure::Failed(reason)) => {
             // The server was unreachable. Never "not a delegate" (W4): a
@@ -4497,7 +4504,7 @@ fn delegate_result(args: &[String]) -> io::Result<i32> {
         Ok(flags) => flags,
         Err(reason) => return Ok(usage(reason)),
     };
-    let mut entry = match require_delegate_no_deadline(name) {
+    let mut entry = match require_delegate_no_deadline(name, flags.json) {
         Ok(Recorded::Live(entry)) => entry,
         // No agent to ask for a reply: the same answer `delegate wait` gives.
         Ok(Recorded::Gone(entry)) => {
@@ -4609,7 +4616,7 @@ fn delegate_status(args: &[String]) -> io::Result<i32> {
         Ok(flags) => flags,
         Err(reason) => return Ok(usage(reason)),
     };
-    let (entry, gone) = match require_delegate_no_deadline(name) {
+    let (entry, gone) = match require_delegate_no_deadline(name, flags.json) {
         Ok(Recorded::Live(entry)) => (entry, false),
         Ok(Recorded::Gone(entry)) => (entry, true),
         Err(code) => return Ok(code),
@@ -4746,6 +4753,8 @@ enum RequireFailure {
     /// (K5). Boxed so this variant does not inflate every `NotDelegate`
     /// return by hundreds of bytes (clippy::result_large_err).
     TimedOut(Box<Entry>),
+    /// A legacy entry cannot authorize session recovery without a saved identity.
+    SessionUnbound(Box<Entry>),
     /// The server was unreachable (dead socket, closed connection). This is
     /// never `NotDelegate` — a server that cannot answer has not proved the
     /// name is gone (W4). Caller exits 1 with the reason on stderr.
@@ -4775,6 +4784,9 @@ fn require_delegate(name: &str, deadline: Option<Instant>) -> Result<Recorded, R
              `flk delegate reap {name}` removes the kept workspace"
         );
         return Ok(Recorded::Gone(entry));
+    }
+    if entry.agent_id.is_none() {
+        return Err(RequireFailure::SessionUnbound(Box::new(entry)));
     }
     let before = entry.clone();
     let by_name = agent_record(name, deadline);
@@ -4819,22 +4831,12 @@ fn persist_reidentified(before: &Entry, live: &Entry) {
 /// Whether `record` is the agent `entry` was written for, and the entry
 /// re-pointed at it.
 ///
-/// The terminal id is the first proof, and backfills the agent id an older
-/// entry lacks. After a restart the terminal id is new, and the agent id is
-/// the proof (#975). An entry from before the agent id was recorded has one
-/// more: a worktree delegate whose agent still runs in that worktree under
-/// the same name, which is what an agent that merely inherited the name
-/// would not do. The cwd must equal the worktree path exactly: an agent that
-/// moved into a subdirectory stays "not a delegate", because a prefix match
-/// would also accept an agent in a nested checkout.
+/// A recorded stable agent id is the identity proof. Names, directories and
+/// terminal addresses cannot authorize a replacement agent's session binding.
 fn reidentify(mut entry: Entry, record: &serde_json::Value) -> Option<Entry> {
     let record_agent_id = field(record, "agent_id").map(str::to_string);
     let same_terminal = field(record, "terminal_id") == Some(entry.terminal_id.as_str());
-    let same_agent = entry.agent_id.is_some() && entry.agent_id == record_agent_id;
-    let legacy_same_worktree = entry.agent_id.is_none()
-        && entry.worktree.is_some()
-        && field(record, "cwd") == entry.worktree.as_deref();
-    if !(same_terminal || same_agent || legacy_same_worktree) {
+    if entry.agent_id.is_none() || entry.agent_id != record_agent_id {
         return None;
     }
     if !same_terminal {
@@ -4844,9 +4846,6 @@ fn reidentify(mut entry: Entry, record: &serde_json::Value) -> Option<Entry> {
         if let Some(pane_id) = field(record, "pane_id") {
             entry.pane_id = pane_id.to_string();
         }
-    }
-    if entry.agent_id.is_none() {
-        entry.agent_id = record_agent_id;
     }
     if let Some(session) = record.get("agent_session").filter(|v| !v.is_null()) {
         entry.session = Some(session.clone());
@@ -4858,6 +4857,9 @@ fn reidentify(mut entry: Entry, record: &serde_json::Value) -> Option<Entry> {
 /// and the agent-lookup outcome. The call-site tests (W7) exercise this.
 fn require_decide(entry: Entry, fetch: AgentFetch) -> Result<Entry, RequireFailure> {
     match fetch {
+        AgentFetch::Found(_) if entry.agent_id.is_none() => {
+            Err(RequireFailure::SessionUnbound(Box::new(entry)))
+        }
         AgentFetch::Found(record) => reidentify(entry, &record).ok_or(RequireFailure::NotDelegate),
         AgentFetch::Missing => Err(RequireFailure::NotDelegate),
         AgentFetch::TimedOut => Err(RequireFailure::TimedOut(Box::new(entry))),
@@ -4868,9 +4870,14 @@ fn require_decide(entry: Entry, fetch: AgentFetch) -> Result<Entry, RequireFailu
 /// Map a `RequireFailure` into an exit code for callers that do not want to
 /// emit a `timeout` outcome object: `NotDelegate` is a usage error (exit 2),
 /// `TimedOut`/`Failed` print on stderr and exit 1.
-fn require_delegate_no_deadline(name: &str) -> Result<Recorded, i32> {
+fn require_delegate_no_deadline(name: &str, json: bool) -> Result<Recorded, i32> {
     match require_delegate(name, None) {
         Ok(recorded) => Ok(recorded),
+        Err(RequireFailure::SessionUnbound(entry)) => Err(session::unbound(
+            &entry,
+            "no stable agent identity was recorded",
+            json,
+        )),
         Err(RequireFailure::NotDelegate) => Err(usage(format!("not a delegate: {name}"))),
         Err(RequireFailure::TimedOut(_)) => Err(fail(format!(
             "delegate {name}: timed out resolving the agent"
