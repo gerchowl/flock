@@ -641,6 +641,7 @@ impl App {
             // rendering, and keeps riding outgoing snapshots to other servers.
             // Only meaningful now that carried freshness decays.
             self.note_mesh_owners();
+            self.state.trace_redundant_relay_claims(&fetch.peer, now);
             self.state.evict_expired_relayed_entries();
             self.sync_directory_events();
             self.render_dirty.store(true, Ordering::Release);
