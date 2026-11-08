@@ -2979,6 +2979,7 @@ fn live_handoff_keeps_an_idle_claude_pane_readable_repainted_and_its_mail_queued
             "{}\n",
             serde_json::json!({
                 "type": "user",
+                "sessionId": IDLE_CLAUDE_SESSION,
                 "message": {"role": "user", "content": "before the handoff"}
             })
         ),

@@ -4624,7 +4624,7 @@ mod tests {
     }
 
     #[test]
-    fn server_identity1076_protocol_32_client_handles_protocol_31_refusal() {
+    fn server_identity1076_protocol_33_client_handles_protocol_32_refusal() {
         let (_lock, _scrub) = crate::config::test_config_env_guard();
         let (mut client, mut server) = UnixStream::pair().unwrap();
         server
@@ -4632,11 +4632,11 @@ mod tests {
             .unwrap();
         let worker = std::thread::spawn(move || {
             let hello: ClientMessage = protocol::read_message(&mut server, MAX_FRAME_SIZE).unwrap();
-            assert!(matches!(hello, ClientMessage::Hello { version: 32, .. }));
+            assert!(matches!(hello, ClientMessage::Hello { version: 33, .. }));
             protocol::write_message(
                 &mut server,
                 &ServerMessage::Welcome {
-                    version: 31,
+                    version: 32,
                     encoding: RenderEncoding::SemanticFrame,
                     error: Some("incompatible protocol".into()),
                 },
@@ -4659,7 +4659,7 @@ mod tests {
         worker.join().unwrap();
         assert!(matches!(
             &error,
-            ClientError::HandshakeRejected { version: 31, .. }
+            ClientError::HandshakeRejected { version: 32, .. }
         ));
         let error = AttachAttemptError::Handshake(error);
         let mut retry = HandoffRetry::default();

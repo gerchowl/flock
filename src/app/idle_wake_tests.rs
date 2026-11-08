@@ -1159,6 +1159,7 @@ async fn guarded_client_rechecks_session_and_settle_before_enter() {
             id: "session".into(),
             method: Method::PaneReportAgentSession(
                 crate::api::schema::PaneReportAgentSessionParams {
+                    rebind_agent_id: None,
                     pane_id: pane.clone(),
                     source: "flock:claude".into(),
                     agent: "claude".into(),

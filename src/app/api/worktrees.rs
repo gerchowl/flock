@@ -4448,7 +4448,11 @@ mod tests {
         let home = unique_temp_path(name);
         let project = home.join(".claude/projects/-repo");
         std::fs::create_dir_all(&project).unwrap();
-        std::fs::write(project.join(format!("{session_id}.jsonl")), "{}\n").unwrap();
+        std::fs::write(
+            project.join(format!("{session_id}.jsonl")),
+            format!("{}\n", serde_json::json!({"sessionId":session_id})),
+        )
+        .unwrap();
         std::env::set_var("HOME", &home);
         home
     }
