@@ -263,6 +263,8 @@ impl App {
             std::time::Instant::now(),
         );
         self.note_mesh_owners();
+        self.state
+            .trace_redundant_relay_claims(&hub, std::time::Instant::now());
         self.state.evict_expired_relayed_entries();
         self.render_dirty
             .store(true, std::sync::atomic::Ordering::Release);
@@ -2753,6 +2755,136 @@ mod tests {
             now,
         );
     }
+    fn receive_claim_3030(direct: bool, hub_push: bool, legacy: bool, other_peer: bool) {
+        let mut app = test_app();
+        let sender = crate::mesh::identity::NodeIdentity::fixture([91; 32]).node_id();
+        let subject = crate::mesh::identity::NodeIdentity::fixture([92; 32]).node_id();
+        if direct {
+            let peer = crate::config::PeerConfig {
+                name: "direct-alias.example".into(),
+                ssh: "direct-dial.example".into(),
+                ..Default::default()
+            };
+            crate::peer_stream::test_enroll(&peer, &subject);
+            let mut reading = crate::peers::PeerSummaryState::new(&peer);
+            reading.bind_node(Some(subject.clone()));
+            reading.last_ok = Some(std::time::Instant::now());
+            reading.protocol = Some(crate::protocol::PROTOCOL_VERSION);
+            app.state.peer_summaries.push(reading);
+            app.state
+                .server_nodes
+                .insert(peer.name.clone(), subject.clone());
+            app.state.peers.push(peer);
+        }
+        if other_peer {
+            app.state.peers.push(crate::config::PeerConfig {
+                name: "other.example".into(),
+                ..Default::default()
+            });
+        }
+        if hub_push {
+            bind_relay(&mut app, "hub.example");
+            let mut row = hub_row("leaf.example", "direct-dial.example", 0);
+            row.node_id = (!legacy).then_some(subject.clone());
+            push_down(
+                &mut app,
+                crate::api::schema::PeersHubFleetParams {
+                    hub: "hub.example".into(),
+                    fleet: vec![row],
+                    hub_self: None,
+                },
+            );
+        } else {
+            let peer = relay_ingest_peer(&mut app);
+            crate::peer_stream::test_enroll(&peer, &sender);
+            ingest_relay_poll(
+                &mut app,
+                &peer,
+                &sender,
+                &subject,
+                std::time::Instant::now(),
+            );
+            crate::peer_stream::reset_enrollment(&peer.name);
+        }
+        assert_eq!(app.state.relayed_fleet_cache.len(), 1);
+        let claim = &app.state.relayed_fleet_cache.values().next().unwrap().peer;
+        assert_eq!(
+            app.state
+                .relay_claim_is_redundant_at(claim, std::time::Instant::now()),
+            direct,
+            "direct={direct}, hub_push={hub_push}, legacy={legacy}"
+        );
+        assert_eq!(crate::mesh::hello::VERSION, 5);
+        if direct {
+            crate::peer_stream::reset_enrollment("direct-alias.example");
+        }
+    }
+
+    #[tokio::test]
+    async fn relay_3030_hub_suppresses_healthy_direct_claims_on_both_ingress_paths() {
+        let _guard = crate::config::test_config_env_guard();
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        receive_claim_3030(true, false, false, false);
+        receive_claim_3030(true, true, false, false);
+        receive_claim_3030(true, true, true, false);
+    }
+
+    #[tokio::test]
+    async fn relay_3030_spoke_keeps_pushed_claims() {
+        let _guard = crate::config::test_config_env_guard();
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        receive_claim_3030(false, true, false, false);
+        receive_claim_3030(false, true, true, false);
+    }
+
+    #[tokio::test]
+    async fn relay_3030_hub_keeps_non_dialed_partition_claims() {
+        let _guard = crate::config::test_config_env_guard();
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        receive_claim_3030(false, false, false, true);
+        receive_claim_3030(false, true, false, true);
+    }
+
+    #[tokio::test]
+    async fn relay_3030_direct_link_down_restores_a_retained_claim() {
+        let _guard = crate::config::test_config_env_guard();
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        let mut app = test_app();
+        let peer = relay_ingest_peer(&mut app);
+        let owner = crate::mesh::identity::NodeIdentity::fixture([93; 32]).node_id();
+        crate::peer_stream::test_enroll(&peer, &owner);
+        ingest_bindings(&mut app);
+        bind_relay(&mut app, "other.example");
+        let mut row = hub_row("leaf.example", "leaf.example", 0);
+        row.node_id = Some(owner.clone());
+        push_down(
+            &mut app,
+            crate::api::schema::PeersHubFleetParams {
+                hub: "other.example".into(),
+                fleet: vec![row],
+                hub_self: None,
+            },
+        );
+        assert_eq!(app.state.relayed_fleet_cache.len(), 1);
+        let target = crate::app::state::ClaimFoldTarget::PinnedPeer { peer_idx: 0 };
+        assert_eq!(app.state.fold_hubs(&target), vec!["other.example"]);
+        ingest_relay_poll(&mut app, &peer, &owner, "", std::time::Instant::now());
+        assert!(app.state.fold_hubs(&target).is_empty());
+        app.handle_internal_event_at(
+            crate::events::AppEvent::PeerSummaryFetched(crate::peers::PeerSummaryFetch {
+                peer: peer.name.clone(),
+                result: Err("Connection refused".into()),
+                stream_error: None,
+            }),
+            std::time::Instant::now(),
+        );
+        assert_eq!(app.state.fold_hubs(&target), vec!["other.example"]);
+        assert_eq!(app.state.relayed_fleet_cache.len(), 1);
+        ingest_relay_poll(&mut app, &peer, &owner, "", std::time::Instant::now());
+        assert!(app.state.fold_hubs(&target).is_empty());
+        crate::peer_stream::reset_enrollment(&peer.name);
+    }
+
     fn ingest_bindings(app: &mut App) {
         let request = serde_json::from_value(serde_json::json!({
             "id":"bindings", "method":"peers.enrollment", "params":{}}))

@@ -3106,3 +3106,5 @@ Last login: banner noise
 
 #[cfg(test)]
 mod legacy_summary;
+
+mod direct_claims;
