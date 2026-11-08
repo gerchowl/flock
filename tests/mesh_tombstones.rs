@@ -2,8 +2,13 @@
 mod support;
 use serde_json::{json, Value};
 use std::{fs, os::unix::fs::PermissionsExt, path::Path, time::Duration};
-use support::fleet::{self, Fleet, Node, NodeSpec};
+// Used only by debug-only fake SSH relay tests (#1715).
+#[cfg(debug_assertions)]
+use support::fleet::Fleet;
+use support::fleet::{self, Node, NodeSpec};
 const DEADLINE: Duration = Duration::from_secs(45);
+// Used only by debug-only fake SSH relay tests (#1715).
+#[cfg(debug_assertions)]
 const PAIR: &[NodeSpec] = &[
     NodeSpec::new("nodea", "tombstone-origin", &["nodeb"]),
     NodeSpec::new("nodeb", "tombstone-owner", &[]),
@@ -73,6 +78,8 @@ fn state(node: &Node, correlation: &str, expected: &str) -> Value {
 fn close(node: &Node, agent: &Value) {
     api(node, "pane.close", json!({"pane_id":agent["pane_id"]}));
 }
+// Used only by debug-only fake SSH relay tests (#1715).
+#[cfg(debug_assertions)]
 fn discover(fleet: &Fleet, target: &Value) {
     fleet.wait_route("nodea", "nodeb", true);
     fleet::wait_until("remote recipient", DEADLINE, || {
@@ -350,6 +357,8 @@ fn replacement_after_exit_accepts_mail_with_fresh_identity() {
     assert_eq!(restored["agent"]["agent_id"], replacement["agent_id"]);
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn explicit_kill_terminates_pending_mail_as_recipient_gone_at_origin() {
     let fleet = fleet::spawn_with_startup_probe("ts-kill", PAIR, |fleet, name| {
@@ -411,6 +420,8 @@ fn explicit_kill_terminates_pending_mail_as_recipient_gone_at_origin() {
     assert_eq!(reason, "killed");
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn stale_directory_send_gets_recipient_gone_from_owner() {
     let fleet = fleet::spawn("ts-stale", PAIR);
@@ -510,6 +521,8 @@ fn resume_failure_reports_offline_not_removed() {
     state(node, "failed-resume-mail", "queued");
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn reply_to_removed_sender_lands_in_origin_status_not_a_replacement_inbox() {
     let fleet = fleet::spawn("ts-reply", PAIR);
