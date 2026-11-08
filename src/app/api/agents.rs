@@ -891,7 +891,11 @@ mod tests {
             std::env::temp_dir().join(format!("flock-history-home-{}-{name}", std::process::id()));
         let project = home.join(".claude/projects/-repo");
         std::fs::create_dir_all(&project).expect("fixture project dir");
-        std::fs::write(project.join(format!("{session_id}.jsonl")), body).expect("transcript");
+        std::fs::write(
+            project.join(format!("{session_id}.jsonl")),
+            format!("{}\n{body}", serde_json::json!({"sessionId":session_id})),
+        )
+        .expect("transcript");
         std::env::set_var("HOME", &home);
         home
     }
@@ -1265,14 +1269,19 @@ mod tests {
         assert_eq!(error.error.code, "transcript_unreadable");
         std::fs::write(
             &path,
-            include_str!("../../../tests/fixtures/codex/in-progress.jsonl"),
+            format!(
+                "{}\n{}",
+                serde_json::json!({"type":"session_meta","payload":{"id":"sess-codex"}}),
+                include_str!("../../../tests/fixtures/codex/in-progress.jsonl")
+            ),
         )
         .unwrap();
         let error: ErrorResponse = serde_json::from_str(&read(&mut app)).unwrap();
         assert_eq!(error.error.code, "no_result");
         std::fs::write(
             &path,
-            include_str!("../../../tests/fixtures/codex/finished.jsonl"),
+            include_str!("../../../tests/fixtures/codex/finished.jsonl")
+                .replace("00000000-0000-4000-8000-000000000613", "sess-codex"),
         )
         .unwrap();
         let response: serde_json::Value = serde_json::from_str(&read(&mut app)).unwrap();
@@ -1283,10 +1292,12 @@ mod tests {
         assert_eq!(result["at_ms"], 1_767_225_603_125_u64);
         std::fs::write(
             &path,
-            concat!(
+            format!(
+                "{}{}",
                 include_str!("../../../tests/fixtures/codex/finished.jsonl"),
                 include_str!("../../../tests/fixtures/codex/in-progress.jsonl")
-            ),
+            )
+            .replace("00000000-0000-4000-8000-000000000613", "sess-codex"),
         )
         .unwrap();
         let response: serde_json::Value = serde_json::from_str(&read(&mut app)).unwrap();

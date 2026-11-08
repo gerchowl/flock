@@ -261,16 +261,6 @@ fn claude_transcript_path_in(
         .flatten()
 }
 
-fn claude_store_error(path: &Path, error: io::Error) -> io::Error {
-    io::Error::new(
-        error.kind(),
-        format!(
-            "cannot read Claude session store {}: {error}",
-            path.display()
-        ),
-    )
-}
-
 fn claude_transcript_path_checked_in(
     home: &Path,
     records_dir: &Path,
@@ -279,106 +269,15 @@ fn claude_transcript_path_checked_in(
     if session_id.is_empty() || session_id.contains(['/', '\\']) || !valid_session_id(session_id) {
         return Ok(None);
     }
-    let record = records_dir.join(session_id);
-    let profile = match std::fs::read_to_string(&record) {
-        Ok(raw) if raw.trim().is_empty() => {
-            return Err(claude_store_error(
-                &record,
-                io::Error::new(io::ErrorKind::InvalidData, "profile record is empty"),
-            ))
-        }
-        Ok(raw) => {
-            let path = std::path::PathBuf::from(raw.trim());
-            if !path.is_absolute() {
-                return Err(claude_store_error(
-                    &record,
-                    io::Error::new(io::ErrorKind::InvalidData, "profile path is not absolute"),
-                ));
-            }
-            Some(path)
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-        Err(error) => return Err(claude_store_error(&record, error)),
-    };
-    let mut stores = std::collections::HashSet::new();
-    let mut found = None;
-    for config_dir in profile
-        .into_iter()
-        .chain(std::iter::once(home.join(".claude")))
-    {
-        let canonical = match std::fs::canonicalize(&config_dir) {
-            Ok(path) => path,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(claude_store_error(&config_dir, error)),
-        };
-        if !stores.insert(canonical) {
-            continue;
-        }
-        if let Some(path) = claude_transcript_in_config_dir(&config_dir, session_id)? {
-            if found.replace(path).is_some() {
-                return Err(claude_store_error(
-                    &config_dir,
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "session id matches multiple transcripts",
-                    ),
-                ));
-            }
-        }
-    }
-    match found {
-        Some(path) => {
-            let metadata = path
-                .metadata()
-                .map_err(|error| claude_store_error(&path, error))?;
-            Ok((metadata.len() > 0).then_some(path))
-        }
-        None => Ok(None),
-    }
-}
-
-fn claude_transcript_in_config_dir(
-    config_dir: &Path,
-    session_id: &str,
-) -> io::Result<Option<std::path::PathBuf>> {
-    let projects = config_dir.join("projects");
-    let entries = match std::fs::read_dir(&projects) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(claude_store_error(&projects, error)),
-    };
-    let file_name = format!("{session_id}.jsonl");
-    let mut found = None;
-    for entry in entries {
-        let project = entry
-            .map_err(|error| claude_store_error(&projects, error))?
-            .path();
-        let metadata = match project.metadata() {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(claude_store_error(&project, error)),
-        };
-        // A non-directory cannot contain a transcript. Symlink targets were checked above.
-        if !metadata.is_dir() {
-            continue;
-        }
-        let candidate = project.join(&file_name);
-        let metadata = match candidate.metadata() {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(claude_store_error(&candidate, error)),
-        };
-        if metadata.is_file() && found.replace(candidate).is_some() {
-            return Err(claude_store_error(
-                &project,
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "session id matches multiple transcripts",
-                ),
-            ));
-        }
-    }
-    Ok(found)
+    let profile = crate::session_evidence::store::recorded_profile(&records_dir.join(session_id))?;
+    crate::session_evidence::store::lookup(
+        profile
+            .into_iter()
+            .chain(std::iter::once(home.join(".claude")))
+            .map(|config| config.join("projects")),
+        crate::session_evidence::store::Layout::Claude,
+        session_id,
+    )
 }
 
 /// The session id a Claude fork plan resumes, if `plan` is one (#178).
@@ -890,7 +789,7 @@ mod tests {
         let home = std::env::temp_dir().join(format!("flock-home-{}-{nanos}", std::process::id()));
         let project = home.join(".claude/projects/-tmp-repo");
         std::fs::create_dir_all(&project).unwrap();
-        std::fs::write(project.join("sess-1.jsonl"), "{}\n").unwrap();
+        std::fs::write(project.join("sess-1.jsonl"), "{\"sessionId\":\"sess-1\"}\n").unwrap();
         std::fs::write(project.join("empty.jsonl"), "").unwrap();
 
         assert_eq!(
@@ -927,8 +826,16 @@ mod tests {
         let default_project = home.join(".claude/projects/-tmp-repo");
         std::fs::create_dir_all(&profile_project).unwrap();
         std::fs::create_dir_all(&default_project).unwrap();
-        std::fs::write(profile_project.join("sess-profile.jsonl"), "{}\n").unwrap();
-        std::fs::write(default_project.join("sess-default.jsonl"), "{}\n").unwrap();
+        std::fs::write(
+            profile_project.join("sess-profile.jsonl"),
+            "{\"sessionId\":\"sess-profile\"}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            default_project.join("sess-default.jsonl"),
+            "{\"sessionId\":\"sess-default\"}\n",
+        )
+        .unwrap();
 
         assert_eq!(
             claude_transcript_path_in(&home, &records, "sess-profile"),
@@ -964,7 +871,11 @@ mod tests {
         for config in [&profile, &home.join(".claude")] {
             let project = config.join("projects/fixture");
             std::fs::create_dir_all(&project).unwrap();
-            std::fs::write(project.join("reused-session.jsonl"), "{}\n").unwrap();
+            std::fs::write(
+                project.join("reused-session.jsonl"),
+                "{\"sessionId\":\"reused-session\"}\n",
+            )
+            .unwrap();
         }
         record_claude_config_dir_in(&records, "reused-session", profile.to_str().unwrap());
         assert!(claude_transcript_path_in(&home, &records, "reused-session").is_none());
@@ -983,7 +894,11 @@ mod tests {
         let config = home.join(".claude");
         let project = config.join("projects/fixture");
         std::fs::create_dir_all(&project).unwrap();
-        std::fs::write(project.join("only-session.jsonl"), "{}\n").unwrap();
+        std::fs::write(
+            project.join("only-session.jsonl"),
+            "{\"sessionId\":\"only-session\"}\n",
+        )
+        .unwrap();
         record_claude_config_dir_in(&records, "only-session", config.to_str().unwrap());
         assert_eq!(
             claude_transcript_path_in(&home, &records, "only-session"),
@@ -1001,11 +916,23 @@ mod tests {
         let blocked = projects.join("blocked");
         std::fs::create_dir_all(&visible).unwrap();
         std::fs::create_dir_all(&blocked).unwrap();
-        std::fs::write(visible.join("unique-session.jsonl"), "{}\n").unwrap();
+        std::fs::write(
+            visible.join("unique-session.jsonl"),
+            "{\"sessionId\":\"unique-session\"}\n",
+        )
+        .unwrap();
         if hidden_match {
-            std::fs::write(blocked.join("unique-session.jsonl"), "{}\n").unwrap();
+            std::fs::write(
+                blocked.join("unique-session.jsonl"),
+                "{\"sessionId\":\"unique-session\"}\n",
+            )
+            .unwrap();
         } else {
-            std::fs::write(blocked.join("unrelated-session.jsonl"), "{}\n").unwrap();
+            std::fs::write(
+                blocked.join("unrelated-session.jsonl"),
+                "{\"sessionId\":\"unrelated-session\"}\n",
+            )
+            .unwrap();
         }
         std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000)).unwrap();
         let result = claude_transcript_path_in(&home, &records, "unique-session");
@@ -1041,7 +968,7 @@ mod tests {
         let projects = home.join(".claude/projects");
         std::fs::create_dir_all(projects.join("visible")).unwrap();
         let transcript = projects.join("visible/unique-session.jsonl");
-        std::fs::write(&transcript, "{}\n").unwrap();
+        std::fs::write(&transcript, "{\"sessionId\":\"unique-session\"}\n").unwrap();
         std::fs::write(projects.join("ordinary-file"), "not a directory").unwrap();
         assert_eq!(
             claude_transcript_path_checked_in(&home, &records, "unique-session").unwrap(),
