@@ -11,6 +11,7 @@ pub(crate) mod peer_discovery;
 pub mod question;
 pub mod queue_event;
 mod reply_wait;
+pub mod retained;
 pub mod schema;
 pub(crate) mod scoped;
 pub(crate) mod server;

@@ -39,6 +39,7 @@ mod owners;
 mod panes;
 pub(crate) mod peers;
 pub(super) mod responses;
+mod retained;
 mod revert;
 mod spawn;
 mod structured_agents;
@@ -1488,6 +1489,8 @@ impl App {
                 | Method::ServerStop(_)
                 | Method::ServerReloadConfig(_)
                 | Method::ServerLiveHandoff(_)
+                | Method::SessionRetainedList(_)
+                | Method::SessionRetainedPurge(_)
                 | Method::ClientTokenAdd(_)
                 | Method::ClientTokenRemove(_)
                 | Method::ClientTokenList(_)
@@ -1558,6 +1561,13 @@ impl App {
                 },
             ));
             return String::new();
+        }
+
+        if matches!(
+            &request.method,
+            Method::SessionRetainedList(_) | Method::SessionRetainedPurge(_)
+        ) {
+            return self.handle_retained(request.id, request.method);
         }
 
         if !matches!(
