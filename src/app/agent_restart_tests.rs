@@ -93,7 +93,7 @@ fn rig_with_harness_options(agent: &str, script: &str, options: &[&str]) -> Rig 
     terminal.cwd = directory.clone();
     terminal.launch_argv = Some(argv);
     terminal.launch_env = vec![("RESTART_PROFILE".into(), "fixture-env".into())];
-    terminal.set_agent_name("restart-fixture".into());
+    terminal.set_agent_name("restart-fixture".into()).unwrap();
     let mut rig = Rig {
         app,
         id,
@@ -117,6 +117,7 @@ fn report_harness_session(rig: &mut Rig, agent: &str, session: &str, seq: u64) {
     let response = rig.app.handle_api_request(Request {
         id: "session-report".into(),
         method: Method::PaneReportAgentSession(PaneReportAgentSessionParams {
+            rebind_agent_id: None,
             pane_id: rig.pane.clone(),
             source: format!("flock:{agent}"),
             agent: agent.into(),

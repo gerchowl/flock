@@ -239,7 +239,7 @@ pub(super) fn emit(out: &SharedOut, value: &Value) -> std::io::Result<()> {
 
 /// Start the push thread. Called once, when the client says it has finished
 /// initializing — a notification sent before that has no listener to reach.
-pub(super) fn spawn_push_feed(out: SharedOut, opts: ChannelOptions) {
+pub(super) fn spawn_push_feed(out: SharedOut, opts: ChannelOptions, client: ApiClient) {
     let spawned = std::thread::Builder::new()
         .name("mcp-channel-push".into())
         .spawn(move || loop {
@@ -247,7 +247,7 @@ pub(super) fn spawn_push_feed(out: SharedOut, opts: ChannelOptions) {
             // live handoff. The inbox holds the mail meanwhile and the other
             // two wake paths still run, so re-attaching late costs latency,
             // never a message.
-            if let Err(reason) = run_feed(&out, &opts) {
+            if let Err(reason) = run_feed(&out, &opts, &client) {
                 crate::logging::mcp_channel_feed_ended(&reason);
             }
             std::thread::sleep(opts.reconnect);
@@ -257,11 +257,14 @@ pub(super) fn spawn_push_feed(out: SharedOut, opts: ChannelOptions) {
     }
 }
 
-fn run_feed(out: &SharedOut, opts: &ChannelOptions) -> Result<(), String> {
-    let client = ApiClient::local();
+pub(super) fn run_feed(
+    out: &SharedOut,
+    opts: &ChannelOptions,
+    client: &ApiClient,
+) -> Result<(), String> {
     // Which inbox is "mine": the same ancestry resolution `msg.read` uses,
     // asked once per attach.
-    let wake = call(&client, Method::MsgWake(MsgWakeParams { pane: None }))?;
+    let wake = call(client, Method::MsgWake(MsgWakeParams { pane: None }))?;
     let pane = wake
         .get("pane")
         .and_then(Value::as_str)
@@ -289,7 +292,7 @@ fn run_feed(out: &SharedOut, opts: &ChannelOptions) -> Result<(), String> {
             continue;
         };
         let wake = call(
-            &client,
+            client,
             Method::MsgWake(MsgWakeParams {
                 pane: Some(pane.clone()),
             }),

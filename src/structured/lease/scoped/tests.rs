@@ -44,14 +44,17 @@ fn agent() -> Caller {
 fn scoped_live_lease_is_agent_and_wrong_or_missing_credentials_refuse() {
     let (leases, lease) = fixture();
     assert_eq!(
-        leases.scoped_with(Some(&lease.credential()), peer(), facts),
+        leases.scoped_for_test(Some(&lease.credential()), peer(), facts),
         agent()
     );
     assert_eq!(
-        leases.scoped_with(Some(&LeaseCredential::generate().unwrap()), peer(), facts),
+        leases.scoped_for_test(Some(&LeaseCredential::generate().unwrap()), peer(), facts),
         Caller::Uncertain
     );
-    assert_eq!(leases.scoped_with(None, peer(), facts), Caller::Uncertain);
+    assert_eq!(
+        leases.scoped_for_test(None, peer(), facts),
+        Caller::Uncertain
+    );
 }
 
 #[test]
@@ -60,21 +63,21 @@ fn scoped_release_rotation_and_restart_never_become_unrelated() {
     let old = lease.credential();
     lease.release();
     assert_eq!(
-        leases.scoped_with(Some(&old), peer(), facts),
+        leases.scoped_for_test(Some(&old), peer(), facts),
         Caller::Uncertain
     );
     let next = leases.reserve("agent", "session", None).unwrap();
     bind(&leases);
     assert_eq!(
-        leases.scoped_with(Some(&old), peer(), facts),
+        leases.scoped_for_test(Some(&old), peer(), facts),
         Caller::Uncertain
     );
     assert_eq!(
-        leases.scoped_with(Some(&next.credential()), peer(), facts),
+        leases.scoped_for_test(Some(&next.credential()), peer(), facts),
         agent()
     );
     assert_eq!(
-        SessionLeases::default().scoped_with(Some(&old), peer(), facts),
+        SessionLeases::default().scoped_for_test(Some(&old), peer(), facts),
         Caller::Uncertain
     );
 }
@@ -102,7 +105,7 @@ fn scoped_kernel_identity_loss_reuse_and_orphan_refuse() {
         },
     ] {
         assert_eq!(
-            leases.scoped_with(Some(&credential), captured, facts),
+            leases.scoped_for_test(Some(&credential), captured, facts),
             Caller::Uncertain
         );
     }
@@ -124,7 +127,7 @@ fn scoped_kernel_identity_loss_reuse_and_orphan_refuse() {
         },
     ] {
         assert_eq!(
-            leases.scoped_with(Some(&credential), peer(), read),
+            leases.scoped_for_test(Some(&credential), peer(), read),
             Caller::Uncertain
         );
     }
@@ -136,14 +139,14 @@ fn scoped_contention_refuses_and_revocation_precedes_registry_removal() {
     let credential = lease.credential();
     let held = leases.0.lock();
     assert_eq!(
-        leases.scoped_with(Some(&credential), peer(), facts),
+        leases.scoped_for_test(Some(&credential), peer(), facts),
         Caller::Uncertain
     );
     lease.revoke();
     drop(held);
     assert!(leases.is_reserved("session").unwrap());
     assert_eq!(
-        leases.scoped_with(Some(&credential), peer(), facts),
+        leases.scoped_for_test(Some(&credential), peer(), facts),
         Caller::Uncertain
     );
 }
@@ -165,7 +168,44 @@ fn scoped_owner_drop_revokes_even_when_cleanup_retains_the_reservation() {
     drop(lease);
     assert!(leases.is_reserved("session").unwrap());
     assert_eq!(
-        leases.scoped_with(Some(&credential), peer(), facts),
+        leases.scoped_for_test(Some(&credential), peer(), facts),
         Caller::Uncertain
     );
+}
+
+#[test]
+fn scoped_busy_registry_is_typed_nonblocking_and_does_no_fact_work() {
+    let (leases, lease) = fixture();
+    let _busy = leases.0.lock();
+    let result = leases.scoped_with(Some(&lease.credential()), peer(), |_| {
+        panic!("no fact read under contention")
+    });
+    assert_eq!(result, Err(ScopedRefusal::RegistryContended));
+}
+
+#[test]
+fn scoped_process_fact_work_has_a_closed_budget() {
+    let (leases, lease) = fixture();
+    let mut reads = 0;
+    let result = leases.scoped_with(Some(&lease.credential()), peer(), |pid| {
+        reads += 1;
+        Some((pid + 1, 20))
+    });
+    assert_eq!(reads, 16);
+    assert_eq!(result, Err(ScopedRefusal::AncestryBudget));
+}
+
+#[test]
+fn hardened_comparison_checks_every_encoded_position() {
+    let credential = LeaseCredential::generate().unwrap();
+    assert!(credential.matches(&credential.clone()));
+    for i in 0..credential.0.len() {
+        let mut wrong = credential.0.to_string().into_bytes();
+        wrong[i] ^= 1;
+        assert!(
+            !credential.matches(&LeaseCredential(zeroize::Zeroizing::new(
+                String::from_utf8(wrong).unwrap()
+            )))
+        );
+    }
 }

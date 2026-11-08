@@ -69,6 +69,9 @@ use crate::api::schema::{
     WorktreeListParams,
 };
 
+#[path = "delegate_lock.rs"]
+mod lock;
+
 use super::ready::{classify_ready_event, status_is_ready, ReadySignal};
 use super::settled::{Cursor, PinnedTarget, SettleTarget};
 
@@ -83,7 +86,9 @@ pub(super) const START_USAGE: &str = concat!(
     "  --brief FILE        a readable file; exactly `Read <path> and execute it exactly.` is typed\n",
     "  --cwd PATH          run in a workspace the delegate creates for that directory\n",
     "  --harness NAME      the agent to run, default opencode; a startup dialog is named rather\n",
-    "                      than typed into: claude_folder_trust, codex_folder_trust, codex_hook_review\n",
+    "                      than typed into: claude_folder_trust, claude_folder_trust_with_permissions,\n",
+    "                      codex_folder_trust, codex_hook_review,\n",
+    "                      codex_conversation_locked\n",
     "                      codex defaults to never approvals and workspace-write (network blocked)\n",
     "  --worktree          run in a fresh linked worktree: --branch is required, --repo and --base optional\n",
     "  --repo PATH         a linked worktree is swapped for its main checkout, branching from its HEAD\n",
@@ -119,6 +124,7 @@ pub(super) const START_USAGE: &str = concat!(
 pub(super) const SEND_USAGE: &str = concat!(
     "flk delegate send <name> --brief FILE [--await] [--timeout MS] [--settle MS]\n",
     "                    [--silence DURATION] [--ready-timeout MS] [--max-chars N] [--json]\n",
+    "  --resolve-lock retry|fork  explicitly resolve a detected Codex lock; no --brief or --await\n",
     "  one round at a time: a send while another round is being awaited is refused as busy\n",
     "  --ready-timeout MS  how long the agent may take to reach its prompt, default 60000\n",
     "  --silence DURATION  unchanged working screen during --await; default 3m, 0 disables",
@@ -255,18 +261,21 @@ impl fmt::Display for BoundedError {
 ///
 /// - 60 s: creates / kills / closes / `AgentStart` — a write that may block
 ///   on filesystem work the operator sees.
-/// - 10 s: `PaneSendInput` — the brief submit is a human-latency write and
-///   must not stall the whole command if the socket goes quiet mid-type.
+/// - Raw input: 10 s. Guarded submit: server wait bound plus probe/reply margins.
+///   The shared client reserves reply
+///   time and selects a shorter raw-write deadline (ADR-0028 §5a).
 /// - 2 s: every poll, get, and list.
 fn cap_for(method: &Method) -> Duration {
     match method {
-        Method::WorktreeCreate(_)
-        | Method::WorktreeKill(_)
-        | Method::WorkspaceCreate(_)
-        | Method::WorkspaceClose(_)
-        | Method::AgentStart(_) => Duration::from_secs(60),
-        Method::PaneSendInput(_) | Method::PaneSubmit(_) => Duration::from_secs(10),
-        _ => REQUEST_TIMEOUT,
+        Method::PaneSubmit(_) => crate::api::client::SUBMIT_CAP,
+        Method::PaneResolveCodexLock(_)
+        | Method::PaneSendInput(_)
+        | Method::PaneSendKeys(_)
+        | Method::PaneSendText(_)
+        | Method::PaneWriteInput(_)
+        | Method::PaneWriteKeys(_)
+        | Method::PaneWriteText(_) => Duration::from_secs(10),
+        _ => crate::api::deadline::operation_timeout(method, REQUEST_TIMEOUT),
     }
 }
 
@@ -274,12 +283,22 @@ fn cap_for(method: &Method) -> Duration {
 ///
 /// The socket timeout is `cap_for(method).min(deadline - now)`; past the
 /// deadline, nothing is sent. On the way back the deadline is re-checked —
-/// a reply that lands late is a `TimedOut` regardless of its content, so a
+/// a read reply that lands late is a `TimedOut`, so a
 /// caller that has run out of clock does not act on what it read on the way
 /// past.
 ///
 /// Returns the raw response; the caller checks for a server-level `error`.
 fn bounded(method: Method, deadline: Option<Instant>) -> Result<serde_json::Value, BoundedError> {
+    let input = matches!(
+        method,
+        Method::PaneSendInput(_)
+            | Method::PaneWriteInput(_)
+            | Method::PaneSubmit(_)
+            | Method::PaneWriteText(_)
+            | Method::PaneWriteKeys(_)
+            | Method::PaneSendText(_)
+            | Method::PaneSendKeys(_)
+    );
     let cap = cap_for(&method);
     // Check if deadline has already passed.
     if let Some(deadline) = deadline {
@@ -306,7 +325,9 @@ fn bounded(method: Method, deadline: Option<Instant>) -> Result<serde_json::Valu
     // Retried with backoff on a transient socket error, reads only, and never
     // past the deadline (#910): under load a 2 s poll times out as EAGAIN while
     // the server is alive, and one of those used to fail the whole verb.
-    let client = ApiClient::local();
+    let client = ApiClient::local().with_class(crate::api::client::RequestClass::for_method(
+        &request.method,
+    ));
     let response = if RETRIES.get() {
         client.request_value_retrying(&request, timeout, deadline)
     } else {
@@ -316,10 +337,8 @@ fn bounded(method: Method, deadline: Option<Instant>) -> Result<serde_json::Valu
         response.map_err(|e| BoundedError::Transport(super::api_client_error_to_io(e)))?;
 
     // Check if deadline passed after the response.
-    if let Some(deadline) = deadline {
-        if Instant::now() >= deadline {
-            return Err(BoundedError::TimedOut);
-        }
+    if !input && deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return Err(BoundedError::TimedOut);
     }
 
     if let Some(message) = super::compatibility::capability_error_message(&response, "flk delegate")
@@ -510,6 +529,8 @@ struct StartupDialog {
     shows: fn(&str) -> bool,
     /// What the delegate says when readiness finds it.
     refusal: &'static str,
+    /// Whether this dialog retains a pending start as a named human block.
+    keep_on_start: bool,
 }
 
 /// The `agent.result` refusals that are ordinary whichever harness asked.
@@ -555,11 +576,20 @@ const HARNESSES: [HarnessSpec; 3] = [
         // transcript entry, so the gap this covers is the same one it covers
         // for opencode: the store, not the screen, is the slow side.
         result_grace: Duration::from_secs(10),
-        startup_dialogs: &[StartupDialog {
-            code: "claude_folder_trust",
-            shows: crate::detect::claude_waiting_on_folder_trust,
-            refusal: "Claude Code is waiting on its folder-trust dialog (see #605)",
-        }],
+        startup_dialogs: &[
+            StartupDialog {
+                code: "claude_folder_trust",
+                shows: crate::detect::claude_waiting_on_folder_trust,
+                refusal: "Claude Code is waiting on its folder-trust dialog (see #605)",
+                keep_on_start: false,
+            },
+            StartupDialog {
+                code: "claude_folder_trust_with_permissions",
+                shows: crate::detect::claude_waiting_on_folder_trust_with_permissions,
+                refusal: "Claude Code needs operator approval of folder trust and pre-approved tool permissions",
+                keep_on_start: true,
+            },
+        ],
     },
     HarnessSpec {
         name: "codex",
@@ -574,6 +604,7 @@ const HARNESSES: [HarnessSpec; 3] = [
                 code: "codex_hook_review",
                 shows: crate::detect::codex_waiting_on_hook_review,
                 refusal: "Codex is waiting on its hook-review dialog; see #626, or `flk integration install codex` to trust flk's hook",
+                keep_on_start: false,
             },
             // Codex keys trust on the repository root, so one acceptance in the
             // main checkout covers every later worktree of that repository.
@@ -581,6 +612,13 @@ const HARNESSES: [HarnessSpec; 3] = [
                 code: "codex_folder_trust",
                 shows: crate::detect::codex_waiting_on_folder_trust,
                 refusal: "Codex is waiting on its folder-trust dialog (see #828); trust the repository once in Codex, which covers its worktrees, or add a trusted [projects] entry for the repository root to ~/.codex/config.toml",
+                keep_on_start: false,
+            },
+            StartupDialog {
+                code: lock::NAME,
+                shows: crate::detect::codex_conversation_locked,
+                refusal: lock::REFUSAL,
+                keep_on_start: false,
             },
         ],
     },
@@ -805,6 +843,9 @@ struct Entry {
     /// are backfilled the first time a verb proves the terminal still matches.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     agent_id: Option<String>,
+    /// Latest explicit lock-resolution intent; false does not prove a key was sent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lock_resolution: Option<serde_json::Value>,
 }
 
 impl Entry {
@@ -868,10 +909,14 @@ fn read_entry(name: &str) -> Option<Entry> {
 /// update atomic: a `delegate status` running against a half-written file reads
 /// the previous round, not a prefix of the next one.
 fn write_entry(entry: &Entry) -> io::Result<()> {
+    write_entry_at(entry, &entry_path(&entry.name))
+}
+
+/// Publish a complete entry at the registry path, removing any failed temp file.
+fn write_entry_at(entry: &Entry, path: &Path) -> io::Result<()> {
     use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt as _;
 
-    let path = entry_path(&entry.name);
     let dir = path.parent().expect("the entry path always has a parent");
     std::fs::create_dir_all(dir)?;
     let temp = dir.join(format!(".{}.json.tmp", entry.name));
@@ -894,7 +939,7 @@ fn write_entry(entry: &Entry) -> io::Result<()> {
         let _ = std::fs::remove_file(&temp);
         return Err(err);
     }
-    if let Err(err) = std::fs::rename(&temp, &path) {
+    if let Err(err) = std::fs::rename(&temp, path) {
         let _ = std::fs::remove_file(&temp);
         return Err(err);
     }
@@ -909,19 +954,23 @@ fn write_entry(entry: &Entry) -> io::Result<()> {
 /// `lock` because a busy delegate is an answer, not a queue: blocking here would
 /// turn `delegate send` into an unbounded wait nobody asked for.
 struct Lock {
-    /// Held open and never dropped early: the lock exists for exactly as long as
-    /// the `File` does, so closing it early would hand a second round the
-    /// delegate while this one is still typing into it.
-    _file: std::fs::File,
+    /// Dropping explicitly unlocks, independent of fork-inherited descriptors.
+    _file: crate::platform::file_lock::LockFile,
 }
 
 fn take_lock(name: &str) -> Result<Lock, &'static str> {
-    let path = lock_path(name);
+    take_lock_at(&lock_path(name))
+}
+
+/// Acquire the delegate lock at its resolved, unchanged registry path.
+fn take_lock_at(path: &Path) -> Result<Lock, &'static str> {
     let Some(dir) = path.parent() else {
         return Err("the lock path has no parent");
     };
     std::fs::create_dir_all(dir).map_err(|_| "could not create the delegate registry directory")?;
-    let file = open_lock_file(&path).map_err(|_| "could not open the delegate lock")?;
+    let file = crate::platform::file_lock::LockFile::new(
+        open_lock_file(path).map_err(|_| "could not open the delegate lock")?,
+    );
     match file.try_lock() {
         Ok(()) => Ok(Lock { _file: file }),
         Err(std::fs::TryLockError::WouldBlock) => Err("busy"),
@@ -965,6 +1014,7 @@ struct StartFlags {
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct SendFlags {
+    resolve_lock: Option<crate::api::schema::CodexLockChoice>,
     brief: Option<String>,
     await_result: bool,
     timeout_ms: Option<u64>,
@@ -1021,6 +1071,7 @@ impl Verb {
             "--silence" => matches!(self, Self::Start | Self::Send | Self::Wait),
             "--settle" => matches!(self, Self::Start | Self::Send | Self::Wait),
             "--ready-timeout" => matches!(self, Self::Start | Self::Send),
+            "--resolve-lock" => self == Self::Send,
             "--brief" => matches!(self, Self::Start | Self::Send),
             "--cwd" | "--worktree" | "--repo" | "--branch" | "--base" | "--harness" | "--model"
             | "--sandbox" => self == Self::Start,
@@ -1097,6 +1148,13 @@ fn parse_flags(verb: Verb, args: &[String]) -> Result<Parsed, String> {
             "--settle" => flags.settle_ms = Some(number(flag, &value(&mut index)?)?),
             "--ready-timeout" => flags.ready_timeout_ms = Some(number(flag, &value(&mut index)?)?),
             "--max-chars" => flags.max_chars = Some(number(flag, &value(&mut index)?)?),
+            "--resolve-lock" => {
+                flags.resolve_lock = Some(match value(&mut index)?.as_str() {
+                    "retry" => crate::api::schema::CodexLockChoice::Retry,
+                    "fork" => crate::api::schema::CodexLockChoice::Fork,
+                    _ => return Err("--resolve-lock must be retry or fork".into()),
+                })
+            }
             "--brief" => flags.brief = Some(value(&mut index)?),
             "--cwd" => flags.cwd = Some(value(&mut index)?),
             "--repo" => flags.repo = Some(value(&mut index)?),
@@ -1135,6 +1193,7 @@ fn number<T: std::str::FromStr>(flag: &str, value: &str) -> Result<T, String> {
 /// already rejects the flags it does not take.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct Parsed {
+    resolve_lock: Option<crate::api::schema::CodexLockChoice>,
     brief: Option<String>,
     cwd: Option<String>,
     worktree: bool,
@@ -1184,6 +1243,7 @@ fn as_start(flags: &Parsed) -> StartFlags {
 
 fn as_send(flags: &Parsed) -> SendFlags {
     SendFlags {
+        resolve_lock: flags.resolve_lock,
         brief: flags.brief.clone(),
         await_result: flags.await_result,
         timeout_ms: flags.timeout_ms,
@@ -1716,6 +1776,9 @@ fn place(name: &str, flags: &StartFlags, mode: Mode) -> Result<Placement, i32> {
             ))
         }
         Err(BoundedError::Transport(e)) => {
+            if let Some(code) = super::outcome_unknown(&e) {
+                return Err(code);
+            }
             return Err(teardown_after_place_failure(
                 name,
                 worktrees_before.as_deref(),
@@ -1723,7 +1786,7 @@ fn place(name: &str, flags: &StartFlags, mode: Mode) -> Result<Placement, i32> {
                 flags,
                 &repo,
                 CreateFailure::Transport(e.kind()),
-            ))
+            ));
         }
     };
 
@@ -2220,7 +2283,7 @@ fn tear_down(target: &Cleanup, force: bool, close_parent: bool) -> Result<TearDo
                 };
                 crate::worktree::run_worktree_command(&command).map_err(|message| ServerError {
                     code: "worktree_prune_failed".to_string(),
-                    message,
+                    message: message.into(),
                 })?;
             }
         }
@@ -2814,6 +2877,7 @@ fn delegate_start(args: &[String]) -> io::Result<i32> {
         base: placement.base.as_ref().map(|fresh| fresh.base.clone()),
         base_sha: placement.base.as_ref().and_then(|fresh| fresh.sha.clone()),
         agent_id: field(&agent, "agent_id").map(str::to_string),
+        lock_resolution: None,
     };
     let failed = |entry: &Entry, written: bool, reason: Option<&str>| {
         fail_started(entry, &cleanup, written, &flags, reason, None)
@@ -2833,6 +2897,16 @@ fn delegate_start(args: &[String]) -> io::Result<i32> {
     let settled_record = match await_ready(name, &agent, harness, ready_deadline) {
         Ok(record) => record,
         Err(reason) => {
+            if reason
+                .startup_dialog
+                .is_some_and(|dialog| dialog.code == lock::NAME)
+            {
+                lock::save(&entry)?;
+                return Ok(lock::blocked(&entry, flags.json));
+            }
+            if let Some(dialog) = reason.startup_dialog.filter(|dialog| dialog.keep_on_start) {
+                return Ok(keep_startup_block(&entry, dialog, flags.json));
+            }
             if reason.deadline_reached {
                 // The verdict read the screen already: its tail is printed
                 // from that read rather than a second one, which a server
@@ -2861,7 +2935,7 @@ fn delegate_start(args: &[String]) -> io::Result<i32> {
         Ok(cursor) => cursor,
         Err(reason) => return Ok(failed(&entry, false, Some(&reason))),
     };
-    let mut submitted_at_ms = now_ms();
+    let submitted_at_ms = now_ms();
     entry.round = 1;
     entry.submitted_at_ms = submitted_at_ms;
     entry.cursor = cursor.clone();
@@ -2881,68 +2955,10 @@ fn delegate_start(args: &[String]) -> io::Result<i32> {
     // whole point of capturing it last is that it is the cursor of the turn
     // this submit starts. The submit is bounded (W2); a server that goes
     // quiet mid-type does not hang start.
-    let submit_started = Instant::now();
-    let submitted = submit_brief(&pane_id, &sentence, None)
-        .map(|()| false)
-        .or_else(|reason| match reason {
-            // A Codex still starting up can swallow the paste: its composer stays
-            // empty and no turn begins (#828). One guarded resubmit, only once
-            // that has held for the whole start-watch window.
-            SubmitFailure::Unconfirmed(_) if harness.resubmit_lost_brief => {
-                recover_lost_brief(&entry, &sentence, flags.settle_ms, submit_started, reason)
-            }
-            other => Err(other),
-        });
-    if let Ok(true) = submitted {
-        submitted_at_ms = now_ms();
-        entry.submitted_at_ms = submitted_at_ms;
-        if let Err(err) = write_entry(&entry) {
-            eprintln!("delegate {name}: the registry could not record the resubmit: {err}");
-        }
+    if let Some(code) = submit_start_brief(&mut entry, &sentence, &cleanup, &flags, harness) {
+        return Ok(code);
     }
-    if let Err(reason) = submitted {
-        if matches!(reason, SubmitFailure::Gone) {
-            return Ok(emit_submit_gone(&entry, flags.json));
-        }
-        if harness.confirm_submit && matches!(reason, SubmitFailure::Unconfirmed(_)) {
-            let reason = format!(
-                "delegate {name}: brief submission could not be confirmed: {reason}. \
-                 Workspace kept for inspection; use `flk delegate reap {name}` to remove it"
-            );
-            eprintln!("{reason}");
-            let text = read_pane_tail(&pane_id).unwrap_or_default();
-            if let Some(block) = tail_block(name, &text) {
-                eprint!("{block}");
-            }
-            if flags.json {
-                emit_start_failed(&entry, Some(&reason), true, &text);
-            }
-            return Ok(1);
-        }
-        if matches!(reason, SubmitFailure::Refused(_)) {
-            // Refused before anything was typed: no round ran, so a kept
-            // delegate's next `send` is round 1.
-            entry.round = 0;
-            entry.submitted_at_ms = 0;
-        }
-        let rolled_back = undo_start(
-            &entry,
-            &cleanup,
-            true,
-            &flags,
-            Some(&format!(
-                "delegate {name}: the brief was not submitted: {reason}"
-            )),
-            None,
-        );
-        return Ok(match &reason {
-            // Nothing typed and rolled back: nothing the caller can see
-            // persists, so it is a refusal (#1025). A kept delegate, or one
-            // whose rollback failed, persists and stays a failure.
-            SubmitFailure::Refused(error) if rolled_back => super::refusal_exit(&error.code),
-            _ => crate::cli::exit::FAILURE,
-        });
-    }
+    let submitted_at_ms = entry.submitted_at_ms;
 
     if !flags.await_result {
         emit_submit(&entry, flags.json);
@@ -3001,6 +3017,133 @@ fn fail_started(
 ) -> i32 {
     undo_start(entry, cleanup, written, flags, reason, screen);
     1
+}
+
+/// Persist an unsubmitted human block without closing its pane or checkout.
+/// Registry durability failures leave the pane available and return failure.
+fn keep_startup_block(entry: &Entry, dialog: &StartupDialog, json: bool) -> i32 {
+    let path = entry_path(&entry.name);
+    let saved = save_startup_block_at(entry, &path, |dir| std::fs::File::open(dir)?.sync_all());
+    emit_startup_block(entry, dialog, json, saved)
+}
+
+/// Confirm retained-block durability after publishing a complete entry.
+/// A failed directory sync can leave the new entry visible, never a prefix.
+fn save_startup_block_at(
+    entry: &Entry,
+    path: &Path,
+    sync_dir: impl FnOnce(&Path) -> io::Result<()>,
+) -> io::Result<()> {
+    write_entry_at(entry, path)?;
+    let dir = path.parent().ok_or(io::ErrorKind::InvalidInput)?;
+    sync_dir(dir)
+}
+
+/// Report durability failure without rolling back an operator-owned prompt.
+fn emit_startup_block(
+    entry: &Entry,
+    dialog: &StartupDialog,
+    json: bool,
+    saved: io::Result<()>,
+) -> i32 {
+    if let Err(err) = saved {
+        let code = crate::api::error_code::ErrorCode::WriteFailed;
+        let response = serde_json::json!({"error": {
+            "code": code.as_str(),
+            "message": format!(
+                "delegate {}: could not durably record the block; pane {} retained: {err}",
+                entry.name, entry.pane_id
+            ),
+            "data": {"pane_id": entry.pane_id, "pane_retained": true},
+        }});
+        return super::output::error(&response, code.exit());
+    }
+    let info = serde_json::json!({"startup_dialog": dialog.code, "status_text": dialog.refusal});
+    emit_outcome(
+        entry,
+        Outcome::AgentBlocked.as_str(),
+        Some(&info),
+        json,
+        &entry.cursor,
+    );
+    exit::AGENT_BLOCKED
+}
+
+/// Submit a persisted start round and retain its state whenever effects are uncertain.
+fn submit_start_brief(
+    entry: &mut Entry,
+    sentence: &str,
+    cleanup: &Cleanup,
+    flags: &StartFlags,
+    harness: &HarnessSpec,
+) -> Option<i32> {
+    let name = entry.name.clone();
+    let pane_id = entry.pane_id.clone();
+    let submit_started = Instant::now();
+    let submitted = submit_brief(&pane_id, sentence, None)
+        .map(|()| false)
+        .or_else(|reason| match reason {
+            // A Codex still starting up can swallow the paste: its composer stays
+            // empty and no turn begins (#828). One guarded resubmit, only once
+            // that has held for the whole start-watch window.
+            SubmitFailure::Unconfirmed(SubmitUncertainty::Observation(_))
+                if harness.resubmit_lost_brief =>
+            {
+                recover_lost_brief(entry, sentence, flags.settle_ms, submit_started, reason)
+            }
+            other => Err(other),
+        });
+    if let Ok(true) = submitted {
+        entry.submitted_at_ms = now_ms();
+        if let Err(err) = write_entry(entry) {
+            eprintln!("delegate {name}: the registry could not record the resubmit: {err}");
+        }
+    }
+    if let Err(reason) = submitted {
+        if matches!(reason, SubmitFailure::Gone) {
+            return Some(emit_submit_gone(entry, flags.json));
+        }
+        if harness.confirm_submit && matches!(reason, SubmitFailure::Unconfirmed(_)) {
+            let reason = format!(
+                "delegate {name}: brief submission could not be confirmed: {reason}. \
+                 Workspace kept for inspection; use `flk delegate reap {name}` to remove it"
+            );
+            eprintln!("{reason}");
+            let text = read_pane_tail(&pane_id).unwrap_or_default();
+            if let Some(block) = tail_block(&name, &text) {
+                eprint!("{block}");
+            }
+            if flags.json {
+                emit_start_failed(entry, Some(&reason), true, &text);
+            }
+            return Some(1);
+        }
+        if matches!(reason, SubmitFailure::Refused(_)) {
+            // Refused before anything was typed: no round ran, so a kept
+            // delegate's next `send` is round 1.
+            entry.round = 0;
+            entry.submitted_at_ms = 0;
+        }
+        let rolled_back = undo_start(
+            entry,
+            cleanup,
+            true,
+            flags,
+            Some(&format!(
+                "delegate {name}: the brief was not submitted: {reason}"
+            )),
+            None,
+        );
+        return Some(match &reason {
+            // Nothing typed and rolled back: nothing the caller can see
+            // persists, so it is a refusal (#1025). A kept delegate, or one
+            // whose rollback failed, persists and stays a failure.
+            SubmitFailure::Refused(error) if rolled_back => super::refusal_exit(&error.code),
+            _ => crate::cli::exit::FAILURE,
+        });
+    }
+
+    None
 }
 
 /// [`fail_started`], saying whether it rolled back cleanly, so nothing the
@@ -3149,7 +3292,7 @@ fn rollback(cleanup: &Cleanup) -> bool {
 }
 
 /// Submit through the server's composer guard and bounded confirmation loop.
-/// The 10 s request cap and caller deadline also bound a stalled transport.
+/// The server-derived submit cap and caller deadline also bound a stalled transport.
 fn submit_brief(pane_id: &str, text: &str, deadline: Option<Instant>) -> Result<(), SubmitFailure> {
     bounded_submit(
         Method::PaneSubmit(PaneSubmitParams {
@@ -3198,17 +3341,38 @@ fn composer_state(screen: &str, sentence: &str) -> Composer {
 enum SubmitFailure {
     /// The server refused before typing anything.
     Refused(ServerError),
-    Unconfirmed(String),
+    Unconfirmed(SubmitUncertainty),
     /// The pane exited before the harness took the brief: the harness died at
     /// launch or on the brief, so no round is running (#817).
     Gone,
+}
+
+/// A final server observation may support the existing startup recovery.
+/// A failed or unknown write never authorizes replay of the brief.
+#[derive(Debug)]
+enum SubmitUncertainty {
+    Observation(String),
+    WriteEffect(ServerError),
+}
+impl From<String> for SubmitUncertainty {
+    fn from(reason: String) -> Self {
+        Self::Observation(reason)
+    }
+}
+impl fmt::Display for SubmitUncertainty {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Observation(reason) => f.write_str(reason),
+            Self::WriteEffect(error) => write!(f, "{error}"),
+        }
+    }
 }
 
 impl fmt::Display for SubmitFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Refused(error) => write!(f, "{error}"),
-            Self::Unconfirmed(reason) => f.write_str(reason),
+            Self::Unconfirmed(reason) => write!(f, "{reason}"),
             Self::Gone => f.write_str("the agent exited before it accepted the brief"),
         }
     }
@@ -3390,8 +3554,12 @@ fn recover_lost_brief_with(
 fn bounded_submit(method: Method, deadline: Option<Instant>) -> Result<(), SubmitFailure> {
     match bounded(method, deadline) {
         Ok(response) => submit_outcome(&response),
-        Err(BoundedError::TimedOut) => Err(SubmitFailure::Unconfirmed("timed out".to_string())),
-        Err(BoundedError::Transport(err)) => Err(SubmitFailure::Unconfirmed(err.to_string())),
+        Err(BoundedError::TimedOut) => {
+            Err(SubmitFailure::Unconfirmed("timed out".to_string().into()))
+        }
+        Err(BoundedError::Transport(err)) => {
+            Err(SubmitFailure::Unconfirmed(err.to_string().into()))
+        }
     }
 }
 
@@ -3406,7 +3574,19 @@ fn submit_outcome(response: &serde_json::Value) -> Result<(), SubmitFailure> {
         if error.get("code") == Some(&pane_gone) {
             return Err(SubmitFailure::Gone);
         }
-        return Err(SubmitFailure::Refused(parse_server_error(error)));
+        let error = parse_server_error(error);
+        if matches!(
+            crate::api::error_code::ErrorCode::from_code(&error.code),
+            Some(
+                crate::api::error_code::ErrorCode::InputWriteUnknown
+                    | crate::api::error_code::ErrorCode::InputWriteFailed
+            )
+        ) {
+            return Err(SubmitFailure::Unconfirmed(SubmitUncertainty::WriteEffect(
+                error,
+            )));
+        }
+        return Err(SubmitFailure::Refused(error));
     }
     if response.pointer("/result/outcome") == Some(&serde_json::json!("abandoned"))
         && response.pointer("/result/reason") == Some(&pane_gone)
@@ -3419,10 +3599,13 @@ fn submit_outcome(response: &serde_json::Value) -> Result<(), SubmitFailure> {
             .and_then(serde_json::Value::as_str),
         Some("accepted" | "observed_accepted")
     ) {
-        return Err(SubmitFailure::Unconfirmed(format!(
-            "submission unconfirmed: {}",
-            response.get("result").unwrap_or(&serde_json::Value::Null)
-        )));
+        return Err(SubmitFailure::Unconfirmed(
+            format!(
+                "submission unconfirmed: {}",
+                response.get("result").unwrap_or(&serde_json::Value::Null)
+            )
+            .into(),
+        ));
     }
     Ok(())
 }
@@ -3467,6 +3650,8 @@ fn refused_questions(
     }
     let preview = bounded(
         Method::AgentStart(AgentStartParams {
+            runtime: Default::default(),
+            model: None,
             dry_run: true,
             name: name.to_string(),
             cwd: None,
@@ -3522,6 +3707,8 @@ fn start_the_agent(
     let argv = (harness.argv)(options);
     let response = request(
         Method::AgentStart(AgentStartParams {
+            runtime: Default::default(),
+            model: None,
             dry_run: false,
             name: name.to_string(),
             cwd: Some(placement.cwd.clone()),
@@ -3576,6 +3763,7 @@ fn harness_for(entry: &Entry) -> &'static HarnessSpec {
 struct ReadyFailure {
     reason: String,
     deadline_reached: bool,
+    startup_dialog: Option<&'static StartupDialog>,
 }
 
 impl From<String> for ReadyFailure {
@@ -3583,6 +3771,7 @@ impl From<String> for ReadyFailure {
         Self {
             reason,
             deadline_reached: false,
+            startup_dialog: None,
         }
     }
 }
@@ -3592,6 +3781,7 @@ impl ReadyFailure {
         Self {
             reason,
             deadline_reached: true,
+            startup_dialog: None,
         }
     }
 }
@@ -3644,7 +3834,7 @@ fn await_ready(
                         if let Some(refusal) =
                             startup_dialog_refusal(name, harness, &pane_id, deadline)
                         {
-                            return Err(refusal.into());
+                            return Err(refusal);
                         }
                         // A dialog's prompt can arrive before its footer in a
                         // separate PTY read. Confirm readiness on the next poll
@@ -3662,7 +3852,7 @@ fn await_ready(
                     startup_dialog_asked = true;
                     if let Some(refusal) = startup_dialog_refusal(name, harness, &pane_id, deadline)
                     {
-                        return Err(refusal.into());
+                        return Err(refusal);
                     }
                 }
                 if expired(Some(deadline)) {
@@ -3712,12 +3902,13 @@ fn startup_dialog_refusal(
     harness: &HarnessSpec,
     pane_id: &str,
     deadline: Instant,
-) -> Option<String> {
+) -> Option<ReadyFailure> {
     let dialog = startup_dialog_shown(harness, pane_id, deadline)?;
-    Some(format!(
-        "delegate {name}: {}: {}",
-        dialog.code, dialog.refusal
-    ))
+    Some(ReadyFailure {
+        reason: format!("delegate {name}: {}: {}", dialog.code, dialog.refusal),
+        deadline_reached: false,
+        startup_dialog: Some(dialog),
+    })
 }
 
 /// The harness's startup dialog this pane is showing, from one bounded read.
@@ -3834,6 +4025,7 @@ fn delegate_wait_for_ready(
             ReadyFailure {
                 reason: format!("delegate {name}: readiness could not be watched: {err}"),
                 deadline_reached: timed_out,
+                startup_dialog: None,
             }
         })?;
     if let Err(err) = crate::api::client::parse_response_value(ack) {
@@ -3926,6 +4118,45 @@ fn delegate_wait_for_ready(
     }
 }
 
+/// Submit a persisted send round without rolling uncertainty back to the prior round.
+fn submit_send_brief(entry: &Entry, original: &Entry, sentence: &str, json: bool) -> Option<i32> {
+    let name = &entry.name;
+    if let Err(reason) = submit_brief(&entry.pane_id, sentence, None) {
+        if matches!(reason, SubmitFailure::Gone) {
+            // The round never started, so the record goes back to the last one
+            // that did, which is what `status` and `reap` then answer from.
+            if let Err(err) = write_entry(original) {
+                eprintln!("delegate {name}: the registry could not be restored: {err}");
+            }
+            return Some(emit_submit_gone(original, json));
+        }
+        if matches!(reason, SubmitFailure::Unconfirmed(_)) {
+            return Some(fail(format!("delegate {name}: brief submission could not be confirmed: {reason}. Workspace kept for inspection; `flk delegate wait {name}` observes a later turn")));
+        }
+        // The server refused before typing, so the whole entry goes back, and a
+        // write-back that itself fails is said rather than swallowed: a
+        // registry that now claims a round nobody is running is worse than
+        // the failed send that caused it.
+        if let Err(err) = write_entry(original) {
+            eprintln!(
+                "delegate {name}: the brief was not submitted and the registry could not be \
+                 restored: {err}"
+            );
+            return Some(fail(format!(
+                "delegate {name}: the brief was not submitted: {reason}"
+            )));
+        }
+        eprintln!("delegate {name}: the brief was not submitted: {reason}");
+        return Some(match &reason {
+            // Nothing typed and the registry restored: nothing changed (#1025).
+            SubmitFailure::Refused(error) => super::refusal_exit(&error.code),
+            _ => crate::cli::exit::FAILURE,
+        });
+    }
+
+    None
+}
+
 // ------------------------------------------------------------------- send
 
 fn delegate_send(args: &[String]) -> io::Result<i32> {
@@ -3937,6 +4168,14 @@ fn delegate_send(args: &[String]) -> io::Result<i32> {
         Err(reason) => return Ok(usage(reason)),
     };
     let flags = as_send(&flags);
+    if let Some(choice) = flags.resolve_lock {
+        if flags.brief.is_some() || flags.await_result {
+            return Ok(usage(
+                "--resolve-lock cannot be combined with --brief or --await",
+            ));
+        }
+        return lock::resolve(name, choice, &flags);
+    }
     let Some(brief_path) = flags.brief.clone() else {
         return Ok(usage(format!("--brief is required\nusage: {}", SEND_USAGE)));
     };
@@ -3980,6 +4219,15 @@ fn delegate_send(args: &[String]) -> io::Result<i32> {
     let record = match await_prompt(name, &entry, ready_deadline) {
         Ok(record) => record,
         Err(reason) => {
+            if reason
+                .startup_dialog
+                .is_some_and(|dialog| dialog.code == lock::NAME)
+            {
+                return Ok(lock::refuse(
+                    crate::api::error_code::ErrorCode::CodexConversationLocked,
+                    lock::REFUSAL,
+                ));
+            }
             if reason.deadline_reached {
                 emit_ready_timeout(
                     name,
@@ -4010,37 +4258,8 @@ fn delegate_send(args: &[String]) -> io::Result<i32> {
         )));
     }
 
-    if let Err(reason) = submit_brief(&entry.pane_id, &sentence, None) {
-        if matches!(reason, SubmitFailure::Gone) {
-            // The round never started, so the record goes back to the last one
-            // that did, which is what `status` and `reap` then answer from.
-            if let Err(err) = write_entry(&original) {
-                eprintln!("delegate {name}: the registry could not be restored: {err}");
-            }
-            return Ok(emit_submit_gone(&original, flags.json));
-        }
-        if matches!(reason, SubmitFailure::Unconfirmed(_)) {
-            return Ok(fail(format!("delegate {name}: brief submission could not be confirmed: {reason}. Workspace kept for inspection; `flk delegate wait {name}` observes a later turn")));
-        }
-        // The server refused before typing, so the whole entry goes back, and a
-        // write-back that itself fails is said rather than swallowed: a
-        // registry that now claims a round nobody is running is worse than
-        // the failed send that caused it.
-        if let Err(err) = write_entry(&original) {
-            eprintln!(
-                "delegate {name}: the brief was not submitted and the registry could not be \
-                 restored: {err}"
-            );
-            return Ok(fail(format!(
-                "delegate {name}: the brief was not submitted: {reason}"
-            )));
-        }
-        eprintln!("delegate {name}: the brief was not submitted: {reason}");
-        return Ok(match &reason {
-            // Nothing typed and the registry restored: nothing changed (#1025).
-            SubmitFailure::Refused(error) => super::refusal_exit(&error.code),
-            _ => crate::cli::exit::FAILURE,
-        });
+    if let Some(code) = submit_send_brief(&entry, &original, &sentence, flags.json) {
+        return Ok(code);
     }
 
     if !flags.await_result {
@@ -4081,6 +4300,20 @@ fn await_prompt(
     loop {
         match agent_record(&entry.terminal_id, Some(deadline)) {
             AgentFetch::Found(record) => {
+                // A missing cursor belongs to the compatibility diagnosis, which
+                // must run before any lock-screen I/O against an older server.
+                if harness_for(entry).name == "codex" && record["turn_cursor"].is_string() {
+                    if let Some(refusal) =
+                        startup_dialog_refusal(name, harness_for(entry), &entry.pane_id, deadline)
+                            .filter(|failure| {
+                                failure
+                                    .startup_dialog
+                                    .is_some_and(|dialog| dialog.code == lock::NAME)
+                            })
+                    {
+                        return Err(refusal);
+                    }
+                }
                 let status = field(&record, "agent_status")
                     .unwrap_or("unknown")
                     .to_string();
@@ -4383,6 +4616,7 @@ fn delegate_status(args: &[String]) -> io::Result<i32> {
                 "settled_with_background_shells": background_shells,
                 "blocked_reason": record.get("blocked_reason"),
                 "startup_dialog": startup_dialog,
+                "lock_resolution": entry.lock_resolution,
                 "retry_after_ms": record.get("retry_after_ms"),
                 "pane_id": entry.pane_id,
                 "workspace_id": entry.workspace_id,
@@ -4641,12 +4875,9 @@ fn delegate_reap(args: &[String]) -> io::Result<i32> {
     // `removed: false` for every field — the serialisation we gave up by
     // skipping the lock is replaced by that record of who did what (F13).
     let _lock = match take_lock(name) {
-        Ok(lock) => lock,
+        Ok(lock) => Some(lock),
         Err("busy") if !flags.force => return Ok(fail(format!("delegate {name} is busy"))),
-        Err("busy") => match open_lock_file(&lock_path(name)) {
-            Ok(file) => Lock { _file: file },
-            Err(err) => return Ok(fail(format!("delegate {name}: {err}"))),
-        },
+        Err("busy") => None,
         Err(reason) => return Ok(fail(format!("delegate {name}: {reason}"))),
     };
     let Some(entry) = read_entry(name) else {
@@ -5106,6 +5337,17 @@ impl Await<'_> {
                 let mut info = info.unwrap_or_else(|| serde_json::json!({}));
                 for (key, value) in observation.as_object().into_iter().flatten() {
                     info[key] = value.clone();
+                }
+                if matches!(outcome, Outcome::AgentBlocked) {
+                    if let Some(dialog) = self
+                        .harness
+                        .startup_dialogs
+                        .iter()
+                        .find(|dialog| (dialog.shows)(&screen))
+                    {
+                        info["startup_dialog"] = serde_json::json!(dialog.code);
+                        info["status_text"] = serde_json::json!(dialog.refusal);
+                    }
                 }
                 info["settled_with_background_shells"] =
                     serde_json::json!(crate::detect::settled_with_background_shells(&screen));
@@ -5695,6 +5937,8 @@ fn emit_outcome(
                 "outcome": outcome,
                 "status": text("status"),
                 "status_text": text("status_text"),
+                "startup_dialog": text("startup_dialog"),
+                "lock_resolution": entry.lock_resolution,
                 "text": text("text"),
                 "total_chars": text("total_chars"),
                 "next_offset": text("next_offset"),
@@ -5742,6 +5986,112 @@ fn emit_outcome(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn permissions_trust_has_a_distinct_startup_dialog_name() {
+        let harness = validate_harness(Some("claude")).unwrap();
+        let shown = |screen: &str| {
+            harness
+                .startup_dialogs
+                .iter()
+                .find(|dialog| (dialog.shows)(screen))
+                .map(|dialog| dialog.code)
+        };
+        let screen =
+            include_str!("../../tests/fixtures/attention-1023/claude-trust-with-permissions.txt");
+        assert_eq!(shown(screen), Some("claude_folder_trust_with_permissions"));
+        assert_eq!(shown(TRUST_DIALOG_SCREEN), Some("claude_folder_trust"));
+        for absent in [
+            "Accessing workspace:",
+            "This folder pre-approves 17 tool permissions",
+            "Yes, I trust this folder",
+            "Enter to confirm",
+        ] {
+            assert_ne!(
+                shown(&screen.replace(absent, "")),
+                Some("claude_folder_trust_with_permissions")
+            );
+        }
+        let history = format!("{screen}\n{}\n❯ \n{}\n", "─".repeat(30), "─".repeat(30));
+        assert_eq!(shown(&history), None);
+    }
+
+    fn assert_permissions_variant(directory_question: bool, cancel: &str) {
+        let screen =
+            include_str!("../../tests/fixtures/attention-1023/claude-trust-gated-grants.txt")
+                .replace("No, continue without these permissions", cancel);
+        let screen = if directory_question {
+            screen
+                .replace("Accessing workspace:", "Now in a new directory:")
+                .replace(
+                    "Quick safety check: Is this a project you created or one you trust?",
+                    "This session hasn't worked here before. Is this a directory you created or one you trust?",
+                )
+                .replace("Yes, I trust this folder", "Yes, trust it and apply them")
+        } else {
+            screen
+        };
+        let harness = validate_harness(Some("claude")).unwrap();
+        let shown = |screen: &str| {
+            harness
+                .startup_dialogs
+                .iter()
+                .find(|dialog| (dialog.shows)(screen))
+        };
+        let dialog = shown(&screen).expect("the live dialog must have a name");
+        assert_eq!(dialog.code, "claude_folder_trust_with_permissions");
+        assert!(dialog.keep_on_start);
+        assert_eq!(
+            shown(&screen.replace("This folder pre-approves 3 tool permissions in", ""))
+                .unwrap()
+                .code,
+            "claude_folder_trust",
+            "the permission notice distinguishes this from plain trust",
+        );
+        let history = format!("{screen}\n{}\n❯ \n{}\n", "─".repeat(30), "─".repeat(30));
+        assert!(shown(&history).is_none(), "a later composer owns the pane");
+    }
+
+    #[test]
+    fn permission_trust_project_without_grants_is_named() {
+        assert_permissions_variant(false, "No, continue without these permissions");
+    }
+
+    #[test]
+    fn permission_trust_project_exit_is_named() {
+        assert_permissions_variant(false, "No, exit");
+    }
+
+    #[test]
+    fn permission_trust_directory_without_grants_is_named() {
+        assert_permissions_variant(true, "No, continue without these permissions");
+    }
+
+    #[test]
+    fn permission_trust_directory_exit_is_named() {
+        assert_permissions_variant(true, "No, exit");
+    }
+
+    #[test]
+    fn inherited_delegate_lock_does_not_refuse_the_next_round() {
+        let root =
+            crate::structured::launch::SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+        let path = root.path().join("delegate.lock");
+        let lock = take_lock_at(&path).unwrap();
+        let mut holder =
+            crate::platform::file_lock::inherited_holder::Holder::spawn(&lock._file).unwrap();
+        drop(lock);
+        let next = take_lock_at(&path);
+        holder.verify().unwrap();
+        assert!(
+            next.is_ok(),
+            "delegate lock retained by child={} fd={} inode={}: {:?}",
+            holder.pid,
+            holder.descriptor,
+            holder.inode,
+            next.as_ref().err()
+        );
+    }
 
     #[test]
     fn expired_report_uses_cached_screen_without_io_or_advice() {
@@ -6285,13 +6635,12 @@ mod tests {
             None
         );
         for dialog in codex.startup_dialogs {
-            assert!(dialog
-                .refusal
-                .contains(if dialog.code == "codex_hook_review" {
-                    "#626"
-                } else {
-                    "#828"
-                }));
+            assert!(dialog.refusal.contains(match dialog.code {
+                "codex_hook_review" => "#626",
+                "codex_folder_trust" => "#828",
+                lock::NAME => "#1667",
+                other => panic!("missing dialog reference for {other}"),
+            }));
         }
         let opencode = validate_harness(Some("opencode")).expect("in the table");
         assert!(opencode.startup_dialogs.is_empty());

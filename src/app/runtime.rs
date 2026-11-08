@@ -57,7 +57,8 @@ impl App {
         changed
     }
 
-    pub(super) fn handle_api_request_message(
+    /// Dispatch one socket request with its captured credentials and response owner.
+    pub(crate) fn handle_api_request_message(
         &mut self,
         msg: crate::api::ApiRequestMessage,
     ) -> bool {
@@ -218,11 +219,19 @@ impl App {
 
     /// Drain structured facts on an owner wake or exact reducer boundary.
     pub(crate) fn service_structured_workers(&mut self, now: Instant) -> bool {
-        self.structured_workers.poll(
+        let changed = self.structured_workers.poll(
             &mut self.state.structured_agents,
             now,
             crate::app::notifications::now_ms(),
-        )
+        );
+        let published = self.queue_events.poll(
+            &self.structured_workers,
+            &self.state.structured_agents,
+            &self.event_hub,
+            &mut self.structured_sends,
+        );
+        self.finish_structured_messages(changed || published, now);
+        self.sync_structured_views() || published || changed
     }
 
     pub(crate) fn handle_scheduled_tasks(&mut self, now: Instant, geometry_dirty: bool) -> bool {
@@ -645,10 +654,12 @@ impl App {
         let workspaces = self.workspace_git_refresh_items();
 
         if workspaces.is_empty() {
+            self.git_refresh_idle = Some(crate::api::schema::PollerReason::NoEligibleWorkspaces);
             self.last_git_remote_status_refresh = now;
             return;
         }
 
+        self.git_refresh_idle = None;
         self.git_refresh_in_flight = true;
         self.git_refresh_health.mark_started(now);
         let event_tx = self.event_tx.clone();
@@ -663,6 +674,7 @@ impl App {
     }
 
     pub(crate) fn mark_git_status_refresh_due(&mut self, now: Instant) {
+        self.git_refresh_idle = None;
         if self.git_refresh_in_flight {
             self.git_refresh_due_after_in_flight = true;
             return;
@@ -739,6 +751,9 @@ impl App {
             // ADR-0028 §5: a wait expires on time in a quiet loop.
             self.waits.next_deadline(),
             self.input_writes.next_deadline(),
+            (!self.fleet_pause.paused)
+                .then(|| self.structured_sends.recovery_deadline(now))
+                .flatten(),
             self.structured_workers
                 .next_deadline(&self.state.structured_agents),
             // #540: the same, for an armed self-compaction — the Enter of a
@@ -778,6 +793,9 @@ impl App {
             .filter_map(|ws| {
                 let cwd =
                     ws.resolved_identity_cwd_from(&self.state.terminals, &self.terminal_runtimes)?;
+                if cwd.as_os_str().is_empty() {
+                    return None;
+                }
                 let git_key = crate::workspace::git_status_cache_key(&cwd);
                 let cache_key = git_key.unwrap_or_else(|| cwd.clone());
                 Some(WorkspaceGitRefreshItem {

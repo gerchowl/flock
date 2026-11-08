@@ -254,7 +254,9 @@ pub fn write_clipboard(bytes: &[u8]) -> bool {
     false
 }
 
-pub fn open_url(url: &str) -> std::io::Result<()> {
+// xdg-open 1.2.1 rejects `--` as an unexpected option. The shared
+// HTTP(S) validator guarantees that this sole argument cannot be an option.
+pub(super) fn open_validated_url(url: &str) -> std::io::Result<()> {
     crate::process::TracedCommand::new("xdg-open", "platform")
         .arg(url)
         .stdin(Stdio::null())
@@ -484,7 +486,7 @@ pub(crate) fn ssh_agent_rescan_roots() -> &'static [&'static str] {
 pub(crate) fn machine_identity() -> std::io::Result<String> {
     super::machine_id::read_machine_id(
         std::path::Path::new("/etc/machine-id"),
-        sysinfo::System::boot_time(),
+        sysinfo::System::boot_time().map_err(std::io::Error::other)?,
     )
 }
 

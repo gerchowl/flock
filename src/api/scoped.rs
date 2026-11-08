@@ -24,15 +24,17 @@ pub(crate) struct ScopedRequest {
 }
 
 /// Decode without letting a malformed scoped envelope fall through to legacy.
-pub(super) fn decode(line: &str) -> Result<(Request, Option<Option<LeaseCredential>>), ()> {
-    let value: serde_json::Value = serde_json::from_str(line).map_err(|_| ())?;
+pub(super) fn decode(
+    line: &str,
+) -> Result<(Request, Option<Option<LeaseCredential>>), Option<serde_json::Error>> {
+    let value: serde_json::Value = serde_json::from_str(line).map_err(Some)?;
     if value.get("request").is_some() || value.get("credential").is_some() {
-        let scoped: ScopedRequest = serde_json::from_value(value).map_err(|_| ())?;
+        let scoped: ScopedRequest = serde_json::from_value(value).map_err(|_| None)?;
         Ok((scoped.request, Some(scoped.credential)))
     } else {
         serde_json::from_value(value)
             .map(|request| (request, None))
-            .map_err(|_| ())
+            .map_err(Some)
     }
 }
 

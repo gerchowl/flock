@@ -18,16 +18,24 @@ impl App {
         if let Some(scope) = &self.current_api_scope {
             return scope.caller();
         }
-        let evidence = self.caller_pane_evidence();
+        self.lease_caller_for(self.current_api_peer_pid, principal)
+    }
+
+    /// Resolve origin from supplied kernel facts without an API request context.
+    pub(super) fn lease_caller_for(
+        &self,
+        peer: Option<u32>,
+        principal: Option<crate::structured::identity::Principal>,
+    ) -> crate::structured::lease::Caller {
+        use crate::structured::identity::Principal;
+        let evidence = self.pane_evidence_for(peer);
         let pane = evidence
             .as_ref()
             .ok()
             .copied()
             .flatten()
             .and_then(|(_, pane)| self.pane_child_pid(pane));
-        let caller = self
-            .session_leases
-            .caller_with_pane(self.current_api_peer_pid, pane);
+        let caller = self.session_leases.caller_with_pane(peer, pane);
         if caller == crate::structured::lease::Caller::Unrelated
             && (evidence.is_err() || (principal == Some(Principal::Agent) && pane.is_none()))
         {
@@ -72,7 +80,10 @@ impl App {
             .workspaces
             .iter()
             .enumerate()
-            .find_map(|(ws_idx, ws)| ws.pane_state(pane_id).map(|pane| (ws_idx, pane)))
+            .find_map(|(ws_idx, ws)| {
+                let tab = ws.find_tab_index_for_pane(pane_id)?;
+                ws.tabs[tab].panes.get(&pane_id).map(|pane| (ws_idx, pane))
+            })
     }
 
     pub(super) fn public_workspace_id(&self, ws_idx: usize) -> String {
@@ -244,7 +255,15 @@ impl App {
     /// A possible caller pane for refusal, self-protection and warning routing only.
     /// PID ancestry is not identity evidence and must never grant authority.
     pub(super) fn caller_pane_candidate(&self) -> Option<(usize, crate::layout::PaneId)> {
-        self.resolve_pane_in_chain(&peer_ancestor_chain(self.current_api_peer_pid?))
+        self.caller_pane_candidate_for(self.current_api_peer_pid)
+    }
+
+    /// Possible pane origin for an explicitly supplied accepted peer.
+    pub(super) fn caller_pane_candidate_for(
+        &self,
+        peer: Option<u32>,
+    ) -> Option<(usize, crate::layout::PaneId)> {
+        self.resolve_pane_in_chain(&peer_ancestor_chain(peer?))
     }
 
     /// The API caller's own pane, bound to the child's original birth identity.
@@ -252,8 +271,43 @@ impl App {
         self.caller_pane_evidence().ok().flatten()
     }
 
+    // Explain a refusal only. Candidate ancestry never grants caller authority.
+    pub(super) fn caller_pane_refusal_reason(&self) -> &'static str {
+        if self.current_api_peer_pid.is_none() {
+            return "socket peer process identity is unavailable";
+        }
+        let Some((_, pane)) = self
+            .caller_pane_candidate()
+            .and_then(|(_, pane)| self.find_pane(pane))
+        else {
+            return "socket peer process ancestry does not identify a live pane";
+        };
+        let Some(runtime) = self.terminal_runtimes.get(&pane.attached_terminal_id) else {
+            return "the candidate pane has no live terminal runtime";
+        };
+        let Some(birth) = runtime.child_birth() else {
+            return "the candidate pane has no process-birth evidence, as can happen \
+                    with a pane imported from a pre-3.3 handoff";
+        };
+        if runtime
+            .child_pid()
+            .and_then(crate::platform::process_start_time)
+            != Some(birth)
+        {
+            return "the pane child's recorded process-birth identity could not be verified";
+        }
+        "the attested pane has no usable agent identity"
+    }
+
     fn caller_pane_evidence(&self) -> Result<Option<(usize, crate::layout::PaneId)>, ()> {
-        let Some(peer) = self.current_api_peer_pid else {
+        self.pane_evidence_for(self.current_api_peer_pid)
+    }
+
+    fn pane_evidence_for(
+        &self,
+        peer: Option<u32>,
+    ) -> Result<Option<(usize, crate::layout::PaneId)>, ()> {
+        let Some(peer) = peer else {
             return Ok(None);
         };
         let chain = peer_ancestor_chain(peer);
@@ -323,7 +377,13 @@ impl App {
 
 /// Collect the peer's ancestor chain (bounded; refreshes one pid at a time).
 pub(super) fn peer_ancestor_chain(peer: u32) -> Vec<u32> {
-    let mut system = sysinfo::System::new();
+    let mut system = match sysinfo::System::new() {
+        Ok(system) => system,
+        Err(error) => {
+            crate::logging::system_information_unavailable("peer_ancestry", &error);
+            return vec![peer];
+        }
+    };
     let mut ancestors = Vec::with_capacity(16);
     let mut current = peer;
     for _ in 0..16 {
