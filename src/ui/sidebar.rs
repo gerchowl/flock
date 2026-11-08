@@ -3726,7 +3726,24 @@ mod tests {
     use crate::{detect::Agent, workspace::Workspace};
     use ratatui::{backend::TestBackend, Terminal};
 
-    fn server_identity1076_fixture() -> (crate::app::App, String) {
+    fn server_identity1076_fixture(self_host: &str) -> (crate::app::App, String) {
+        // Reuse just's hostname pin after the caller's config-env scrub.
+        // Isolate config lookup because a file's name overrides the env pin.
+        let root =
+            crate::structured::launch::SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+        let previous = std::env::var_os(crate::config::CONFIG_PATH_ENV_VAR);
+        std::env::set_var(
+            crate::config::CONFIG_PATH_ENV_VAR,
+            root.path().join("config.toml"),
+        );
+        std::env::set_var("FLOCK_HOST_NAME", self_host);
+        let actual = crate::app::short_host_name();
+        match previous {
+            Some(value) => std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, value),
+            None => std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR),
+        }
+        assert_eq!(actual, self_host);
+
         let identity = crate::mesh::identity::NodeIdentity::fixture([7; 32]);
         let node = identity.node_id();
         let peer = crate::config::PeerConfig {
@@ -3810,7 +3827,9 @@ mod tests {
     async fn server_identity1076_healthy_direct_reading_hides_via_until_failure() {
         let (_lock, _scrub) = crate::config::test_config_env_guard();
         let _store = crate::mesh::runtime_store::TestStore::new();
-        let (mut app, node) = server_identity1076_fixture();
+        let (mut app, node) = server_identity1076_fixture(
+            "runner-with-a-deliberately-long-fictional-machine-name-3030.example",
+        );
         assert_eq!(app.state.relayed_fleet_cache.len(), 1);
         let direct = &mut app.state.peer_summaries[0];
         direct.bind_node(Some(node));
@@ -3818,7 +3837,10 @@ mod tests {
         direct.protocol = Some(crate::protocol::PROTOCOL_VERSION);
         direct.error = None;
         let band = |state: &AppState| {
-            let area = Rect::new(0, 0, 120, 16);
+            // Reserve the entire pinned self name plus 120 cells for the
+            // peer's counts, direct status, failure diagnostic and +via cell.
+            let width = u16::try_from(crate::app::short_host_name().width() + 120).unwrap();
+            let area = Rect::new(0, 0, width, 16);
             let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
             terminal
                 .draw(|frame| render_servers_section(state, frame, area, false))
@@ -3829,10 +3851,20 @@ mod tests {
                 .join("\n")
         };
         assert_eq!(app.state.remote_peers().len(), 1);
-        assert!(!band(&app.state).contains("+via"));
+        let healthy = band(&app.state);
+        assert!(healthy.contains("node-b-alias.example"), "{healthy}");
+        assert!(!healthy.contains("+via"), "{healthy}");
         app.state.peer_summaries[0].error = Some("Connection refused".into());
         let text = band(&app.state);
-        assert!(text.contains("+via node-b.example"), "{text}");
+        let peer_row = text
+            .lines()
+            .find(|line| line.contains("node-b-alias.example"))
+            .expect("configured peer row remains visible");
+        assert!(peer_row.contains("+via node-b.example"), "{text}");
+        assert!(
+            !peer_row.contains('…'),
+            "peer row must fit without truncation: {text}"
+        );
         assert_eq!(app.state.relayed_fleet_cache.len(), 1);
     }
 
@@ -3845,7 +3877,7 @@ mod tests {
         // as a second "unverified" row — the fold adds no authority.
         let (_lock, _scrub) = crate::config::test_config_env_guard();
         let _store = crate::mesh::runtime_store::TestStore::new();
-        let (mut app, _) = server_identity1076_fixture();
+        let (mut app, _) = server_identity1076_fixture("host");
         // Capture the SPOOF's name/target BEFORE taking a shared ref to
         // app.state, so the assertions below can check the pinned row
         // against them without borrowing mutably twice.
@@ -3916,7 +3948,7 @@ mod tests {
     async fn server_identity1076_proven_self_reading_keeps_configured_target() {
         let (_lock, _scrub) = crate::config::test_config_env_guard();
         let _store = crate::mesh::runtime_store::TestStore::new();
-        let (mut app, _) = server_identity1076_fixture();
+        let (mut app, _) = server_identity1076_fixture("host");
         app.state
             .relayed_fleet_cache
             .values_mut()
@@ -3937,7 +3969,7 @@ mod tests {
     async fn server_identity1076_enrolled_direct_edge_does_not_render_via_itself() {
         let (_lock, _scrub) = crate::config::test_config_env_guard();
         let _store = crate::mesh::runtime_store::TestStore::new();
-        let (mut app, _) = server_identity1076_fixture();
+        let (mut app, _) = server_identity1076_fixture("host");
         // Isolate the route symptom from the separately tested alias duplicate.
         app.state.peer_summaries.clear();
         let area = Rect::new(0, 0, 120, 16);
@@ -3965,7 +3997,10 @@ mod tests {
                 ..Default::default()
             },
         ));
-        let area = Rect::new(0, 0, 80, 12);
+        // The local name pads every peer row, including this legacy row.
+        // Keep 80 cells beyond that name for the counts and unverified label.
+        let width = u16::try_from(crate::app::short_host_name().width() + 80).unwrap();
+        let area = Rect::new(0, 0, width, 12);
         let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
         terminal
             .draw(|frame| render_servers_section(&app, frame, area, false))
@@ -3974,8 +4009,12 @@ mod tests {
             .map(|y| buffer_row_text(terminal.backend().buffer(), area, y))
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(text.contains("node-a.invalid"));
-        assert!(text.contains("unverified"));
+        let peer_row = text
+            .lines()
+            .find(|line| line.contains("node-a.invalid"))
+            .expect("legacy peer row remains visible");
+        assert!(peer_row.contains("unverified"), "{text}");
+        assert!(!peer_row.contains('…'), "{text}");
     }
 
     #[test]
@@ -4069,7 +4108,7 @@ mod tests {
     async fn server_identity1076_real_next_hop_replaces_gossip_supplier() {
         let (_lock, _scrub) = crate::config::test_config_env_guard();
         let _store = crate::mesh::runtime_store::TestStore::new();
-        let (mut app, node) = server_identity1076_fixture();
+        let (mut app, node) = server_identity1076_fixture("host");
         use crate::mesh::routes::{Adjacency, Advert};
         let local = crate::mesh::identity::NodeIdentity::load().unwrap();
         let middle = crate::mesh::identity::NodeIdentity::fixture([7; 32]);
@@ -5895,6 +5934,21 @@ mod tests {
 
     #[test]
     fn two_hubs_dialing_the_same_peers_render_each_peer_once_with_a_via_annotation() {
+        let (_lock, _scrub) = crate::config::test_config_env_guard();
+        let root =
+            crate::structured::launch::SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+        let previous = std::env::var_os(crate::config::CONFIG_PATH_ENV_VAR);
+        std::env::set_var(
+            crate::config::CONFIG_PATH_ENV_VAR,
+            root.path().join("config.toml"),
+        );
+        std::env::set_var("FLOCK_HOST_NAME", "host");
+        let actual = crate::app::short_host_name();
+        match previous {
+            Some(value) => std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, value),
+            None => std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR),
+        }
+        assert_eq!(actual, "host");
         // #2998: with mba22 (viewer, hub A) and sage-ws (hub B) both polling
         // `anvil`, `ksb-ws` and each other, hub B pushes a relayed view of
         // its peers down to A. BEFORE the fold, A's band showed every peer
