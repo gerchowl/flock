@@ -318,3 +318,242 @@ async fn operator_without_a_dedicated_account_keeps_normal_mutations() {
     assert!(result.get("result").is_some(), "{result}");
     assert!(app.state.should_quit);
 }
+
+impl App {
+    pub(crate) fn test_attach_relay(&mut self, enrolled: bool) {
+        let pid = std::process::id();
+        self.inbound
+            .attach(
+                pid,
+                crate::platform::process_start_time(pid).unwrap(),
+                crate::platform::process_start_time,
+            )
+            .unwrap();
+        if enrolled {
+            self.inbound
+                .enroll(
+                    pid,
+                    crate::mesh::hello::Enrollment {
+                        peer: "relay.example".into(),
+                        source: crate::mesh::store::PinSource::Inbound,
+                        pin_origin: Default::default(),
+                        node_id: Some("relay.example".into()),
+                        state: "pinned".into(),
+                        reason: None,
+                    },
+                    crate::platform::process_start_time,
+                )
+                .unwrap();
+        }
+    }
+}
+
+fn relay_request(method: &str) -> Request {
+    serde_json::from_value(serde_json::json!({
+        "id": "relay-boundary", "method": method,
+        "params": if matches!(method, "agent.stop" | "agent.fork") {
+            serde_json::json!({"target": "fixture-agent"})
+        } else { serde_json::json!({}) }
+    }))
+    .unwrap()
+}
+
+async fn relay_refusal(method: &str) {
+    let (_guard, _scrub) = crate::config::test_config_env_guard();
+    let root = crate::test_support::TempDir::socket();
+    let config = root.path().join("config.toml");
+    std::fs::write(
+        &config,
+        "[terminal]\ndefault_shell = \"relay-test-shell\"\n",
+    )
+    .unwrap();
+    std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &config);
+    let mut violations = Vec::new();
+    for enrolled in [true, false] {
+        let mut app = fixture(Some(7));
+        app.test_attach_relay(enrolled);
+        let shell = app.state.default_shell.clone();
+        let result = response(&mut app, relay_request(method));
+        if result["error"]["code"] != "operator_only" {
+            violations.push(format!("{method}, enrolled={enrolled}: {result}"));
+            continue;
+        }
+        assert!(!app.state.should_quit);
+        assert!(!app.take_config_reloaded_from_disk());
+        assert_eq!(app.state.default_shell, shell);
+        assert!(app.state.workspaces.is_empty());
+    }
+    assert!(violations.is_empty(), "{violations:#?}");
+}
+#[tokio::test]
+async fn relay_operator_server_stop() {
+    relay_refusal("server.stop").await;
+}
+#[tokio::test]
+async fn relay_operator_reload_config() {
+    relay_refusal("server.reload_config").await;
+}
+#[tokio::test]
+async fn relay_operator_live_handoff() {
+    relay_refusal("server.live_handoff").await;
+}
+#[tokio::test]
+async fn relay_operator_agent_fork() {
+    relay_refusal("agent.fork").await;
+}
+
+#[tokio::test]
+async fn relay_operator_classification_never_bypasses_fork_admission() {
+    for enrolled in [false, true] {
+        let mut app = fixture(Some(7));
+        app.test_attach_relay(enrolled);
+        app.state.config.fleet.max_spawn_depth = 0;
+        app.state.config.fleet.max_spawn_fanout = 0;
+        app.state.config.fleet.max_concurrent_agents = 0;
+        let caller = app.spawn_caller();
+        assert!(app
+            .admit_spawn(crate::spawn::SpawnVerb::Fork, &caller, None)
+            .is_err());
+        assert!(!app.caller_is_local_operator());
+    }
+}
+
+#[tokio::test]
+async fn relay_operator_agent_stop_leaves_live_worker_running() {
+    use crate::structured::workers::tests::global::{max_policy, AppQueue};
+    for enrolled in [true, false] {
+        let mut r = AppQueue::new(3101 + u32::from(enrolled), |_| max_policy()).await;
+        r.until(|r| r.app.queue_observation(&r.case.id).is_some())
+            .await;
+        r.app.runtime_config.uid_policy = UidPolicy {
+            operator: 7,
+            dedicated: Ok(None).into(),
+        };
+        r.app.test_attach_relay(enrolled);
+        let mut request = relay_request("agent.stop");
+        request.method = Method::AgentStop(AgentTarget {
+            target: r.case.id.clone(),
+        });
+        let (tx, rx) = std::sync::mpsc::channel();
+        r.app
+            .handle_api_request_message(crate::api::ApiRequestMessage {
+                scope: None,
+                request: request.clone(),
+                respond_to: tx,
+                peer_pid: Some(std::process::id()),
+                peer_birth: crate::platform::process_start_time(std::process::id()),
+                peer_uid: Some(7),
+            });
+        let result: serde_json::Value =
+            serde_json::from_str(&rx.recv_timeout(Duration::from_secs(1)).unwrap()).unwrap();
+        assert_eq!(result["error"]["code"], "operator_only", "{result}");
+        assert!(r
+            .app
+            .structured_workers
+            .report(&r.case.id, r.case.generation)
+            .is_none());
+        // An owned child must still respond after refusal, proving stop was not queued.
+        r.case.submit(&r.app.structured_workers);
+        r.until(|r| !r.inputs().is_empty()).await;
+        assert!(r
+            .app
+            .structured_workers
+            .report(&r.case.id, r.case.generation)
+            .is_none());
+        r.app.inbound = Default::default();
+        r.app.current_api_peer_pid = Some(std::process::id());
+        r.app.current_api_peer_birth =
+            Some(crate::platform::process_start_time(std::process::id()));
+        r.app.current_api_peer_uid = Some(Some(7));
+        let mut lease = enrolled.then(|| {
+            let session = r
+                .app
+                .state
+                .structured_agents
+                .get(&r.case.id)
+                .unwrap()
+                .0
+                .session_id
+                .clone();
+            r.app
+                .session_leases
+                .reserve(&r.case.id, &session, None)
+                .unwrap()
+        });
+        if let Some(lease) = &mut lease {
+            lease.bind_test_peer(std::process::id());
+            assert!(matches!(
+                r.app.spawn_caller(),
+                spawn::SpawnCaller::Structured {
+                    agent_id: Some(_),
+                    ..
+                }
+            ));
+        } else {
+            assert!(r.app.caller_is_local_operator());
+        }
+        let stopped = response(&mut r.app, request);
+        assert!(stopped.get("result").is_some(), "{stopped}");
+        r.stop().await;
+        assert_eq!(
+            r.app
+                .state
+                .structured_agents
+                .get(&r.case.id)
+                .unwrap()
+                .1
+                .update
+                .state
+                .lifecycle,
+            crate::api::agent_state::Lifecycle::Offline
+        );
+    }
+}
+
+#[tokio::test]
+async fn relay_operator_fix_preserves_local_and_bounded_agent_admission() {
+    let mut app = fixture(Some(7));
+    app.state.config.fleet.max_spawn_depth = 0;
+    let caller = app.spawn_caller();
+    assert!(app
+        .admit_spawn(crate::spawn::SpawnVerb::Fork, &caller, None)
+        .unwrap()
+        .is_none());
+    pane(&mut app, true);
+    app.state.config.fleet.agent_spawn_enabled = true;
+    app.state.config.fleet.max_spawn_depth = 4;
+    app.state.config.fleet.max_spawn_fanout = 4;
+    app.state.config.fleet.max_concurrent_agents = 4;
+    let caller = app.spawn_caller();
+    assert!(app
+        .admit_spawn(crate::spawn::SpawnVerb::Fork, &caller, None)
+        .unwrap()
+        .is_some());
+    app.state.config.fleet.max_spawn_depth = 0;
+    assert!(app
+        .admit_spawn(crate::spawn::SpawnVerb::Fork, &caller, None)
+        .is_err());
+}
+
+#[tokio::test]
+async fn relay_operator_app_local_reload_and_handoff_controls() {
+    let (_guard, _scrub) = crate::config::test_config_env_guard();
+    let root = crate::test_support::TempDir::socket();
+    let config = root.path().join("config.toml");
+    std::fs::write(
+        &config,
+        "[terminal]\ndefault_shell = \"relay-test-shell\"\n",
+    )
+    .unwrap();
+    std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &config);
+    let mut app = fixture(Some(7));
+    let result = response(&mut app, relay_request("server.reload_config"));
+    assert!(result.get("result").is_some(), "{result}");
+    assert_eq!(app.state.default_shell, "relay-test-shell");
+    let mut app = fixture(Some(7));
+    let result = response(&mut app, relay_request("server.live_handoff"));
+    assert_eq!(
+        result["error"]["code"], "unsupported_in_app_mode",
+        "{result}"
+    );
+}
