@@ -523,6 +523,8 @@ Known limitation, fixed in v1.1.0: terminal failures decided at an intermediate 
 
 Replies use the request's stored return binding and travel down the hub's dialed edge with `mesh.deliver`. When disconnected, the hub retains the answer and pushes it after re-enrollment. There is no in-memory message uplink queue, `msg.uplink_take`, or `msg.uplink_result`. Removed configuration keys warn with file-and-line migration instructions; startup, live handoff, and reload ignore them while applying the remaining settings. Each inbound relay binds its process identity through `mesh.hello` and authenticates independently. Up to 32 inbound edges may coexist, including several hubs dialing the same node. At capacity, `inbound_edges_full` is transient; dead edges are pruned every second. The newer completed handshake supersedes an older edge for the same node ID. Relays carry summary requests, summary pushes, and `peers.hub_fleet` directory updates under their own enrolled identity. Mesh delivery and collection require that edge's enrollment; unrelated socket callers cannot collect mail. The former `peers.relay_attach` method is removed.
 
+Relayed directory claims from summary polls and `peers.hub_fleet` pushes stay cached under the normal expiry policy. The receiver suppresses redundant server rows and `+via` annotations only while it holds a fresh, successful, protocol-compatible direct reading verified by its local node binding. This decision is recomputed when projecting the rows. An absent, stale, failed or refused direct reading keeps the relayed claim visible; a healthy owner relay can still supply node status while preserving the direct-link diagnostic. Node IDs are compared against local bindings; ID-less rows use the exact configured SSH target, never a display name or shortened hostname. Unknown bindings cannot suppress claims. Spokes and nodes outside the configured dial set retain their usual visibility. The existing claim fold remains the fallback, and mesh protocol 5 is unchanged. Sender-side filtering and the proposed per-peer `relay_to` policy remain follow-up work ([#3033](https://github.com/gerchowl/flock/issues/3033)); no relay policy option is introduced here.
+
 `agent.restart` schedules a restart and returns `agent_restart_queued { pane_id, session, stop_only }` immediately. Params are `target` (default `self`), required `reason`, optional `continue_with`, and `when` (only `after_turn`). Duplicate requests return `restart_pending`; disabled policy returns `restart_disabled`; missing confirmed session-reporting hooks, ambiguous launch options or a mismatched executable return `restart_unsupported`. A runtime-less hibernated or deferred-resume binding returns `parked` (`retry: never`, CLI/MCP exit 2): call `agent resume` first. A binding that still has a runtime and is hibernating, resuming or compacting, or has an in-flight wake, returns `restart_busy`. Explicit requests at the rate cap return `restart_rate_limited` with a `retry_after_secs` in the error message; they leave the agent running. MCP accepts only `target: "self"`; arbitrary targets are CLI/API-only.
 
 ```json
@@ -840,13 +842,15 @@ Refusals: `unsupported_for_agent` (the pane's agent writes no conversation Flock
 {
   "type": "agent_result",
   "result": {
-    "pane_id": "1-2", "workspace_id": "1", "agent": "opencode", "session_id": "ses_...",
+    "pane_id": "1-2", "terminal_id": "term_example", "workspace_id": "1", "agent": "opencode", "session_id": "ses_...",
     "finished": true, "status": "verdict", "status_text": "approve",
     "text": "Read the diff; the tests cover it.\nVERDICT: approve",
     "offset": 0, "total_chars": 52, "at_ms": 1756300000000
   }
 }
 ```
+
+`terminal_id` identifies the terminal resolved with the session for this read. Older servers omit it. Delegate wait binds each result read to its settled terminal and restarts settling if the delegate changes terminal during the read.
 
 `status`/`status_text` come from a final `DONE: …`, `BLOCKED: …` or `VERDICT: …` line, after the markdown dressing the recap hook also peels (`**`, `- `, `> `) and skipping a trailing `※ recap:` line; both are absent when the reply ends on none of them. `finished` is false while the newest turn is still going: for Claude, until the transcript records the turn's end, by the rules below; for opencode, while the newest message is not an assistant message opencode marked completed. `text` is then the reply of the turn before. The reply is the text after the newest assistant message's last tool call, joined with the text-only entries just before it (Claude writes one entry per content block). `max_chars` (default 4000, at most 65536) and `offset` page it by characters, and `next_offset` is present until the last page. Reads are bounded: the last 1 MiB of a Claude transcript, or the newest 64 opencode messages. Like `agent.history` it touches no pane state. Refusals: the same as `agent.history`, plus `no_result` when the session has no assistant reply yet. While a Claude turn is still going by that rule, the result carries `turn_open_at_ms`, when its prompt was written, and so does a `no_result` refusal as `data.turn_open_at_ms`: a supervisor can tell "this turn is still running" from "nothing was written" without trusting a screen that may read idle mid-turn. It is absent when the turn is over, when the prompt lies outside the 1 MiB read, or when its entry carries no time; older servers never send it.
 
@@ -976,7 +980,7 @@ subscriptions of the same type. Every event also carries `seq`, the hub sequence
 it covers. Hub events use their committed sequence; current-state predicates
 carry their observation cursor and do not provide historical predicate replay.
 The acknowledgement includes `result.start_sequence`, the common initial cursor
-captured for every accepted filter before polling begins. For example:
+captured for hub-backed filters before polling begins. For example:
 
 ```json
 {"id":"sub_1","result":{"type":"subscription_started","start_sequence":49}}
@@ -998,9 +1002,12 @@ without it cannot supply a safe initial cursor.
 For hub-backed facts, deduplicate by subscription and `seq`. A current-state
 predicate is an observation, not historical replay: its `seq` is an observation
 watermark rather than a unique observation id. In particular,
-`pane.output_matched` samples `current_sequence()` but advances only its own
-applied cursor; the minimum rule protects events not yet applied by the other
-filters. Loss notices are not applied event cursors.
+`pane.output_matched` samples `current_sequence()` and
+`pane.agent_status_changed` seeds from the current hub head, ignoring a supplied
+history cursor. Both observe current pane state rather than replaying historical
+predicates, and advance only their own applied cursor. The minimum rule protects
+hub events not yet applied by the other filters. Loss notices are not applied
+event cursors.
 
 `events_lost` has retry class `after_inspecting`: resync before treating the stream
 as complete. Use `workspace.list`, `pane.list`, `agent.list` and `msg.list` as

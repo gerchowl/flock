@@ -1,1 +1,0 @@
-- Refuse delegate recovery when a Claude session store cannot be read, identify the failing store, and require proven absence before ignoring a project during uniqueness checks.
