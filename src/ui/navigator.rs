@@ -195,6 +195,11 @@ fn render_row(app: &AppState, frame: &mut Frame, rect: Rect, row: &NavigatorRow,
         .saturating_sub(meta_width)
         .saturating_sub(left_fixed.chars().count() as u16)
         .saturating_sub(3) as usize;
+    if left_budget == 0 && crate::peer_name::is_claim(&row.label) {
+        let title = truncate_text(&row.label, rect.width as usize);
+        frame.render_widget(Paragraph::new(title).style(text_style), rect);
+        return;
+    }
     let title = truncate_text(&row.label, left_budget);
 
     let spans = vec![
@@ -317,9 +322,9 @@ fn remote_workspace_detail(
     let Some(summary) = peer.workspaces.get(peer_ws_idx) else {
         return String::new();
     };
-    let host = peer.host.as_deref().unwrap_or(peer.peer.as_str());
+    let host = app.server_peer_host(peer);
     let mut parts = vec![
-        super::grammar::solo_remote_label(app.server_label, peer, summary),
+        super::grammar::solo_remote_label(app.server_label, peer, summary, &host),
         format!("server {host}"),
     ];
     if let Some(agent) = summary.agent.as_deref().filter(|a| !a.is_empty()) {
@@ -495,6 +500,9 @@ fn render_footer(app: &AppState, frame: &mut Frame, area: Rect) {
 }
 
 fn truncate_text(text: &str, max_width: usize) -> String {
+    if let Some(label) = crate::peer_name::fit(text, max_width) {
+        return label;
+    }
     let len = text.chars().count();
     if len <= max_width {
         return text.to_string();
@@ -507,6 +515,112 @@ fn truncate_text(text: &str, max_width: usize) -> String {
     }
     let prefix: String = text.chars().take(max_width.saturating_sub(1)).collect();
     format!("{prefix}…")
+}
+
+#[cfg(test)]
+mod trust_tests {
+    use super::*;
+
+    #[test]
+    fn security2166_r2_navigator_truncation_keeps_the_badge() {
+        let name = AppState::test_new().server_claim_name("node-unknown.example", None);
+        for width in [1, 2, 5, 12, 16] {
+            let title = truncate_text(&format!("project · {name}:main"), width);
+            assert!(
+                title.contains("[unverified]") || title.starts_with('?'),
+                "{title:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn security2166_navigator_detail_cannot_claim_a_configured_alias() {
+        let mut app = AppState::test_new();
+        app.peers.push(crate::config::PeerConfig {
+            name: "node-trusted.example".into(),
+            ..Default::default()
+        });
+        let mut peer = crate::peers::PeerSummaryState::new(&crate::config::PeerConfig {
+            name: "node-trusted.example".into(),
+            ..Default::default()
+        });
+        peer.host = Some("node-trusted.example".into());
+        peer.node_id = Some("claimed-node".into());
+        peer.workspaces = vec![serde_json::from_value(serde_json::json!({
+            "workspace":"project", "status":"working"
+        }))
+        .unwrap()];
+        app.fleet_snapshot = Some(crate::peers::FleetSnapshotState {
+            origin: "node-home.example".into(),
+            peers: vec![peer],
+            origin_summary: None,
+            received_at: std::time::Instant::now(),
+        });
+        let detail = remote_workspace_detail(
+            &app,
+            &crate::app::state::RemotePeerRef::Snapshot { entry_idx: 0 },
+            0,
+        );
+        assert!(!detail.contains("node-trusted.example"), "{detail}");
+        assert!(detail.contains("unverified"), "{detail}");
+    }
+
+    #[test]
+    fn security2261_hub_detail_cannot_claim_a_configured_alias() {
+        let (_lock, _scrub) = crate::config::test_config_env_guard();
+        super::super::sidebar::tests::pin_server_identity_host("host");
+        let mut app = AppState::test_new();
+        app.peers.push(crate::config::PeerConfig {
+            name: "node-trusted.example".into(),
+            ..Default::default()
+        });
+        let mut peer = crate::peers::PeerSummaryState::new(&crate::config::PeerConfig {
+            name: "node-trusted.example".into(),
+            ..Default::default()
+        });
+        peer.host = Some("node-trusted.example".into());
+        peer.node_id = Some("claimed-node".into());
+        peer.workspaces = vec![serde_json::from_value(serde_json::json!({
+            "workspace":"project", "status":"working"
+        }))
+        .unwrap()];
+        app.relayed_fleet_cache.insert(
+            "hub-claim".into(),
+            crate::peers::RelayedEntry {
+                peer,
+                via: Some("node-hub.example".into()),
+                hub_pushed: true,
+                source_node: None,
+            },
+        );
+        let detail = remote_workspace_detail(
+            &app,
+            &crate::app::state::RemotePeerRef::Relayed {
+                host_key: "hub-claim".into(),
+            },
+            0,
+        );
+        assert!(!detail.contains("node-trusted.example"), "{detail}");
+        assert!(detail.contains("unverified"), "{detail}");
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 12)).unwrap();
+        terminal
+            .draw(|frame| {
+                render_rows(&app, frame, Rect::new(0, 0, 120, 6));
+                render_detail(&app, frame, Rect::new(0, 6, 120, 6));
+            })
+            .unwrap();
+        for area in [Rect::new(0, 0, 120, 6), Rect::new(0, 6, 120, 6)] {
+            let mut text = String::new();
+            for y in area.y..area.bottom() {
+                for x in area.x..area.right() {
+                    text.push_str(terminal.backend().buffer()[(x, y)].symbol());
+                }
+            }
+            assert!(text.contains(crate::peer_name::BADGE), "{text}");
+            assert!(!text.contains("node-trusted.example"), "{text}");
+        }
+    }
 }
 
 #[cfg(test)]

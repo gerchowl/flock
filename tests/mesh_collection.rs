@@ -38,15 +38,16 @@ fn agent(node: &Node) -> Value {
 
 // Used only by debug-only fake SSH relay tests (#1715).
 #[cfg(debug_assertions)]
-fn discover(fleet: &fleet::Fleet, recipient: &Value) {
-    let location = fleet::wait_until("recipient discovery", Duration::from_secs(90), || {
+fn discover(fleet: &fleet::Fleet, recipient_node: &str, recipient: &Value) {
+    fleet::wait_until("recipient discovery", Duration::from_secs(90), || {
         request(fleet.node("nodea"), "agent.list", json!({}))["result"]["fleet"]
             .as_array()?
             .iter()
             .find(|row| row["agent_id"] == recipient["agent_id"])
             .cloned()
     });
-    fleet.wait_route("nodea", location["host"].as_str().unwrap(), true);
+    // Directory host text is presentation; routing uses the fixture owner identity.
+    fleet.wait_route("nodea", recipient_node, true);
 }
 
 // Used only by debug-only fake SSH relay tests (#1715).
@@ -120,7 +121,7 @@ fn withhold_outbound_answers(fleet: &fleet::Fleet) {
 fn question(fleet: &fleet::Fleet, correlation: &str) -> (Value, Value) {
     let sender = agent(fleet.node("nodea"));
     let recipient = agent(fleet.node("nodeb"));
-    discover(fleet, &recipient);
+    discover(fleet, "nodeb", &recipient);
     let sent = send(fleet, &recipient, correlation);
     assert_eq!(sent["result"]["state"], "delivered", "{sent}");
     (sender, recipient)
@@ -538,7 +539,7 @@ fn a_nonresponding_collection_peer_cannot_starve_a_user_send_to_another_peer() {
     );
     question(&fleet, "blocked-collection");
     let target = agent(fleet.node("nodec"));
-    discover(&fleet, &target);
+    discover(&fleet, "nodec", &target);
     let hold = fleet.base.join("hold-collect-nodea-nodeb");
     std::fs::create_dir(&hold).unwrap();
     ready(fleet.node("nodea"));

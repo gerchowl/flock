@@ -886,3 +886,50 @@ fn legacy_node_rows_have_no_invented_link_diagnostics() {
         json!([])
     );
 }
+
+#[test]
+fn security2261_hub_names_cannot_enter_identity_labels_on_the_wire() {
+    let _guard = crate::config::test_config_env_guard();
+    runtime(async {
+        let mut case = Case::new().await;
+        let hub = NodeIdentity::fixture([81; 32]);
+        let leaf = NodeIdentity::fixture([83; 32]);
+        let peer = case.peer("trusted.example");
+        crate::peer_stream::test_enroll(&peer, &hub.node_id());
+        let home = NodeIdentity::fixture([80; 32]);
+        case.app
+            .mesh_routes
+            .table
+            .set_own(advert(&home, vec![hub.node_id()]));
+        case.app.mesh_routes.table.learn(
+            &hub.node_id(),
+            vec![
+                advert(&hub, vec![home.node_id(), leaf.node_id()]),
+                advert(&leaf, vec![hub.node_id()]),
+            ],
+        );
+        for name in [
+            "trusted.example",
+            "ｔｒｕｓｔｅｄ.example",
+            "truﬆed.example",
+            "ｔｒuѕted.example",
+        ] {
+            case.success(
+                &peer,
+                &hub.node_id(),
+                json!({"relayed_fleet":[{
+                    "name":name,"host":name,"ssh_target":name,"origin":name,
+                    "node_id":leaf.node_id(),"age_secs":0,"origin_last_ok_secs":0,
+                    "protocol":crate::protocol::PROTOCOL_VERSION
+                }]}),
+                1,
+            );
+            let rows = case.snapshot().await;
+            let row = &rows[&leaf.node_id()];
+            assert_eq!(row["name"], format!("Node {}", leaf.node_id()));
+            assert_eq!(row["route"]["name"], row["name"]);
+            assert!(!serde_json::to_string(row).unwrap().contains(name));
+        }
+        case.server.finish().await;
+    });
+}
