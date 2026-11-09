@@ -1,0 +1,1 @@
+- Mesh relays running as the operator UID no longer receive local-operator authority for stop, reload, handoff and fork admission.
