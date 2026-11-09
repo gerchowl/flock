@@ -61,6 +61,7 @@ can be exempted in `guardrails-adr-exempt.txt`.
 | [0049](0049-agent-types-workflows-and-one-authority-model.md) | Agent types and workflows are versioned declarative definitions adopted by hash, run by a closed executable vocabulary with durable, reconciled effects; permission decisions are operator authority, delegated to architects only by scoped, revocable, audited grants | Accepted |
 | [0050](0050-keyboard-first-command-model.md) | A keyboard-first GUI: one command model, configurable bindings, hints and smart next | Proposed |
 | [0051](0051-durable-writes-off-the-server-loop.md) | Durable writes leave the server loop through bounded, ordered owners | Proposed |
+| [0052](0052-structured-harness-profiles.md) | Structured harness profiles separate operator authority, immutable assets and session storage | Proposed |
 
 ADR-0026 supersedes the affected transport, reply, deferral and deduplication
 contracts in ADR-0006, ADR-0008, ADR-0009, ADR-0018 and ADR-0019. Their other
