@@ -22,7 +22,8 @@ export type FleetAgentInfo = {
  */
 agent_id: string,
 /**
- * Short host name of the server the agent lives on.
+ * Viewer-safe server label, including a badge for unverified claims.
+ * Presentation only: delivery targets `agent_id`, never this label.
  */
 host: string,
 /**

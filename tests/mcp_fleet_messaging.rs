@@ -364,7 +364,10 @@ fn an_agent_discovers_and_messages_another_host_through_mcp_alone() {
         remote["local"], false,
         "an agent on another machine must not look addressable by pane id: {remote}"
     );
-    assert_eq!(remote["host"], "nodec", "the row names where it lives");
+    assert_eq!(
+        remote["host"], "[unverified] nodec",
+        "the remote label remains unverified"
+    );
     assert_eq!(
         remote["route"], "nodeb",
         "and how this server reaches it: {remote}"
