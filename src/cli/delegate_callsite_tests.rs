@@ -12,6 +12,37 @@ use std::cell::RefCell;
 use std::io;
 use std::rc::Rc;
 
+fn with_json_output<T>(run: impl FnOnce() -> T) -> T {
+    struct ResetOnDrop;
+    impl Drop for ResetOnDrop {
+        fn drop(&mut self) {
+            crate::cli::output::set(crate::cli::output::Format::Default);
+        }
+    }
+    crate::cli::output::set(crate::cli::output::Format::Json);
+    let _reset = ResetOnDrop;
+    run()
+}
+
+#[test]
+fn retained_block_json_output_resets_during_unwind() {
+    let failed = std::panic::catch_unwind(|| {
+        with_json_output(|| {
+            let response = json!({"error": {"code": "write_failed", "message": "fixture failure"}});
+            crate::cli::output::error(
+                &response,
+                crate::api::error_code::ErrorCode::WriteFailed.exit(),
+            );
+            assert!(crate::cli::output::json());
+            assert!(crate::cli::output::envelope_pending());
+            panic!("fixture panic before normal output reset");
+        })
+    });
+    assert!(failed.is_err());
+    assert!(!crate::cli::output::json());
+    assert!(!crate::cli::output::envelope_pending());
+}
+
 // ---------- fixtures ---------------------------------------------------------
 
 fn start_flags_worktree(branch: &str) -> StartFlags {
@@ -328,19 +359,23 @@ fn entry_for(name: &str) -> Entry {
         base: None,
         base_sha: None,
         agent_id: None,
+        lock_resolution: None,
+        session: None,
     }
 }
 
 #[test]
-fn w7_require_decide_a_found_record_with_matching_terminal_is_ours() {
-    let entry = entry_for("d1");
-    let record = json!({"terminal_id": "t"});
+fn w7_require_decide_a_found_record_with_matching_identity_is_ours() {
+    let mut entry = entry_for("d1");
+    entry.agent_id = Some("agent_a".into());
+    let record = json!({"terminal_id": "t", "agent_id":"agent_a"});
     assert!(require_decide(entry, AgentFetch::Found(record)).is_ok());
 }
 
 #[test]
-fn w7_require_decide_a_mismatched_terminal_is_not_a_delegate() {
-    let entry = entry_for("d1");
+fn w7_require_decide_a_mismatched_identity_is_not_a_delegate() {
+    let mut entry = entry_for("d1");
+    entry.agent_id = Some("agent_a".into());
     let record = json!({"terminal_id": "someone_else"});
     assert!(matches!(
         require_decide(entry, AgentFetch::Found(record)),
@@ -372,28 +407,41 @@ fn require_decide_another_agent_on_a_new_terminal_is_not_a_delegate() {
 }
 
 #[test]
-fn require_decide_backfills_the_agent_id_on_a_terminal_match() {
+fn require_decide_no_recorded_identity_cannot_backfill_from_a_terminal() {
     let entry = entry_for("d1");
     let record = json!({"terminal_id": "t", "agent_id": "agent_a"});
-    let live = require_decide(entry, AgentFetch::Found(record)).expect("same terminal");
-    assert_eq!(live.agent_id.as_deref(), Some("agent_a"));
+    assert!(matches!(
+        require_decide(entry, AgentFetch::Found(record)),
+        Err(RequireFailure::SessionUnbound(_, _))
+    ));
 }
 
 #[test]
-fn require_decide_a_legacy_worktree_entry_survives_a_restart_in_its_worktree() {
-    // An entry written before agent ids were recorded (the #975 report): the
-    // agent still runs in the delegate's own worktree under its name.
+fn require_decide_a_legacy_worktree_cannot_authorize_recovery() {
     let mut entry = entry_for("d1");
     entry.worktree = Some("/wt/d1".to_string());
-    let record =
-        json!({"terminal_id": "t2", "pane_id": "p2", "agent_id": "agent_a", "cwd": "/wt/d1"});
-    let live = require_decide(entry.clone(), AgentFetch::Found(record)).expect("same worktree");
-    assert_eq!(live.terminal_id, "t2");
-    assert_eq!(live.agent_id.as_deref(), Some("agent_a"));
+    for cwd in ["/wt/d1", "/elsewhere"] {
+        let record = json!({"terminal_id":"t2", "pane_id":"p2", "agent_id":"agent_a", "cwd":cwd,
+            "agent_session":{"source":"flock:codex","agent":"codex","kind":"id","value":"other-session"}});
+        let Err(RequireFailure::SessionUnbound(saved, _)) =
+            require_decide(entry.clone(), AgentFetch::Found(record))
+        else {
+            panic!("a directory is not identity evidence");
+        };
+        assert!(saved.agent_id.is_none());
+        assert!(saved.session.is_none());
+    }
+}
 
-    let elsewhere = json!({"terminal_id": "t2", "agent_id": "agent_a", "cwd": "/elsewhere"});
+#[test]
+fn require_decide_a_terminal_match_cannot_override_a_conflicting_agent_id() {
+    let mut entry = entry_for("d1");
+    entry.agent_id = Some("agent_a".into());
     assert!(matches!(
-        require_decide(entry, AgentFetch::Found(elsewhere)),
+        require_decide(
+            entry,
+            AgentFetch::Found(json!({"terminal_id":"t","agent_id":"agent_b"}))
+        ),
         Err(RequireFailure::NotDelegate)
     ));
 }
@@ -448,9 +496,11 @@ fn recorded_decide_a_renamed_agent_is_still_not_a_delegate() {
 
 #[test]
 fn recorded_decide_a_live_agent_skips_the_terminal_lookup() {
+    let mut entry = entry_for("d1");
+    entry.agent_id = Some("agent_a".into());
     let out = recorded_decide(
-        entry_for("d1"),
-        AgentFetch::Found(json!({"terminal_id": "t"})),
+        entry,
+        AgentFetch::Found(json!({"terminal_id": "t", "agent_id":"agent_a"})),
         || panic!("a name that resolves needs no second lookup"),
     );
     assert!(matches!(out, Ok(Recorded::Live(_))), "{out:?}");
@@ -662,7 +712,7 @@ fn run_lost_brief(mut probe: impl FnMut(u64) -> Probe) -> LostBriefRun {
         settle,
         start,
         deadline,
-        SubmitFailure::Unconfirmed("owned_composer_not_visible".into()),
+        SubmitFailure::Unconfirmed("owned_composer_not_visible".to_string().into()),
         || {
             second += 1;
             probe(second)
@@ -851,4 +901,241 @@ fn keep_on_failure_is_a_start_flag() {
     for verb in [Verb::Send, Verb::Wait, Verb::Reap] {
         assert!(parse_flags(verb, &args(&["d1", "--keep-on-failure"])).is_err());
     }
+}
+
+#[test]
+fn retained_block_directory_sync_failure_is_typed_and_keeps_a_complete_entry() {
+    let dir = crate::test_support::TempDir::socket();
+    let path = dir.path().join("retained.json");
+    let mut entry = entry_for("retained");
+    entry.round = 0;
+    entry.harness = "claude".into();
+    let saved = save_startup_block_at(&entry, &path, |parent| {
+        assert_eq!(parent, dir.path());
+        let published: Entry = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            published, entry,
+            "the rename publishes the complete entry before directory sync"
+        );
+        Err(io::ErrorKind::PermissionDenied.into())
+    });
+    assert_eq!(
+        saved.as_ref().unwrap_err().kind(),
+        io::ErrorKind::PermissionDenied
+    );
+    let dialog = validate_harness(Some("claude"))
+        .unwrap()
+        .startup_dialogs
+        .iter()
+        .find(|dialog| dialog.keep_on_start)
+        .unwrap();
+    with_json_output(|| {
+        let code = emit_startup_block(&entry, dialog, true, saved);
+        assert_eq!(code, crate::api::error_code::ErrorCode::WriteFailed.exit());
+        assert!(
+            crate::cli::output::envelope_pending(),
+            "durability failure has a typed envelope"
+        );
+    });
+    assert_eq!(
+        serde_json::from_slice::<Entry>(&std::fs::read(&path).unwrap()).unwrap(),
+        entry
+    );
+    assert!(!dir.path().join(".retained.json.tmp").exists());
+}
+
+#[test]
+fn retained_block_write_failure_keeps_prior_regular_file_untouched() {
+    let dir = crate::test_support::TempDir::socket();
+    let path = dir.path().join("retained.json");
+    let mut prior = entry_for("retained");
+    prior.round = 7;
+    let prior_bytes = serde_json::to_vec_pretty(&prior).unwrap();
+    std::fs::write(&path, &prior_bytes).unwrap();
+    assert!(path.is_file());
+    // A directory at the temporary path refuses the write deterministically,
+    // including when the test process can bypass filesystem permissions.
+    let temp = dir.path().join(".retained.json.tmp");
+    std::fs::create_dir(&temp).unwrap();
+    let mut entry = prior.clone();
+    entry.round = 0;
+    let saved = save_startup_block_at(&entry, &path, |_| {
+        panic!("failed temporary write must not reach directory sync")
+    });
+    assert!(saved.is_err());
+    let dialog = validate_harness(Some("claude"))
+        .unwrap()
+        .startup_dialogs
+        .iter()
+        .find(|dialog| dialog.keep_on_start)
+        .unwrap();
+    with_json_output(|| {
+        assert_eq!(
+            emit_startup_block(&entry, dialog, true, saved),
+            crate::api::error_code::ErrorCode::WriteFailed.exit()
+        );
+        assert!(crate::cli::output::envelope_pending());
+    });
+    assert!(path.is_file());
+    assert_eq!(std::fs::read(&path).unwrap(), prior_bytes);
+    assert_eq!(
+        serde_json::from_slice::<Entry>(&std::fs::read(&path).unwrap()).unwrap(),
+        prior
+    );
+    assert!(temp.is_dir());
+    assert_eq!(std::fs::read_dir(&temp).unwrap().count(), 0);
+}
+
+#[test]
+fn s4_delegate_write_budget_fits_the_actual_cap_and_preserves_unknown_effect() {
+    let peer = crate::test_support::ScriptedApi::new(vec![
+        (
+            "ping",
+            Some(
+                json!({"result":{"version":"fixture","protocol":crate::protocol::PROTOCOL_VERSION,"capabilities":{"pane_input_write_ack":true}}}),
+            ),
+        ),
+        ("pane.write_input", None),
+    ]);
+    std::env::set_var(crate::api::SOCKET_PATH_ENV_VAR, peer.path());
+    let method = Method::PaneSendInput(crate::api::schema::PaneSendInputParams {
+        write_timeout_ms: None,
+        pane_id: "p_fixture".into(),
+        text: "hello".into(),
+        keys: vec![],
+        raw: false,
+    });
+    assert_eq!(cap_for(&method), Duration::from_secs(10));
+    let result = bounded(method, Some(Instant::now() + Duration::from_millis(2500))).unwrap();
+    std::env::remove_var(crate::api::SOCKET_PATH_ENV_VAR);
+    assert_eq!(result["error"]["code"], "input_write_unknown");
+    let calls = peer.finish();
+    assert!(calls[1]["params"]["write_timeout_ms"].as_u64().unwrap() < 1500);
+}
+
+/// Restore both caller settings on success or unwinding, including absent values.
+struct SubmitTestEnv([(&'static str, Option<std::ffi::OsString>); 2]);
+impl SubmitTestEnv {
+    fn capture() -> Self {
+        Self(["XDG_STATE_HOME", "FLOCK_SOCKET_PATH"].map(|key| (key, std::env::var_os(key))))
+    }
+}
+impl Drop for SubmitTestEnv {
+    fn drop(&mut self) {
+        for (key, previous) in &self.0 {
+            if let Some(value) = previous {
+                std::env::set_var(key, value);
+            } else {
+                std::env::remove_var(key);
+            }
+        }
+    }
+}
+
+/// Run the real submit client and start/send completion handlers against an isolated peer.
+fn r2_unknown_submit_keeps_round(start: bool, failure: Option<&str>, codex: bool) {
+    for &keep_on_failure in if start {
+        &[true, false][..]
+    } else {
+        &[false][..]
+    } {
+        let root = crate::test_support::TempDir::socket();
+        let _environment = SubmitTestEnv::capture();
+        std::env::set_var("XDG_STATE_HOME", root.path());
+        let mut script = vec![
+        ("ping", Some(json!({"result":{"capabilities":{"pane_input_write_ack":true}}}))),
+        ("pane.submit", failure.map(|code| json!({"error":{"code":code,"message":"inspect the pane",
+            "data":{"input_write":{"bytes_written":1,"bytes_total":2,"reason":"write_failed","remainder_discarded":true}}}}))),
+    ];
+        if start {
+            script.push(("pane.read", Some(json!({"result":{"read":{"text":""}}}))));
+        }
+        let peer = crate::test_support::ScriptedApi::new(script);
+        std::env::set_var("FLOCK_SOCKET_PATH", peer.path());
+        let original = entry_for("r2-fixture");
+        let mut entry = original.clone();
+        entry.round = if start { 1 } else { 2 };
+        entry.submitted_at_ms = 42;
+        entry.cursor = "retained-round-cursor".into();
+        write_entry(&entry).unwrap();
+        let code = if start {
+            // Even --keep-on-failure used to overwrite this round with round zero.
+            let flags = StartFlags {
+                keep_on_failure,
+                ..StartFlags::default()
+            };
+            submit_start_brief(
+                &mut entry,
+                "brief",
+                &cleanup_cwd(),
+                &flags,
+                validate_harness(Some(if codex { "codex" } else { "opencode" })).unwrap(),
+            )
+        } else {
+            submit_send_brief(&entry, &original, "brief", false)
+        };
+        assert_eq!(code, Some(crate::cli::exit::FAILURE));
+        let saved = read_entry(&entry.name).expect("workspace record must remain");
+        assert_eq!(
+            saved.round,
+            if start { 1 } else { 2 },
+            "unknown effect keeps the round"
+        );
+        assert_eq!(saved.submitted_at_ms, 42);
+        assert_eq!(saved.cursor, "retained-round-cursor");
+        let calls = peer.finish();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call["method"] == "pane.submit")
+                .count(),
+            1
+        );
+        assert!(!calls.iter().any(|call| matches!(
+            call["method"].as_str(),
+            Some("workspace.close" | "worktree.kill")
+        )));
+    }
+}
+
+#[test]
+fn r2_start_unknown_effect_keeps_workspace_and_round() {
+    r2_unknown_submit_keeps_round(true, None, false);
+}
+#[test]
+fn r2_send_unknown_effect_keeps_workspace_and_round() {
+    r2_unknown_submit_keeps_round(false, None, false);
+}
+#[test]
+fn r2_partial_submit_keeps_start_and_send_rounds() {
+    r2_unknown_submit_keeps_round(true, Some("input_write_failed"), false);
+    r2_unknown_submit_keeps_round(false, Some("input_write_failed"), false);
+}
+#[test]
+fn r2_codex_unknown_effect_is_not_resubmitted() {
+    r2_unknown_submit_keeps_round(true, None, true);
+}
+#[test]
+fn r2_submit_cap_exceeds_the_server_waits_and_reply_margin() {
+    let method = Method::PaneSubmit(crate::api::schema::PaneSubmitParams {
+        pane_id: "p".into(),
+        text: "brief".into(),
+        if_session: None,
+        min_age_secs: 0,
+        self_submit_confirmed: None,
+    });
+    // Three 1s draft steps, three 2s windows, a 120ms gap and seven 50ms polls.
+    let server_waits = crate::app::guarded_submit::SUBMIT_WAIT_BOUND;
+    assert!(cap_for(&method) > server_waits + Duration::from_secs(1));
+}
+
+#[test]
+fn restack_codex_lock_resolution_keeps_its_own_write_cap() {
+    let method = Method::PaneResolveCodexLock(crate::api::schema::PaneResolveCodexLockParams {
+        pane_id: "p".into(),
+        choice: crate::api::schema::CodexLockChoice::Retry,
+        write_timeout_ms: None,
+    });
+    assert_eq!(cap_for(&method), Duration::from_secs(10));
+    assert_ne!(cap_for(&method), crate::api::client::SUBMIT_CAP);
 }

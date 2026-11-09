@@ -324,6 +324,22 @@ impl TerminalRuntime {
         self.0.snapshot_history()
     }
 
+    /// Capture or extend content identity under the parser lock (ADR-0040 §1).
+    pub fn pin_selection(
+        &self,
+        selection: &mut crate::selection::Selection,
+        drag: Option<(u16, u16, Rect)>,
+    ) {
+        self.0.pin_selection(selection, drag);
+    }
+    /// Resolve current endpoint coordinates, refusing discarded content.
+    pub fn resolve_selection(
+        &self,
+        selection: &crate::selection::Selection,
+    ) -> Option<crate::selection::Selection> {
+        self.0.resolve_selection(selection)
+    }
+
     pub fn extract_selection(&self, selection: &crate::selection::Selection) -> Option<String> {
         self.0.extract_selection(selection)
     }

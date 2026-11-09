@@ -1,18 +1,59 @@
 pub(crate) mod types;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use tracing_subscriber::fmt::writer::MakeWriter;
+use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{filter::FilterExt, layer::SubscriberExt, Layer};
 
 const DEFAULT_MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
 // Keep previous generations on rotation: retained=0 DELETED the log at the
 // cap, and the failure being diagnosed usually lived in the tail just dropped.
 const DEFAULT_RETAINED_LOG_FILES: usize = 2;
+
+// Keep failure categories and I/O kinds observable without logging OS error payloads.
+pub(crate) fn system_information_unavailable(operation: &'static str, error: &sysinfo::Error) {
+    let (reason, io_kind) = match error {
+        sysinfo::Error::Unsupported => ("unsupported", None),
+        sysinfo::Error::Io(error) => ("io", Some(error.kind())),
+        sysinfo::Error::Other(_) => ("other", None),
+    };
+    tracing::warn!(
+        event = "system.information.unavailable",
+        operation,
+        reason,
+        io_kind = ?io_kind,
+        "system information unavailable"
+    );
+}
+
+/// Fleet storage failures expose only the typed I/O kind.
+#[cfg(feature = "web")]
+pub(crate) fn structured_fleet_stopped(error: &io::Error) {
+    tracing::error!(event = "structured.fleet.stopped", kind = ?error.kind(), "fleet stream owner stopped");
+}
+
+/// A directory without a UTF-8 identity cannot be a fleet project. No path or
+/// agent contents are logged, and the agent remains available in the stream.
+pub(crate) fn structured_fleet_project_unavailable() {
+    tracing::warn!(
+        event = "structured.fleet.project_unavailable",
+        code = "fleet_project_unavailable",
+        reason = "non_utf8_cwd",
+        "fleet agent project unavailable"
+    );
+}
+
+/// Recovery facts contain only a closed variant and a durable cursor floor.
+#[cfg(feature = "web")]
+pub(crate) fn structured_fleet_recovered(diagnostic: &crate::structured::fleet_lite::Diagnostic) {
+    tracing::warn!(event = "structured.fleet.recovered", diagnostic = ?diagnostic, "fleet snapshot recovered");
+}
 
 /// Surface retained recovery entries without reading session contents.
 pub(crate) fn structured_sweep_outcome(entry: &crate::structured::supervision::SweepEntry) {
@@ -31,10 +72,25 @@ pub(crate) fn structured_worker_shutdown_failed(error: &crate::structured::worke
         tracing::error!(
             event = "structured.worker.shutdown_failed",
             agent_id = agent_id.as_str(),
-            code = code.as_str(),
+            failure_code = code.as_str(),
             "structured worker cleanup failed"
         );
     }
+}
+
+/// Optional structured launch provisioning must never prevent server startup.
+/// Resolution details may contain private paths; report only the typed code and category.
+pub(crate) fn structured_mcp_endpoint_unavailable(reason: crate::api::server::McpEndpointFailure) {
+    let reason = match reason {
+        crate::api::server::McpEndpointFailure::Exe => "exe",
+        crate::api::server::McpEndpointFailure::Socket => "socket",
+    };
+    tracing::warn!(
+        event = "structured.mcp.endpoint_unavailable",
+        reason,
+        code = crate::api::error_code::ErrorCode::StructuredEndpointRestartRequired.as_str(),
+        "structured MCP endpoint unavailable; structured start will refuse"
+    );
 }
 
 /// Report failed structured-session cleanup without reading session contents.
@@ -52,6 +108,140 @@ pub(crate) fn structured_stream_repaired(bytes_dropped: u64) {
     );
 }
 
+/// Classify internal browser-exchange failures without formatting credential-bearing data.
+#[cfg(feature = "web")]
+pub(crate) fn client_exchange_failed(
+    error: Option<&crate::structured::permissions::auth::tokens::TokenError>,
+) {
+    use crate::structured::permissions::auth::tokens::TokenError;
+    let (reason, io_kind) = match error {
+        Some(TokenError::Io(error)) => ("store_io", Some(error.kind())),
+        Some(TokenError::Unsafe) => ("unsafe_store", None),
+        Some(TokenError::Busy) => ("store_busy", None),
+        Some(TokenError::Unauthorized | TokenError::Revoked | TokenError::Scope) => return,
+        None => ("worker_unavailable", None),
+    };
+    tracing::warn!(event = "client.exchange.internal_failure", subsystem = "structured_client", reason, io_kind = ?io_kind, "browser credential exchange unavailable");
+}
+
+/// Once per listener startup, report positive absence rather than hiding a failed probe.
+#[cfg(feature = "web")]
+pub(crate) fn client_tailscale_not_installed(checked_paths: &str) {
+    tracing::info!(
+        event = "client.listener.tailscale_not_installed",
+        subsystem = "structured_client",
+        checked_paths,
+        "Tailscale forwarding check skipped because Tailscale is not installed"
+    );
+}
+
+/// Report secondary listener cleanup errors without replacing the primary server failure.
+#[cfg(feature = "web")]
+pub(crate) fn client_listener_shutdown_failed(error: &std::io::Error) {
+    tracing::warn!(event = "client.listener.shutdown_failed", subsystem = "structured_client", kind = ?error.kind(), errno = ?error.raw_os_error(), "client listener cleanup failed after server failure");
+}
+
+/// App credential revocation failed; transport shutdown still runs to completion.
+#[cfg(feature = "web")]
+pub(crate) fn client_app_revocation_failed(error: &std::io::Error) {
+    tracing::warn!(event = "client.app.revocation_failed", subsystem = "structured_client", kind = ?error.kind(), errno = ?error.raw_os_error(), "app credential revocation failed during shutdown");
+}
+
+/// Report a single capacity refusal without recording tool input or prompts.
+pub(crate) fn structured_permission_request_refused(
+    agent: &str,
+    request_id: &str,
+    request_seq: u64,
+    error_code: &str,
+) {
+    tracing::warn!(
+        event = "structured.permission.refused",
+        agent_id = agent,
+        request_id,
+        request_seq,
+        error_code,
+        "permission request denied at open-request capacity"
+    );
+}
+
+/// Report accept failures with typed classes and errno, never request contents.
+#[cfg(feature = "web")]
+pub(crate) fn client_accept_failed(
+    error: &std::io::Error,
+    class: crate::platform::client_listener::AcceptFailure,
+) {
+    use crate::platform::client_listener::AcceptFailure;
+    let errno = error.raw_os_error();
+    let event = "client.listener.accept";
+    match class {
+        AcceptFailure::Connection => tracing::debug!(event, errno, ?class),
+        AcceptFailure::Resource | AcceptFailure::Unknown => tracing::warn!(event, errno, ?class),
+        AcceptFailure::Fatal => tracing::error!(event, errno, ?class),
+    }
+}
+
+/// Report skipped queue records with fixed reasons and optional cursors, never payloads.
+pub(crate) fn structured_queue_record_skipped(sequence: Option<u64>, reason: &'static str) {
+    tracing::warn!(
+        event = "structured.queue.record_skipped",
+        sequence = ?sequence,
+        reason,
+        "skipped queue record; original journal retained"
+    );
+}
+
+/// Report startup settlement failure without logging input; reopen fences the item.
+pub(crate) fn structured_queue_opening_settlement_failed(code: crate::api::error_code::ErrorCode) {
+    tracing::error!(
+        event = "structured.queue.opening_settlement_failed",
+        failure_code = code.as_str(),
+        "opening item settlement failed; reopen must settle it before delivery"
+    );
+}
+
+/// Report the first corrupt queue record without exposing any input payload.
+pub(crate) fn structured_queue_corrupt(reason: &crate::structured::queue::QueueJournalCorrupt) {
+    tracing::warn!(
+        event = "structured.queue.corrupt",
+        sequence = ?reason.seq,
+        offset = reason.offset,
+        reason = reason.reason,
+        "queue journal is read-only; operator recovery required"
+    );
+}
+
+/// Report a durable corrupt-blob replacement without exposing stored content.
+pub(crate) fn structured_blob_repaired(reference: &crate::structured::blobs::BlobRef) {
+    tracing::warn!(
+        event = "structured.blob.repaired",
+        blob = reference.blob.as_str(),
+        size = reference.size,
+        "repaired corrupt stored blob"
+    );
+}
+
+/// Report degraded repair coordination without logging OS error text or content.
+pub(crate) fn structured_blob_repair_lock_unavailable(
+    reference: &crate::structured::blobs::BlobRef,
+    kind: io::ErrorKind,
+) {
+    tracing::warn!(
+        event = "structured.blob.repair_lock_unavailable",
+        blob = reference.blob.as_str(),
+        error_kind = ?kind,
+        "repair lock unavailable; publishing without coordination"
+    );
+}
+
+/// Report a malformed permission header without disclosing the stored payload.
+pub(crate) fn structured_permission_recovery_skipped(seq: u64) {
+    tracing::warn!(
+        event = "structured.permission.recovery_skipped",
+        seq,
+        "invalid permission recovery header skipped and preserved"
+    );
+}
+
 pub(crate) fn init_file_logging(file_name: &str) {
     let Ok(make_writer) = RotatingFileMakeWriter::new(
         crate::session::data_dir(),
@@ -62,6 +252,14 @@ pub(crate) fn init_file_logging(file_name: &str) {
         return;
     };
 
+    let _ = file_log_subscriber(make_writer).try_init();
+}
+
+/// Build the disk subscriber, shared with real-wire secret regression tests.
+fn file_log_subscriber<W>(make_writer: W) -> impl tracing::Subscriber + Send + Sync
+where
+    W: for<'a> MakeWriter<'a> + Send + Sync + 'static,
+{
     // Default filter covers both the crate's module_path (`flk`, the [[bin]]
     // name from Cargo.toml; see ADR-0003) AND the explicit brand-namespaced
     // `target: "flock::..."` events (e.g. `flock::attach`, `flock::peers`)
@@ -78,17 +276,54 @@ pub(crate) fn init_file_logging(file_name: &str) {
     // Spans are off: nothing #[instrument]s yet, and the default timestamp
     // precision matches the old text layer, preserving merge_log_records'
     // lexicographic-sort contract across mixed-format tails.
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(make_writer)
-        .with_ansi(false)
-        .with_target(true)
-        .json()
-        .flatten_event(true)
-        .with_current_span(false)
-        .with_span_list(false)
-        .event_format(InputJsonFormat::default())
-        .try_init();
+    tracing_subscriber::registry().with(
+        tracing_subscriber::fmt::layer()
+            .with_writer(make_writer)
+            .with_ansi(false)
+            .with_target(true)
+            .json()
+            .flatten_event(true)
+            .with_current_span(false)
+            .with_span_list(false)
+            .event_format(InputJsonFormat::default())
+            .with_filter(credential_safe_filter(filter)),
+    )
+}
+
+/// Apply an immutable credential boundary alongside the user's filter (ADR-0036 §5,
+/// ADR-0038 §6). WebSocket TRACE events dump raw hello/frame payloads. Protocol
+/// DEBUG events also dump peer-controlled close reasons, so that module uses INFO.
+/// An AND filter, rather than overridable EnvFilter directives, enforces the caps
+/// even for more specific module/span directives from FLOCK_LOG or RUST_LOG.
+/// File and web console subscribers share this boundary; flk TRACE is unaffected.
+/// The cap advertises TRACE (its highest permitted level) so AND preserves the
+/// user's lower max-level hint and default INFO callsites retain their fast path.
+pub(crate) fn credential_safe_filter<S>(
+    directives: EnvFilter,
+) -> impl tracing_subscriber::layer::Filter<S>
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    directives.and(
+        tracing_subscriber::filter::filter_fn(|metadata| {
+            let target = metadata.target();
+            let module = |name: &str| {
+                target == name
+                    || target
+                        .strip_prefix(name)
+                        .is_some_and(|tail| tail.starts_with("::"))
+            };
+            let cap = if module("tungstenite::protocol") {
+                tracing::Level::INFO
+            } else if module("tungstenite") || module("tokio_tungstenite") {
+                tracing::Level::DEBUG
+            } else {
+                tracing::Level::TRACE
+            };
+            *metadata.level() <= cap
+        })
+        .with_max_level_hint(tracing_subscriber::filter::LevelFilter::TRACE),
+    )
 }
 
 /// Bridge typed input metadata into stable tracing's scalar-only field API.
@@ -130,14 +365,72 @@ where
             tracing_subscriber::fmt::format::Writer::new(&mut text),
             event,
         )?;
-        let mut record: serde_json::Map<String, serde_json::Value> =
+        let mut record: InputJsonFields =
             serde_json::from_str(&text).map_err(|_| std::fmt::Error)?;
-        let metadata = record.remove("input_metadata").ok_or(std::fmt::Error)?;
-        let fields: serde_json::Map<String, serde_json::Value> =
+        let index = record
+            .0
+            .iter()
+            .position(|(key, _)| key == "input_metadata")
+            .ok_or(std::fmt::Error)?;
+        let metadata = record.0.remove(index).1;
+        let fields: InputJsonFields =
             serde_json::from_str(metadata.as_str().ok_or(std::fmt::Error)?)
                 .map_err(|_| std::fmt::Error)?;
-        record.extend(fields);
-        writeln!(writer, "{}", serde_json::Value::Object(record))
+        record.0.splice(index..index, fields.0);
+        writeln!(
+            writer,
+            "{}",
+            serde_json::to_string(&record).map_err(|_| std::fmt::Error)?
+        )
+    }
+}
+
+/// Preserve the formatter's field order while expanding sealed input metadata.
+/// This avoids changing serde_json's map representation for the whole binary.
+/// Duplicate names reject formatting before a JSON record is written (ADR-0039).
+struct InputJsonFields(Vec<(String, serde_json::Value)>);
+
+impl<'de> serde::Deserialize<'de> for InputJsonFields {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Fields;
+        impl<'de> serde::de::Visitor<'de> for Fields {
+            type Value = InputJsonFields;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("an ordered JSON object")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut fields = Vec::new();
+                let mut names = HashSet::new();
+                while let Some(field) = map.next_entry::<String, serde_json::Value>()? {
+                    if !names.insert(field.0.clone()) {
+                        return Err(serde::de::Error::custom("duplicate input JSON field"));
+                    }
+                    fields.push(field);
+                }
+                Ok(InputJsonFields(fields))
+            }
+        }
+        deserializer.deserialize_map(Fields)
+    }
+}
+
+impl serde::Serialize for InputJsonFields {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut names = HashSet::new();
+        for (key, _) in &self.0 {
+            if !names.insert(key) {
+                return Err(serde::ser::Error::custom("duplicate input JSON field"));
+            }
+        }
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+        for (key, value) in &self.0 {
+            map.serialize_entry(key, value)?;
+        }
+        map.end()
     }
 }
 
@@ -662,7 +955,7 @@ pub(crate) fn self_compact_armed(pane: &str, bytes: usize) {
         subsystem = "agent",
         outcome = "ok",
         pane,
-        bytes,
+        byte_count = bytes,
         "agent armed a self-compaction"
     );
 }
@@ -691,7 +984,7 @@ pub(crate) fn self_compact_continued(pane: &str, bytes: usize) {
         subsystem = "agent",
         outcome = "ok",
         pane,
-        bytes,
+        byte_count = bytes,
         "agent resumed on a compacted context with its own handoff prompt"
     );
 }
@@ -706,7 +999,7 @@ pub(crate) fn self_compact_completed(pane: &str, bytes: usize) {
         subsystem = "agent",
         outcome = "ok",
         pane,
-        bytes,
+        byte_count = bytes,
         "self-compaction finished"
     );
 }
@@ -1739,6 +2032,40 @@ pub(crate) fn client_conn_hello_read_failed(client_id: u64, err: &str) {
     );
 }
 
+/// An observer exceeded its bounded reliable control backlog.
+pub(crate) fn client_conn_control_overflow(client_id: u64) {
+    tracing::warn!(
+        event = "client_conn.control_overflow",
+        subsystem = "client_conn",
+        outcome = "disconnected",
+        client_id,
+        "observer disconnected after exceeding its control backlog limit"
+    );
+}
+
+/// Structured tty-query failures distinguish confirmed loss from retention.
+pub(crate) fn client_geometry_query_failed(
+    stage: &'static str,
+    reason: &'static str,
+    outcome: &'static str,
+    error: &std::io::Error,
+) {
+    tracing::debug!(event = "client.geometry_query_failed", subsystem = "client", stage,
+        reason, outcome,
+        errno = error.raw_os_error(), kind = ?error.kind(), "terminal geometry query failed");
+}
+
+/// A terminal observer exhausted its no-progress write deadline.
+pub(crate) fn client_conn_write_stalled(client_id: u64) {
+    tracing::warn!(
+        event = "client_conn.write_stalled",
+        subsystem = "client_conn",
+        outcome = "disconnected",
+        client_id,
+        "observer disconnected after exhausting its socket write progress deadline"
+    );
+}
+
 pub(crate) fn client_conn_write_failed(err: &str) {
     tracing::debug!(
         event = "client_conn.write",
@@ -2061,7 +2388,7 @@ pub(crate) fn client_clipboard_image_staged(client_id: u64, bytes: usize, path: 
         subsystem = "clipboard",
         outcome = "ok",
         client_id,
-        bytes,
+        byte_count = bytes,
         path,
         "staged client clipboard image"
     );
@@ -2074,7 +2401,7 @@ pub(crate) fn handoff_recorded(file_id: &str, extension: &str, bytes: usize) {
         outcome = "ok",
         file_id,
         extension,
-        bytes,
+        byte_count = bytes,
         "filed a handed-over file as an MCP resource"
     );
 }
@@ -2326,7 +2653,7 @@ pub(crate) fn raw_input_flushing_lone_escape(input_len: usize) {
         subsystem = "raw_input",
         outcome = "lone_escape",
         input_len,
-        "flushing lone escape after input timeout"
+        "flushing lone escape after input timeout; if this follows an alt chord or focus switch it may reach the pane as plain esc"
     );
 }
 
@@ -3035,13 +3362,22 @@ pub(crate) fn session_restore_tab_pruned_empty(tab: &str) {
     );
 }
 
+/// Discard untrusted agent identity text without logging its content.
+pub(crate) fn agent_name_dropped(source: &'static str) {
+    tracing::warn!(
+        code = crate::api::error_code::ErrorCode::InvalidAgentName.as_str(),
+        source,
+        "agent name dropped"
+    );
+}
+
 // --- agent-resume family (logging redesign PR-6) ---------------------------
-// The three deferred agent-resume paths (empty argv, shell spawn failure,
-// send-command failure) all reach tracing with %terminal_id / %plan.agent /
-// %err. TerminalId is Display-shaped; the facade takes a shaped &str so no
-// other module carries the raw Display fmt. Level stays WARN — a failed
-// resume drops the pane back to its non-resumed state, which is surfaced
-// to the user via the terminal.
+// The three deferred launch failures are empty argv, shell spawn failure and
+// command send failure. They retain the plan and set resume_failed, suppressing
+// automatic retries in this server. Agent info reports blocked_reason=resume_failed.
+// An explicit operator retry makes one new attempt. All three paths log WARN
+// through the facade with shaped terminal and agent strings. Only spawn and send
+// failures include an err field.
 
 pub(crate) fn agent_resume_empty_argv(pane: u32, terminal: &str, agent: &str) {
     tracing::warn!(
@@ -4939,12 +5275,12 @@ pub(crate) fn mesh_custody_failed(operation: &'static str, code: &'static str) {
 }
 
 /// Unexpected scope-release failure, with no token, path or bearer contents.
-pub(crate) fn client_token_unlock_failed(error: &std::io::Error) {
-    tracing::warn!(
-        event = "client_token.lock.release_failed",
+pub(crate) fn file_lock_unlock_failed(error: &std::io::Error) {
+    tracing::error!(
+        event = "file_lock.release_failed",
         error = %error,
         errno = error.raw_os_error(),
-        "client-token lock release failed"
+        "file lock release failed"
     );
 }
 
@@ -4957,9 +5293,88 @@ pub(crate) fn client_token_entry_unsafe(entry: &str) {
     );
 }
 
+/// A content anchor no longer resolves, so copying refuses rather than retargets.
+pub(crate) fn selection_content_unavailable(pane_closed: bool) {
+    tracing::debug!(
+        event = "selection.copy_refused",
+        subsystem = "selection",
+        reason = if pane_closed {
+            "pane_closed"
+        } else {
+            "content_unavailable"
+        },
+        "selected content is no longer available"
+    );
+}
+
+/// Close metadata only: no bearer, frame payload or client-provided reason.
+#[cfg(feature = "web")]
+pub(crate) fn client_wire_closing(code: u16, source: &'static str, line: u32) {
+    let source = source.rsplit('/').next().unwrap_or("wire");
+    tracing::debug!(
+        event = "client.wire.closing",
+        close_code = code,
+        source,
+        line,
+        "structured transport closing"
+    );
+}
+/// Internal cause and I/O class, without paths or raw parser errors.
+#[cfg(feature = "web")]
+pub(crate) fn client_wire_unavailable(cause: &'static str, kind: Option<io::ErrorKind>) {
+    tracing::debug!(event = "client.wire.unavailable", cause, kind = ?kind, "structured transport unavailable");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn system_information_failures_log_typed_reasons_without_error_payloads() {
+        let out = capture_logs(|| {
+            system_information_unavailable("cpu", &sysinfo::Error::Unsupported);
+            system_information_unavailable(
+                "disk",
+                &sysinfo::Error::Io(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "private system error payload",
+                )),
+            );
+            system_information_unavailable(
+                "network",
+                &sysinfo::Error::from("private system error payload"),
+            );
+        });
+        for expected in [
+            "system.information.unavailable",
+            "unsupported",
+            "io",
+            "PermissionDenied",
+            "other",
+        ] {
+            assert!(out.contains(expected), "{out}");
+        }
+        assert!(!out.contains("private system error payload"), "{out}");
+    }
+
+    #[cfg(feature = "web")]
+    #[test]
+    fn structured_fleet_diagnostics_exclude_error_payloads() {
+        let out = capture_logs(|| {
+            structured_fleet_stopped(&io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "private fixture error payload",
+            ));
+            structured_fleet_recovered(
+                &crate::structured::fleet_lite::Diagnostic::SnapshotCorrupt { high_water: 9 },
+            );
+        });
+        assert!(out.contains("structured.fleet.stopped"), "{out}");
+        assert!(out.contains("PermissionDenied"), "{out}");
+        assert!(out.contains("structured.fleet.recovered"), "{out}");
+        assert!(out.contains("SnapshotCorrupt"), "{out}");
+        assert!(!out.contains("private fixture error payload"), "{out}");
+    }
 
     #[test]
     fn remote_bridge_started_logs_full_command_shape() {
@@ -5459,6 +5874,17 @@ mod tests {
     }
 
     #[test]
+    fn stalled_observer_log_is_typed_and_connection_scoped() {
+        let log = capture_logs(|| client_conn_write_stalled(42));
+        assert!(log.contains("event=\"client_conn.write_stalled\""), "{log}");
+        assert!(log.contains("outcome=\"disconnected\""), "{log}");
+        assert!(log.contains("client_id=42"), "{log}");
+        assert!(log.contains("WARN"), "{log}");
+        assert!(!log.contains("host="), "{log}");
+        assert!(!log.contains("path="), "{log}");
+    }
+
+    #[test]
     fn client_conn_write_flush_read_split_by_stage() {
         let w = capture_logs(|| client_conn_write_failed("EPIPE"));
         assert!(w.contains("event=\"client_conn.write\""), "{w}");
@@ -5643,7 +6069,7 @@ mod tests {
             staged.contains("path=\"/tmp/flock-clip-7.png\""),
             "{staged}"
         );
-        assert!(staged.contains("bytes=4096"), "{staged}");
+        assert!(staged.contains("byte_count=4096"), "{staged}");
         assert!(staged.contains("INFO"), "{staged}");
 
         let fail = capture_logs(|| client_clipboard_image_stage_failed(7, "ENOSPC"));
@@ -5832,6 +6258,11 @@ mod tests {
                         if let crate::raw_input::RawInputEvent::Key(key) = event {
                             let event = crossterm::event::KeyEvent::new(key.code, key.modifiers);
                             terminal_key_empty_encoding(&event);
+                            terminal_key_intercept_action(&event, "ToggleFloat");
+                            terminal_key_intercept_command(&event, "edit config");
+                            terminal_key_page_intercept(&event.code, 3);
+                            terminal_key_modifier_only_dropped(&event);
+                            terminal_key_forward_ambiguous(&event, "legacy", text.len());
                         }
                     }
                     assert!(framer.flush_timeout().is_empty());
@@ -5845,6 +6276,23 @@ mod tests {
             out.contains("raw_input.parsed"),
             "input path must emit logs"
         );
+        for expected in [
+            "action",
+            "command",
+            "page_scroll",
+            "modifier_only",
+            "ambiguous",
+            "empty",
+        ] {
+            assert!(
+                out.contains(&format!("\"outcome\":\"{expected}\"")),
+                "missing wrapper: {expected}"
+            );
+        }
+        assert_private_input_json(&out, canary);
+    }
+
+    fn assert_private_input_json(out: &str, canary: &str) {
         for line in out.lines() {
             let record: serde_json::Value = serde_json::from_str(line).unwrap();
             for field in [
@@ -5874,6 +6322,166 @@ mod tests {
                 !line.contains("Char("),
                 "character debug escaped into telemetry"
             );
+        }
+    }
+
+    #[test]
+    fn drained_input_canary_never_reaches_logs() {
+        let canary = "DrainSecret1965🦩";
+        let out = capture_input_json(|| {
+            let (tx, mut rx) = tokio::sync::mpsc::channel(canary.len() + 32);
+            let mut buffer = format!("{canary}\x1b[200~{canary}\x1b[201~").into_bytes();
+            crate::raw_input::drain_buffer(&mut buffer, &tx);
+            assert!(buffer.is_empty());
+            for character in canary.chars() {
+                assert!(
+                    matches!(rx.try_recv().unwrap(), crate::raw_input::RawInputEvent::Key(key)
+                    if key.code == crossterm::event::KeyCode::Char(character))
+                );
+            }
+            assert!(
+                matches!(rx.try_recv().unwrap(), crate::raw_input::RawInputEvent::Paste(text) if text == canary)
+            );
+            assert!(rx.try_recv().is_err());
+        });
+        assert!(out.contains("raw_input.parsed"));
+        assert_private_input_json(&out, canary);
+    }
+
+    #[test]
+    fn input_json_keeps_default_envelope_order() {
+        let out = capture_input_json(|| {
+            tracing::info!(event = "format.reference", "reference formatter");
+            let _ = crate::raw_input::parse_raw_input_bytes_sync(b"x");
+        });
+        assert_eq!(out.lines().count(), 2);
+        for line in out.lines() {
+            assert!(line.starts_with("{\"timestamp\":"), "{line}");
+            assert!(
+                line.find("\"level\":").unwrap() < line.find("\"event\":").unwrap(),
+                "{line}"
+            );
+            assert!(
+                line.find("\"message\":").unwrap() < line.find("\"target\":").unwrap(),
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn input_json_fields_reject_duplicate_names_on_read() {
+        assert!(
+            serde_json::from_str::<InputJsonFields>(r#"{"input_len":1,"input_len":2}"#).is_err()
+        );
+    }
+
+    #[test]
+    fn input_json_fields_reject_envelope_metadata_collisions_on_write() {
+        let mut envelope: InputJsonFields = serde_json::from_str(r#"{"input_len":2}"#).unwrap();
+        let metadata: InputJsonFields = serde_json::from_str(r#"{"input_len":1}"#).unwrap();
+        envelope.0.extend(metadata.0);
+        assert!(serde_json::to_string(&envelope).is_err());
+    }
+
+    #[test]
+    fn input_json_format_returns_format_error_on_field_collision() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct ObserveError(Arc<AtomicBool>);
+        impl<S, N> tracing_subscriber::fmt::FormatEvent<S, N> for ObserveError
+        where
+            S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+            N: for<'a> tracing_subscriber::fmt::FormatFields<'a> + 'static,
+        {
+            fn format_event(
+                &self,
+                ctx: &tracing_subscriber::fmt::FmtContext<'_, S, N>,
+                writer: tracing_subscriber::fmt::format::Writer<'_>,
+                event: &tracing::Event<'_>,
+            ) -> std::fmt::Result {
+                let result = tracing_subscriber::fmt::FormatEvent::format_event(
+                    &InputJsonFormat::default(),
+                    ctx,
+                    writer,
+                    event,
+                );
+                self.0.store(result.is_err(), Ordering::Relaxed);
+                result
+            }
+        }
+        let dir = crate::test_support::TempDir::socket();
+        let path = dir.path().join("collision.log");
+        let failed = Arc::new(AtomicBool::new(false));
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(Mutex::new(File::create(&path).unwrap()))
+            // Observe formatter output separately from the subscriber's error diagnostic.
+            .log_internal_errors(false)
+            .event_format(ObserveError(failed.clone()))
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(
+                event = "fixture.collision",
+                input_len = 2,
+                input_metadata = r#"{"input_len":1,"input_class":"unknown"}"#,
+                "duplicate metadata fixture"
+            );
+        });
+        assert!(
+            failed.load(Ordering::Relaxed),
+            "collision must return a format error"
+        );
+        assert!(
+            fs::read(path).unwrap().is_empty(),
+            "no partial JSON record may escape"
+        );
+    }
+
+    #[test]
+    fn non_input_diagnostics_survive_report_redaction() {
+        let out = capture_input_json(|| {
+            structured_worker_shutdown_failed(&crate::structured::workers::ShutdownError(vec![(
+                "worker-example".into(),
+                crate::api::error_code::ErrorCode::SessionBusy,
+            )]));
+            self_compact_armed("pane-example", 11);
+            self_compact_continued("pane-example", 12);
+            self_compact_completed("pane-example", 13);
+            client_clipboard_image_staged(1, 14, "image-example.png");
+            handoff_recorded("file-example", "png", 15);
+            let _ = crate::raw_input::parse_raw_input_bytes_sync(b"s\x1b[A\x1b[15~");
+        });
+        let records = crate::report::redact::extract(
+            &out,
+            "fixture.log",
+            &crate::report::redact::Scrubber::new(None, None),
+        );
+        assert!(out.contains("\"named_key\":\"up\""));
+        assert!(out.contains("\"function_key\":5"));
+        assert_eq!(records.len(), 9);
+        assert!(records[0]
+            .fields
+            .contains(&("failure_code".into(), "session_busy".into())));
+        for (record, count) in records[1..6].iter().zip(11..=15) {
+            assert!(
+                record
+                    .fields
+                    .contains(&("byte_count".into(), count.to_string())),
+                "{record:?}"
+            );
+        }
+        for record in records {
+            for (name, _) in record.fields {
+                assert!(![
+                    "input_len",
+                    "input_class",
+                    "key_class",
+                    "named_key",
+                    "function_key",
+                    "modifiers",
+                    "input_metadata",
+                ]
+                .contains(&name.as_str()));
+            }
         }
     }
 
@@ -5944,6 +6552,12 @@ mod tests {
         assert!(out.contains("outcome=\"lone_escape\""), "{out}");
         assert!(out.contains("input_len=1"), "{out}");
         assert!(out.contains("WARN"), "lone-escape must WARN: {out}");
+        assert!(
+            out.contains(
+                "if this follows an alt chord or focus switch it may reach the pane as plain esc"
+            ),
+            "{out}"
+        );
     }
 
     #[test]
@@ -6945,3 +7559,6 @@ mod tests {
         assert!(out.contains("INFO"), "{out}");
     }
 }
+
+#[cfg(all(test, feature = "web"))]
+mod secret_tests;

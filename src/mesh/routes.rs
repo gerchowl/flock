@@ -121,7 +121,9 @@ pub struct RouteTable {
     cap_warned: bool,
 }
 
+/// Live mesh path to a public-key-derived node identity (ADR-0026).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct Route {
     pub node: String,
     pub name: String,

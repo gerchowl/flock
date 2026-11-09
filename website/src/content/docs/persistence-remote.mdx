@@ -31,6 +31,26 @@ flk server stop
 
 When Flock starts again after a full server stop, it restores the saved session shape. For what survives detach, server restart, screen history replay, native agent session restore, and live handoff, see [Session state and restore](/docs/session-state/).
 
+Control delivery is bounded to 4 MiB of queued encoded frames per observer,
+plus one control frame being written. Each control frame may contain at most
+2 MiB of payload plus its four-byte length prefix; an oversized frame or an
+exceeded byte budget disconnects only that observer and logs
+`client_conn.control_overflow`. Pending `SetWindowTitle`, `MouseCapture`, and
+`ReloadSoundConfig` updates coalesce to their latest values. Notifications and
+clipboard writes retain their order. Overflow discards queued controls, so a
+`ServerShutdown` sent to that observer is lost and the client sees transport
+loss instead. Trickling readers can delay delivery indefinitely but cannot grow
+the queued byte backlog without bound. Render frames have a separate one-frame
+queue.
+
+A terminal observer with pending output is disconnected after 30 seconds without
+any bytes accepted by its socket. Queuing a render is not progress. Each partial
+socket write restarts this limit, so a slow reader that keeps making progress can
+stay attached. Idle observers with no pending output are unaffected. Disconnecting
+an observer frees its connection while its panes and other attached clients keep
+running, and the server logs a `client_conn.write_stalled` event without host or
+path details.
+
 ## Named sessions
 
 Use named sessions when you want independent Flock servers.

@@ -74,6 +74,18 @@ async fn fake_claude_calls(mcp: bool) {
         "requests.json",
         &serde_json::to_vec(&[
             Request {
+                id: "retained-list".into(),
+                method: Method::SessionRetainedList(EmptyParams {}),
+            },
+            Request {
+                id: "retained-purge".into(),
+                method: Method::SessionRetainedPurge(crate::api::retained::PurgeParams {
+                    selection: crate::api::retained::Selection::All,
+                    yes: true,
+                    older_than_ms: None,
+                }),
+            },
+            Request {
                 id: "owner".into(),
                 method: Method::OwnerPolicyAdopt(OwnerPolicyParams {
                     repo: root.display().to_string(),
@@ -141,7 +153,7 @@ async fn fake_claude_calls(mcp: bool) {
     };
     let (ready_tx, ready_rx) = mpsc::channel();
     let (exit_tx, exit_rx) = mpsc::channel();
-    let request_count = if mcp { 2 } else { 3 };
+    let request_count = if mcp { 2 } else { 5 };
     let endpoint = if mcp {
         // The ordinary cargo/nextest all-target build provides the sibling CLI.
         // Derive it from this test artifact, never PATH or an installed binary.
@@ -199,6 +211,7 @@ async fn fake_claude_calls(mcp: bool) {
                 &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
                 None,
                 &std::sync::Mutex::default(),
+                &crate::api::client_listener::Health::default(),
                 &Default::default(),
             )
             .unwrap();
@@ -209,10 +222,8 @@ async fn fake_claude_calls(mcp: bool) {
         .unwrap();
     let mut attributed = true;
     for _ in 0..request_count {
-        let msg = tokio::time::timeout(Duration::from_secs(10), app.api_rx.recv())
-            .await
-            .expect("bounded socket dispatch")
-            .expect("request");
+        // Scoped authentication probes precede effects on each fresh connection.
+        let msg = super::scoped_mcp_tests::next_effect(&mut app).await;
         let root_pid: u32 = std::fs::read_to_string(root.join("model.pid"))
             .unwrap()
             .parse()
@@ -297,9 +308,18 @@ async fn fake_claude_calls(mcp: bool) {
             responses[0]["error"]["code"], "operator_only",
             "{responses}"
         );
-        assert!(responses[1].get("result").is_some(), "{responses}");
-        assert!(responses[2].get("result").is_some(), "{responses}");
+        assert_eq!(
+            responses[1]["error"]["code"], "operator_only",
+            "{responses}"
+        );
+        assert_eq!(
+            responses[2]["error"]["code"], "operator_only",
+            "{responses}"
+        );
+        assert!(responses[3].get("result").is_some(), "{responses}");
+        assert!(responses[4].get("result").is_some(), "{responses}");
     }
+
     assert!(sent.from_pane.is_none());
 }
 

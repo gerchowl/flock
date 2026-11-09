@@ -727,7 +727,7 @@ fn print_msg_help() {
          under a tighter rate limit"
     );
     eprintln!("  flk msg list [--pane TARGET]");
-    eprintln!("  flk msg read [--pane TARGET]   consume an inbox (agents use the MCP tool)");
+    eprintln!("  flk msg read [--pane TARGET]   consume your attested pane or structured inbox");
     eprintln!(
         "  flk msg status <correlation_id>  what became of a message you sent, and its reply"
     );
@@ -749,7 +749,7 @@ fn print_msg_help() {
          deliver it as text"
     );
     eprintln!("  targets: pane id, terminal id, unique agent name; or repo:pane / --repo NAME");
-    eprintln!("  agents read their own inbox (flock_msg_read); flock never types into a session");
+    eprintln!("  agents read their attested inbox with flock_msg_read or flk msg read");
 }
 
 #[cfg(test)]

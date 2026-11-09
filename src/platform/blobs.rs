@@ -1,6 +1,6 @@
 //! Descriptor-relative blob operations keep namespace replacements from redirecting I/O.
 use std::ffi::CString;
-use std::fs::{File, Metadata};
+use std::fs::{File, Metadata, TryLockError};
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -62,6 +62,33 @@ impl Directory {
         }
         Ok(file)
     }
+    /// Try to coordinate a repair across independently opened stores/processes.
+    /// Contention returns WouldBlock; callers may publish without coordination
+    /// on unsupported filesystems. First writes do not need this lock.
+    /// Reopen the pinned directory: duplicated descriptors would share a lock.
+    /// Closing the returned descriptor releases the advisory lock, including on crash.
+    pub(crate) fn try_publication_lock(&self) -> io::Result<File> {
+        let component = c".";
+        // SAFETY: the directory owns its fd and the component is terminated.
+        let fd = unsafe {
+            libc::openat(
+                self.0.as_raw_fd(),
+                component.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: successful openat transfers this new descriptor to File.
+        let file = unsafe { File::from_raw_fd(fd) };
+        validate(&file.metadata()?, true)?;
+        file.try_lock().map_err(|error| match error {
+            TryLockError::WouldBlock => io::Error::from(io::ErrorKind::WouldBlock),
+            TryLockError::Error(error) => error,
+        })?;
+        Ok(file)
+    }
     pub(crate) fn rename(&self, from: &str, to: &str) -> io::Result<()> {
         let (from, to) = (Self::name(from)?, Self::name(to)?);
         // SAFETY: both names are terminated and resolve relative to the owned fd.
@@ -105,14 +132,15 @@ fn validate(meta: &Metadata, directory: bool) -> io::Result<()> {
     Ok(())
 }
 
-/// Recognize filesystem refusals without leaking platform errno into core code.
+/// Recognize unsafe namespace entries without leaking platform errno into core code.
+/// Permission validation refusals carry no OS errno. Actual OS permission errors
+/// remain I/O failures rather than evidence of an unsafe entry.
 pub(crate) fn unsafe_path(error: &io::Error) -> bool {
     matches!(
         error.kind(),
-        io::ErrorKind::PermissionDenied
-            | io::ErrorKind::NotADirectory
-            | io::ErrorKind::InvalidInput
-    ) || error.raw_os_error() == Some(libc::ELOOP)
+        io::ErrorKind::NotADirectory | io::ErrorKind::InvalidInput
+    ) || (error.kind() == io::ErrorKind::PermissionDenied && error.raw_os_error().is_none())
+        || error.raw_os_error() == Some(libc::ELOOP)
 }
 
 #[cfg(test)]
@@ -140,5 +168,42 @@ mod tests {
             .read_to_end(&mut bytes)
             .unwrap();
         assert_eq!(bytes, b"owned elsewhere");
+    }
+    #[test]
+    fn actual_eacces_is_io_instead_of_an_unsafe_path_refusal() {
+        use crate::structured::blobs::BlobError;
+        let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+        let path = root.path().join("non-executable");
+        std::fs::write(&path, b"fixture bytes").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        // No execute bits means exec refuses even for a privileged test process.
+        // No child starts, and no ambient environment is passed to the attempt.
+        let error = crate::process::TracedCommand::new(&path, "blob-fixture")
+            .env_clear()
+            .status_traced()
+            .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EACCES));
+        let classified = BlobError::from(error);
+        assert!(
+            matches!(&classified, BlobError::Io(error) if error.raw_os_error() == Some(libc::EACCES)),
+            "{classified:?}"
+        );
+    }
+    #[test]
+    fn contended_publication_lock_returns_without_waiting() {
+        let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+        let path = root.path().join("blobs");
+        let directory = Directory::open(&path).unwrap();
+        let _held = directory.try_publication_lock().unwrap();
+        let other = Directory::open(&path).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _ = tx.send(other.try_publication_lock());
+        });
+        let result = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("publication lock must be nonblocking");
+        assert!(matches!(result, Err(error) if error.kind() == io::ErrorKind::WouldBlock));
+        worker.join().unwrap();
     }
 }

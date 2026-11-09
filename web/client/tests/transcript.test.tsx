@@ -1,10 +1,12 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { render } from "solid-js/web";
 
+import { permissionLifecycle } from "../src/gen/FixtureExamples";
 import { App } from "../src/App";
 import type { Transport } from "../src/transport";
 import { FIXTURE_STREAM, createFixtureTransport } from "../src/transport/fixture";
 import { Transcript } from "../src/views/Transcript";
+import { createComposerState } from "../src/workbench/Composer";
 import { readFixture, readVariants } from "./fixture-replay";
 
 let dispose: (() => void) | undefined;
@@ -82,6 +84,42 @@ describe("Transcript", () => {
     expect(root.querySelector('[data-testid="unknown-event"]')).toBeNull();
   });
 
+  test("a reset mid-stream ends Current until the stream re-syncs, so only a send after that folds into its echo (#1791, #2234)", () => {
+    let observer: Parameters<Transport["subscribe"]>[2] | undefined;
+    const transport: Transport = { subscribe: (_stream, _after, given) => ((observer = given), { close: () => undefined }) };
+    const composer = createComposerState();
+    const currents: boolean[] = [];
+    const root = mount(() => (
+      <Transcript
+        transport={transport}
+        stream="agent/a"
+        source="live"
+        onEntry={(seq, text) => composer.observe("a", seq, text)}
+        onCurrent={(current) => (currents.push(current), composer.current("a", current))}
+      />
+    ));
+    const said = (seq: number, text: string) => ({ seq, kind: "known", event: { type: "user", message: { role: "user", content: text } } }) as const;
+    observer?.entry(said(1, "earlier"));
+    observer?.synced();
+    const status = (): string | null | undefined => root.querySelector(".transcript__status")?.textContent;
+    expect(status()).toBe("Up to date");
+    observer?.reset?.();
+    expect(currents).toEqual([false, true, false]);
+    expect(status()).toBe("Loading history…");
+    // Sent while the stream replays again: had the reset kept Current, it would record cursor 1 and fold into seq 2.
+    const replaying = { cmdId: "c1", text: "hello", after: composer.cursor("a") };
+    observer?.entry(said(1, "earlier"));
+    observer?.entry(said(2, "hello"));
+    expect([...composer.echoed("a", [replaying])]).toEqual([]);
+    // The re-subscription's barrier starts a new epoch: Current again, and a send now folds into its echo.
+    observer?.synced();
+    expect(currents).toEqual([false, true, false, true]);
+    expect(status()).toBe("Up to date");
+    const resynced = { cmdId: "c2", text: "again", after: composer.cursor("a") };
+    observer?.entry(said(3, "again"));
+    expect([...composer.echoed("a", [replaying, resynced])]).toEqual(["c2"]);
+  });
+
   test("a failed subscription is shown, not swallowed", async () => {
     const root = mount(() => <Transcript transport={createFixtureTransport("")} stream="agent/other" source="replay" />);
     await Promise.resolve();
@@ -103,4 +141,42 @@ describe("App", () => {
     await Promise.resolve();
     expect(root.querySelectorAll('[data-testid="known-event"]').length).toBeGreaterThan(0);
   });
+});
+
+test("permission audit open and closed render as known transcript entries", async () => {
+  const lines = permissionLifecycle.filter((record) => "state" in record).map((record) => JSON.stringify(record)).join("\n");
+  const { transport, synced } = whenSynced(createFixtureTransport(lines));
+  const root = mount(() => <Transcript transport={transport} stream={FIXTURE_STREAM} source="replay" />);
+  await synced;
+  expect(root.querySelectorAll('[data-testid="known-event"]').length).toBe(2);
+  expect(root.querySelectorAll('[data-testid="unknown-event"]').length).toBe(0);
+  expect(root.textContent).toContain("Permission request · Bash");
+  expect(root.textContent).toContain("Permission request closed");
+});
+
+
+test("raw JSON fallback preserves reserved item kinds as well as their queue record wrappers", async () => {
+  const kinds = ["finding", "delegate_result", "reload_notice", { future_queue_kind: { version: 1 } }];
+  const records = kinds.map((kind, index) => ({ seq: index + 1, kind: "upsert", position: index, item: {
+    item_id: `00000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`,
+    producer: { system: "fixture" }, kind, state: "queued", delivery: "at_idle", priority: "normal",
+    body: "<script>queue payload</script>", attachments: [],
+  } }));
+  // There is no queue transport or renderer yet. Exercise the session fallback
+  // with the items themselves too, independently of the upsert discriminator.
+  const raw = records.flatMap((record) => [record, record.item]);
+  const next = { type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "following event still renders" }] } };
+  const { transport, synced } = whenSynced(createFixtureTransport([...raw, next].map((record) => JSON.stringify(record)).join("\n")));
+  const root = mount(() => <Transcript transport={transport} stream={FIXTURE_STREAM} source="replay" />);
+  await synced;
+  const generic = [...root.querySelectorAll('[data-testid="unknown-event"]')];
+  expect(generic).toHaveLength(8);
+  for (const [index, block] of generic.entries()) {
+    const rendered = JSON.parse(block.querySelector("pre")?.textContent ?? "null");
+    expect(rendered).toEqual(raw[index]);
+    expect(index % 2 === 0 ? rendered.item.kind : rendered.kind).toEqual(kinds[Math.floor(index / 2)]);
+    expect((block as HTMLDetailsElement).open).toBe(false);
+  }
+  expect(root.querySelector("script")).toBeNull();
+  expect(root.textContent).toContain("following event still renders");
 });
