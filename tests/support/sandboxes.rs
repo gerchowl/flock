@@ -72,7 +72,8 @@ impl ServerRecord {
                 Some("flk" | "flock")
             )
             || !server_argv(&self.argv)
-            || self.argv.first().map(Path::new) != Some(self.binary.as_path())
+            || (self.argv.first().map(Path::new) != Some(self.binary.as_path())
+                && captured_binary(&base).ok().as_ref() != Some(&self.binary))
         {
             return Some(false);
         }
@@ -101,26 +102,57 @@ pub fn server_argv(argv: &[String]) -> bool {
     matches!(argv, [_, mode] if mode == "server")
 }
 
-/// Record a direct child only in a sandbox owned by this test process.
-pub fn record_spawn(pid: u32, config: &Path, runtime: &Path) {
-    record_invocation(
-        pid,
-        config,
-        runtime,
-        vec![env!("CARGO_BIN_EXE_flk").into(), "server".into()],
-    );
+// Relative argv is a launch spelling, not executable identity. Its separate
+// before-spawn fact must still match; live argv and birth are checked too.
+fn captured_binary(base: &Path) -> io::Result<PathBuf> {
+    File::open(base.join(".launch-binary.json"))
+        .and_then(|file| serde_json::from_reader(file).map_err(io::Error::other))
 }
 
-fn record_invocation(pid: u32, config: &Path, runtime: &Path, argv: Vec<String>) {
+/// Capture the canonical executable before spawn and return the path to execute.
+/// This launch fact is not signal authority; a complete server record is still required.
+pub fn prepare_launch(binary: &Path, runtime: &Path) -> io::Result<PathBuf> {
+    let base = runtime
+        .parent()
+        .filter(|base| owner(base) == Some(std::process::id()))
+        .ok_or_else(|| io::Error::other("launch requires an owned sandbox"))?;
+    let binary = binary.canonicalize()?;
+    let pending = base.join(".launch-binary.pending");
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&pending)?;
+    file.write_all(&serde_json::to_vec(&binary)?)?;
+    file.sync_all()?;
+    fs::rename(pending, base.join(".launch-binary.json"))?;
+    File::open(base)?.sync_all()?;
+    Ok(binary)
+}
+
+/// Record a direct child only in a sandbox owned by this test process.
+pub fn record_spawn(pid: u32, config: &Path, runtime: &Path) {
+    record_invocation(pid, config, runtime, None);
+}
+
+fn record_invocation(pid: u32, config: &Path, runtime: &Path, argv: Option<Vec<String>>) {
     let Some(base) = runtime
         .parent()
         .filter(|base| owner(base) == Some(std::process::id()))
     else {
         return;
     };
+    let binary: PathBuf = match captured_binary(base) {
+        Ok(binary) => binary,
+        Err(error) => {
+            eprintln!("sandbox server {pid} retained: no proven launch binary: {error}");
+            return;
+        }
+    };
+    let argv = argv.unwrap_or_else(|| vec![binary.to_string_lossy().into_owned(), "server".into()]);
     let record = ServerRecord {
         pid,
-        binary: PathBuf::from(&argv[0]),
+        binary,
         home: config.join("home"),
         state: config.join("state"),
         start_time: process_lifetime::birth(pid),
@@ -162,7 +194,7 @@ pub fn record_runtime_candidates(
             continue;
         };
         if server_argv(&info.argv) && !base.join(format!(".server-{pid}.json")).exists() {
-            record_invocation(pid, config, runtime, info.argv);
+            record_invocation(pid, config, runtime, Some(info.argv));
         }
     }
 }
