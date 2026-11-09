@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+## [3.5.0] - 2026-11-09
+
+### Maintenance
+- Match fixture servers against Cargo's actual binary under test in every build profile, pass the compiled namespace explicitly to the Claude question probe, and mark fake SSH relay tests as debug-only because their ancestry override is deliberately unavailable in release products.
+- Verify structured runtime shutdown wiring when its acceptance observer disconnects, including empty child stdin after refused admission.
+- Strengthen event-subscription recovery and reply-wait regression coverage, isolate capability-test sockets with owned temporary directories, and clarify current-state predicate cursor semantics.
+
+### Added
+- Add operator-only retained structured-record list/purge commands and doctor counts with cleanup hints; require explicit confirmation before purging rollback-compatible records.
+
+### Fixed
+- Refuse retained-record list, purge, and doctor requests from mesh relays, including enrolled peers; maintenance requires the local operator.
+- Retry a contended structured blob repair lock after its final backoff sleep, preserving the full 20 ms acquisition window.
+- Bound observer control backlogs by queued bytes, coalesce superseded title, mouse-capture and config updates, and disconnect only overloaded observers.
+- Follow recorded delegate identity across terminal changes in wait and result, preserve immutable launch session evidence, and return `session_unbound` (exit 12) when recovery is unsafe.
+- Recover a delegate’s recorded session before sending, guard the target session, and confirm native turn starts from an exact newly appended prompt without relying on cursor or composer evidence.
+- Suppress redundant relayed server claims while a verified direct reading is healthy; retain claims so direct-link failures immediately restore relay visibility and preserve link diagnostics.
+- Refuse delegate recovery when a Claude session store cannot be read, identify the failing store, and require proven absence before ignoring a project during uniqueness checks.
+- Authorize recovery against a delegate’s own server-side native session record, require exact session-store evidence unique across searched stores, and guard recovery with protocol 33.
+- Validate all Claude and Codex session identities consistently, refuse conflicting or malformed transcripts, and detect distinct duplicate files through symlinks while accepting aliases to one file.
+- Restart delegate wait settling after session recovery during reply grace, preserve the recorded round and submission time, and keep cursor counters local to their terminal.
+- Restart delegate settling when the terminal changes during a result read, including cached replies from an unknown replacement.
+- Reuse the identity check after each delegate result read for the turn check, preserving event-driven wait request budgets.
+- Confirm delegate submissions only from transcript evidence after the first Enter, reject evidence of an earlier turn, and report session changes before typing as `session_unbound` (exit 12) without advancing the recorded round.
+- Stop delegate submission if another turn or prompt arrives before Enter, and prevent completed or unrelated turns from falsely confirming a later prompt echo.
+
+### Security
+- Mesh relays running as the operator UID no longer receive local-operator authority for stop, reload, handoff and fork admission.
+
 ## [3.4.0] - 2026-11-08
 
 ### Fixed
