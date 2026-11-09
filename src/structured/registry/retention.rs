@@ -127,6 +127,46 @@ impl Registry {
         }
     }
 
+    /// Unknown registry collection formats require the documented offline repair path.
+    pub fn check_retained_collection(&self) -> Result<(), RegistryError> {
+        if self.unparsed.is_some() {
+            return Err(RegistryError::UnsupportedCollectionShape);
+        }
+        Ok(())
+    }
+
+    /// Explicit operator selection; missing timestamps never satisfy an age filter.
+    /// This changes only inactive records, preserving active workers and observations.
+    /// Reclassify remaining copies so removing an earlier duplicate cannot orphan DEAD data.
+    pub fn purge_retained(&mut self, all: bool, older_than_ms: Option<u64>, now_ms: u64) -> usize {
+        let before = self.retained.len();
+        self.retained.retain(|slot, entry| {
+            let selected = (all || entry.kind == RetainedKind::Dead)
+                && older_than_ms.is_none_or(|age| {
+                    entry
+                        .first_seen_ms
+                        .is_some_and(|first| now_ms.saturating_sub(first) > age)
+                });
+            if selected {
+                self.preserved[*slot] = None;
+            }
+            !selected
+        });
+        let mut seen = BTreeSet::new();
+        for (slot, raw) in self.preserved.iter().enumerate() {
+            let Some(raw) = raw else { continue };
+            let duplicate = !seen.insert(digest(raw));
+            if let Some(entry) = self.retained.get_mut(&slot) {
+                entry.kind = if !raw.is_object() || duplicate {
+                    RetainedKind::Dead
+                } else {
+                    RetainedKind::Forward
+                };
+            }
+        }
+        before - self.retained.len()
+    }
+
     /// Stamp at the injected wall-clock time; prune only at an actual save boundary.
     /// Capture/undo callers pass `false` so no record disappears from a snapshot.
     /// FORWARD records are never auto-pruned. Equal-age DEAD ties use original order.

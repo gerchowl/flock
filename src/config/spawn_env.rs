@@ -49,6 +49,7 @@
 //! [`crate::spawn::env`] states: keys whose absence silently changes WHICH
 //! ACCOUNT the child runs as, not everything the child might like.
 
+use super::validation::{message, Cause};
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
@@ -160,29 +161,30 @@ impl SpawnEnvConfig {
         // way on every node rather than by hash order.
         let mut claimed: BTreeMap<String, String> = BTreeMap::new();
 
-        for (spelling, keys) in declared {
+        for (index, (spelling, keys)) in declared.into_iter().enumerate() {
             let Some(agent) = crate::detect::identify_agent(&spelling) else {
-                diagnostics.push(format!(
-                    "[spawn.env] {spelling:?} is not an agent flock detects; entry ignored"
-                ));
+                diagnostics.push(message(Cause::UnknownAgent, "spawn.env", Some(index)));
                 continue;
             };
             let label = crate::detect::agent_label(agent).to_string();
-            if let Some(first) = claimed.get(&label) {
-                diagnostics.push(format!(
-                    "[spawn.env] {spelling:?} and {first:?} both name the {label} agent; \
-                     {spelling:?} ignored"
-                ));
+            if claimed.contains_key(&label) {
+                diagnostics.push(message(Cause::AgentAlias, "spawn.env", Some(index)));
                 continue;
             }
 
             let mut accepted: Vec<String> = Vec::with_capacity(keys.len());
-            for key in keys {
+            for (key_index, key) in keys.into_iter().enumerate() {
                 let trimmed = key.trim();
                 if let Some(reason) = key_rejection(trimmed) {
-                    diagnostics.push(format!(
-                        "[spawn.env] {label} key {key:?} {reason}; key ignored"
-                    ));
+                    diagnostics.push(
+                        super::safe_diagnostic::Diagnostic::validation(
+                            reason,
+                            "spawn.env",
+                            Some(index),
+                        )
+                        .with_item_index(key_index)
+                        .to_string(),
+                    );
                     continue;
                 }
                 if !accepted.iter().any(|seen| seen == trimmed) {
@@ -205,18 +207,18 @@ impl SpawnEnvConfig {
 /// convenient and is how a credential ends up allowed by a rule written for a
 /// config variable that happened to share a stem — so a wildcard is refused
 /// out loud rather than quietly matched as a literal name that never exists.
-fn key_rejection(key: &str) -> Option<&'static str> {
+fn key_rejection(key: &str) -> Option<Cause> {
     if key.is_empty() {
-        return Some("is empty");
+        return Some(Cause::EmptyEnv);
     }
     if key.contains('=') {
-        return Some("contains '=', which is not part of a variable name");
+        return Some(Cause::EqualsEnv);
     }
     if key.contains('*') {
-        return Some("looks like a wildcard, and only exact names are matched");
+        return Some(Cause::WildcardEnv);
     }
     if key.contains(char::is_whitespace) {
-        return Some("contains whitespace, which no shell can export");
+        return Some(Cause::WhitespaceEnv);
     }
     None
 }
@@ -293,7 +295,10 @@ mod tests {
         let mut config = declared(&[("not-an-agent", &["X"]), ("codex", &["CODEX_HOME"])]);
         let diagnostics = config.normalize();
         assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
-        assert!(diagnostics[0].contains("not-an-agent"), "{diagnostics:?}");
+        assert!(
+            diagnostics[0].contains("unknown agent") && diagnostics[0].contains("entry_index=1"),
+            "{diagnostics:?}"
+        );
         assert_eq!(config.keys_for(Some(Agent::Codex)), ["CODEX_HOME"]);
     }
 
@@ -304,7 +309,11 @@ mod tests {
         let mut config = declared(&[("claude", &["FIRST"]), ("claude-code", &["SECOND"])]);
         let diagnostics = config.normalize();
         assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
-        assert!(diagnostics[0].contains("claude-code"), "{diagnostics:?}");
+        assert!(
+            diagnostics[0].contains("duplicate agent alias")
+                && diagnostics[0].contains("entry_index=1"),
+            "{diagnostics:?}"
+        );
         assert_eq!(
             config.keys_for(Some(Agent::Claude)),
             ["FIRST"],

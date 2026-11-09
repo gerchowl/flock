@@ -15,8 +15,8 @@
 //! Contract carried over verbatim from the shims: a hook must NEVER block or
 //! fail the parent agent. Every socket error is swallowed; a malformed payload
 //! degrades to a no-op. The only stdout this ever writes is Claude's
-//! `decision:block` nudge on Stop, and an architect's delegate table after a
-//! compaction or resume (#962).
+//! `decision:block` nudge or nonblocking authority notice on Stop, and an
+//! architect's delegate table after a compaction or resume (#962).
 //!
 //! Testability: each action plans a [`HookOutcome`] (the `pane.report_*`
 //! methods to send + any stdout) as a pure function of the parsed input. The
@@ -240,11 +240,10 @@ pub(super) fn run_hook_command(args: &[String]) -> std::io::Result<i32> {
     // The count comes from `msg.wake`, not `msg.list`: the server decides
     // whether a wake may fire at all (a paused fleet, a muted recipient) and
     // answers with a number rather than message previews (#316).
-    let pending_messages = if matches!(action, Action::Stop) {
-        wake_message_count(&pane_id)
-    } else {
-        0
-    };
+    let wake = matches!(action, Action::Stop)
+        .then(|| wake_messages(&pane_id))
+        .flatten();
+    let pending_messages = wake.as_ref().map_or(0, wake_count_from_response);
     // #415: an older harness hands the hook no `last_assistant_message`, so
     // `plan_stop` has only the transcript — and the turn's final reply may not
     // have landed there yet. Give it a bounded window here, at the IO edge,
@@ -280,6 +279,10 @@ pub(super) fn run_hook_command(args: &[String]) -> std::io::Result<i32> {
         if let Some(table) = own_delegate_table() {
             outcome.stdout = Some(table_stdout(shape, &table));
         }
+    }
+    if let Some(wake) = wake {
+        let marker = inbox_refusal_marker(&pane_id, &input);
+        apply_wake_authority(&mut outcome, &wake, &marker);
     }
     emit(outcome);
     Ok(0)
@@ -589,6 +592,7 @@ fn plan_session(
     HookOutcome {
         reports: vec![Method::PaneReportAgentSession(
             PaneReportAgentSessionParams {
+                rebind_agent_id: None,
                 pane_id: pane_id.to_string(),
                 source: agent.source().to_string(),
                 agent: agent.agent().to_string(),
@@ -735,9 +739,9 @@ fn mail_nudge(pending_messages: usize, want_recap: bool, pane_id: &str) -> Optio
 /// decision belongs to the server, where the fleet pause and the recipient's
 /// own mute are known.
 ///
-/// Any failure counts as zero. A hook must never block or fail the parent
-/// agent, so an unreachable or older server means no nudge.
-fn wake_message_count(pane_id: &str) -> usize {
+/// Failures contribute no mail count. Authority refusals also suppress the
+/// recap nudge and produce one nonblocking notice; transport failures remain quiet.
+fn wake_messages(pane_id: &str) -> Option<serde_json::Value> {
     let request = Request {
         id: format!("flock:hook:{}", seq()),
         method: Method::MsgWake(crate::api::schema::MsgWakeParams {
@@ -747,10 +751,55 @@ fn wake_message_count(pane_id: &str) -> usize {
     ApiClient::local()
         .request_value_with_timeout(&request, HOOK_TIMEOUT)
         .ok()
-        .map_or(0, |value| wake_count_from_response(&value))
 }
 
-/// Pure half of [`wake_message_count`]: read the count out of a `msg.wake`
+/// Keep the once-only notice separate for each server, pane and harness session.
+fn inbox_refusal_marker(pane_id: &str, input: &serde_json::Value) -> std::path::PathBuf {
+    use sha2::{Digest, Sha256};
+    let key = serde_json::json!([
+        env_nonempty("FLOCK_SOCKET_PATH"),
+        pane_id,
+        str_field(input, "session_id")
+    ]);
+    let digest = Sha256::digest(key.to_string().as_bytes());
+    let name: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    crate::session::data_dir()
+        .join("hook-inbox-refusals")
+        .join(name)
+}
+
+/// An unreadable inbox must suppress both mail demands and recap continuations.
+fn apply_wake_authority(
+    outcome: &mut HookOutcome,
+    wake: &serde_json::Value,
+    marker: &std::path::Path,
+) {
+    if matches!(
+        wake.pointer("/error/code")
+            .and_then(serde_json::Value::as_str),
+        Some("not_authorized" | "inbox_not_owner")
+    ) {
+        outcome.stdout = None;
+        let first = marker.parent().is_some_and(|parent| {
+            std::fs::create_dir_all(parent).is_ok()
+                && std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(marker)
+                    .is_ok()
+        });
+        if first {
+            outcome.stdout = Some(serde_json::json!({
+                "systemMessage": "Inbox authority unavailable for this process. Ask the operator to read this pane's inbox from their own interactive shell with `flk msg read --pane <pane-id>`. This does not restore agent authority; see #3000."
+            }).to_string());
+        }
+    } else if wake.get("result").is_some() {
+        // Successful authority checks end the refusal episode.
+        let _ = std::fs::remove_file(marker);
+    }
+}
+
+/// Pure half of [`wake_messages`]: read the count out of a `msg.wake`
 /// response.
 ///
 /// Split out so a test can pin it against a response built from the server's
@@ -978,6 +1027,68 @@ fn cap(text: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn stop_hook_authority_refusal_reports_once_without_blocking_and_resets_after_recovery() {
+        let root =
+            crate::structured::launch::SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+        let marker = root.path().join("notices").join("session");
+        for code in ["not_authorized", "inbox_not_owner"] {
+            let refused = json!({"error": {"code": code}});
+            let mut outcome = HookOutcome {
+                stdout: mail_nudge(3, true, "p_1"),
+                ..Default::default()
+            };
+            apply_wake_authority(&mut outcome, &refused, &marker);
+            let notice: serde_json::Value =
+                serde_json::from_str(outcome.stdout.as_ref().unwrap()).unwrap();
+            assert!(notice.get("decision").is_none(), "{notice}");
+            assert!(notice["systemMessage"]
+                .as_str()
+                .unwrap()
+                .contains("operator"));
+            assert!(notice["systemMessage"]
+                .as_str()
+                .unwrap()
+                .contains("flk msg read"));
+            assert!(notice["systemMessage"].as_str().unwrap().contains("#3000"));
+            for count in [0, 3] {
+                outcome.stdout = mail_nudge(count, true, "p_1");
+                apply_wake_authority(&mut outcome, &refused, &marker);
+                assert!(
+                    outcome.stdout.is_none(),
+                    "neither unread mail nor recap may loop"
+                );
+            }
+            let readable = json!({"result": {"count": 3, "type": "msg_wake"}});
+            outcome.stdout = mail_nudge(wake_count_from_response(&readable), false, "p_1");
+            let original = outcome.stdout.clone();
+            apply_wake_authority(&mut outcome, &readable, &marker);
+            assert_eq!(
+                outcome.stdout, original,
+                "authorized mail still blocks for a read"
+            );
+            assert!(!marker.exists());
+        }
+    }
+
+    #[test]
+    fn stop_hook_authority_refusal_cannot_block_when_notice_storage_fails() {
+        let root =
+            crate::structured::launch::SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+        let parent = root.path().join("file");
+        std::fs::write(&parent, "fixture").unwrap();
+        let mut outcome = HookOutcome {
+            stdout: mail_nudge(2, true, "p_1"),
+            ..Default::default()
+        };
+        apply_wake_authority(
+            &mut outcome,
+            &json!({"error": {"code": "not_authorized"}}),
+            &parent.join("notice"),
+        );
+        assert!(outcome.stdout.is_none());
+    }
 
     /// ADR-0018 §1, from where the value starts to where it is observed: a
     /// `msg.send` as a client puts it on the socket, the `msg.wake` the stop

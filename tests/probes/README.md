@@ -144,4 +144,13 @@ takes under 500 ms, and a `route`-hinted delegate is refused with the fallback
 sentence. The hook entry is the one `flk integration install claude` writes
 into a sandbox `CLAUDE_CONFIG_DIR`, passed to Claude with `--settings`, so the
 operator's profile is never written. Run it once per build, `--flk` naming a
-build with the change and then one without, for the A/B.
+build with the change and then one without, for the A/B. Pass `--app-dir` explicitly:
+`flock-dev` when the binary has debug assertions, `flock` otherwise. Rust callers
+use `support::paths::app_dir_name()`; neither a renamed binary nor a custom target
+directory is evidence of its compiled namespace.
+
+`worktree-checkout-unreachable.py --flk <binary>` drives a real isolated server
+and PTY client against an owned checkout with its gitfile removed. It confirms
+the kill dialog displays the full remount/no-prune recovery, then checks the
+same typed API refusal and preserved checkout. It clears inherited environment,
+uses short socket paths and bounds every producer wait without sleeps.

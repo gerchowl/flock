@@ -12,7 +12,7 @@
  *
  * @module
  */
-import fixtureJsonl from "../../../tests/fixtures/claude-session/events.jsonl?raw";
+import fixtureJsonl from "../../../tests/fixtures/claude-session/events.jsonl";
 
 import { SHELL_CONFIG_GLOBAL, type FixtureShellConfig } from "./config";
 

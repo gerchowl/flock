@@ -68,6 +68,7 @@ impl Drop for HeldWait<'_> {
         // reader could act on.
         let (respond_to, _) = std::sync::mpsc::channel();
         let _ = self.api_tx.send(ApiRequestMessage {
+            scope: None,
             request: Request {
                 id: "events.read:release".into(),
                 method: Method::WaitRelease(wait_id),

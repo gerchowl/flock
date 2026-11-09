@@ -6,6 +6,8 @@ use serde_json::{json, Value};
 use std::time::Duration;
 use support::fleet::{self, Node, NodeSpec};
 
+// Used only by debug-only fake SSH relay tests (#1715).
+#[cfg(debug_assertions)]
 const PAIR: &[NodeSpec] = &[
     NodeSpec::new("nodea", "mesh-origin", &["nodeb"]),
     NodeSpec::new("nodeb", "mesh-recipient", &[]),
@@ -34,17 +36,22 @@ fn agent(node: &Node) -> Value {
     started["result"]["agent"].clone()
 }
 
-fn discover(fleet: &fleet::Fleet, recipient: &Value) {
-    let location = fleet::wait_until("recipient discovery", Duration::from_secs(90), || {
+// Used only by debug-only fake SSH relay tests (#1715).
+#[cfg(debug_assertions)]
+fn discover(fleet: &fleet::Fleet, recipient_node: &str, recipient: &Value) {
+    fleet::wait_until("recipient discovery", Duration::from_secs(90), || {
         request(fleet.node("nodea"), "agent.list", json!({}))["result"]["fleet"]
             .as_array()?
             .iter()
             .find(|row| row["agent_id"] == recipient["agent_id"])
             .cloned()
     });
-    fleet.wait_route("nodea", location["host"].as_str().unwrap(), true);
+    // Directory host text is presentation; routing uses the fixture owner identity.
+    fleet.wait_route("nodea", recipient_node, true);
 }
 
+// Used only by debug-only fake SSH relay tests (#1715).
+#[cfg(debug_assertions)]
 fn send(fleet: &fleet::Fleet, recipient: &Value, correlation: &str) -> Value {
     request(
         fleet.node("nodea"),
@@ -57,6 +64,8 @@ fn send(fleet: &fleet::Fleet, recipient: &Value, correlation: &str) -> Value {
     )
 }
 
+// Used only by debug-only fake SSH relay tests (#1715).
+#[cfg(debug_assertions)]
 fn read(node: &Node, pane: &Value) -> Value {
     request(node, "msg.read", json!({"pane":pane}))["result"]["messages"].clone()
 }
@@ -81,6 +90,8 @@ fn reply(node: &Node, correlation: &str, body: &str) -> Value {
     )
 }
 
+// Used only by debug-only fake SSH relay tests (#1715).
+#[cfg(debug_assertions)]
 fn ready(node: &Node) {
     // Move only this sandbox's scheduler deadline, not production backoff or timeouts.
     database(node)
@@ -88,6 +99,8 @@ fn ready(node: &Node) {
         .unwrap();
 }
 
+// Used only by debug-only fake SSH relay tests (#1715).
+#[cfg(debug_assertions)]
 fn answers(node: &Node, pane: &Value) -> Value {
     fleet::wait_until("collected answer", Duration::from_secs(30), || {
         let messages = read(node, pane);
@@ -97,19 +110,25 @@ fn answers(node: &Node, pane: &Value) -> Value {
 
 /// Keep the held answer on the collect lane. The outbound poll offers it too,
 /// and when that poll wins it bypasses the collect-lane fault under test.
+// Used only by debug-only fake SSH relay tests (#1715).
+#[cfg(debug_assertions)]
 fn withhold_outbound_answers(fleet: &fleet::Fleet) {
     std::fs::write(fleet.base.join("withhold-outbound-answers-nodea-nodeb"), "").unwrap();
 }
 
+// Used only by debug-only fake SSH relay tests (#1715).
+#[cfg(debug_assertions)]
 fn question(fleet: &fleet::Fleet, correlation: &str) -> (Value, Value) {
     let sender = agent(fleet.node("nodea"));
     let recipient = agent(fleet.node("nodeb"));
-    discover(fleet, &recipient);
+    discover(fleet, "nodeb", &recipient);
     let sent = send(fleet, &recipient, correlation);
     assert_eq!(sent["result"]["state"], "delivered", "{sent}");
     (sender, recipient)
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn incident_direct_reply_is_held_and_collected_without_a_waiter() {
     let fleet = fleet::spawn("mesh-collect", PAIR);
@@ -132,6 +151,8 @@ fn incident_direct_reply_is_held_and_collected_without_a_waiter() {
     assert_eq!(messages[0]["from_host"], "nodeb");
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn offline_origin_and_receiver_restart_preserve_held_answer() {
     let mut fleet = fleet::spawn("mesh-collect-restart", PAIR);
@@ -151,6 +172,8 @@ fn offline_origin_and_receiver_restart_preserve_held_answer() {
     assert_eq!(messages.as_array().unwrap().len(), 1);
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn lost_ack_recollects_the_same_key_and_imports_it_only_once() {
     let mut fleet = fleet::spawn("mesh-collect-ack", PAIR);
@@ -220,6 +243,8 @@ fn lost_ack_recollects_the_same_key_and_imports_it_only_once() {
     );
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn real_answer_after_a_deferral_is_collected_independently() {
     let fleet = fleet::spawn("mesh-collect-defer", PAIR);
@@ -243,6 +268,8 @@ fn real_answer_after_a_deferral_is_collected_independently() {
     assert_eq!(messages[0]["body"], "finished");
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn pause_freezes_collection_and_custody_clock_across_restart() {
     let mut fleet = fleet::spawn("mesh-collect-pause", PAIR);
@@ -288,6 +315,8 @@ fn pause_freezes_collection_and_custody_clock_across_restart() {
     );
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn another_enrolled_node_cannot_collect_even_with_the_origins_token() {
     let mut fleet = fleet::spawn_with_startup_probe(
@@ -423,6 +452,8 @@ fn local_held_answer_and_deferral_use_custody_and_keep_existing_wait_semantics()
     );
 }
 
+// Used only by debug-only fake SSH relay tests (#1715).
+#[cfg(debug_assertions)]
 fn enrolled(node: &Node, peer: &str) {
     fleet::wait_until("outbound edge enrolled", Duration::from_secs(30), || {
         request(node, "peers.enrollment", json!({}))["result"]["peers"]
@@ -437,6 +468,8 @@ fn enrolled(node: &Node, peer: &str) {
     });
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn bidirectional_answers_push_immediately_without_waiting_for_collection() {
     let fleet = fleet::spawn(
@@ -473,6 +506,8 @@ fn bidirectional_answers_push_immediately_without_waiting_for_collection() {
     });
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn one_way_answer_arrives_on_the_first_fast_poll_without_a_waiter() {
     let fleet = fleet::spawn("mesh-fast-collect", PAIR);
@@ -490,6 +525,8 @@ fn one_way_answer_arrives_on_the_first_fast_poll_without_a_waiter() {
     assert_eq!(received[0]["body"], "five seconds");
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn a_nonresponding_collection_peer_cannot_starve_a_user_send_to_another_peer() {
     let fleet = fleet::spawn(
@@ -502,7 +539,7 @@ fn a_nonresponding_collection_peer_cannot_starve_a_user_send_to_another_peer() {
     );
     question(&fleet, "blocked-collection");
     let target = agent(fleet.node("nodec"));
-    discover(&fleet, &target);
+    discover(&fleet, "nodec", &target);
     let hold = fleet.base.join("hold-collect-nodea-nodeb");
     std::fs::create_dir(&hold).unwrap();
     ready(fleet.node("nodea"));
@@ -521,6 +558,8 @@ fn a_nonresponding_collection_peer_cannot_starve_a_user_send_to_another_peer() {
     std::fs::write(hold.join("release"), "").unwrap();
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn collected_answer_signature_covers_the_binding_and_failure_is_visible() {
     let fleet = fleet::spawn("mesh-collect-failed", PAIR);
@@ -584,6 +623,8 @@ fn local_reply_survives_a_mesh_writer_failure() {
     );
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn collection_policy_uses_the_stored_origin_name_not_the_current_ssh_alias() {
     let fleet = fleet::spawn("mesh-collect-alias",&[
@@ -618,6 +659,8 @@ fn collection_policy_uses_the_stored_origin_name_not_the_current_ssh_alias() {
     assert_eq!(received[0]["from_host"], "b-policy.test");
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn an_active_reply_wait_shortens_a_backed_off_collection_deadline() {
     use std::io::{BufRead, BufReader, Write};
@@ -658,6 +701,8 @@ fn an_active_reply_wait_shortens_a_backed_off_collection_deadline() {
     assert_eq!(response["result"]["reply"]["body"], "wait accelerated");
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn reenrolling_the_edge_restores_fast_collection_after_backoff() {
     let fleet = fleet::spawn("mesh-collect-reenroll", PAIR);
@@ -691,6 +736,8 @@ fn reenrolling_the_edge_restores_fast_collection_after_backoff() {
     assert_eq!(received[0]["body"], "edge is back");
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn idle_held_answers_make_no_commits_and_push_when_a_reverse_edge_enrolls() {
     let fleet = fleet::spawn("mesh-held-enroll", PAIR);
@@ -778,6 +825,8 @@ fn idle_held_answers_make_no_commits_and_push_when_a_reverse_edge_enrolls() {
     assert_eq!(received[0]["body"], "waiting for an outbound edge");
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn many_held_answers_do_not_delay_the_targets_own_outbox_retry() {
     let mut fleet = fleet::spawn(
@@ -852,6 +901,8 @@ fn many_held_answers_do_not_delay_the_targets_own_outbox_retry() {
     );
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn a_failed_reply_push_returns_to_held_without_idle_retry_commits() {
     let fleet = fleet::spawn(
@@ -936,6 +987,8 @@ fn a_failed_reply_push_returns_to_held_without_idle_retry_commits() {
     );
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn custody_status_read_receipt_and_wait_survive_audit_rotation_and_restart() {
     use std::io::{BufRead, Write};
@@ -1015,6 +1068,8 @@ fn custody_status_read_receipt_and_wait_survive_audit_rotation_and_restart() {
 
 // This integration probe executes the real CLI against only its isolated server.
 #[allow(clippy::disallowed_methods)]
+// Used only by debug-only fake SSH relay tests (#1715).
+#[cfg(debug_assertions)]
 fn cli_status(node: &Node, correlation: &str) -> Value {
     let output = support::environment::Command::new(env!("CARGO_BIN_EXE_flk"))
         .env_clear()

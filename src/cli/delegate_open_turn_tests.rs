@@ -35,6 +35,8 @@ fn entry(round: u64) -> Entry {
         base: None,
         base_sha: None,
         agent_id: None,
+        lock_resolution: None,
+        session: None,
     }
 }
 
@@ -164,7 +166,7 @@ impl RoundIo for Scripted {
         Ok((settled, false))
     }
 
-    fn agent_result(&mut self) -> Result<serde_json::Value, BoundedError> {
+    fn agent_result(&mut self) -> Result<ResultFetch, BoundedError> {
         self.polled += 1;
         // The last answer stands until the script says otherwise.
         let answer = if self.results.len() > 1 {
@@ -172,7 +174,9 @@ impl RoundIo for Scripted {
         } else {
             self.results.front().cloned()
         };
-        Ok(answer.expect("the script has no agent.result answer"))
+        Ok(ResultFetch::Response(
+            answer.expect("the script has no agent.result answer"),
+        ))
     }
 
     fn agent_record(&mut self) -> AgentFetch {
@@ -268,4 +272,13 @@ fn a_still_running_turn_keeps_waiting_until_it_ends() {
     // what paces the loop, not a timer.
     assert_eq!((io.settled, io.polled), (3, 3));
     assert_eq!(io.slept(), Duration::ZERO);
+}
+
+#[test]
+fn future_lock_resolution_metadata_survives_registry_round_trip() {
+    let mut entry = entry(0);
+    let future = json!({"choice":"future-choice", "future":{"raw":true}});
+    entry.lock_resolution = Some(future.clone());
+    let decoded: Entry = serde_json::from_value(serde_json::to_value(entry).unwrap()).unwrap();
+    assert_eq!(decoded.lock_resolution, Some(future));
 }

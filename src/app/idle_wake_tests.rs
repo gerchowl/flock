@@ -1159,6 +1159,7 @@ async fn guarded_client_rechecks_session_and_settle_before_enter() {
             id: "session".into(),
             method: Method::PaneReportAgentSession(
                 crate::api::schema::PaneReportAgentSessionParams {
+                    rebind_agent_id: None,
                     pane_id: pane.clone(),
                     source: "flock:claude".into(),
                     agent: "claude".into(),
@@ -1254,7 +1255,7 @@ async fn guarded_dispatch_requires_consuming_deferred_attempt() {
         panic!("expected submit event")
     };
     runtime(&app).test_stamp_operator_input_at(Instant::now());
-    app.advance_guarded_request(request_id, pane_id, attempt, respond_to);
+    app.advance_guarded_request(request_id, pane_id, *attempt, respond_to);
     assert!(!app.active_submissions.contains(&pane));
     let response: serde_json::Value = serde_json::from_str(&receiver.recv().unwrap()).unwrap();
     assert_eq!(response["result"]["outcome"], "unconfirmed");
@@ -1446,22 +1447,42 @@ async fn delivery_attempt_unconfirmed_survives_restart_without_replaying_and_lat
 
 #[tokio::test]
 async fn delivery_attempt_interrupted_restart_is_unconfirmed_and_deduplicated() {
+    assert_interrupted_restart(false);
+}
+
+#[tokio::test]
+async fn delivery_attempt_submitted_restart_is_unconfirmed_and_deduplicated() {
+    assert_interrupted_restart(true);
+}
+
+fn assert_interrupted_restart(submit: bool) {
     let Rig {
         mut app,
         pane,
         mut pty,
     } = rig();
-    let log = std::env::temp_dir().join(format!(
-        "flock-attempt-{}-{}.jsonl",
-        std::process::id(),
-        crate::app::api::messages::now_ms()
-    ));
+    let dir = crate::test_support::TempDir::socket();
+    let log = dir.path().join("events.jsonl");
     app.event_hub = crate::api::EventHub::with_persistence(log.clone());
     claude_idle_for(&mut app, settled());
     send(&mut app, &pane, "interrupted-mail", MsgIntent::NeedsReply);
-    app.tick_idle_wakes(Instant::now());
-    assert!(!drain(&mut pty).is_empty());
+    // Enqueue already types the paste. A wall-clock tick here can send Enter:
+    // synchronous event-log persistence may take longer than GAP (#2594).
+    assert_eq!(drain(&mut pty), vec![super::idle_wake_text(1).into_bytes()]);
     assert_eq!(app.delivery_attempts()[0].state, "typed");
+    if submit {
+        // The fixture completes writes synchronously. Advance one exact gap
+        // from after that completion to cover a delayed frame without sleeping.
+        let after_paste = Instant::now();
+        app.tick_idle_wakes(after_paste + GAP);
+        assert_eq!(drain(&mut pty), vec![b"\r".to_vec()]);
+    }
+    let before_restart = app.delivery_attempts();
+    assert_eq!(before_restart.len(), 1);
+    assert_eq!(
+        before_restart[0].state,
+        if submit { "submit_sent" } else { "typed" }
+    );
     app.event_hub = crate::api::EventHub::with_persistence(log.clone());
     let restored = app.event_hub.persisted_events_after(0);
     app.mailboxes = crate::app::mailboxes::MailboxRegistry::default();
@@ -1472,6 +1493,7 @@ async fn delivery_attempt_interrupted_restart_is_unconfirmed_and_deduplicated() 
     app.restore_delivery_attempts();
     let attempts = app.delivery_attempts();
     assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].attempt_id, before_restart[0].attempt_id);
     assert_eq!(attempts[0].state, "unconfirmed");
     assert_eq!(attempts[0].reason.as_deref(), Some("server_restarted"));
     terminal(&mut app).set_detected_state_with_screen_signals_at(
@@ -1489,7 +1511,6 @@ async fn delivery_attempt_interrupted_restart_is_unconfirmed_and_deduplicated() 
     app.tick_idle_wakes(Instant::now() + GAP);
     assert!(drain(&mut pty).is_empty());
     assert_eq!(app.mailboxes.queued_len(&pane), 1);
-    std::fs::remove_file(log).unwrap();
 }
 
 #[tokio::test]
@@ -1562,7 +1583,7 @@ async fn delivery_attempt_disable_resets_tracker_and_digest_reports_uncertainty(
     let attempts = app.delivery_attempts();
     assert_eq!(attempts[0].state, "unconfirmed");
     assert_eq!(attempts[0].reason.as_deref(), Some("paste_written"));
-    let events = app.event_hub.events_after(0);
+    let events = app.event_hub.ring_snapshot_after(0);
     let digest = crate::digest::categorize(events.iter().map(|(seq, event)| (*seq, 0, event)));
     let row = digest
         .yellow
@@ -1738,6 +1759,7 @@ async fn plain_paste_retains_missing_runtime_error_codes() {
         };
         let method = if agent_send {
             Method::AgentSend(crate::api::schema::AgentSendParams {
+                item_id: None,
                 write_timeout_ms: None,
                 raw: false,
                 target: pane,
