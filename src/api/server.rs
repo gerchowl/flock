@@ -746,6 +746,7 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::FleetStatus(_) => "fleet.status",
         Method::StructuredGrantsList(_) => "structured.grants.list",
         Method::StructuredGrantsRevoke(_) => "structured.grants.revoke",
+        Method::ProfileEnable(_) => "profile.enable",
         Method::RevertRun(_) => "revert.run",
     }
 }

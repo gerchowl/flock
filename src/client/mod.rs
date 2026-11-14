@@ -4624,7 +4624,7 @@ mod tests {
     }
 
     #[test]
-    fn server_identity1076_protocol_33_client_handles_protocol_32_refusal() {
+    fn server_identity1076_current_client_handles_protocol_32_refusal() {
         let (_lock, _scrub) = crate::config::test_config_env_guard();
         let (mut client, mut server) = UnixStream::pair().unwrap();
         server
@@ -4632,7 +4632,7 @@ mod tests {
             .unwrap();
         let worker = std::thread::spawn(move || {
             let hello: ClientMessage = protocol::read_message(&mut server, MAX_FRAME_SIZE).unwrap();
-            assert!(matches!(hello, ClientMessage::Hello { version: 33, .. }));
+            assert!(matches!(hello, ClientMessage::Hello { version: 34, .. }));
             protocol::write_message(
                 &mut server,
                 &ServerMessage::Welcome {

@@ -7,6 +7,7 @@ pub mod history;
 pub mod launch;
 pub mod lease;
 pub mod permissions;
+pub(crate) mod profiles;
 pub mod queue;
 pub mod registry;
 pub mod runtime;
