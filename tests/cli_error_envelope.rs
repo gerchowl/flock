@@ -471,22 +471,28 @@ fn the_skew_envelope_says_the_exit_the_process_returns() {
     assert_eq!(value["error"]["retry"], "after_handoff");
 }
 
-/// A protocol-33 client refuses a write to a protocol-32 server before sending
-/// it, preserving the typed handoff recovery path across the snapshot bump.
+/// Profile enable refuses the released protocol before sending any mutation.
 #[test]
-fn protocol_33_client_refuses_protocol_32_server_with_handoff_recovery() {
+fn profile_enable_refuses_released_server_before_mutation() {
     fn old_server(request: &Value) -> Value {
         assert_eq!(
             request["method"], "ping",
             "no mutation reaches the old server"
         );
-        json!({"result":{"type":"pong","version":"3.3.0","protocol":32}})
+        json!({"result":{"type":"pong","version":"3.5.0","protocol":33}})
     }
     let (socket, _server) = scripted_server("snapshot-skew", old_server);
     let output = flk(
         &socket,
         &[
-            "--format", "json", "agent", "send", "--submit", "w1", "fixture",
+            "--format",
+            "json",
+            "profile",
+            "enable",
+            "--plan",
+            "review-plan",
+            "--expect",
+            "digest",
         ],
     );
     let value = envelope(&output, 78);
