@@ -128,7 +128,7 @@ export function phaseLine(state: Phase): PhaseLine {
 
 /** The phase line for `row`, which may not be listed. */
 export function rowLine(row: AgentRow | undefined): PhaseLine {
-  return row === undefined ? { line: "Agent not in the agent list", open: true } : phaseLine(row.state);
+  return row === undefined ? { line: explain({ code: "agent_not_found", message: "" }).line, open: false } : phaseLine(row.state);
 }
 
 /** The send shortcut as this platform writes it: the HIG's ⌘↩ on Apple platforms. */
@@ -212,6 +212,7 @@ export function createComposerState(): ComposerState {
 export function Composer(props: {
   readonly agent: string;
   readonly row: AgentRow | undefined;
+  readonly unavailable?: string | null;
   readonly sender: Sender | null;
   readonly state: ComposerState;
 }): JSX.Element {
@@ -223,6 +224,7 @@ export function Composer(props: {
   };
   const [error, setError] = createSignal<string | null>(null);
   const blocked = (): string | null => {
+    if (props.unavailable != null) return props.unavailable;
     if (props.sender === null) return "Replay: sending needs a live server.";
     const mode = rowLine(props.row);
     return mode.open ? props.sender.blocked() : mode.line;

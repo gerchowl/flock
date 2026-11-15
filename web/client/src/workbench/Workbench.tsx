@@ -42,7 +42,7 @@ import { Transcript, type TranscriptSource } from "../views/Transcript";
 import { createBadgeWriter } from "./badge";
 import { attentionCards, needsYou } from "./attention";
 import type { InboxCard } from "./inbox";
-import { Composer, createComposerState, type Sender } from "./Composer";
+import { Composer, createComposerState, rowLine, type Sender } from "./Composer";
 import { HEALTH_LABELS, HostStatus, type HostView } from "./HostStatus";
 import { SHORTCUTS, bindKeys, formatCombo, pageShortcutAvailable, runPageShortcut } from "./keys";
 import { Palette, type PaletteCommand, type WaitingAction } from "./Palette";
@@ -191,6 +191,13 @@ export function Workbench(props: WorkbenchProps): JSX.Element {
     return agentOf(current.focused === null ? undefined : current.tiles[current.focused]?.subject);
   });
   const focusedRow = createMemo(() => rows().find((row) => row.id === focusedAgent()));
+  // A saved tile identifies a selection, not evidence that its agent is still available.
+  const unavailable = createMemo(() => {
+    if (focusedRow() !== undefined) return null;
+    const progress = fleet.agents.progress();
+    if (progress.phase === "loading") return "Loading the agent list…";
+    return progress.phase === "failed" ? progress.message : rowLine(undefined).line;
+  });
   /** Focuses `id`'s tile; true when that pushed a tile, which `back` may then pop. */
   const openAgent = (id: string): boolean => {
     if (focusedAgent() === id) return false;
@@ -305,15 +312,17 @@ export function Workbench(props: WorkbenchProps): JSX.Element {
                 </Show>
               </header>
               <div class="focus__body">
-                <Transcript
-                  transport={props.transport}
-                  stream={`agent/${agent}`}
-                  source={props.source}
-                  onEntry={(seq, text) => composer.observe(agent, seq, text)}
-                  onCurrent={(current) => composer.current(agent, current)}
-                />
+                <Show when={unavailable() === null} fallback={<p class="focus__empty">{unavailable()}</p>}>
+                  <Transcript
+                    transport={props.transport}
+                    stream={`agent/${agent}`}
+                    source={props.source}
+                    onEntry={(seq, text) => composer.observe(agent, seq, text)}
+                    onCurrent={(current) => composer.current(agent, current)}
+                  />
+                </Show>
               </div>
-              <Composer agent={agent} row={focusedRow()} sender={props.sender} state={composer} />
+              <Composer unavailable={unavailable()} agent={agent} row={focusedRow()} sender={props.sender} state={composer} />
             </>
           )}
         </Show>
@@ -337,6 +346,7 @@ export function Workbench(props: WorkbenchProps): JSX.Element {
         fleetNote={() => fleetNote() ?? (prefs().scope === "node" && home() === null ? HOME_UNKNOWN : null)}
         agent={focusedAgent}
         row={focusedRow}
+        unavailable={unavailable}
         open={openAgent}
         back={back}
         widened={() => !phone()}
