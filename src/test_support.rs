@@ -12,6 +12,30 @@
 
 use std::path::PathBuf;
 
+/// Locate the built CLI above this unit-test artifact, including extracted archives.
+///
+/// Cargo may nest test executables at different depths beneath the profile
+/// directory. Walk ancestors for the companion executable instead of assuming
+/// the test is exactly one directory below it. Never search the installed PATH.
+pub(crate) fn flk_binary() -> PathBuf {
+    let artifact = std::env::current_exe().expect("current unit-test executable");
+    find_flk_binary(&artifact, Path::is_file).unwrap_or_else(|| {
+        panic!(
+            "built flk executable not found above {}; build the CLI before running unit tests",
+            artifact.display()
+        )
+    })
+}
+
+fn find_flk_binary(artifact: &Path, mut is_file: impl FnMut(&Path) -> bool) -> Option<PathBuf> {
+    let name = format!("flk{}", std::env::consts::EXE_SUFFIX);
+    artifact
+        .parent()?
+        .ancestors()
+        .map(|directory| directory.join(&name))
+        .find(|candidate| is_file(candidate))
+}
+
 /// Absolute path to `name`, found on `PATH`.
 ///
 /// Panics rather than returning an `Option`: every caller wants a program it
@@ -500,6 +524,34 @@ pub(crate) fn hostile_agent_names() -> Vec<(&'static str, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn helper_cli_resolves_both_cargo_artifact_layouts() {
+        let profile = Path::new("fixture-profile");
+        let helper = profile.join(format!("flk{}", std::env::consts::EXE_SUFFIX));
+        for artifact in [
+            profile.join("deps/unit-test"),
+            profile.join("build/package/hash/out/unit-test"),
+        ] {
+            assert_eq!(
+                find_flk_binary(&artifact, |candidate| candidate == helper),
+                Some(helper.clone()),
+                "artifact {}",
+                artifact.display()
+            );
+        }
+    }
+
+    #[test]
+    fn helper_cli_refuses_a_missing_companion_instead_of_searching_path() {
+        assert_eq!(
+            find_flk_binary(
+                Path::new("fixture-profile/build/package/hash/out/unit-test"),
+                |_| false
+            ),
+            None
+        );
+    }
 
     #[test]
     fn resolves_a_program_that_exists_on_path() {
