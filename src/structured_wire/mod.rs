@@ -113,6 +113,11 @@ pub enum ClientFrame {
         #[cfg_attr(feature = "ts", ts(type = "number"))]
         after: Option<u64>,
     },
+    /// Resume probe, only after welcome advertises resume_probe.
+    Ping {
+        /// Nonempty opaque nonce, at most 128 UTF-8 bytes. Only one reply may be outstanding.
+        nonce: String,
+    },
     /// Echo only a current connection's server ping nonce, immediately.
     Pong {
         /// Opaque outstanding ping identity; invalid/replayed values renew nothing.
@@ -277,7 +282,7 @@ pub enum ServerFrame {
         protocol: u32,
         /// Server build version.
         server_version: String,
-        /// Advertised operations; no command capability in ReadOnly.
+        /// Advertised operations and transport features; no command capability in ReadOnly.
         capabilities: Vec<String>,
         /// Token's principal name, never its address or bearer value.
         principal: String,
@@ -291,6 +296,11 @@ pub enum ServerFrame {
     /// Independent application heartbeat, prioritized ahead of replay messages.
     Ping {
         /// Unique bounded nonce echoed by pong.
+        nonce: String,
+    },
+    /// Immediate response to a client resume probe; never renews server heartbeat liveness.
+    Pong {
+        /// Exact client ping nonce, bounded to 128 UTF-8 bytes.
         nonce: String,
     },
     /// Apply through the stream reducer before persisting a cursor.

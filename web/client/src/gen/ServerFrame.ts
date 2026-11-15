@@ -17,7 +17,7 @@ protocol: number,
  */
 server_version: string,
 /**
- * Advertised operations; no command capability in ReadOnly.
+ * Advertised operations and transport features; no command capability in ReadOnly.
  */
 capabilities: Array<string>,
 /**
@@ -35,6 +35,10 @@ server_epoch: string,
 idempotency_window_ms: number, } | { "t": "ping",
 /**
  * Unique bounded nonce echoed by pong.
+ */
+nonce: string, } | { "t": "pong",
+/**
+ * Exact client ping nonce, bounded to 128 UTF-8 bytes.
  */
 nonce: string, } | { "t": "ev",
 /**

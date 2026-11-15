@@ -39,14 +39,14 @@ pub(super) struct Subscriptions {
     data: mpsc::Sender<Delivery>,
     shared: Arc<Shared>,
     session: Session,
-    priority: mpsc::Sender<Message>,
+    priority: mpsc::Sender<output::Control>,
 }
 impl Subscriptions {
     pub(super) fn new(
         shared: Arc<Shared>,
         data: mpsc::Sender<Delivery>,
         session: Session,
-        priority: mpsc::Sender<Message>,
+        priority: mpsc::Sender<output::Control>,
     ) -> Self {
         let owner = shared.histories.clone();
         Self {
@@ -122,7 +122,7 @@ impl Subscriptions {
                     }
                     Some(Err(TokenError::Scope)) => Err(Some(SubfailCode::Scope)),
                     Some(Err(TokenError::Unauthorized | TokenError::Revoked)) => {
-                        let _ = priority.send(close(AUTH_REVOKED_CLOSE)).await;
+                        let _ = priority.send(close(AUTH_REVOKED_CLOSE).into()).await;
                         return;
                     }
                     Some(Err(TokenError::Busy)) => Err(Some(SubfailCode::SessionBusy)),
@@ -130,7 +130,7 @@ impl Subscriptions {
                 }
             };
             if result == Err(None) {
-                let _ = priority.send(close(GOING_AWAY_CLOSE)).await;
+                let _ = priority.send(close(GOING_AWAY_CLOSE).into()).await;
                 return;
             }
             if let Err(Some(code)) = result {

@@ -1389,6 +1389,7 @@ client → server
                                             stream ∈ agent/<id>, agent/<id>/live,
                                               queue/<id>, events, terminal/<pane>,
                                               fleet, inbox, artifacts, work
+  ping    { nonce }                          resume probe, with resume_probe capability
   pong    { nonce }                          echo the server ping nonce
   unsub   { sub_id }                         closes id; drop late frames for it
   cmd     { cmd_id, verb, args, resume_only } cmd_id is the idempotency key
@@ -1396,6 +1397,7 @@ server → client
   welcome { protocol, server_version, capabilities, principal,
             server_epoch, idempotency_window_ms }
   ping    { nonce }                          application heartbeat (§5a)
+  pong    { nonce }                          echo the client resume probe nonce
   ev      { sub_id, stream, seq, ts_ms, ev }  ev is the typed event (§6)
   synced  { sub_id, seq }                    replay barrier on every seq stream
   subfail { sub_id, code, message }          closes id; drop late frames (§5a)
@@ -1722,6 +1724,30 @@ Discard every frame from the abandoned socket, including late pings; send no
 pong for them and let no old callback advance a cursor or renew liveness.
 A stream's independent progress deadline still applies during traffic.
 
+**Resume probes (#2977).** `welcome.capabilities` advertises the additive
+`resume_probe` transport capability independently of the authenticated operation
+grants. Clients send JSON `ping { nonce }` only when that capability is present;
+the server echoes `pong { nonce }` through its priority writer. Nonces are opaque,
+nonempty strings of at most 128 UTF-8 bytes, accommodating the heartbeat's
+bounded epoch/connection/sequence identities. Like invalid heartbeat pongs,
+empty or oversized probe nonces are ignored and renew no liveness deadline.
+One probe response per connection may be queued or writing: the server ignores
+additional probes until that response has flushed. This bounds probe buffering
+without blocking heartbeat or subscription processing. Probe requests never
+renew the server's heartbeat deadline; clients must still answer server pings.
+
+On persisted `pageshow` or hidden-to-visible `visibilitychange`, the GUI sends
+one probe and gives it 3 s. Concurrent resume signals share that probe and its
+original deadline. Only its matching pong satisfies it; unrelated traffic and
+wrong, old or replayed pongs cannot do so. A healthy response leaves the visible
+connection state unchanged. On expiry, the client shows Reconnecting, closes the
+abandoned socket, and uses the existing reconnect backoff and applied cursors.
+For older servers without the capability it sends no unsupported frame: any
+valid server frame within the 15 s heartbeat interval plus 2 s scheduling grace
+proves liveness; otherwise it reconnects through the same path. Resume establishes
+this bounded window even when the pre-suspension liveness timer was overdue.
+Disconnect cancels the probe, and client disposal removes both browser listeners.
+
 **Reconnect and failure scope.** Connect/handshake expiry, protocol failure,
 socket loss or heartbeat failure ends the connection attempt and enters
 Reconnecting, preserving displayed state and applied cursors. Subscription
@@ -2027,7 +2053,7 @@ controlled socket faults and bounded receives, not sleeps or live models.
 | subfail scope | Insufficient token scope refuses only that sub until authorization changes; sibling streams remain live. |
 | Per-stream progress deadline | Replay exceeds 30 s overall but progresses within each window and succeeds. A stalled sub expires despite duplicate/unrelated/heartbeat traffic: unsub the stalled ID, then re-subscribe with a fresh ID from its applied cursor, retaining resync marker and the connection. |
 | Ack timeout and delayed original | Missing ack marks only that cmd uncertain; no same-socket resend or teardown. A late current-socket ack resolves it. After reconnect, deliver resume-only lookup before buffered original: show unknown outcome while the original may later execute once; never manufacture a new ID. Verify retry:later remains harmless with resume_only. |
-| Mobile suspend and remote outage | Foreground invalidates old socket and resumes. Local heartbeat does not clear remote stale state; cross-node cmd still refuses under VERSION 5. |
+| Mobile suspend and remote outage | Browser resume probes the old socket and reconnects on a miss. Local heartbeat does not clear remote stale state; cross-node cmd still refuses under VERSION 5. |
 
 #### S7-min agent subscription resource bounds (§5a implementation)
 
@@ -2106,7 +2132,8 @@ S7a. The server supplies the wrapper before sending, not the frontend reducer.
 
 The initial `WIRE_JSON_VERSION` is 1. Wire streams are strings using §5's paths;
 unknown paths decode so the server can return `subfail unknown_stream`. The
-`welcome` principal is the token name and capabilities are operation strings;
+`welcome` principal is the token name and capabilities include operation strings
+and the additive `resume_probe` transport feature;
 a newer client's read-only welcome advertises no command capability. `ev.seq`
 is omitted only for `agent/<id>/live`; its timestamp is still present. Ack
 success/error fields are exclusive; successful void commands may omit result.
