@@ -882,6 +882,45 @@ describe("wire mode, one transport per connection", () => {
     return { h, root };
   }
 
+  test("a restored pending send to a missing agent replays once and its typed refusal stays failed", () => {
+    const h = new Harness();
+    const saved = createManager(emptyLayout());
+    saved.open("agent/missing", "replace");
+    localStorage.setItem(`flock.layout:${encodeURIComponent("wss://fixture.invalid/v1/ws")}`, JSON.stringify({ version: 1, layout: saved.state }));
+    h.step(step({ step: "given", cursors: {}, outbox: [{ cmd_id: "c-restored-selection", verb: "agent.send", args: { target: "missing", text: "pending draft", submit: true }, principal: "fixture-principal", created_ms: 0, status: "pending" }] }));
+    const root = mount(() => <App config={{ ok: true, config }} env={{ clock: h.clock, sockets: h.net.factory, random: () => 0, store: h.store }} />);
+    h.net.current().open();
+    h.net.current().deliver(WELCOME);
+    const sends = (): unknown[] => sentFrames(h).filter(frame => (frame as { verb?: string }).verb === "agent.send");
+    expect(sends()).toEqual([]);
+    expect($(root, "sent-message")?.getAttribute("data-status")).toBe("pending");
+    send(h, { t: "gap", sub_id: fleetSub(h), from: 1, to: 0, snapshot_to: 0 });
+    send(h, { t: "synced", sub_id: fleetSub(h), seq: 0 });
+    expect((root.querySelector("textarea") as HTMLTextAreaElement).disabled).toBe(true);
+    expect(sends()).toEqual([{ t: "cmd", cmd_id: "c-restored-selection", verb: "agent.send", resume_only: false, args: { target: "missing", text: "pending draft", submit: true } }]);
+    send(h, { t: "ack", cmd_id: "c-restored-selection", ok: false, error: { code: "agent_not_found", message: "command refused: agent_not_found", exit: 2, retry: "never" } });
+    const failed = (): void => {
+      expect($$(root, "sent-message")).toHaveLength(1);
+      expect($(root, "sent-message")?.getAttribute("data-status")).toBe("failed");
+      expect($(root, "sent-message")?.querySelector(".sent__status")?.textContent).toBe("The server no longer knows this agent. Pick an agent from the list.");
+      expect($(root, "sent-message")?.textContent).toContain("pending draft");
+      expect(JSON.parse(h.store.getItem(OUTBOX_KEY) ?? "null").commands).toEqual([]);
+      expect(sends()).toHaveLength(1);
+    };
+    failed();
+    // Virtual time passes the ack deadline, then a new socket reaches Live again.
+    h.clock.advanceTo(h.clock.now() + 30_001);
+    failed();
+    h.net.current().drop();
+    h.clock.advanceTo(h.clock.now() + 1_000);
+    h.net.current().open();
+    h.net.current().deliver(WELCOME);
+    send(h, { t: "gap", sub_id: fleetSub(h), from: 1, to: 0, snapshot_to: 0 });
+    send(h, { t: "synced", sub_id: fleetSub(h), seq: 0 });
+    expect(health(root)).toBe("live");
+    failed();
+  });
+
   for (const [restored, phone] of [[true, false], [false, false], [false, true]] as const) {
     test(`unavailable selection: ${restored ? "restored missing agent" : "selected agent removed"}${phone ? " on phone" : ""} cannot send`, () => {
       const dom = (globalThis as unknown as { happyDOM: { setURL: (url: string) => void } }).happyDOM;
