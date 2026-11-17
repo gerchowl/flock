@@ -127,7 +127,9 @@ use serde::{Deserialize, Serialize};
 /// `session_unbound` error. A v32 server ignores the unknown guard field, so
 /// recovery mutations require a v33 server. TUI attachment requires an exact
 /// protocol match; JSON API hooks retain their separate skew exemptions.
-pub const PROTOCOL_VERSION: u32 = 33;
+/// v34 adds the operator-only `profile.enable` JSON API (ADR-0052 slice 1).
+/// Enable requests require the current protocol before sending a mutation.
+pub const PROTOCOL_VERSION: u32 = 34;
 
 /// Refusal notice sent to clients while a live update handoff is in
 /// progress. Clients recognize this exact string (in a rejection `Welcome`
@@ -1846,7 +1848,11 @@ mod tests {
             check_client_version(32),
             VersionCheck::Incompatible(_)
         ));
-        assert!(matches!(check_client_version(33), VersionCheck::Compatible));
+        assert!(matches!(
+            check_client_version(33),
+            VersionCheck::Incompatible(_)
+        ));
+        assert!(matches!(check_client_version(34), VersionCheck::Compatible));
     }
 
     // ---- Version negotiation ----
@@ -1932,7 +1938,7 @@ mod tests {
     // PINNED_PROTOCOL_VERSION and paste the refreshed GOLDEN table (the failing
     // test prints it paste-ready).
 
-    const PINNED_PROTOCOL_VERSION: u32 = 33;
+    const PINNED_PROTOCOL_VERSION: u32 = 34;
 
     fn fnv1a(bytes: &[u8]) -> u64 {
         let mut hash: u64 = 0xcbf2_9ce4_8422_2325;

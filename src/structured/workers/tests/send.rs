@@ -230,13 +230,7 @@ async fn send_admission_cli_uses_actual_socket_dispatch_and_prints_lifecycle_id(
     let target = r.case.id.clone();
     let child = tokio::task::spawn_blocking(move || {
         let mut command = crate::process::TracedCommand::new(
-            std::env::current_exe()
-                .unwrap()
-                .parent()
-                .unwrap()
-                .parent()
-                .unwrap()
-                .join("flk"),
+            crate::test_support::flk_binary(),
             "send-admission-test",
         );
         for (key, _) in

@@ -58,6 +58,7 @@ const HELP_FLAGS: [&str; 2] = ["--help", "-h"];
 /// `pane` is the group to watch when adding rows here: `src/cli/pane.rs` owns
 /// those parsers and its own help text, and this table mirrors them.
 const VERBS: &[(&str, &str, &str)] = &[
+    ("profile", "enable", super::profile::USAGE),
     ("structured", "grants", super::grants::USAGE),
     ("server", "stop", "flk server stop"),
     (
@@ -640,6 +641,7 @@ mod tests {
             "owner" => include_str!("owner.rs"),
             "goal" => include_str!("goal.rs"),
             "structured" => include_str!("grants.rs"),
+            "profile" => include_str!("profile.rs"),
             "events" => include_str!("events.rs"),
             "adapter" => include_str!("adapter.rs"),
             // `wait park` shares the `events` parser.
