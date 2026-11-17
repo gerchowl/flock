@@ -17,13 +17,7 @@ fn local_checksum_refusal_reaches_the_real_cli_with_its_registered_exit() {
     let curl = format!("#!/bin/sh\nwhile [ \"$#\" -gt 0 ]; do\nif [ \"$1\" = -o ]; then shift; printf partial > \"$1\"; exit 0; fi\nshift\ndone\nprintf '%s' {}\n", quoted_manifest);
     fs::write(bin.join("curl"), curl).unwrap();
     fs::set_permissions(bin.join("curl"), fs::Permissions::from_mode(0o755)).unwrap();
-    let helper = std::env::current_exe()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("flk");
+    let helper = crate::test_support::flk_binary();
     let mut child = Command::new(helper)
         .arg("update")
         .env_clear()
