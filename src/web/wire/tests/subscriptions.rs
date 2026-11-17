@@ -532,7 +532,8 @@ fn unsubscribe_api_fences_an_already_queued_jsonl_event_before_the_writer_starts
                 output::encode(ServerFrame::Ping {
                     nonce: "priority".into(),
                 })
-                .unwrap(),
+                .unwrap()
+                .into(),
             )
             .unwrap();
         let (sink, release, _started, mut flushed, _dropped) = gated_sink();

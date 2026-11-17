@@ -30,7 +30,11 @@ stream: string,
  * JSON number; exact in JavaScript below 2^53.
  * Omitted for bootstrap and cursorless `agent/<id>/live`.
  */
-after?: number, } | { "t": "pong",
+after?: number, } | { "t": "ping",
+/**
+ * Nonempty opaque nonce, at most 128 UTF-8 bytes. Only one reply may be outstanding.
+ */
+nonce: string, } | { "t": "pong",
 /**
  * Opaque outstanding ping identity; invalid/replayed values renew nothing.
  */

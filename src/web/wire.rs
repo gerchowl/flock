@@ -598,7 +598,7 @@ async fn connection(
         }
     };
     // ADR-0036 §5/§6: advertise exact grants, while admission rechecks authority.
-    let capabilities = session
+    let mut capabilities: Vec<String> = session
         .info
         .scopes
         .iter()
@@ -613,6 +613,7 @@ async fn connection(
             .to_owned()
         })
         .collect();
+    capabilities.push("resume_probe".to_owned());
     let principal = session.info.principal.clone();
     let welcome = ServerFrame::Welcome {
         protocol: WIRE_JSON_VERSION,
@@ -673,6 +674,7 @@ async fn connection(
     .for_protocol(client_protocol);
     let mut running = tokio::task::JoinSet::new();
     let mut heartbeat = Heartbeat::new(shared.clock.now());
+    let probe_slots = Arc::new(Semaphore::new(1));
     let mut code = loop {
         tokio::select! { biased;
             code = &mut lifetime => break code,
@@ -691,10 +693,15 @@ async fn connection(
             _ = shared.clock.until(heartbeat.next_ping) => {
                 let Some(nonce) = heartbeat.ping(shared.clock.now(), &format!("{}/{id}", shared.epoch)) else { break unavailable("heartbeat_budget") };
                 let Some(frame) = output::encode(ServerFrame::Ping { nonce }) else { break unavailable("ping_encoding") };
-                if priority.try_send(frame).is_err() { break unavailable("control_capacity"); }
+                if priority.try_send(frame.into()).is_err() { break unavailable("control_capacity"); }
             }
             frame = stream.next() => match frame {
                 Some(Ok(Message::Text(text))) => match serde_json::from_str(&text) {
+                    Ok(ClientFrame::Ping { nonce }) => {
+                        if let Some(reply) = output::probe(nonce, &probe_slots) {
+                            if priority.try_send(reply).is_err() { break unavailable("control_capacity"); }
+                        }
+                    }
                     Ok(ClientFrame::Pong { nonce }) => heartbeat.pong(&nonce, shared.clock.now()),
                     Ok(ClientFrame::Sub { sub_id, stream, after }) => {
                         if !subscriptions.subscribe(sub_id, stream, after) { break unavailable("subscription_capacity") }
@@ -715,7 +722,7 @@ async fn connection(
                                 _ = revoked.changed() => break AUTH_REVOKED_CLOSE,
                                 _ = &mut writer => return,
                                 _ = shared.clock.until(heartbeat.expires()) => break unavailable("heartbeat_expired"),
-                                sent = priority.send(ack) => if sent.is_err() { return },
+                                sent = priority.send(ack.into()) => if sent.is_err() { return },
                             }
                             continue;
                         }
@@ -756,7 +763,7 @@ async fn connection(
             code = GOING_AWAY_CLOSE;
         }
     }
-    if priority.try_send(close(code)).is_ok() {
+    if priority.try_send(close(code).into()).is_ok() {
         tokio::select! { biased; _ = &mut writer => (), _ = shared.clock.until(close_deadline) => () }
     }
 }

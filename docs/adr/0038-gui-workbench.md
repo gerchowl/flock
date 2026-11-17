@@ -335,6 +335,7 @@ sets:
 | restore deadline | 10 s from page load: its own value, equal to the connect deadline today; a change to ADR-0036 §5a's connect deadline does not move it | the store's **Load** (below) |
 | handshake deadline | 5 s from socket open to `welcome` | Hello |
 | heartbeat | the server sends `ping { nonce }` every 15 s; the client answers `pong { nonce }` at once | Syncing, Live, ReadOnly |
+| resume probe | 3 s for a matching pong after a resume ping; older servers allow 15 s heartbeat plus 2 s scheduling grace for any valid frame | Syncing, Live, ReadOnly |
 | liveness window | 45 s without any valid server frame, `ping` included | heartbeat missed → Stale |
 | subscription progress deadline | 30 s without a frame that advances that `sub`, while it waits for `synced` or a snapshot's end | Replaying, Resyncing |
 | command ack deadline | 30 s from each send | the outbox: `sent` → `uncertain` |
@@ -342,8 +343,12 @@ sets:
 
 Every state that waits on the server has a deadline that ends it (ADR-0037:
 waits fail, they never hang). The client measures them on a monotonic clock. A
-suspended page or app does not count frozen time as liveness: on foreground it
-closes the old socket and connects again. No deadline ever makes a stream
+suspended page does not count frozen time as liveness: persisted `pageshow` and
+hidden-to-visible `visibilitychange` start the capability-gated resume probe
+(ADR-0036 §5a, #2977). A matching response keeps its visible state; a miss closes
+the old socket and enters Reconnecting under the existing backoff. Concurrent
+resume signals share one probe and its original deadline. Older servers without
+`resume_probe` get the bounded heartbeat fallback and no unsupported frame. No deadline ever makes a stream
 Current or a command acknowledged; expiry only fails. The diagram shows the main
 path. The tables are complete and win where they differ.
 
@@ -596,7 +601,9 @@ take longer than 30 s in total.
     **held**.
   - Reconnecting uses the backoff in the parameter table. A network-change or
     foreground event cancels it for one immediate attempt, and a foreground
-    event first closes a socket that may have been suspended.
+    event first closes a socket that may have been suspended. Browser tab-resume
+    and BFCache events instead use the bounded probe above, preserving backoff
+    after a probe miss.
   - The client always offers `disconnect`, which cancels the attempt and its
     timer. While it reconnects it shows the latest failure.
 - **NeedsToken.**
