@@ -12,28 +12,43 @@
 
 use std::path::PathBuf;
 
-/// Locate the built CLI above this unit-test artifact, including extracted archives.
+/// Locate the built CLI in this unit-test artifact's own build profile.
 ///
-/// Cargo may nest test executables at different depths beneath the profile
-/// directory. Walk ancestors for the companion executable instead of assuming
-/// the test is exactly one directory below it. Never search the installed PATH.
+/// Recognize Cargo's `deps` and `build/<package>/<hash>/out` artifact directories,
+/// including extracted archives and custom profiles. An unknown layout or a
+/// missing companion refuses without searching other directories or PATH.
 pub(crate) fn flk_binary() -> PathBuf {
     let artifact = std::env::current_exe().expect("current unit-test executable");
-    find_flk_binary(&artifact, Path::is_file).unwrap_or_else(|| {
-        panic!(
-            "built flk executable not found above {}; build the CLI before running unit tests",
-            artifact.display()
-        )
+    find_flk_binary(&artifact, Path::is_file).unwrap_or_else(|| match build_profile_dir(&artifact) {
+        Some(profile) => panic!(
+            "built flk executable missing from its own build profile {}; build the CLI before running unit tests",
+            profile.display()
+        ),
+        None => panic!("unrecognized unit-test artifact layout: {}", artifact.display()),
     })
+}
+
+fn build_profile_dir(artifact: &Path) -> Option<&Path> {
+    let directory = artifact.parent()?;
+    if directory.file_name()? == "deps" {
+        return directory.parent();
+    }
+    if directory.file_name()? != "out" {
+        return None;
+    }
+    let hash = directory.parent()?;
+    let package = hash.parent()?;
+    let build = package.parent()?;
+    if build.file_name()? != "build" {
+        return None;
+    }
+    build.parent()
 }
 
 fn find_flk_binary(artifact: &Path, mut is_file: impl FnMut(&Path) -> bool) -> Option<PathBuf> {
     let name = format!("flk{}", std::env::consts::EXE_SUFFIX);
-    artifact
-        .parent()?
-        .ancestors()
-        .map(|directory| directory.join(&name))
-        .find(|candidate| is_file(candidate))
+    let candidate = build_profile_dir(artifact)?.join(name);
+    is_file(&candidate).then_some(candidate)
 }
 
 /// Absolute path to `name`, found on `PATH`.
@@ -527,18 +542,20 @@ mod tests {
 
     #[test]
     fn helper_cli_resolves_both_cargo_artifact_layouts() {
-        let profile = Path::new("fixture-profile");
-        let helper = profile.join(format!("flk{}", std::env::consts::EXE_SUFFIX));
-        for artifact in [
-            profile.join("deps/unit-test"),
-            profile.join("build/package/hash/out/unit-test"),
-        ] {
-            assert_eq!(
-                find_flk_binary(&artifact, |candidate| candidate == helper),
-                Some(helper.clone()),
-                "artifact {}",
-                artifact.display()
-            );
+        for label in ["debug", "release", "custom-profile"] {
+            let profile = Path::new("fixture-target").join(label);
+            let helper = profile.join(format!("flk{}", std::env::consts::EXE_SUFFIX));
+            for artifact in [
+                profile.join("deps/unit-test"),
+                profile.join("build/package/hash/out/unit-test"),
+            ] {
+                assert_eq!(
+                    find_flk_binary(&artifact, |candidate| candidate == helper),
+                    Some(helper.clone()),
+                    "artifact {}",
+                    artifact.display()
+                );
+            }
         }
     }
 
@@ -551,6 +568,43 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn helper_cli_rejects_helpers_outside_its_build_profile() {
+        let target = Path::new("fixture-target");
+        let name = format!("flk{}", std::env::consts::EXE_SUFFIX);
+        let profile = target.join("custom-profile");
+        for artifact in [
+            profile.join("deps/unit-test"),
+            profile.join("build/package/hash/out/unit-test"),
+        ] {
+            for outside in [target.join(&name), target.join("other-profile").join(&name)] {
+                assert_eq!(
+                    find_flk_binary(&artifact, |candidate| candidate == outside),
+                    None,
+                    "artifact {}, outside helper {}",
+                    artifact.display(),
+                    outside.display()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn helper_cli_rejects_unrecognized_artifact_layouts_without_discovery() {
+        for artifact in [
+            "fixture-target/custom-profile/unit-test",
+            "fixture-target/custom-profile/unknown/unit-test",
+            "fixture-target/custom-profile/build/package/out/unit-test",
+        ] {
+            assert_eq!(
+                find_flk_binary(Path::new(artifact), |_| {
+                    panic!("unrecognized artifact layout must not inspect helper candidates")
+                }),
+                None
+            );
+        }
     }
 
     #[test]
