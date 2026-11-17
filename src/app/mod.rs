@@ -234,6 +234,8 @@ pub struct App {
     /// Internal call, captured UID, or captured-but-unavailable UID.
     pub(crate) current_api_peer_uid: Option<Option<u32>>,
     pub(crate) session_leases: crate::structured::lease::SessionLeases,
+    /// ADR-0052 operator binding switch, independent of agent-editable config.
+    pub(crate) structured_profiles: crate::structured::profiles::ProfileAdmission,
     /// Test-only override for pane child PIDs so ancestry reconciliation can
     /// be exercised without spawning real PTYs.
     #[cfg(test)]
@@ -1053,6 +1055,7 @@ impl App {
             current_api_peer_birth: None,
             current_api_peer_uid: None,
             session_leases: Default::default(),
+            structured_profiles: Default::default(),
             #[cfg(test)]
             test_pane_child_pids: std::collections::HashMap::new(),
             event_rx,

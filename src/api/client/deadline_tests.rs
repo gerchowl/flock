@@ -243,13 +243,7 @@ async fn cli_timeout(mutating: bool) {
     let root = TempDir::socket();
     let path = root.path().join("cli");
     let listener = tokio::net::UnixListener::bind(&path).unwrap();
-    let binary = std::env::current_exe()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("flk");
+    let binary = crate::test_support::flk_binary();
     let mut command = tokio::process::Command::new(binary);
     command
         .env_clear()

@@ -1,15 +1,15 @@
 # ADR 0052 — Structured harness profiles separate operator authority, immutable assets and session storage
 
-- Status: Proposed
+- Status: Accepted (2026-11-11)
 - Date: 2026-11-08
 - Issues: [#3066](https://github.com/gerchowl/flock/issues/3066)
 - Decision owner: operator
-- Implemented: none. This record proposes the provisioning contract and ordered
-  implementation slices. It changes no runtime behavior.
-- Amends on acceptance: ADR-0036 §1 isolation and hot reload, and ADR-0032 §3
+- Implemented: slice 1, disabled admission guard. Production execution remains
+  unavailable until slice 17.
+- Amends: ADR-0036 §1 isolation and hot reload, and ADR-0032 §3
   structured-session context replenishment. Composes with ADR-0049 requests,
   operator bindings and the shared authority resolver. Existing accepted ADRs
-  remain unchanged by this proposal.
+  compose with this decision.
 
 ## Evidence and scope
 
@@ -512,9 +512,11 @@ native rollout importer. No Codex support is implied by the Claude slices.
 
 ### 9. Operator command and recovery contract
 
-These are proposed CLI/API contracts, not commands available today. One operator
-controls the authority; ordinary relay or harness principals cannot invoke these
-mutations. Authenticated operator transport remains required on remote nodes.
+These are target CLI/API contracts. Slice 1 exposes only `profile.enable`, which
+refuses execution while the build is incomplete; the transactions below are not
+available yet. One operator controls the authority; ordinary relay or harness
+principals cannot invoke these mutations. Authenticated operator transport remains
+required on remote nodes.
 
 | Operation | CLI | API transaction |
 | --- | --- | --- |
@@ -585,6 +587,8 @@ safety prerequisites. It can execute actual adopted assets in its isolated probe
 domain while production remains disabled, and can never publish a production
 session or transfer mailbox ownership. Its separate admission test proves this.
 
+Slice 1 holds the switch in server memory only; slice 2 persists it with the binding records.
+
 Existing trusted single-account launch behavior stays on its existing path;
 profile operations never fall back to it on denial. Slice 17 is the only initial
 production activation path: its readiness predicate requires all slices 1–16,
@@ -628,7 +632,7 @@ consumer; slice 18 adds orchestration, not a late exception to pin enforcement.
 | 24. Codex native importer | 19–20 and 23. Separate rollout/sidecar discovery and import adapter. | Partial/ambiguous import or a live writer refuses; recovery proves one owner and preserves the native thread. |
 | 25. Dogfood | 14–22, with 23–24 only for Codex consumers. Isolated recovery drill then operator-authorized staged canary. | Demonstrate real-bundle qualification before enablement, replenishment, immutable workflow pins, revocation/partition bounds and rollback at cap before fleet expansion. |
 
-This ADR's PR remains docs only. These caps are planning constraints, not measured
+The original ADR PR was docs only. These caps are planning constraints, not measured
 implementation sizes: each implementation brief must enumerate touched functions
 and a production-line estimate, subdividing oversized rows into inactive dependent
 PRs before work begins. Qualification is the sole pre-activation execution mode
