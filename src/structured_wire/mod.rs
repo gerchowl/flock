@@ -13,7 +13,11 @@ use serde_json::Value;
 
 #[cfg(test)]
 pub(crate) mod fixture;
+#[cfg(any(feature = "web", feature = "ts"))]
+mod lifecycle;
 mod minimal;
+#[cfg(any(feature = "web", feature = "ts"))]
+pub use lifecycle::AgentLifecycleCommand;
 mod permission;
 // Later wire slices consume these exact payload re-exports.
 #[cfg_attr(feature = "web", allow(unused_imports))]
@@ -30,8 +34,8 @@ mod review_tests;
 #[cfg(test)]
 mod tests;
 
-/// Initial, unreleased structured wire version; independent of terminal/mesh versions.
-pub const WIRE_JSON_VERSION: u32 = 1;
+/// Structured wire version with local lifecycle commands, independent of terminal/mesh versions.
+pub const WIRE_JSON_VERSION: u32 = 2;
 /// Per-attempt connect ceiling, including resolution and upgrade (ADR-0036 §5a).
 // Client timers and later wire slices consume this contract constant.
 #[cfg_attr(feature = "web", allow(dead_code))]

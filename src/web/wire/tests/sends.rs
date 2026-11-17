@@ -893,3 +893,145 @@ fn app_remint_deduplicates_the_same_command_without_a_second_queue_effect() {
         case.stop().await;
     });
 }
+
+#[test]
+fn lifecycle_send_scope_refuses_before_dispatch() {
+    runtime(async {
+        let mut case = Case::new(30940).await;
+        case.scopes(json!(["read", "send"]));
+        let mut socket = case.open().await;
+        for verb in ["agent.start", "agent.restart", "agent.stop"] {
+            let ack = case.command(&mut socket, verb, json!({})).await;
+            assert_eq!(ack["error"]["code"], "not_authorized", "{ack}");
+        }
+        case.stop().await;
+    });
+}
+
+#[test]
+fn lifecycle_operate_start_replays_first_ack_without_second_launch() {
+    runtime(async {
+        let mut case = Case::new(30941).await;
+        case.scopes(json!(["read", "operate"]));
+        let mut socket = case.open().await;
+        let args = json!({"name":"wire-fresh", "argv":["/bin/sh", "-c", "read line"],
+            "cwd":case.queue.case.fixture.root.path()});
+        let command = json!({"t":"cmd", "cmd_id":"fresh-start", "verb":"agent.start",
+            "args":args, "resume_only":false});
+        socket.send(command.clone()).await;
+        let first = case.ack(&mut socket).await;
+        assert_eq!(first["ok"], true, "{first}");
+        socket.send(command.clone()).await;
+        assert_eq!(case.ack(&mut socket).await, first);
+        let mut resumed = command.clone();
+        resumed["resume_only"] = json!(true);
+        socket.send(resumed).await;
+        assert_eq!(case.ack(&mut socket).await, first);
+        let mut changed = command.clone();
+        changed["args"]["name"] = json!("wire-other");
+        socket.send(changed).await;
+        assert_eq!(
+            case.ack(&mut socket).await["error"]["code"],
+            "invalid_params"
+        );
+        let mut unknown = command.clone();
+        unknown["cmd_id"] = json!("unknown-start");
+        unknown["resume_only"] = json!(true);
+        socket.send(unknown).await;
+        assert_eq!(
+            case.ack(&mut socket).await["error"]["code"],
+            "session_unconfirmed"
+        );
+        case.scopes(json!(["read", "send"]));
+        socket.send(command).await;
+        assert_eq!(
+            case.ack(&mut socket).await["error"]["code"],
+            "not_authorized"
+        );
+        assert_eq!(
+            case.queue
+                .app
+                .state
+                .terminals
+                .values()
+                .filter(|t| t.agent_name() == Some("wire-fresh"))
+                .count(),
+            1
+        );
+        case.stop().await;
+    });
+}
+
+#[test]
+fn lifecycle_structured_token_refusals_preserve_journal() {
+    runtime(async {
+        let mut case = Case::new(30942).await;
+        let mut socket = case.open().await;
+        let before = case.journal();
+        let id = case.queue.case.id.clone();
+        for (verb, args, code) in [
+            ("agent.stop", json!({"target":id}), "operator_only"),
+            (
+                "agent.restart",
+                json!({"target":id,"reason":"fixture restart"}),
+                "runtime_unsupported",
+            ),
+            (
+                "agent.start",
+                json!({"runtime":"structured","name":id,"argv":["claude"]}),
+                "operator_only",
+            ),
+            (
+                "agent.start",
+                json!({"runtime":"structured","name":"wire-new-structured","argv":["claude"]}),
+                "structured_needs_agent_user",
+            ),
+        ] {
+            let ack = case.command(&mut socket, verb, args).await;
+            assert_eq!(ack["error"]["code"], code, "{ack}");
+            assert_eq!(case.journal(), before);
+        }
+        case.stop().await;
+    });
+}
+
+#[test]
+fn lifecycle_remote_node_refuses_before_local_effect() {
+    runtime(async {
+        let mut case = Case::new(30943).await;
+        let mut socket = case.open().await;
+        let before = case.journal();
+        let id = case.queue.case.id.clone();
+        for verb in ["agent.start", "agent.restart", "agent.stop"] {
+            let ack = case.command(&mut socket, verb,
+                json!({"node_id":"remote-fixture", "target":id, "name":"wire-remote", "argv":["/bin/sh"]})).await;
+            assert_eq!(ack["error"]["code"], "unsupported_for_agent", "{ack}");
+            assert_eq!(case.journal(), before);
+        }
+        let remote = "00000000-0000-4000-8000-000000030943";
+        let mut peer = crate::peers::PeerSummaryState::new(&crate::config::PeerConfig {
+            name: "remote.example".into(),
+            ..Default::default()
+        });
+        peer.structured_agents
+            .push(crate::api::schema::PeerStructuredAgentSummary {
+                agent_id: remote.into(),
+                agent: None,
+                status: crate::api::schema::AgentStatus::Idle,
+                runtime: crate::structured::registry::StructuredRuntime::Structured,
+            });
+        case.queue.app.state.peer_summaries.push(peer);
+        for verb in ["agent.stop", "agent.restart"] {
+            let ack = case
+                .command(
+                    &mut socket,
+                    verb,
+                    json!({"target":remote,"reason":"fixture restart"}),
+                )
+                .await;
+            assert_eq!(ack["error"]["code"], "unsupported_for_agent", "{ack}");
+            assert_eq!(case.journal(), before);
+        }
+        case.stop().await;
+    });
+}

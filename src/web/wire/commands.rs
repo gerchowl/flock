@@ -46,10 +46,14 @@ struct Pending {
     receipt: parking_lot::Mutex<Receipt>,
     response: oneshot::Sender<ServerFrame>,
 }
+struct Completed {
+    key: (String, String),
+    lifecycle: Option<(String, Value, Result<Value, ErrorCode>)>,
+}
 /// Only the app owner touches App, runtime permission books and send admission.
 pub(super) struct Owner {
     rx: [mpsc::Receiver<Request>; 2],
-    completed: VecDeque<(String, String)>,
+    completed: VecDeque<Completed>,
     pending: Vec<Pending>,
 }
 /// Share the existing app-loop wake without introducing a second state owner.
@@ -77,6 +81,7 @@ impl Client {
 enum Outcome {
     Queued(Receipt),
     Decided(Value),
+    Replayed(Result<Value, ErrorCode>),
 }
 fn dispatch(
     app: &mut App,
@@ -99,11 +104,36 @@ fn missing_target(app: &App, target: &str) -> ErrorCode {
         ErrorCode::AgentNotFound
     }
 }
+fn lifecycle(verb: &str) -> bool {
+    matches!(verb, "agent.start" | "agent.restart" | "agent.stop")
+}
 fn dispatch_verb(
     app: &mut App,
     command: &Command,
     principal: &Principal<'_>,
 ) -> Result<Outcome, ErrorCode> {
+    if lifecycle(&command.verb) {
+        let mut args = command.args.clone();
+        if let Some(node) = args.as_object_mut().and_then(|args| args.remove("node_id")) {
+            let node = node.as_str().ok_or(ErrorCode::InvalidParams)?;
+            if app.node_id.as_deref() != Some(node) {
+                return Err(ErrorCode::UnsupportedForAgent);
+            }
+        }
+        if args
+            .get("target")
+            .and_then(Value::as_str)
+            .and_then(|target| app.locate_agent(target))
+            .is_some_and(|location| !location.local)
+        {
+            return Err(ErrorCode::UnsupportedForAgent);
+        }
+        let typed = serde_json::from_value(serde_json::json!({
+            "verb": command.verb, "args": args,
+        }))
+        .map_err(|_| ErrorCode::InvalidParams)?;
+        return app.wire_agent_lifecycle(typed).map(Outcome::Decided);
+    }
     match command.verb.as_str() {
         "agent.send" => {
             let args: crate::api::schema::AgentSendParams =
@@ -193,11 +223,15 @@ pub(super) fn ack(id: String, result: Result<Value, ErrorCode>) -> ServerFrame {
     }
 }
 impl Owner {
-    fn remember(&mut self, key: (String, String)) {
+    fn remember(
+        &mut self,
+        key: (String, String),
+        lifecycle: Option<(String, Value, Result<Value, ErrorCode>)>,
+    ) {
         if self.completed.len() == COMMAND_IDS {
             self.completed.pop_front();
         }
-        self.completed.push_back(key);
+        self.completed.push_back(Completed { key, lifecycle });
     }
     /// Revalidate under the token revocation lock through bounded admission.
     /// Queue completion is polled separately; no model or stdin completion is awaited.
@@ -216,7 +250,7 @@ impl Owner {
             let result = result.and_then(|result| {
                 serde_json::to_value(result).map_err(|_| ErrorCode::SerializationError)
             });
-            self.remember(pending.key.clone());
+            self.remember(pending.key.clone(), None);
             let _ = pending.response.send(ack(pending.key.1, result));
         }
         // Decisions have independent capacity even when every send receipt is pending.
@@ -235,20 +269,34 @@ impl Owner {
                     request.session.info.principal.clone(),
                     request.command.id.clone(),
                 );
-                let scope = if lane == 1 {
+                let is_lifecycle = lifecycle(&request.command.verb);
+                let scope = if is_lifecycle {
+                    Scope::Operate
+                } else if lane == 1 {
                     Scope::Answer
                 } else {
                     Scope::Send
                 };
                 // Only the owner mutates these sets; lookup need not hold the token lock.
-                let duplicate =
-                    self.completed.contains(&key) || self.pending.iter().any(|p| p.key == key);
+                let completed = self.completed.iter().find(|entry| entry.key == key);
+                let duplicate = completed.is_some() || self.pending.iter().any(|p| p.key == key);
+                let mut dispatched = false;
                 let outcome = request
                     .store
                     .admit(&request.session, scope, |token| {
                         if duplicate {
+                            if let Some((verb, args, result)) = completed
+                                .filter(|_| is_lifecycle)
+                                .and_then(|entry| entry.lifecycle.as_ref())
+                            {
+                                if verb != &request.command.verb || args != &request.command.args {
+                                    return Err(ErrorCode::InvalidParams);
+                                }
+                                return Ok(Outcome::Replayed(result.clone()));
+                            }
                             return Err(ErrorCode::SessionUnconfirmed);
                         }
+                        dispatched = true;
                         dispatch(app, &request.command, &Principal::Token(token))
                     })
                     .unwrap_or_else(|error| {
@@ -256,6 +304,7 @@ impl Owner {
                             TokenError::Revoked | TokenError::Unauthorized => {
                                 ErrorCode::AuthRevoked
                             }
+                            TokenError::Scope if is_lifecycle => ErrorCode::NotAuthorized,
                             TokenError::Scope => ErrorCode::Scope,
                             TokenError::Busy => ErrorCode::SessionBusy,
                             TokenError::Unsafe | TokenError::Io(_) => ErrorCode::InternalError,
@@ -268,10 +317,30 @@ impl Owner {
                         response: request.response,
                     }),
                     Ok(Outcome::Decided(value)) => {
-                        self.remember(key);
+                        let cached = is_lifecycle.then(|| {
+                            (
+                                request.command.verb.clone(),
+                                request.command.args.clone(),
+                                Ok(value.clone()),
+                            )
+                        });
+                        self.remember(key, cached);
                         let _ = request.response.send(ack(request.command.id, Ok(value)));
                     }
+                    Ok(Outcome::Replayed(result)) => {
+                        let _ = request.response.send(ack(request.command.id, result));
+                    }
                     Err(code) => {
+                        if is_lifecycle && dispatched {
+                            self.remember(
+                                key,
+                                Some((
+                                    request.command.verb.clone(),
+                                    request.command.args.clone(),
+                                    Err(code),
+                                )),
+                            );
+                        }
                         let _ = request.response.send(ack(request.command.id, Err(code)));
                     }
                 }

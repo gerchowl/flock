@@ -701,7 +701,7 @@ async fn connection(
                     }
                     Ok(ClientFrame::Unsub { sub_id }) => subscriptions.unsubscribe(&sub_id),
                     Ok(ClientFrame::Cmd { cmd_id, verb, args, resume_only }) => {
-                        let refusal = if !matches!(verb.as_str(), "agent.send" | "agent.decide") || read_only {
+                        let refusal = if !matches!(verb.as_str(), "agent.send" | "agent.decide" | "agent.start" | "agent.restart" | "agent.stop") || read_only {
                             Some(crate::api::error_code::ErrorCode::ServerVersionGap)
                         } else if cmd_id.len() > 128 {
                             Some(crate::api::error_code::ErrorCode::InvalidParams)

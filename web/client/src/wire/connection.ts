@@ -89,7 +89,7 @@ export function replaceProviderSession(connection: WireConnection, install: () =
  * The JSON wire version this client speaks: `WIRE_JSON_VERSION` in
  * `src/structured_wire/mod.rs`, which a test keeps in step.
  */
-export const WIRE_PROTOCOL = 1;
+export const WIRE_PROTOCOL = 2;
 
 /** ADR-0036 §5a's parameters, in milliseconds. */
 export const DEADLINES = {

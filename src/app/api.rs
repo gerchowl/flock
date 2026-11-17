@@ -49,6 +49,8 @@ pub(crate) mod structured_queue;
 mod structured_relay;
 mod structured_start;
 mod tabs;
+#[cfg(feature = "web")]
+mod wire_lifecycle;
 pub(crate) mod workspaces;
 mod worktrees;
 
