@@ -7,6 +7,19 @@ Flock exposes a local socket API for scripts and agents that need to inspect or 
 
 Most automation should start with the CLI wrappers. Use the raw socket API only when you need direct request/response control or long-lived event subscriptions.
 
+## Structured profile admission
+
+`profile.enable` requires client/server protocol 34. It takes `{ "plan": "<id>", "expect": "<digest>" }` and requires
+the local authenticated operator. Agents and pending or enrolled mesh relays
+receive `operator_only`. This incomplete build refuses even operator requests
+with `structured_profiles_not_ready`; no enable plan is consumed or execution
+started. ADR-0052 slice 17 adds the reviewed activation transaction.
+
+The server holds `structured_profiles.enabled` in memory, initially false;
+agent-editable configuration cannot set it. Slice 2 persists the switch with
+binding records. Every future profile execution path must pass shared admission
+before accessing secrets, starting processes or transferring mailbox ownership.
+
 ## Structured permission decision messages
 
 For the structured `agent.decide` contract, the optional `message` is normalized

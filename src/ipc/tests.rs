@@ -287,13 +287,7 @@ fn a_real_server_start_preserves_both_legacy_listener_inodes() {
         "onboarding = false\n[security]\nagent_account = \"none\"\n",
     )
     .unwrap();
-    let binary = std::env::current_exe()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("flk");
+    let binary = crate::test_support::flk_binary();
     let output_path = root.path().join("starter.log");
     let output = fs::File::create(&output_path).unwrap();
     let mut command = crate::process::TracedCommand::new(binary, "legacy-listener-starter");

@@ -1047,6 +1047,20 @@ Sync uses the selected `CLAUDE_CONFIG_DIR` and `CODEX_HOME` profiles (or their d
 
 Sync reports client, installed binary and server drift but does not perform a server handoff or stop sessions. Use `flk server live-handoff` when needed. Running agents need `flk agent restart` or an MCP reconnect to load the new bridge and tool catalog.
 
+## Structured profile admission
+
+`flk profile enable --plan <id> --expect <digest>` sends the operator-only
+`profile.enable` request. This build always refuses with
+`structured_profiles_not_ready` (exit 1, retry `never`), including for the
+operator. Enable requests require server protocol **34** before sending a mutation.
+Reviewed enable plans and production activation arrive in ADR-0052
+slice 17. Agents and mesh relays receive `operator_only` (exit 13).
+
+The `structured_profiles.enabled` switch is server memory, initially false,
+and cannot be set through `config.toml` or repository files. Slice 2 will persist
+it with operator binding records. Profile refusal does not fall back to legacy
+launch. Existing trusted single-account launches keep their current behavior.
+
 ## Structured session grants
 
 ```bash
