@@ -332,3 +332,154 @@ fn upgrade_initializes_private_floor_without_rewriting_store() {
     assert_eq!(fs::read(&floor).unwrap(), b"unknown floor version");
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn concurrent_saves_cannot_interleave_or_lower_the_acknowledged_floor() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+    let ceiling = Duration::from_secs(10);
+    let (root, path) = fixture();
+    let candidate = |revision| {
+        let mut raw = envelope(json!([]));
+        raw["policy_revision"] = json!(revision);
+        let mut store = BindingStore::default();
+        store.decode(raw);
+        store
+    };
+    candidate(1).save(&path).unwrap();
+    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+    let (held_tx, held_rx) = mpsc::sync_channel(1);
+    let held_path = path.clone();
+    let held = std::thread::spawn(move || {
+        let result = candidate(1).save_with_store_write(&held_path, |path, raw| {
+            entered_tx.send(()).map_err(io::Error::other)?;
+            release_rx
+                .recv_timeout(ceiling * 3)
+                .map_err(io::Error::other)?;
+            write_private_json(path, raw)
+        });
+        held_tx.send(result).unwrap();
+    });
+    entered_rx
+        .recv_timeout(ceiling)
+        .expect("first writer must reach its commit fence");
+    let (results_tx, results_rx) = mpsc::channel();
+    let mut workers = Vec::new();
+    for revision in 2..=8 {
+        let results_tx = results_tx.clone();
+        let path = path.clone();
+        workers.push(std::thread::spawn(move || {
+            results_tx
+                .send((revision, candidate(revision).save(&path)))
+                .unwrap();
+        }));
+    }
+    drop(results_tx);
+    let results: Result<Vec<_>, _> = (2..=8).map(|_| results_rx.recv_timeout(ceiling)).collect();
+    let during = floor_revision(&path).unwrap();
+    release_tx.send(()).unwrap();
+    let held_result = held_rx
+        .recv_timeout(ceiling)
+        .expect("held writer must finish");
+    // Check bounded completion before joining; a silent producer must fail here.
+    let results = results.expect("every contender must refuse within the fail ceiling");
+    held_result.unwrap();
+    held.join().unwrap();
+    for worker in workers {
+        worker.join().unwrap();
+    }
+    assert!(
+        results.iter().all(|(_, result)| result.is_err()),
+        "a contender interleaved with the held transaction"
+    );
+    assert_eq!(during, Some(1), "a refused contender advanced the floor");
+    candidate(8).save(&path).unwrap();
+    let highest_acknowledged = 8;
+    assert!(floor_revision(&path).unwrap().unwrap() >= highest_acknowledged);
+    let mut older = envelope(json!([]));
+    older["policy_revision"] = json!(3);
+    fs::write(&path, serde_json::to_vec(&older).unwrap()).unwrap();
+    let restarted = crate::structured::profiles::ProfileAdmission::load(&path);
+    assert_eq!(
+        restarted.status(true)["policy_revision"],
+        highest_acknowledged
+    );
+    assert_eq!(
+        restarted.admit().unwrap_err().code().as_str(),
+        "policy_revision_regressed"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn linked_store_floor_and_lock_never_confer_authority() {
+    for extension in ["json", "floor.json", "lock"] {
+        let (root, path) = fixture();
+        let raw = serde_json::to_vec(&envelope(json!([binding()]))).unwrap();
+        fs::write(&path, &raw).unwrap();
+        let referent = root.join("referent");
+        fs::write(
+            &referent,
+            if extension == "json" {
+                raw.as_slice()
+            } else {
+                b"7"
+            },
+        )
+        .unwrap();
+        let linked = path.with_extension(extension);
+        if linked.exists() {
+            fs::remove_file(&linked).unwrap();
+        }
+        std::os::unix::fs::symlink(&referent, &linked).unwrap();
+        let gate = crate::structured::profiles::ProfileAdmission::load(&path);
+        assert_eq!(
+            gate.admit().unwrap_err().code().as_str(),
+            "policy_revision_unavailable",
+            "followed {extension}"
+        );
+        assert_eq!(gate.status(true)["bindings"], json!([]));
+        assert_eq!(gate.status(false), json!({}));
+        assert!(fs::symlink_metadata(&linked)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            fs::read(&referent).unwrap(),
+            if extension == "json" {
+                raw.as_slice()
+            } else {
+                b"7"
+            }
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn external_lock_holder_refuses_initialization_and_save_without_interleaving() {
+    let (root, path) = fixture();
+    let raw = serde_json::to_vec(&envelope(json!([binding()]))).unwrap();
+    fs::write(&path, &raw).unwrap();
+    let file = fs::File::create(path.with_extension("lock")).unwrap();
+    let mut holder = crate::platform::file_lock::inherited_holder::Holder::lock(&file).unwrap();
+    drop(file);
+    let gate = crate::structured::profiles::ProfileAdmission::load(&path);
+    let fault = gate.admit().unwrap_err().code().as_str();
+    let mut candidate = BindingStore::default();
+    candidate.decode(envelope(json!([binding()])));
+    let refused = candidate.save(&path).is_err();
+    let initialized = path.with_extension("floor.json").exists();
+    holder.verify().unwrap();
+    drop(holder);
+    assert_eq!(fault, "policy_revision_unavailable");
+    assert!(refused);
+    assert!(
+        !initialized,
+        "floor initialized despite another process holding authority"
+    );
+    assert_eq!(fs::read(&path).unwrap(), raw);
+    candidate.save(&path).unwrap();
+    fs::remove_dir_all(root).unwrap();
+}

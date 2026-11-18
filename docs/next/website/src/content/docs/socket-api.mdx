@@ -26,7 +26,12 @@ switch withheld. Operator status reports `policy_revision` as the floor and
 and enablement return `policy_revision_regressed`. Unreadable floor or policy state
 returns `policy_revision_unavailable`. Both faults have retry class `after_human`:
 operator recovery is required. Other server operations continue. A missing
-floor is initialized from an existing store on first upgrade.
+floor is initialized from an existing store on first upgrade. Policy load and
+save transactions hold both an in-process mutex and an exclusive advisory lock
+on the stable `profile-bindings.lock`; contention refuses without waiting.
+Symlinked, non-regular or foreign-owned store/floor/lock files produce
+`policy_revision_unavailable` during load. Temporary files are created exclusively,
+and the lock file is never replaced during policy updates.
 
 `profile.status` accepts `{}`. The authenticated local operator receives
 `policy_revision`, `execution_switch`, and binding records containing explicit

@@ -603,7 +603,15 @@ rename and directory-fsync discipline. First upgrade initializes a missing floor
 from an existing document. A document below the floor is retained unchanged;
 profiles refuse with `policy_revision_regressed {store, floor}`, operator status
 reports the floor and fault, and other server operations continue. Unreadable
-floor/policy state refuses profiles with `policy_revision_unavailable`. Non-operator status projections omit binding and account metadata.
+floor/policy state refuses profiles with `policy_revision_unavailable`.
+One store-owned in-process mutex and an exclusive advisory lock on the stable
+`profile-bindings.lock` serialize the complete read/check/floor/write/acknowledgment
+transaction, including load-time floor initialization. Revision allocation in 2b
+must run inside that same section. Contention refuses without waiting or making
+partial observations. The floor is updated to `max(existing, proposed)` under
+both locks. Store, floor and lock opens do not follow final-component symlinks;
+only regular files owned by the server user can supply policy or lock ownership.
+Temporary files are created exclusively beside their destination. Non-operator status projections omit binding and account metadata.
 Binding records contain `binding_id`, explicit `target` (`repo_id`, `node_ids`,
 `agent_ids`), `account_alias`, `credential_ref`, `credential_generation`,
 `bundle_digests`, `grants`, `revision` and nullable `revoked` evidence (reason,

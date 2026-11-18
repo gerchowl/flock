@@ -112,6 +112,17 @@ impl BindingStore {
     /// Load operator state without consulting repository or agent configuration.
     /// Older snapshots cannot lower a revision already observed by this authority.
     pub fn load(&mut self, path: &Path) {
+        if Self::transaction(path, || {
+            self.load_locked(path);
+            Ok(())
+        })
+        .is_err()
+        {
+            self.refuse(super::ProfileRefusal::PolicyRevisionUnavailable);
+        }
+    }
+
+    fn load_locked(&mut self, path: &Path) {
         let floor = match floor_revision(path) {
             Ok(floor) => self.policy_revision.max(floor.unwrap_or_default()),
             Err(_) => {
@@ -120,8 +131,7 @@ impl BindingStore {
             }
         };
         self.policy_revision = floor;
-        let loaded = fs::read(path)
-            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).map_err(io::Error::other));
+        let loaded = read_policy_json(path);
         let raw = match loaded {
             Ok(raw) => raw,
             Err(e) if e.kind() == io::ErrorKind::NotFound && floor == 0 => return,
@@ -238,16 +248,41 @@ impl BindingStore {
         path: &Path,
         write: impl FnOnce(&Path, &Value) -> io::Result<()>,
     ) -> io::Result<()> {
-        let mut disk = Self::default();
-        disk.load(path);
-        if self.refusal().is_some()
-            || disk.refusal().is_some()
-            || disk.policy_revision > self.policy_revision
-        {
-            return Err(io::Error::other("profile policy persistence refused"));
-        }
-        advance_floor(path, self.policy_revision)?;
-        write(path, &self.snapshot())
+        Self::transaction(path, || {
+            let mut disk = Self::default();
+            disk.load_locked(path);
+            if self.refusal().is_some()
+                || disk.refusal().is_some()
+                || disk.policy_revision > self.policy_revision
+            {
+                return Err(io::Error::other("profile policy persistence refused"));
+            }
+            advance_floor(path, self.policy_revision)?;
+            write(path, &self.snapshot())
+        })
+    }
+
+    // All authority observations and effects, including future revision allocation,
+    // belong inside this section. Never delete or replace the stable lock file.
+    fn transaction<T>(path: &Path, apply: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
+        static OWNER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _owner = OWNER.try_lock().map_err(|_| {
+            io::Error::new(io::ErrorKind::WouldBlock, "profile policy transaction busy")
+        })?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| io::Error::other("missing state directory"))?;
+        fs::create_dir_all(parent)?;
+        let file = crate::platform::profile_bindings::open_owned_regular(
+            &path.with_extension("lock"),
+            true,
+        )?;
+        let lock = crate::platform::file_lock::LockFile::new(file);
+        lock.try_lock().map_err(|error| match error {
+            fs::TryLockError::WouldBlock => io::ErrorKind::WouldBlock.into(),
+            fs::TryLockError::Error(error) => error,
+        })?;
+        apply()
     }
 
     fn snapshot(&self) -> Value {
@@ -294,27 +329,40 @@ impl BindingStore {
     }
 }
 
+fn read_policy_json(path: &Path) -> io::Result<Value> {
+    serde_json::from_reader(crate::platform::profile_bindings::open_owned_regular(
+        path, false,
+    )?)
+    .map_err(io::Error::other)
+}
+
 fn floor_revision(path: &Path) -> io::Result<Option<u64>> {
-    match fs::read(path.with_extension("floor.json")) {
-        Ok(bytes) => serde_json::from_slice(&bytes)
+    match read_policy_json(&path.with_extension("floor.json")) {
+        Ok(value) => value
+            .as_u64()
             .map(Some)
-            .map_err(io::Error::other),
+            .ok_or_else(|| io::Error::other("invalid profile revision floor")),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e),
     }
 }
 
+// The transaction owns both locks throughout this read/compare/write.
 fn advance_floor(path: &Path, revision: u64) -> io::Result<()> {
-    match floor_revision(path)? {
-        Some(floor) if floor > revision => {
-            Err(io::Error::other("profile revision floor would regress"))
-        }
-        Some(floor) if floor == revision => Ok(()),
-        _ => write_private_json(&path.with_extension("floor.json"), &json!(revision)),
+    let current = floor_revision(path)?;
+    let next = current.unwrap_or_default().max(revision);
+    if current == Some(next) {
+        return Ok(());
     }
+    write_private_json(&path.with_extension("floor.json"), &json!(next))
 }
 
 fn write_private_json(path: &Path, value: &Value) -> io::Result<()> {
+    match crate::platform::profile_bindings::open_owned_regular(path, false) {
+        Ok(_) => (),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => (),
+        Err(error) => return Err(error),
+    }
     let parent = path
         .parent()
         .ok_or_else(|| io::Error::other("missing state directory"))?;
@@ -325,12 +373,12 @@ fn write_private_json(path: &Path, value: &Value) -> io::Result<()> {
         ".profile-bindings-{:032x}.tmp",
         u128::from_le_bytes(entropy)
     ));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temp)?;
     let result = (|| {
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&temp)?;
         serde_json::to_writer(&mut file, value)?;
         file.flush()?;
         file.sync_all()?;
