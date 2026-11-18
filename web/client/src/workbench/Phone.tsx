@@ -27,6 +27,7 @@ export type PhoneProps = {
   readonly fleetNote: () => string | null;
   readonly agent: () => string | null;
   readonly row: () => AgentRow | undefined;
+  readonly unavailable: () => string | null;
   /** Focuses the agent; true when that pushed a layout tile. */
   readonly open: (agentId: string) => boolean;
   readonly back: () => void;
@@ -140,15 +141,17 @@ export function PhoneWorkbench(props: PhoneProps): JSX.Element {
               </p>
             </Show>
             <div class="phone__body">
-              <Transcript
-                transport={props.transport}
-                stream={`agent/${agent}`}
-                source={props.source}
-                onEntry={(seq, text) => props.composer.observe(agent, seq, text)}
-                onCurrent={(current) => props.composer.current(agent, current)}
-              />
+              <Show when={props.unavailable() === null} fallback={<p class="focus__empty">{props.unavailable()}</p>}>
+                <Transcript
+                  transport={props.transport}
+                  stream={`agent/${agent}`}
+                  source={props.source}
+                  onEntry={(seq, text) => props.composer.observe(agent, seq, text)}
+                  onCurrent={(current) => props.composer.current(agent, current)}
+                />
+              </Show>
             </div>
-            <Composer agent={agent} row={props.row()} sender={props.sender} state={props.composer} />
+            <Composer unavailable={props.unavailable()} agent={agent} row={props.row()} sender={props.sender} state={props.composer} />
           </main>
           );
         }}

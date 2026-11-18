@@ -101,6 +101,11 @@ export const DEADLINES = {
   healthy: 60_000,
 } as const;
 
+/** Resume probes wait 3 s, well below the normal 45 s liveness window. */
+export const RESUME_PROBE_MS = 3_000;
+/** Older servers cannot answer client pings: allow their 15 s heartbeat plus 2 s scheduling grace. */
+export const RESUME_FALLBACK_MS = 15_000 + 2_000;
+
 /** ADR-0038 §3's connection states. */
 export type ConnectionState =
   | "Disconnected"
@@ -224,7 +229,7 @@ type Snapshot = {
 
 type Welcome = Extract<ServerFrame, { t: "welcome" }>;
 
-type Timer = "connect" | "handshake" | "liveness" | "backoff" | "healthy";
+type Timer = "probe" | "connect" | "handshake" | "liveness" | "backoff" | "healthy";
 
 const NORMAL = 1000;
 const PROTOCOL_ERROR = 1002;
@@ -242,6 +247,8 @@ export class WireConnection {
   #awaiting = false;
   #generation = 0;
   #attempt = 0;
+  #nextProbe = 0;
+  #probeNonce: string | null = null;
   #acks = 0;
   #timers = new Map<Timer, TimerHandle>();
   #subs = new Map<string, Sub>();
@@ -438,6 +445,17 @@ export class WireConnection {
     }
   }
 
+  /** Probe a resumed socket once, preserving the visible state until a miss. */
+  resume(): void {
+    if (!this.#connected() || this.#timers.has("probe")) return;
+    const capable = this.#welcome?.capabilities.includes("resume_probe") === true;
+    this.#probeNonce = capable ? `resume/${++this.#nextProbe}` : null;
+    // Frozen timers may already be overdue. Give this socket its bounded resume window.
+    this.#clear("liveness");
+    this.#arm("probe", capable ? RESUME_PROBE_MS : RESUME_FALLBACK_MS, () => this.#lost(NORMAL, "the resume probe deadline elapsed"));
+    if (this.#probeNonce !== null) this.#send({ t: "ping", nonce: this.#probeNonce });
+  }
+
   /**
    * The next sub id. The counter lives here, not in a view or adapter, so
    * remounting one cannot reuse an id whose late frames may still be in
@@ -618,8 +636,9 @@ export class WireConnection {
   #abandon(closeCode: number | null, reason: string): void {
     this.#generation++;
     this.#awaiting = false;
-    for (const timer of ["connect", "handshake", "liveness"] as const) this.#clear(timer);
+    for (const timer of ["connect", "handshake", "liveness", "probe"] as const) this.#clear(timer);
     for (const sub of this.#subs.values()) this.#stopProgress(sub);
+    this.#probeNonce = null;
     this.#outbox.socketLost();
     this.#ended.clear();
     const socket = this.#socket;
@@ -648,6 +667,15 @@ export class WireConnection {
       return frame.t === "welcome" ? this.#welcomed(frame) : this.#protocolError(`${frame.t} before welcome`);
     }
     if (!this.#connected()) return;
+    if (frame.t === "pong") {
+      // Only the outstanding nonce proves the round trip; late and replayed replies renew nothing.
+      if (this.#probeNonce === null || frame.nonce !== this.#probeNonce) return;
+      this.#probeNonce = null;
+      this.#clear("probe");
+      this.#renewLiveness();
+      return;
+    }
+    if (this.#probeNonce === null) this.#clear("probe");
     this.#renewLiveness();
     switch (frame.t) {
       case "welcome":
@@ -745,7 +773,7 @@ export class WireConnection {
     this.#changed();
   }
 
-  #streamFrame(frame: Exclude<ServerFrame, { t: "welcome" | "ping" | "ack" }>): void {
+  #streamFrame(frame: Exclude<ServerFrame, { t: "welcome" | "ping" | "pong" | "ack" }>): void {
     const sub = this.#subs.get(frame.sub_id);
     if (sub === undefined) {
       if (this.#ended.has(frame.sub_id)) return;

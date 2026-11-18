@@ -159,14 +159,14 @@ test("server conformance selection excludes the client-only fleet fixture", asyn
   expect(coverage("fleet-lite", await load("fleet-lite"))).toEqual(["client-only"]);
 });
 
-// ADR-0036 S6/#1429 and #2580: command scenarios use the ClientOpen grants.
+// ADR-0036 S6/#1429 and #2580: command scenarios advertise ClientOpen grants and transport features.
 for (const name of ["permission-decision", "agent-send", "token-revoked"]) {
-  test(`${name} fixture declares its exact ClientOpen grants`, async () => {
+  test(`${name} fixture declares exact ClientOpen grants and the resume capability`, async () => {
     const welcome = (await load(name)).find(
       (line) => line.step === "send" && line.frame.t === "welcome",
     );
     expect(welcome?.step === "send" && welcome.frame.t === "welcome" && welcome.frame.capabilities)
-      .toEqual(["read", "send", "answer", "operate"]);
+      .toEqual(["read", "send", "answer", "operate", "resume_probe"]);
   });
 }
 
@@ -205,14 +205,14 @@ test("permission script assigns one valid principal per scripted token", async (
 });
 
 // The real endpoint must issue this exact principal; no received-frame normalization.
-test("protocol trace uses a valid literal principal and exact ClientOpen grants", async () => {
+test("protocol trace declares its principal, exact ClientOpen grants and resume capability", async () => {
   const welcome = (await load("unknown-subscription")).find(
     (line) => line.step === "send" && line.frame.t === "welcome",
   );
   if (welcome?.step !== "send" || welcome.frame.t !== "welcome") throw new Error("missing welcome");
   expect(welcome.frame.principal).toBe("0123456789abcdef0123456789abcdef");
   expect(welcome.frame.server_epoch).toBe("00000000000000000000000000000001");
-  expect(welcome.frame.capabilities).toEqual(["read", "send", "answer", "operate"]);
+  expect(welcome.frame.capabilities).toEqual(["read", "send", "answer", "operate", "resume_probe"]);
 });
 
 

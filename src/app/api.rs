@@ -1,6 +1,8 @@
 #[cfg(test)]
 mod peer_uid_tests;
 #[cfg(test)]
+mod profile_tests;
+#[cfg(test)]
 mod scoped_mcp_tests;
 #[cfg(test)]
 mod structured_lease_tests;
@@ -1487,6 +1489,7 @@ impl App {
         if matches!(
             request.method,
             Method::AgentStop(_)
+                | Method::ProfileEnable(_)
                 | Method::AgentFork(_)
                 | Method::ServerStop(_)
                 | Method::ServerReloadConfig(_)
@@ -1510,6 +1513,7 @@ impl App {
         let code = if matches!(
             request.method,
             Method::StructuredGrantsList(_)
+                | Method::ProfileEnable(_)
                 | Method::StructuredGrantsRevoke(_)
                 | Method::ServerStop(_)
                 | Method::ServerReloadConfig(_)
@@ -1613,6 +1617,26 @@ impl App {
             );
         }
         let response = match request.method {
+            Method::ProfileEnable(_) => {
+                if !self.caller_is_local_operator() {
+                    return responses::encode_error(
+                        request.id,
+                        crate::api::error_code::ErrorCode::OperatorOnly.as_str(),
+                        "profile enable requires the local operator",
+                    );
+                }
+                if let Err(refusal) = self.structured_profiles.enable() {
+                    return responses::encode_error(
+                        request.id,
+                        refusal.code().as_str(),
+                        refusal.message(),
+                    );
+                }
+                SuccessResponse {
+                    id: request.id,
+                    result: ResponseResult::Ok {},
+                }
+            }
             Method::StructuredGrantsList(p) => {
                 return self.handle_structured_grants(
                     request.id,

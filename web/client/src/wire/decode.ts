@@ -32,6 +32,7 @@ const SHAPES: Shapes = {
     idempotency_window_ms: req("number"),
   },
   ping: { nonce: req("string") },
+  pong: { nonce: req("string") },
   ev: { sub_id: req("string"), stream: req("string"), seq: opt("number"), ts_ms: req("number"), ev: req("json") },
   synced: { sub_id: req("string"), seq: req("number") },
   subfail: { sub_id: req("string"), code: req("string"), message: req("string") },

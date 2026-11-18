@@ -150,7 +150,7 @@ fn socket_mint_is_fixed_scoped_shared_memory_only_and_renews_independently() {
         let mut ws = Socket::open(&server).await;
         let welcome = ws.hello(WIRE_JSON_VERSION, &token.0).await;
         assert_eq!(
-            welcome["capabilities"],
+            granted_scopes(&welcome),
             json!(["read", "send", "answer", "operate"])
         );
         let renewed = mint(&mut app).await;

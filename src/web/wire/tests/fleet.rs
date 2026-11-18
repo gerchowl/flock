@@ -98,7 +98,7 @@ fn fleet_endpoint_empty_and_nonempty_bootstrap() {
 struct Controlled {
     subscriptions: super::super::subscriptions::Subscriptions,
     frames: mpsc::Receiver<super::super::output::Delivery>,
-    _priority: mpsc::Receiver<Message>,
+    _priority: mpsc::Receiver<super::super::output::Control>,
 }
 impl Controlled {
     fn new(case: &Case) -> Self {

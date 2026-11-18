@@ -12,6 +12,9 @@ pub struct Request {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "method", content = "params")]
 pub enum Method {
+    /// Operator-only request to enable reviewed profile execution (ADR-0052 §9).
+    #[serde(rename = "profile.enable")]
+    ProfileEnable(ProfileEnableParams),
     #[serde(rename = "ping")]
     Ping(PingParams),
     #[serde(rename = "structured.grants.list")]
@@ -545,9 +548,23 @@ impl Method {
             | Self::FleetPause(_)
             | Self::FleetResume(_)
             | Self::StructuredGrantsRevoke(_)
+            | Self::ProfileEnable(_)
             | Self::RevertRun(_) => true,
         }
     }
+}
+
+/// Reviewed enable transaction identifiers (ADR-0052 §9).
+///
+/// Slice 1 refuses before consulting a plan. Slice 17 implements plan lookup,
+/// digest/revision validation and the complete production activation transaction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileEnableParams {
+    /// Operator-reviewed plan identifier.
+    pub plan: String,
+    /// Expected immutable review-plan digest.
+    pub expect: String,
 }
 
 /// `revert.run` params.

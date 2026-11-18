@@ -6,6 +6,12 @@ use std::time::{Duration, Instant};
 const LIVENESS_WINDOW: Duration = Duration::from_millis(LIVENESS_WINDOW_MS);
 /// Maximum retained outstanding ping identities per socket.
 const MAX_OUTSTANDING_PINGS: usize = 3;
+/// Shared JSON heartbeat/probe nonce ceiling, larger than epoch/connection/sequence identities.
+const NONCE_BYTES: usize = 128;
+/// Nonces are opaque, nonempty UTF-8 strings with bounded retained and echoed bytes.
+pub(super) fn valid_nonce(nonce: &str) -> bool {
+    !nonce.is_empty() && nonce.len() <= NONCE_BYTES
+}
 /// Supplied monotonic clock; deadlines share the same origin as received frames.
 pub(crate) trait Clock: Send + Sync {
     /// Current monotonic instant, in the same domain as every deadline.
@@ -55,6 +61,9 @@ impl Heartbeat {
         Some(nonce)
     }
     pub fn pong(&mut self, nonce: &str, now: Instant) {
+        if !valid_nonce(nonce) {
+            return;
+        }
         if let Some(at) = self
             .pending
             .iter()
