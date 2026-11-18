@@ -35,6 +35,7 @@ impl Case {
         self.registry
             .register(Record {
                 harness_established: false,
+                profile_identity: None,
                 runtime: StructuredRuntime::Structured,
                 agent_id: id.into(),
                 name: Some(id.into()),

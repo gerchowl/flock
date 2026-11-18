@@ -5,6 +5,7 @@ use crate::structured::claude::SessionEvent;
 pub(super) fn record(id: &str) -> Record {
     Record {
         harness_established: false,
+        profile_identity: None,
         runtime: crate::structured::registry::StructuredRuntime::Structured,
         agent_id: id.into(),
         name: Some(format!("name-{id}")),
@@ -469,4 +470,75 @@ fn malformed_establishment_field_is_preserved_without_failing_registry_load() {
     assert_eq!(registry.records().len(), 1);
     assert_eq!(registry.retained_records().len(), 1);
     assert_eq!(serde_json::to_value(&registry).unwrap(), raw);
+}
+
+#[test]
+fn binding_identity_is_pinned_only_by_establishment_and_refuses_changed_continuations() {
+    let mut registry = Registry::default();
+    let id = "agent_fixture_a";
+    let generation = registry.register(record(id)).unwrap();
+    let identity = ProfileIdentity {
+        profile: "fixture".into(),
+        binding: Some(BindingIdentity {
+            binding_id: "binding-fixture".into(),
+            revision: 7,
+        }),
+    };
+    registry
+        .stage_profile(id, generation, Some(identity.clone()))
+        .unwrap();
+    assert!(serde_json::to_value(&registry).unwrap()[0]
+        .get("profile_identity")
+        .is_none());
+    let init = |session: &str| {
+        SessionEvent::parse(&serde_json::json!({"type":"system","subtype":"init","session_id":session,"model":"fixture-model","claude_code_version":"2.1.296","tools":[]}).to_string(), "2.1.296")
+    };
+    send(
+        &mut registry,
+        id,
+        generation,
+        &init("wrong-session"),
+        Instant::now(),
+    );
+    assert!(registry.get(id).unwrap().0.profile_identity.is_none());
+    send(
+        &mut registry,
+        id,
+        generation,
+        &init("session-agent_fixture_a"),
+        Instant::now(),
+    );
+    assert!(registry.take_establishment_dirty());
+    let raw = serde_json::to_value(registry.snapshot()).unwrap();
+    assert_eq!(raw[0]["profile_identity"]["binding"]["revision"], 7);
+    let restored: Registry = serde_json::from_value(raw.clone()).unwrap();
+    let record = restored.get(id).unwrap().0;
+    assert_eq!(record.profile_identity.as_ref(), Some(&identity));
+    assert!(record.admit_profile(Some(&identity)).is_ok());
+    assert_eq!(
+        record.admit_profile(None),
+        Err(crate::api::error_code::ErrorCode::StructuredProfileMismatch)
+    );
+    let mut switched = identity.clone();
+    switched.binding.as_mut().unwrap().revision = 8;
+    let mut other = identity.clone();
+    other.binding.as_mut().unwrap().binding_id = "different-binding".into();
+    for different in [
+        switched,
+        other,
+        ProfileIdentity {
+            profile: "fixture".into(),
+            binding: None,
+        },
+    ] {
+        assert_eq!(
+            record.admit_profile(Some(&different)),
+            Err(crate::api::error_code::ErrorCode::StructuredProfileMismatch)
+        );
+    }
+    let mut unknown = raw;
+    unknown[0]["profile_identity"]["future"] = serde_json::json!(true);
+    let restored: Registry = serde_json::from_value(unknown.clone()).unwrap();
+    assert!(restored.records().is_empty());
+    assert_eq!(serde_json::to_value(&restored).unwrap(), unknown);
 }

@@ -133,6 +133,7 @@ impl AppQueue {
         let listener = UnixListener::bind(socket).unwrap();
         listener.set_nonblocking(true).unwrap();
         let launch = Launch {
+            profile_identity: None,
             opening_turn: None,
             storage: Default::default(),
             admission: None,

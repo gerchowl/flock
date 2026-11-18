@@ -514,10 +514,13 @@ native rollout importer. No Codex support is implied by the Claude slices.
 ### 9. Operator command and recovery contract
 
 These are target CLI/API contracts. Slice 1 exposes `profile.enable`, which
-refuses execution while the build is incomplete. Slice 2b-1 adds the socket-only
+refuses execution while the build is incomplete. Slice 2b-1 adds
 `profile.plan {action: bind}`, `profile.bind` and binding-only `profile.revoke`
-preparation APIs; other transactions below remain unavailable. CLI preparation
-commands and session establishment/continuation pins follow in 2b-2. One operator controls the authority; ordinary relay or harness
+preparation APIs. Slice 2b-2 adds their CLI commands plus `profile status`, and
+establishment/continuation identity pins. Lists use comma-separated IDs; budget
+and preset flags and other transactions below remain unavailable. Current legacy
+launches pin `structured.profile` with no operator binding; resolved binding pins
+carry the binding ID and revision when a later production launch path supplies them. One operator controls the authority; ordinary relay or harness
 principals cannot invoke these mutations. Authenticated operator transport remains
 required on remote nodes.
 

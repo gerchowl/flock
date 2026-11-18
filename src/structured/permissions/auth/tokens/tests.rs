@@ -923,6 +923,7 @@ fn pending_revoke_refuses_only_the_new_subscription_and_preserves_siblings() {
         registry
             .register(crate::structured::registry::Record {
                 harness_established: false,
+                profile_identity: None,
                 runtime: crate::structured::registry::StructuredRuntime::Structured,
                 agent_id: "fixture-agent".into(),
                 name: None,

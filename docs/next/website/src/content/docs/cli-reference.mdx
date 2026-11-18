@@ -1062,10 +1062,37 @@ operator. Enable requests require server protocol **34** before sending a mutati
 Reviewed enable plans and production activation arrive in ADR-0052
 slice 17. Agents and mesh relays receive `operator_only` (exit 13).
 
-The `structured_profiles.enabled` switch is server memory, initially false,
-and cannot be set through `config.toml` or repository files. Slice 2 will persist
-it with operator binding records. Profile refusal does not fall back to legacy
-launch. Existing trusted single-account launches keep their current behavior.
+The execution switch is persisted in server-owned `profile-bindings.json`, initially
+false, and cannot be set through `config.toml` or repository files. Profile refusal
+does not fall back to legacy launch. Production readiness remains false.
+
+Binding preparation is available without enabling execution:
+
+```bash
+flk profile plan bind --repo <repo-id> --nodes <node-ids> --agents <agent-ids> --account <alias> --bundle <digests> --credential-ref <ref> --generation <n> [--grants <grant-ids>] [--binding <existing-id>] --format json
+flk profile bind --plan <id> --expect <digest> --format json
+flk profile status --format json
+flk profile revoke --binding <id> --reason <text> --format json
+```
+
+Lists use comma-separated identifiers. Omit `--binding` to allocate a new identity;
+omit `--grants` for an empty grant list. Budget and preset flags, adoption, rotation,
+and fleet recovery are not available in this slice. Credential references are
+identifiers only. A plan is an immutable five-minute review; `bind` must carry its
+returned `plan` and `expect`. Commit refuses altered, expired or stale reviews.
+Successful mutations return durable operation receipts; repeating the same bind
+or revocation returns its original receipt without allocating another revision.
+Revocation is terminal. The commands use the shared typed error and exit mapping;
+`--format json` includes the registered code, retry class and exit on failure.
+
+Structured conversations pin their actual launch profile when a matching harness
+init establishes the session. A continuation after switching `structured.profile`
+is refused with `structured_profile_mismatch` (exit 1, retry `after_human`) before
+launch or credential access. Restore the recorded profile or explicitly start a
+new conversation. Records without a profile pin retain legacy continuation
+behavior. The pin also represents an optional resolved binding ID/revision;
+current trusted single-account launches have no operator binding, and binding
+execution remains unavailable.
 
 ## Structured session grants
 
