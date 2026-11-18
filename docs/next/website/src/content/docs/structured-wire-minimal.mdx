@@ -278,6 +278,40 @@ a handle matches by ID. Unknown records remain untouched, and invalid permission
 headers are logged and preserved rather than failing the entire recovery scan.
 
 
+## Agent lifecycle commands
+
+JSON wire version 2 accepts `agent.start`, `agent.restart`, and `agent.stop`.
+Their arguments reuse the socket API's `AgentStartParams`, `AgentRestartParams`,
+and `AgentTarget`. All three require `operate`; a send-only token receives
+`not_authorized` before argument or target lookup. The generated
+`AgentLifecycleCommand` TypeScript type lists the verbs and argument types.
+
+Lifecycle arguments may additionally carry `node_id`. Omit it for this server,
+or supply this server's pinned NodeId. Another node receives
+`unsupported_for_agent` before any local dispatch. A target agent ID known
+through the remote fleet directory receives the same refusal, even without
+`node_id`. Remote lifecycle forwarding
+remains gated by ADR-0043.
+
+An authenticated replay of the same principal, command ID, verb and arguments
+returns the first lifecycle ack while that entry remains in the owner's bounded
+1,024-command retention set. Reusing a retained ID with different arguments or
+verb refuses `invalid_params`. Revocation and scope checks precede replay.
+An uncertain retry with `resume_only: true` and no retained result refuses
+`session_unconfirmed`; it never launches again. Retention is in memory and
+ends on server restart or eviction.
+
+`agent.start` permits fresh launches through the existing server-side launch
+gates, including `structured_needs_agent_user`. It cannot resume a structured
+record: that receives `operator_only`. Structured `agent.stop` also receives
+`operator_only`; structured `agent.restart` retains the socket backend's
+`runtime_unsupported` refusal. The socket API also refuses PTY `agent.stop`
+with `runtime_unsupported`; the wire preserves that behavior. These refusals
+preserve the session and journal.
+[ADR-0036 §1a](https://github.com/gerchowl/flock/blob/dev/docs/adr/0036-structured-agent-sessions.md#1a-identity-and-the-operator-boundary-for-structured-agents)
+reserves structured resume and stop authority independently of token scope.
+ADR-0052 slice 21 and a future authority amendment govern GUI structured controls.
+
 ## Unsupported command verbs
 
 After authentication, an otherwise valid, bounded `cmd` frame with an unknown
