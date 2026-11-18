@@ -1509,6 +1509,10 @@ impl App {
                 "this operation requires local authority, not a mesh relay",
             ));
         }
+        // Status has no non-operator fields; origin is resolved again at projection.
+        if matches!(request.method, Method::ProfileStatus(_)) {
+            return None;
+        }
         let uid = self.current_api_peer_uid?;
         let code = if matches!(
             request.method,
@@ -1579,6 +1583,15 @@ impl App {
         if let Some(response) = self.peer_uid_refusal(&request) {
             return response;
         }
+        if matches!(request.method, Method::ProfileStatus(_)) {
+            let operator = self.caller_is_local_operator();
+            return responses::encode_success(
+                request.id,
+                ResponseResult::ProfileStatus {
+                    status: self.structured_profiles.status(operator),
+                },
+            );
+        }
         if self.waits_for_mesh_recovery(&request.method) {
             self.pending_recovery_park = Some((
                 request,
@@ -1617,6 +1630,7 @@ impl App {
             );
         }
         let response = match request.method {
+            Method::ProfileStatus(_) => unreachable!("status projected before relay dispatch"),
             Method::ProfileEnable(_) => {
                 if !self.caller_is_local_operator() {
                     return responses::encode_error(
