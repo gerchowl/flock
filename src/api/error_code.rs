@@ -128,6 +128,12 @@ error_codes! {
         AlreadyHibernated = "already_hibernated",
         AmbiguousWorktreeBranch = "ambiguous_worktree_branch",
         AtLineageDepth = "at_lineage_depth",
+        /// Caller pane identity could not be attested (CLI exit 1, retry never).
+        /// Message verbs name the missing evidence and direct the operator to
+        /// structured-agent migration (#3066) or `flk msg read --pane <id>`.
+        /// MCP reports -32000 with `data.refusal = "caller_pane_unresolved"`,
+        /// `data.exit = 1` and `data.retry = "never"`. Explicit pane selection
+        /// does not restore authority to a legacy handoff pane.
         CallerPaneUnresolved = "caller_pane_unresolved",
         ChannelNotOwner = "channel_not_owner",
         ChannelUnauthorized = "channel_unauthorized",

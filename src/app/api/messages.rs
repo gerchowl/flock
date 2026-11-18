@@ -197,9 +197,9 @@ pub(crate) struct WakeSuppression {
 impl App {
     pub(super) fn handle_msg_send(&mut self, id: String, params: MsgSendParams) -> String {
         if self.lease_caller() == crate::structured::lease::Caller::Uncertain {
-            return encode_error(
+            return self.message_authority_error(
                 id,
-                "msg_not_allowed",
+                crate::api::error_code::ErrorCode::MsgNotAllowed,
                 "structured caller identity is unresolved",
             );
         }
@@ -339,9 +339,9 @@ impl App {
 
     pub(super) fn handle_msg_reply(&mut self, id: String, params: MsgReplyParams) -> String {
         if self.lease_caller() == crate::structured::lease::Caller::Uncertain {
-            return encode_error(
+            return self.message_authority_error(
                 id,
-                "msg_not_allowed",
+                crate::api::error_code::ErrorCode::MsgNotAllowed,
                 "structured caller identity is unresolved",
             );
         }
@@ -911,9 +911,9 @@ impl App {
         params: crate::api::schema::MsgWakeParams,
     ) -> String {
         if let Err(code) = self.native_inbox_owner(params.pane.as_deref()) {
-            return encode_error(
+            return self.message_authority_error(
                 id,
-                code.as_str(),
+                code,
                 "native inbox authority refused or unavailable",
             );
         }
@@ -3912,30 +3912,81 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stop_hook_wake_refuses_the_same_unproven_caller_as_inbox_read() {
+    async fn msg_verbs_explain_unproven_callers_without_effects() {
         for mismatch in [false, true] {
             let mut app = test_app_with_hub(crate::api::EventHub::default());
             let target = pane_target(&app, 1);
             waking_send(&mut app, "unread-authority", "fixture mail");
             let pane = app.state.workspaces[1].focused_pane_id().unwrap();
             crate::test_support::adopt_unproven_pane_caller(&mut app, pane, mismatch);
-            let read: serde_json::Value = serde_json::from_str(&app.handle_msg_read(
-                "read".into(),
-                MsgReadParams {
-                    pane: Some(target.clone()),
-                },
-            ))
-            .unwrap();
-            assert_eq!(read["error"]["code"], "not_authorized");
-            let wake: serde_json::Value = serde_json::from_str(&app.handle_msg_wake(
-                "wake".into(),
-                crate::api::schema::MsgWakeParams {
-                    pane: Some(target.clone()),
-                },
-            ))
-            .unwrap();
-            assert_eq!(wake["error"]["code"], read["error"]["code"], "{wake}");
+            let reason = app.caller_pane_refusal_reason();
+            let before = app.event_hub.ring_snapshot_after(0).len();
+            let mut replies = Vec::new();
+            for selected in [None, Some(target.clone())] {
+                replies.push(app.handle_msg_read(
+                    "read".into(),
+                    MsgReadParams {
+                        pane: selected.clone(),
+                    },
+                ));
+                replies.push(app.handle_msg_list(
+                    "list".into(),
+                    MsgListParams {
+                        pane: selected.clone(),
+                    },
+                ));
+                replies.push(app.handle_msg_wake(
+                    "wake".into(),
+                    crate::api::schema::MsgWakeParams { pane: selected },
+                ));
+            }
+            for (method, params) in [
+                (
+                    "msg.send",
+                    serde_json::json!({"to": {"type": "pane", "pane": pane_target(&app, 0)}, "body": "refused send"}),
+                ),
+                (
+                    "msg.reply",
+                    serde_json::json!({"correlation_id": "unread-authority", "body": "refused reply"}),
+                ),
+            ] {
+                replies.push(app.handle_api_request(wire_request(serde_json::json!({
+                    "id": method, "method": method, "params": params,
+                }))));
+            }
             assert_eq!(app.mailboxes.queued_len(&target), 1);
+            assert_eq!(app.caller_pane(), None);
+            assert_eq!(
+                app.lease_caller(),
+                crate::structured::lease::Caller::Uncertain
+            );
+            assert_eq!(app.mailboxes.queued_len(&pane_target(&app, 0)), 0);
+            assert_eq!(app.event_hub.ring_snapshot_after(0).len(), before);
+            let codes: Vec<_> = replies
+                .iter()
+                .map(|raw| {
+                    let reply: serde_json::Value = serde_json::from_str(raw).unwrap();
+                    reply["error"]["code"].as_str().unwrap().to_owned()
+                })
+                .collect();
+            assert!(
+                codes.iter().all(|code| code == "caller_pane_unresolved"),
+                "read/list/wake (implicit then explicit), send, reply: {codes:?}"
+            );
+            for raw in replies {
+                let reply: serde_json::Value = serde_json::from_str(&raw).unwrap();
+                assert_eq!(reply["error"]["code"], "caller_pane_unresolved", "{raw}");
+                let message = reply["error"]["message"].as_str().unwrap();
+                for expected in [
+                    reason,
+                    "#3066",
+                    "migrat",
+                    "operator",
+                    "flk msg read --pane <id>",
+                ] {
+                    assert!(message.contains(expected), "missing {expected}: {raw}");
+                }
+            }
         }
     }
 
