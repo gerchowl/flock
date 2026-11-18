@@ -614,6 +614,8 @@ flk msg send <target> <text...> [--repo NAME] [--intent fyi|needs-reply|blocking
 flk msg reply <correlation_id> <text...> [--intent fyi|needs-reply|blocking] [-- <text starting with dashes>]
 flk msg list [--pane TARGET]
 flk msg read [--pane TARGET]
+flk msg operator-list --pane TARGET
+flk msg operator-read --pane TARGET
 flk msg status <correlation_id>
 flk msg mute <seconds> [--pane TARGET] [--reason TEXT]
 flk checks list
@@ -676,6 +678,19 @@ attested connection or MCP lease. `--pane self`, the stable native id, or an
 unambiguous native name may name that same inbox; another target is refused as
 `inbox_not_owner` (retry `never`, exit 13), and ambiguous names are refused as
 `agent_target_ambiguous`. Invalid and revoked leases both return `not_authorized`.
+For a legacy pane whose inbox authority is unresolved, the local operator can
+run `flk msg operator-list --pane TARGET` to peek (120-character previews), or
+`flk msg operator-read --pane TARGET` to consume the full messages, from a shell
+outside Flock panes. These are interim recovery commands until migration to a
+structured agent ([#3066](https://github.com/gerchowl/flock/issues/3066)); reading
+does not restore the agent's authority. Both commands refuse structured agents,
+legacy pane callers, mesh relays and unattested callers with `operator_only`
+(exit 13). Successful accesses record a durable `operator_inbox_access` event
+with the pane, operation, caller PID/UID and message count, without message bodies.
+Existing `msg read --pane TARGET` and `msg list --pane TARGET` require the same
+operator check when TARGET is another pane; an attested caller may still read
+its own inbox.
+
 The operator's global `msg list` is unchanged. Reads return only live entries from
 a mixed expired/live batch, once; each expired entry emits one durable
 `dropped_undeliverable` event. Reading the projection does not submit another turn.

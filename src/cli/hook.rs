@@ -777,7 +777,7 @@ fn apply_wake_authority(
     if matches!(
         wake.pointer("/error/code")
             .and_then(serde_json::Value::as_str),
-        Some("not_authorized" | "inbox_not_owner")
+        Some("not_authorized" | "inbox_not_owner" | "caller_pane_unresolved")
     ) {
         outcome.stdout = None;
         let first = marker.parent().is_some_and(|parent| {
@@ -790,7 +790,7 @@ fn apply_wake_authority(
         });
         if first {
             outcome.stdout = Some(serde_json::json!({
-                "systemMessage": "Inbox authority unavailable for this process. Ask the operator to read this pane's inbox from their own interactive shell with `flk msg read --pane <pane-id>`. This does not restore agent authority; see #3000."
+                "systemMessage": "Inbox authority unavailable for this process. Ask the operator to read this pane's inbox from their own interactive shell with `flk msg operator-read --pane <pane-id>` (peek with `flk msg operator-list --pane <pane-id>`). This does not restore agent authority; migrate to a structured agent (#3066); see #3000."
             }).to_string());
         }
     } else if wake.get("result").is_some() {
@@ -1033,7 +1033,11 @@ mod tests {
         let root =
             crate::structured::launch::SessionConfigDir::create(&std::env::temp_dir()).unwrap();
         let marker = root.path().join("notices").join("session");
-        for code in ["not_authorized", "inbox_not_owner"] {
+        for code in [
+            "not_authorized",
+            "inbox_not_owner",
+            "caller_pane_unresolved",
+        ] {
             let refused = json!({"error": {"code": code}});
             let mut outcome = HookOutcome {
                 stdout: mail_nudge(3, true, "p_1"),
@@ -1050,7 +1054,7 @@ mod tests {
             assert!(notice["systemMessage"]
                 .as_str()
                 .unwrap()
-                .contains("flk msg read"));
+                .contains("flk msg operator-read --pane"));
             assert!(notice["systemMessage"].as_str().unwrap().contains("#3000"));
             for count in [0, 3] {
                 outcome.stdout = mail_nudge(count, true, "p_1");

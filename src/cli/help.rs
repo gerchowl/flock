@@ -59,6 +59,8 @@ const HELP_FLAGS: [&str; 2] = ["--help", "-h"];
 /// those parsers and its own help text, and this table mirrors them.
 const VERBS: &[(&str, &str, &str)] = &[
     ("profile", "enable", super::profile::USAGE),
+    ("msg", "operator-read", "flk msg operator-read --pane TARGET"),
+    ("msg", "operator-list", "flk msg operator-list --pane TARGET"),
     ("structured", "grants", super::grants::USAGE),
     ("server", "stop", "flk server stop"),
     (

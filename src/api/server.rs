@@ -670,6 +670,8 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::MsgReply(_) => "msg.reply",
         Method::MsgList(_) => "msg.list",
         Method::MsgRead(_) => "msg.read",
+        Method::MsgOperatorList(_) => "msg.operator_list",
+        Method::MsgOperatorRead(_) => "msg.operator_read",
         Method::MsgStatus(_) => "msg.status",
         Method::MsgWaitReply(_) => "msg.wait_reply",
         Method::MsgWake(_) => "msg.wake",

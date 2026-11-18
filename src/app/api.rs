@@ -1490,6 +1490,8 @@ impl App {
             request.method,
             Method::AgentStop(_)
                 | Method::ProfileEnable(_)
+                | Method::MsgOperatorList(_)
+                | Method::MsgOperatorRead(_)
                 | Method::AgentFork(_)
                 | Method::ServerStop(_)
                 | Method::ServerReloadConfig(_)
@@ -1514,6 +1516,8 @@ impl App {
             request.method,
             Method::StructuredGrantsList(_)
                 | Method::ProfileEnable(_)
+                | Method::MsgOperatorList(_)
+                | Method::MsgOperatorRead(_)
                 | Method::StructuredGrantsRevoke(_)
                 | Method::ServerStop(_)
                 | Method::ServerReloadConfig(_)
@@ -1780,6 +1784,12 @@ impl App {
             Method::MsgReply(params) => return self.handle_msg_reply(request.id, params),
             Method::MsgList(params) => return self.handle_msg_list(request.id, params),
             Method::MsgRead(params) => return self.handle_msg_read(request.id, params),
+            Method::MsgOperatorList(params) => {
+                return self.handle_operator_inbox(request.id, params, false)
+            }
+            Method::MsgOperatorRead(params) => {
+                return self.handle_operator_inbox(request.id, params, true)
+            }
             Method::MsgStatus(params) => return self.handle_msg_status(request.id, params),
             Method::MsgWake(params) => return self.handle_msg_wake(request.id, params),
             Method::HookDecide(params) => return self.handle_hook_decide(request.id, params),

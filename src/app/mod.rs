@@ -1336,6 +1336,8 @@ impl App {
                     | Method::MsgReply(_)
                     | Method::MsgList(_)
                     | Method::MsgRead(_)
+                    | Method::MsgOperatorList(_)
+                    | Method::MsgOperatorRead(_)
                     | Method::MsgStatus(_)
                     | Method::MsgWake(_)
                     | Method::MsgMute(_)

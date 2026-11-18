@@ -147,6 +147,11 @@ pub enum Method {
     MsgList(MsgListParams),
     #[serde(rename = "msg.read")]
     MsgRead(MsgReadParams),
+    /// Operator recovery for one legacy pane inbox (#3089).
+    #[serde(rename = "msg.operator_list")]
+    MsgOperatorList(MsgOperatorInboxParams),
+    #[serde(rename = "msg.operator_read")]
+    MsgOperatorRead(MsgOperatorInboxParams),
     #[serde(rename = "msg.status")]
     MsgStatus(MsgStatusParams),
     /// #576: block until a message is answered, deferred or expires.
@@ -393,6 +398,7 @@ impl Method {
                 | Self::GoalStatus(_)
                 | Self::DelegateList(_)
                 | Self::MsgList(_)
+                | Self::MsgOperatorList(_)
                 | Self::MsgStatus(_)
                 | Self::PeersEnrollment(_)
                 | Self::OwnerPolicyShow(_)
@@ -452,6 +458,8 @@ impl Method {
             | Self::DelegateList(_)
             | Self::MsgList(_)
             | Self::MsgRead(_)
+            | Self::MsgOperatorList(_)
+            | Self::MsgOperatorRead(_)
             | Self::MsgStatus(_)
             | Self::MsgWaitReply(_)
             | Self::MeshHello(_)
@@ -1724,6 +1732,13 @@ pub struct MsgReadParams {
     pub pane: Option<String>,
 }
 
+/// A required local pane target; operator authority is checked before lookup.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MsgOperatorInboxParams {
+    pub pane: String,
+}
+
 /// `msg.status` — what became of one message, asked by whoever sent it.
 ///
 /// `msg.list` answers the recipient's question ("what is waiting for me").
@@ -2920,6 +2935,8 @@ pub enum EventKind {
     /// ADR-0035 §6.2 (#1195): the operator adopted a repo's owner policy.
     /// See `EventData::OwnerPolicyAdopted`.
     OwnerPolicyAdopted,
+    /// Audited operator access to a named pane inbox, without message bodies.
+    OperatorInboxAccess,
 }
 
 impl EventKind {
@@ -2997,7 +3014,8 @@ impl EventKind {
             | Self::PrMerged
             | Self::PrClosed
             | Self::WaitExpired
-            | Self::OwnerPolicyAdopted => true,
+            | Self::OwnerPolicyAdopted
+            | Self::OperatorInboxAccess => true,
             Self::PaneOutputChanged | Self::MeshRoutesChanged | Self::MeshOutboundPending => false,
         }
     }
@@ -4479,6 +4497,14 @@ pub struct AgentPhaseEvent {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum EventData {
+    /// Successful operator peek or consumption of a named pane inbox.
+    OperatorInboxAccess {
+        pane: String,
+        operation: String,
+        peer_pid: Option<u32>,
+        peer_uid: Option<u32>,
+        message_count: usize,
+    },
     /// Payload-free directory invalidation; the envelope sequence is its version.
     DirectoryChanged {},
     StructuredGrantRevoked {
