@@ -892,6 +892,15 @@ impl App {
                 .and_then(|(ws_idx, pane_id)| self.public_pane_id(ws_idx, pane_id)),
         };
         resolved.ok_or_else(|| {
+            if self.lease_caller() == crate::structured::lease::Caller::Uncertain
+                && self.caller_pane_candidate().is_some()
+            {
+                return self.message_authority_error(
+                    id.to_string(),
+                    crate::api::error_code::ErrorCode::MsgNotAllowed,
+                    "structured caller identity is unresolved",
+                );
+            }
             MessageTargetError::not_found(format!(
                 "no pane to {verb}: pass `pane`, or call from inside the pane whose inbox you want"
             ))
@@ -3909,6 +3918,55 @@ mod tests {
         })));
         app.current_api_peer_pid = None;
         assert_eq!(app.mailboxes.queued_len(&answerer), 1);
+    }
+
+    #[tokio::test]
+    async fn unresolved_legacy_mute_explains_refusal_without_effects() {
+        for mismatch in [false, true] {
+            let mut app = test_app_with_hub(crate::api::EventHub::default());
+            let target = pane_target(&app, 1);
+            waking_send(&mut app, "unread-mute-authority", "fixture mail");
+            let pane = app.state.workspaces[1].focused_pane_id().unwrap();
+            crate::test_support::adopt_unproven_pane_caller(&mut app, pane, mismatch);
+            let reason = app.caller_pane_refusal_reason();
+            for seconds in [60, 0] {
+                let now = super::now_ms();
+                app.mailboxes
+                    .set_mute(&target, if seconds == 0 { 120 } else { 0 }, now, None);
+                let before_mute = app.mailboxes.muted_until(&target, now);
+                let before_events = app.event_hub.ring_snapshot_after(0).len();
+                let before_deferrals = app.mailboxes.owed_deferrals(&target).len();
+                let reply: serde_json::Value = serde_json::from_str(&app.handle_msg_mute(
+                    "mute".into(),
+                    crate::api::schema::MsgMuteParams {
+                        pane: None,
+                        seconds,
+                        reason: Some("fixture mute".into()),
+                    },
+                ))
+                .unwrap();
+                assert_eq!(app.mailboxes.muted_until(&target, now), before_mute);
+                assert_eq!(app.mailboxes.queued_len(&target), 1);
+                assert_eq!(app.mailboxes.queued_len(&pane_target(&app, 0)), 0);
+                assert_eq!(
+                    app.mailboxes.owed_deferrals(&target).len(),
+                    before_deferrals
+                );
+                assert_eq!(app.event_hub.ring_snapshot_after(0).len(), before_events);
+                assert_eq!(app.caller_pane(), None);
+                assert_eq!(reply["error"]["code"], "caller_pane_unresolved", "{reply}");
+                let message = reply["error"]["message"].as_str().unwrap();
+                for expected in [
+                    reason,
+                    "#3066",
+                    "migrate",
+                    "operator",
+                    "flk msg read --pane <id>",
+                ] {
+                    assert!(message.contains(expected), "missing {expected}: {reply}");
+                }
+            }
+        }
     }
 
     #[tokio::test]
