@@ -14,7 +14,8 @@ pub(crate) struct ProfileAdmission {
 }
 
 /// A profile refusal is terminal for this request, with no legacy-launch fallback.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "code", rename_all = "snake_case")]
 pub(crate) enum ProfileRefusal {
     /// The operator has not enabled production profiles.
     Disabled,
@@ -22,6 +23,15 @@ pub(crate) enum ProfileRefusal {
     NotReady,
     /// Durable operator-state replacement failed.
     Persistence,
+    /// The document is older than the independently persisted revision floor.
+    PolicyRevisionRegressed {
+        /// Revision found in the rejected document.
+        store: u64,
+        /// Highest durable revision observed by this authority.
+        floor: u64,
+    },
+    /// Current policy or its independent floor cannot be established safely.
+    PolicyRevisionUnavailable,
 }
 
 impl ProfileRefusal {
@@ -31,6 +41,8 @@ impl ProfileRefusal {
             Self::Disabled => ErrorCode::StructuredProfilesDisabled,
             Self::NotReady => ErrorCode::StructuredProfilesNotReady,
             Self::Persistence => ErrorCode::InternalError,
+            Self::PolicyRevisionRegressed { .. } => ErrorCode::PolicyRevisionRegressed,
+            Self::PolicyRevisionUnavailable => ErrorCode::PolicyRevisionUnavailable,
         }
     }
 
@@ -38,6 +50,8 @@ impl ProfileRefusal {
     pub(crate) fn message(self) -> &'static str {
         match self {
             Self::Persistence => "profile policy persistence refused",
+            Self::PolicyRevisionRegressed { .. } => "persisted profile policy revision regressed",
+            Self::PolicyRevisionUnavailable => "current profile policy revision is unavailable",
             Self::Disabled => "structured profile execution is disabled",
             Self::NotReady => {
                 "structured profile execution is unavailable in this incomplete build"
@@ -75,6 +89,9 @@ impl ProfileAdmission {
     /// This is a necessary gate, not a grant: future slices must also check
     /// current authority, workflow pins, permits and all operation prerequisites.
     pub(crate) fn admit(&self) -> Result<(), ProfileRefusal> {
+        if let Some(fault) = self.store.refusal() {
+            return Err(fault);
+        }
         if !self.store.execution_switch {
             return Err(ProfileRefusal::Disabled);
         }
@@ -89,6 +106,9 @@ impl ProfileAdmission {
     /// An incomplete build refuses without changing the switch. Slice 17 adds
     /// the reviewed plan transaction and full readiness/permit checks.
     pub(crate) fn enable(&mut self) -> Result<(), ProfileRefusal> {
+        if let Some(fault) = self.store.refusal() {
+            return Err(fault);
+        }
         if !production_ready() {
             return Err(ProfileRefusal::NotReady);
         }

@@ -105,26 +105,69 @@ pub(crate) struct BindingStore {
     unknown: Vec<Value>,
     root: Value,
     opaque: bool,
+    fault: Option<super::ProfileRefusal>,
 }
 
 impl BindingStore {
     /// Load operator state without consulting repository or agent configuration.
     /// Older snapshots cannot lower a revision already observed by this authority.
     pub fn load(&mut self, path: &Path) {
+        let floor = match floor_revision(path) {
+            Ok(floor) => self.policy_revision.max(floor.unwrap_or_default()),
+            Err(_) => {
+                self.refuse(super::ProfileRefusal::PolicyRevisionUnavailable);
+                return;
+            }
+        };
+        self.policy_revision = floor;
         let loaded = fs::read(path)
             .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).map_err(io::Error::other));
         let raw = match loaded {
             Ok(raw) => raw,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return,
+            Err(e) if e.kind() == io::ErrorKind::NotFound && floor == 0 => return,
             Err(_) => {
-                self.opaque = true;
-                self.execution_switch = false;
-                self.bindings.clear();
-                tracing::warn!("unreadable profile binding store retained");
+                self.refuse(super::ProfileRefusal::PolicyRevisionUnavailable);
                 return;
             }
         };
+        let Some(revision) = raw.get("policy_revision").and_then(Value::as_u64) else {
+            self.refuse(super::ProfileRefusal::PolicyRevisionUnavailable);
+            return;
+        };
+        if revision < floor {
+            tracing::warn!(
+                event = "policy_revision_regressed",
+                store = revision,
+                floor,
+                "profile policy rollback refused"
+            );
+            self.refuse(super::ProfileRefusal::PolicyRevisionRegressed {
+                store: revision,
+                floor,
+            });
+            return;
+        }
+        if advance_floor(path, revision).is_err() {
+            self.refuse(super::ProfileRefusal::PolicyRevisionUnavailable);
+            return;
+        }
+        self.fault = None;
         self.decode(raw);
+    }
+
+    fn refuse(&mut self, fault: super::ProfileRefusal) {
+        self.fault = Some(fault);
+        self.opaque = true;
+        self.execution_switch = false;
+        self.bindings.clear();
+        tracing::warn!("profile policy unavailable; bindings withheld");
+    }
+
+    /// A retained policy fault precedes switch and build-readiness checks.
+    pub(super) fn refusal(&self) -> Option<super::ProfileRefusal> {
+        self.fault.or(self
+            .opaque
+            .then_some(super::ProfileRefusal::PolicyRevisionUnavailable))
     }
 
     fn decode(&mut self, raw: Value) {
@@ -186,37 +229,25 @@ impl BindingStore {
     /// Persist with private temp-file fsync, atomic rename and parent-directory fsync.
     /// Unsupported envelopes are never overwritten; higher disk revisions refuse.
     pub fn save(&self, path: &Path) -> io::Result<()> {
+        self.save_with_store_write(path, write_private_json)
+    }
+
+    // The store writer is injectable so tests can fail exactly after the floor commit.
+    fn save_with_store_write(
+        &self,
+        path: &Path,
+        write: impl FnOnce(&Path, &Value) -> io::Result<()>,
+    ) -> io::Result<()> {
         let mut disk = Self::default();
         disk.load(path);
-        if self.opaque || disk.opaque || disk.policy_revision > self.policy_revision {
+        if self.refusal().is_some()
+            || disk.refusal().is_some()
+            || disk.policy_revision > self.policy_revision
+        {
             return Err(io::Error::other("profile policy persistence refused"));
         }
-        let parent = path
-            .parent()
-            .ok_or_else(|| io::Error::other("missing state directory"))?;
-        fs::create_dir_all(parent)?;
-        let mut entropy = [0; 16];
-        getrandom::fill(&mut entropy).map_err(io::Error::other)?;
-        let temp = parent.join(format!(
-            ".profile-bindings-{:032x}.tmp",
-            u128::from_le_bytes(entropy)
-        ));
-        let result = (|| {
-            let mut file = fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&temp)?;
-            serde_json::to_writer(&mut file, &self.snapshot())?;
-            file.flush()?;
-            file.sync_all()?;
-            fs::rename(&temp, path)?;
-            fs::File::open(parent)?.sync_all()
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(&temp);
-        }
-        result
+        advance_floor(path, self.policy_revision)?;
+        write(path, &self.snapshot())
     }
 
     fn snapshot(&self) -> Value {
@@ -236,6 +267,9 @@ impl BindingStore {
     /// Resolve explicit target identities using in-memory data alone.
     /// Revoked, missing and ambiguous matches all withhold authority.
     pub fn resolve(&self, repo: &str, node: &str, agent: &str) -> Option<BindingView> {
+        if self.refusal().is_some() {
+            return None;
+        }
         let mut matches = self.bindings.iter().filter(|b| {
             b.revoked.is_none()
                 && b.target.repo_id == repo
@@ -252,8 +286,61 @@ impl BindingStore {
         if !operator {
             return json!({});
         }
-        json!({"policy_revision":self.policy_revision,"execution_switch":self.execution_switch,"bindings":self.bindings})
+        let mut status = json!({"policy_revision":self.policy_revision,"execution_switch":self.execution_switch,"bindings":self.bindings});
+        if let Some(fault) = self.refusal() {
+            status["policy_error"] = json!(fault);
+        }
+        status
     }
+}
+
+fn floor_revision(path: &Path) -> io::Result<Option<u64>> {
+    match fs::read(path.with_extension("floor.json")) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(io::Error::other),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+fn advance_floor(path: &Path, revision: u64) -> io::Result<()> {
+    match floor_revision(path)? {
+        Some(floor) if floor > revision => {
+            Err(io::Error::other("profile revision floor would regress"))
+        }
+        Some(floor) if floor == revision => Ok(()),
+        _ => write_private_json(&path.with_extension("floor.json"), &json!(revision)),
+    }
+}
+
+fn write_private_json(path: &Path, value: &Value) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::other("missing state directory"))?;
+    fs::create_dir_all(parent)?;
+    let mut entropy = [0; 16];
+    getrandom::fill(&mut entropy).map_err(io::Error::other)?;
+    let temp = parent.join(format!(
+        ".profile-bindings-{:032x}.tmp",
+        u128::from_le_bytes(entropy)
+    ));
+    let result = (|| {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temp)?;
+        serde_json::to_writer(&mut file, value)?;
+        file.flush()?;
+        file.sync_all()?;
+        fs::rename(&temp, path)?;
+        fs::File::open(parent)?.sync_all()
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
 }
 
 #[cfg(test)]

@@ -18,7 +18,15 @@ started. ADR-0052 slice 17 adds the reviewed activation transaction.
 The server persists the execution switch (default false) with operator binding
 records in `profile-bindings.json`, beside its session state. Agent-editable
 configuration cannot set it. Unknown or invalid binding entries remain preserved
-and inactive; unsupported store formats are never overwritten.
+and inactive; unsupported store formats are never overwritten. A separate private
+`profile-bindings.floor.json` retains the highest revision across restarts. A
+store restored below that floor is retained unchanged, with its bindings and
+switch withheld. Operator status reports `policy_revision` as the floor and
+`policy_error: {code: "policy_revision_regressed", store, floor}`; profile admission
+and enablement return `policy_revision_regressed`. Unreadable floor or policy state
+returns `policy_revision_unavailable`. Both faults have retry class `after_human`:
+operator recovery is required. Other server operations continue. A missing
+floor is initialized from an existing store on first upgrade.
 
 `profile.status` accepts `{}`. The authenticated local operator receives
 `policy_revision`, `execution_switch`, and binding records containing explicit

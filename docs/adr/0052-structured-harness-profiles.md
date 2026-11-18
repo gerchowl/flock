@@ -597,7 +597,13 @@ Slice 2 is split into inactive 2a (store, data-only resolution and read-only
 `unknown` entries. One global policy revision orders all binding changes and
 revocations; each binding records its last change revision. Reload refuses a
 revision lower than one already observed, and saving refuses to replace a higher
-disk revision. Non-operator status projections omit binding and account metadata.
+disk revision. A separate private `profile-bindings.floor.json` durably records
+the highest revision before a store write is acknowledged, using the same fsync,
+rename and directory-fsync discipline. First upgrade initializes a missing floor
+from an existing document. A document below the floor is retained unchanged;
+profiles refuse with `policy_revision_regressed {store, floor}`, operator status
+reports the floor and fault, and other server operations continue. Unreadable
+floor/policy state refuses profiles with `policy_revision_unavailable`. Non-operator status projections omit binding and account metadata.
 Binding records contain `binding_id`, explicit `target` (`repo_id`, `node_ids`,
 `agent_ids`), `account_alias`, `credential_ref`, `credential_generation`,
 `bundle_digests`, `grants`, `revision` and nullable `revoked` evidence (reason,

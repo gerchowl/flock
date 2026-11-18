@@ -210,3 +210,125 @@ fn resolution_cannot_open_credential_reference_or_spawn_it() {
     fs::remove_file(socket).unwrap();
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn restart_rejects_older_snapshot_using_durable_floor() {
+    let (root, path) = fixture();
+    fs::write(
+        &path,
+        serde_json::to_vec(&envelope(json!([binding()]))).unwrap(),
+    )
+    .unwrap();
+    let original = crate::structured::profiles::ProfileAdmission::load(&path);
+    assert_eq!(original.status(true)["policy_revision"], 7);
+    let mut older = envelope(json!([binding()]));
+    older["policy_revision"] = json!(6);
+    older["bindings"][0]["revision"] = json!(6);
+    older["execution_switch"] = json!(true);
+    fs::write(&path, serde_json::to_vec(&older).unwrap()).unwrap();
+    let bytes = fs::read(&path).unwrap();
+    let mut restarted = None;
+    let logs = crate::logging::capture_logs(|| {
+        restarted = Some(crate::structured::profiles::ProfileAdmission::load(&path));
+    });
+    let restarted = restarted.unwrap();
+    assert!(logs.contains("policy_revision_regressed"));
+    assert!(logs.contains("store=6") && logs.contains("floor=7"));
+    assert!(!logs.contains("fixture-token-ref") && !logs.contains("fixture-account"));
+    assert_eq!(restarted.status(true)["policy_revision"], 7);
+    assert_eq!(
+        restarted.status(true)["policy_error"],
+        json!({"code":"policy_revision_regressed","store":6,"floor":7})
+    );
+    assert_eq!(restarted.status(true)["bindings"], json!([]));
+    assert_eq!(restarted.status(true)["execution_switch"], false);
+    assert_eq!(restarted.status(false), json!({}));
+    assert_eq!(
+        restarted.admit().unwrap_err().code().as_str(),
+        "policy_revision_regressed"
+    );
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn floor_survives_store_write_failure_and_blocks_stale_retry() {
+    let (root, path) = fixture();
+    let mut original = BindingStore::default();
+    original.decode(envelope(json!([binding()])));
+    original.save(&path).unwrap();
+    let bytes = fs::read(&path).unwrap();
+    let mut advanced = BindingStore::default();
+    let mut newer = envelope(json!([binding()]));
+    newer["policy_revision"] = json!(8);
+    newer["bindings"][0]["revision"] = json!(8);
+    advanced.decode(newer);
+    let floor = path.with_extension("floor.json");
+    let result = advanced.save_with_store_write(&path, |_, _| {
+        assert_eq!(
+            serde_json::from_slice::<u64>(&fs::read(&floor).unwrap()).unwrap(),
+            8
+        );
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        Err(io::Error::other(
+            "injected store-write failure after the floor commit",
+        ))
+    });
+    assert!(result.is_err());
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+    let mut restarted = BindingStore::default();
+    restarted.load(&path);
+    assert_eq!(restarted.policy_revision, 8);
+    assert_eq!(
+        restarted.status(true)["policy_error"],
+        json!({"code":"policy_revision_regressed","store":7,"floor":8})
+    );
+    assert!(restarted.resolve("repo-a", "node-a", "agent-a").is_none());
+    assert!(original.save(&path).is_err());
+    assert_eq!(
+        serde_json::from_slice::<u64>(&fs::read(&floor).unwrap()).unwrap(),
+        8
+    );
+    fs::remove_file(&path).unwrap();
+    let missing = crate::structured::profiles::ProfileAdmission::load(&path);
+    assert_eq!(missing.status(true)["policy_revision"], 8);
+    assert_eq!(
+        missing.admit().unwrap_err().code().as_str(),
+        "policy_revision_unavailable"
+    );
+    assert!(!path.exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn upgrade_initializes_private_floor_without_rewriting_store() {
+    let (root, path) = fixture();
+    let floor = path.with_extension("floor.json");
+    let mut missing = BindingStore::default();
+    missing.load(&path);
+    assert_eq!(missing.policy_revision, 0);
+    assert!(!floor.exists());
+    let raw = serde_json::to_vec(&envelope(json!([binding()]))).unwrap();
+    fs::write(&path, &raw).unwrap();
+    let mut store = BindingStore::default();
+    store.load(&path);
+    assert_eq!(fs::read(&path).unwrap(), raw);
+    assert_eq!(
+        serde_json::from_slice::<u64>(&fs::read(&floor).unwrap()).unwrap(),
+        7
+    );
+    assert_eq!(
+        fs::metadata(&floor).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert!(store.resolve("repo-a", "node-a", "agent-a").is_some());
+    fs::write(&floor, b"unknown floor version").unwrap();
+    let invalid = crate::structured::profiles::ProfileAdmission::load(&path);
+    assert_eq!(
+        invalid.admit().unwrap_err().code().as_str(),
+        "policy_revision_unavailable"
+    );
+    assert_eq!(invalid.status(true)["bindings"], json!([]));
+    assert_eq!(fs::read(&floor).unwrap(), b"unknown floor version");
+    fs::remove_dir_all(root).unwrap();
+}

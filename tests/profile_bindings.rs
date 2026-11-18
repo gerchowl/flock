@@ -71,7 +71,13 @@ fn socket_status_restores_operator_bindings_and_true_switch_without_activation()
     let path = state.join("profile-bindings.json");
     fs::write(&path, serde_json::to_vec(&raw).unwrap()).unwrap();
     let socket = dir.path().join("s.sock");
-    for _ in 0..2 {
+    for generation in 0..3 {
+        let mut expected = raw.clone();
+        if generation == 2 {
+            expected["policy_revision"] = json!(6);
+            expected["bindings"][0]["revision"] = json!(6);
+            fs::write(&path, serde_json::to_vec(&expected).unwrap()).unwrap();
+        }
         let server = start(&root, &socket);
         let reply = json_api::request(
             &socket,
@@ -81,16 +87,41 @@ fn socket_status_restores_operator_bindings_and_true_switch_without_activation()
         .unwrap();
         let reply: Value = serde_json::from_str(&reply).unwrap();
         assert_eq!(reply["result"]["policy_revision"], 7);
-        assert_eq!(reply["result"]["execution_switch"], true);
-        assert_eq!(reply["result"]["bindings"], raw["bindings"]);
+        assert_eq!(reply["result"]["execution_switch"], generation != 2);
+        if generation == 2 {
+            assert_eq!(reply["result"]["bindings"], json!([]));
+            assert_eq!(
+                reply["result"]["policy_error"],
+                json!({"code":"policy_revision_regressed","store":6,"floor":7})
+            );
+            let normal = json_api::request(
+                &socket,
+                r#"{"id":"normal","method":"workspace.list","params":{}}"#,
+                Duration::from_secs(5),
+            )
+            .unwrap();
+            assert!(serde_json::from_str::<Value>(&normal)
+                .unwrap()
+                .get("error")
+                .is_none());
+        } else {
+            assert_eq!(reply["result"]["bindings"], raw["bindings"]);
+        }
         let reply = json_api::request(&socket, r#"{"id":"enable","method":"profile.enable","params":{"plan":"fixture-plan","expect":"fixture-digest"}}"#, Duration::from_secs(5)).unwrap();
         let reply: Value = serde_json::from_str(&reply).unwrap();
-        assert_eq!(reply["error"]["code"], "structured_profiles_not_ready");
+        assert_eq!(
+            reply["error"]["code"],
+            if generation == 2 {
+                "policy_revision_regressed"
+            } else {
+                "structured_profiles_not_ready"
+            }
+        );
         drop(server);
         let _ = fs::remove_file(&socket);
         assert_eq!(
             serde_json::from_slice::<Value>(&fs::read(&path).unwrap()).unwrap(),
-            raw
+            expected
         );
     }
 }
