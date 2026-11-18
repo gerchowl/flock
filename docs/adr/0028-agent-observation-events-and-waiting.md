@@ -1813,7 +1813,7 @@ in ADR-0030 §8.
   attribution, absent for harnesses without it, and it leaves goal-s1 guessing.
   Kept as one registration form, not the model.
 - **Type digests or event bodies into the pane.** The hand-rolled failure
-  (claude-config#18, #559). Rejected again.
+  (#559). Rejected again.
 - **Make every `fyi` wake.** Undoes ADR-0018's reason for intent and would
   interrupt agents with chatter they did not ask for.
 - **Channels as a pane-typing client.** Clobbers drafts and races turns from

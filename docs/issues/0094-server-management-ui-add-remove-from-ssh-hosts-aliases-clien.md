@@ -24,4 +24,4 @@ url: https://github.com/gerchowl/herdr/issues/94
 Client-anchor arc: #65 (slots, landed) → #79 (viewer profile — the overlay file naturally lives beside it) → this. Composes with #80 (visibility selection) — alias + visibility may share the per-server overlay entry.
 
 ## References
-~/.ssh/config parsing precedent (ssh_config crate or hand parse Host lines), #39/#76 (SlotTarget keys), #79/#80, g-fleet common.nix peer generation (the read-only base).
+~/.ssh/config parsing precedent (ssh_config crate or hand parse Host lines), #39/#76 (SlotTarget keys), #79/#80, the fleet configuration repo common.nix peer generation (the read-only base).
