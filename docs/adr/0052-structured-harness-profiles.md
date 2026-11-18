@@ -5,7 +5,7 @@
 - Issues: [#3066](https://github.com/gerchowl/flock/issues/3066)
 - Decision owner: operator
 - Implemented: slice 1, disabled admission guard; slice 2a, inactive binding
-  storage and status projection. Production execution remains
+  storage/status; slice 2b-1, operator-only binding review/commit/revocation APIs. Production execution remains
   unavailable until slice 17.
 - Amends: ADR-0036 §1 isolation and hot reload, and ADR-0032 §3
   structured-session context replenishment. Composes with ADR-0049 requests,
@@ -513,9 +513,11 @@ native rollout importer. No Codex support is implied by the Claude slices.
 
 ### 9. Operator command and recovery contract
 
-These are target CLI/API contracts. Slice 1 exposes only `profile.enable`, which
-refuses execution while the build is incomplete; the transactions below are not
-available yet. One operator controls the authority; ordinary relay or harness
+These are target CLI/API contracts. Slice 1 exposes `profile.enable`, which
+refuses execution while the build is incomplete. Slice 2b-1 adds the socket-only
+`profile.plan {action: bind}`, `profile.bind` and binding-only `profile.revoke`
+preparation APIs; other transactions below remain unavailable. CLI preparation
+commands and session establishment/continuation pins follow in 2b-2. One operator controls the authority; ordinary relay or harness
 principals cannot invoke these mutations. Authenticated operator transport remains
 required on remote nodes.
 
@@ -591,7 +593,20 @@ session or transfer mailbox ownership. Its separate admission test proves this.
 Slice 1 holds the switch in server memory only; slice 2 persists it with the binding records.
 
 Slice 2 is split into inactive 2a (store, data-only resolution and read-only
-`profile.status`) and 2b (reviewed binding/revocation transactions). Store 2a uses
+`profile.status`) and 2b (reviewed binding/revocation transactions). Slice 2b is
+further split: 2b-1 supplies transaction storage and authenticated socket APIs;
+2b-2 supplies CLI commands and #3111 session pins. Review plans are server-private
+and expire after five suspend-inclusive monotonic minutes; restart discards
+uncommitted plans.
+A bind plan ID is also its durable operation ID. Receipts are stored atomically
+with binding mutations in the same document, keyed by operation ID, operation
+kind, operator UID and expected digest. A committed repeat returns the original
+receipt even after restart, expiry or subsequent revocation, without changing
+current authority. Repeating binding revocation with the same binding/reason and
+operator returns its original terminal receipt. Unknown receipt entries are
+logged and preserved raw; ambiguous/unusable matching IDs refuse. Revision
+allocation, CAS, floor publication and the mutation receipt remain inside both
+store locks. Preparation never reads credential references or executes assets. Store 2a uses
 `profile-bindings.json` beside server session state, mode 0600, with schema 1,
 `policy_revision`, default-false `execution_switch`, `bindings` and retained raw
 `unknown` entries. One global policy revision orders all binding changes and
