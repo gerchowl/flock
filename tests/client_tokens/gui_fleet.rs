@@ -33,7 +33,12 @@ fn cli(server: &Server, args: &[&str]) -> Value {
 }
 
 fn next(socket: &mut WebSocket, stage: &str) -> Value {
+    let deadline = std::time::Instant::now() + support::command::CLI_LIMIT;
     loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "wire producer stayed silent during {stage}"
+        );
         let (opcode, bytes) = socket.receive();
         assert_eq!(opcode, 1, "wire closed during {stage}: {bytes:?}");
         let frame: Value = serde_json::from_slice(&bytes).unwrap();
@@ -74,7 +79,9 @@ fn scripted_model_stream_permission_and_resume_through_real_runtime() {
             {"expect":"gate", "name":"partial-observed"},
             {"emit":"permission", "request_id":"gui-permission", "input":{"command":"true"}},
             {"expect":"decision", "behavior":"allow"},
-            {"emit":"reply", "text":"permission accepted"}
+            {"emit":"reply", "text":"permission accepted"},
+            {"expect":"message", "text":"continue fixture"},
+            {"emit":"reply", "text":"continued after restart"}
         ])).unwrap()).unwrap();
             let token = root.join("token");
             fs::write(&token, "fixture-token-not-a-credential").unwrap();
@@ -210,12 +217,6 @@ fn scripted_model_stream_permission_and_resume_through_real_runtime() {
     assert_eq!(restarted["result"]["agent"]["session_id"], session);
     assert_eq!(restarted["result"]["agent"]["agent_id"], agent);
     loop {
-        let diagnostic = server.root.join("c/home/gui-fleet-error.json");
-        assert!(
-            !diagnostic.exists(),
-            "resumed model failed: {}",
-            fs::read_to_string(&diagnostic).unwrap_or_default()
-        );
         let status = cli(&server, &["agent", "status", agent]);
         if status["result"]["agent"]["lifecycle"] == "live" {
             break;
@@ -248,10 +249,18 @@ fn scripted_model_stream_permission_and_resume_through_real_runtime() {
             "server exited during model resume"
         );
     }
+    let diagnostic = server.root.join("c/home/gui-fleet-error.json");
+    assert!(
+        !diagnostic.exists(),
+        "resumed model failed: {}",
+        fs::read_to_string(&diagnostic).unwrap_or_default()
+    );
     assert_eq!(
         cli(&server, &["agent", "status", agent])["result"]["agent"]["session_id"],
         session
     );
+    cli(&server, &["agent", "send", agent, "continue fixture"]);
+    screen_contains(&mut native, "continued after restart");
     cli(&server, &["agent", "stop", agent]);
 }
 

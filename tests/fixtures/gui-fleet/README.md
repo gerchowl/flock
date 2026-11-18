@@ -67,6 +67,7 @@ The lifecycle test uses a real server, public `flk --json` start/send/status/sto
 commands, the native rendered view for live partials, and authenticated structured
 wire subscriptions and permission decision.
 Restart uses the existing operator stop/start path. It checks both the reported
-session id and the actual resumed launch. A separate fixture test checks a
-continued scripted reply after the completed-turn checkpoint. The GUI restart command is separate
+session id and the actual resumed launch, then sends another message and observes
+the continued reply. A separate fixture test checks the completed-turn checkpoint.
+The GUI restart command is separate
 work; this fixture does not change production lifecycle behavior.
