@@ -30,6 +30,13 @@ impl Server {
         Self::with_probe_bind(probe, None)
     }
     fn with_probe_bind(probe: &str, bind: Option<std::net::SocketAddr>) -> std::io::Result<Self> {
+        Self::with_setup(probe, bind, |_, _| {})
+    }
+    fn with_setup(
+        probe: &str,
+        bind: Option<std::net::SocketAddr>,
+        setup: impl FnOnce(&std::path::Path, &std::path::Path),
+    ) -> std::io::Result<Self> {
         assert!(
             probe.starts_with("#!/bin/sh\n"),
             "controlled executable needs a valid interpreter line"
@@ -63,6 +70,7 @@ impl Server {
         fs::create_dir(&tools).unwrap();
         fs::write(tools.join("tailscale"), probe).unwrap();
         fs::set_permissions(tools.join("tailscale"), fs::Permissions::from_mode(0o700)).unwrap();
+        setup(&root, &directory);
         let gate = root.join("funnel-gate");
         let gate_name = std::ffi::CString::new(gate.to_str().unwrap()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(gate_name.as_ptr(), 0o600) }, 0);
@@ -90,6 +98,7 @@ impl Server {
         cmd.env("FUNNEL_FIXTURE_ENTERED", root.join("probe-entered"));
         cmd.env("FLOCK_LOG", "debug");
         cmd.env("FLOCK_SOCKET_PATH", &socket);
+        cmd.env("FLOCK_HOST_NAME", "host");
         cmd.env("SHELL", "/bin/sh");
         support::environment::assert_pty_isolated(&cmd);
         let child = support::environment::spawn_pty(pair.slave.as_ref(), cmd).unwrap();
