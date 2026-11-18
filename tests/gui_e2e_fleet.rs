@@ -172,6 +172,17 @@ fn real_gui_two_nodes_online() {
     let fleet = fleet::spawn_with_startup_probe("gui", &specs, |fleet, name| {
         let node = fleet.node(name);
         fs::write(node.home.join("gui-fleet.json"), "[]").unwrap();
+        fs::create_dir(tools.0.join(name)).unwrap();
+        let token = node.home.join("setup-token");
+        fs::write(&token, "synthetic-gui-fixture-token").unwrap();
+        fs::set_permissions(&token, fs::Permissions::from_mode(0o600)).unwrap();
+        let config = node
+            .config_home
+            .join(support::paths::app_dir_name())
+            .join("config.toml");
+        let mut contents = fs::read_to_string(&config).unwrap();
+        contents.push_str(&format!("token_file = '{}'\n", token.display()));
+        fs::write(config, contents).unwrap();
         if std::env::var_os("GUI_E2E_FLEET_REFUSE_EDGE").is_some() {
             fleet.refuse_edge("nodea", "nodeb");
         }
@@ -198,7 +209,8 @@ fn real_gui_two_nodes_online() {
                     std::env::var("PATH").unwrap()
                 )),
             );
-            json!({"name":node.name, "id":fleet.node_id(&node.name), "socket":node.api_socket, "env":env})
+            let working_directory = tools.0.join(&node.name).canonicalize().unwrap();
+            json!({"name":node.name, "id":fleet.node_id(&node.name), "socket":node.api_socket, "working_directory":working_directory, "env":env})
         })
         .collect();
     let manifest = fleet.base.join("gui.json");

@@ -110,7 +110,7 @@ describe("fixture mode", () => {
       const id = button?.getAttribute("aria-describedby");
       return id ? document.getElementById(id)?.textContent : undefined;
     };
-    expect(buttonLabels(root).filter((label) => UNBUILT.includes(label))).toEqual(["New agent", "Diff", "Fork"]);
+    expect(buttonLabels(root).filter((label) => UNBUILT.includes(label))).toEqual(["Diff", "Fork"]);
     const fork = [...root.querySelectorAll("button")].find((button) => button.textContent === "Fork");
     expect(fork?.getAttribute("aria-disabled")).toBe("true");
     expect(fork?.disabled).toBe(false);
@@ -453,9 +453,7 @@ describe("command palette", () => {
       ["Previous agent↑", null],
       ["Next agent↓", null],
       ["Keyboard shortcuts?", null],
-      ["New agentWaits for the harness picker", "true"],
     ]);
-    waiting.at(-1)?.click();
     expect($(root, "palette")).not.toBeNull();
   });
 

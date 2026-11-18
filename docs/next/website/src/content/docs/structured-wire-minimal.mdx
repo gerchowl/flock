@@ -312,6 +312,22 @@ preserve the session and journal.
 reserves structured resume and stop authority independently of token scope.
 ADR-0052 slice 21 and a future authority amendment govern GUI structured controls.
 
+## New agent picker
+
+In the live GUI, **New agent** opens a sheet from the toolbar or command
+palette. Enter a name, choose a node and an absolute working directory, then
+select **Start agent**. Reported project paths are offered as choices, with the
+first selected by default; you can also type another path. The home node is
+selected by default. Runtime is **Structured** and harness is **Claude Code**, the currently supported adapter.
+An empty or relative working directory keeps **Start agent** disabled. The
+server checks that the directory exists on the chosen node.
+
+The picker sends `agent.start` through the existing command outbox and shows
+the server’s acknowledgment. An unresolved start stays disabled to prevent a
+second launch. A non-home selection shows a plain-language refusal with the
+server code available under **Details**. Server admission and operator authority
+gates still apply.
+
 ## Unsupported command verbs
 
 After authentication, an otherwise valid, bounded `cmd` frame with an unknown

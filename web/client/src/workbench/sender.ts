@@ -1,6 +1,6 @@
 /**
- * The workbench's {@link Sender} over a {@link WireConnection}: `agent.send`
- * and `agent.decide` both go through the outbox (ADR-0038 §3), so each has a
+ * The workbench's {@link Sender} over a {@link WireConnection}: `agent.send`,
+ * `agent.decide` and `agent.start` go through the outbox (ADR-0038 §3), so each has a
  * `cmd_id`, a resend within the window, and an explicit unknown outcome.
  *
  * @module
@@ -17,6 +17,7 @@ export function createWireSender(connection: WireConnection, revision: () => num
     send: (agent, text, echoAfter) => connection.command("agent.send", { target: agent, text, submit: true }, undefined, echoAfter ?? undefined),
     // `AgentDecide` carries `request_seq` as the card's open record sent it; nothing here changes it.
     decide: (args) => connection.command("agent.decide", args satisfies { readonly [key: string]: JsonValue } as JsonValue),
+    start: (name, node, cwd) => connection.command("agent.start", { name, node_id: node, cwd, runtime: "structured", argv: ["claude"] }),
     // ReadOnly holds the outbox, so its controls say why instead of queueing (ADR-0038 §3).
     blocked: () => (revision(), connection.principal === null ? "Sending opens once the server has welcomed this client." : connection.readOnly),
   };

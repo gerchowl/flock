@@ -9,11 +9,27 @@ Rust shards on both platforms exclude this browser-dependent binary.
 The Rust driver starts two isolated nodes with the fleet SSH shim. It scrubs
 inherited `FLOCK_*` variables and uses short socket paths. Each node has its own
 HOME, XDG directories, structured configuration and scripted Claude executable.
-No agent is started by this slice. Future lifecycle tests can seed
-`gui-fleet.json` in each home, then use the same manifest and CLI helper.
+Each node receives a synthetic setup token, readable only by its owner.
+The browser starts a structured agent on the home node through New agent and
+checks its registration through that node’s CLI. It then chooses the other node,
+checks the plain-language refusal and verifies that node’s agent list is unchanged.
+The driver creates one short, temporary working directory per node and records
+its canonical path as `working_directory` in that node’s manifest entry. These
+directories live under the driver’s owned tools root and are removed on teardown.
+The browser first submits a nonexistent directory and checks its plain-language
+refusal, then corrects the path in the same sheet. It checks the exact
+cwd and structured runtime through `flk --json agent list` on the home socket.
+It types the other node’s own path when testing the remote refusal.
+
+The working-directory input defaults to the first project path reported by the
+chosen node, if any. A project select offers those paths and **Other directory…**;
+the operator can always type a path. An empty or relative path keeps Start
+disabled. Changing nodes resets the directory to that node’s first project, or
+an empty input. Directory existence is validated by the server.
+Future conversation tests can seed `gui-fleet.json` in each home.
 
 The version 1 manifest contains the binary path, home node name, nodes (name, authenticated NodeId,
-socket and isolated CLI environment), and artifact directory. The browser asks
+socket, working directory and isolated CLI environment), and artifact directory. The browser asks
 `client open --print` for the home URL immediately before navigation, after launching
 Chromium, so an operator code cannot expire during browser startup. It then adds that
 URL as `home_url` in the disposable manifest immediately before navigation.
