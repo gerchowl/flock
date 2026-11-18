@@ -72,6 +72,12 @@ ci_features := "web,ts"
 ci filter='all()': lint
     cargo nextest run --locked --features {{ci_features}} -E "{{filter}}" --status-level fail --final-status-level slow --failure-output final --success-output never
 
+# Build the real GUI before compiling the isolated browser fleet driver.
+gui-e2e-fleet:
+    cd web/client && bun install --frozen-lockfile && bun run build
+    FLOCK_GUI_DIST="{{justfile_directory()}}/web/client/dist" cargo build --locked --features web,ts --bin flk
+    FLOCK_GUI_DIST="{{justfile_directory()}}/web/client/dist" cargo nextest run --locked --features web,ts --test gui_e2e_fleet --test-threads 2 --retries 0
+
 # Build both feature variants with an explicit fixture input, proving GUI
 # embedding and exclusion without the independent frontend build (#1826).
 gui-check:
