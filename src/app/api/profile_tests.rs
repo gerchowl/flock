@@ -201,3 +201,198 @@ async fn non_operator_status_never_discloses_authority_or_usage() {
     lease.bind_test_peer(std::process::id());
     redacted(&mut leased);
 }
+
+fn mutation(method: &str, params: Value) -> Request {
+    serde_json::from_value(json!({"id":"profile-transaction","method":method,"params":params}))
+        .expect("profile transaction API must be supported")
+}
+
+fn proposed(binding: &str) -> Value {
+    json!({"action":"bind","binding_id":binding,
+        "target":{"repo_id":"repo-fixture","node_ids":["node-fixture"],"agent_ids":["agent-fixture"]},
+        "account_alias":"fixture-account","credential_ref":"fixture-token-reference","credential_generation":1,
+        "bundle_digests":["fixture-digest"],"grants":["fixture-select"]})
+}
+
+fn transactional_app() -> (App, std::path::PathBuf) {
+    let root = crate::test_support::unique_temp_path("profile-transactions");
+    std::fs::create_dir_all(&root).unwrap();
+    let mut app = app(&Config::default());
+    app.structured_profiles =
+        crate::structured::profiles::ProfileAdmission::load(&root.join("profile-bindings.json"));
+    (app, root)
+}
+
+fn transact(app: &mut App, method: &str, params: Value) -> Value {
+    serde_json::from_str(
+        &app.handle_api_request_after_internal_events_drained(mutation(method, params)),
+    )
+    .unwrap()
+}
+
+fn commit_plan(app: &mut App, plan: &Value) -> Value {
+    transact(
+        app,
+        "profile.bind",
+        json!({"plan":plan["plan"],"expect":plan["expect"]}),
+    )
+}
+
+#[tokio::test]
+async fn profile_mutations_refuse_relays_and_agents_before_any_effect() {
+    for params in [
+        ("profile.plan", proposed("binding-a")),
+        (
+            "profile.bind",
+            json!({"plan":"fixture-plan","expect":"fixture-digest"}),
+        ),
+        (
+            "profile.revoke",
+            json!({"binding":"binding-a","reason":"fixture revoke"}),
+        ),
+    ] {
+        for enrolled in [false, true] {
+            for uid in [None, Some(Some(7))] {
+                let (mut app, root) = transactional_app();
+                let before = std::fs::read_dir(&root).unwrap().count();
+                app.test_attach_relay(enrolled);
+                app.current_api_peer_uid = uid;
+                assert_eq!(
+                    transact(&mut app, params.0, params.1.clone())["error"]["code"],
+                    "operator_only"
+                );
+                assert_eq!(std::fs::read_dir(&root).unwrap().count(), before);
+                assert_eq!(app.structured_profiles.status(true)["policy_revision"], 0);
+                std::fs::remove_dir_all(root).unwrap();
+            }
+        }
+        let (mut app, root) = transactional_app();
+        app.current_api_peer_uid = None;
+        assert_eq!(
+            transact(&mut app, params.0, params.1.clone())["error"]["code"],
+            "operator_only"
+        );
+        assert!(!root.join("profile-bindings.json").exists());
+        std::fs::remove_dir_all(root).unwrap();
+        let (mut app, root) = transactional_app();
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("profile-agent")];
+        app.state.ensure_test_terminals();
+        let pane = app.state.workspaces[0].focused_pane_id().unwrap();
+        let terminal = app.state.workspaces[0]
+            .pane_state(pane)
+            .unwrap()
+            .attached_terminal_id
+            .clone();
+        app.state.terminals.get_mut(&terminal).unwrap().launch_argv = Some(vec!["claude".into()]);
+        crate::test_support::attest_pane_caller(&mut app, pane);
+        app.current_api_peer_birth = Some(
+            app.current_api_peer_pid
+                .and_then(crate::platform::process_start_time),
+        );
+        assert_eq!(
+            transact(&mut app, params.0, params.1.clone())["error"]["code"],
+            "operator_only"
+        );
+        assert!(!root.join("profile-bindings.json").exists());
+        std::fs::remove_dir_all(root).unwrap();
+        let (mut app, root) = transactional_app();
+        app.current_api_peer_uid = Some(Some(42));
+        assert_eq!(
+            transact(&mut app, params.0, params.1.clone())["error"]["code"],
+            "operator_only"
+        );
+        assert!(!root.join("profile-bindings.json").exists());
+        std::fs::remove_dir_all(root).unwrap();
+        let (mut app, root) = transactional_app();
+        let mut lease = app
+            .session_leases
+            .reserve("agent_atlas_profile", "profile-session", None)
+            .unwrap();
+        lease.bind_test_peer(std::process::id());
+        assert_eq!(
+            transact(&mut app, params.0, params.1)["error"]["code"],
+            "operator_only"
+        );
+        assert!(!root.join("profile-bindings.json").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn bind_checks_digest_cas_and_durable_idempotence() {
+    let (mut app, root) = transactional_app();
+    let first = transact(&mut app, "profile.plan", proposed("binding-a"))["result"].clone();
+    let stale = transact(&mut app, "profile.plan", proposed("binding-b"))["result"].clone();
+    assert_eq!(
+        transact(
+            &mut app,
+            "profile.bind",
+            json!({"plan":first["plan"],"expect":"altered"})
+        )["error"]["code"],
+        "profile_plan_invalid"
+    );
+    assert!(!root.join("profile-bindings.json").exists());
+    let applied = commit_plan(&mut app, &first);
+    assert_eq!(applied["result"]["binding"]["revision"], 1);
+    assert_eq!(commit_plan(&mut app, &first), applied);
+    assert_eq!(
+        commit_plan(&mut app, &stale)["error"]["code"],
+        "profile_revision_conflict"
+    );
+    let saved = std::fs::read(root.join("profile-bindings.json")).unwrap();
+    app.structured_profiles =
+        crate::structured::profiles::ProfileAdmission::load(&root.join("profile-bindings.json"));
+    assert_eq!(commit_plan(&mut app, &first), applied);
+    assert_eq!(
+        std::fs::read(root.join("profile-bindings.json")).unwrap(),
+        saved
+    );
+    assert_eq!(app.structured_profiles.status(true)["policy_revision"], 1);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn revoke_is_terminal_durable_and_idempotent() {
+    let (mut app, root) = transactional_app();
+    let plan = transact(&mut app, "profile.plan", proposed("binding-a"))["result"].clone();
+    let bound = commit_plan(&mut app, &plan);
+    let revoked = transact(
+        &mut app,
+        "profile.revoke",
+        json!({"binding":"binding-a","reason":"fixture revoke"}),
+    );
+    assert_eq!(revoked["result"]["binding"]["revision"], 2);
+    assert_eq!(
+        transact(
+            &mut app,
+            "profile.bind",
+            json!({"plan":revoked["result"]["operation_id"],"expect":revoked["result"]["expect"]})
+        )["error"]["code"],
+        "profile_plan_invalid"
+    );
+    assert_eq!(
+        revoked["result"]["binding"]["revoked"]["operation_id"],
+        revoked["result"]["operation_id"]
+    );
+    app.structured_profiles =
+        crate::structured::profiles::ProfileAdmission::load(&root.join("profile-bindings.json"));
+    assert_eq!(
+        transact(
+            &mut app,
+            "profile.revoke",
+            json!({"binding":"binding-a","reason":"fixture revoke"})
+        ),
+        revoked
+    );
+    assert_eq!(commit_plan(&mut app, &plan), bound);
+    assert_eq!(app.structured_profiles.status(true)["policy_revision"], 2);
+    assert_eq!(
+        transact(&mut app, "profile.plan", proposed("binding-a"))["error"]["code"],
+        "profile_binding_revoked"
+    );
+    assert_eq!(
+        app.structured_profiles.admit().unwrap_err().code().as_str(),
+        "structured_profiles_disabled"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
