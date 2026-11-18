@@ -164,6 +164,18 @@ Use separate storage roots with separate lifetimes:
   supervision has reaped all relevant descendants. They include typed settings
   and the lease-bound MCP configuration; they are not bundle content.
 
+Slice 3 prepares these roots under the server state directory at
+`profile-storage/sessions/<session-id>/`, with native `config/` and a private
+`record.json` containing session, target and binding ID/revision. Preparation
+checks current binding authority and the exact requested pin without launching.
+Published roots, including completed sessions, are retained. Retention and cleanup
+policy await #3140. Failed allocation rolls back only staging created by that call.
+Startup moves unpublished `.alloc-<session-id>` staging into the adjacent
+`profile-storage/quarantine/`, logs a typed diagnostic and reports staging entry names in
+operator-only `profile.status.session_storage`. Unknown or invalid session records
+remain untouched and inactive; they never prevent other records from loading.
+Preparation is an internal seam for the following slices, not a public launch API.
+
 Persist adoption/binding/import records with temp-file fsync, rename and
 parent-directory fsync. In lists of persisted records, skip, log and retain raw
 unknown or invalid entries per ADR-0028; refuse only launches depending on an

@@ -1075,6 +1075,12 @@ flk profile status --format json
 flk profile revoke --binding <id> --reason <text> --format json
 ```
 
+Operator `profile status` includes `session_storage` with durable session/binding
+pins, retained unknown-record count, quarantined staging names and availability.
+Published native roots are retained. Startup quarantines crash-left staging;
+retention and cleanup policy await a separate decision. This storage preparation
+does not enable execution or change legacy profile storage.
+
 Lists use comma-separated identifiers. Omit `--binding` to allocate a new identity;
 omit `--grants` for an empty grant list. Budget and preset flags, adoption, rotation,
 and fleet recovery are not available in this slice. Credential references are

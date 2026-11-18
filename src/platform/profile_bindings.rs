@@ -7,6 +7,29 @@ use std::{
     path::Path,
 };
 
+/// Create or validate a server-owned private directory without following links.
+pub(crate) fn private_directory(path: &Path, create: bool) -> io::Result<File> {
+    if create {
+        match super::structured::create_private_dir(path) {
+            Ok(()) => (),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => (),
+            Err(e) => return Err(e),
+        }
+    }
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_NONBLOCK)
+        .open(path)?;
+    let metadata = directory.metadata()?;
+    if metadata.uid() != super::peer::effective_uid() || metadata.mode() & 0o7777 != 0o700 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "session storage requires a private owned directory",
+        ));
+    }
+    Ok(directory)
+}
+
 /// Open existing policy data or create its stable advisory lock, without following
 /// the final symlink component or blocking on a special file. Validate the opened
 /// inode before callers can read policy bytes or acquire authority through it.

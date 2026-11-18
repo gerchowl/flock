@@ -199,7 +199,7 @@ impl ProfileAdmission {
         })
     }
 
-    fn edit(
+    pub(in crate::structured::profiles) fn edit(
         &mut self,
         apply: impl FnOnce(&mut BindingStore, &Path) -> Result<Value, E>,
     ) -> Result<Value, E> {

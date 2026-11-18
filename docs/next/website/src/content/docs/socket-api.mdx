@@ -40,6 +40,14 @@ References contain no resolved secret bytes. Agents and pending or enrolled mesh
 relays receive no binding, account, sibling identity, or usage fields. This API
 only projects data. Production execution remains unavailable.
 
+Operator status also includes `session_storage`: durable session/target and binding
+revision pins, `retained_unknown`, `quarantined` staging entry names, and
+`unavailable`. Native config lives under server-owned
+`profile-storage/sessions/<session-id>/config/`, separate from operator profiles.
+Published roots remain retained; startup quarantines unpublished allocation staging
+beside the roots. Unusable records remain untouched and inactive. Storage allocation
+is internal preparation only, with no new launch or credential access.
+
 The following preparation methods require the authenticated local operator.
 Relays and agents receive `operator_only` before mutation. The matching CLI
 commands are `profile plan bind`, `profile bind`, `profile revoke` and `profile status`.
