@@ -16,6 +16,7 @@
  */
 import { describe, expect, test } from "bun:test";
 import { readdir } from "node:fs/promises";
+import { WIRE_PROTOCOL } from "../src/wire/connection";
 
 import type { FixtureCoverage } from "../src/gen/FixtureCoverage";
 import type { FixtureLine } from "../src/gen/FixtureLine";
@@ -65,7 +66,7 @@ const REPLAYED = [
  * `hello` names; every other script runs the client's own `WIRE_PROTOCOL`.
  */
 const NEWER_CLIENT: { readonly [script: string]: number } = {
-  "version-gap": 2,
+  "version-gap": WIRE_PROTOCOL + 1,
 };
 
 /** Left to G3 #1595 (G3b), with the feature each one needs. */

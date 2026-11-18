@@ -26,8 +26,8 @@
 {"v":1,"step":"observe","connection":"Reconnecting"}
 {"v":1,"step":"expect_connect","not_before_ms":15000,"within_ms":30000}
 {"v":1,"step":"open"}
-{"v":1,"step":"expect","frame":{"t":"hello","protocol":1,"client":{"name":"fixture","version":"1"},"token":"fixture-token"},"fields":["protocol","token"],"absent":[]}
-{"v":1,"step":"send","frame":{"t":"welcome","protocol":1,"server_version":"fixture","capabilities":["read","send"],"principal":"fixture-principal","server_epoch":"fixture-epoch","idempotency_window_ms":86400000}}
+{"v":1,"step":"expect","frame":{"t":"hello","protocol":2,"client":{"name":"fixture","version":"1"},"token":"fixture-token"},"fields":["protocol","token"],"absent":[]}
+{"v":1,"step":"send","frame":{"t":"welcome","protocol":2,"server_version":"fixture","capabilities":["read","send"],"principal":"fixture-principal","server_epoch":"fixture-epoch","idempotency_window_ms":86400000}}
 {"v":1,"step":"observe","connection":"Live"}
 {"v":1,"step":"quiet","ceiling_ms":15000}
 {"v":1,"step":"send","frame":{"t":"ping","nonce":"healthy-0"}}
@@ -42,8 +42,8 @@
 {"v":1,"step":"drop"}
 {"v":1,"step":"expect_connect","not_before_ms":15000,"within_ms":30000}
 {"v":1,"step":"open"}
-{"v":1,"step":"expect","frame":{"t":"hello","protocol":1,"client":{"name":"fixture","version":"1"},"token":"fixture-token"},"fields":["protocol","token"],"absent":[]}
-{"v":1,"step":"send","frame":{"t":"welcome","protocol":1,"server_version":"fixture","capabilities":["read","send"],"principal":"fixture-principal","server_epoch":"fixture-epoch","idempotency_window_ms":86400000}}
+{"v":1,"step":"expect","frame":{"t":"hello","protocol":2,"client":{"name":"fixture","version":"1"},"token":"fixture-token"},"fields":["protocol","token"],"absent":[]}
+{"v":1,"step":"send","frame":{"t":"welcome","protocol":2,"server_version":"fixture","capabilities":["read","send"],"principal":"fixture-principal","server_epoch":"fixture-epoch","idempotency_window_ms":86400000}}
 {"v":1,"step":"observe","connection":"Live"}
 {"v":1,"step":"quiet","ceiling_ms":15000}
 {"v":1,"step":"send","frame":{"t":"ping","nonce":"healthy-0"}}
