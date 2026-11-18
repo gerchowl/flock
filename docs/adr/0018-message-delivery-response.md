@@ -175,7 +175,7 @@ are explicitly pull-only until their integration says otherwise.
 **Operational dependency.** The turn-boundary half requires the agent's `Stop`
 hook to carry flock's entry. On nix-managed hosts that is declared in the host's
 Home-Manager configuration, not installed by `flk integration install`, which
-cannot write a read-only `settings.json` (g-fleet#156).
+cannot write a read-only `settings.json`.
 
 ## Alternatives rejected
 

@@ -117,7 +117,7 @@ rubric `ax/1` from §2 in dry-run mode (no filing):
 | Answers | all 8 questions, each citing log timestamps; "unknown" where the stand-in had no tool history (it had read the log, not lived it) |
 | Candidate issues | 5, with confidence 0.5–0.7 |
 | Dedup searches | failed inside the sandbox (`gh` reads `$XDG_CONFIG_HOME/gh`, exit 4); re-run read-only by hand |
-| After the search | 4 of 5 match existing issues: #892 (shipped, not yet rolled out), #639 / #911 (shipped), #663 / #819 (open, covered by ADR-0028 E1b, E3 and E7), claude-config#49 (closed). The fifth (builders ignore the size budget) is new but is exactly §7 of this ADR |
+| After the search | 4 of 5 match existing issues: #892 (shipped, not yet rolled out), #639 / #911 (shipped), #663 / #819 (open, covered by ADR-0028 E1b, E3 and E7), a downstream configuration issue (closed). The fifth (builders ignore the size budget) is new but is exactly §7 of this ADR |
 
 **At real architect sizes.** The probe ran at 84k and 136k tokens; ADR-0032
 records real architect contexts of 210k–637k before compaction. Every call a
@@ -401,7 +401,7 @@ The prototype's 4 duplicates out of 5 decide the order:
    closed** issues in the target repo (`gh issue list --state all --search`,
    3–5 keywords taken from the exact error or command), plus the issues the
    #987 survey already maps. The target repo follows architect skill §6
-   (flock, g-fleet, claude-config, watcher-s1).
+   (flock, the fleet configuration repo, the agent configuration repo, watcher-s1).
 2. **Match → comment, and only with new evidence.** A match that is open gets
    a comment only if the fork has evidence the issue lacks (a new command, an
    error, a version, a timestamp); a "+1" is never posted. A closed match
