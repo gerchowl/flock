@@ -32,6 +32,7 @@ impl Case {
         let mut registry = Registry::default();
         let generation = registry
             .register(Record {
+                harness_established: false,
                 runtime: StructuredRuntime::Structured,
                 agent_id: "fixture-agent".into(),
                 session_id: "history".into(),
@@ -385,6 +386,7 @@ fn selected_agent_gap_fixture_runs_against_cold_persisted_jsonl_and_owner_instal
         case.workers = Workers::new(case.server.wake.clone());
         case.registry
             .register(Record {
+                harness_established: false,
                 runtime: StructuredRuntime::Structured,
                 agent_id: "fixture".into(),
                 session_id: "history".into(),
@@ -605,6 +607,7 @@ fn invalid_stored_subject_is_distinct_from_unknown_stream() {
         let mut case = Case::new(vec![]).await;
         case.registry
             .register(Record {
+                harness_established: false,
                 runtime: StructuredRuntime::Structured,
                 agent_id: "reserved".into(),
                 session_id: "queue".into(),

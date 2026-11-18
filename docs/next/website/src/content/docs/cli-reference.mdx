@@ -541,6 +541,12 @@ Pane-only operations on structured records, including attach, readiness and
 settled waits, return `runtime_unsupported` (retry `never`, exit 2). Use the
 structured state for observation instead. PTY records keep their existing fields.
 Start a structured session with `flk agent start NAME --runtime structured --model MODEL --cwd /absolute/checkout -- claude`.
+After stopping it, the operator can run `flk agent start NAME --runtime structured -- claude`
+to continue the retained conversation. New records launch the harness with
+`--session-id`; a relaunch uses `--resume` only after the harness reported a matching
+`system/init` and that establishment evidence was saved with the record. Failed
+attempts before init and older records without this field use `--session-id`.
+Saved conversation ids must be UUIDs; invalid ids are refused before launch.
 
 An attached local TUI can choose **Allow once** or **Deny** on a native permission
 card. The server authenticates the attaching process and uses a private app-session

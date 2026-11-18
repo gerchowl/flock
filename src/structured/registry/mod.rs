@@ -64,6 +64,11 @@ pub struct Record {
     pub harness: String,
     /// Native conversation identity, exclusively reserved while registered.
     pub session_id: String,
+    /// True only after a matching harness `system/init` was observed.
+    /// Persisted with the session snapshot. Older records omit this field and
+    /// default to false, so their next launch uses fresh-session creation.
+    #[serde(default)]
+    pub harness_established: bool,
     /// Launch working directory, never a fabricated pane location.
     pub cwd: PathBuf,
     /// Requested model, absent when the provider selects its default.
@@ -161,6 +166,7 @@ impl Entry {
 pub struct Registry {
     entries: BTreeMap<String, Entry>,
     generation: u64,
+    establishment_dirty: bool,
     preserved: Vec<Option<Value>>,
     unparsed: Option<Value>,
     retained: BTreeMap<usize, retention::Retained>,
@@ -168,6 +174,12 @@ pub struct Registry {
     retention_opaque: Option<Value>,
 }
 impl Registry {
+    /// Consume new establishment evidence so the owner schedules its normal
+    /// synced session-snapshot writer. Cold snapshots carry no pending save work.
+    pub(crate) fn take_establishment_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.establishment_dirty)
+    }
+
     /// Whether there is nothing durable, including inactive retained records.
     /// Unknown-only sessions must survive the application's empty-session cleanup.
     pub fn is_empty(&self) -> bool {
@@ -284,6 +296,18 @@ impl Registry {
             .get_mut(agent_id)
             .filter(|entry| entry.generation == generation)
             .ok_or(RegistryError::StaleGeneration)?;
+        if let Input::Event(super::claude::SessionEvent::Init(init)) = &input {
+            if !entry.record.harness_established
+                && init.session_id.as_ref().and_then(Option::as_deref)
+                    == Some(entry.record.session_id.as_str())
+            {
+                entry.record.harness_established = true;
+                if let Some(Some(raw)) = self.preserved.get_mut(entry.slot) {
+                    raw["harness_established"] = Value::Bool(true);
+                }
+                self.establishment_dirty = true;
+            }
+        }
         entry
             .reducer
             .publish(input, now, unix_ms, stall_after, &mut entry.projection);
@@ -364,6 +388,7 @@ impl Registry {
                 })
                 .collect(),
             generation: self.generation,
+            establishment_dirty: false,
             preserved: self.preserved.clone(),
             unparsed: self.unparsed.clone(),
             retained: self.retained.clone(),
