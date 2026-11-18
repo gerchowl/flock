@@ -328,9 +328,57 @@ stop remains available only to the operator and the structured agent itself.
 MCP spawn is fresh-only. Mesh relays cannot carry structured start/spawn, and the
 server independently refuses recorded mesh edges. Client token scopes, including
 `operate`, grant permission decisions, not local socket operator identity or
-resume authority. The current WebSocket terminal bridge does not dispatch the
+resume authority (**proposed amendment below narrows this for operator
+app-session tokens; owner decision pending**). The current WebSocket terminal bridge does not dispatch the
 structured `cmd` frame; future command admission must preserve this boundary.
 The cooperative same-UID limitation of #1177 still applies.
+
+#### Proposed amendment (owner decision pending): operate app-session tokens may stop and restart structured agents
+
+**Status: Proposed.** Not accepted and not implemented; the owner rules on it.
+Until accepted, the text above is in force and the `agent.start`, `agent.restart`
+and `agent.stop` wire verbs refuse structured stop/restart for every token with a
+typed error.
+
+*Need.* The GUI must restart (resume the same session) and stop a structured
+agent. It reaches only its home node's wire, authenticated by an app-session
+token (§5). Without this amendment those controls and their end-to-end coverage
+(#3096, #3098) cannot work.
+
+*Proposal.* An **operator app-session token with the `operate` scope** carries
+structured **stop** and **restart (resume)** authority for structured agents on
+its **home node**. The token must have been minted for the local operator's own
+GUI session by the operator principal (§5: only the local operator, after the
+uid check above, can mint), never by an agent or a relay. Per §5 such a token
+*is* the operator's identity for ADR-0014's operator-only verbs, and `agent.start`
+already relies on that; this extends the same identity to stop and resume.
+
+*Unchanged.*
+- Agent-minted or delegated tokens get no structured stop/resume.
+- `read`, `send` and `answer` scopes get none.
+- Mesh-relayed frames and lineage parents get none; mesh relays still cannot
+  carry structured start/spawn.
+- Remote targets stay refused until ADR-0043.
+- ADR-0052 profile admission still applies to every resume.
+- The structured agent itself keeps its existing self-stop authority; resume of
+  a record by an agent stays refused.
+- Every stop or restart is audited with the token id.
+
+*Threat considered.* A stolen operate token can already start agents and act as
+the operator for every ADR-0014 operator-only verb. This adds stop/resume of
+structured agents to that same blast radius and grants nothing a holder of the
+token lacks today in practice. Existing mitigations: token TTL and revocation,
+loopback-only bind unless `--allow-non-loopback` is set, and the audit trail.
+
+*Rejected alternative.* Keep §1a as is and have the GUI call through the local
+unix socket. Rejected: the GUI's only channel is its home node's wire, so it
+would need a second, privileged channel that duplicates and bypasses the token
+model.
+
+*Follow-up implementation slice (after acceptance).* Lift the typed refusal in
+the wire verbs for operate app-session tokens (home node only, audited with the
+token id), keeping every other caller refused; add restart and stop steps to
+`gui-e2e-fleet`. Part of #3096.
 
 `caller_is_local_operator()` (`src/app/api/mesh.rs:182`) treats a local
 caller with no flk pane in its process ancestry as the operator. A
