@@ -623,7 +623,7 @@ fn msg_operator_inbox(args: &[String], consume: bool) -> std::io::Result<i32> {
             "usage: flk msg operator-{} --pane TARGET",
             if consume { "read" } else { "list" }
         );
-        return Ok(2);
+        return Ok(super::exit::USAGE);
     };
     super::print_response(&super::send_request(&Request {
         id: "cli:msg:operator-inbox".into(),

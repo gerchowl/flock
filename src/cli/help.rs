@@ -186,7 +186,7 @@ const VERBS: &[(&str, &str, &str)] = &[
         "reply",
         "flk msg reply <correlation_id> <text...> [--intent fyi|needs-reply|blocking] [-- <text starting with dashes>]",
     ),
-    ("msg", "list", "flk msg list [--pane TARGET]   peek at your attested inbox or the audited operator global list"),
+    ("msg", "list", "flk msg list [--pane TARGET]   peek at your attested pane or structured inbox; listing all panes or another inbox requires the local operator and is audited"),
     ("msg", "read", "flk msg read [--pane TARGET]   consume your attested pane or structured inbox"),
     ("msg", "status", "flk msg status <correlation_id>"),
     (
