@@ -16,6 +16,9 @@
 - S6e amendment Accepted (2026-10-29, #2242/#2731): the owner typed
   "accept all rec with star". All S6e recommendations are decided; no
   question-thread implementation is claimed.
+- Proposed amendment (owner decision pending; not accepted, not implemented):
+  §1a lets operator app-session `operate` tokens stop and restart structured
+  agents on their home node; file tokens stay refused.
 - Implemented: the S0 probes (#1356); the slices are tracked in #1307.
 - Date: 2026-10-13
 - Issues: #1299 (the spike this records, with the owner decisions of
@@ -370,7 +373,8 @@ paragraph ("the operator and the structured agent itself only").
 - The structured agent itself keeps its existing self-stop authority; resume of
   a record by an agent stays refused.
 - This is consistent with ADR-0052 §1 ("existing operator-only resume authority
-  in ADR-0036 §1a remains in force") and ADR-0049 (resume is never delegable):
+  in ADR-0036 §1a remains in force"), ADR-0044 ("operator-only resume
+  authority") and ADR-0049 (resume is never delegable):
   the authority belongs to the operator identity, not to any delegate.
 - Every stop or restart is audited with the per-mint credential `app:<nonce>`
   (the fresh random name of that mint), not only the shared principal
@@ -1740,7 +1744,9 @@ are deferred to S6 (#1429); this types slice names the contracts only.
   whatever the token says unless it is `operate`-scoped. Stated plainly: an
   `operate`-scoped bearer token *is* the operator's identity for ADR-0014's
   operator-only verbs, from any address, and once `--allow-non-loopback`
-  is on that includes other machines (owner decision 9). Token files live in
+  is on that includes other machines (owner decision 9). That reach is why the
+  §1a proposed amendment extends structured stop/restart only to app-session
+  tokens, never to file tokens. Token files live in
   the operator's data dir, which `flk-agent` cannot read (ADR-0035 §6.3), so
   structured agents cannot pick up a client token. `pty` agents that still
   run as the operator's uid until O19a can; that limit is #1177's.
