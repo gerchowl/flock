@@ -40,8 +40,19 @@ impl Fixture {
     }
 
     fn profile(&self) -> LaunchProfile {
-        LaunchProfile::prepare(&self.config(), &self.0, SESSION_ID, self.binary(), |_| None)
-            .expect("launch preparation")
+        self.profile_with_mode(LaunchMode::Fresh)
+    }
+
+    fn profile_with_mode(&self, mode: LaunchMode) -> LaunchProfile {
+        LaunchProfile::prepare(
+            &self.config(),
+            &self.0,
+            SESSION_ID,
+            mode,
+            self.binary(),
+            |_| None,
+        )
+        .expect("launch preparation")
     }
 }
 
@@ -92,6 +103,7 @@ fn default_run_as_is_gated_before_any_file_access() {
         &StructuredConfig::default(),
         &fixture.0.join("missing-parent"),
         SESSION_ID,
+        LaunchMode::Fresh,
         fixture.binary(),
         |_| None,
     )
@@ -205,6 +217,7 @@ fn allowlist_excludes_server_credentials_and_live_session_markers() {
         &fixture.config(),
         &fixture.0,
         SESSION_ID,
+        LaunchMode::Fresh,
         fixture.binary(),
         |key| supplied.get(key).cloned(),
     )
@@ -326,9 +339,16 @@ fn config_directory_is_removed_on_unwind_and_writer_error() {
     let config = fixture.config();
     let binary = fixture.binary();
     let result = std::panic::catch_unwind(|| {
-        LaunchProfile::prepare(&config, &fixture.0, SESSION_ID, binary, |_| {
-            panic!("injected preparation failure after writing session files");
-        })
+        LaunchProfile::prepare(
+            &config,
+            &fixture.0,
+            SESSION_ID,
+            LaunchMode::Fresh,
+            binary,
+            |_| {
+                panic!("injected preparation failure after writing session files");
+            },
+        )
     });
     assert!(result.is_err());
     assert_eq!(
@@ -382,8 +402,15 @@ fn harness_profile_persists_across_session_drop_and_unwind() {
     assert!(transcript.is_file());
     let mut config = fixture.config();
     config.profile = "work".into();
-    let other = LaunchProfile::prepare(&config, &fixture.0, SESSION_ID, fixture.binary(), |_| None)
-        .expect("other profile");
+    let other = LaunchProfile::prepare(
+        &config,
+        &fixture.0,
+        SESSION_ID,
+        LaunchMode::Fresh,
+        fixture.binary(),
+        |_| None,
+    )
+    .expect("other profile");
     assert_eq!(
         other.profile_directory.path(),
         fixture.0.join("structured/claude/work")
@@ -425,20 +452,31 @@ fn preparation_failures_leave_no_session_files() {
     let fixture = Fixture::new();
     let mut config = fixture.config();
     config.token_file = None;
-    assert!(
-        LaunchProfile::prepare(&config, &fixture.0, SESSION_ID, fixture.binary(), |_| None)
-            .is_err()
-    );
+    assert!(LaunchProfile::prepare(
+        &config,
+        &fixture.0,
+        SESSION_ID,
+        LaunchMode::Fresh,
+        fixture.binary(),
+        |_| None
+    )
+    .is_err());
     config.token_file = Some(fixture.file("token", b"", 0o600));
-    assert!(
-        LaunchProfile::prepare(&config, &fixture.0, SESSION_ID, fixture.binary(), |_| None)
-            .is_err()
-    );
+    assert!(LaunchProfile::prepare(
+        &config,
+        &fixture.0,
+        SESSION_ID,
+        LaunchMode::Fresh,
+        fixture.binary(),
+        |_| None
+    )
+    .is_err());
     config = fixture.config();
     assert!(LaunchProfile::prepare(
         &config,
         &fixture.0.join("missing"),
         SESSION_ID,
+        LaunchMode::Fresh,
         fixture.binary(),
         |_| None
     )
@@ -628,4 +666,13 @@ fn opening_refusal_display_omits_option_debug_and_uses_source_display() {
         present.to_string(),
         "opening turn refused: input_write_unknown: owned fixture failure"
     );
+}
+
+#[test]
+fn continuation_launch_profile_uses_resume() {
+    let fixture = Fixture::new();
+    let profile = fixture.profile_with_mode(LaunchMode::Continuation);
+    let args = profile.args();
+    assert!(args.windows(2).any(|pair| pair == ["--resume", SESSION_ID]));
+    assert!(!args.iter().any(|arg| arg == "--session-id"));
 }

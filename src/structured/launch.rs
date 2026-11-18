@@ -406,6 +406,17 @@ impl Drop for SessionConfigDir {
     }
 }
 
+/// Explicit harness identity operation selected by the session owner.
+/// The caller chooses from retained session state, before preparing the launch.
+/// Filesystem contents and transient process observations never choose this mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchMode {
+    /// Create a new conversation with `--session-id` and its newly allocated UUID.
+    Fresh,
+    /// Continue the retained harness conversation with `--resume` and its saved id.
+    Continuation,
+}
+
 /// Prepared argv, typed settings and owned secrets, with no spawn side effects.
 /// Dropping an unarmed profile removes its session files; arm before spawning.
 #[derive(Debug)]
@@ -426,6 +437,7 @@ impl LaunchProfile {
         config: &StructuredConfig,
         state_dir: &Path,
         session_id: &str,
+        mode: LaunchMode,
         binary: VerifiedBinary,
         read_env: impl FnMut(&str) -> Option<OsString>,
     ) -> Result<Self, LaunchError> {
@@ -468,7 +480,11 @@ impl LaunchProfile {
             settings_path.into_os_string(),
             "--mcp-config".into(),
             mcp_path.into_os_string(),
-            "--session-id".into(),
+            match mode {
+                LaunchMode::Fresh => "--session-id",
+                LaunchMode::Continuation => "--resume",
+            }
+            .into(),
             session_id.into(),
         ]);
         let environment = EnvironmentAllowlist::capture(read_env, token);
