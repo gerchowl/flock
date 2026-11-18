@@ -442,6 +442,16 @@ mod tests {
             assert_eq!(queued["state"], "queued");
         }
         crate::test_support::attest_pane_caller(&mut api.0.borrow_mut(), pane);
+        let listed = route(
+            "tools/call",
+            json!({"name":"flock_msg_list", "arguments":{}}),
+            &api,
+            &ChannelOptions::off(),
+        )
+        .unwrap();
+        let listed: Value =
+            serde_json::from_str(listed["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(listed["messages"].as_array().unwrap().len(), 7);
         let read = api
             .call(Method::MsgRead(crate::api::schema::MsgReadParams {
                 pane: Some(pane_id.clone()),

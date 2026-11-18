@@ -644,29 +644,49 @@ impl App {
     }
 
     pub(super) fn handle_msg_list(&mut self, id: String, params: MsgListParams) -> String {
+        if params.pane.is_none()
+            && !self.caller_is_local_operator()
+            && !matches!(
+                self.lease_caller(),
+                crate::structured::lease::Caller::Agent { .. }
+            )
+            && self.caller_pane().is_none()
+        {
+            return self.unresolved_msg_list_caller(id);
+        }
         if let Some(response) = self.native_inbox_request(&id, params.pane.as_deref(), false) {
             return response;
         }
+        let operator = self.caller_is_local_operator();
         let pane_filter = match params.pane {
-            Some(pane) => match self.resolve_terminal_target(&pane) {
-                Ok(resolved) => self.public_pane_id(resolved.ws_idx, resolved.pane_id),
-                Err(err) => {
-                    return super::responses::encode_error_body(
-                        id,
-                        self.agent_target_error_body(err),
-                    )
-                }
+            Some(pane) => match self.resolve_inbox_pane(&id, Some(pane), "list") {
+                Ok(pane) => Some(pane),
+                Err(refusal) => return refusal,
             },
-            None => None,
+            None if operator => None,
+            None => match self
+                .caller_pane()
+                .and_then(|(ws, pane)| self.public_pane_id(ws, pane))
+            {
+                Some(pane) => Some(pane),
+                None => return self.unresolved_msg_list_caller(id),
+            },
         };
         let operator = match pane_filter.as_deref() {
             Some(pane) => match self.inbox_operator_access(&id, pane) {
                 Ok(operator) => operator,
                 Err(refusal) => return refusal,
             },
-            None => false,
+            None => operator,
         };
         self.legacy_inbox_list(id, pane_filter, operator)
+    }
+
+    fn unresolved_msg_list_caller(&self, id: String) -> String {
+        encode_error(id, "caller_pane_unresolved", format!(
+            "the calling pane could not be resolved from attested identity: {}. Ask the local operator to use flk msg operator-list --pane TARGET, or migrate this agent to a structured agent (#3066)",
+            self.caller_pane_refusal_reason(),
+        ))
     }
 
     fn legacy_inbox_list(
@@ -684,8 +704,8 @@ impl App {
                 .cloned()
                 .collect();
         }
-        if let Some(pane) = pane_filter.as_deref().filter(|_| operator) {
-            self.audit_operator_inbox(pane, "list", messages.len());
+        if operator {
+            self.audit_operator_inbox(pane_filter.as_deref(), "list", messages.len());
         }
         encode_success(id, ResponseResult::MsgList { messages })
     }
@@ -886,8 +906,8 @@ impl App {
     /// or — omitted — the caller's own pane, resolved the way `msg.send`
     /// resolves its sender. `Err` is the encoded refusal, ready to return.
     ///
-    /// Shared by `msg.read`, `msg.wake` and `msg.mute` so the three cannot
-    /// drift on what "my inbox" means. They have to agree: a wake counted
+    /// Shared by pane inbox verbs so they cannot drift on what "my inbox"
+    /// means. They have to agree: a wake counted
     /// against one pane and a read taken from another is an agent told it has
     /// mail that it then cannot find.
     fn resolve_inbox_pane(
@@ -1196,11 +1216,11 @@ impl App {
         }
     }
 
-    fn audit_operator_inbox(&mut self, pane: &str, operation: &str, message_count: usize) {
+    fn audit_operator_inbox(&mut self, pane: Option<&str>, operation: &str, message_count: usize) {
         self.emit_event(EventEnvelope {
             event: EventKind::OperatorInboxAccess,
             data: EventData::OperatorInboxAccess {
-                pane: pane.into(),
+                pane: pane.map(str::to_owned),
                 operation: operation.into(),
                 peer_pid: self.current_api_peer_pid,
                 peer_uid: self.current_api_peer_uid.flatten(),
@@ -1292,7 +1312,7 @@ impl App {
         self.sync_blocking_mail();
         self.idle_wake_on_read(&pane);
         if operator {
-            self.audit_operator_inbox(&pane, "read", messages.len());
+            self.audit_operator_inbox(Some(&pane), "read", messages.len());
         }
         encode_success(id, ResponseResult::MsgRead { messages })
     }
@@ -3699,6 +3719,145 @@ mod tests {
             assert_eq!(response["error"]["code"], "operator_only", "{response}");
             assert_eq!(app.mailboxes.queued_len(&target), 1);
         }
+    }
+
+    #[tokio::test]
+    async fn implicit_msg_list_refuses_unresolved_callers_without_preview_or_effects() {
+        for origin in [
+            "missing",
+            "unproven",
+            "mismatched",
+            "pending",
+            "enrolled",
+            "dedicated",
+        ] {
+            let hub = crate::api::EventHub::default();
+            let mut app = test_app_with_hub(hub.clone());
+            basic_send(&mut app, "other-inbox", "other inbox body");
+            let target = pane_target(&app, 1);
+            match origin {
+                "missing" => app.current_api_peer_pid = None,
+                "unproven" | "mismatched" => {
+                    let pane = app.state.workspaces[0].focused_pane_id().unwrap();
+                    crate::test_support::adopt_unproven_pane_caller(
+                        &mut app,
+                        pane,
+                        origin == "mismatched",
+                    );
+                }
+                "pending" | "enrolled" => app.test_attach_relay(origin == "enrolled"),
+                "dedicated" => {
+                    app.runtime_config.uid_policy = crate::structured::identity::UidPolicy {
+                        operator: 7,
+                        dedicated: Ok(Some(42)).into(),
+                    };
+                    app.current_api_peer_uid = Some(Some(42));
+                }
+                _ => unreachable!(),
+            }
+            let before = hub.ring_snapshot_after(0).len();
+            let raw = app.handle_api_request(Request {
+                id: "unresolved-list".into(),
+                method: Method::MsgList(MsgListParams { pane: None }),
+            });
+            let response: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            let expected = if origin == "pending" {
+                "mesh_not_enrolled"
+            } else {
+                "caller_pane_unresolved"
+            };
+            assert_eq!(response["error"]["code"], expected, "{origin}: {response}");
+            assert!(!raw.contains("other inbox body"));
+            assert!(response.get("result").is_none());
+            assert_eq!(app.mailboxes.queued_len(&target), 1);
+            assert_eq!(hub.ring_snapshot_after(0).len(), before);
+        }
+    }
+
+    #[tokio::test]
+    async fn operator_global_msg_list_is_audited_including_an_empty_list() {
+        let hub = crate::api::EventHub::default();
+        let mut app = test_app_with_hub(hub.clone());
+        basic_send(&mut app, "global-list", "operator list body");
+        for count in [1, 0] {
+            let raw = app.handle_api_request(Request {
+                id: "global-list".into(),
+                method: Method::MsgList(MsgListParams { pane: None }),
+            });
+            let response: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(
+                response["result"]["messages"].as_array().unwrap().len(),
+                count,
+                "{response}"
+            );
+            assert_eq!(app.mailboxes.queued_len(&pane_target(&app, 1)), count);
+            if count == 1 {
+                let target = pane_target(&app, 1);
+                read_inbox(&mut app, &target);
+            }
+        }
+        let counts = hub
+            .ring_snapshot_after(0)
+            .into_iter()
+            .filter_map(|(_, event)| match &event.data {
+                EventData::OperatorInboxAccess {
+                    pane: None,
+                    operation,
+                    peer_pid,
+                    message_count,
+                    ..
+                } if operation == "list" => {
+                    assert!(event.event.is_persisted());
+                    assert_eq!(*peer_pid, Some(std::process::id()));
+                    let json = serde_json::to_value(&event).unwrap();
+                    assert!(json["data"]["pane"].is_null());
+                    assert!(!json.to_string().contains("operator list body"));
+                    Some(*message_count)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(counts, [1, 0]);
+    }
+
+    #[tokio::test]
+    async fn implicit_msg_list_is_scoped_to_attested_caller_inbox() {
+        let mut app = test_app_with_hub(crate::api::EventHub::default());
+        basic_send(&mut app, "other-inbox", "other inbox body");
+        let own = pane_target(&app, 0);
+        send(
+            &mut app,
+            MsgSendParams {
+                from_agent: None,
+                to: MessageTarget::Pane { pane: own.clone() },
+                body: "own inbox body".into(),
+                correlation_id: Some("own-inbox".into()),
+                in_reply_to: None,
+                intent: MsgIntent::Fyi,
+            },
+        );
+        let pane = app.state.workspaces[0].focused_pane_id().unwrap();
+        crate::test_support::attest_pane_caller(&mut app, pane);
+        assert!(!app.caller_is_local_operator());
+        let response = app.handle_api_request(Request {
+            id: "implicit-list".into(),
+            method: Method::MsgList(MsgListParams { pane: None }),
+        });
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        let messages = response["result"]["messages"]
+            .as_array()
+            .expect("own inbox list");
+        assert_eq!(messages.len(), 1, "{response}");
+        assert_eq!(messages[0]["to_pane"], own);
+        assert_eq!(messages[0]["correlation_id"], "own-inbox");
+        assert!(!response.to_string().contains("other inbox body"));
+        assert_eq!(app.mailboxes.queued_len(&own), 1);
+        assert_eq!(app.mailboxes.queued_len(&pane_target(&app, 1)), 1);
+        assert!(!app
+            .event_hub
+            .ring_snapshot_after(0)
+            .iter()
+            .any(|(_, e)| e.event == EventKind::OperatorInboxAccess));
     }
 
     #[tokio::test]

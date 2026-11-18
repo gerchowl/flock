@@ -473,6 +473,9 @@ outside pane ancestry, with no structured identity or inbound relay origin.
 Refused callers receive `operator_only`, before target lookup. Successful accesses
 emit a durable `operator_inbox_access` event containing `pane`, `operation`
 (`list` or `read`), `peer_pid`, `peer_uid`, and `message_count`, without bodies.
+`msg.list` without `pane` returns only the non-operator caller's attested inbox;
+unresolved callers receive `caller_pane_unresolved`. A global list requires the
+local operator and emits the same audit event with `pane: null`.
 The ordinary `msg.list` and `msg.read` methods also require this operator check
 when an explicit target names another pane. These operator methods are an interim
 recovery path until agent migration (#3066), and do not restore agent authority.

@@ -1712,7 +1712,7 @@ pub struct MsgReplyParams {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct MsgListParams {
-    /// Recipient target. Omitted means structured self or the operator global list.
+    /// Recipient target. Omitted means attested self, or an audited operator global list.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pane: Option<String>,
 }
@@ -4497,9 +4497,10 @@ pub struct AgentPhaseEvent {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum EventData {
-    /// Successful operator peek or consumption of a named pane inbox.
+    /// Successful operator peek or consumption of pane inboxes.
     OperatorInboxAccess {
-        pane: String,
+        /// Named pane, or `None` for a global operator list.
+        pane: Option<String>,
         operation: String,
         peer_pid: Option<u32>,
         peer_uid: Option<u32>,
