@@ -8,6 +8,7 @@ fn app(config: &Config) -> App {
         operator: 7,
         dedicated: Ok(Some(42)).into(),
     };
+    app.structured_profiles = Default::default();
     app.current_api_peer_pid = Some(std::process::id());
     app.current_api_peer_birth = Some(crate::platform::process_start_time(std::process::id()));
     app.current_api_peer_uid = Some(Some(7));
@@ -120,4 +121,83 @@ async fn agent_editable_config_cannot_enable_profiles() {
         enable(&mut app)["error"]["code"],
         "structured_profiles_not_ready"
     );
+}
+
+fn seed_bindings(app: &mut App) {
+    let root = crate::test_support::unique_temp_path("profile-status");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("profile-bindings.json");
+    std::fs::write(&path, serde_json::to_vec(&json!({
+        "schema":1,"policy_revision":7,"execution_switch":false,"unknown":[],
+        "bindings":[{"binding_id":"binding-sibling","target":{"repo_id":"repo-fixture",
+        "node_ids":["node-fixture"],"agent_ids":["agent-sibling"]},"account_alias":"sibling-account",
+        "credential_ref":"sibling-token-ref","credential_generation":1,"bundle_digests":["fixture-digest"],
+        "grants":[],"revision":7,"revoked":null}]
+    })).unwrap()).unwrap();
+    app.structured_profiles = crate::structured::profiles::ProfileAdmission::load(&path);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+fn status_request() -> Request {
+    serde_json::from_value(json!({"id":"profile-status","method":"profile.status","params":{}}))
+        .expect("read-only profile.status must be supported")
+}
+
+#[tokio::test]
+async fn operator_status_reports_disabled_binding_state() {
+    let mut app = app(&Config::default());
+    let response: Value = serde_json::from_str(
+        &app.handle_api_request_after_internal_events_drained(status_request()),
+    )
+    .unwrap();
+    assert_eq!(response["result"]["execution_switch"], false);
+    assert_eq!(response["result"]["policy_revision"], 0);
+    assert_eq!(response["result"]["bindings"], json!([]));
+    seed_bindings(&mut app);
+    let response: Value = serde_json::from_str(
+        &app.handle_api_request_after_internal_events_drained(status_request()),
+    )
+    .unwrap();
+    assert_eq!(response["result"]["policy_revision"], 7);
+    assert_eq!(
+        response["result"]["bindings"][0]["binding_id"],
+        "binding-sibling"
+    );
+}
+
+#[tokio::test]
+async fn non_operator_status_never_discloses_authority_or_usage() {
+    fn redacted(app: &mut App) {
+        seed_bindings(app);
+        let mut request = status_request();
+        // Self-reported identity and profile selection never confer authority.
+        request = serde_json::from_value(json!({"id":request.id,"method":"profile.status",
+            "params":{"operator":true,"agent_id":"agent-sibling","binding_id":"binding-sibling"}}))
+        .unwrap();
+        let response: Value =
+            serde_json::from_str(&app.handle_api_request_after_internal_events_drained(request))
+                .unwrap();
+        assert_eq!(response["result"], json!({"type":"profile_status"}));
+    }
+    for enrolled in [false, true] {
+        for uid in [None, Some(Some(7))] {
+            let mut app = app(&Config::default());
+            app.test_attach_relay(enrolled);
+            app.current_api_peer_uid = uid;
+            redacted(&mut app);
+        }
+    }
+    let mut dedicated = app(&Config::default());
+    dedicated.current_api_peer_uid = Some(Some(42));
+    redacted(&mut dedicated);
+    let mut unauthenticated = app(&Config::default());
+    unauthenticated.current_api_peer_pid = None;
+    redacted(&mut unauthenticated);
+    let mut leased = app(&Config::default());
+    let mut lease = leased
+        .session_leases
+        .reserve("agent_atlas_profile", "profile-session", None)
+        .unwrap();
+    lease.bind_test_peer(std::process::id());
+    redacted(&mut leased);
 }

@@ -1055,7 +1055,9 @@ impl App {
             current_api_peer_birth: None,
             current_api_peer_uid: None,
             session_leases: Default::default(),
-            structured_profiles: Default::default(),
+            structured_profiles: crate::structured::profiles::ProfileAdmission::load(
+                &crate::session::data_dir().join("profile-bindings.json"),
+            ),
             #[cfg(test)]
             test_pane_child_pids: std::collections::HashMap::new(),
             event_rx,

@@ -3,7 +3,7 @@ import { expect, test } from "bun:test";
 import { chromium } from "playwright";
 import { mkdir } from "node:fs/promises";
 
-type Node = { id: string; name: string; socket: string; env: Record<string, string> };
+type Node = { id: string; name: string; socket: string; working_directory: string; env: Record<string, string> };
 type Manifest = { version: 1; binary: string; home: string; nodes: Node[]; artifacts: string };
 const STEP_MS = 15_000;
 
@@ -31,7 +31,7 @@ async function cli(manifest: Manifest, node: Node, args: string[]): Promise<unkn
   }
 }
 
-test("both meshed node rows are online in the real GUI", async () => {
+test("the real GUI starts a home agent and refuses a remote start", async () => {
   const path = process.env["FLOCK_GUI_FLEET_MANIFEST"];
   if (!path) throw new Error("Rust fleet driver must provide FLOCK_GUI_FLEET_MANIFEST");
   const manifest = await step("read fleet manifest", () => Bun.file(path).json()) as Manifest;
@@ -61,6 +61,35 @@ test("both meshed node rows are online in the real GUI", async () => {
     for (const node of manifest.nodes.filter((node) => node.name !== manifest.home)) {
       expect(peers.find((peer) => peer.node_id === node.id)?.routes.length).toBeGreaterThan(0);
     }
+    const remote = manifest.nodes.find((node) => node.name !== manifest.home)!;
+    const localAgents = async (node: Node): Promise<unknown> => {
+      const list = await cli(manifest, node, ["agent", "list"]) as { result: { agents: unknown[]; structured_agents: unknown[] } };
+      return { agents: list.result.agents, structured_agents: list.result.structured_agents };
+    };
+    const before = await localAgents(remote);
+    await step("open new agent picker", () => page.getByRole("button", { name: "New agent", exact: true }).click());
+    const picker = page.getByRole("dialog", { name: "New agent", exact: true });
+    expect(await step("home node default", () => picker.getByLabel("Node", { exact: true }).inputValue())).toBe(home.id);
+    await step("name home agent", () => picker.getByLabel("Name", { exact: true }).fill("gui-home-agent"));
+    await step("invalid working directory", () => picker.getByLabel("Working directory", { exact: true }).fill(`${home.working_directory}/missing`));
+    await step("request invalid directory", () => picker.getByRole("button", { name: "Start agent", exact: true }).click());
+    await step("directory refusal", () => picker.getByText("The agent could not be started with these settings. Check the name and working directory, then try again.", { exact: true }).waitFor({ timeout: STEP_MS }));
+    await step("home working directory", () => picker.getByLabel("Working directory", { exact: true }).fill(home.working_directory));
+    await step("start home agent", () => picker.getByRole("button", { name: "Start agent", exact: true }).click());
+    await step("home start accepted", () => picker.getByText("Agent started.", { exact: true }).waitFor({ timeout: STEP_MS }));
+    const agents = await cli(manifest, home, ["agent", "list"]) as { result: { structured_agents: { name: string; runtime: string; cwd: string }[] } };
+    const started = agents.result.structured_agents.find((agent) => agent.name === "gui-home-agent");
+    expect(started?.runtime).toBe("structured");
+    expect(started?.cwd).toBe(home.working_directory);
+    await step("close picker", () => picker.getByRole("button", { name: "Done", exact: true }).click());
+    await step("open remote picker", () => page.getByRole("button", { name: "New agent", exact: true }).click());
+    await step("name remote agent", () => picker.getByLabel("Name", { exact: true }).fill("gui-remote-agent"));
+    await step("choose remote node", () => picker.getByLabel("Node", { exact: true }).selectOption(remote.id));
+    expect(await step("remote directory reset", () => picker.getByLabel("Working directory", { exact: true }).inputValue())).toBe("");
+    await step("remote working directory", () => picker.getByLabel("Working directory", { exact: true }).fill(remote.working_directory));
+    await step("request remote start", () => picker.getByRole("button", { name: "Start agent", exact: true }).click());
+    await step("remote refusal", () => picker.getByText("Agents cannot be started on another node yet. Choose the home node.", { exact: true }).waitFor({ timeout: STEP_MS }));
+    expect(await localAgents(remote)).toEqual(before);
     failed = false;
   } finally {
     try {

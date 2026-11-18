@@ -790,7 +790,7 @@ fn apply_wake_authority(
         });
         if first {
             outcome.stdout = Some(serde_json::json!({
-                "systemMessage": "Inbox authority unavailable for this process. Ask the operator to read this pane's inbox from their own interactive shell with `flk msg operator-read --pane <pane-id>` (peek with `flk msg operator-list --pane <pane-id>`). This does not restore agent authority; migrate to a structured agent (#3066); see #3000."
+                "systemMessage": "Inbox authority unavailable for this process. Ask the operator to read this pane's inbox from their own interactive shell with `flk msg operator-read --pane <pane-id>` (peek with `flk msg operator-list --pane <pane-id>`). For a legacy handoff pane, ask the operator to migrate this agent to a structured agent, resuming its harness session (#3066). Reading the inbox does not restore agent authority; see #3000."
             }).to_string());
         }
     } else if wake.get("result").is_some() {
@@ -1056,6 +1056,11 @@ mod tests {
                 .unwrap()
                 .contains("flk msg operator-read --pane"));
             assert!(notice["systemMessage"].as_str().unwrap().contains("#3000"));
+            assert!(notice["systemMessage"].as_str().unwrap().contains("#3066"));
+            assert!(notice["systemMessage"]
+                .as_str()
+                .unwrap()
+                .contains("migrate"));
             for count in [0, 3] {
                 outcome.stdout = mail_nudge(count, true, "p_1");
                 apply_wake_authority(&mut outcome, &refused, &marker);

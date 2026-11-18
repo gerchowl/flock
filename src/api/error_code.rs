@@ -128,6 +128,12 @@ error_codes! {
         AlreadyHibernated = "already_hibernated",
         AmbiguousWorktreeBranch = "ambiguous_worktree_branch",
         AtLineageDepth = "at_lineage_depth",
+        /// Caller pane identity could not be attested (CLI exit 1, retry never).
+        /// Message verbs name the missing evidence and direct the operator to
+        /// structured-agent migration (#3066) or `flk msg read --pane <id>`.
+        /// MCP reports -32000 with `data.refusal = "caller_pane_unresolved"`,
+        /// `data.exit = 1` and `data.retry = "never"`. Explicit pane selection
+        /// does not restore authority to a legacy handoff pane.
         CallerPaneUnresolved = "caller_pane_unresolved",
         ChannelNotOwner = "channel_not_owner",
         ChannelUnauthorized = "channel_unauthorized",
@@ -325,6 +331,10 @@ error_codes! {
         CodexLockUnconfirmed = "codex_lock_unconfirmed",
         SessionMismatch = "session_mismatch";
     AfterHuman:
+        /// Persisted profile policy predates its independent durable revision floor.
+        PolicyRevisionRegressed = "policy_revision_regressed",
+        /// Current profile policy or its durable revision floor is unreadable.
+        PolicyRevisionUnavailable = "policy_revision_unavailable",
         ChecksumToolMissing = "checksum_tool_missing",
         AuthRevoked = "auth_revoked",
         StructuredEndpointRestartRequired = "structured_endpoint_restart_required",
@@ -412,7 +422,7 @@ mod tests {
             ("yes", "remote_checksum_mismatch timeout"),
             ("later", "agent_not_ready at_agent_capacity at_fanout_limit auth_rate_limited channel_token_unavailable fleet_paused handoff_undrained injection_pending input_not_empty input_write_cancelled mail_store_full mailbox_full mesh_not_enrolled msg_rate_limited no_local_server not_settled operator_active preauth_capacity queue_source_cold restart_busy restart_pending restart_rate_limited session_busy session_unconfirmed too_many_waits unknown_composer worktree_merge_unknown worktree_open_pr"),
             ("after_inspecting", "agent_exited_at_start agent_exited_before_ready codex_lock_unconfirmed events_lost input_write_failed input_write_unknown no_result queue_recovery_failed request_outcome_unknown self_submit_unconfirmed server_executable_unresolved session_mismatch session_unbound"),
-            ("after_human", "auth_revoked checksum_tool_missing claude_folder_trust claude_folder_trust_with_permissions codex_conversation_locked codex_folder_trust codex_hook_review queue_journal_corrupt structured_endpoint_restart_required structured_harness_version_unsupported structured_needs_agent_user structured_recovery_required structured_worker_cleanup_failed structured_worker_panicked structured_worker_timeout worktree_checkout_unreachable"),
+            ("after_human", "auth_revoked checksum_tool_missing claude_folder_trust claude_folder_trust_with_permissions codex_conversation_locked codex_folder_trust codex_hook_review policy_revision_regressed policy_revision_unavailable queue_journal_corrupt structured_endpoint_restart_required structured_harness_version_unsupported structured_needs_agent_user structured_recovery_required structured_worker_cleanup_failed structured_worker_panicked structured_worker_timeout worktree_checkout_unreachable"),
             ("after_handoff", "mail_store_schema_too_new mesh_version_mismatch peer_incompatible queue_journal_newer server_version_gap"),
         ]
         .into_iter()

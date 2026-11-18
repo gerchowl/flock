@@ -12,6 +12,9 @@ pub struct Request {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "method", content = "params")]
 pub enum Method {
+    /// Read-only binding metadata, redacted for non-operator callers.
+    #[serde(rename = "profile.status")]
+    ProfileStatus(EmptyParams),
     /// Operator-only request to enable reviewed profile execution (ADR-0052 §9).
     #[serde(rename = "profile.enable")]
     ProfileEnable(ProfileEnableParams),
@@ -376,6 +379,7 @@ impl Method {
         matches!(
             self,
             Self::Ping(_)
+                | Self::ProfileStatus(_)
                 | Self::SessionRetainedList(_)
                 | Self::StructuredGrantsList(_)
                 | Self::NotificationList(_)
@@ -428,7 +432,8 @@ impl Method {
             return false;
         }
         match self {
-            Self::Ping(_)
+            Self::ProfileStatus(_)
+            | Self::Ping(_)
             | Self::StructuredGrantsList(_)
             | Self::ServerStop(_)
             | Self::ServerLiveHandoff(_)
@@ -3136,6 +3141,12 @@ pub struct ApiListenerHealth {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResponseResult {
+    /// Inactive binding state, containing no metadata for non-operator callers.
+    ProfileStatus {
+        /// Authorized operator fields; empty for other principals.
+        #[serde(flatten)]
+        status: serde_json::Value,
+    },
     Retained {
         records: Vec<crate::structured::registry::RetainedInfo>,
         forward: usize,

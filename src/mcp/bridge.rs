@@ -1019,6 +1019,40 @@ mod tests {
     }
 
     #[test]
+    fn message_tools_preserve_unresolved_caller_diagnosis_and_remedy() {
+        let message = "the candidate pane has no process-birth evidence; ask the operator to migrate (#3066) or run flk msg read --pane <id>";
+        for (tool, arguments) in [
+            ("flock_msg_read", json!({})),
+            ("flock_msg_list", json!({})),
+            (
+                "flock_msg_send",
+                json!({"to": "p_1", "body": "fixture", "intent": "fyi"}),
+            ),
+            (
+                "flock_msg_reply",
+                json!({"correlation_id": "fixture", "body": "fixture"}),
+            ),
+        ] {
+            let flock = MockApi::ok(json!({"error": {
+                "code": "caller_pane_unresolved", "message": message,
+            }}));
+            let err = route(
+                "tools/call",
+                json!({"name": tool, "arguments": arguments}),
+                &flock,
+                &ChannelOptions::off(),
+            )
+            .unwrap_err();
+            assert_eq!(err.code, -32000);
+            assert_eq!(err.message, message);
+            assert_eq!(
+                err.data,
+                Some(json!({"refusal": "caller_pane_unresolved", "retry": "never", "exit": 1}))
+            );
+        }
+    }
+
+    #[test]
     fn tools_call_translates_flock_error_envelope() {
         // Mock the raw wire ERROR envelope: the server would emit this for a
         // fork of a non-Claude agent.
