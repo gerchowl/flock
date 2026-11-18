@@ -4,7 +4,8 @@
 - Date: 2026-11-08
 - Issues: [#3066](https://github.com/gerchowl/flock/issues/3066)
 - Decision owner: operator
-- Implemented: slice 1, disabled admission guard. Production execution remains
+- Implemented: slice 1, disabled admission guard; slice 2a, inactive binding
+  storage and status projection. Production execution remains
   unavailable until slice 17.
 - Amends: ADR-0036 §1 isolation and hot reload, and ADR-0032 §3
   structured-session context replenishment. Composes with ADR-0049 requests,
@@ -588,6 +589,22 @@ domain while production remains disabled, and can never publish a production
 session or transfer mailbox ownership. Its separate admission test proves this.
 
 Slice 1 holds the switch in server memory only; slice 2 persists it with the binding records.
+
+Slice 2 is split into inactive 2a (store, data-only resolution and read-only
+`profile.status`) and 2b (reviewed binding/revocation transactions). Store 2a uses
+`profile-bindings.json` beside server session state, mode 0600, with schema 1,
+`policy_revision`, default-false `execution_switch`, `bindings` and retained raw
+`unknown` entries. One global policy revision orders all binding changes and
+revocations; each binding records its last change revision. Reload refuses a
+revision lower than one already observed, and saving refuses to replace a higher
+disk revision. Non-operator status projections omit binding and account metadata.
+Binding records contain `binding_id`, explicit `target` (`repo_id`, `node_ids`,
+`agent_ids`), `account_alias`, `credential_ref`, `credential_generation`,
+`bundle_digests`, `grants`, `revision` and nullable `revoked` evidence (reason,
+principal, operation ID and revision). Resolution neither dereferences credentials
+nor executes anything. Session binding pins and continuation refusal (#3111) move
+to 2b to keep 2a within the production-line cap. Budgets, permits, containment and
+activation remain in their numbered later slices.
 
 Existing trusted single-account launch behavior stays on its existing path;
 profile operations never fall back to it on denial. Slice 17 is the only initial

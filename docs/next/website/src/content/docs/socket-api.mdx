@@ -15,9 +15,18 @@ receive `operator_only`. This incomplete build refuses even operator requests
 with `structured_profiles_not_ready`; no enable plan is consumed or execution
 started. ADR-0052 slice 17 adds the reviewed activation transaction.
 
-The server holds `structured_profiles.enabled` in memory, initially false;
-agent-editable configuration cannot set it. Slice 2 persists the switch with
-binding records. Every future profile execution path must pass shared admission
+The server persists the execution switch (default false) with operator binding
+records in `profile-bindings.json`, beside its session state. Agent-editable
+configuration cannot set it. Unknown or invalid binding entries remain preserved
+and inactive; unsupported store formats are never overwritten.
+
+`profile.status` accepts `{}`. The authenticated local operator receives
+`policy_revision`, `execution_switch`, and binding records containing explicit
+targets, credential references, bundle digests, grants, and revocation metadata.
+References contain no resolved secret bytes. Agents and pending or enrolled mesh
+relays receive no binding, account, sibling identity, or usage fields. This API
+only projects data; binding mutation transactions arrive in slice 2b. Production
+execution remains unavailable. Every future profile execution path must pass shared admission
 before accessing secrets, starting processes or transferring mailbox ownership.
 
 ## Structured permission decision messages

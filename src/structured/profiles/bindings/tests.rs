@@ -1,0 +1,212 @@
+use super::*;
+use std::os::unix::{fs::PermissionsExt, net::UnixListener};
+
+fn binding() -> Value {
+    json!({"binding_id":"binding-a","target":{"repo_id":"repo-a","node_ids":["node-a"],"agent_ids":["agent-a"]},
+        "account_alias":"fixture-account","credential_ref":"fixture-token-ref","credential_generation":1,
+        "bundle_digests":["fixture-digest"],"grants":["fixture-selection"],"revision":7,"revoked":null})
+}
+
+fn envelope(entries: Value) -> Value {
+    json!({"schema":1,"policy_revision":7,"bindings":entries,"unknown":[]})
+}
+
+fn fixture() -> (std::path::PathBuf, std::path::PathBuf) {
+    let root = crate::test_support::unique_temp_path("profile-bindings");
+    fs::create_dir_all(&root).unwrap();
+    let path = root.join("profile-bindings.json");
+    (root, path)
+}
+
+#[test]
+fn round_trip_preserves_switch_revision_and_private_mode() {
+    let (root, path) = fixture();
+    let mut store = BindingStore::default();
+    store.decode(envelope(json!([binding()])));
+    assert!(!store.execution_switch);
+    store.execution_switch = true;
+    store.save(&path).unwrap();
+    assert_eq!(
+        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let mut restored = BindingStore::default();
+    restored.load(&path);
+    assert_eq!(restored.policy_revision, 7);
+    assert!(restored.execution_switch);
+    assert_eq!(
+        restored.resolve("repo-a", "node-a", "agent-a"),
+        store.resolve("repo-a", "node-a", "agent-a")
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn invalid_future_and_conflicting_entries_are_preserved_without_authority() {
+    let (root, path) = fixture();
+    let mut future = binding();
+    future["binding_id"] = json!("future");
+    future["future_field"] = json!(true);
+    let mut invalid = binding();
+    invalid["binding_id"] = json!("invalid");
+    invalid["target"]["agent_ids"] = json!(["*"]);
+    let mut conflict = binding();
+    conflict["credential_ref"] = json!("conflicting-ref");
+    let entries = json!([binding(), conflict, future, invalid, 42]);
+    let mut survivor = binding();
+    survivor["binding_id"] = json!("binding-survivor");
+    survivor["target"]["agent_ids"] = json!(["agent-survivor"]);
+    let mut all_entries = entries.as_array().unwrap().clone();
+    all_entries.push(survivor.clone());
+    let mut raw = envelope(json!(all_entries));
+    raw["extra_root_field"] = json!({"future":true});
+    raw["unknown"] = json!([{"previously_retained":true}]);
+    let mut store = BindingStore::default();
+    store.decode(raw);
+    assert!(store.resolve("repo-a", "node-a", "agent-a").is_none());
+    store.save(&path).unwrap();
+    let saved: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert_eq!(saved["bindings"], json!([survivor]));
+    assert!(store
+        .resolve("repo-a", "node-a", "agent-survivor")
+        .is_some());
+    assert_eq!(saved["unknown"][0], json!({"previously_retained":true}));
+    assert_eq!(
+        saved["unknown"].as_array().unwrap()[1..],
+        *entries.as_array().unwrap()
+    );
+    assert_eq!(saved["extra_root_field"], json!({"future":true}));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn unknown_or_malformed_envelope_is_never_overwritten() {
+    for raw in [
+        json!({"schema":2,"bindings":[binding()]}),
+        json!({"schema":1,"policy_revision":7,"bindings":{}}),
+    ] {
+        let (root, path) = fixture();
+        fs::write(&path, serde_json::to_vec(&raw).unwrap()).unwrap();
+        let before = fs::read(&path).unwrap();
+        let mut store = BindingStore::default();
+        store.load(&path);
+        assert!(store.resolve("repo-a", "node-a", "agent-a").is_none());
+        assert!(store.save(&path).is_err());
+        assert_eq!(fs::read(&path).unwrap(), before);
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn older_snapshot_cannot_lower_observed_or_persisted_revision() {
+    let (root, path) = fixture();
+    let mut store = BindingStore::default();
+    store.decode(envelope(json!([binding()])));
+    store.save(&path).unwrap();
+    let mut older = envelope(json!([]));
+    older["policy_revision"] = json!(6);
+    store.decode(older.clone());
+    assert_eq!(store.policy_revision, 7);
+    assert!(store.resolve("repo-a", "node-a", "agent-a").is_some());
+    let mut stale = BindingStore::default();
+    stale.decode(older);
+    assert!(stale.save(&path).is_err());
+    let mut restarted = BindingStore::default();
+    restarted.load(&path);
+    assert_eq!(restarted.policy_revision, 7);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn revoked_and_ambiguous_targets_never_resolve() {
+    let mut initial = BindingStore::default();
+    initial.decode(envelope(json!([binding()])));
+    assert!(initial.resolve("repo-a", "node-a", "agent-a").is_some());
+    let mut revoked = binding();
+    revoked["revoked"] = json!({"reason":"fixture revocation","principal":"fixture operator","operation_id":"fixture-op","revision":7});
+    let mut store = BindingStore::default();
+    store.decode(envelope(json!([revoked])));
+    assert!(store.resolve("repo-a", "node-a", "agent-a").is_none());
+    let mut other = binding();
+    other["binding_id"] = json!("binding-b");
+    store.decode(envelope(json!([binding(), other])));
+    assert!(store.resolve("repo-a", "node-a", "agent-a").is_none());
+}
+
+#[test]
+fn resolution_cannot_open_credential_reference_or_spawn_it() {
+    if let Ok(reference) = std::env::var("FLOCK_BINDING_READ_CANARY") {
+        let mut raw = binding();
+        raw["credential_ref"] = json!(reference);
+        let mut store = BindingStore::default();
+        store.decode(envelope(json!([raw])));
+        assert!(store.resolve("repo-a", "node-a", "agent-a").is_some());
+        return;
+    }
+    let (root, _) = fixture();
+    let fifo = root.join("read-canary");
+    let name = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: the NUL-terminated fixture path is owned for this call.
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+    let mut child = crate::process::TracedCommand::new(std::env::current_exe().unwrap(), "profile-resolution-canary")
+        .args(["--exact", "structured::profiles::bindings::tests::resolution_cannot_open_credential_reference_or_spawn_it"])
+        .env("FLOCK_BINDING_READ_CANARY", &fifo).spawn_traced().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut opened = false;
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if let Ok(mut writer) = fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&fifo)
+        {
+            opened = true;
+            let _ = writer.write_all(b"synthetic credential canary");
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("credential-resolution child exceeded its fail ceiling");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    };
+    assert!(status.success());
+    assert!(!opened, "resolution opened the credential reference");
+    // Opening this credential reference as a file fails; treating it as an endpoint
+    // leaves an observable connection. Its executable canary records any spawn.
+    // Unix socket paths need an explicitly short root on macOS.
+    // guardrails-ok(hermetic): explicit short Unix socket root for macOS.
+    let socket = std::path::PathBuf::from("/tmp").join(format!("pb-{}", std::process::id()));
+    let listener = UnixListener::bind(&socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let executable = root.join("credential-canary");
+    let marker = root.join("spawned");
+    fs::write(
+        &executable,
+        format!("#!/bin/sh\n: > '{}'\n", marker.display()),
+    )
+    .unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    for reference in [&socket, &executable] {
+        let mut raw = binding();
+        raw["credential_ref"] = json!(reference);
+        let mut store = BindingStore::default();
+        store.decode(envelope(json!([raw])));
+        assert_eq!(
+            store
+                .resolve("repo-a", "node-a", "agent-a")
+                .unwrap()
+                .credential_ref,
+            reference.to_str().unwrap()
+        );
+        assert!(store.resolve("repo-a", "node-a", "agent-sibling").is_none());
+        assert!(store.resolve("repo-b", "node-a", "agent-a").is_none());
+        assert!(store.resolve("repo-a", "node-b", "agent-a").is_none());
+    }
+    assert!(matches!(listener.accept(), Err(e) if e.kind() == io::ErrorKind::WouldBlock));
+    assert!(!marker.exists());
+    fs::remove_file(socket).unwrap();
+    fs::remove_dir_all(root).unwrap();
+}

@@ -1,14 +1,16 @@
 //! Shared production admission boundary for ADR-0052 profiles.
 
+mod bindings;
+
 use crate::api::error_code::ErrorCode;
 
 /// Server-owned binding state, never deserialized from agent-editable config.
 ///
-/// Slice 1 holds this switch in memory only. Slice 2 persists it with binding
-/// records, separately from repository and user configuration (ADR-0052 §1).
+/// The switch persists with binding records, separately from repository and
+/// user configuration (ADR-0052 §1). Production readiness remains false.
 #[derive(Debug, Default)]
 pub(crate) struct ProfileAdmission {
-    enabled: bool,
+    store: bindings::BindingStore,
 }
 
 /// A profile refusal is terminal for this request, with no legacy-launch fallback.
@@ -18,6 +20,8 @@ pub(crate) enum ProfileRefusal {
     Disabled,
     /// This build cannot safely execute production profiles.
     NotReady,
+    /// Durable operator-state replacement failed.
+    Persistence,
 }
 
 impl ProfileRefusal {
@@ -26,12 +30,14 @@ impl ProfileRefusal {
         match self {
             Self::Disabled => ErrorCode::StructuredProfilesDisabled,
             Self::NotReady => ErrorCode::StructuredProfilesNotReady,
+            Self::Persistence => ErrorCode::InternalError,
         }
     }
 
     /// Public explanation containing no binding, account or credential details.
     pub(crate) fn message(self) -> &'static str {
         match self {
+            Self::Persistence => "profile policy persistence refused",
             Self::Disabled => "structured profile execution is disabled",
             Self::NotReady => {
                 "structured profile execution is unavailable in this incomplete build"
@@ -50,6 +56,18 @@ pub(crate) fn production_ready() -> bool {
 }
 
 impl ProfileAdmission {
+    /// Restore durable authority independently of workspace restoration.
+    pub(crate) fn load(path: &std::path::Path) -> Self {
+        let mut gate = Self::default();
+        gate.store.load(path);
+        gate
+    }
+
+    /// Return binding metadata only to the authenticated local operator.
+    pub(crate) fn status(&self, operator: bool) -> serde_json::Value {
+        self.store.status(operator)
+    }
+
     /// Admit a profile operation before any secret, process or mailbox effect.
     ///
     /// Every future profile spawn/resume/reload, migration, GUI and adapter path
@@ -57,7 +75,7 @@ impl ProfileAdmission {
     /// This is a necessary gate, not a grant: future slices must also check
     /// current authority, workflow pins, permits and all operation prerequisites.
     pub(crate) fn admit(&self) -> Result<(), ProfileRefusal> {
-        if !self.enabled {
+        if !self.store.execution_switch {
             return Err(ProfileRefusal::Disabled);
         }
         if !production_ready() {
@@ -71,8 +89,18 @@ impl ProfileAdmission {
     /// An incomplete build refuses without changing the switch. Slice 17 adds
     /// the reviewed plan transaction and full readiness/permit checks.
     pub(crate) fn enable(&mut self) -> Result<(), ProfileRefusal> {
-        Self { enabled: true }.admit()?;
-        self.enabled = true;
+        if !production_ready() {
+            return Err(ProfileRefusal::NotReady);
+        }
+        self.store.execution_switch = true;
+        if self
+            .store
+            .save(&crate::session::data_dir().join("profile-bindings.json"))
+            .is_err()
+        {
+            self.store.execution_switch = false;
+            return Err(ProfileRefusal::Persistence);
+        }
         Ok(())
     }
 }
@@ -83,7 +111,7 @@ mod tests {
 
     #[test]
     fn switch_defaults_off() {
-        assert!(!ProfileAdmission::default().enabled);
+        assert!(!ProfileAdmission::default().store.execution_switch);
     }
 
     #[test]
@@ -106,7 +134,8 @@ mod tests {
 
     #[test]
     fn true_switch_cannot_bypass_build_readiness() {
-        let gate = ProfileAdmission { enabled: true };
+        let mut gate = ProfileAdmission::default();
+        gate.store.execution_switch = true;
         assert_eq!(gate.admit(), Err(ProfileRefusal::NotReady));
     }
 
@@ -114,6 +143,6 @@ mod tests {
     fn refused_enable_keeps_switch_off() {
         let mut gate = ProfileAdmission::default();
         assert_eq!(gate.enable(), Err(ProfileRefusal::NotReady));
-        assert!(!gate.enabled);
+        assert!(!gate.store.execution_switch);
     }
 }
