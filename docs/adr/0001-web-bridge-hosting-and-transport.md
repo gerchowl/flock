@@ -12,7 +12,7 @@ This is flock's first ADR; it seeds `docs/adr/` with sequential numbering.
 
 We want a phone (browser) to view the flock fleet via a web terminal served
 over the tailnet, hosted on an always-on machine (e.g. atlas) so it works even
-when the hopper is off. An MVP existed out-of-tree (g-fleet `pkgs/flock-web/`:
+when the hopper is off. An MVP existed out-of-tree (the fleet configuration repo `pkgs/flock-web/`:
 an axum + portable-pty WS bridge spawning a `flock` client with
 `FLOCK_RENDER_ENCODING=terminal-ansi`). The decision was where this belongs and
 how it should be shaped, given flock's existing client/server/gossip design.
@@ -81,13 +81,13 @@ Key facts established during the spike (file:line in the issues):
   reimplemented client logic for the initial cut.
 - **Faster poll / push-on-change gossip to make the phone real-time** — rejected
   for this work; fleet-wide blast radius, separate concern.
-- **Keeping the bridge in g-fleet** — rejected; it is product, entirely coupled
-  to flock's `terminal-ansi` output, and belongs versioned with flock. g-fleet
+- **Keeping the bridge in the fleet configuration repo** — rejected; it is product, entirely coupled
+  to flock's `terminal-ansi` output, and belongs versioned with flock. The fleet configuration repo
   keeps only `enable + tailscale serve` (#149).
 
 ## Consequences
 
-- Any host can opt into `flock web`; g-fleet just picks which and fronts it.
+- Any host can opt into `flock web`; the fleet configuration repo just picks which and fronts it.
 - The phone shares live sessions with the desktop (multi-client) and sees fleet
   state at the attached node's gossip cadence.
 - The PTY-per-connection ceiling and the structured-frame features remain until
@@ -99,7 +99,7 @@ Key facts established during the spike (file:line in the issues):
 ## References
 
 - Issues: #131 (spike addendum + acceptance), #109 (parent), #147 (identity
-  allow-list), #148 (idle timeout/cap), #149 (g-fleet retirement + daemon),
+  allow-list), #148 (idle timeout/cap), #149 (the fleet configuration repo retirement + daemon),
   #150 (native transport v2), #151 (`--session` flag), #128/#129/#130 (web UI).
 - Implementation: `src/web/mod.rs`, dispatch in `src/cli.rs` + `src/main.rs`,
   assets in `assets/web/`.

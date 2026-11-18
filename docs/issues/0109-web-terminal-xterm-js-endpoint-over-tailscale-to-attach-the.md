@@ -28,7 +28,7 @@ Get a phone (browser) into the same herdr fleet via a web terminal, served over 
 - Multi-client: the phone is just another client on the session server (herdr already supports multiple clients per session) -- the desktop and phone view the same session live.
 
 ## References
-9ern + `tailscale serve` (g-fleet), the mobile single-column layout, herdr client/server semantic-frame protocol, multi-client support, #65 (slots/federation).
+9ern + `tailscale serve` (the fleet configuration repo), the mobile single-column layout, herdr client/server semantic-frame protocol, multi-client support, #65 (slots/federation).
 
 ---
 
@@ -36,13 +36,13 @@ Get a phone (browser) into the same herdr fleet via a web terminal, served over 
 
 ### gerchowl — 2026-06-13T17:55:21Z
 
-## Spike verdict: DECISIVE-YES (~weekend MVP, lives in g-fleet)
+## Spike verdict: DECISIVE-YES (~weekend MVP, lives in the fleet configuration repo)
 
 The render model is ALREADY solved: wire.rs has a **TerminalAnsi** encoding (TerminalFrame { bytes }) -- server-side diffed ANSI via render_ansi.rs BlitEncoder. With HERDR_RENDER_ENCODING=terminal-ansi the client pipes frame.bytes straight to stdout (client/mod.rs:879). xterm.js eats exactly that byte stream -- no JS painting, no server rerender for the web case. Multi-client exists (headless.rs clients map + foreground_client_id). Mobile UI is width-driven (compute_mobile_view) so a narrow browser auto-gets it.
 
 **v1 architecture**: a standalone bridge (Rust ~200-400 LoC, tokio + axum/tungstenite + portable-pty): WS connect -> spawn herdr in a PTY with HERDR_RENDER_ENCODING=terminal-ansi + COLUMNS/LINES from xterm; PTY stdout -> WS -> term.write; term.onData -> PTY stdin; onResize -> pty.resize. Front with tailscale serve; auth via the Tailscale-User-Login identity header. Kitty graphics is the known v1 cut (cell_width_px=0 disables it).
 
-**Repo: g-fleet** (modules/herdr-web.nix + the bridge bin + a static xterm.js page), next to 9ern -- it's a transport/ops concern, keeps hyper/axum out of the herdr crate. Landing per the session goal.
+**Repo: the fleet configuration repo** (modules/herdr-web.nix + the bridge bin + a static xterm.js page), next to 9ern -- it's a transport/ops concern, keeps hyper/axum out of the herdr crate. Landing per the session goal.
 
 ### gerchowl — 2026-06-14T12:29:24Z
 
@@ -56,5 +56,5 @@ Feature parity is inherent (it's the same herdr binary); #129 + #130 are the inp
 
 ### gerchowl — 2026-06-14T12:41:42Z
 
-Graduation issue: https://github.com/gerchowl/herdr/issues/131 — port the bridge out of g-fleet into herdr as a first-class `herdr web` option, leaving g-fleet to own only the tailscale-serve exposure. The web-view fixes (#128/#129/#130) should land there.
+Graduation issue: https://github.com/gerchowl/herdr/issues/131 — port the bridge out of the fleet configuration repo into herdr as a first-class `herdr web` option, leaving the fleet configuration repo to own only the tailscale-serve exposure. The web-view fixes (#128/#129/#130) should land there.
 

@@ -261,7 +261,7 @@ pub(super) fn run_hook_command(args: &[String]) -> std::io::Result<i32> {
             );
         }
     }
-    // The account profile the session is running under (g-fleet's claude-auth):
+    // The account profile the session is running under (an account switcher):
     // read here, at the IO edge, so `plan` stays a pure function of its inputs.
     let config_dir = env_nonempty("CLAUDE_CONFIG_DIR");
     let mut outcome = plan(
@@ -1714,11 +1714,11 @@ mod tests {
             "SessionStart",
             "p_1",
             0,
-            Some("/home/u/.claude-profiles/work"),
+            Some("/home/u/.config/profile-a"),
         );
         assert_eq!(
             out.config_dir_record,
-            Some(("sid-9".into(), "/home/u/.claude-profiles/work".into()))
+            Some(("sid-9".into(), "/home/u/.config/profile-a".into()))
         );
     }
 
@@ -1746,7 +1746,7 @@ mod tests {
             "",
             "p_1",
             0,
-            Some("/home/u/.claude-profiles/work"),
+            Some("/home/u/.config/profile-a"),
         )
         .config_dir_record
         .is_none());
