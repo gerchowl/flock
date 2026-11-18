@@ -1039,6 +1039,7 @@ pub struct TabRenameParams {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct AgentTarget {
     pub target: String,
 }
@@ -1190,6 +1191,7 @@ pub struct RestartDroppedFlag {
 /// Queue a server-owned restart. The caller must finish its requesting turn.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct AgentRestartParams {
     #[serde(default = "restart_self")]
     pub target: String,
@@ -1230,6 +1232,7 @@ impl AgentRuntime {
     }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct AgentStartParams {
     /// Explicit opt-in, sent only to a server advertising structured_agents.
     #[serde(default, skip_serializing_if = "AgentRuntime::is_pty")]
@@ -1993,6 +1996,7 @@ pub struct PaneSplitParams {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub enum SplitDirection {
     Right,
     Down,

@@ -187,7 +187,7 @@ fn seq_snapshot_and_live_forms_remain_distinct() {
 
 #[test]
 fn settled_parameters_and_uncertain_ack_use_existing_exit_constant() {
-    assert_eq!(WIRE_JSON_VERSION, 1);
+    assert_eq!(WIRE_JSON_VERSION, 2);
     assert_eq!(
         (
             CONNECT_DEADLINE_MS,
