@@ -125,3 +125,88 @@ fn socket_status_restores_operator_bindings_and_true_switch_without_activation()
         );
     }
 }
+
+fn rpc(socket: &Path, method: &str, params: Value) -> Value {
+    let request = json!({"id":"transaction-test","method":method,"params":params});
+    serde_json::from_str(
+        &json_api::request(socket, &request.to_string(), Duration::from_secs(5)).unwrap(),
+    )
+    .unwrap()
+}
+
+fn bind_request(binding: &str) -> Value {
+    json!({"action":"bind","binding_id":binding,
+        "target":{"repo_id":"repo-fixture","node_ids":["node-fixture"],"agent_ids":["agent-fixture"]},
+        "account_alias":"fixture-account","credential_ref":"fixture-reference","credential_generation":1,
+        "bundle_digests":["fixture-digest"],"grants":[]})
+}
+
+#[test]
+fn socket_binding_transactions_replay_after_restart_and_revoke_terminally() {
+    let dir = SocketDir::reserve("pb-transact");
+    let root = dir.path().join("c");
+    let state = root.join(support::paths::app_dir_name());
+    fs::create_dir_all(&state).unwrap();
+    fs::write(state.join("config.toml"), "onboarding = false\n").unwrap();
+    let socket = dir.path().join("s.sock");
+    let server = start(&root, &socket);
+    let mut create = bind_request("binding-a");
+    create.as_object_mut().unwrap().remove("binding_id");
+    let plan = rpc(&socket, "profile.plan", create)["result"].clone();
+    let binding_id = plan["review"]["binding"]["binding_id"]
+        .as_str()
+        .expect("server allocates binding identity")
+        .to_owned();
+    assert_eq!(binding_id.len(), 36);
+    assert!(
+        plan["plan"].is_string(),
+        "socket API must produce a review plan: {plan}"
+    );
+    let stale = rpc(&socket, "profile.plan", bind_request("binding-b"))["result"].clone();
+    assert_eq!(
+        rpc(
+            &socket,
+            "profile.bind",
+            json!({"plan":plan["plan"],"expect":"altered"})
+        )["error"]["code"],
+        "profile_plan_invalid"
+    );
+    let commit = json!({"plan":plan["plan"],"expect":plan["expect"]});
+    let bound = rpc(&socket, "profile.bind", commit.clone());
+    assert_eq!(bound["result"]["binding"]["revision"], 1);
+    assert_eq!(rpc(&socket, "profile.bind", commit.clone()), bound);
+    assert_eq!(
+        rpc(
+            &socket,
+            "profile.bind",
+            json!({"plan":stale["plan"],"expect":stale["expect"]})
+        )["error"]["code"],
+        "profile_revision_conflict"
+    );
+    drop(server);
+    let _ = fs::remove_file(&socket);
+    let server = start(&root, &socket);
+    assert_eq!(rpc(&socket, "profile.bind", commit.clone()), bound);
+    let revoke = json!({"binding":binding_id,"reason":"fixture revoke"});
+    let revoked = rpc(&socket, "profile.revoke", revoke.clone());
+    assert_eq!(revoked["result"]["binding"]["revision"], 2);
+    assert_eq!(
+        revoked["result"]["binding"]["revoked"]["operation_id"],
+        revoked["result"]["operation_id"]
+    );
+    assert_eq!(rpc(&socket, "profile.revoke", revoke.clone()), revoked);
+    assert_eq!(rpc(&socket, "profile.bind", commit.clone()), bound);
+    drop(server);
+    let _ = fs::remove_file(&socket);
+    let _server = start(&root, &socket);
+    assert_eq!(rpc(&socket, "profile.revoke", revoke), revoked);
+    assert_eq!(rpc(&socket, "profile.bind", commit), bound);
+    assert_eq!(
+        rpc(&socket, "profile.plan", bind_request(&binding_id))["error"]["code"],
+        "profile_binding_revoked"
+    );
+    let status = rpc(&socket, "profile.status", json!({}));
+    assert_eq!(status["result"]["policy_revision"], 2);
+    assert_eq!(status["result"]["execution_switch"], false);
+    assert!(status["result"]["bindings"][0]["revoked"].is_object());
+}

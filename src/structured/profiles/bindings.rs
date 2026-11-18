@@ -1,5 +1,7 @@
 //! Inactive operator binding data and durable storage (ADR-0052 §1–2).
 
+pub(crate) mod transactions;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
@@ -233,6 +235,7 @@ impl BindingStore {
             }
         }
         self.root = raw;
+        transactions::inspect_receipts(&self.root, self.policy_revision);
         self.opaque = false;
     }
 

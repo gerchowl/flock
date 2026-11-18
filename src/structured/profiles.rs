@@ -1,6 +1,6 @@
 //! Shared production admission boundary for ADR-0052 profiles.
 
-mod bindings;
+pub(crate) mod bindings;
 
 use crate::api::error_code::ErrorCode;
 
@@ -11,6 +11,8 @@ use crate::api::error_code::ErrorCode;
 #[derive(Debug, Default)]
 pub(crate) struct ProfileAdmission {
     store: bindings::BindingStore,
+    path: Option<std::path::PathBuf>,
+    plans: std::collections::BTreeMap<String, bindings::transactions::Plan>,
 }
 
 /// A profile refusal is terminal for this request, with no legacy-launch fallback.
@@ -72,7 +74,10 @@ pub(crate) fn production_ready() -> bool {
 impl ProfileAdmission {
     /// Restore durable authority independently of workspace restoration.
     pub(crate) fn load(path: &std::path::Path) -> Self {
-        let mut gate = Self::default();
+        let mut gate = Self {
+            path: Some(path.to_path_buf()),
+            ..Self::default()
+        };
         gate.store.load(path);
         gate
     }
