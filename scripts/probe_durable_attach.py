@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import select
 import shutil
 import signal
@@ -88,19 +89,34 @@ def request(path, method, params, deadline):
         raise
 
 
-def attach(binary, env):
-    # The client times out before terminal setup, so no terminal is needed for
-    # the stalled baseline. A successful handshake proceeds to terminal setup.
+FRAME_LABEL = "sync-probe"
+
+
+def painted_workspace(output, records):
+    """Require both the real client's frame flush and visible workspace content."""
+    painted = any(record.get("target") == "flock::attach"
+                  and record.get("side") == "client"
+                  and record.get("stage") == "first_paint" for record in records)
+    # Strip OSC (including window titles), CSI and single escape controls.
+    visible = re.sub(rb"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)", b"", output)
+    visible = re.sub(rb"\x1b\[[0-?]*[ -/]*[@-~]|\x1b[@-_]", b"", visible)
+    return painted and FRAME_LABEL.encode() in visible
+
+
+def attach(binary, env, timeout=7):
     import pty
     import termios
     master, slave = pty.openpty()
     termios.tcsetwinsize(slave, (40, 120))
+    log_path = Path(env["XDG_CONFIG_HOME"]) / "flock-dev" / "flock-client.log"
+    log_offset = log_path.stat().st_size if log_path.exists() else 0
     started = time.monotonic()
     child = subprocess.Popen([str(binary)], env=env, stdin=slave, stdout=slave,
                              stderr=slave, start_new_session=True)
     os.close(slave)
     output = bytearray()
-    deadline = started + 7
+    deadline = started + timeout
+    welcome_seconds = None
     try:
         while time.monotonic() < deadline:
             if select.select([master], [], [], min(0.05, max(0, deadline - time.monotonic())))[0]:
@@ -113,15 +129,29 @@ def attach(binary, env):
                 output.extend(data)
                 if time.monotonic() >= deadline:
                     break
-                # Alternate-screen entry is after the Welcome handshake.
-                if b"\x1b[?1049h" in output:
-                    return {"seconds": round(time.monotonic() - started, 3), "attached": True}
+                # Welcome and first usable paint are separate observations.
+                if welcome_seconds is None and b"\x1b[?1049h" in output:
+                    welcome_seconds = round(time.monotonic() - started, 3)
+            records = []
+            if log_path.exists():
+                with log_path.open("rb") as log:
+                    log.seek(log_offset)
+                    for line in log.read().splitlines():
+                        try:
+                            records.append(json.loads(line))
+                        except json.JSONDecodeError:
+                            continue
+            if painted_workspace(output, records):
+                seconds = round(time.monotonic() - started, 3)
+                return {"seconds": seconds, "attached": True,
+                        "welcome_seconds": welcome_seconds, "first_frame_seconds": seconds}
             if child.poll() is not None:
                 break
         text = output.decode(errors="replace")
         return {"seconds": round(time.monotonic() - started, 3), "attached": False,
                 "timeout_error": "os error" in text or "did not answer attach" in text,
-                "exit": child.poll(), "diagnostic": text[-1500:]}
+                "exit": child.poll(), "diagnostic": text,
+                "welcome_seconds": welcome_seconds, "first_frame_seconds": None}
     finally:
         if child.poll() is None:
             os.killpg(child.pid, signal.SIGKILL)
@@ -132,7 +162,9 @@ def attach(binary, env):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bin", type=Path, required=True)
-    parser.add_argument("--assert-responsive", action="store_true")
+    assertions = parser.add_mutually_exclusive_group()
+    assertions.add_argument("--assert-responsive", action="store_true")
+    assertions.add_argument("--assert-baseline", action="store_true")
     args = parser.parse_args()
     binary = args.bin.resolve(strict=True)
     if os.getloadavg()[0] >= 10:
@@ -146,7 +178,8 @@ def main():
         env.update(HOME=str(root), XDG_CONFIG_HOME=str(root / "c"),
                    XDG_DATA_HOME=str(root / "d"), XDG_STATE_HOME=str(root / "s"),
                    XDG_CACHE_HOME=str(root / "cache"), XDG_RUNTIME_DIR=str(root / "r"),
-                   SHELL="/bin/sh", TERM="xterm-256color", FLOCK_HOST_NAME="probe.example")
+                   SHELL="/bin/sh", TERM="xterm-256color", FLOCK_HOST_NAME="probe.example",
+                   FLOCK_LOG="flk=info,flock=info,flock::attach=debug")
         for name in ("c", "d", "s", "cache", "r"):
             (root / name).mkdir(mode=0o700)
         for app in ("flock", "flock-dev"):
@@ -182,6 +215,12 @@ def main():
                 logs = list(root.rglob("event-log.jsonl"))
                 if len(logs) != 1 or str(logs[0]) != server_env["PROBE_SYNC_TARGET"]:
                     raise RuntimeError("expected a debug event log in the private config directory")
+                seed_deadline = time.monotonic() + 20
+                with request(api, "workspace.create",
+                             {"cwd": str(root), "label": FRAME_LABEL, "focus": True},
+                             seed_deadline) as peer:
+                    if "error" in json.loads(read_line_until(peer, seed_deadline)):
+                        raise RuntimeError("seed workspace refused")
                 baseline = attach(binary, env)
                 if not baseline["attached"]:
                     raise RuntimeError(f"control attach failed: {baseline}")
@@ -203,6 +242,12 @@ def main():
                           "trigger_seconds": round(time.monotonic() - started, 3),
                           "control": baseline, "stalled": stalled}
                 print(json.dumps(result, sort_keys=True), flush=True)
+                if args.assert_baseline and not (
+                        result["sync_thread"] == "main" and not stalled["attached"]
+                        and stalled["first_frame_seconds"] is None
+                        and stalled["welcome_seconds"] is None
+                        and stalled["timeout_error"] and stalled["exit"] == 1):
+                    raise AssertionError("expected main-thread sync and attach timeout without a frame")
                 if args.assert_responsive and (not stalled["attached"] or stalled["seconds"] >= 2):
                     raise AssertionError("attach must complete within 2s during stalled fsync")
         finally:
