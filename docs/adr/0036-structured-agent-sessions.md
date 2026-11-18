@@ -232,8 +232,8 @@ and `--add-dir`. The server owns stdin and stdout exclusively.
   agent never runs as the operator's uid. Its `CLAUDE_CONFIG_DIR` is a
   private dir per profile in the `flk-agent` user's `HOME`
   (`~flk-agent/.flk/claude/<profile>`). The login is a `claude setup-token`
-  token only (owner decision 1, narrowed 2026-10-14): g-fleet renders it
-  from sops as a 0600 file owned by `flk-agent` (g-fleet#476), and flk
+  token only (owner decision 1, narrowed 2026-10-14): the fleet configuration repo renders it
+  from sops as a 0600 file owned by `flk-agent`, and flk
   passes it into the session's environment as `CLAUDE_CODE_OAUTH_TOKEN`
   and never logs it. `claude /login` is not used for agents: as a macOS
   user with no GUI session it cannot save its login (no keychain, and no
@@ -3288,8 +3288,8 @@ decision by the owner.
    file (2.1.287); a `setup-token` token in `CLAUDE_CODE_OAUTH_TOKEN`
    worked for the same user (A.16).
    *Owner decision, 2026-10-14 (#1404):* agent users log in with
-   `setup-token` only. g-fleet renders it from sops as a 0600 file owned by
-   `flk-agent` (g-fleet#476); flk passes it into the session env and never
+   `setup-token` only. The fleet configuration repo renders it from sops as a 0600 file owned by
+   `flk-agent`; flk passes it into the session env and never
    logs it. `/login` is kept for GUI operators only. Rejected alternative:
    unlocking a keychain at boot. (§1, S3)
 2. **Build on `--resume-session-at`.** As recommended: yes, behind the §9
@@ -3421,7 +3421,7 @@ remaining slice-8 acceptance is tracked in #2467; #1833 and #1746 stay open.
 | S0 | Complete (2026-10-14): the probes landed (#1356); the A.13 controls and token-path re-runs, the concurrency-safe call behind an open permission, and A.16 are recorded (#1404). Probes, recorded in the appendix: the messaging socket of E16 (what it accepts, its owner and mode, a switch to disable it); the placeholder carrier, `deny` versus `allow` with placeholder answers, and that the model keeps working after it (§2a); parallel control requests, an `AskUserQuestion` while a permission is open (§2b); the harness's own queue in `-p`: take-back, edit and send-now behind `interrupt_cancel_queued_v1` / `interrupt_send_now_v1` (§3); `set_permission_mode` over stdio (§10b); `claude /login` and its keychain item for a macOS user without a GUI login (owner decision 1) | — | 0 (probe) |
 | S1 | `SessionEvent` types for Claude stream-json: known variants with `extra`, `Unknown{raw, shape}`, shape key; redacted probe fixtures as tests | — | 350 |
 | S2 | `session.unknown_shape` persisted kind (skip test per ADR-0028 §3a), once-per-shape registry logging through `tracing` only (#1300), `flk report --unknown-events` | S1 | 250 |
-| S3 | Structured runtime: spawn as `flk-agent` with the §1 launch profile (the login from the 0600 `setup-token` file g-fleet renders (g-fleet#476), passed as `CLAUDE_CODE_OAUTH_TOKEN` in the session env and never logged, owner decision 1; `--restricted`; the restricted-versus-unrestricted `system/init` diff; refuse a session that reports `messaging_socket_path`), session lease (`session_busy`), lease-based caller identity and the uid check of §1a, stdout pump into the per-agent stream, blob store, truthful outcome | S0, S1, O19a #1208 | 400 |
+| S3 | Structured runtime: spawn as `flk-agent` with the §1 launch profile (the login from the 0600 `setup-token` file the fleet configuration repo renders, passed as `CLAUDE_CODE_OAUTH_TOKEN` in the session env and never logged, owner decision 1; `--restricted`; the restricted-versus-unrestricted `system/init` diff; refuse a session that reports `messaging_socket_path`), session lease (`session_busy`), lease-based caller identity and the uid check of §1a, stdout pump into the per-agent stream, blob store, truthful outcome | S0, S1, O19a #1208 | 400 |
 | S4 | Pure per-agent state reducer: `StateSource::Session`, turn / attention / limit from events, stall observation and in-process phase/needs-human facts; registry seam for #1439 and S7-min #1746. Pane-free EventHub events deferred to #1804 | S3 | 300 |
 | S5 | Input queue: `queue/<agent>` stream, producers, gate, `command_lifecycle` acks, independent `delivery` (`at_idle` / `steer` / `interrupt`) and `priority` ordering, one batch per turn with the FIFO rules 1 to 4 and batch messages, `flk agent send` and msg delivery routed to it | S3 | 400 |
 | S5c | Queue UX: `queue.update` / `edit` leases / `move` / `delete`, named stashes with `stash` / `pop` / `clear` / `stashes`, `send_now` (`steer`, or `interrupt` through the harness's `interrupt{send_now}`), `take_back` through `cancel_async_message` (§3, A.14, owner decision 4) | S0, S5 | 300 |

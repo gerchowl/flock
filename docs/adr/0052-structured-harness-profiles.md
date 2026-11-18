@@ -4,7 +4,8 @@
 - Date: 2026-11-08
 - Issues: [#3066](https://github.com/gerchowl/flock/issues/3066)
 - Decision owner: operator
-- Implemented: slice 1, disabled admission guard. Production execution remains
+- Implemented: slice 1, disabled admission guard; slice 2a, inactive binding
+  storage and status projection. Production execution remains
   unavailable until slice 17.
 - Amends: ADR-0036 §1 isolation and hot reload, and ADR-0032 §3
   structured-session context replenishment. Composes with ADR-0049 requests,
@@ -406,7 +407,7 @@ contain that exposure.
 
 ### 5. Hook inventory and disposition
 
-Inventory taken 2026-11-08 from the owner's claude-config checkout at
+Inventory taken 2026-11-08 from the owner's agent configuration checkout at
 `0f8d7d499c5c9b29b093957a8dd0814989fe28dc` (README and `hooks/`), the
 fleet-generated shared settings, and the local effective settings' hook entries.
 Only event/function identities are recorded here; deployment paths and identities
@@ -588,6 +589,36 @@ domain while production remains disabled, and can never publish a production
 session or transfer mailbox ownership. Its separate admission test proves this.
 
 Slice 1 holds the switch in server memory only; slice 2 persists it with the binding records.
+
+Slice 2 is split into inactive 2a (store, data-only resolution and read-only
+`profile.status`) and 2b (reviewed binding/revocation transactions). Store 2a uses
+`profile-bindings.json` beside server session state, mode 0600, with schema 1,
+`policy_revision`, default-false `execution_switch`, `bindings` and retained raw
+`unknown` entries. One global policy revision orders all binding changes and
+revocations; each binding records its last change revision. Reload refuses a
+revision lower than one already observed, and saving refuses to replace a higher
+disk revision. A separate private `profile-bindings.floor.json` durably records
+the highest revision before a store write is acknowledged, using the same fsync,
+rename and directory-fsync discipline. First upgrade initializes a missing floor
+from an existing document. A document below the floor is retained unchanged;
+profiles refuse with `policy_revision_regressed {store, floor}`, operator status
+reports the floor and fault, and other server operations continue. Unreadable
+floor/policy state refuses profiles with `policy_revision_unavailable`.
+One store-owned in-process mutex and an exclusive advisory lock on the stable
+`profile-bindings.lock` serialize the complete read/check/floor/write/acknowledgment
+transaction, including load-time floor initialization. Revision allocation in 2b
+must run inside that same section. Contention refuses without waiting or making
+partial observations. The floor is updated to `max(existing, proposed)` under
+both locks. Store, floor and lock opens do not follow final-component symlinks;
+only regular files owned by the server user can supply policy or lock ownership.
+Temporary files are created exclusively beside their destination. Non-operator status projections omit binding and account metadata.
+Binding records contain `binding_id`, explicit `target` (`repo_id`, `node_ids`,
+`agent_ids`), `account_alias`, `credential_ref`, `credential_generation`,
+`bundle_digests`, `grants`, `revision` and nullable `revoked` evidence (reason,
+principal, operation ID and revision). Resolution neither dereferences credentials
+nor executes anything. Session binding pins and continuation refusal (#3111) move
+to 2b to keep 2a within the production-line cap. Budgets, permits, containment and
+activation remain in their numbered later slices.
 
 Existing trusted single-account launch behavior stays on its existing path;
 profile operations never fall back to it on denial. Slice 17 is the only initial
