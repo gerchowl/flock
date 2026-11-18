@@ -676,3 +676,32 @@ fn continuation_launch_profile_uses_resume() {
     assert!(args.windows(2).any(|pair| pair == ["--resume", SESSION_ID]));
     assert!(!args.iter().any(|arg| arg == "--session-id"));
 }
+
+#[test]
+fn invalid_session_uuid_is_typed_and_never_prepares_argv() {
+    for mode in [LaunchMode::Fresh, LaunchMode::Continuation] {
+        for id in [
+            "",
+            "--help",
+            "not-a-session-uuid",
+            "00000000_0000-4000-8000-000000000001",
+            "00000000-0000-4000-8000-00000000000z",
+        ] {
+            let fixture = Fixture::new();
+            let error = LaunchProfile::prepare(
+                &fixture.config(),
+                &fixture.0,
+                id,
+                mode,
+                fixture.binary(),
+                |_| None,
+            )
+            .expect_err("invalid session id must refuse");
+            assert_eq!(error.code(), ErrorCode::InvalidParams);
+            assert!(
+                !fixture.0.join("structured").exists(),
+                "invalid id created session files"
+            );
+        }
+    }
+}

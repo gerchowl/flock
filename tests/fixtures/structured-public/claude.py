@@ -15,7 +15,7 @@ if sys.argv[1:] == ["--version"]:
 # Composer tests need a ready fake session; queue admission is observed separately.
 if "--model" in sys.argv and sys.argv[sys.argv.index("--model") + 1] == "fixture-worker-model":
     init = json.loads((root / "restricted-init.json").read_text())
-    init["session_id"] = sys.argv[sys.argv.index("--session-id") + 1]
+    init["session_id"] = sys.argv[sys.argv.index("--resume" if "--resume" in sys.argv else "--session-id") + 1]
     print(json.dumps(init), flush=True)
     if (root / "native-permission-fixture").exists():
         for line in sys.stdin:
@@ -50,7 +50,7 @@ if "--model" in sys.argv and sys.argv[sys.argv.index("--model") + 1].startswith(
         if "lifecycle" in mode:
             emit_live(dict(envelope, event={"type": "content_block_stop", "index": index}))
     init = json.loads((root / "restricted-init.json").read_text())
-    init["session_id"] = sys.argv[sys.argv.index("--session-id") + 1]
+    init["session_id"] = sys.argv[sys.argv.index("--resume" if "--resume" in sys.argv else "--session-id") + 1]
     emit_live(init)
     if "rewritten" in mode:
         emit_block(0, "text_delta", "text", "partial", "first")
@@ -93,7 +93,7 @@ assert "FLOCK_MCP_LEASE_CREDENTIAL" not in os.environ, "lease secret in model en
 assert not any(key.startswith("FLOCK_") for key in os.environ), "unlisted model environment"
 assert "--restricted" in sys.argv and "--strict-mcp-config" in sys.argv
 assert os.getpgrp() == os.getpid(), "unowned process group"
-session = sys.argv[sys.argv.index("--session-id") + 1]
+session = sys.argv[sys.argv.index("--resume" if "--resume" in sys.argv else "--session-id") + 1]
 model = sys.argv[sys.argv.index("--model") + 1]
 config_path = Path(sys.argv[sys.argv.index("--mcp-config") + 1])
 assert stat.S_IMODE(config_path.stat().st_mode) == 0o600, "MCP config is not private"

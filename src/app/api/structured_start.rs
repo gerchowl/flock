@@ -96,10 +96,15 @@ impl App {
             .clone()
             .ok_or(ErrorCode::StructuredEndpointRestartRequired)?;
         let is_new = existing.is_none();
-        let mode = if is_new {
-            LaunchMode::Fresh
-        } else {
+        let mode = if existing.as_ref().is_some_and(|(id, _)| {
+            self.state
+                .structured_agents
+                .get(id)
+                .is_some_and(|(record, _, _)| record.harness_established)
+        }) {
             LaunchMode::Continuation
+        } else {
+            LaunchMode::Fresh
         };
         let (agent_id, generation) = if let Some((id, generation)) = existing {
             if params.cwd.is_some() || params.model.is_some() {
@@ -131,6 +136,7 @@ impl App {
                 .state
                 .structured_agents
                 .register(Record {
+                    harness_established: false,
                     runtime: StructuredRuntime::Structured,
                     agent_id: id.clone(),
                     name: Some(params.name),
