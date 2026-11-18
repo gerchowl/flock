@@ -43,7 +43,8 @@ class CiChanges(unittest.TestCase):
         self.assertFalse(self.skip(["src/x.rs", "docs/x.rs"]))
         self.assertFalse(self.skip(["web/client/src/gen/types.ts"]))
         self.assertFalse(self.skip(["website/scripts/prepare-docs.mjs"]))
-        self.assertFalse(self.skip(["web/client/src/wire/connection.ts", "web/client/tests/wire/fleet-server.ts"]))
+        self.assertFalse(self.skip(["web/client/src/wire/connection.ts", "web/client/tests/wire/fleet-server.ts",
+                                    "web/client/e2e-fleet/fleet.test.ts"]))
         # Safe only because script-tests run in a job that is never skipped.
         self.assertTrue(self.skip(["README.md"]))
 

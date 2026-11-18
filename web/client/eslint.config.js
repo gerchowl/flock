@@ -215,7 +215,7 @@ const keys = {
 };
 
 export default [
-  { ignores: ["node_modules/**", "dist/**", "artifacts/**", "tests/**", "e2e/**", "scripts/**", "test/**", "vite.config.ts", "eslint.config.js", "stylelint.config.js"] },
+  { ignores: ["node_modules/**", "dist/**", "artifacts/**", "tests/**", "e2e/**", "e2e-fleet/**", "scripts/**", "test/**", "vite.config.ts", "eslint.config.js", "stylelint.config.js"] },
   {
     files: ["**/*.{js,jsx,ts,tsx,mts,mjs,cts,cjs}"],
     linterOptions: { noInlineConfig: true },
