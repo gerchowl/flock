@@ -86,7 +86,8 @@ then performs the real sync. Linux intercepts `fsync`/`fdatasync`; macOS also
 intercepts `fcntl(F_FULLFSYNC/F_BARRIERFSYNC)`. No FUSE mount, disk pressure,
 privileges, production hook or patched production source is needed. macOS
 requires an unsigned dynamic debug binary that permits DYLD insertion.
-Linux is supported by the script but was not measured in this macOS session.
+Linux was supported but not measured in the original 2026-11-08 macOS
+session; the accepted-design refresh below records the subsequent Linux run.
 
 ```sh
 export CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 RUSTC_WRAPPER=
@@ -166,8 +167,31 @@ Complete stalled diagnostic (preceded only by OSC 10/11 theme queries):
 flock: protocol error: I/O error: Resource temporarily unavailable (os error 35)
 ```
 
-No production responsiveness improvement is claimed. The original macOS
-measurement remains historical evidence; the refresh adds a usable-frame gate.
+GitHub `ubuntu-latest` baseline, unchanged production code:
+
+| Control Welcome | Control usable first frame | Stalled attach | Sync thread | Trigger completion |
+| --- | --- | --- | --- | --- |
+| 0.425 s | 0.479 s | 5.572 s, exit 1; no Welcome or frame | main | 8.015 s |
+
+The [successful manual run](https://github.com/gerchowl/flock/actions/runs/44420536042)
+measured revision `673bc7fae` and uploaded the complete JSON result as artifact
+`durable-attach-baseline`. The interposer ran unprivileged on the GitHub runner.
+Complete stalled diagnostic (preceded only by OSC 10/11 theme queries):
+
+```text
+flock: protocol error: I/O error: Resource temporarily unavailable (os error 11)
+```
+
+Both `--assert-baseline` runs exited 0. A separate macOS
+`--assert-responsive` run exited 1 as expected (5.332 s stalled attach, exit 1,
+no Welcome or frame). Injecting the old terminal-setup-only predicate makes
+three observer tests fail, including the live silent client's bounded wait.
+The corrected observer also rejects complete and partial OSC window titles;
+all 355 maintenance tests pass. No production responsiveness improvement is
+claimed. The original macOS measurement remains historical evidence; this
+refresh supplies the isolated Linux baseline and usable-frame gate required
+before production implementation. Per-family candidate and activation gates
+remain required.
 
 ## Decision
 
