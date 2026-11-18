@@ -19,7 +19,7 @@ herdr's agent integration (the hooks that feed the top panel: last prompt, idle/
 1. the hook **script** `~/.claude/hooks/herdr-agent-state.sh` (installed by `herdr integration install claude`), and
 2. the **hook entries** in `~/.claude/settings.json` pointing at it.
 
-On a Nix-managed fleet this splits badly: on macOS `settings.json` is a **read-only /nix/store symlink**, so herdr's own settings.json patch can't run there — the entries have to be re-declared in the machine-config repo (g-fleet). On the Linux servers neither half is present (`herdr integration status` → `claude: not installed`), so the panel shows no agent state at all. The integration — herdr's own concern — is leaking into and being re-implemented per-host in an external config repo, and silently absent where nobody ran the install.
+On a Nix-managed fleet this splits badly: on macOS `settings.json` is a **read-only /nix/store symlink**, so herdr's own settings.json patch can't run there — the entries have to be re-declared in the machine-config repo (the fleet configuration repo). On the Linux servers neither half is present (`herdr integration status` → `claude: not installed`), so the panel shows no agent state at all. The integration — herdr's own concern — is leaking into and being re-implemented per-host in an external config repo, and silently absent where nobody ran the install.
 
 **Goal:** a host running herdr gets the full, correct integration *from herdr*, with zero/minimal external per-host wiring, and herdr tells you when it's missing instead of failing silently.
 
@@ -52,7 +52,7 @@ Gaps:
 
 **P2**
 - [ ] `homeModules.default` (Nix) consumers import for full integration.
-- [ ] Decide what the external machine-config repo (g-fleet) then *stops* carrying.
+- [ ] Decide what the external machine-config repo (the fleet configuration repo) then *stops* carrying.
 
 ## Pitfalls
 - Read-only vs writable `settings.json` differ by host class (Nix store symlink on Macs; writable shared file on servers used by an account-switcher) — a single install strategy must handle both.
@@ -68,7 +68,7 @@ Gaps:
 
 ## References
 - `src/integration/mod.rs`, `src/cli/integration.rs`, `src/integration/assets/claude/herdr-agent-state.sh`
-- Consumer side (g-fleet): hook entries Nix-declared Mac-only in `modules/home/darwin-common.nix`; statusLine in `modules/home/common.nix`; config.toml band-aided onto NixOS hosts in `modules/herdr.nix`.
+- Consumer side (the fleet configuration repo): hook entries Nix-declared Mac-only in `modules/home/darwin-common.nix`; statusLine in `modules/home/common.nix`; config.toml band-aided onto NixOS hosts in `modules/herdr.nix`.
 - Design spike — to be aligned via parallel agent review before implementation.
 
 ---
@@ -85,7 +85,7 @@ Gaps:
 - **`integration status` needs a richer state model + machine-readability:** entries-present-regardless-of-author = installed/declarative (so a Nix-declared install reads green, not "not installed"); add exit codes (0/1/2) + `--json`.
 - **Ship the statusline from herdr** (`herdr statusline` subcommand/binary) and **built-in styling defaults that user config overlays** — kill the consumer's hardcoded `~/dotfiles/bin/...` path.
 - **Self-detect + nudge** is the cheap win: never auto-write settings.json (first-run consent prompt at most); a persistent header badge + a transition-only/snooze toast (no per-session nag). Remote: check on the remote, surface locally prefixed with the host.
-- **Consumer (g-fleet) deletes**: hand-declared hook entries, the `~/dotfiles` statusline path, the config.toml band-aid, the macOS-vs-NixOS divergence. **Keeps**: channel pin, per-host opt-in, activation glue, restart-on-upgrade trigger.
+- **Consumer (the fleet configuration repo) deletes**: hand-declared hook entries, the `~/dotfiles` statusline path, the config.toml band-aid, the macOS-vs-NixOS divergence. **Keeps**: channel pin, per-host opt-in, activation glue, restart-on-upgrade trigger.
 
 ### The real disagreement — the delivery seam
 - **One reviewer:** herdr ships `homeModules.default` + `nixosModules.default` (+ a `lib.integration` data export) — ergonomic one-liner.
