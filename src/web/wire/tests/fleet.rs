@@ -34,6 +34,7 @@ impl Case {
     fn add(&mut self, id: &str) {
         self.registry
             .register(Record {
+                harness_established: false,
                 runtime: StructuredRuntime::Structured,
                 agent_id: id.into(),
                 name: Some(id.into()),

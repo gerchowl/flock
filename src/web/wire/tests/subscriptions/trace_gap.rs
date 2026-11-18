@@ -32,6 +32,7 @@ fn gap_script_checks_cold_owner_install_replay_cursor_and_causal_controls() {
             let mut registry = Registry::default();
             registry
                 .register(Record {
+                    harness_established: false,
                     runtime: StructuredRuntime::Structured,
                     agent_id: "fixture".into(),
                     session_id: "history".into(),

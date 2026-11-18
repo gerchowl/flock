@@ -840,6 +840,7 @@ async fn waiting_hellos_do_not_starve_established_subscriptions() {
             .state
             .structured_agents
             .register(crate::structured::registry::Record {
+                harness_established: false,
                 runtime: crate::structured::registry::StructuredRuntime::Structured,
                 agent_id: "fixture-event".into(),
                 name: None,
@@ -959,6 +960,7 @@ async fn waiting_retirements_do_not_starve_established_subscriptions() {
         .state
         .structured_agents
         .register(crate::structured::registry::Record {
+            harness_established: false,
             runtime: crate::structured::registry::StructuredRuntime::Structured,
             agent_id: "fixture-retire-event".into(),
             name: None,

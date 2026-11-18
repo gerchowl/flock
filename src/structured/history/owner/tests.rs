@@ -26,6 +26,7 @@ impl Fixture {
         let mut registry = Registry::default();
         let generation = registry
             .register(Record {
+                harness_established: false,
                 runtime: StructuredRuntime::Structured,
                 agent_id: "fixture-agent".into(),
                 name: None,
@@ -361,6 +362,7 @@ async fn invalid_stored_namespaces_never_reach_filesystem_recovery() {
         fixture
             .registry
             .register(Record {
+                harness_established: false,
                 runtime: StructuredRuntime::Structured,
                 agent_id: id.into(),
                 session_id: session.into(),

@@ -4,6 +4,7 @@ use crate::structured::claude::SessionEvent;
 
 pub(super) fn record(id: &str) -> Record {
     Record {
+        harness_established: false,
         runtime: crate::structured::registry::StructuredRuntime::Structured,
         agent_id: id.into(),
         name: Some(format!("name-{id}")),
@@ -389,4 +390,83 @@ fn security_agent_name_structured_registry_rejects_and_retains_inactive() {
         failures.is_empty(),
         "accepted structured name cases: {failures:?}"
     );
+}
+
+#[test]
+fn matching_init_is_the_only_persisted_establishment_fact() {
+    let mut raw = serde_json::to_value(record("agent_fixture_a")).unwrap();
+    raw["future_field"] = serde_json::json!({"retain":true});
+    let mut registry: Registry = serde_json::from_value(serde_json::json!([raw])).unwrap();
+    let generation = registry.get("agent_fixture_a").unwrap().2;
+    let now = Instant::now();
+    let established = |registry: &Registry| {
+        serde_json::to_value(registry).unwrap()[0]["harness_established"]
+            .as_bool()
+            .unwrap_or(false)
+    };
+    assert!(!established(&registry));
+    registry
+        .apply(
+            "agent_fixture_a",
+            generation,
+            Input::Lifecycle(Lifecycle::Live),
+            now,
+            1000,
+            Duration::from_secs(60),
+        )
+        .unwrap();
+    assert!(
+        !established(&registry),
+        "reservation/spawn is not session establishment"
+    );
+    for session in [
+        serde_json::Value::Null,
+        serde_json::json!("different-session"),
+    ] {
+        let event = SessionEvent::parse(&serde_json::json!({"type":"system","subtype":"init","session_id":session,"model":"fixture-model","claude_code_version":"2.1.296","tools":[]}).to_string(), "2.1.296");
+        send(&mut registry, "agent_fixture_a", generation, &event, now);
+        assert!(
+            !established(&registry),
+            "mismatched init established a session"
+        );
+    }
+    let event = SessionEvent::parse(&serde_json::json!({"type":"system","subtype":"init","session_id":"session-agent_fixture_a","model":"fixture-model","claude_code_version":"2.1.296","tools":[]}).to_string(), "2.1.296");
+    let current = registry
+        .begin_launch("agent_fixture_a", generation)
+        .unwrap();
+    assert!(registry
+        .apply(
+            "agent_fixture_a",
+            generation,
+            Input::Event(&event),
+            now,
+            1000,
+            Duration::from_secs(60)
+        )
+        .is_err());
+    assert!(
+        !established(&registry),
+        "retired generation established a session"
+    );
+    send(&mut registry, "agent_fixture_a", current, &event, now);
+    assert!(established(&registry));
+    assert!(registry.take_establishment_dirty());
+    assert!(!registry.take_establishment_dirty());
+    let saved = serde_json::to_value(&registry).unwrap();
+    assert_eq!(saved[0]["future_field"], serde_json::json!({"retain":true}));
+    let restored: Registry = serde_json::from_value(saved.clone()).unwrap();
+    assert!(established(&restored));
+    assert_eq!(serde_json::to_value(restored.snapshot()).unwrap(), saved);
+}
+
+#[test]
+fn malformed_establishment_field_is_preserved_without_failing_registry_load() {
+    let good = serde_json::to_value(record("agent_fixture_a")).unwrap();
+    let mut bad = serde_json::to_value(record("agent_fixture_b")).unwrap();
+    bad["harness_established"] = serde_json::json!({"unknown":true});
+    let raw = serde_json::json!([good, bad]);
+    let registry: Registry = serde_json::from_value(raw.clone()).unwrap();
+    assert_eq!(registry.records().len(), 1);
+    assert_eq!(registry.retained_records().len(), 1);
+    assert_eq!(serde_json::to_value(&registry).unwrap(), raw);
 }

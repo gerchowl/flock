@@ -1549,6 +1549,7 @@ mod tests {
         let generation = state
             .structured_agents
             .register(Record {
+                harness_established: false,
                 runtime: StructuredRuntime::Structured,
                 agent_id: "fixture-agent".into(),
                 name: None,

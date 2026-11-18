@@ -56,6 +56,7 @@ impl Case {
         let session = format!("00000000-0000-4000-8000-{n:012}");
         let generation = registry
             .register(Record {
+                harness_established: false,
                 runtime: StructuredRuntime::Structured,
                 agent_id: id.clone(),
                 name: Some(format!("worker-{n}")),

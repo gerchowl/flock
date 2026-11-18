@@ -16,6 +16,7 @@ struct Agent {
 fn agent(id: &str) -> Agent {
     Agent {
         record: Record {
+            harness_established: false,
             runtime: StructuredRuntime::Structured,
             agent_id: id.into(),
             name: Some(format!("label-{id}")),

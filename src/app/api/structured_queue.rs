@@ -439,6 +439,7 @@ mod tests {
         app.state
             .structured_agents
             .register(crate::structured::registry::Record {
+                harness_established: false,
                 runtime: crate::structured::registry::StructuredRuntime::Structured,
                 agent_id: "recipient".into(),
                 name: None,

@@ -6,7 +6,7 @@ use crate::api::{
     schema::{AgentStartParams, ResponseResult},
 };
 use crate::structured::{
-    launch::{LaunchError, LaunchProfile, ProfileConfigDir, VerifiedBinary},
+    launch::{LaunchError, LaunchMode, LaunchProfile, ProfileConfigDir, VerifiedBinary},
     registry::{Record, StructuredRuntime},
     workers::{Admission, Launch},
 };
@@ -96,6 +96,16 @@ impl App {
             .clone()
             .ok_or(ErrorCode::StructuredEndpointRestartRequired)?;
         let is_new = existing.is_none();
+        let mode = if existing.as_ref().is_some_and(|(id, _)| {
+            self.state
+                .structured_agents
+                .get(id)
+                .is_some_and(|(record, _, _)| record.harness_established)
+        }) {
+            LaunchMode::Continuation
+        } else {
+            LaunchMode::Fresh
+        };
         let (agent_id, generation) = if let Some((id, generation)) = existing {
             if params.cwd.is_some() || params.model.is_some() {
                 return Err(ErrorCode::InvalidParams);
@@ -126,6 +136,7 @@ impl App {
                 .state
                 .structured_agents
                 .register(Record {
+                    harness_established: false,
                     runtime: StructuredRuntime::Structured,
                     agent_id: id.clone(),
                     name: Some(params.name),
@@ -191,9 +202,14 @@ impl App {
                     }
                     String::from_utf8(output.stdout).map_err(io::Error::other)
                 })?;
-                LaunchProfile::prepare(&config, &prepare_state, &record.session_id, binary, |key| {
-                    std::env::var_os(key)
-                })
+                LaunchProfile::prepare(
+                    &config,
+                    &prepare_state,
+                    &record.session_id,
+                    mode,
+                    binary,
+                    |key| std::env::var_os(key),
+                )
             },
         );
         let generation = match started {

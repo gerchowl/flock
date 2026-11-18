@@ -1405,6 +1405,7 @@ fn owner_lookup_replay_consumes_real_storage_and_the_verified_socket_writer() {
         let mut registry = Registry::default();
         registry
             .register(Record {
+                harness_established: false,
                 runtime: StructuredRuntime::Structured,
                 agent_id: "fixture-agent".into(),
                 name: None,

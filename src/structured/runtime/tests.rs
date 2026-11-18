@@ -107,21 +107,21 @@ impl Fixture {
             Ok("2.1.296 (Claude Code)".into())
         })
         .expect("preparation seam");
-        let profile =
-            LaunchProfile::prepare(
-                &config,
-                self.root.path(),
-                session,
-                binary,
-                |key| match key {
-                    "HOME" | "TMPDIR" => Some(self.root.path().as_os_str().to_owned()),
-                    "PATH" => Some(self.root.path().join("bin").into_os_string()),
-                    "LANG" | "LC_ALL" => Some(OsString::from("C")),
-                    "USER" | "LOGNAME" => Some(OsString::from("fixture-user")),
-                    _ => None,
-                },
-            )
-            .expect("profile");
+        let profile = LaunchProfile::prepare(
+            &config,
+            self.root.path(),
+            session,
+            crate::structured::launch::LaunchMode::Fresh,
+            binary,
+            |key| match key {
+                "HOME" | "TMPDIR" => Some(self.root.path().as_os_str().to_owned()),
+                "PATH" => Some(self.root.path().join("bin").into_os_string()),
+                "LANG" | "LC_ALL" => Some(OsString::from("C")),
+                "USER" | "LOGNAME" => Some(OsString::from("fixture-user")),
+                _ => None,
+            },
+        )
+        .expect("profile");
         let args: Vec<_> = profile
             .args()
             .iter()
