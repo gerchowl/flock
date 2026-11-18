@@ -98,7 +98,7 @@ def painted_workspace(output, records):
                   and record.get("side") == "client"
                   and record.get("stage") == "first_paint" for record in records)
     # Strip OSC (including window titles), CSI and single escape controls.
-    visible = re.sub(rb"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)", b"", output)
+    visible = re.sub(rb"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\|$)", b"", output)
     visible = re.sub(rb"\x1b\[[0-?]*[ -/]*[@-~]|\x1b[@-_]", b"", visible)
     return painted and FRAME_LABEL.encode() in visible
 

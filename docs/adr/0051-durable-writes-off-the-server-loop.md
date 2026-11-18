@@ -158,7 +158,7 @@ Fresh macOS arm64 dev host baseline, unchanged production code:
 
 | Control Welcome | Control usable first frame | Stalled attach | Sync thread | Trigger completion |
 | --- | --- | --- | --- | --- |
-| 0.545 s | 0.641 s | 5.354 s, exit 1; no Welcome or frame | main | 8.051 s |
+| 0.328 s | 0.411 s | 5.328 s, exit 1; no Welcome or frame | main | 8.057 s |
 
 Complete stalled diagnostic (preceded only by OSC 10/11 theme queries):
 

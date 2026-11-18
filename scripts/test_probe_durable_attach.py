@@ -123,6 +123,9 @@ class FirstFrameTests(unittest.TestCase):
         self.assertFalse(painted_workspace(b"\x1b]2;sync-probe\x07", [self.PAINT]))
         self.assertFalse(painted_workspace(b"\x1b]2;sync-probe\x1b\\", [self.PAINT]))
 
+    def test_incomplete_window_title_is_not_visible_content(self):
+        self.assertFalse(painted_workspace(b"\x1b]2;sync-probe", [self.PAINT]))
+
     def test_frame_must_be_flushed_and_contain_workspace(self):
         self.assertFalse(painted_workspace(b"sync-probe", []))
         self.assertFalse(painted_workspace(b"", [self.PAINT]))
