@@ -68,6 +68,8 @@ export type Sender = {
   readonly send: (agent: string, text: string, echoAfter: number | null) => string;
   /** Queues `agent.decide`; throws when no principal is known yet. */
   readonly decide: (args: AgentDecide) => string;
+  /** Queues a structured start through the same durable outbox. */
+  readonly start?: (name: string, node: string, cwd: string) => string;
   /** Why sending is impossible right now, or null. */
   readonly blocked: () => string | null;
 };
