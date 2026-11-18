@@ -7,10 +7,13 @@ use std::{
     fs, io,
     os::unix::{fs::PermissionsExt, process::CommandExt},
     path::{Path, PathBuf},
-    process::{Command, ExitStatus, Stdio},
+    process::{ExitStatus, Stdio},
     time::Duration,
 };
-use support::fleet::{self, NodeSpec};
+use support::{
+    environment::Command,
+    fleet::{self, NodeSpec},
+};
 
 struct ProcessGroup {
     pid: i32,
@@ -43,7 +46,9 @@ fn run(mut command: Command, limit: Duration) -> io::Result<ExitStatus> {
             })
             .flatten()
     });
-    command.process_group(0).stdin(Stdio::null());
+    command.stdin(Stdio::null());
+    let mut command = command.into_std();
+    command.process_group(0);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
