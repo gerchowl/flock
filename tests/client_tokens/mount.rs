@@ -1,5 +1,7 @@
 //! Full headless-server paths; every executable, socket, config and token is isolated.
 use super::*;
+#[path = "gui_fleet.rs"]
+mod gui_fleet;
 use std::{
     io::Read,
     net::{SocketAddr, TcpStream},
