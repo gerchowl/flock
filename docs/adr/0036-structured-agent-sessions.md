@@ -341,7 +341,8 @@ The cooperative same-UID limitation of #1177 still applies.
 #### Amendment, Accepted 2026-11-19 (owner decision): operate app-session tokens may stop and restart structured agents
 
 **Status: Accepted 2026-11-19 (owner decision).** Not yet implemented.
-Until implemented, the `agent.restart` and `agent.stop` wire verbs refuse structured stop/restart for every token with a
+Until implemented, the `agent.start`, `agent.restart`
+and `agent.stop` wire verbs refuse structured stop/restart for every token with a
 typed error.
 
 *Need.* The GUI must restart (resume the same session) and stop a structured
