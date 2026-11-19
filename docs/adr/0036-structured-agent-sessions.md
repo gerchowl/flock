@@ -397,7 +397,7 @@ runs over the local unix socket, so this would not add isolation; it would add
 a second privileged API surface for the GUI shell and duplicate the authority
 checks the app-session token already performs.
 
-*Follow-up implementation slice (after acceptance).* Larger than lifting a
+*Follow-up implementation slice.* Larger than lifting a
 refusal:
 - The wire lifecycle handler has no token or session context today
   (`wire_agent_lifecycle`, `src/app/api/wire_lifecycle.rs`); plumb the
@@ -698,8 +698,8 @@ omitted until S10. No PTY placement, process id or caller credential is fabricat
 `agent.get` and its `agent.status` alias resolve registered identity/name, refusing
 cross-runtime ambiguity. `agent.stop` accepts only a structured target and is
 restricted to the operator and the structured agent itself only (an
-app-session `operate` token counts as the operator if the §1a amendment is
-accepted). PTY callers
+app-session `operate` token counts as the operator under the accepted §1a
+amendment). PTY callers
 and lineage parents receive no stop authority. Stop latches cancellation and
 returns current facts; it does not promise immediate Offline. Offline stop is
 idempotent. A restored Unknown record refuses launch before epoch advancement or
