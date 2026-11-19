@@ -14,6 +14,14 @@ on:
           - macos
           - all
           - durable-attach-baseline
+      attach_expectation:
+        description: attach timeout contract to measure
+        required: true
+        default: timeout
+        type: choice
+        options:
+          - baseline
+          - timeout
       libghostty_optimize:
         description: libghostty-vt optimize mode for this build
         required: true
@@ -200,6 +208,7 @@ jobs:
     env:
       CARGO_BUILD_JOBS: '2'
       CARGO_INCREMENTAL: '0'
+      PROBE_EXPECTATION: ${{ inputs.attach_expectation }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -215,8 +224,14 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
+          set -e
           python3 -m unittest scripts.test_probe_durable_attach
-          python3 scripts/probe_durable_attach.py --bin target/debug/flk --assert-baseline 2>&1 | tee durable-attach-output.txt
+          if [ "$PROBE_EXPECTATION" = timeout ]; then
+            python3 scripts/probe_durable_attach.py --bin target/debug/flk --assert-attach-timeout
+            python3 tests/probes/attach_welcome.py --bin target/debug/flk
+          else
+            python3 scripts/probe_durable_attach.py --bin target/debug/flk --assert-baseline
+          fi 2>&1 | tee durable-attach-output.txt
       - name: Upload raw measurement
         if: always()
         uses: actions/upload-artifact@v7
