@@ -16,7 +16,7 @@
 - S6e amendment Accepted (2026-10-29, #2242/#2731): the owner typed
   "accept all rec with star". All S6e recommendations are decided; no
   question-thread implementation is claimed.
-- Proposed amendment (owner decision pending; not accepted, not implemented):
+- §1a amendment Accepted 2026-11-19 (owner decision; not yet implemented):
   §1a lets operator app-session `operate` tokens stop and restart structured
   agents on their home node; file tokens stay refused.
 - Implemented: the S0 probes (#1356); the slices are tracked in #1307.
@@ -333,16 +333,15 @@ amendment below).
 MCP spawn is fresh-only. Mesh relays cannot carry structured start/spawn, and the
 server independently refuses recorded mesh edges. Client token scopes, including
 `operate`, grant permission decisions, not local socket operator identity or
-resume authority (**proposed amendment below narrows this for operator
-app-session tokens; owner decision pending**). The current WebSocket terminal bridge does not dispatch the
+resume authority (**the amendment below, Accepted 2026-11-19 (owner decision),
+narrows this for operator app-session tokens**). The current WebSocket terminal bridge does not dispatch the
 structured `cmd` frame; future command admission must preserve this boundary.
 The cooperative same-UID limitation of #1177 still applies.
 
-#### Proposed amendment (owner decision pending): operate app-session tokens may stop and restart structured agents
+#### Amendment, Accepted 2026-11-19 (owner decision): operate app-session tokens may stop and restart structured agents
 
-**Status: Proposed.** Not accepted and not implemented; the owner rules on it.
-Until accepted, the text above is in force and the `agent.start`, `agent.restart`
-and `agent.stop` wire verbs refuse structured stop/restart for every token with a
+**Status: Accepted 2026-11-19 (owner decision).** Not yet implemented.
+Until implemented, the `agent.restart` and `agent.stop` wire verbs refuse structured stop/restart for every token with a
 typed error.
 
 *Need.* The GUI must restart (resume the same session) and stop a structured
