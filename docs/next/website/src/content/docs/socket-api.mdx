@@ -38,8 +38,42 @@ and the lock file is never replaced during policy updates.
 targets, credential references, bundle digests, grants, and revocation metadata.
 References contain no resolved secret bytes. Agents and pending or enrolled mesh
 relays receive no binding, account, sibling identity, or usage fields. This API
-only projects data; binding mutation transactions arrive in slice 2b. Production
-execution remains unavailable. Every future profile execution path must pass shared admission
+only projects data. Production execution remains unavailable.
+
+The following socket-only preparation methods require the authenticated local
+operator. Relays and agents receive `operator_only` before mutation. CLI commands
+and structured-session profile pins follow in slice 2b-2.
+
+- `profile.plan` accepts `{ "action": "bind", "binding_id": "optional-existing-id",
+  "target": { "repo_id": "repo", "node_ids": ["node"], "agent_ids": ["agent"] },
+  "account_alias": "alias", "credential_ref": "opaque-reference",
+  "credential_generation": 1, "bundle_digests": ["digest"], "grants": [] }`.
+  Omit `binding_id` to allocate a fresh identity. The response contains `plan`,
+  `expect` (the review SHA-256) and `review`, including the predecessor policy
+  revision, previous binding, exact proposed binding and expiration timestamp.
+  Plans expire after five minutes using a suspend-inclusive monotonic deadline; uncommitted plans
+  are discarded on server restart. Wildcard/empty targets are refused.
+- `profile.bind` accepts `{ "plan": "id", "expect": "review-digest" }`. Commit
+  rechecks caller identity, immutable review bytes, expiry and current policy
+  revision while holding both store locks, then allocates the next revision.
+- `profile.revoke` accepts `{ "binding": "id", "reason": "operator reason" }`.
+  It commits a terminal tombstone without preview, increments the policy revision
+  and records the operator principal and operation ID. A revoked identity cannot
+  be rebound; corrected authority needs a fresh identity.
+
+Mutation responses contain `operation_id`, `action`, `principal`, `expect` and the
+committed `binding`. A bind operation uses its plan ID. Repeating a committed bind
+with the same ID/digest/caller returns its original receipt across restart and
+later changes, including revocation; that historical receipt does not change
+current authority. Repeating revocation for the same binding/reason/caller returns
+its original receipt. Receipts persist with the binding document and preserve
+unknown entries without treating them as authority.
+
+Typed preparation refusals include `profile_plan_invalid`, `profile_plan_expired`,
+`profile_revision_conflict`, `profile_binding_revoked`, and
+`profile_binding_not_found`. A stale review requires a fresh plan. Credential
+references remain identifiers only; these methods do not resolve secrets,
+activate profiles or launch processes. Every future profile execution path must pass shared admission
 before accessing secrets, starting processes or transferring mailbox ownership.
 
 ## Structured permission decision messages
