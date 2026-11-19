@@ -16,7 +16,8 @@
 - S6e amendment Accepted (2026-10-29, #2242/#2731): the owner typed
   "accept all rec with star". All S6e recommendations are decided; no
   question-thread implementation is claimed.
-- §1a amendment Accepted 2026-11-19 (owner decision; not yet implemented):
+- §1a amendment Accepted 2026-11-19 (owner decision, #3135; not yet
+  implemented):
   §1a lets operator app-session `operate` tokens stop and restart structured
   agents on their home node; file tokens stay refused.
 - Implemented: the S0 probes (#1356); the slices are tracked in #1307.
@@ -328,7 +329,7 @@ record is operator-only (`operator_only`), including an agent resuming itself.
 The original parent and depth survive every resume and lease generation; resume
 never re-parents a conversation. This rule is adjacent to the `may_stop` policy:
 stop remains available only to the operator and the structured agent itself
-(an app-session `operate` token counts as the operator under the proposed
+(an app-session `operate` token counts as the operator under the accepted
 amendment below).
 MCP spawn is fresh-only. Mesh relays cannot carry structured start/spawn, and the
 server independently refuses recorded mesh edges. Client token scopes, including
@@ -350,7 +351,7 @@ agent. It reaches only its home node's wire, authenticated by an app-session
 token (§5). Without this amendment those controls and their end-to-end coverage
 (#3096, #3098) cannot work.
 
-*Proposal.* Tokens split by origin, not by who minted them (only the local
+*Decision.* Tokens split by origin, not by who minted them (only the local
 operator can mint any token). An **app-session token** (`Source::App`, minted
 for the operator's own GUI shell under a fresh LocalOperator check; always
 `operate`, principal `app:operator:<uid>`) carries structured **stop** and
@@ -1745,7 +1746,7 @@ are deferred to S6 (#1429); this types slice names the contracts only.
   `operate`-scoped bearer token *is* the operator's identity for ADR-0014's
   operator-only verbs, from any address, and once `--allow-non-loopback`
   is on that includes other machines (owner decision 9). That reach is why the
-  §1a proposed amendment extends structured stop/restart only to app-session
+  accepted §1a amendment extends structured stop/restart only to app-session
   tokens, never to file tokens. Token files live in
   the operator's data dir, which `flk-agent` cannot read (ADR-0035 §6.3), so
   structured agents cannot pick up a client token. `pty` agents that still
