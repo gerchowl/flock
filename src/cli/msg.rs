@@ -24,6 +24,8 @@ pub(super) fn run_msg_command(args: &[String]) -> std::io::Result<i32> {
         "reply" => msg_reply(&args[1..]),
         "list" => msg_list(&args[1..]),
         "read" => msg_read(&args[1..]),
+        "operator-read" => msg_operator_inbox(&args[1..], true),
+        "operator-list" => msg_operator_inbox(&args[1..], false),
         "status" => msg_status(&args[1..]),
         "mute" => msg_mute(&args[1..]),
         "help" | "--help" | "-h" => {
@@ -601,6 +603,34 @@ fn msg_read(args: &[String]) -> std::io::Result<i32> {
     })?)
 }
 
+fn parse_operator_inbox(args: &[String], consume: bool) -> Option<Method> {
+    match args {
+        [flag, pane] if flag == "--pane" && !pane.is_empty() && !pane.starts_with('-') => {
+            let params = crate::api::schema::MsgOperatorInboxParams { pane: pane.clone() };
+            Some(if consume {
+                Method::MsgOperatorRead(params)
+            } else {
+                Method::MsgOperatorList(params)
+            })
+        }
+        _ => None,
+    }
+}
+
+fn msg_operator_inbox(args: &[String], consume: bool) -> std::io::Result<i32> {
+    let Some(method) = parse_operator_inbox(args, consume) else {
+        eprintln!(
+            "usage: flk msg operator-{} --pane TARGET",
+            if consume { "read" } else { "list" }
+        );
+        return Ok(super::exit::USAGE);
+    };
+    super::print_response(&super::send_request(&Request {
+        id: "cli:msg:operator-inbox".into(),
+        method,
+    })?)
+}
+
 /// `flk msg status` — the sender's view.
 ///
 /// `msg list` answers "what is waiting for me"; nothing answered "what
@@ -749,6 +779,8 @@ fn print_msg_help() {
          deliver it as text"
     );
     eprintln!("  targets: pane id, terminal id, unique agent name; or repo:pane / --repo NAME");
+    eprintln!("  flk msg operator-list --pane TARGET  operator peek at a legacy pane inbox");
+    eprintln!("  flk msg operator-read --pane TARGET  operator consumes a legacy pane inbox");
     eprintln!("  agents read their attested inbox with flock_msg_read or flk msg read");
 }
 
@@ -761,6 +793,35 @@ mod tests {
 
     fn argv(args: &[&str]) -> Vec<String> {
         args.iter().map(|arg| (*arg).to_string()).collect()
+    }
+
+    #[test]
+    fn operator_inbox_requires_exactly_one_named_pane() {
+        for consume in [false, true] {
+            let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+            let method = super::parse_operator_inbox(&args(&["--pane", "p_1"]), consume).unwrap();
+            let wire = serde_json::to_value(&method).unwrap();
+            assert_eq!(
+                wire["method"],
+                if consume {
+                    "msg.operator_read"
+                } else {
+                    "msg.operator_list"
+                }
+            );
+            assert_eq!(wire["params"]["pane"], "p_1");
+            for input in [
+                vec![],
+                vec!["p_1"],
+                vec!["--pane"],
+                vec!["--pane", ""],
+                vec!["--pane", "--help"],
+                vec!["--pane", "p_1", "extra"],
+            ] {
+                assert!(super::parse_operator_inbox(&args(&input), consume).is_none());
+            }
+            assert_eq!(method.is_retry_safe(), !consume);
+        }
     }
 
     #[test]
