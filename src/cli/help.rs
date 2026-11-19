@@ -93,6 +93,7 @@ const VERBS: &[(&str, &str, &str)] = &[
     ("delegate", "wait", super::delegate::WAIT_USAGE),
     ("delegate", "result", super::delegate::RESULT_USAGE),
     ("delegate", "status", super::delegate::STATUS_USAGE),
+    ("delegate", "rebind", super::delegate::backfill::USAGE),
     ("delegate", "reap", super::delegate::REAP_USAGE),
     ("delegate", "list", super::delegate_list::LIST_USAGE),
     (
@@ -626,7 +627,8 @@ mod tests {
             "notification" => include_str!("notification.rs"),
             "delegate" => concat!(
                 include_str!("delegate.rs"),
-                include_str!("delegate_list.rs")
+                include_str!("delegate_list.rs"),
+                include_str!("delegate/backfill.rs")
             ),
             "agent" => include_str!("agent.rs"),
             "msg" => include_str!("msg.rs"),
@@ -824,6 +826,7 @@ mod tests {
                     "delegate" => vec![
                         include_str!("delegate.rs"),
                         include_str!("delegate_list.rs"),
+                        include_str!("delegate/backfill.rs"),
                     ],
                     "wait" => vec![DISPATCH_SOURCE, include_str!("events.rs")],
                     "session" => vec![DISPATCH_SOURCE, include_str!("retained.rs")],
