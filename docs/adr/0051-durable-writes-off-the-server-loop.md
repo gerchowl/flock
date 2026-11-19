@@ -233,6 +233,25 @@ Complete stalled diagnostic (preceded only by OSC 10/11 theme queries):
 flock: server did not answer attach within 5s (server busy?)
 ```
 
+GitHub `ubuntu-latest`, same candidate probe, exit 0:
+
+| Control Welcome | Control usable first frame | Stalled attach | Sync thread | Trigger completion |
+| --- | --- | --- | --- | --- |
+| 0.404 s | 0.461 s | 5.336 s, exit 124; no Welcome or frame | main | 8.013 s |
+
+The [successful candidate run](https://github.com/gerchowl/flock/actions/runs/44425762244)
+measured revision `9b02e142c` unprivileged and uploaded complete raw output in
+artifact `durable-attach-baseline`. Its complete stalled diagnostic is identical
+to the macOS candidate diagnostic above. All eight fake-peer observations also
+passed on Linux: silent/prefix/payload and JSON timeouts took 5.051–5.055 s after
+Hello, restored the PTY, made one connection and replayed zero input bytes.
+EOF, malformed and version paths exited 1; explicit handoff made exactly two
+connections and preserved the final version-refusal diagnostic. The macOS
+candidate driver passed the same eight observations. Locally, all 208 client
+and error-registry group tests and all 154 tests in `client_mode`, `multi_client`,
+`detach_reattach`, `live_handoff` and `attach_welcome` passed. The six deadline
+tests also passed after strengthening the distinct framing-error assertions.
+
 ## Decision
 
 Use a dedicated durable-writer thread with a bounded queue, ordered commands,
