@@ -5,7 +5,8 @@
 - Date: 2026-11-08
 - Issues: [#3013](https://github.com/gerchowl/flock/issues/3013)
 - Decision owner: operator
-- Implemented: measurement tooling only. Production slices remain unimplemented.
+- Implemented: slice A (whole-Welcome deadline and timeout classification).
+  Durable-writer slices remain unimplemented.
 - Acceptance: [owner decision on #3013](https://github.com/gerchowl/flock/issues/3013#issuecomment-6874877063).
 
 ## Evidence and scope
@@ -146,8 +147,9 @@ Linux EAGAIN is 11. No implementation speedup is claimed.
 ### Accepted-design baseline refresh (2026-11-19)
 
 The manual `Build artifacts (manual)` workflow's `durable-attach-baseline`
-choice builds a dynamic debug binary on GitHub `ubuntu-latest`, runs the probe
-with `--assert-baseline` and uploads complete raw output as the
+choice builds a dynamic debug binary on GitHub `ubuntu-latest`. With
+`attach_expectation=baseline`, it runs the probe with `--assert-baseline` and
+uploads complete raw output as the
 `durable-attach-baseline` artifact, including on probe failure. It uses private
 HOME/XDG/socket roots and clears inherited `FLOCK_*` and loader variables.
 `--assert-baseline` requires verified interposer entry on the main thread,
@@ -192,6 +194,63 @@ claimed. The original macOS measurement remains historical evidence; this
 refresh supplies the isolated Linux baseline and usable-frame gate required
 before production implementation. Per-family candidate and activation gates
 remain required.
+
+### Slice A candidate evidence (2026-11-19)
+
+The per-family activation gates below name C, E, D1/D2 and F1/F2; A does not
+activate a durable writer. Nevertheless, this slice records both macOS and
+Linux candidate measurements against the accepted baseline. Its expected
+stalled result is the friendly diagnostic and exit 124, with no Welcome or
+frame; `--assert-responsive` remains a failing server-repair gate. Neither a
+successful control attach nor a classified timeout claims server responsiveness.
+
+The fake-peer acceptance driver is `tests/probes/attach_welcome.py`, also run
+by the `attach_welcome` nextest integration binary. Against the pre-change
+build, silent attach exits 1 with the raw I/O error; both trickled header and
+payload cases fail the driver's 8 s ceiling. EOF, malformed, version and
+explicit handoff paths already pass and remain distinct on the candidate.
+The candidate expires each slow Welcome after about 5.06 s measured after
+Hello, exits 124, restores the PTY, makes one connection, and sends no terminal
+input after Hello. JSON includes `attach_timeout`, `retry=yes`, `exit=124`,
+`phase=welcome` and `timeout_ms=5000`. The handoff case makes exactly two
+connections after an explicit refusal. Injected-clock tests separately advance
+partial prefix/payload reads to exactly 5 s, including early socket timeouts,
+WouldBlock and interrupted reads, without real waits.
+
+The manual workflow's `attach_expectation=timeout` selection runs the new
+probe with `--assert-attach-timeout` and the fake-peer driver, uploading both
+raw outputs in the same artifact. The dispatch uses the task branch explicitly.
+
+macOS arm64 dev host, new probe with `--assert-attach-timeout`, exit 0:
+
+| Control Welcome | Control usable first frame | Stalled attach | Sync thread | Trigger completion |
+| --- | --- | --- | --- | --- |
+| 0.563 s | 0.661 s | 5.350 s, exit 124; no Welcome or frame | main | 8.054 s |
+
+Complete stalled diagnostic (preceded only by OSC 10/11 theme queries):
+
+```text
+flock: server did not answer attach within 5s (server busy?)
+```
+
+GitHub `ubuntu-latest`, same candidate probe, exit 0:
+
+| Control Welcome | Control usable first frame | Stalled attach | Sync thread | Trigger completion |
+| --- | --- | --- | --- | --- |
+| 0.404 s | 0.461 s | 5.336 s, exit 124; no Welcome or frame | main | 8.013 s |
+
+The [successful candidate run](https://github.com/gerchowl/flock/actions/runs/44425762244)
+measured revision `9b02e142c` unprivileged and uploaded complete raw output in
+artifact `durable-attach-baseline`. Its complete stalled diagnostic is identical
+to the macOS candidate diagnostic above. All eight fake-peer observations also
+passed on Linux: silent/prefix/payload and JSON timeouts took 5.051–5.055 s after
+Hello, restored the PTY, made one connection and replayed zero input bytes.
+EOF, malformed and version paths exited 1; explicit handoff made exactly two
+connections and preserved the final version-refusal diagnostic. The macOS
+candidate driver passed the same eight observations. Locally, all 208 client
+and error-registry group tests and all 154 tests in `client_mode`, `multi_client`,
+`detach_reattach`, `live_handoff` and `attach_welcome` passed. The six deadline
+tests also passed after strengthening the distinct framing-error assertions.
 
 ## Decision
 
