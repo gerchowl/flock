@@ -53,6 +53,17 @@ execution with `invalid_params` and usage exit 2, rather than panicking. This ea
 parse error prints on stderr before output-format selection. Native socket paths
 used by the internal handoff importer retain their original OS bytes.
 
+Attach has its own five-second Welcome deadline starting immediately after
+Hello. The complete frame header and payload share that budget, so trickled
+bytes cannot extend it. Expiry restores the terminal before reporting
+`server did not answer attach within 5s (server busy?)` and exits **124**.
+JSON-capable attach commands report `attach_timeout`, `retry: yes`, and
+`data: {"phase": "welcome", "timeout_ms": 5000}`. A timeout does not start an
+automatic attach retry or replay terminal input; the existing bounded retry
+window after an explicit live-handoff refusal remains available. You can retry
+attach with a fresh connection. EOF, malformed frames and version refusals
+retain their existing diagnostics.
+
 ## Exit codes
 
 `flk --help` lists every exit code, what it means and whether retrying is safe, from one registry (`src/cli/exit.rs`). Four cases moved in #1025, and for one release each prints `note: exit code is now N (was M); see CHANGELOG` on stderr when it returns its new code. stdout, `--json` output included, is unchanged.
