@@ -790,7 +790,7 @@ fn apply_wake_authority(
         });
         if first {
             outcome.stdout = Some(serde_json::json!({
-                "systemMessage": "Inbox authority unavailable for this process. Ask the operator to read this pane's inbox from their own interactive shell with `flk msg read --pane <pane-id>`. For a legacy handoff pane, ask the operator to migrate this agent to a structured agent, resuming its harness session (#3066). Reading the inbox does not restore agent authority."
+                "systemMessage": "Inbox authority unavailable for this process. Ask the operator to read this pane's inbox from their own interactive shell with `flk msg operator-read --pane <pane-id>` (peek with `flk msg operator-list --pane <pane-id>`). For a legacy handoff pane, ask the operator to migrate this agent to a structured agent, resuming its harness session (#3066). Reading the inbox does not restore agent authority; see #3000."
             }).to_string());
         }
     } else if wake.get("result").is_some() {
@@ -1054,7 +1054,8 @@ mod tests {
             assert!(notice["systemMessage"]
                 .as_str()
                 .unwrap()
-                .contains("flk msg read"));
+                .contains("flk msg operator-read --pane"));
+            assert!(notice["systemMessage"].as_str().unwrap().contains("#3000"));
             assert!(notice["systemMessage"].as_str().unwrap().contains("#3066"));
             assert!(notice["systemMessage"]
                 .as_str()
