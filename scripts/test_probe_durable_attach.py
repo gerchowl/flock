@@ -1,11 +1,14 @@
 """Failure ceilings for the slow-sync probe's producer handshake."""
 
-import time
+import os
+from pathlib import Path
 import socket
+import tempfile
 import threading
+import time
 import unittest
 
-from scripts.probe_durable_attach import read_line_until, wait_for
+from scripts.probe_durable_attach import attach, painted_workspace, read_line_until, wait_for
 
 
 class Producer:
@@ -108,3 +111,36 @@ class ResponseDeadlineTests(unittest.TestCase):
         finally:
             reader.close()
             writer.close()
+
+
+class FirstFrameTests(unittest.TestCase):
+    PAINT = {"target": "flock::attach", "side": "client", "stage": "first_paint"}
+
+    def test_terminal_setup_is_not_a_frame(self):
+        self.assertFalse(painted_workspace(b"\x1b[?1049h", []))
+
+    def test_window_title_is_not_visible_workspace_content(self):
+        self.assertFalse(painted_workspace(b"\x1b]2;sync-probe\x07", [self.PAINT]))
+        self.assertFalse(painted_workspace(b"\x1b]2;sync-probe\x1b\\", [self.PAINT]))
+
+    def test_incomplete_window_title_is_not_visible_content(self):
+        self.assertFalse(painted_workspace(b"\x1b]2;sync-probe", [self.PAINT]))
+
+    def test_frame_must_be_flushed_and_contain_workspace(self):
+        self.assertFalse(painted_workspace(b"sync-probe", []))
+        self.assertFalse(painted_workspace(b"", [self.PAINT]))
+        self.assertTrue(painted_workspace(b"\x1b[3;1Hsync-\x1b[32mprobe", [self.PAINT]))
+
+    def test_live_peer_with_only_terminal_setup_fails_at_ceiling(self):
+        with tempfile.TemporaryDirectory() as directory:
+            binary = Path(directory) / "silent-client"
+            binary.write_text("#!/usr/bin/env python3\nimport os\nos.write(1, b'\\x1b[?1049h')\nos.read(0, 1)\n")
+            binary.chmod(0o700)
+            env = dict(os.environ, XDG_CONFIG_HOME=directory)
+            started = time.monotonic()
+            result = attach(binary, env, timeout=0.5)
+            self.assertFalse(result["attached"])
+            self.assertIsNotNone(result["welcome_seconds"])
+            self.assertIsNone(result["first_frame_seconds"])
+            self.assertIsNone(result["exit"], "producer must remain alive until probe cleanup")
+            self.assertLess(time.monotonic() - started, 2)

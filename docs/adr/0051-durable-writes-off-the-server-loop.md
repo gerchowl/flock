@@ -1,11 +1,12 @@
 # ADR 0051 — Durable writes leave the server loop through bounded, ordered owners
 
-- Status: Proposed
+- Status: Accepted
+- Accepted: 2026-11-14
 - Date: 2026-11-08
 - Issues: [#3013](https://github.com/gerchowl/flock/issues/3013)
 - Decision owner: operator
-- Implemented: none. This PR contains a measurement script and its test-only
-  interposer, an index entry and this proposal. It changes no production code.
+- Implemented: measurement tooling only. Production slices remain unimplemented.
+- Acceptance: [owner decision on #3013](https://github.com/gerchowl/flock/issues/3013#issuecomment-6874877063).
 
 ## Evidence and scope
 
@@ -85,7 +86,8 @@ then performs the real sync. Linux intercepts `fsync`/`fdatasync`; macOS also
 intercepts `fcntl(F_FULLFSYNC/F_BARRIERFSYNC)`. No FUSE mount, disk pressure,
 privileges, production hook or patched production source is needed. macOS
 requires an unsigned dynamic debug binary that permits DYLD insertion.
-Linux is supported by the script but was not measured in this macOS session.
+Linux was supported but not measured in the original 2026-11-08 macOS
+session; the accepted-design refresh below records the subsequent Linux run.
 
 ```sh
 export CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 RUSTC_WRAPPER=
@@ -102,8 +104,15 @@ The script refuses load ≥10 or free disk <15 GiB, clears inherited `FLOCK_*`
 and loader variables, sets private HOME/XDG roots, uses a short `/tmp/da-*`
 socket base, seeds onboarding off, launches an owned foreground server and
 creates an actual workspace through its private API. The client runs in a
-40×120 PTY. It detects terminal setup after Welcome, not a successful socket
-connect. Readiness has one 20 s monotonic budget covering connect, send and
+40×120 PTY. It records terminal setup after Welcome separately from a usable
+first frame.
+A frame requires the real client's `flock::attach` / `side=client` /
+`stage=first_paint` record (emitted after encoding, writing and flushing a
+semantic frame) plus the seeded workspace label in PTY output after stripping
+OSC window titles and ANSI controls. Each attempt reads only new client log
+bytes, so the control cannot satisfy the stalled attempt. Terminal setup alone
+never passes this gate. Readiness has one 20 s monotonic budget covering
+connect, send and
 complete NDJSON response. The trigger has a separate 20 s monotonic budget
 covering send, marker wait, the attach observation and its complete response;
 partial bytes never reset either budget. The PTY observation has its own 7 s
@@ -134,7 +143,57 @@ These measurements establish the timeout failure; they are not a throughput
 benchmark or a claim about Linux latency. macOS's EAGAIN is 35; the incident's
 Linux EAGAIN is 11. No implementation speedup is claimed.
 
-## Proposed decision
+### Accepted-design baseline refresh (2026-11-19)
+
+The manual `Build artifacts (manual)` workflow's `durable-attach-baseline`
+choice builds a dynamic debug binary on GitHub `ubuntu-latest`, runs the probe
+with `--assert-baseline` and uploads complete raw output as the
+`durable-attach-baseline` artifact, including on probe failure. It uses private
+HOME/XDG/socket roots and clears inherited `FLOCK_*` and loader variables.
+`--assert-baseline` requires verified interposer entry on the main thread,
+exit 1 with the complete timeout diagnostic, and no Welcome or usable frame
+before timeout. `--assert-responsive` independently requires the usable frame
+within 2 s; an early Welcome with a frozen frame cannot pass it.
+
+Fresh macOS arm64 dev host baseline, unchanged production code:
+
+| Control Welcome | Control usable first frame | Stalled attach | Sync thread | Trigger completion |
+| --- | --- | --- | --- | --- |
+| 0.328 s | 0.411 s | 5.328 s, exit 1; no Welcome or frame | main | 8.057 s |
+
+Complete stalled diagnostic (preceded only by OSC 10/11 theme queries):
+
+```text
+flock: protocol error: I/O error: Resource temporarily unavailable (os error 35)
+```
+
+GitHub `ubuntu-latest` baseline, unchanged production code:
+
+| Control Welcome | Control usable first frame | Stalled attach | Sync thread | Trigger completion |
+| --- | --- | --- | --- | --- |
+| 0.425 s | 0.479 s | 5.572 s, exit 1; no Welcome or frame | main | 8.015 s |
+
+The [successful manual run](https://github.com/gerchowl/flock/actions/runs/44420536042)
+measured revision `673bc7fae` and uploaded the complete JSON result as artifact
+`durable-attach-baseline`. The interposer ran unprivileged on the GitHub runner.
+Complete stalled diagnostic (preceded only by OSC 10/11 theme queries):
+
+```text
+flock: protocol error: I/O error: Resource temporarily unavailable (os error 11)
+```
+
+Both `--assert-baseline` runs exited 0. A separate macOS
+`--assert-responsive` run exited 1 as expected (5.332 s stalled attach, exit 1,
+no Welcome or frame). Injecting the old terminal-setup-only predicate makes
+three observer tests fail, including the live silent client's bounded wait.
+The corrected observer also rejects complete and partial OSC window titles;
+all 355 maintenance tests pass. No production responsiveness improvement is
+claimed. The original macOS measurement remains historical evidence; this
+refresh supplies the isolated Linux baseline and usable-frame gate required
+before production implementation. Per-family candidate and activation gates
+remain required.
+
+## Decision
 
 Use a dedicated durable-writer thread with a bounded queue, ordered commands,
 group commit and completion receipts for the event log and session snapshots.
