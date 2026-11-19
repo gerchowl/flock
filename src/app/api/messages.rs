@@ -652,7 +652,7 @@ impl App {
             )
             && self.caller_pane().is_none()
         {
-            return self.unresolved_msg_list_caller(id);
+            return self.unresolved_message_caller(id);
         }
         if let Some(response) = self.native_inbox_request(&id, params.pane.as_deref(), false) {
             return response;
@@ -669,7 +669,7 @@ impl App {
                 .and_then(|(ws, pane)| self.public_pane_id(ws, pane))
             {
                 Some(pane) => Some(pane),
-                None => return self.unresolved_msg_list_caller(id),
+                None => return self.unresolved_message_caller(id),
             },
         };
         let operator = match pane_filter.as_deref() {
@@ -680,13 +680,6 @@ impl App {
             None => operator,
         };
         self.legacy_inbox_list(id, pane_filter, operator)
-    }
-
-    fn unresolved_msg_list_caller(&self, id: String) -> String {
-        encode_error(id, "caller_pane_unresolved", format!(
-            "the calling pane could not be resolved from attested identity: {}. Ask the local operator to use flk msg operator-list --pane TARGET, or migrate this agent to a structured agent (#3066)",
-            self.caller_pane_refusal_reason(),
-        ))
     }
 
     fn legacy_inbox_list(
