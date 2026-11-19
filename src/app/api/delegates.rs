@@ -59,14 +59,21 @@ impl App {
                 "agent id has no unique live PTY binding",
             );
         };
-        self.emit_event(crate::api::schema::EventEnvelope {
-            event: crate::api::schema::EventKind::DelegateRebindAuthorized,
-            data: crate::api::schema::EventData::DelegateRebindAuthorized {
-                name: params.name,
-                previous_agent_id: params.previous_agent_id,
-                agent_id: agent.agent_id.clone(),
-            },
-        });
+        if let Err(error) = self
+            .event_hub
+            .try_push_durable(crate::api::schema::EventEnvelope {
+                event: crate::api::schema::EventKind::DelegateRebindAuthorized,
+                data: crate::api::schema::EventData::DelegateRebindAuthorized {
+                    name: params.name,
+                    previous_agent_id: params.previous_agent_id,
+                    agent_id: agent.agent_id.clone(),
+                },
+            })
+        {
+            crate::logging::event_log_write_failed(&error.to_string());
+            return encode_error(id, crate::api::error_code::ErrorCode::DelegateAuditUnavailable.as_str(),
+                "rebind audit unavailable; repair audit storage and restart the server before retrying");
+        }
         encode_success(id, ResponseResult::AgentInfo { agent })
     }
 
@@ -648,6 +655,37 @@ mod rebind_tests {
         serde_json::from_value(json!({"id":"rebind","method":"delegate.rebind",
             "params":{"name":"fixture","agent_id":agent,"previous_agent_id":null}}))
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn rebind_refuses_failed_audit_append_before_authorizing_the_client() {
+        let log = temp_log("rebind-audit-failed");
+        let hub = EventHub::with_persistence(log.clone());
+        let mut app = app_on(hub.clone());
+        let agent = caller_is_an_agent(&mut app);
+        app.current_api_peer_pid = Some(std::process::id());
+        app.current_api_peer_birth = Some(crate::platform::process_start_time(std::process::id()));
+        let before = std::fs::read(&log).unwrap();
+        hub.fail_appends_for_test();
+        for _ in 0..2 {
+            let response: Value =
+                serde_json::from_str(&app.handle_api_request(request(&agent))).unwrap();
+            assert_eq!(
+                response["error"]["code"], "delegate_audit_unavailable",
+                "{response}"
+            );
+            assert!(response.get("result").is_none());
+        }
+        assert_eq!(std::fs::read(&log).unwrap(), before);
+        assert!(!hub
+            .events_after(0)
+            .unwrap_or_default()
+            .iter()
+            .any(|(_, e)| e.event == EventKind::DelegateRebindAuthorized));
+        assert!(app.delegations.edges().next().is_none());
+        crate::app::delegation::handler_tests::shutdown(app);
+        drop(hub);
+        std::fs::remove_dir_all(log.parent().unwrap()).unwrap();
     }
 
     #[tokio::test]

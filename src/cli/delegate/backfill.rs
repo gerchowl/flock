@@ -1,10 +1,11 @@
 //! Legacy identity repair uses saved native sessions, never terminal equality.
 use super::*;
+use crate::api::error_code::ErrorCode;
 
 pub(in crate::cli) const USAGE: &str = "flk delegate rebind <name> --agent <id> [--json]";
 
-fn unbound(entry: Entry, reason: &'static str) -> RequireFailure {
-    RequireFailure::SessionUnbound(Box::new(entry), reason)
+fn unbound(entry: Entry, reason: ErrorCode) -> RequireFailure {
+    RequireFailure::SessionUnbound(Box::new(entry), reason.as_str())
 }
 
 fn session_key(session: &serde_json::Value) -> Option<(&str, &str)> {
@@ -20,7 +21,7 @@ fn bind(mut entry: Entry, record: &serde_json::Value) -> Result<Entry, RequireFa
         .zip(field(record, "pane_id").filter(|id| !id.is_empty()))
         .map(|((agent, terminal), pane)| (agent, terminal, pane))
     else {
-        return Err(unbound(entry, "live_binding_incomplete"));
+        return Err(unbound(entry, ErrorCode::LiveBindingIncomplete));
     };
     entry.agent_id = Some(agent.into());
     entry.terminal_id = terminal.into();
@@ -35,7 +36,7 @@ pub(super) fn upgrade(entry: Entry, deadline: Option<Instant>) -> Result<Entry, 
         .and_then(session_key)
         .filter(|(harness, _)| *harness == entry.harness)
     else {
-        return Err(unbound(entry, "saved_session_missing"));
+        return Err(unbound(entry, ErrorCode::SavedSessionMissing));
     };
     let response =
         bounded(Method::AgentList(EmptyParams {}), deadline).map_err(|err| match err {
@@ -69,9 +70,9 @@ pub(super) fn upgrade(entry: Entry, deadline: Option<Instant>) -> Result<Entry, 
         });
     let record = match (matches.as_slice(), native_claims) {
         ([record], 0) => *record,
-        ([], 0) => return Err(unbound(entry, "saved_session_not_found")),
-        ([], 1) => return Err(unbound(entry, "saved_session_runtime_unsupported")),
-        _ => return Err(unbound(entry, "saved_session_ambiguous")),
+        ([], 0) => return Err(unbound(entry, ErrorCode::SavedSessionNotFound)),
+        ([], 1) => return Err(unbound(entry, ErrorCode::SavedSessionRuntimeUnsupported)),
+        _ => return Err(unbound(entry, ErrorCode::SavedSessionAmbiguous)),
     };
     let live = bind(entry, record)?;
     write_entry(&live).map_err(|err| RequireFailure::Failed(err.to_string()))?;

@@ -26,6 +26,9 @@ fn agent() -> Value {
 }
 impl Fixture {
     fn new(saved: Value, agents: Vec<Value>) -> Self {
+        Self::serve(saved, agents, false)
+    }
+    fn serve(saved: Value, agents: Vec<Value>, audit_failure: bool) -> Self {
         let dir = support::socket_dir::SocketDir::reserve("d3088");
         let socket = dir.path().join("s");
         let registry = dir
@@ -68,6 +71,8 @@ impl Fixture {
                     "ping" => json!({"result":{"protocol_version":34}}),
                     "agent.list" => json!({"result":{"agents":agents,"structured_agents":[]}}),
                     "agent.get" => json!({"result":{"agent":agent()}}),
+                    "delegate.rebind" if audit_failure => json!({"error":{
+                        "code":"delegate_audit_unavailable","message":"audit append failed"}}),
                     "delegate.rebind" => json!({"result":{"agent":agent()}}),
                     other => panic!("unexpected request: {other}"),
                 };
@@ -220,4 +225,20 @@ fn unknown_neighbor_record_is_preserved_raw_during_upgrade() {
     std::fs::write(&neighbor, raw).unwrap();
     assert!(fixture.run(&["status", "fixture"]).status.success());
     assert_eq!(std::fs::read(neighbor).unwrap(), raw);
+}
+
+#[test]
+fn audit_refusal_leaves_the_client_record_unchanged() {
+    let fixture = Fixture::serve(Value::Null, vec![agent()], true);
+    let before = std::fs::read(&fixture.entry).unwrap();
+    let output = fixture.run(&[
+        "rebind",
+        "fixture",
+        "--agent",
+        "agent_fixture.example_backfill",
+    ]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(response["error"]["code"], "delegate_audit_unavailable");
+    assert_eq!(std::fs::read(&fixture.entry).unwrap(), before);
 }

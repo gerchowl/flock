@@ -128,6 +128,17 @@ impl PersistentLog {
         Ok(())
     }
 
+    /// Required audits also commit directory entries created by open or rotation.
+    fn append_required(&mut self, event: &PersistedEvent) -> std::io::Result<()> {
+        self.append(event)?;
+        let directory = self
+            .path
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        std::fs::File::open(directory)?.sync_all()
+    }
+
     fn rotate(&mut self) -> std::io::Result<()> {
         let oldest = self.rotated_path(MAX_ROTATED);
         if oldest.exists() {
@@ -417,6 +428,54 @@ impl EventHub {
         hub
     }
 
+    #[cfg(test)]
+    pub(crate) fn fail_appends_for_test(&self) {
+        let mut state = self.inner.lock().unwrap();
+        let log = state.log.as_mut().expect("persistent fixture log");
+        log.file = std::fs::File::open(&log.path).unwrap();
+    }
+
+    /// Publish only after a persisted event's append and sync succeed.
+    /// A failed writer is closed to preserve a potentially torn tail. Required
+    /// audit writes stay unavailable until the journal is reopened on restart.
+    /// Ordinary best-effort `push` callers retain their existing behavior.
+    pub(crate) fn try_push_durable(&self, event: EventEnvelope) -> std::io::Result<()> {
+        use std::io::{Error, ErrorKind};
+        if !event.event.is_persisted() {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "event kind is not durable",
+            ));
+        }
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| Error::other("event hub unavailable"))?;
+        let sequence = state.next_sequence + 1;
+        let persisted = PersistedEvent {
+            seq: sequence,
+            ts_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_millis().min(u128::from(u64::MAX)) as u64)
+                .unwrap_or(0),
+            envelope: event.clone(),
+        };
+        let result = state
+            .log
+            .as_mut()
+            .ok_or_else(|| Error::new(ErrorKind::NotConnected, "durable event log unavailable"))?
+            .append_required(&persisted);
+        // An uncertain append may have written bytes; never reuse its sequence.
+        state.next_sequence = sequence;
+        if let Err(error) = result {
+            state.log = None;
+            return Err(error);
+        }
+        state.durable_sequence = sequence;
+        self.publish_event(state, sequence, event);
+        Ok(())
+    }
+
     pub fn push(&self, event: EventEnvelope) {
         let Ok(mut state) = self.inner.lock() else {
             return;
@@ -439,6 +498,15 @@ impl EventHub {
                 }
             }
         }
+        self.publish_event(state, sequence, event);
+    }
+
+    fn publish_event(
+        &self,
+        mut state: std::sync::MutexGuard<'_, EventHubState>,
+        sequence: u64,
+        event: EventEnvelope,
+    ) {
         state.events.push((sequence, event));
         #[cfg(test)]
         let cap = state.ring_cap.unwrap_or(Self::MAX_EVENTS);
@@ -794,6 +862,79 @@ mod tests {
                 workspace_id: label.to_string(),
             },
         }
+    }
+
+    #[test]
+    fn required_audit_append_is_replayable_before_publication() {
+        let path = temp_log("required-success");
+        let hub = EventHub::with_persistence(path.clone());
+        hub.set_ring_cap(1);
+        hub.push(workspace_event("existing"));
+        hub.try_push_durable(workspace_event("required")).unwrap();
+        assert_eq!(hub.durable_sequence(), 2);
+        assert_eq!(hub.events_after(1).unwrap().len(), 1);
+        assert!(hub.wait_after(1, std::time::Duration::ZERO));
+        let reopened = EventHub::with_persistence(path.clone());
+        let persisted = reopened.persisted_events_after(0);
+        assert_eq!(persisted.len(), 2);
+        assert_eq!(persisted[1].2, workspace_event("required"));
+        drop(reopened);
+        drop(hub);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn required_audit_failure_never_publishes_or_advances_the_durable_cursor() {
+        let path = temp_log("required-failure");
+        let hub = EventHub::with_persistence(path.clone());
+        hub.push(workspace_event("existing"));
+        let before = std::fs::read(&path).unwrap();
+        hub.fail_appends_for_test();
+        assert!(hub.try_push_durable(workspace_event("rejected")).is_err());
+        assert_eq!(hub.durable_sequence(), 1);
+        assert_eq!(hub.current_sequence(), 2);
+        assert!(hub.events_after(1).unwrap().is_empty());
+        assert!(!hub.wait_after(1, std::time::Duration::ZERO));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(hub
+            .try_push_durable(workspace_event("still-rejected"))
+            .is_err());
+        assert_eq!(hub.current_sequence(), 2);
+        drop(hub);
+        let reopened = EventHub::with_persistence(path.clone());
+        reopened
+            .try_push_durable(workspace_event("recovered"))
+            .unwrap();
+        assert_eq!(reopened.persisted_events_after(0).len(), 2);
+        drop(reopened);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn required_audit_refuses_when_the_log_directory_cannot_be_synced() {
+        let path = temp_log("required-directory");
+        let hub = EventHub::with_persistence(path.clone());
+        let directory = path.parent().unwrap();
+        let relocated = directory.with_extension("relocated");
+        std::fs::rename(directory, &relocated).unwrap();
+        assert!(hub
+            .try_push_durable(workspace_event("unconfirmed"))
+            .is_err());
+        assert_eq!(hub.durable_sequence(), 0);
+        assert!(!hub.wait_after(0, std::time::Duration::ZERO));
+        assert!(hub.events_after(0).unwrap_or_default().is_empty());
+        drop(hub);
+        std::fs::remove_dir_all(relocated).unwrap();
+    }
+
+    #[test]
+    fn required_audits_reject_memory_only_hubs_and_non_durable_kinds() {
+        let hub = EventHub::default();
+        assert!(hub.try_push_durable(workspace_event("required")).is_err());
+        assert!(hub.try_push_durable(output_event()).is_err());
+        assert_eq!(hub.current_sequence(), 0);
+        hub.push(workspace_event("best-effort"));
+        assert_eq!(hub.events_after(0).unwrap().len(), 1);
     }
 
     #[test]
