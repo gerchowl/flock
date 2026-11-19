@@ -12,6 +12,15 @@ pub struct Request {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "method", content = "params")]
 pub enum Method {
+    /// Operator-only immutable binding review; never executes profile assets.
+    #[serde(rename = "profile.plan")]
+    ProfilePlan(crate::structured::profiles::bindings::transactions::PlanRequest),
+    /// Operator-only compare-and-swap of the exact reviewed binding.
+    #[serde(rename = "profile.bind")]
+    ProfileBind(ProfileBindParams),
+    /// Operator-only terminal binding revocation, without preview.
+    #[serde(rename = "profile.revoke")]
+    ProfileRevoke(crate::structured::profiles::bindings::transactions::RevokeRequest),
     /// Read-only binding metadata, redacted for non-operator callers.
     #[serde(rename = "profile.status")]
     ProfileStatus(EmptyParams),
@@ -554,10 +563,16 @@ impl Method {
             | Self::FleetResume(_)
             | Self::StructuredGrantsRevoke(_)
             | Self::ProfileEnable(_)
+            | Self::ProfilePlan(_)
+            | Self::ProfileBind(_)
+            | Self::ProfileRevoke(_)
             | Self::RevertRun(_) => true,
         }
     }
 }
+
+/// Binding commits use the same closed plan/digest shape as reviewed enablement.
+pub type ProfileBindParams = ProfileEnableParams;
 
 /// Reviewed enable transaction identifiers (ADR-0052 §9).
 ///
@@ -3123,6 +3138,12 @@ pub struct ApiListenerHealth {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResponseResult {
+    /// Operator review data or a durable binding mutation receipt.
+    ProfileTransaction {
+        /// Identifiers and reviewed metadata, never resolved credential bytes.
+        #[serde(flatten)]
+        data: serde_json::Value,
+    },
     /// Inactive binding state, containing no metadata for non-operator callers.
     ProfileStatus {
         /// Authorized operator fields; empty for other principals.

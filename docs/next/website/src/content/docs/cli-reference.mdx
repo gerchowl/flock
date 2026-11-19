@@ -691,6 +691,22 @@ The operator's global `msg list` is unchanged. Reads return only live entries fr
 a mixed expired/live batch, once; each expired entry emits one durable
 `dropped_undeliverable` event. Reading the projection does not submit another turn.
 
+Message read, list, wake, send and reply from a legacy pane whose caller identity
+cannot be attested return `caller_pane_unresolved` (CLI exit **1**, retry `never`).
+The diagnostic names the missing evidence, including a missing process birth after
+a pre-3.3 handoff. MCP returns JSON-RPC **-32000**, with
+`data.refusal: "caller_pane_unresolved"`, `data.exit: 1` and `data.retry: "never"`.
+Selecting `--pane` does not restore authority. Ask the operator to migrate the
+agent to a structured agent while resuming its harness session ([#3066](https://github.com/gerchowl/flock/issues/3066)).
+Until migration, the operator can read the inbox from their own interactive shell
+with `flk msg read --pane <id>`. The Stop hook gives one nonblocking notice naming
+these remedies and suppresses further inbox demands until authority recovers.
+Legacy panes stay fail-closed; automatic re-attestation is not performed.
+
+The same refusal applies to `msg mute` when `--pane` is omitted and the caller's
+pane cannot be attested. A refused mute neither sets nor clears the mute, and
+queued messages are not deferred.
+
 The stop-hook mail nudge names `flock_msg_read` and, if the MCP tool is unavailable, `flk msg read --pane <pane_id>` with the stopping pane’s ID filled in. Both read and consume the same inbox.
 
 `msg status` and `msg list` include `attempts`: local wake submission evidence with an attempt id, pane, correlation ids, timestamps, retry flag and reason. Attempts progress through `queued`, `typed` and `submit_sent` to `accepted`, `observed_accepted`, `unconfirmed` or `abandoned`. A genuine inbox read during verification (or after an unconfirmed wake) records `read`; a read before Enter cancels the pending submission. An accepted wake does not mean the inbox was read: a message still in an inbox on this server stays `queued` until a genuine read, whether it took the mesh path or the older local one. Explicit guarded-submit responses carry the same evidence. Mesh attempt queries read the custody store; older local attempts use an in-memory registry restored from the retained audit window. Both restore during boot and live handoff. The registry targets 4,096 entries, matching mailbox history: completed attempts are evicted oldest-first. Pending attempts are never evicted. An unconfirmed attempt stays protected while any of its correlated messages is queued in any local mailbox; once none remain queued (including after expiry or dropping), it becomes eligible for oldest-first eviction on the next submission. Unconfirmed explicit submissions with no correlated mail are also eligible. No additional attempt TTL is used. New submissions are refused with `delivery_attempt_capacity` only if all slots are still protected. Restoring older logs with more protected entries preserves them and refuses new submissions until capacity is available. Mesh attempt recovery is independent of audit retention; older local attempt recovery is limited to the retained log window. Interrupted attempts become `unconfirmed` with reason `server_restarted`, and their keys are never replayed. Older pre-mesh `relayed` records still mean transport handoff, not a read receipt. Unconfirmed and abandoned attempts also appear in the digest. The optional System One advisory is deferred to Clef (#714).

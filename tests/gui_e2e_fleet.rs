@@ -171,7 +171,19 @@ fn real_gui_two_nodes_online() {
     ];
     let fleet = fleet::spawn_with_startup_probe("gui", &specs, |fleet, name| {
         let node = fleet.node(name);
-        fs::write(node.home.join("gui-fleet.json"), "[]").unwrap();
+        let script = json!([
+            {"expect":"message", "text":"hello fixture"},
+            {"emit":"reply", "text":"hello from fixture"},
+            {"expect":"message", "text":"request permission"},
+            {"emit":"permission", "request_id":"gui-permission", "input":{"command":"true"}},
+            {"expect":"decision", "behavior":"allow"},
+            {"emit":"reply", "text":"permission accepted"}
+        ]);
+        fs::write(
+            node.home.join("gui-fleet.json"),
+            serde_json::to_vec(&script).unwrap(),
+        )
+        .unwrap();
         fs::create_dir(tools.0.join(name)).unwrap();
         let token = node.home.join("setup-token");
         fs::write(&token, "synthetic-gui-fixture-token").unwrap();

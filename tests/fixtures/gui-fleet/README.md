@@ -23,6 +23,8 @@ Write a JSON array to `$HOME/gui-fleet.json` before starting the server:
 
 Each step has exactly the documented fields. `message` checks the exact user
 text, extracting the body when the runtime supplies its nonce-delimited queue frame.
+With `--replay-user-messages`, the fixture echoes each accepted user envelope,
+including its UUID and original framed content, as the real harness does.
 `stream` emits and flushes each partial separately within an active turn.
 `permission` emits a Bash permission request but never executes its input.
 `decision` blocks on the matching request's response, with behavior `allow` or

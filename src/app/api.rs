@@ -2,6 +2,7 @@
 mod peer_uid_tests;
 #[cfg(test)]
 mod profile_tests;
+mod profiles;
 #[cfg(test)]
 mod scoped_mcp_tests;
 #[cfg(test)]
@@ -1489,6 +1490,9 @@ impl App {
         if matches!(
             request.method,
             Method::AgentStop(_)
+                | Method::ProfilePlan(_)
+                | Method::ProfileBind(_)
+                | Method::ProfileRevoke(_)
                 | Method::ProfileEnable(_)
                 | Method::AgentFork(_)
                 | Method::ServerStop(_)
@@ -1517,6 +1521,9 @@ impl App {
         let code = if matches!(
             request.method,
             Method::StructuredGrantsList(_)
+                | Method::ProfilePlan(_)
+                | Method::ProfileBind(_)
+                | Method::ProfileRevoke(_)
                 | Method::ProfileEnable(_)
                 | Method::StructuredGrantsRevoke(_)
                 | Method::ServerStop(_)
@@ -1631,6 +1638,11 @@ impl App {
         }
         let response = match request.method {
             Method::ProfileStatus(_) => unreachable!("status projected before relay dispatch"),
+            method @ (Method::ProfilePlan(_)
+            | Method::ProfileBind(_)
+            | Method::ProfileRevoke(_)) => {
+                return self.handle_profile_mutation(request.id, method);
+            }
             Method::ProfileEnable(_) => {
                 if !self.caller_is_local_operator() {
                     return responses::encode_error(
