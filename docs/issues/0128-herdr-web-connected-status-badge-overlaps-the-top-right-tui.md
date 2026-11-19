@@ -17,7 +17,7 @@ The web view's status badge is an HTML overlay pinned to the top-right *on top o
 ```css
 #status { position: fixed; top: 8px; right: 12px; ... z-index: 10; }
 ```
-(`pkgs/herdr-web/static/index.html:35-39`, in g-fleet)
+(`pkgs/herdr-web/static/index.html:35-39`, in the fleet configuration repo)
 
 herdr draws the server/repo header / sidebar in that same top-right region, so the badge covers it. It also never moves or hides after connecting — it sits there reading "connected" permanently.
 

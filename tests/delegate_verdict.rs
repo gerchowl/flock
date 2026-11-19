@@ -312,7 +312,7 @@ struct S1 {
     worker: Option<thread::JoinHandle<()>>,
 }
 
-// Kev answered with `answers` alone. Clef (since g-fleet#330) adds
+// Kev answered with `answers` alone. Clef adds
 // `model`, `usage`, a cache count and per-answer `type`, `choice` and
 // `confidence`. Only `answers` may matter to the client.
 #[derive(Clone, Copy)]

@@ -407,7 +407,7 @@ contain that exposure.
 
 ### 5. Hook inventory and disposition
 
-Inventory taken 2026-11-08 from the owner's claude-config checkout at
+Inventory taken 2026-11-08 from the owner's agent configuration checkout at
 `0f8d7d499c5c9b29b093957a8dd0814989fe28dc` (README and `hooks/`), the
 fleet-generated shared settings, and the local effective settings' hook entries.
 Only event/function identities are recorded here; deployment paths and identities

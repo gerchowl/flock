@@ -304,7 +304,7 @@ pub fn claude_resume_session_id(plan: &AgentResumePlan) -> Option<&str> {
 
 // --- Claude account-profile (CLAUDE_CONFIG_DIR) recall across a flk restart --
 //
-// `claude-auth <profile>` (the g-fleet account switcher) works by exporting
+// `claude-auth <profile>` (a fleet account switcher) works by exporting
 // `CLAUDE_CONFIG_DIR` into the interactive shell, so `claude` launched there
 // runs under that account. That env lives ONLY in that shell — but when flk
 // resumes an agent (server restart, reboot, hibernate/resume) it spawns a FRESH
@@ -484,10 +484,10 @@ mod tests {
 
         let sid = "session-round-trip";
         assert_eq!(claude_config_dir_for_session_in(&tmp, sid), None);
-        record_claude_config_dir_in(&tmp, sid, "/home/u/.claude-profiles/work");
+        record_claude_config_dir_in(&tmp, sid, "/home/u/.config/profile-a");
         assert_eq!(
             claude_config_dir_for_session_in(&tmp, sid).as_deref(),
-            Some("/home/u/.claude-profiles/work")
+            Some("/home/u/.config/profile-a")
         );
         // An empty config dir is never recorded, and junk ids never look up.
         record_claude_config_dir_in(&tmp, "blank", "");
@@ -821,7 +821,7 @@ mod tests {
             std::env::temp_dir().join(format!("flock-profile-{}-{nanos}", std::process::id()));
         let home = base.join("home");
         let records = base.join("records");
-        let profile = home.join(".claude-profiles/eth");
+        let profile = home.join(".config/profile-b");
         let profile_project = profile.join("projects/-tmp-repo");
         let default_project = home.join(".claude/projects/-tmp-repo");
         std::fs::create_dir_all(&profile_project).unwrap();

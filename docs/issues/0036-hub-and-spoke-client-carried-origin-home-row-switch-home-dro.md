@@ -23,7 +23,7 @@ First two-server dogfood: the full-mesh peer topology (every host lists every ot
 3. **`switch_home` keybind** (unset by default): same action without touching the sidebar.
 4. No reverse polling: while attached to a spoke you see the spoke's world + the home row. Live hub summaries inside the spoke view are explicitly out of scope (home is one keypress away).
 
-## Topology consequence (g-fleet side, after this lands)
+## Topology consequence (the fleet configuration repo side, after this lands)
 Only the hub generates [[peers]]; spokes get none. Spoke→hub inbound keys get dropped. Adding a server = one hub-side entry.
 
 ## Pitfalls
@@ -33,7 +33,7 @@ Only the hub generates [[peers]]; spokes get none. Spoke→hub inbound keys get 
 - Nested leaps (hub→atlas, then atlas's UI offers its own peers→kiln): origin should be the ORIGINAL hub, not the previous hop — pass-through, don't re-stamp.
 
 ## References
-#32/PR #34 (servers band v2 — the home row slots above the self row), peer federation PRs #18/#19, g-fleet mesh commit (to be partially reverted).
+#32/PR #34 (servers band v2 — the home row slots above the self row), peer federation PRs #18/#19, the fleet configuration repo mesh commit (to be partially reverted).
 
 ---
 
@@ -53,7 +53,7 @@ The switch handshake carries not just the origin label but the hub's **current f
 - Staleness: snapshot-at-switch, refreshed every leap. Deliberately NOT a live relay — that would require the client to hold dual connections (the fat-client trap).
 - The home row is then just the origin entry of the snapshot, pinned first.
 - Spoke-side: render-only; reuse the existing peer-row machinery fed from the handshake payload instead of the spoke's own pollers.
-- g-fleet consequence unchanged: only the hub generates [[peers]]; spokes none; spoke→hub inbound keys dropped.
+- the fleet configuration repo consequence unchanged: only the hub generates [[peers]]; spokes none; spoke→hub inbound keys dropped.
 
 ### gerchowl — 2026-06-11T06:32:30Z
 
@@ -63,5 +63,5 @@ The currently-attached machine's row in the servers band must be highlighted wit
 
 ### gerchowl — 2026-06-11T11:53:14Z
 
-Shipped across PR #39 (snapshot + home row + switch_home), #51 (spaces folding + server filter), #52 (attach retry #38 + theme port #47), #54/#55 (band medallion + state SSoT). Hub-and-spoke is the live topology; g-fleet generates hub-only peers.
+Shipped across PR #39 (snapshot + home row + switch_home), #51 (spaces folding + server filter), #52 (attach retry #38 + theme port #47), #54/#55 (band medallion + state SSoT). Hub-and-spoke is the live topology; the fleet configuration repo generates hub-only peers.
 

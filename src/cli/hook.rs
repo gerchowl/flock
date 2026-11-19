@@ -261,7 +261,7 @@ pub(super) fn run_hook_command(args: &[String]) -> std::io::Result<i32> {
             );
         }
     }
-    // The account profile the session is running under (g-fleet's claude-auth):
+    // The account profile the session is running under (an account switcher):
     // read here, at the IO edge, so `plan` stays a pure function of its inputs.
     let config_dir = env_nonempty("CLAUDE_CONFIG_DIR");
     let mut outcome = plan(
@@ -777,7 +777,7 @@ fn apply_wake_authority(
     if matches!(
         wake.pointer("/error/code")
             .and_then(serde_json::Value::as_str),
-        Some("not_authorized" | "inbox_not_owner")
+        Some("not_authorized" | "inbox_not_owner" | "caller_pane_unresolved")
     ) {
         outcome.stdout = None;
         let first = marker.parent().is_some_and(|parent| {
@@ -790,7 +790,7 @@ fn apply_wake_authority(
         });
         if first {
             outcome.stdout = Some(serde_json::json!({
-                "systemMessage": "Inbox authority unavailable for this process. Ask the operator to read this pane's inbox from their own interactive shell with `flk msg read --pane <pane-id>`. This does not restore agent authority; see #3000."
+                "systemMessage": "Inbox authority unavailable for this process. Ask the operator to read this pane's inbox from their own interactive shell with `flk msg read --pane <pane-id>`. For a legacy handoff pane, ask the operator to migrate this agent to a structured agent, resuming its harness session (#3066). Reading the inbox does not restore agent authority."
             }).to_string());
         }
     } else if wake.get("result").is_some() {
@@ -1033,7 +1033,11 @@ mod tests {
         let root =
             crate::structured::launch::SessionConfigDir::create(&std::env::temp_dir()).unwrap();
         let marker = root.path().join("notices").join("session");
-        for code in ["not_authorized", "inbox_not_owner"] {
+        for code in [
+            "not_authorized",
+            "inbox_not_owner",
+            "caller_pane_unresolved",
+        ] {
             let refused = json!({"error": {"code": code}});
             let mut outcome = HookOutcome {
                 stdout: mail_nudge(3, true, "p_1"),
@@ -1051,7 +1055,11 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("flk msg read"));
-            assert!(notice["systemMessage"].as_str().unwrap().contains("#3000"));
+            assert!(notice["systemMessage"].as_str().unwrap().contains("#3066"));
+            assert!(notice["systemMessage"]
+                .as_str()
+                .unwrap()
+                .contains("migrate"));
             for count in [0, 3] {
                 outcome.stdout = mail_nudge(count, true, "p_1");
                 apply_wake_authority(&mut outcome, &refused, &marker);
@@ -1714,11 +1722,11 @@ mod tests {
             "SessionStart",
             "p_1",
             0,
-            Some("/home/u/.claude-profiles/work"),
+            Some("/home/u/.config/profile-a"),
         );
         assert_eq!(
             out.config_dir_record,
-            Some(("sid-9".into(), "/home/u/.claude-profiles/work".into()))
+            Some(("sid-9".into(), "/home/u/.config/profile-a".into()))
         );
     }
 
@@ -1746,7 +1754,7 @@ mod tests {
             "",
             "p_1",
             0,
-            Some("/home/u/.claude-profiles/work"),
+            Some("/home/u/.config/profile-a"),
         )
         .config_dir_record
         .is_none());
