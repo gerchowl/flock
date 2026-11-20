@@ -7,13 +7,13 @@ use serde::{Deserialize, Serialize};
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(tag = "verb", content = "args")]
 pub enum AgentLifecycleCommand {
-    /// Fresh launch only; structured resume authority remains socket-only.
+    /// Fresh launch only; structured resume uses restart with operator app-session authority.
     #[serde(rename = "agent.start")]
     Start(AgentStartParams),
-    /// Preserve the backend's terminal-only restart contract.
+    /// Restart terminal agents, or resume structured agents with an operate app-session token.
     #[serde(rename = "agent.restart")]
     Restart(AgentRestartParams),
-    /// Preserve structured stop's independent operator identity boundary.
+    /// Stop a structured agent with an operate app-session token on its home node.
     #[serde(rename = "agent.stop")]
     Stop(AgentTarget),
 }
