@@ -294,15 +294,15 @@ through the remote fleet directory receives the same refusal, even without
 remains gated by ADR-0043.
 
 An authenticated replay of the same principal, command ID, verb and arguments
-returns the first lifecycle ack while that entry remains in the owner's bounded
-1,024-command retention set. Reusing a retained ID with different arguments or
-verb refuses `invalid_params`. Revocation and scope checks precede replay.
-An uncertain retry with `resume_only: true` and no retained result refuses
-`session_unconfirmed`; it never launches again. Retention is in memory and
-ends on server restart or eviction.
+returns the first lifecycle ack within the journal's 24-hour retention window.
+Reusing a retained ID with different arguments or verb refuses `invalid_params`. Revocation and scope checks precede replay.
+An uncertain retry with `resume_only: true` returns the first durable
+acknowledgement. An absent, expired, lost or recovered pending claim refuses
+`session_unconfirmed` and never launches again. Claims are retained for 24 hours;
+unexpired claims are never evicted.
 
 Core owns the command-journal lease and acquires it at handoff ownership commit,
-never during importer preparation. Each journal caller waits at most one second.
+never during importer preparation. Each ownership caller waits at most one second.
 A delayed or failed startup/commit acquisition leaves the server running with
 wire commands refused as audited `session_busy`. Background attempts retry every
 250 ms and reopen admission only after acquiring the lease and replaying.
@@ -311,9 +311,13 @@ The exporter closes wire admission before requesting a drain. Freeze and shutdow
 proceed after their one-second journal budget, logging pending write counts;
 abandoned I/O retains its exclusive lease until the worker actually stops.
 Rollback remains fenced while it reacquires and replays. A late drain cannot
-close a newer recovered owner. Live commands still use in-memory deduplication,
-so no wire acknowledgement is derived from abandoned journal writes in this
-phase. This ownership work does not enable durable command replay.
+close a newer recovered owner. Live commands claim their principal/command key
+durably before dispatch, then recheck current authorization under the token fence. Outcomes sync before
+acknowledgement; identical in-flight requests join and each waiter is
+reauthorized with its own credential. Completed outcomes replay after restart or
+handoff. Conflicting payloads refuse `invalid_params`; journal capacity or writer
+queue pressure returns audited `session_busy` before effects. Ownership phase
+changes fence earlier claim completions from dispatch.
 
 `agent.start` permits fresh launches through the existing server-side launch
 gates, including `structured_needs_agent_user`. It cannot resume a structured
@@ -331,8 +335,9 @@ or `agent.get` for confirmed `offline` state. Owner-side stop/restart decisions,
 including refusals and replays, log the requested `target`, resolved `agent_id`
 and `session_id` when known, authenticated `principal`, per-mint `app:<nonce>`
 credential identity, and outcome. Unresolved identities use empty ID fields.
-Generic ingress refusals (including version, command-ID and capacity checks)
-and queue-full refusals before owner dispatch retain their pre-existing audit gap.
+Authenticated ingress and owner refusals, including journal capacity and writer
+queue pressure, use the bounded `wire_refused` audit with the requesting
+credential's identity.
 
 The GUI's agent view and command palette offer **Stop agent** with a confirmation
 and **Restart agent** when the agent is offline. Restart resumes the existing

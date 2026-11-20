@@ -395,8 +395,8 @@ fn same_principal_command_id_is_fenced_across_sockets() {
         second.send(json!({"t":"cmd","cmd_id":"same-id","verb":"agent.decide","args":other,"resume_only":false})).await;
         refusal(
             case.ack(&mut second).await,
-            "session_unconfirmed",
-            crate::cli::exit::UNCONFIRMED,
+            "invalid_params",
+            crate::api::error_code::ErrorCode::InvalidParams.exit(),
         );
         assert_eq!(
             case.handles()
@@ -1160,3 +1160,5 @@ fn subscription_resource_refusal_and_invalid_probes_are_audited() {
 }
 
 mod ownership;
+
+mod durable;

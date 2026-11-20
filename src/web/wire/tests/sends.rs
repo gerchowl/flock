@@ -228,10 +228,7 @@ fn agent_send_fixture_ack_matches_one_durable_user_turn() {
         socket
             .send(send_script("agent-send", &case.queue.case.id))
             .await;
-        let refusal = case.ack(&mut socket).await;
-        assert_eq!(refusal["error"]["code"], "session_unconfirmed");
-        assert_eq!(refusal["error"]["exit"], crate::cli::exit::UNCONFIRMED);
-        assert_eq!(refusal["error"]["retry"], "later");
+        assert_eq!(case.ack(&mut socket).await, ack);
         let inputs: Vec<_> = case
             .events()
             .into_iter()
@@ -509,15 +506,12 @@ fn same_principal_command_id_is_fenced_across_sockets() {
         first
             .send(send_script("agent-send", &case.queue.case.id))
             .await;
-        assert_eq!(case.ack(&mut first).await["ok"], true);
+        let first_ack = case.ack(&mut first).await;
+        assert_eq!(first_ack["ok"], true);
         second
             .send(send_script("agent-send", &case.queue.case.id))
             .await;
-        refusal(
-            case.ack(&mut second).await,
-            "session_unconfirmed",
-            crate::cli::exit::UNCONFIRMED,
-        );
+        assert_eq!(case.ack(&mut second).await, first_ack);
         let journal = String::from_utf8(case.journal()).unwrap();
         let identities: std::collections::HashSet<String> = journal
             .lines()
@@ -858,7 +852,8 @@ fn app_remint_deduplicates_the_same_command_without_a_second_queue_effect() {
         first.hello(WIRE_JSON_VERSION, &a.0).await;
         let command = send_script("agent-send", &case.queue.case.id);
         first.send(command.clone()).await;
-        assert_eq!(case.ack(&mut first).await["ok"], true);
+        let first_ack = case.ack(&mut first).await;
+        assert_eq!(first_ack["ok"], true);
         case.queue
             .until(|r| {
                 let record = r.app.state.structured_agents.get(&r.case.id).unwrap().0;
@@ -878,10 +873,7 @@ fn app_remint_deduplicates_the_same_command_without_a_second_queue_effect() {
         let mut renewed = Socket::open(&case.server).await;
         renewed.hello(WIRE_JSON_VERSION, &b.0).await;
         renewed.send(command).await;
-        assert_eq!(
-            case.ack(&mut renewed).await["error"]["code"],
-            "session_unconfirmed"
-        );
+        assert_eq!(case.ack(&mut renewed).await, first_ack);
         assert_eq!(case.journal(), journal);
         assert_eq!(
             case.events()

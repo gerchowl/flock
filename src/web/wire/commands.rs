@@ -1,7 +1,5 @@
 //! Bounded app-owner command admission (ADR-0036 §5/§5a, S7-min slice 5).
 use super::*;
-// J1b2a owns the journal lease; command claims remain dormant until J1b2b.
-#[allow(dead_code)]
 mod journal;
 mod ownership;
 use crate::{
@@ -15,10 +13,7 @@ use crate::{
 };
 pub(super) use ownership::Ownership;
 use serde_json::Value;
-use std::{
-    collections::VecDeque,
-    sync::mpsc::{Receiver, TryRecvError},
-};
+use std::sync::mpsc::{Receiver, TryRecvError};
 use tokio::sync::{oneshot, Notify};
 /// Closed registry shared by wire admission and refusal budget normalization.
 pub(super) fn known_verb(verb: &str) -> Option<&'static str> {
@@ -33,9 +28,8 @@ pub(super) fn known_verb(verb: &str) -> Option<&'static str> {
 }
 /// Each command lane and the send receipt set have this fixed capacity.
 const CAPACITY: usize = 32;
-/// Completed principal/command keys retained in FIFO order; pending sends never evict.
-const COMMAND_IDS: usize = 1024;
 /// One decoded first-send command; identity and authority never come from args.
+#[derive(Clone)]
 pub(super) struct Command {
     pub(super) id: String,
     pub(super) verb: String,
@@ -57,27 +51,28 @@ pub(super) struct Client {
     gate: Arc<AtomicU64>,
 }
 type Receipt = Receiver<Result<AgentSendResult, ErrorCode>>;
-struct Pending {
-    command: Command,
-    session: Session,
-    key: (String, String),
-    // Shared core shutdown requires Sync; the app owner uses get_mut, never a blocking lock.
-    receipt: parking_lot::Mutex<Receipt>,
-    response: oneshot::Sender<ServerFrame>,
+enum Stage {
+    Claim(journal::Response),
+    Send(parking_lot::Mutex<Receipt>),
+    Finish(journal::Response),
 }
-struct Completed {
-    key: (String, String),
-    lifecycle: Option<(String, Value, Result<Value, ErrorCode>)>,
+struct Pending {
+    request: Request,
+    joined: Vec<Request>,
+    phase: u64,
+    admitted_ms: u64,
+    stage: Stage,
 }
 /// Only the app owner touches App, runtime permission books and send admission.
 pub(super) struct Owner {
     rx: [mpsc::Receiver<Request>; 2],
     gate: Arc<AtomicU64>,
-    completed: VecDeque<Completed>,
+    journal: Ownership,
     pending: Vec<Pending>,
 }
 /// Share the existing app-loop wake without introducing a second state owner.
-pub(super) fn channel(wake: Arc<Notify>, gate: Arc<AtomicU64>) -> (Client, Owner) {
+pub(super) fn channel(wake: Arc<Notify>, journal: Ownership) -> (Client, Owner) {
+    let gate = journal.gate();
     let (send, sends) = mpsc::channel(CAPACITY);
     let (decide, decisions) = mpsc::channel(CAPACITY);
     (
@@ -89,7 +84,7 @@ pub(super) fn channel(wake: Arc<Notify>, gate: Arc<AtomicU64>) -> (Client, Owner
         Owner {
             rx: [sends, decisions],
             gate,
-            completed: VecDeque::new(),
+            journal,
             pending: Vec::new(),
         },
     )
@@ -104,7 +99,6 @@ impl Client {
 enum Outcome {
     Queued(Receipt),
     Decided(Value),
-    Replayed(Result<Value, ErrorCode>),
 }
 fn dispatch(
     app: &mut App,
@@ -114,10 +108,6 @@ fn dispatch(
 ) -> Result<Outcome, ErrorCode> {
     if command.read_only {
         return Err(ErrorCode::ServerVersionGap);
-    }
-    // No durable command journal exists in S7-min; uncertain retries never dispatch.
-    if command.resume_only {
-        return Err(ErrorCode::SessionUnconfirmed);
     }
     dispatch_verb(app, command, principal, session)
 }
@@ -249,50 +239,191 @@ pub(super) fn ack(id: String, result: Result<Value, ErrorCode>) -> ServerFrame {
         error,
     }
 }
-impl Owner {
-    fn remember(
-        &mut self,
-        key: (String, String),
-        lifecycle: Option<(String, Value, Result<Value, ErrorCode>)>,
-    ) {
-        if self.completed.len() == COMMAND_IDS {
-            self.completed.pop_front();
-        }
-        self.completed.push_back(Completed { key, lifecycle });
+fn scope(command: &Command) -> Scope {
+    if lifecycle(&command.verb) {
+        Scope::Operate
+    } else if command.verb == "agent.decide" {
+        Scope::Answer
+    } else {
+        Scope::Send
     }
-    /// Revalidate under the token revocation lock through bounded admission.
-    /// Queue completion is polled separately; no model or stdin completion is awaited.
-    pub(super) fn service(&mut self, app: &mut App, shared: &Shared) {
-        let mut i = 0;
-        while i < self.pending.len() {
-            let result = match self.pending[i].receipt.get_mut().try_recv() {
-                Ok(result) => result,
-                Err(TryRecvError::Empty) => {
-                    i += 1;
-                    continue;
-                }
-                Err(TryRecvError::Disconnected) => Err(ErrorCode::InputWriteUnknown),
-            };
-            let pending = self.pending.swap_remove(i);
-            let result = result.and_then(|result| {
-                serde_json::to_value(result).map_err(|_| ErrorCode::SerializationError)
-            });
-            if let Err(code) = &result {
-                shared.refusals.record(
-                    shared.clock.now(),
-                    &pending.session.info,
-                    &pending.command.verb,
-                    &pending.command.args,
-                    *code,
-                );
-            }
-            self.remember(pending.key.clone(), None);
-            let _ = pending.response.send(ack(pending.key.1, result));
+}
+fn authorize<T>(
+    request: &Request,
+    apply: impl for<'a> FnOnce(permissions::auth::VerifiedToken<'a>) -> Result<T, ErrorCode>,
+) -> Result<T, ErrorCode> {
+    request
+        .store
+        .admit(&request.session, scope(&request.command), apply)
+        .unwrap_or_else(|error| {
+            Err(match error {
+                TokenError::Revoked | TokenError::Unauthorized => ErrorCode::AuthRevoked,
+                TokenError::Scope if lifecycle(&request.command.verb) => ErrorCode::NotAuthorized,
+                TokenError::Scope => ErrorCode::Scope,
+                TokenError::Busy => ErrorCode::SessionBusy,
+                TokenError::Unsafe | TokenError::Io(_) => ErrorCode::InternalError,
+            })
+        })
+}
+fn respond(request: Request, frame: ServerFrame, shared: &Shared, app: &App) {
+    let frame = match authorize(&request, |_| Ok(())) {
+        Ok(()) => frame,
+        Err(code) => ack(request.command.id.clone(), Err(code)),
+    };
+    let outcome = match &frame {
+        ServerFrame::Ack {
+            result: Some(value),
+            error: None,
+            ..
+        } => Ok(Outcome::Decided(value.clone())),
+        ServerFrame::Ack {
+            error: Some(error), ..
+        } => Err(ErrorCode::from_code(&error.code).unwrap_or(ErrorCode::InternalError)),
+        _ => Err(ErrorCode::InternalError),
+    };
+    trace_lifecycle(app, &request, &outcome);
+    if let ServerFrame::Ack {
+        error: Some(ref error),
+        ..
+    } = frame
+    {
+        if let Some(code) = ErrorCode::from_code(&error.code) {
+            shared.refusals.record(
+                shared.clock.now(),
+                &request.session.info,
+                &request.command.verb,
+                &request.command.args,
+                code,
+            );
         }
-        // Decisions have independent capacity even when every send receipt is pending.
+    }
+    let _ = request.response.send(frame);
+}
+fn trace_lifecycle(app: &App, request: &Request, outcome: &Result<Outcome, ErrorCode>) {
+    if lifecycle(&request.command.verb) {
+        let target = request
+            .command
+            .args
+            .get("target")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        // Registry context keeps refused decisions attributable without granting authority.
+        let identity = match outcome {
+            Ok(Outcome::Decided(value)) => value.get("agent").and_then(|agent| {
+                Some((
+                    agent.get("agent_id")?.as_str()?.to_owned(),
+                    agent.get("session_id")?.as_str()?.to_owned(),
+                ))
+            }),
+            _ => None,
+        }
+        .or_else(|| {
+            if target == "self" {
+                None
+            } else {
+                app.state
+                    .structured_agents
+                    .get(target)
+                    .map(|(record, _, _)| (record.agent_id.clone(), record.session_id.clone()))
+                    .or_else(|| {
+                        app.state
+                            .structured_agents
+                            .records()
+                            .into_iter()
+                            .find(|record| record.name.as_deref() == Some(target))
+                            .map(|record| (record.agent_id, record.session_id))
+                    })
+            }
+        });
+        let agent_id = identity
+            .as_ref()
+            .map(|(agent, _)| agent.clone())
+            .or_else(|| app.locate_agent(target).map(|location| location.agent_id))
+            .unwrap_or_default();
+        tracing::info!(
+            event = "wire.lifecycle.admission",
+            credential = request.session.info.name.as_str(),
+            principal = request.session.info.principal.as_str(),
+            target,
+            agent_id = agent_id.as_str(),
+            session_id = identity
+                .as_ref()
+                .map_or("", |(_, session)| session.as_str()),
+            verb = request.command.verb.as_str(),
+            cmd_id = request.command.id.as_str(),
+            outcome = outcome
+                .as_ref()
+                .map_or_else(|code| code.as_str(), |_| "admitted"),
+            "wire lifecycle admission"
+        );
+    }
+}
+impl Pending {
+    fn key(&self) -> (String, String, String) {
+        (
+            "local".into(),
+            self.request.session.info.principal.clone(),
+            self.request.command.id.clone(),
+        )
+    }
+    fn finish(
+        &mut self,
+        journal: &Ownership,
+        result: Result<Value, ErrorCode>,
+    ) -> Result<(), ErrorCode> {
+        self.stage = Stage::Finish(
+            journal
+                .submit(
+                    self.phase,
+                    journal::Operation::Finish {
+                        key: self.key(),
+                        admitted_ms: self.admitted_ms,
+                        result,
+                    },
+                )
+                .map_err(|_| ErrorCode::SessionUnconfirmed)?,
+        );
+        Ok(())
+    }
+    fn respond(self, frame: ServerFrame, shared: &Shared, app: &App) {
+        let expired = self.admitted_ms != 0
+            && crate::app::notifications::now_ms().saturating_sub(self.admitted_ms)
+                >= IDEMPOTENCY_WINDOW_MS;
+        for request in self.joined {
+            let frame = if expired {
+                ack(
+                    request.command.id.clone(),
+                    Err(if request.command.resume_only {
+                        ErrorCode::SessionUnconfirmed
+                    } else {
+                        ErrorCode::SessionBusy
+                    }),
+                )
+            } else {
+                frame.clone()
+            };
+            respond(request, frame, shared, app);
+        }
+        respond(self.request, frame, shared, app);
+    }
+}
+impl Owner {
+    #[cfg(test)]
+    pub(in crate::web::wire) fn queued_test(&self) -> usize {
+        self.rx.iter().map(mpsc::Receiver::len).sum()
+    }
+    /// Poll durable claims, effects and outcome sync without waiting on the writer.
+    pub(super) fn service(&mut self, app: &mut App, shared: &Shared) {
         for lane in [1, 0] {
             for _ in 0..CAPACITY {
-                if lane == 0 && self.pending.len() == CAPACITY {
+                if self
+                    .pending
+                    .iter()
+                    .filter(|p| usize::from(p.request.command.verb == "agent.decide") == lane)
+                    .map(|p| 1 + p.joined.len())
+                    .sum::<usize>()
+                    >= CAPACITY
+                {
                     break;
                 }
                 let Ok(request) = self.rx[lane].try_recv() else {
@@ -301,175 +432,140 @@ impl Owner {
                 if request.response.is_closed() {
                     continue;
                 }
-                let key = (
-                    request.session.info.principal.clone(),
-                    request.command.id.clone(),
-                );
-                let is_lifecycle = lifecycle(&request.command.verb);
-                let scope = if is_lifecycle {
-                    Scope::Operate
-                } else if lane == 1 {
-                    Scope::Answer
-                } else {
-                    Scope::Send
+                let phase = self.gate.load(Ordering::Acquire);
+                let admitted = authorize(&request, |_| {
+                    if phase & 1 == 0 {
+                        Err(ErrorCode::SessionBusy)
+                    } else if request.command.read_only {
+                        Err(ErrorCode::ServerVersionGap)
+                    } else {
+                        Ok(())
+                    }
+                });
+                if let Err(code) = admitted {
+                    let frame = ack(request.command.id.clone(), Err(code));
+                    respond(request, frame, shared, app);
+                    continue;
+                }
+                if let Some(pending) = self.pending.iter_mut().find(|p| {
+                    p.phase == phase
+                        && p.request.session.info.principal == request.session.info.principal
+                        && p.request.command.id == request.command.id
+                }) {
+                    if journal::digest(&pending.request.command)
+                        .and_then(|digest| {
+                            journal::digest(&request.command).map(|other| digest == other)
+                        })
+                        .unwrap_or(false)
+                    {
+                        pending.joined.push(request);
+                    } else {
+                        let frame = ack(request.command.id.clone(), Err(ErrorCode::InvalidParams));
+                        respond(request, frame, shared, app);
+                    }
+                    continue;
+                }
+                let operation = journal::Operation::Claim {
+                    namespace: "local".into(),
+                    principal: request.session.info.principal.clone(),
+                    command: request.command.clone(),
+                    now: crate::app::notifications::now_ms(),
                 };
-                // Only the owner mutates these sets; lookup need not hold the token lock.
-                let completed = self.completed.iter().find(|entry| entry.key == key);
-                let duplicate = completed.is_some() || self.pending.iter().any(|p| p.key == key);
-                let mut dispatched = false;
-                let outcome = request
-                    .store
-                    .admit(&request.session, scope, |token| {
-                        if self.gate.load(Ordering::Acquire) & 1 == 0 {
+                match self.journal.submit(phase, operation) {
+                    Ok(reply) => self.pending.push(Pending {
+                        request,
+                        joined: Vec::new(),
+                        phase,
+                        admitted_ms: 0,
+                        stage: Stage::Claim(reply),
+                    }),
+                    Err(code) => {
+                        let frame = ack(request.command.id.clone(), Err(code));
+                        respond(request, frame, shared, app);
+                    }
+                }
+            }
+        }
+        let mut i = 0;
+        while i < self.pending.len() {
+            let pending = &mut self.pending[i];
+            let completion = match &mut pending.stage {
+                Stage::Claim(reply) | Stage::Finish(reply) => match reply.try_recv() {
+                    Ok(result) => result,
+                    Err(oneshot::error::TryRecvError::Empty) => {
+                        i += 1;
+                        continue;
+                    }
+                    Err(oneshot::error::TryRecvError::Closed) => Err(ErrorCode::SessionUnconfirmed),
+                },
+                Stage::Send(receipt) => {
+                    let result = match receipt.get_mut().try_recv() {
+                        Ok(result) => result.and_then(|v| {
+                            serde_json::to_value(v).map_err(|_| ErrorCode::SerializationError)
+                        }),
+                        Err(TryRecvError::Empty) => {
+                            i += 1;
+                            continue;
+                        }
+                        Err(TryRecvError::Disconnected) => Err(ErrorCode::InputWriteUnknown),
+                    };
+                    match pending.finish(&self.journal, result) {
+                        Ok(()) => {
+                            i += 1;
+                            continue;
+                        }
+                        Err(code) => Err(code),
+                    }
+                }
+            };
+            let completion = match completion {
+                Ok(journal::Admission::Claimed(admitted_ms)) => {
+                    pending.admitted_ms = admitted_ms;
+                    let request = &pending.request;
+                    let outcome = authorize(request, |token| {
+                        if self.gate.load(Ordering::Acquire) != pending.phase {
                             return Err(ErrorCode::SessionBusy);
                         }
-                        if duplicate {
-                            if let Some((verb, args, result)) = completed
-                                .filter(|_| is_lifecycle)
-                                .and_then(|entry| entry.lifecycle.as_ref())
-                            {
-                                if verb != &request.command.verb || args != &request.command.args {
-                                    return Err(ErrorCode::InvalidParams);
-                                }
-                                return Ok(Outcome::Replayed(result.clone()));
-                            }
-                            return Err(ErrorCode::SessionUnconfirmed);
-                        }
-                        dispatched = true;
                         dispatch(
                             app,
                             &request.command,
                             &Principal::Token(token),
                             &request.session,
                         )
-                    })
-                    .unwrap_or_else(|error| {
-                        Err(match error {
-                            TokenError::Revoked | TokenError::Unauthorized => {
-                                ErrorCode::AuthRevoked
-                            }
-                            TokenError::Scope if is_lifecycle => ErrorCode::NotAuthorized,
-                            TokenError::Scope => ErrorCode::Scope,
-                            TokenError::Busy => ErrorCode::SessionBusy,
-                            TokenError::Unsafe | TokenError::Io(_) => ErrorCode::InternalError,
-                        })
                     });
-                if is_lifecycle {
-                    let target = request
-                        .command
-                        .args
-                        .get("target")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default();
-                    // Registry context keeps refused decisions attributable without granting authority.
-                    let identity = match &outcome {
-                        Ok(Outcome::Decided(value) | Outcome::Replayed(Ok(value))) => {
-                            value.get("agent").and_then(|agent| {
-                                Some((
-                                    agent.get("agent_id")?.as_str()?.to_owned(),
-                                    agent.get("session_id")?.as_str()?.to_owned(),
-                                ))
-                            })
+                    let result = match outcome {
+                        Ok(Outcome::Queued(receipt)) => {
+                            pending.stage = Stage::Send(parking_lot::Mutex::new(receipt));
+                            i += 1;
+                            continue;
                         }
-                        _ => None,
-                    }
-                    .or_else(|| {
-                        if target == "self" {
-                            None
-                        } else {
-                            app.state
-                                .structured_agents
-                                .get(target)
-                                .map(|(record, _, _)| {
-                                    (record.agent_id.clone(), record.session_id.clone())
-                                })
-                                .or_else(|| {
-                                    app.state
-                                        .structured_agents
-                                        .records()
-                                        .into_iter()
-                                        .find(|record| record.name.as_deref() == Some(target))
-                                        .map(|record| (record.agent_id, record.session_id))
-                                })
+                        Ok(Outcome::Decided(value)) => Ok(value),
+                        Err(code) => Err(code),
+                    };
+                    match pending.finish(&self.journal, result) {
+                        Ok(()) => {
+                            i += 1;
+                            continue;
                         }
-                    });
-                    let agent_id = identity
-                        .as_ref()
-                        .map(|(agent, _)| agent.clone())
-                        .or_else(|| app.locate_agent(target).map(|location| location.agent_id))
-                        .unwrap_or_default();
-                    tracing::info!(
-                        event = "wire.lifecycle.admission",
-                        credential = request.session.info.name.as_str(),
-                        principal = request.session.info.principal.as_str(),
-                        target,
-                        agent_id = agent_id.as_str(),
-                        session_id = identity
-                            .as_ref()
-                            .map_or("", |(_, session)| session.as_str()),
-                        verb = request.command.verb.as_str(),
-                        cmd_id = request.command.id.as_str(),
-                        outcome = outcome.as_ref().map_or_else(
-                            |code| code.as_str(),
-                            |value| {
-                                match value {
-                                    Outcome::Replayed(Err(code)) => code.as_str(),
-                                    _ => "admitted",
-                                }
-                            }
-                        ),
-                        "wire lifecycle admission"
-                    );
-                }
-                if let Some(code) = match &outcome {
-                    Err(code) | Ok(Outcome::Replayed(Err(code))) => Some(*code),
-                    _ => None,
-                } {
-                    shared.refusals.record(
-                        shared.clock.now(),
-                        &request.session.info,
-                        &request.command.verb,
-                        &request.command.args,
-                        code,
-                    );
-                }
-                match outcome {
-                    Ok(Outcome::Queued(receipt)) => self.pending.push(Pending {
-                        command: request.command,
-                        session: request.session,
-                        key,
-                        receipt: parking_lot::Mutex::new(receipt),
-                        response: request.response,
-                    }),
-                    Ok(Outcome::Decided(value)) => {
-                        let cached = is_lifecycle.then(|| {
-                            (
-                                request.command.verb.clone(),
-                                request.command.args.clone(),
-                                Ok(value.clone()),
-                            )
-                        });
-                        self.remember(key, cached);
-                        let _ = request.response.send(ack(request.command.id, Ok(value)));
-                    }
-                    Ok(Outcome::Replayed(result)) => {
-                        let _ = request.response.send(ack(request.command.id, result));
-                    }
-                    Err(code) => {
-                        if is_lifecycle && dispatched {
-                            self.remember(
-                                key,
-                                Some((
-                                    request.command.verb.clone(),
-                                    request.command.args.clone(),
-                                    Err(code),
-                                )),
-                            );
-                        }
-                        let _ = request.response.send(ack(request.command.id, Err(code)));
+                        Err(code) => Err(code),
                     }
                 }
-            }
+                Ok(journal::Admission::Pending(admitted_ms)) => {
+                    pending.admitted_ms = admitted_ms;
+                    Err(ErrorCode::SessionUnconfirmed)
+                }
+                other => other,
+            };
+            let pending = self.pending.swap_remove(i);
+            let frame = match completion {
+                Ok(journal::Admission::Replayed(frame)) => frame,
+                Err(code) => ack(pending.request.command.id.clone(), Err(code)),
+                _ => ack(
+                    pending.request.command.id.clone(),
+                    Err(ErrorCode::SessionUnconfirmed),
+                ),
+            };
+            pending.respond(frame, shared, app);
         }
     }
 }

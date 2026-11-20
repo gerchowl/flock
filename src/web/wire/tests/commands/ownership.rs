@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn rollback_reopens_wire_admission_before_effect_and_keeps_claims_dormant() {
+fn rollback_reopens_wire_admission_before_effect_and_persists_outcome() {
     runtime(async {
         let mut case = Case::new(183170).await;
         let args = case.prompt().await;
@@ -23,12 +23,12 @@ fn rollback_reopens_wire_admission_before_effect_and_keeps_claims_dormant() {
             true
         );
         case.until(|r| r.handles().len() == 1).await;
-        assert_eq!(
+        assert!(
             fs::metadata(case.server._root.path().join("wire/commands.jsonl"))
                 .unwrap()
-                .len(),
-            0,
-            "J1b2a owns the journal but live commands do not consult it"
+                .len()
+                > 0,
+            "live admission must persist its claim and outcome"
         );
         case.stop().await;
     });
