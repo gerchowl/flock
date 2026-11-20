@@ -126,7 +126,7 @@ fn run(args: &[String]) -> std::io::Result<CommandOutcome> {
     if command == "client"
         && !matches!(
             args.get(2).map(String::as_str),
-            Some("token" | "open" | "help" | "--help" | "-h")
+            Some("token" | "grant" | "open" | "help" | "--help" | "-h")
         )
     {
         return Ok(CommandOutcome::NotCli);

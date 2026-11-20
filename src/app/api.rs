@@ -1537,6 +1537,9 @@ impl App {
                 | Method::ServerLiveHandoff(_)
                 | Method::SessionRetainedList(_)
                 | Method::SessionRetainedPurge(_)
+                | Method::ClientGrantAdd(_)
+                | Method::ClientGrantList(_)
+                | Method::ClientGrantRevoke(_)
                 | Method::ClientTokenAdd(_)
                 | Method::ClientTokenRemove(_)
                 | Method::ClientTokenList(_)
@@ -1790,7 +1793,10 @@ impl App {
                 return self.handle_delegate_rebind(request.id, params)
             }
             Method::MsgSend(params) => return self.handle_msg_send(request.id, params),
-            Method::ClientTokenAdd(_)
+            Method::ClientGrantAdd(_)
+            | Method::ClientGrantList(_)
+            | Method::ClientGrantRevoke(_)
+            | Method::ClientTokenAdd(_)
             | Method::ClientTokenRemove(_)
             | Method::ClientTokenList(_)
             | Method::ClientOpen(_)

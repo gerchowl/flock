@@ -7,6 +7,7 @@ pub(crate) mod deadline;
 pub(crate) mod error_code;
 mod event_hub;
 mod events_read;
+pub mod gateway_grants;
 pub(crate) mod peer_discovery;
 pub mod question;
 pub mod queue_event;
