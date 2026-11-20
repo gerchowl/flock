@@ -44,15 +44,20 @@ impl App {
             model: params.model,
             profiles: params.profiles,
         };
-        if let Err(code) = self.record_owner_event(EventEnvelope {
+        if let Err(error) = self.record_owner_event(EventEnvelope {
             event: EventKind::OwnerBound,
             data: EventData::OwnerBound {
                 binding: binding.clone(),
                 reissued: false,
             },
         }) {
-            return encode_error(id, code.as_str(),
-                "owner audit unavailable; repair audit storage and restart the server before retrying");
+            return encode_error(
+                id,
+                error
+                    .code(crate::api::error_code::ErrorCode::AuditUnavailable)
+                    .as_str(),
+                error.to_string(),
+            );
         }
         encode_success(
             id,
@@ -70,14 +75,19 @@ impl App {
         let Some(binding) = self.owners.get(&params.repo).cloned() else {
             return not_bound(id, &params.repo);
         };
-        if let Err(code) = self.record_owner_event(EventEnvelope {
+        if let Err(error) = self.record_owner_event(EventEnvelope {
             event: EventKind::OwnerUnbound,
             data: EventData::OwnerUnbound {
                 repo: binding.repo.clone(),
             },
         }) {
-            return encode_error(id, code.as_str(),
-                "owner audit unavailable; repair audit storage and restart the server before retrying");
+            return encode_error(
+                id,
+                error
+                    .code(crate::api::error_code::ErrorCode::AuditUnavailable)
+                    .as_str(),
+                error.to_string(),
+            );
         }
         encode_success(id, ResponseResult::OwnerUnbound { binding })
     }

@@ -90,12 +90,17 @@ impl App {
                 policy_version: located.current.clone(),
                 reissued: false,
             };
-            if let Err(code) = self.record_owner_event(EventEnvelope {
+            if let Err(error) = self.record_owner_event(EventEnvelope {
                 event: EventKind::OwnerPolicyAdopted,
                 data,
             }) {
-                return encode_error(id, code.as_str(),
-                    "owner audit unavailable; repair audit storage and restart the server before retrying");
+                return encode_error(
+                    id,
+                    error
+                        .code(crate::api::error_code::ErrorCode::AuditUnavailable)
+                        .as_str(),
+                    error.to_string(),
+                );
             }
         }
         match owner_policy::report(&located, self.owner_policies.get(&repo)) {

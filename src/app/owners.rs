@@ -80,12 +80,11 @@ impl App {
     pub(crate) fn record_owner_event(
         &mut self,
         event: EventEnvelope,
-    ) -> Result<(), crate::api::error_code::ErrorCode> {
+    ) -> Result<(), crate::api::RequiredAuditError> {
         self.event_hub
             .try_push_durable(event.clone())
-            .map_err(|error| {
+            .inspect_err(|error| {
                 crate::logging::event_log_write_failed(&error.to_string());
-                crate::api::error_code::ErrorCode::AuditUnavailable
             })?;
         self.owners.apply(&event.data);
         self.owner_policies.apply(&event.data);
@@ -195,6 +194,211 @@ mod tests {
             binding,
             reissued: false,
         }
+    }
+
+    /// Start at each public verb and rebuild state from reopened journal files.
+    #[tokio::test]
+    async fn audit_failures_reconstruct_only_committed_mutations() {
+        use crate::api::{error_code::ErrorCode, AuditFault};
+        use crate::owner_policy::test_fixture::{path, Fixture};
+        let fixture = Fixture::new(
+            "owner-audit-replay",
+            r#"[owner.standup]
+time = "09:00"
+"#,
+        );
+        let version = fixture.upstream_blob();
+        for fault in [
+            AuditFault::PartialWrite,
+            AuditFault::FileSync,
+            AuditFault::DirectorySync,
+            AuditFault::Rollback,
+        ] {
+            for rotate in [false, true] {
+                for verb in ["bind", "rebind", "unbind", "policy", "delegate"] {
+                    let log = temp_log("owner-audit-replay");
+                    let hub = EventHub::with_persistence(log.clone());
+                    let mut app = app_on(hub.clone());
+                    let agent = caller_is_an_agent(&mut app);
+                    app.current_api_peer_pid = Some(std::process::id());
+                    app.current_api_peer_birth =
+                        Some(crate::platform::process_start_time(std::process::id()));
+                    let checkout = checkout(&log);
+                    let before = (verb != "bind").then(|| bind(&mut app, bind_params(&checkout)).0);
+                    let policy_request =
+                        Method::OwnerPolicyAdopt(crate::api::schema::OwnerPolicyParams {
+                            repo: path(&fixture.clone).into(),
+                            policy_version: Some(version.clone()),
+                        });
+                    let delegate_request: Method = serde_json::from_value(serde_json::json!({
+                        "method":"delegate.rebind", "params":{"name":"fixture", "agent_id":agent, "previous_agent_id":null}
+                    })).unwrap();
+                    let mut params = bind_params(&checkout);
+                    params.harness = OwnerHarness::Codex;
+                    let request = match verb {
+                        "bind" | "rebind" => Method::OwnerBind(params),
+                        "unbind" => Method::OwnerUnbind(OwnerRepoParams { repo: REPO.into() }),
+                        "policy" => policy_request.clone(),
+                        "delegate" => delegate_request.clone(),
+                        _ => unreachable!(),
+                    };
+                    let before_bytes = std::fs::read(&log).unwrap();
+                    let before_count = hub.persisted_events_after(0).len();
+                    let before_cursor = hub.current_sequence();
+                    if rotate {
+                        hub.rotate_on_next_push();
+                    }
+                    hub.fail_audit_for_test(fault);
+                    let uncertain = fault == AuditFault::Rollback;
+                    let expected = if uncertain {
+                        "audit_indeterminate"
+                    } else if verb == "delegate" {
+                        "delegate_audit_unavailable"
+                    } else {
+                        "audit_unavailable"
+                    };
+                    let response = call(&mut app, request.clone());
+                    assert_eq!(
+                        response["error"]["code"], expected,
+                        "{verb} {fault:?} rotate={rotate}: {response}"
+                    );
+                    assert!(response.get("result").is_none());
+                    assert_eq!(app.owners.get(REPO), before.as_ref());
+                    let shown = call(
+                        &mut app,
+                        Method::OwnerPolicyShow(crate::api::schema::OwnerPolicyParams {
+                            repo: path(&fixture.clone).into(),
+                            policy_version: None,
+                        }),
+                    );
+                    assert!(shown["result"]["adopted"].is_null(), "{shown}");
+                    if uncertain {
+                        assert!(response["error"]["message"]
+                            .as_str()
+                            .unwrap()
+                            .contains("may or may not take effect after restart"));
+                        assert_eq!(
+                            ErrorCode::AuditIndeterminate.retry().as_str(),
+                            "after_inspecting"
+                        );
+                        assert_eq!(
+                            ErrorCode::AuditIndeterminate.exit(),
+                            crate::cli::exit::REQUEST_OUTCOME_UNKNOWN
+                        );
+                        for later in [
+                            request,
+                            Method::OwnerBind(bind_params(&checkout)),
+                            policy_request,
+                            delegate_request,
+                        ] {
+                            let response = call(&mut app, later);
+                            assert_eq!(
+                                response["error"]["code"], "audit_indeterminate",
+                                "{response}"
+                            );
+                        }
+                    } else {
+                        assert_eq!(call(&mut app, request)["error"]["code"], expected);
+                        assert_eq!(
+                            std::fs::read(&log).unwrap(),
+                            if rotate { vec![] } else { before_bytes.clone() }
+                        );
+                        if rotate {
+                            assert_eq!(
+                                std::fs::read(log.with_file_name("event-log.1.jsonl")).unwrap(),
+                                before_bytes
+                            );
+                        }
+                    }
+                    assert_eq!(hub.rotations(), u64::from(rotate));
+                    assert_eq!(app.owners.get(REPO), before.as_ref());
+                    assert!(!hub
+                        .events_after(before_cursor)
+                        .unwrap_or_default()
+                        .iter()
+                        .any(|(_, e)| matches!(
+                            e.event,
+                            EventKind::OwnerBound
+                                | EventKind::OwnerUnbound
+                                | EventKind::OwnerPolicyAdopted
+                                | EventKind::DelegateRebindAuthorized
+                        )));
+
+                    shutdown(app);
+                    drop(hub);
+                    let hub = EventHub::with_persistence(log.clone());
+                    let history = hub.persisted_events_after(0);
+                    assert_eq!(
+                        history.len(),
+                        before_count + usize::from(uncertain),
+                        "{verb} {fault:?} rotate={rotate}"
+                    );
+                    assert_eq!(
+                        history
+                            .iter()
+                            .filter(|(_, _, e)| e.event == EventKind::DelegateRebindAuthorized)
+                            .count(),
+                        usize::from(uncertain && verb == "delegate")
+                    );
+                    let mut app = app_on(hub.clone());
+                    app.reissue_open_records();
+                    let owner = app.owners.get(REPO);
+                    match (uncertain, verb) {
+                        (true, "bind" | "rebind") => {
+                            assert_eq!(owner.unwrap().harness, OwnerHarness::Codex)
+                        }
+                        (true, "unbind") => assert!(owner.is_none()),
+                        _ => assert_eq!(owner, before.as_ref()),
+                    }
+                    let shown = call(
+                        &mut app,
+                        Method::OwnerPolicyShow(crate::api::schema::OwnerPolicyParams {
+                            repo: path(&fixture.clone).into(),
+                            policy_version: None,
+                        }),
+                    );
+                    if uncertain && verb == "policy" {
+                        assert_eq!(shown["result"]["adopted"]["policy_version"], version);
+                        assert_eq!(shown["result"]["policy"]["standup"]["time"], "09:00");
+                    } else {
+                        assert!(shown["result"]["adopted"].is_null(), "{shown}");
+                    }
+                    app.current_api_peer_pid = Some(std::process::id());
+                    assert!(call(&mut app, Method::OwnerBind(bind_params(&checkout)))
+                        .get("result")
+                        .is_some());
+                    shutdown(app);
+                    drop(hub);
+                    std::fs::remove_dir_all(log.parent().unwrap()).unwrap();
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn refused_unbind_never_reappears_on_restart_after_directory_repair() {
+        let log = temp_log("owner-refusal-restart");
+        let mut app = app_on(EventHub::with_persistence(log.clone()));
+        app.current_api_peer_pid = Some(std::process::id());
+        let (before, _) = bind(&mut app, bind_params(&checkout(&log)));
+        let relocated = log.parent().unwrap().with_extension("relocated");
+        std::fs::rename(log.parent().unwrap(), &relocated).unwrap();
+        let refused = call(
+            &mut app,
+            Method::OwnerUnbind(OwnerRepoParams { repo: REPO.into() }),
+        );
+        assert_eq!(refused["error"]["code"], "audit_unavailable");
+        shutdown(app);
+        std::fs::rename(&relocated, log.parent().unwrap()).unwrap();
+        let mut app = app_on(EventHub::with_persistence(log.clone()));
+        app.reissue_open_records();
+        assert_eq!(
+            app.owners.get(REPO),
+            Some(&before),
+            "a refused unbind must not replay"
+        );
+        shutdown(app);
+        std::fs::remove_dir_all(log.parent().unwrap()).unwrap();
     }
 
     #[tokio::test]
