@@ -972,6 +972,11 @@ fn lifecycle_structured_token_refusals_preserve_journal() {
         for (verb, args, code) in [
             ("agent.stop", json!({"target":id}), "operator_only"),
             (
+                "agent.stop",
+                json!({"target":id,"source":"app","scopes":["operate"]}),
+                "operator_only",
+            ),
+            (
                 "agent.restart",
                 json!({"target":id,"reason":"fixture restart"}),
                 "runtime_unsupported",

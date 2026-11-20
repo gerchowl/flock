@@ -1540,6 +1540,15 @@ Duplicate native placements or invalid layout membership make `agent.get` and
 `agent.focus` refuse with `internal_error` without changing the layout.
 
 
+Structured socket resume continues to use `agent.start` with an existing agent
+identity and operator authority. The wire `agent.restart` command additionally
+allows an operator app-session token with `operate` to resume a stopped
+structured agent on its home node through the same launch funnel, preserving
+its session ID. Wire structured stop uses the same app-session authority.
+File tokens retain their existing refusals. See
+[wire lifecycle commands](./structured-wire-minimal.mdx#agent-lifecycle-commands)
+for admission, asynchronous stop completion and typed refusals.
+
 ### Queue item lifecycle facts
 
 `queue_item_state` is a durable, local event emitted after an existing queue

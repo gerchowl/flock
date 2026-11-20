@@ -303,14 +303,31 @@ ends on server restart or eviction.
 
 `agent.start` permits fresh launches through the existing server-side launch
 gates, including `structured_needs_agent_user`. It cannot resume a structured
-record: that receives `operator_only`. Structured `agent.stop` also receives
-`operator_only`; structured `agent.restart` retains the socket backend's
-`runtime_unsupported` refusal. The socket API also refuses PTY `agent.stop`
-with `runtime_unsupported`; the wire preserves that behavior. These refusals
-preserve the session and journal.
+record: that receives `operator_only`.
+
+An operator app-session token with `operate` may stop a structured agent or
+restart a stopped structured agent on its home node. Restart resumes the same
+agent and session ID through the socket structured-resume funnel, including
+run-as, recovery and spawn admission. An active worker refuses replacement with
+`session_busy`; uncertain recovery state refuses `structured_recovery_required`.
+`continue_with` is unsupported for structured
+restart; `when` must be `after_turn` and `reason` must be nonempty plain text
+of at most 1,024 bytes. Stop requests asynchronous cleanup; inspect `agent.list`
+or `agent.get` for confirmed `offline` state. Owner-side stop/restart decisions,
+including refusals and replays, log the requested `target`, resolved `agent_id`
+and `session_id` when known, authenticated `principal`, per-mint `app:<nonce>`
+credential identity, and outcome. Unresolved identities use empty ID fields.
+Generic ingress refusals (including version, command-ID and capacity checks)
+and queue-full refusals before owner dispatch retain their pre-existing audit gap.
+
+File credentials retain `operator_only` for structured stop and
+`runtime_unsupported` for structured restart, even with `operate`. Tokens
+without `operate` receive `not_authorized`. Agent callers and mesh relays gain
+no resume authority. The socket API still refuses PTY `agent.stop` with
+`runtime_unsupported`; the wire preserves that behavior.
 [ADR-0036 §1a](https://github.com/gerchowl/flock/blob/dev/docs/adr/0036-structured-agent-sessions.md#1a-identity-and-the-operator-boundary-for-structured-agents)
-reserves structured resume and stop authority independently of token scope.
-ADR-0052 slice 21 and a future authority amendment govern GUI structured controls.
+defines the app-session authority boundary. ADR-0052 slice 17 will add profile
+admission at the shared socket/wire entry for profile-bound execution.
 
 ## New agent picker
 
