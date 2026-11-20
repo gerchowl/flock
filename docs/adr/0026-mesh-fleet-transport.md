@@ -680,6 +680,15 @@ never a silent drop and never an unacknowledged skip. The receiver:
 4. closes and resets the session, which returns to the long refusal backoff
    after the reconnect, and shows the reason in `flk peers`.
 
+The mesh wire requires object-form envelopes and envelope-bearing records
+(`Deliver`, `OutboundCollect`, and `OutboundAck`). Sequence-form structs are
+`mesh_protocol_violation`, including sequences used for enclosing records or
+for optional receipt envelopes. The single kind gate enforces these object
+boundaries before decoding or importing any batch. An explicit `kind` must be
+a string; serde enum-map aliases and other tag representations are violations.
+An absent object tag still means `message`. Optional `receipt: null` means no
+envelope, and the collection result's string receipt token remains a token.
+
 `mesh_protocol_violation` is a new error code in the `after_handoff` retry
 class in `src/api/error_code.rs`; the held edge uses the long refusal backoff.
 

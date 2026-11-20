@@ -495,4 +495,41 @@ mod tests {
                 .starts_with("mesh_protocol_violation:"));
         }
     }
+
+    #[tokio::test]
+    async fn sequence_forms_and_invalid_tags_reset_the_inbound_session() {
+        let _guard = crate::config::test_config_env_guard();
+        let _store = TestStore::new();
+        for (payload, deliver) in crate::mesh::version_gate::tests::noncanonical_payloads() {
+            let mut app = app();
+            let pid = std::process::id();
+            let mut status = app
+                .inbound
+                .edge(Some(pid), crate::platform::process_start_time)
+                .unwrap()
+                .enrollment
+                .clone();
+            status.peer = "peer.test".into();
+            status.node_id = Some("peer.test".into());
+            status.state = "pinned".into();
+            status.negotiated = Some(5);
+            app.inbound
+                .enroll(pid, status, crate::platform::process_start_time)
+                .unwrap();
+            let response = app.handle_mesh_payload("probe".into(), payload.clone(), deliver);
+            let response: Value = serde_json::from_str(&response).unwrap();
+            assert_eq!(
+                response["error"]["code"], "mesh_protocol_violation",
+                "{payload}: {response}"
+            );
+            assert!(response.get("result").is_none());
+            let edge = app
+                .inbound
+                .edge(Some(pid), crate::platform::process_start_time)
+                .unwrap();
+            assert!(!edge.enrolled(), "{payload}");
+            assert_eq!(edge.enrollment.negotiated, None);
+            assert_eq!(edge.enrollment.state, "refused");
+        }
+    }
 }

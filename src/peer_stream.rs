@@ -1791,28 +1791,55 @@ mod negotiation_tests {
 
     #[test]
     fn real_old_acceptor_enrolls_a_new_dialer_at_five_without_report() {
-        old_acceptor(false, None, None);
+        old_acceptor(false, None, None, None);
     }
 
     #[test]
     fn old_acceptor_refusal_names_pre_negotiation_peer_and_is_permanent() {
-        old_acceptor(true, None, None);
+        old_acceptor(true, None, None, None);
     }
 
     #[test]
     fn unknown_kind_refuses_whole_response_and_holds_edge_in_long_backoff() {
-        old_acceptor(false, Some("mesh.collect"), None);
-        old_acceptor(false, Some("peers.summary"), None);
+        old_acceptor(false, Some("mesh.collect"), None, None);
+        old_acceptor(false, Some("peers.summary"), None, None);
     }
 
     #[test]
     fn ranged_acceptor_reply_tampering_is_refused_permanently() {
         for attack in ["minimum", "report", "disagreement"] {
-            old_acceptor(false, None, Some(attack));
+            old_acceptor(false, None, Some(attack), None);
         }
     }
 
-    fn old_acceptor(version_six: bool, query: Option<&'static str>, attack: Option<&'static str>) {
+    #[test]
+    fn sequence_forms_reset_the_outbound_session_without_acknowledging() {
+        for (payload, deliver) in crate::mesh::version_gate::tests::noncanonical_payloads() {
+            if deliver {
+                old_acceptor(
+                    false,
+                    Some("mesh.collect"),
+                    None,
+                    Some(json!({"result":{"answers":[{"envelope":{}},payload]}})),
+                );
+            }
+        }
+        old_acceptor(
+            false,
+            Some("mesh.deliver"),
+            None,
+            Some(
+                json!({"error":{"code":"mesh_delivery_refused","data":{"receipt":crate::mesh::version_gate::tests::sequence_envelope()}}}),
+            ),
+        );
+    }
+
+    fn old_acceptor(
+        version_six: bool,
+        query: Option<&'static str>,
+        attack: Option<&'static str>,
+        response: Option<Value>,
+    ) {
         let _guard = crate::config::test_config_env_guard();
         let _store = TestStore::new();
         reset_enrollment("old.test");
@@ -1832,6 +1859,7 @@ mod negotiation_tests {
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
         let (tx, lines) = std::sync::mpsc::channel();
+        let noncanonical = response.is_some();
         let fixture = std::thread::spawn(move || {
             let key = SigningKey::from_bytes(&[22; 32]);
             let acceptor = legacy::offer(&key, "old.test");
@@ -1898,11 +1926,8 @@ mod negotiation_tests {
                 let query: Value =
                     serde_json::from_str(&requests.next().unwrap().unwrap()).unwrap();
                 assert_eq!(query["method"], method);
-                tx.send(
-                    json!({"result":{"answers":[{"envelope":{}}, {"envelope":{"kind":"future"}}]}})
-                        .to_string(),
-                )
-                .unwrap();
+                let response = response.unwrap_or_else(|| json!({"result":{"answers":[{"envelope":{}}, {"envelope":{"kind":"future"}}]}}));
+                tx.send(response.to_string()).unwrap();
             }
         });
         let (_done_tx, stderr_done) = std::sync::mpsc::channel();
@@ -1939,8 +1964,9 @@ mod negotiation_tests {
             }
             let error = result.unwrap_err();
             assert!(error.starts_with("mesh_protocol_violation:"), "{error}");
-            assert!(error.contains("future"), "{error}");
+            assert!(noncanonical || error.contains("future"), "{error}");
             assert_eq!(enrollment(&peer).state, "refused");
+            assert_eq!(enrollment(&peer).negotiated, None);
             let slots = registry().lock().unwrap();
             let slot = slots[&peer.name].lock().unwrap();
             assert!(slot.stream.is_none());

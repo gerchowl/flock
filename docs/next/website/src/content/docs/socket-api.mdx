@@ -569,6 +569,14 @@ For terminal recipients, `msg.send` queues a message for another pane's agent. D
 
 Message acceptance commits to the mesh custody store before returning a `message_key` containing `origin_node` and a server-minted ULID `message_id`. Correlation IDs remain caller-selected conversation labels: two accepted sends with the same correlation ID have distinct message keys.
 
+Mesh envelopes and the records that carry them (`Deliver`, `OutboundCollect`,
+and `OutboundAck`) require JSON object form. Sequence-form structs, including
+enclosing records and optional receipt envelopes, cause
+`mesh_protocol_violation`: the entire batch remains unacknowledged and the
+session resets. Explicit envelope `kind` tags must be strings; an absent tag
+means `message`, and enum-map aliases are refused. Optional `receipt: null`
+means no envelope. The collection result's string receipt token is unchanged.
+
 `mesh.deliver` takes a `Deliver` object with these fields:
 
 | Field | Meaning |
