@@ -1662,9 +1662,9 @@ that other processes could read its operator credential, and offer explicit
 remote pairing or administrator-enabled `ptrace_scope ≥ 1`. G9a owns that
 native check and fallback presentation; there is no silent fallback.
 
-Authenticated structured-wire ingress and enqueue-capacity refusals emit
+Every authenticated structured-wire refusal (commands, subscriptions and protocol) emits
 best-effort `wire_refused` events through the event hub. See the
 [structured wire refusal audit contract](../structured-wire-minimal/#refusal-audit-events)
 for fields, exact suppression summaries, the shared 60-second per-key/global
-budgets, and the limits at capacity, restart and journal failure. These
-no-effect refusals do not use the required-audit mutation fence.
+budgets, graceful shutdown flushing, and the limits at capacity, crash and
+journal failure. Refusal reporting does not replace required mutation audits.

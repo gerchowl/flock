@@ -1,4 +1,4 @@
-//! Best-effort evidence for authenticated commands refused before dispatch.
+//! Best-effort evidence for every authenticated wire refusal.
 use super::*;
 use crate::api::{
     error_code::ErrorCode,
@@ -6,12 +6,10 @@ use crate::api::{
     EventHub,
 };
 use std::collections::BTreeMap;
-
 const WINDOW: Duration = Duration::from_secs(60);
 const KEYS: usize = 64;
 const PER_KEY: u64 = 8;
 const GLOBAL: u64 = 128;
-
 type Key = (String, &'static str, &'static str);
 struct Entry {
     emitted: u64,
@@ -24,20 +22,23 @@ struct State {
     emitted: u64,
     overflow: u64,
 }
-/// One server-wide fixed 60-second window, shared by ingress and queue races.
-/// Emit at most eight refusals per (authenticated principal, registered verb,
-/// typed reason), 128 individual events globally, and retain at most 64 keys.
-/// Unknown verbs share `unknown`. Keys never evict before window expiry.
-/// Excess requests for resident keys count toward one per-key summary, unless
-/// the global budget is exhausted, when they join the exact overflow total.
-/// Nonresident keys beyond either cap also join that single aggregate summary.
-/// Summaries are outside the individual-event budget (at most 65 per window).
-/// Tick or the next request closes the window, including idle-key summaries.
-/// Restart/handoff resets budgets and loses pending suppression counts.
-/// No refusal has an effect to fence: use best-effort `EventHub::push`, whose
-/// storage failures may degrade to memory-only, never required-audit admission.
-/// Unauthenticated traffic has no attributable principal and emits no events,
-/// avoiding an unauthenticated journal-amplification path.
+/// One server-wide fixed 60-second window for authenticated wire refusals.
+/// Eight individual events per (principal, closed verb, typed reason), at most
+/// 64 resident keys and 128 individual events globally. Unknown commands share
+/// `unknown`; control categories are sub, unsub, ping, pong and protocol.
+/// Keys never evict within a window. Resident suppression gets one exact
+/// per-key summary unless the global budget is exhausted; new keys beyond
+/// either cap and globally suppressed requests join one exact overflow total.
+/// At most 65 summaries are reserved outside the individual-event budget.
+/// Tick/next refusal closes expired windows; graceful shutdown flushes the
+/// current partial window after draining connections. Crash loses pending
+/// counts; restart/handoff starts fresh budgets.
+/// Decisions and event construction hold the limiter mutex; publication never
+/// does. Best-effort `EventHub::push` may block its caller on journal I/O or
+/// degrade to memory-only, but cannot hold up concurrent limiter decisions.
+/// Refusals have no effect to fence, so required-audit admission is inappropriate.
+/// Pre-authentication failures have no verified identity and stay unaudited to
+/// avoid an unauthenticated journal-amplification path.
 pub(super) struct Refusals(Mutex<State>);
 impl Refusals {
     pub(super) fn new(now: Instant) -> Self {
@@ -52,62 +53,165 @@ impl Refusals {
     pub(super) fn attach(&self, hub: EventHub) {
         self.0.lock().unwrap_or_else(|e| e.into_inner()).hub = hub;
     }
+    fn publish(&self, decide: impl FnOnce(&mut State) -> Vec<EventEnvelope>) {
+        let (hub, events) = {
+            let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            (state.hub.clone(), decide(&mut state))
+        };
+        for event in events {
+            hub.push(event);
+        }
+    }
     pub(super) fn tick(&self, now: Instant) {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).roll(now);
+        self.publish(|s| s.roll(now, false));
+    }
+    pub(super) fn flush(&self, now: Instant) {
+        self.publish(|s| s.roll(now, true));
     }
     pub(super) fn record(
         &self,
         now: Instant,
-        session: &crate::api::client_tokens::TokenInfo,
+        info: &crate::api::client_tokens::TokenInfo,
         verb: &str,
         args: &serde_json::Value,
         reason: ErrorCode,
     ) {
-        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        state.roll(now);
         let verb = commands::known_verb(verb).unwrap_or("unknown");
-        let key = (session.principal.clone(), verb, reason.as_str());
-        if state.emitted >= GLOBAL
-            || (!state.entries.contains_key(&key) && state.entries.len() == KEYS)
+        self.reason(now, info, verb, args, reason.as_str());
+    }
+    pub(super) fn control(
+        &self,
+        now: Instant,
+        info: &crate::api::client_tokens::TokenInfo,
+        verb: &'static str,
+        reason: ErrorCode,
+    ) {
+        self.reason(now, info, verb, &serde_json::Value::Null, reason.as_str());
+    }
+    fn reason(
+        &self,
+        now: Instant,
+        info: &crate::api::client_tokens::TokenInfo,
+        verb: &'static str,
+        args: &serde_json::Value,
+        reason: &'static str,
+    ) {
+        self.publish(|s| s.decide(now, info, verb, args, reason));
+    }
+    pub(super) fn subscription_revoked(
+        &self,
+        now: Instant,
+        info: &crate::api::client_tokens::TokenInfo,
+        stream: &str,
+    ) {
+        self.reason(
+            now,
+            info,
+            "sub",
+            &serde_json::json!({"target":stream}),
+            ErrorCode::AuthRevoked.as_str(),
+        );
+    }
+    pub(super) fn subscription(
+        &self,
+        now: Instant,
+        info: &crate::api::client_tokens::TokenInfo,
+        stream: &str,
+        code: Option<&SubfailCode>,
+    ) {
+        let reason = match code {
+            Some(SubfailCode::InvalidAgent) => "invalid_agent",
+            Some(SubfailCode::CursorAhead) => "cursor_ahead",
+            Some(SubfailCode::OperatorOnly) => "operator_only",
+            Some(SubfailCode::UnknownStream) => "unknown_stream",
+            Some(SubfailCode::Scope) => "scope",
+            Some(SubfailCode::SessionBusy) => "session_busy",
+            Some(SubfailCode::SubIdReused) => "sub_id_reused",
+            None => "internal_error",
+        };
+        self.reason(
+            now,
+            info,
+            "sub",
+            &serde_json::json!({"target":stream}),
+            reason,
+        );
+    }
+    pub(super) fn malformed(
+        &self,
+        now: Instant,
+        info: &crate::api::client_tokens::TokenInfo,
+        frame: &serde_json::Value,
+    ) {
+        let verb = match frame["t"].as_str() {
+            Some("cmd") => commands::known_verb(frame["verb"].as_str().unwrap_or("unknown"))
+                .unwrap_or("unknown"),
+            Some("sub") => "sub",
+            Some("unsub") => "unsub",
+            Some("ping") => "ping",
+            Some("pong") => "pong",
+            _ => "protocol",
+        };
+        self.reason(
+            now,
+            info,
+            verb,
+            frame.get("args").unwrap_or(frame),
+            ErrorCode::InvalidParams.as_str(),
+        );
+    }
+}
+impl State {
+    fn decide(
+        &mut self,
+        now: Instant,
+        info: &crate::api::client_tokens::TokenInfo,
+        verb: &'static str,
+        args: &serde_json::Value,
+        reason: &'static str,
+    ) -> Vec<EventEnvelope> {
+        let mut events = self.roll(now, false);
+        let key = (info.principal.clone(), verb, reason);
+        if self.emitted >= GLOBAL
+            || (!self.entries.contains_key(&key) && self.entries.len() == KEYS)
         {
-            state.overflow += 1;
-            return;
+            self.overflow += 1;
+            return events;
         }
-        let entry = state.entries.entry(key.clone()).or_insert_with(|| Entry {
+        let entry = self.entries.entry(key.clone()).or_insert_with(|| Entry {
             emitted: 0,
             suppressed: 0,
         });
         if entry.emitted == PER_KEY {
             entry.suppressed += 1;
-            return;
+            return events;
         }
         entry.emitted += 1;
-        state.emitted += 1;
-        state.hub.push(EventEnvelope {
+        self.emitted += 1;
+        events.push(EventEnvelope {
             event: EventKind::WireRefused,
             data: EventData::WireRefused {
                 principal: Some(key.0),
-                token_id: Some(session.name.clone()),
+                token_id: Some(info.name.clone()),
                 verb: Some(verb.into()),
-                target: args
-                    .get("target")
-                    .and_then(serde_json::Value::as_str)
-                    .or_else(|| args.get("agent").and_then(serde_json::Value::as_str))
+                target: ["target", "agent", "stream"]
+                    .iter()
+                    .find_map(|key| args.get(key).and_then(serde_json::Value::as_str))
                     .map(|s| s.chars().take(256).collect()),
-                reason: Some(reason.as_str().into()),
+                reason: Some(reason.into()),
                 suppressed: 0,
             },
         });
+        events
     }
-}
-impl State {
-    fn roll(&mut self, now: Instant) {
-        if now.saturating_duration_since(self.start) < WINDOW {
-            return;
+    fn roll(&mut self, now: Instant, force: bool) -> Vec<EventEnvelope> {
+        let mut events = Vec::new();
+        if !force && now.saturating_duration_since(self.start) < WINDOW {
+            return events;
         }
         for ((principal, verb, reason), entry) in std::mem::take(&mut self.entries) {
             if entry.suppressed > 0 {
-                self.hub.push(EventEnvelope {
+                events.push(EventEnvelope {
                     event: EventKind::WireRefused,
                     data: EventData::WireRefused {
                         principal: Some(principal),
@@ -121,7 +225,7 @@ impl State {
             }
         }
         if self.overflow > 0 {
-            self.hub.push(EventEnvelope {
+            events.push(EventEnvelope {
                 event: EventKind::WireRefused,
                 data: EventData::WireRefused {
                     principal: None,
@@ -136,9 +240,9 @@ impl State {
         self.start = now;
         self.emitted = 0;
         self.overflow = 0;
+        events
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,13 +285,16 @@ mod tests {
         for n in 0..1000 {
             record(&audit, now, "fixture-principal", &format!("unknown-{n}"));
         }
+        for verb in ["sub", "unsub", "ping", "pong", "protocol"] {
+            record(&audit, now, "fixture-principal", verb);
+        }
         assert_eq!(audit.0.lock().unwrap().entries.len(), 1);
         assert_eq!(events(&audit).len(), PER_KEY as usize);
         audit.tick(now + WINDOW);
         audit.tick(now + WINDOW);
         let events = events(&audit);
         assert_eq!(events.len(), PER_KEY as usize + 1);
-        assert_eq!(events.last().unwrap()["suppressed"], 1000 - PER_KEY);
+        assert_eq!(events.last().unwrap()["suppressed"], 1005 - PER_KEY);
         assert_eq!(events.last().unwrap()["verb"], "unknown");
         assert!(events.last().unwrap()["token_id"].is_null());
     }
@@ -300,5 +407,42 @@ mod tests {
             PER_KEY as usize + 1
         );
         assert!(EventKind::WireRefused.is_persisted());
+    }
+    #[test]
+    fn blocked_push_does_not_block_concurrent_refusal_decision() {
+        let audit = Arc::new(Refusals::new(Instant::now()));
+        let now = Instant::now();
+        for _ in 0..PER_KEY {
+            record(&audit, now, "saturated", "agent.send");
+        }
+        let hub = EventHub::default();
+        let (entered, started) = std::sync::mpsc::channel();
+        let (release, resume) = std::sync::mpsc::channel();
+        hub.before_push_for_test(move || {
+            entered.send(()).unwrap();
+            resume
+                .recv_timeout(Duration::from_secs(5))
+                .expect("blocked writer was not released");
+        });
+        audit.attach(hub);
+        let first = audit.clone();
+        let writer = std::thread::spawn(move || record(&first, now, "writer", "agent.send"));
+        started
+            .recv_timeout(Duration::from_secs(5))
+            .expect("writer never reached push");
+        let second = audit.clone();
+        let (finished, decision) = std::sync::mpsc::channel();
+        let decider = std::thread::spawn(move || {
+            record(&second, now, "saturated", "agent.send");
+            finished.send(()).unwrap();
+        });
+        let result = decision.recv_timeout(Duration::from_secs(1));
+        release.send(()).unwrap();
+        writer.join().unwrap();
+        decider.join().unwrap();
+        assert!(
+            result.is_ok(),
+            "journal push held the refusal decision lock"
+        );
     }
 }

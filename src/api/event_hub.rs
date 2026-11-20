@@ -13,10 +13,15 @@ struct PersistedEvent {
     envelope: EventEnvelope,
 }
 
+#[cfg(all(test, feature = "web"))]
+type PushHook = std::sync::Arc<std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>>;
+
 #[derive(Clone, Default)]
 pub struct EventHub {
     reply_waiters: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, usize>>>,
     inner: std::sync::Arc<std::sync::Mutex<EventHubState>>,
+    #[cfg(all(test, feature = "web"))]
+    before_push: PushHook,
     /// The newest sequence pushed, behind its own lock so a waiter can sleep
     /// on it (#438). Kept apart from `inner` because a condvar pairs with ONE
     /// mutex, and `inner` is held across disk writes — a waiter must never
@@ -450,6 +455,10 @@ impl Drop for ReplyWaitGuard {
 }
 
 impl EventHub {
+    #[cfg(all(test, feature = "web"))]
+    pub(crate) fn before_push_for_test(&self, hook: impl FnOnce() + Send + 'static) {
+        *self.before_push.lock().unwrap() = Some(Box::new(hook));
+    }
     pub(crate) fn track_reply_wait(&self, correlation: &str) -> ReplyWaitGuard {
         if let Ok(mut waiters) = self.reply_waiters.lock() {
             *waiters.entry(correlation.into()).or_default() += 1;
@@ -630,6 +639,10 @@ impl EventHub {
     }
 
     pub fn push(&self, event: EventEnvelope) {
+        #[cfg(all(test, feature = "web"))]
+        if let Some(hook) = self.before_push.lock().unwrap().take() {
+            hook();
+        }
         let Ok(mut state) = self.inner.lock() else {
             return;
         };

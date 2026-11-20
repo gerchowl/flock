@@ -261,7 +261,7 @@ impl Core {
         self.shared.refusals.attach(app.event_hub.clone());
         self.shared.refusals.tick(self.shared.clock.now());
         self.admission.service(app);
-        self.command_owner.service(app);
+        self.command_owner.service(app, &self.shared);
     }
     /// Stop and drain every transport lease even when app revocation fails.
     /// Revocation and lease draining each have a five-second caller budget.
@@ -294,6 +294,7 @@ impl Core {
         .await
         .map(|_| ())
         .map_err(io::Error::other);
+        self.shared.refusals.flush(self.shared.clock.now());
         revocation.and(drained)
     }
 }
@@ -712,11 +713,21 @@ async fn connection(
             frame = stream.next() => match frame {
                 Some(Ok(Message::Text(text))) => match serde_json::from_str(&text) {
                     Ok(ClientFrame::Ping { nonce }) => {
+                        let reason = if timing::valid_nonce(&nonce) { crate::api::error_code::ErrorCode::SessionBusy } else { crate::api::error_code::ErrorCode::InvalidParams };
                         if let Some(reply) = output::probe(nonce, &probe_slots) {
-                            if priority.try_send(reply).is_err() { break unavailable("control_capacity"); }
+                            if priority.try_send(reply).is_err() {
+                                shared.refusals.control(shared.clock.now(), &session.info, "ping", crate::api::error_code::ErrorCode::SessionBusy);
+                                break unavailable("control_capacity");
+                            }
+                        } else {
+                            shared.refusals.control(shared.clock.now(), &session.info, "ping", reason);
                         }
                     }
-                    Ok(ClientFrame::Pong { nonce }) => heartbeat.pong(&nonce, shared.clock.now()),
+                    Ok(ClientFrame::Pong { nonce }) => {
+                        if !heartbeat.pong(&nonce, shared.clock.now()) {
+                            shared.refusals.control(shared.clock.now(), &session.info, "pong", crate::api::error_code::ErrorCode::InvalidParams);
+                        }
+                    },
                     Ok(ClientFrame::Sub { sub_id, stream, after }) => {
                         if !subscriptions.subscribe(sub_id, stream, after) { break unavailable("subscription_capacity") }
                     }
@@ -743,12 +754,22 @@ async fn connection(
                         }
                         running.spawn(commands::execute(shared.clone(), session.clone(), data.clone(), commands::Command { id: cmd_id, verb, args, resume_only, read_only }));
                     }
-                    _ => break POLICY_VIOLATION_CLOSE,
+                    _ => {
+                        let frame = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
+                        shared.refusals.malformed(shared.clock.now(), &session.info, &frame);
+                        break POLICY_VIOLATION_CLOSE;
+                    },
                 },
-                Some(Ok(Message::Binary(_))) => break POLICY_VIOLATION_CLOSE,
+                Some(Ok(Message::Binary(_))) => {
+                    shared.refusals.malformed(shared.clock.now(), &session.info, &serde_json::Value::Null);
+                    break POLICY_VIOLATION_CLOSE;
+                },
                 Some(Ok(Message::Ping(_) | Message::Pong(_))) => (),
                 Some(Ok(Message::Close(_))) => break unavailable("peer_close"),
-                Some(Err(_)) => break unavailable("peer_transport"),
+                Some(Err(_)) => {
+                    shared.refusals.control(shared.clock.now(), &session.info, "protocol", crate::api::error_code::ErrorCode::InternalError);
+                    break unavailable("peer_transport");
+                },
                 None => break unavailable("peer_eof"),
             }
         }

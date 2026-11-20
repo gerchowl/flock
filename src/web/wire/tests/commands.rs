@@ -958,3 +958,203 @@ fn ingress_flood_is_summarized_by_owner_tick_without_another_request() {
         case.stop().await;
     });
 }
+
+#[test]
+fn review_shutdown_flushes_suppressed() {
+    runtime(async {
+        let mut case = Case::new(315903).await;
+        case.service();
+        let mut socket = case.open().await;
+        for n in 0..20 {
+            assert_eq!(
+                case.command(&mut socket, &format!("unknown-{n}"), json!({}))
+                    .await["error"]["code"],
+                "server_version_gap"
+            );
+        }
+        case.server.core.shutdown().await.unwrap();
+        let events: Vec<Value> = case
+            .app
+            .event_hub
+            .events_after(0)
+            .unwrap()
+            .into_iter()
+            .map(|(_, e)| serde_json::to_value(e).unwrap())
+            .filter(|e| e["event"] == "wire_refused")
+            .collect();
+        assert_eq!(events.len(), 9);
+        assert_eq!(events.last().unwrap()["data"]["suppressed"], 12);
+        assert_eq!(events.last().unwrap()["data"]["verb"], "unknown");
+        case.stop().await;
+    });
+}
+
+#[test]
+fn review_scope_refusal_is_audited() {
+    runtime(async {
+        let mut case = Case::new(315904).await;
+        case.service();
+        let mut socket = case.open().await;
+        case.scopes(json!(["read"]));
+        let ack = case
+            .command(
+                &mut socket,
+                "agent.decide",
+                json!({"agent":"fixture-agent"}),
+            )
+            .await;
+        assert_eq!(ack["error"]["code"], "scope");
+        let events = case.app.event_hub.events_after(0).unwrap();
+        assert!(
+            events.into_iter().any(|(_, e)| {
+                let v = serde_json::to_value(e).unwrap();
+                v["event"] == "wire_refused" && v["data"]["reason"] == "scope"
+            }),
+            "authenticated scope refusal produced no audit event"
+        );
+        case.stop().await;
+    });
+}
+
+fn refusal_events(case: &Case) -> Vec<Value> {
+    case.app
+        .event_hub
+        .events_after(0)
+        .unwrap()
+        .into_iter()
+        .map(|(_, event)| serde_json::to_value(event).unwrap())
+        .filter(|event| event["event"] == "wire_refused")
+        .map(|event| event["data"].clone())
+        .collect()
+}
+
+#[test]
+fn owner_parse_resume_and_cached_refusals_are_each_audited() {
+    runtime(async {
+        let mut case = Case::new(315905).await;
+        case.service();
+        let mut socket = case.open().await;
+        let args = json!({"target":"fixture-agent"});
+        let parsed = case
+            .command(&mut socket, "agent.decide", args.clone())
+            .await;
+        assert_eq!(parsed["error"]["code"], "invalid_params");
+        socket.send(json!({"t":"cmd","cmd_id":"resume","verb":"agent.send","args":args,"resume_only":true})).await;
+        assert_eq!(
+            case.ack(&mut socket).await["error"]["code"],
+            "session_unconfirmed"
+        );
+        for _ in 0..2 {
+            socket.send(json!({"t":"cmd","cmd_id":"cached","verb":"agent.stop","args":{"target":"fixture-agent"},"resume_only":false})).await;
+            assert_eq!(case.ack(&mut socket).await["ok"], false);
+        }
+        let events = refusal_events(&case);
+        assert_eq!(events.len(), 4);
+        assert_eq!(events[0]["reason"], "invalid_params");
+        assert_eq!(events[1]["reason"], "session_unconfirmed");
+        assert_eq!(events[2]["reason"], events[3]["reason"]);
+        assert_eq!(events[2]["verb"], "agent.stop");
+        for event in events {
+            assert_eq!(event["token_id"], "one");
+            assert_eq!(event["target"], "fixture-agent");
+        }
+        case.stop().await;
+    });
+}
+
+#[test]
+fn subscription_refusals_preserve_identity_target_and_typed_reason() {
+    runtime(async {
+        let mut case = Case::new(315906).await;
+        case.service();
+        let mut socket = case.open().await;
+        for (id, reason) in [("missing", "unknown_stream"), ("missing", "sub_id_reused")] {
+            socket
+                .send(json!({"t":"sub","sub_id":id,"stream":"unsupported-stream","after":null}))
+                .await;
+            let Received::Text(frame) = case.frame(&mut socket).await else {
+                panic!("subscription ended without refusal")
+            };
+            assert_eq!(frame["t"], "subfail");
+            assert_eq!(frame["code"], reason);
+        }
+        case.scopes(json!(["send"]));
+        socket
+            .send(json!({"t":"sub","sub_id":"scope","stream":"fleet","after":null}))
+            .await;
+        let Received::Text(frame) = case.frame(&mut socket).await else {
+            panic!("scope refusal missing")
+        };
+        assert_eq!(frame["code"], "scope");
+        let events = refusal_events(&case);
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0]["reason"], "unknown_stream");
+        assert_eq!(events[1]["reason"], "sub_id_reused");
+        assert_eq!(events[2]["reason"], "scope");
+        assert_eq!(events[2]["target"], "fleet");
+        for event in events {
+            assert_eq!(event["verb"], "sub");
+            assert_eq!(event["token_id"], "one");
+        }
+        case.stop().await;
+    });
+}
+
+#[test]
+fn authenticated_malformed_frames_are_audited_with_parsed_context() {
+    runtime(async {
+        let mut case = Case::new(315907).await;
+        case.service();
+        let mut socket = case.open().await;
+        socket
+            .send(json!({"t":"cmd","verb":"agent.send","args":{"target":"fixture-agent"}}))
+            .await;
+        assert!(matches!(
+            socket.receive().await,
+            Received::Close(POLICY_VIOLATION_CLOSE)
+        ));
+        let events = refusal_events(&case);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["reason"], "invalid_params");
+        assert_eq!(events[0]["verb"], "agent.send");
+        assert_eq!(events[0]["target"], "fixture-agent");
+        let mut binary = case.open().await;
+        binary.raw(b"untrusted content", 0x82).await;
+        assert!(matches!(
+            binary.receive().await,
+            Received::Close(POLICY_VIOLATION_CLOSE)
+        ));
+        let events = refusal_events(&case);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1]["verb"], "protocol");
+        assert!(events[1]["target"].is_null());
+        case.stop().await;
+    });
+}
+
+#[test]
+fn subscription_resource_refusal_and_invalid_probes_are_audited() {
+    runtime(async {
+        let mut case = Case::new(315908).await;
+        case.service();
+        let mut socket = case.open().await;
+        socket.send(json!({"t":"ping","nonce":""})).await;
+        socket.send(json!({"t":"pong","nonce":"unmatched"})).await;
+        socket
+            .send(json!({"t":"sub","sub_id":"x".repeat(129),"stream":"fleet","after":null}))
+            .await;
+        assert!(matches!(
+            socket.receive().await,
+            Received::Close(GOING_AWAY_CLOSE)
+        ));
+        let events = refusal_events(&case);
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0]["verb"], "ping");
+        assert_eq!(events[1]["verb"], "pong");
+        assert_eq!(events[2]["verb"], "sub");
+        for event in events {
+            assert_eq!(event["reason"], "invalid_params");
+        }
+        case.stop().await;
+    });
+}

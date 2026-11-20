@@ -373,18 +373,32 @@ existing protocol-close rules for malformed frames or invalid session traffic.
 
 ### Refusal audit events
 
-Authenticated `cmd` refusals at ingress (unknown verb, read-only connection,
-invalid command ID, socket concurrency or lane capacity) and a full lane during
-command enqueue produce best-effort `wire_refused` events in the server event
-hub, available through the socket event APIs. Every supported command uses the
-same refusal path. Existing command responses and retry classes are unchanged.
+Every authenticated wire request refusal produces a best-effort `wire_refused`
+event through the server event hub and socket event APIs. This includes command
+ingress, owner admission (scope, revocation and capacity), argument validation,
+dispatch, replay/resume refusals, cached failed outcomes and failed input
+receipts. The owner records command failures before sending the reply, including
+when the reply's reader has disconnected. Full or closed enqueue lanes are
+recorded at enqueue. Existing responses, uncertainty and retry classes stay
+unchanged; an audited error does not prove an uncertain input had no effect.
 
-The event data has `type: "wire_refused"`, authenticated `principal`, public
+Subscription auditing covers identity/length/capacity rejection, reused IDs,
+read authorization, unknown or invalid streams, cursor/replay failures and
+storage unavailability. Authenticated JSON/framing/binary protocol refusals and
+ignored invalid or excess JSON probes are also recorded. Idempotent unsubscribe,
+normal disconnect and idle liveness expiry are not refused requests.
+
+The event data has `type: "wire_refused"`, verified `principal`, public
 `token_id` (file-token name or per-mint app-session label), normalized `verb`,
-`target` when parsed from `args.target` or `args.agent` (first 256 Unicode
-characters), registered error-code `reason`, and `suppressed: 0`. Bearer secrets,
-command contents and raw unknown verbs are never recorded. Unknown verbs all
-normalize to `unknown`, including in the budget key.
+parsed `target` (first 256 Unicode characters), typed `reason`, and
+`suppressed: 0`. Targets come from `args.target`, `args.agent` or the subscription
+`stream`. Reasons use registered command error codes or the closed subscription
+refusal codes. Malformed frames use `invalid_params`; transport/framing read
+errors use `internal_error`. Known command verbs keep
+their names; unknown commands all normalize to `unknown`. Control categories
+are `sub`, `unsub`, `ping`, `pong`, and `protocol` (when no request verb can be
+parsed). Bearer secrets, command bodies, nonces and raw unknown verbs are never
+recorded.
 
 One server-wide monotonic 60-second window permits eight individual events per
 `(principal, verb, reason)`, with at most 64 resident keys and 128 individual
@@ -399,15 +413,18 @@ and within the global budget. Shared operator principals share budgets across
 tokens; summaries do not claim attribution to one of those tokens.
 
 Summaries use the same event kind and are outside the individual-event budget:
-at most 65 summaries and 128 individual events per window. The app-owner tick
-or the next refusal closes an expired window, so idle floods also get a
-summary without another request. Delayed ticks delay summaries; shutdown,
-handoff and restart discard pending counts and reset budgets. No global
-lifetime or cross-server rate guarantee is provided.
+at most 65 summaries and 128 individual events per window. The owner tick or
+next refusal closes an expired window, including idle keys. Graceful shutdown
+drains connections and flushes the current partial window's exact suppression
+counts; repeated shutdown does not repeat summaries. A crash or abrupt owner
+drop can lose pending counts. Restart and handoff start fresh budgets; there is
+no global lifetime or cross-server rate guarantee.
 
-These refusals have no effect to fence, so events use best-effort
-`EventHub::push`, rather than the required-audit primitive for mutations. Journal
-failure can degrade to memory-only events; refusal responses never depend on
-audit durability. Unauthenticated refusals remain unchanged and emit no
-per-request events: they lack a verified principal and must not provide an
-unauthenticated journal-amplification path.
+The limiter decides and constructs events under its mutex, then releases that
+mutex before `EventHub::push`. Journal I/O can still block a publishing caller,
+but never holds the limiter lock across I/O or prevents concurrent refusal
+budget decisions. Publication is best-effort, rather than a required-audit
+mutation fence: failure can degrade to memory-only events and never changes a
+request's outcome. Existing required mutation audits retain their own fences.
+Pre-authentication failures remain unaudited: they lack a verified principal
+and must not provide an unauthenticated journal-amplification path.
