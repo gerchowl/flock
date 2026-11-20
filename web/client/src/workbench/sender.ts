@@ -18,6 +18,8 @@ export function createWireSender(connection: WireConnection, revision: () => num
     // `AgentDecide` carries `request_seq` as the card's open record sent it; nothing here changes it.
     decide: (args) => connection.command("agent.decide", args satisfies { readonly [key: string]: JsonValue } as JsonValue),
     start: (name, node, cwd) => connection.command("agent.start", { name, node_id: node, cwd, runtime: "structured", argv: ["claude"] }),
+    restart: agent => connection.command("agent.restart", { target: agent, reason: "Operator requested restart", when: "after_turn" }),
+    stop: agent => connection.command("agent.stop", { target: agent }),
     // ReadOnly holds the outbox, so its controls say why instead of queueing (ADR-0038 §3).
     blocked: () => (revision(), connection.principal === null ? "Sending opens once the server has welcomed this client." : connection.readOnly),
   };

@@ -3574,3 +3574,40 @@ fn queue_stdin_admission_waits_for_permission_book_release() {
     );
     accepted(&transport);
 }
+
+#[test]
+fn cancelled_transport_keeps_durable_history_readable_through_terminal_audits() {
+    use crate::structured::history::Item;
+    let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+    let (transport, mut output, _input) = start(&root);
+    permission(&mut output, "history-stop-request");
+    receive(&transport);
+    receive(&transport);
+    transport.cancel();
+    assert_eq!(
+        reader_done(&transport).unwrap_err().kind(),
+        io::ErrorKind::Interrupted
+    );
+    let mut cut = transport.history.subscribe(None).unwrap();
+    let mut records = Vec::new();
+    for _ in 0..32 {
+        match cut
+            .page()
+            .expect("cancelled delivery preserves readable history")
+        {
+            Item::Record(record) => {
+                records.push(serde_json::from_str::<Value>(&record.raw).unwrap())
+            }
+            Item::Synced(_) | Item::Progress => (),
+            Item::End => {
+                assert!(records
+                    .iter()
+                    .any(|record| record["type"] == "flk_permission_request"
+                        && record["state"] == "closed"));
+                return;
+            }
+            item => panic!("unexpected completed history page: {item:?}"),
+        }
+    }
+    panic!("completed history did not end within its bounded record count");
+}
