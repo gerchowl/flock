@@ -361,6 +361,7 @@ fn entry_for(name: &str) -> Entry {
         agent_id: None,
         lock_resolution: None,
         session: None,
+        extra: Default::default(),
     }
 }
 
