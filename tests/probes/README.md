@@ -105,6 +105,15 @@ explicit setup failure rather than an unnoticed loss of the Rust crash proof.
 
 ## Socket-driven measurement scripts
 
+`fork_resume_messaging.py --bin <binary> --mode fork|resume` drives an owned fake
+Claude harness through an isolated server. The fork case uses `agent.fork` with
+a fixture transcript; the resume case launches `claude --resume` through
+`agent.start`. Both inject a stale pane environment into real Stop-hook and
+inbox-read CLI processes, verify wake/read ownership agrees, and exercise send
+and reply without model calls. The `fork_resume_messaging` nextest binary runs
+both cases. All sockets use a short sandbox, inherited `FLOCK_*` variables are
+cleared, and every producer wait has a failure ceiling.
+
 `agent_wake.py` is not a TUI runbook: it drives an isolated flk over its socket
 to time wakes (idle, mid-turn, with a harness background task), and it reads an
 `event-log.jsonl` or a System One endpoint for the volume and judge-latency
