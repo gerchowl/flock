@@ -128,6 +128,8 @@ pub enum MeshMode {
     RelayReset,
     LegacyDialer,
     VersionMismatch(u32),
+    /// Explicit range for negotiation probes, independent of the compiled VERSION.
+    VersionRange(u32, u32),
 }
 
 /// A spawned node, with everything a test needs to talk to it.
@@ -236,6 +238,10 @@ impl Node {
         }
         if let MeshMode::VersionMismatch(version) = self.mesh {
             cmd.env("FLOCK_TEST_MESH_VERSION", version.to_string());
+        }
+        if let MeshMode::VersionRange(min, max) = self.mesh {
+            cmd.env("FLOCK_TEST_MESH_MIN", min.to_string());
+            cmd.env("FLOCK_TEST_MESH_VERSION", max.to_string());
         }
         let outer_path = std::env::var("PATH").unwrap_or_default();
         let tools = self

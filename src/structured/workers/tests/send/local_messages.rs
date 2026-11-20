@@ -199,6 +199,7 @@ fn local_message_policy_and_unproven_caller_refuse_before_custody() {
             .enroll(
                 pid,
                 crate::mesh::hello::Enrollment {
+                    negotiated: None,
                     peer: "relay.example".into(),
                     source: crate::mesh::store::PinSource::Inbound,
                     pin_origin: Default::default(),

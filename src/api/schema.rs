@@ -178,10 +178,12 @@ pub enum Method {
     MeshHello(crate::mesh::hello::Hello),
     #[serde(rename = "mesh.routes")]
     MeshRoutes { adverts: Vec<serde_json::Value> },
+    /// Inspect envelope kinds against the session before decoding the payload.
     #[serde(rename = "mesh.deliver")]
-    MeshDeliver(Box<crate::mesh::delivery::Deliver>),
+    MeshDeliver(serde_json::Value),
+    /// Inspect the complete acknowledgement batch before any custody mutation.
     #[serde(rename = "mesh.collect")]
-    MeshCollect(crate::mesh::collect::Collect),
+    MeshCollect(serde_json::Value),
     #[serde(rename = "peers.enroll_reset")]
     PeersEnrollReset(PeersEnrollResetParams),
     #[serde(rename = "peers.enrollment")]
