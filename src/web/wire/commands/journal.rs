@@ -1,6 +1,7 @@
-//! Dormant J1a backend: no live command uses this store or writer yet.
-//! J1b replaces the active in-memory duplicate list, restores one admission source
-//! of truth, and adds asynchronous authorization/dispatch and off-loop compaction.
+//! Dormant command journal: no live wire command uses this backend yet.
+//! Opening and shutdown are asynchronous lease barriers. Compaction copies a fixed
+//! prefix off-thread, catches up appends, then publishes a bounded tail atomically.
+//! J1b2 supplies live admission, fresh authorization, dispatch and outcome-before-ack.
 use super::{ack, Command, ErrorCode, ServerFrame};
 use crate::platform::{file_lock::LockFile, structured as files};
 use serde::{Deserialize, Serialize};
@@ -13,7 +14,8 @@ use std::{
     path::{Path, PathBuf},
     sync::{mpsc, Arc},
 };
-use tokio::sync::{oneshot, Notify};
+use tokio::sync::{oneshot, watch, Notify};
+mod compact;
 const PRINCIPAL_LIMIT: usize =
     super::super::CREDENTIAL_CONNECTIONS * super::super::COMMANDS_PER_SOCKET * 2880;
 const GLOBAL_LIMIT: usize =
@@ -22,6 +24,11 @@ const ENTRY_BYTES: usize = super::super::MAX_MESSAGE + 2048;
 const LOG_BYTES: u64 = (GLOBAL_LIMIT * ENTRY_BYTES * 2) as u64;
 const QUEUED: usize = 32;
 type Key = (String, String, String);
+#[derive(Default)]
+struct Index {
+    records: HashMap<Key, Record>,
+    counts: HashMap<(String, String), usize>,
+}
 #[cfg(not(test))]
 type Stream = File;
 #[cfg(test)]
@@ -38,6 +45,11 @@ struct Record {
     outcome: Option<Value>,
 }
 impl Record {
+    fn decode(line: &[u8]) -> Option<Self> {
+        serde_json::from_slice::<Self>(line).ok().filter(|r| r.version == 1 && r.outcome.as_ref().is_none_or(|v| {
+            matches!(serde_json::from_value::<ServerFrame>(v.clone()), Ok(ServerFrame::Ack {cmd_id, ..}) if cmd_id == r.cmd_id)
+        }))
+    }
     fn key(&self) -> Key {
         (
             self.namespace.clone(),
@@ -66,43 +78,91 @@ pub(super) enum Operation {
 }
 type Response = oneshot::Receiver<Result<Admission, ErrorCode>>;
 type Job = (Operation, oneshot::Sender<Result<Admission, ErrorCode>>);
+enum Message {
+    Job(Job),
+    Compacted(io::Result<compact::Snapshot>),
+}
 #[derive(Clone)]
-pub(super) struct Writer(mpsc::SyncSender<Job>);
+pub(super) struct Writer {
+    admission: Arc<parking_lot::Mutex<Option<mpsc::SyncSender<Message>>>>,
+    closed: watch::Receiver<bool>,
+}
 impl Writer {
-    /// Opening, replay and fsync run on the worker. Dropping a waiter never cancels a job.
-    pub(super) fn open(data: PathBuf, wake: Arc<Notify>) -> io::Result<Self> {
-        Self::spawn(move || Journal::open(&data), wake)
+    /// Return only after replay and exclusive lease acquisition succeed off-thread.
+    /// A held lease returns typed busy, never a permanently failed usable writer.
+    pub(super) async fn open(data: PathBuf, wake: Arc<Notify>) -> Result<Self, ErrorCode> {
+        Self::spawn(move || Journal::open(&data), wake).await
     }
-    fn spawn(
+    async fn spawn(
         open: impl FnOnce() -> io::Result<Journal> + Send + 'static,
         wake: Arc<Notify>,
-    ) -> io::Result<Self> {
-        let (tx, rx) = mpsc::sync_channel::<Job>(QUEUED);
+    ) -> Result<Self, ErrorCode> {
+        let (tx, rx) = mpsc::sync_channel::<Message>(QUEUED);
+        let admission = Arc::new(parking_lot::Mutex::new(Some(tx)));
+        let weak = Arc::downgrade(&admission);
+        let (opened, ready) = oneshot::channel();
+        let (closed, completion) = watch::channel(false);
         std::thread::Builder::new()
             .name("wire-journal".into())
             .spawn(move || {
-                let mut journal = open();
-                if let Err(error) = &journal {
-                    unavailable(error);
+                if let Ok(mut journal) = open().inspect_err(unavailable) {
+                    let _ = opened.send(Ok(()));
+                    while let Ok(message) = rx.recv() {
+                        match message {
+                            Message::Job((operation, reply)) => {
+                                let now = match &operation {
+                                    Operation::Claim { now, .. } => Some(*now),
+                                    _ => None,
+                                };
+                                let _ = reply.send(journal.apply(operation));
+                                if let Some(now) = now {
+                                    if let Some(admission) = weak.upgrade() {
+                                        let tx = admission.lock().as_ref().cloned();
+                                        if let Some(tx) = tx {
+                                            journal.start_compaction(now, tx);
+                                        }
+                                    }
+                                }
+                            }
+                            Message::Compacted(result) => journal.compacted(result),
+                        }
+                        wake.notify_one();
+                    }
+                    // The lease is released before shutdown completion becomes observable.
+                    drop(journal);
+                } else {
+                    let _ = opened.send(Err(ErrorCode::SessionBusy));
                 }
-                while let Ok((operation, reply)) = rx.recv() {
-                    let result = journal
-                        .as_mut()
-                        .map_err(|_| ErrorCode::SessionBusy)
-                        .and_then(|j| j.apply(operation));
-                    let _ = reply.send(result);
-                    wake.notify_one();
-                }
-            })?;
-        Ok(Self(tx))
+                closed.send_replace(true);
+            })
+            .map_err(|_| ErrorCode::SessionBusy)?;
+        ready.await.map_err(|_| ErrorCode::SessionBusy)??;
+        Ok(Self {
+            admission,
+            closed: completion,
+        })
     }
-    /// Bounded, nonblocking submission: one active job and at most QUEUED waiting jobs.
+    /// Admission never waits on filesystem work. Cancelling a reply cannot cancel a job.
     pub(super) fn submit(&self, operation: Operation) -> Result<Response, ErrorCode> {
         let (tx, rx) = oneshot::channel();
-        self.0
-            .try_send((operation, tx))
+        self.admission
+            .lock()
+            .as_ref()
+            .ok_or(ErrorCode::SessionBusy)?
+            .try_send(Message::Job((operation, tx)))
             .map_err(|_| ErrorCode::SessionBusy)?;
         Ok(rx)
+    }
+    /// Close all clones' admission, drain accepted jobs and compaction, release the lease.
+    /// Dropping this waiter does not cancel shutdown. Dropping all handles also drains.
+    pub(super) async fn shutdown(&self) -> Result<(), ErrorCode> {
+        self.admission.lock().take();
+        let mut closed = self.closed.clone();
+        closed
+            .wait_for(|done| *done)
+            .await
+            .map_err(|_| ErrorCode::SessionBusy)?;
+        Ok(())
     }
 }
 fn unavailable(error: &io::Error) {
@@ -123,8 +183,9 @@ struct Journal {
     file: Stream,
     root: PathBuf,
     _lease: LockFile,
-    records: HashMap<Key, Record>,
-    counts: HashMap<(String, String), usize>,
+    index: Index,
+    compaction: Option<mpsc::Sender<compact::Continue>>,
+    next_compaction: u64,
     bytes: u64,
     blocked: bool,
     principal_limit: usize,
@@ -133,10 +194,12 @@ struct Journal {
     fault: Option<Fault>,
     #[cfg(test)]
     before_sync: Option<Box<dyn FnMut() + Send>>,
+    #[cfg(test)]
+    compaction_hook: Option<fn(&str)>,
 }
 impl Journal {
     fn open(data: &Path) -> io::Result<Self> {
-        let root = data.join("wire");
+        let root = data.canonicalize()?.join("wire");
         match files::create_private_dir(&root) {
             Ok(()) => File::open(data)?.sync_all()?,
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => files::check_private_dir(&root)?,
@@ -155,8 +218,9 @@ impl Journal {
             file,
             root,
             _lease: lease,
-            records: HashMap::new(),
-            counts: HashMap::new(),
+            index: Index::default(),
+            compaction: None,
+            next_compaction: compact::THRESHOLD,
             bytes,
             blocked: false,
             principal_limit: PRINCIPAL_LIMIT,
@@ -165,32 +229,11 @@ impl Journal {
             fault: None,
             #[cfg(test)]
             before_sync: None,
+            #[cfg(test)]
+            compaction_hook: None,
         };
         journal.replay()?;
         Ok(journal)
-    }
-    fn fold(&mut self, record: Record) -> bool {
-        let key = record.key();
-        if let Some(first) = self.records.get_mut(&key) {
-            if first.digest != record.digest
-                || first.admitted_ms != record.admitted_ms
-                || first.outcome.is_some()
-                || record.outcome.is_none()
-            {
-                return false;
-            }
-            first.outcome = record.outcome;
-        } else {
-            if record.outcome.is_some() || self.records.len() == self.global_limit {
-                return false;
-            }
-            *self
-                .counts
-                .entry((key.0.clone(), key.1.clone()))
-                .or_default() += 1;
-            self.records.insert(key, record);
-        }
-        true
     }
     fn replay(&mut self) -> io::Result<()> {
         let mut reader = io::BufReader::new(self.file.try_clone()?);
@@ -239,9 +282,8 @@ impl Journal {
                 break;
             }
             good += line.len() as u64;
-            let valid = serde_json::from_slice::<Record>(&line).ok().filter(|r| r.version == 1 && r.outcome.as_ref().is_none_or(|v| {
-                matches!(serde_json::from_value::<ServerFrame>(v.clone()), Ok(ServerFrame::Ack {cmd_id, ..}) if cmd_id == r.cmd_id)
-            })).is_some_and(|r| self.fold(r));
+            let valid =
+                Record::decode(&line).is_some_and(|r| self.index.fold(r, self.global_limit));
             if !valid {
                 self.blocked = true;
                 tracing::warn!("opaque command journal entry skipped and preserved");
@@ -332,7 +374,7 @@ impl Journal {
                 .map_err(|_| ErrorCode::SerializationError)?,
         )
         .into();
-        if let Some(record) = self.records.get(&key) {
+        if let Some(record) = self.index.records.get(&key) {
             if now.saturating_sub(record.admitted_ms) >= super::super::IDEMPOTENCY_WINDOW_MS {
                 return Err(if command.resume_only {
                     ErrorCode::SessionUnconfirmed
@@ -353,8 +395,9 @@ impl Journal {
         if command.resume_only {
             return Err(ErrorCode::SessionUnconfirmed);
         }
-        if self.records.len() >= self.global_limit
+        if self.index.records.len() >= self.global_limit
             || self
+                .index
                 .counts
                 .get(&(key.0.clone(), key.1.clone()))
                 .copied()
@@ -373,7 +416,7 @@ impl Journal {
             outcome: None,
         };
         self.append(&record)?;
-        self.fold(record);
+        self.index.fold(record, self.global_limit);
         Ok(Admission::Claimed(now))
     }
     fn finish(
@@ -383,6 +426,7 @@ impl Journal {
         result: Result<Value, ErrorCode>,
     ) -> Result<ServerFrame, ErrorCode> {
         let record = self
+            .index
             .records
             .get(key)
             .filter(|r| r.admitted_ms == admitted_ms)
@@ -404,8 +448,33 @@ impl Journal {
             Some(serde_json::to_value(&frame).map_err(|_| ErrorCode::SerializationError)?);
         self.append(&record)
             .map_err(|_| ErrorCode::SessionUnconfirmed)?;
-        self.fold(record);
+        self.index.fold(record, self.global_limit);
         Ok(frame)
+    }
+}
+impl Index {
+    fn fold(&mut self, record: Record, global_limit: usize) -> bool {
+        let key = record.key();
+        if let Some(first) = self.records.get_mut(&key) {
+            if first.digest != record.digest
+                || first.admitted_ms != record.admitted_ms
+                || first.outcome.is_some()
+                || record.outcome.is_none()
+            {
+                return false;
+            }
+            first.outcome = record.outcome;
+        } else {
+            if record.outcome.is_some() || self.records.len() == global_limit {
+                return false;
+            }
+            *self
+                .counts
+                .entry((key.0.clone(), key.1.clone()))
+                .or_default() += 1;
+            self.records.insert(key, record);
+        }
+        true
     }
 }
 #[cfg(test)]

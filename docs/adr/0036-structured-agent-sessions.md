@@ -2007,34 +2007,61 @@ An oversized outcome leaves its durable claim uncertain instead of truncating
 the result. The namespace is an explicit string (`local` today), so a later
 home-node namespace needs no format change.
 
-**J1a backend status (#1380).** The append-only backend and bounded off-loop
+**J1 backend status (#1380).** The append-only backend and bounded off-loop
 writer are implemented but dormant. Live commands still use the existing
 in-memory duplicate list; no request claims or finishes this journal yet.
-J1b replaces that list with asynchronous claim completion, reauthorization,
-dispatch and outcome-before-ack, restoring one live source of truth. J1b also
-adds threshold compaction and its append catch-up/publication protocol.
+J1b1 adds compaction and explicit writer lifecycle barriers to this dormant
+backend. J1b2 will replace the live list with asynchronous claim completion,
+reauthorization, dispatch and outcome-before-ack, restoring one live source of
+truth. These backend changes do not enable command recovery on the live wire.
 
 The backend holds an exclusive writer lease, rebuilds its index and per-principal
 counts by replay once at open, and appends one bounded record per claim/outcome.
 Successful completion follows file sync and index publication; failed appends
 roll back to the previous length and sync it, then fence further writes until
-reopen. Directory sync occurs on file creation; rename publication belongs to
-J1b. Its mailbox holds at most 32 queued jobs plus one active job. Submission
+reopen. Directory sync occurs on file creation and compaction publication.
+Its mailbox holds at most 32 queued messages plus one active job. Submission
 uses a nonblocking try-send and owns no filesystem or authorization lock.
-Startup recovery and all journal writes run on the dedicated writer thread.
+Startup recovery and journal writes run on the dedicated writer thread.
+Asynchronous open returns a usable handle only after replay and exclusive lease
+acquisition succeed; a held lease returns typed `session_busy`. There is no
+usable handle retaining a failed open. Shutdown closes admission across all
+clones, drains accepted writes and compaction, and reports completion only after
+lease release. Cancelling a started shutdown waiter does not cancel the drain.
+Callers must await shutdown before opening a replacement; opening while the
+lease is held refuses, and a fresh open after release can succeed even when
+closed handles remain alive.
 
-Until J1b compacts, expired entries continue occupying their counts: resume-only
+After eight MiB of log growth, a claim attempt starts a separate compaction
+worker with that attempt's clock value and a fixed, complete append prefix.
+The copier keeps records younger than 24 hours, conservatively retaining future
+timestamps. It catches up concurrent appends and builds the replacement index
+and per-principal counts off-thread, reserving capacity so publication cannot
+rehash the index. If more than two record byte caps remain, catch-up returns to
+the copier. Otherwise the writer copies the bounded final tail, syncs the
+private temporary file, renames it onto the active journal, syncs the directory
+and publishes matching index/count removals before serving another message.
+Old index destruction also runs on the copier. A crash leaves the complete old
+or new journal; abandoned `commands.compact` files are ignored during replay.
+Copy or publication failures fence further writes. The primary file's identity
+is checked before copying and publication, so a lost or replaced log is not
+resurrected. A failed concurrent append cancels publication rather than replacing an uncertain authoritative tail. A sweep that
+frees nothing waits for another eight MiB of growth before trying again.
+
+Expired entries occupy their counts until successful compaction: resume-only
 lookup refuses them as uncertain, and reuse as a new claim refuses busy. No
-entry is evicted. There are at most two records per retained key and a hard
-active-file byte bound of twice the global entry cap times the record byte cap.
+unexpired entry is evicted. There are at most two records per retained key and
+a hard active-file byte bound of twice the global entry cap times the record byte cap.
 Unknown/invalid complete records stay raw in place, are skipped and logged,
 and fence further writes while readable indexed results remain available.
+Opaque journals are not compacted, preserving every raw row and the recovery
+fence rather than attempting expiry inference from unknown data.
 A torn final line is archived as raw bytes in private `commands.torn.jsonl`,
 file-synced before the active tail is truncated and synced. The archive is
 bounded to 32 record byte caps; recovery refuses without truncation when full.
 A recovered pending claim remains uncertain and a completed claim returns
 its first acknowledgement. These are backend properties, not active wire
-recovery promises in J1a.
+recovery promises on the live wire.
 
 Automatic resend is allowed for the listed §5 verbs only through this durable
 idempotency path, not based on an assumed harmless verb. Permission/question
