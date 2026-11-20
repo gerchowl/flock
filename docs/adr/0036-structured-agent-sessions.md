@@ -2008,21 +2008,36 @@ the result. The namespace is an explicit string (`local` today), so a later
 home-node namespace needs no format change.
 
 **J1 ownership status (#1380).** The append-only backend, bounded off-loop
-writer and compaction are implemented. J1b2a starts and owns the writer at Core
-startup, but live commands still use the existing in-memory duplicate list;
-no request claims or finishes this journal yet. Importer Core preparation does
-not open the journal. At the existing mesh custody freeze point, the exporter
-closes wire command admission, drains accepted writer jobs and releases the
-exclusive lease. The importer acquires and replays only after ownership commit,
-before enabling wire admission. Rollback schedules off-loop reacquisition at the
-same recovery point as mesh custody. Admission remains closed until replay and
-lease acquisition succeed; failure reports `session_busy` through the bounded
-authenticated refusal auditor and logs the recovery failure. Generation fencing
-prevents an old recovery from reopening admission after freeze or shutdown;
-shutdown also waits for an in-progress open to drain and release its lease.
-J1b2b will replace the live duplicate list with durable claims, fresh
-authorization, dispatch and outcome-before-ack. J1b2a does not enable command
-recovery across restart or handoff.
+writer and compaction are implemented. J1b2a owns the writer, but live commands
+still use the in-memory duplicate list: they neither write this journal nor
+acknowledge journal completions. Abandoned journal I/O therefore cannot produce
+a wire acknowledgement in this slice. J1b2b must preserve the admission-phase
+fence when introducing durable command outcomes.
+
+Every journal caller has a one-second budget (`JOURNAL_WAIT`). Startup and
+post-commit importer acquisition return a running server even when that budget
+expires or open fails; wire commands remain refused as audited `session_busy`
+until the background task holds the lease and finishes replay. Failed attempts
+retry every 250 ms (`ACQUIRE_RETRY`). Importer preparation never opens the
+journal. The existing watchdog may be disarmed before ownership commit because
+the subsequent journal caller wait is bounded independently.
+
+At the existing mesh custody freeze point, the exporter closes wire admission
+and requests a drain. Freeze and shutdown stop waiting after one second, log
+the number of accepted queued/active journal writes, and proceed. Counts retire
+before their completion is published. Timed-out work is detached, not cancelled;
+the worker retains the exclusive lease until it actually stops. A replacement
+fails closed and retries while that lease is held, never becoming a second
+holder. Shutdown retains its existing separate five-second revocation and
+transport-drain budgets, plus at most one second for the journal caller.
+
+Rollback schedules reacquisition at the same recovery point as mesh custody.
+Generation fencing prevents stale recovery from reopening admission after a
+freeze or shutdown, and prevents an abandoned old drain from closing a newer
+recovered writer. Recovery finishes any earlier drain before replaying.
+J1b2b will replace the duplicate list with durable claims, reauthorization,
+dispatch and outcome-before-ack. J1b2a enables no command recovery across restart
+or handoff.
 
 The backend holds an exclusive writer lease, rebuilds its index and per-principal
 counts by replay once at open, and appends one bounded record per claim/outcome.

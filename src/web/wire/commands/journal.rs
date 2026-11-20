@@ -12,7 +12,10 @@ use std::{
     fs::File,
     io::{self, BufRead, Read, Write},
     path::{Path, PathBuf},
-    sync::{mpsc, Arc},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        mpsc, Arc,
+    },
 };
 use tokio::sync::{oneshot, watch, Notify};
 mod compact;
@@ -87,6 +90,7 @@ enum Message {
 pub(super) struct Writer {
     admission: Arc<parking_lot::Mutex<Option<mpsc::SyncSender<Message>>>>,
     closed: watch::Receiver<bool>,
+    pending: Arc<AtomicUsize>,
 }
 impl Writer {
     /// Return only after replay and exclusive lease acquisition succeed off-thread.
@@ -103,6 +107,8 @@ impl Writer {
         let weak = Arc::downgrade(&admission);
         let (opened, ready) = oneshot::channel();
         let (closed, completion) = watch::channel(false);
+        let pending = Arc::new(AtomicUsize::new(0));
+        let worker_pending = pending.clone();
         std::thread::Builder::new()
             .name("wire-journal".into())
             .spawn(move || {
@@ -115,7 +121,10 @@ impl Writer {
                                     Operation::Claim { now, .. } => Some(*now),
                                     _ => None,
                                 };
-                                let _ = reply.send(journal.apply(operation));
+                                let result = journal.apply(operation);
+                                // Counted I/O has no published completion yet.
+                                worker_pending.fetch_sub(1, Ordering::AcqRel);
+                                let _ = reply.send(result);
                                 if let Some(now) = now {
                                     if let Some(admission) = weak.upgrade() {
                                         let tx = admission.lock().as_ref().cloned();
@@ -141,18 +150,32 @@ impl Writer {
         Ok(Self {
             admission,
             closed: completion,
+            pending,
         })
     }
     /// Admission never waits on filesystem work. Cancelling a reply cannot cancel a job.
     pub(super) fn submit(&self, operation: Operation) -> Result<Response, ErrorCode> {
         let (tx, rx) = oneshot::channel();
-        self.admission
+        self.pending.fetch_add(1, Ordering::AcqRel);
+        let result = self
+            .admission
             .lock()
             .as_ref()
-            .ok_or(ErrorCode::SessionBusy)?
-            .try_send(Message::Job((operation, tx)))
-            .map_err(|_| ErrorCode::SessionBusy)?;
+            .ok_or(ErrorCode::SessionBusy)
+            .and_then(|queue| {
+                queue
+                    .try_send(Message::Job((operation, tx)))
+                    .map_err(|_| ErrorCode::SessionBusy)
+            });
+        if result.is_err() {
+            self.pending.fetch_sub(1, Ordering::AcqRel);
+        }
+        result?;
         Ok(rx)
+    }
+    /// Accepted queued/active I/O; decremented before publishing its completion.
+    pub(super) fn pending(&self) -> Arc<AtomicUsize> {
+        self.pending.clone()
     }
     /// Close all clones' admission, drain accepted jobs and compaction, release the lease.
     /// Dropping this waiter does not cancel shutdown. Dropping all handles also drains.

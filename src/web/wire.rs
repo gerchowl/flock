@@ -292,7 +292,8 @@ impl Core {
         self.journal.acquire().await.map_err(io::Error::other)
     }
     /// Stop and drain every transport lease even when app revocation fails.
-    /// Revocation and lease draining each have a five-second caller budget.
+    /// Revocation and transport draining each have a five-second caller budget.
+    /// The journal adds a one-second caller wait; abandoned I/O retains its lease.
     /// Abandoned store workers retain their slots/fences until actual completion
     /// (#2742); a timeout does not claim a blocking syscall was cancelled.
     pub(crate) async fn shutdown(&self) -> io::Result<()> {

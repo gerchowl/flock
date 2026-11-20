@@ -1,27 +1,36 @@
 //! Journal ownership follows handoff admission, not process lifetime.
-//! J1b2a still dispatches through the in-memory duplicate list: no live command
-//! claims or finishes the owned journal until J1b2b.
+//! J1b2a keeps command deduplication in memory: no live command writes this journal
+//! or acknowledges its completions. An abandoned journal write cannot produce a
+//! wire acknowledgement. Closing the phase fences admission until replay succeeds.
 use super::{journal::Writer, ErrorCode};
 use std::{
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
+    time::Duration,
 };
-use tokio::sync::{Mutex, Notify};
-
+use tokio::sync::{oneshot, Mutex, Notify};
+/// Each startup/commit, rollback, freeze and shutdown journal caller waits at most
+/// one second. Expiry detaches work; it never cancels I/O or releases its lease.
+const JOURNAL_WAIT: Duration = Duration::from_secs(1);
+/// Failed acquisitions retry off-loop, without reopening command admission.
+const ACQUIRE_RETRY: Duration = Duration::from_millis(250);
 #[cfg(test)]
-type OpenBarrier = (
-    tokio::sync::oneshot::Sender<()>,
-    tokio::sync::oneshot::Receiver<()>,
-);
+type OpenBarrier = (oneshot::Sender<()>, oneshot::Receiver<()>);
+#[derive(Default)]
+struct Slot {
+    phase: u64,
+    writer: Option<Writer>,
+}
 struct Inner {
     data: PathBuf,
     wake: Arc<Notify>,
     phase: Arc<AtomicU64>,
     stopped: AtomicBool,
-    writer: Mutex<Option<Writer>>,
+    writer: Mutex<Slot>,
+    pending: parking_lot::Mutex<Arc<AtomicUsize>>,
     #[cfg(test)]
     open_barrier: parking_lot::Mutex<Option<OpenBarrier>>,
 }
@@ -29,14 +38,17 @@ struct Inner {
 pub(in crate::web::wire) struct Ownership(Arc<Inner>);
 impl Ownership {
     pub(in crate::web::wire) fn new(data: PathBuf, wake: Arc<Notify>) -> Self {
+        #[cfg(test)]
+        let open_barrier = tests::take_open_barrier(&data);
         Self(Arc::new(Inner {
             data,
             wake,
             phase: Arc::new(AtomicU64::new(0)),
             stopped: AtomicBool::new(false),
-            writer: Mutex::new(None),
+            writer: Mutex::new(Slot::default()),
+            pending: parking_lot::Mutex::new(Arc::new(AtomicUsize::new(0))),
             #[cfg(test)]
-            open_barrier: parking_lot::Mutex::new(None),
+            open_barrier: parking_lot::Mutex::new(open_barrier),
         }))
     }
     pub(in crate::web::wire) fn gate(&self) -> Arc<AtomicU64> {
@@ -57,27 +69,94 @@ impl Ownership {
         self.0.stopped.store(true, Ordering::Release);
         self.close();
     }
+    fn current(&self, phase: u64) -> bool {
+        !self.0.stopped.load(Ordering::Acquire) && self.0.phase.load(Ordering::Acquire) == phase
+    }
+    fn abandoned(&self, stage: &'static str) {
+        let pending_writes = self.0.pending.lock().load(Ordering::Acquire);
+        tracing::warn!(
+            stage,
+            pending_writes,
+            "command journal caller stopped waiting; work remains fenced"
+        );
+    }
+    /// Success permits the server to run; only the gate proves lease/replay readiness.
+    /// Open failure or timeout keeps the gate closed and recovery running off-loop.
     pub(in crate::web::wire) async fn acquire(&self) -> Result<(), ErrorCode> {
-        self.acquire_at(self.close()).await
+        if self.0.stopped.load(Ordering::Acquire) {
+            return Err(ErrorCode::SessionBusy);
+        }
+        let reply = self.recover(false);
+        let _ = self.wait_open(reply).await;
+        if self.0.stopped.load(Ordering::Acquire) {
+            Err(ErrorCode::SessionBusy)
+        } else {
+            Ok(())
+        }
+    }
+    fn recover(&self, notify: bool) -> oneshot::Receiver<Result<(), ErrorCode>> {
+        let phase = self.close();
+        let (send, reply) = oneshot::channel();
+        let owner = self.clone();
+        tokio::spawn(async move {
+            let mut send = Some(send);
+            loop {
+                let result = owner.acquire_at(phase).await;
+                let delivered = send.take().is_some_and(|send| send.send(result).is_ok());
+                // Synchronous startup already observes its reply. Only later
+                // recovery or rollback needs to wake the running owner loop.
+                if notify || !delivered {
+                    owner.0.wake.notify_one();
+                }
+                if result.is_ok() || !owner.current(phase) {
+                    break;
+                }
+                tokio::time::sleep(ACQUIRE_RETRY).await;
+            }
+        });
+        reply
+    }
+    async fn wait_open(
+        &self,
+        reply: oneshot::Receiver<Result<(), ErrorCode>>,
+    ) -> Result<(), ErrorCode> {
+        let result = match tokio::time::timeout(JOURNAL_WAIT, reply).await {
+            Ok(Ok(result)) => result,
+            _ => Err(ErrorCode::SessionBusy),
+        };
+        if result.is_err() {
+            self.abandoned("open");
+        }
+        result
     }
     async fn acquire_at(&self, phase: u64) -> Result<(), ErrorCode> {
         let mut slot = self.0.writer.lock().await;
-        if self.0.stopped.load(Ordering::Acquire) || self.0.phase.load(Ordering::Acquire) != phase {
+        if !self.current(phase) {
             return Err(ErrorCode::SessionBusy);
         }
-        if slot.is_none() {
+        // Recovery after a freeze must finish the old drain before replay, even
+        // when its caller already timed out and a later intent reached us first.
+        if slot.phase != phase {
+            if let Some(writer) = slot.writer.take() {
+                writer.shutdown().await?;
+            }
+        }
+        if slot.writer.is_none() {
             #[cfg(test)]
             {
                 let barrier = self.0.open_barrier.lock().take();
                 if let Some((entered, release)) = barrier {
                     let _ = entered.send(());
-                    tokio::time::timeout(std::time::Duration::from_secs(5), release)
+                    tokio::time::timeout(Duration::from_secs(5), release)
                         .await
                         .map_err(|_| ErrorCode::SessionBusy)?
                         .map_err(|_| ErrorCode::SessionBusy)?;
                 }
             }
-            *slot = Some(Writer::open(self.0.data.clone(), self.0.wake.clone()).await?);
+            let writer = Writer::open(self.0.data.clone(), self.0.wake.clone()).await?;
+            *self.0.pending.lock() = writer.pending();
+            slot.phase = phase;
+            slot.writer = Some(writer);
         }
         if self.0.stopped.load(Ordering::Acquire)
             || self
@@ -86,7 +165,7 @@ impl Ownership {
                 .compare_exchange(phase, phase | 1, Ordering::AcqRel, Ordering::Acquire)
                 .is_err()
         {
-            if let Some(writer) = slot.take() {
+            if let Some(writer) = slot.writer.take() {
                 writer.shutdown().await?;
             }
             return Err(ErrorCode::SessionBusy);
@@ -94,31 +173,32 @@ impl Ownership {
         Ok(())
     }
     pub(in crate::web::wire) async fn freeze(&self) -> Result<(), ErrorCode> {
-        self.close();
-        let mut slot = self.0.writer.lock().await;
-        let result = match slot.take() {
-            Some(writer) => writer.shutdown().await,
-            None => Ok(()),
-        };
-        self.close();
-        result
-    }
-    /// Rollback uses the existing off-loop recovery pattern; admission stays closed
-    /// until replay and lease acquisition succeed. Errors leave it closed and reported.
-    pub(in crate::web::wire) fn reopen(&self) -> tokio::task::JoinHandle<Result<(), ErrorCode>> {
         let phase = self.close();
         let owner = self.clone();
-        tokio::spawn(async move {
-            let result = owner.acquire_at(phase).await;
-            if let Err(error) = &result {
-                tracing::warn!(
-                    error = error.as_str(),
-                    "wire command journal reacquire failed"
-                );
+        // Dropping this JoinHandle on timeout detaches, never cancels, the drain.
+        let drain = tokio::spawn(async move {
+            let mut slot = owner.0.writer.lock().await;
+            // An abandoned old drain must not close a newer recovered owner.
+            if slot.phase <= phase {
+                if let Some(writer) = slot.writer.take() {
+                    writer.shutdown().await?;
+                }
             }
-            owner.0.wake.notify_one();
-            result
-        })
+            Ok::<_, ErrorCode>(())
+        });
+        if !matches!(
+            tokio::time::timeout(JOURNAL_WAIT, drain).await,
+            Ok(Ok(Ok(())))
+        ) {
+            self.abandoned("drain");
+        }
+        Ok(())
+    }
+    /// The first wait is bounded; retries retain fencing after it returns.
+    pub(in crate::web::wire) fn reopen(&self) -> tokio::task::JoinHandle<Result<(), ErrorCode>> {
+        let reply = self.recover(true);
+        let owner = self.clone();
+        tokio::spawn(async move { owner.wait_open(reply).await })
     }
     pub(in crate::web::wire) async fn shutdown(&self) -> Result<(), ErrorCode> {
         self.stop();

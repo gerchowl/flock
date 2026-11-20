@@ -30,12 +30,19 @@ fn claim(id: &str) -> Operation {
         now: 100,
     }
 }
+async fn install(owner: &Ownership, writer: Writer) {
+    *owner.0.pending.lock() = writer.pending();
+    let mut slot = owner.0.writer.lock().await;
+    slot.phase = owner.0.phase.load(Ordering::Acquire) & !1;
+    slot.writer = Some(writer);
+}
 async fn apply(owner: &Ownership, operation: Operation) -> Result<Admission, ErrorCode> {
     let reply = owner
         .0
         .writer
         .lock()
         .await
+        .writer
         .as_ref()
         .unwrap()
         .submit(operation)?;
@@ -65,7 +72,7 @@ async fn commit_prepares_without_lease_then_replays_after_exporter_freeze() {
     .unwrap();
     let importer = Ownership::new(root.path().to_owned(), Arc::new(Notify::new()));
     assert_eq!(importer.gate().load(Ordering::Acquire) & 1, 0);
-    assert!(importer.0.writer.lock().await.is_none());
+    assert!(importer.0.writer.lock().await.writer.is_none());
     exporter.freeze().await.unwrap();
     importer.acquire().await.unwrap();
     assert_eq!(importer.gate().load(Ordering::Acquire) & 1, 1);
@@ -95,7 +102,7 @@ async fn rollback_replays_before_opening_and_shutdown_cannot_be_undone_by_recove
     owner.shutdown().await.unwrap();
     let _ = within(recovery).await.unwrap();
     assert_eq!(owner.gate().load(Ordering::Acquire) & 1, 0);
-    assert!(owner.0.writer.lock().await.is_none());
+    assert!(owner.0.writer.lock().await.writer.is_none());
     assert_eq!(owner.acquire().await.unwrap_err(), ErrorCode::SessionBusy);
 }
 #[tokio::test]
@@ -117,7 +124,7 @@ async fn shutdown_drains_accepted_write_and_releases_lease_with_handles_alive() 
     )
     .await;
     let reply = writer.submit(claim("drained")).unwrap();
-    *owner.0.writer.lock().await = Some(writer);
+    install(&owner, writer).await;
     within(ready).await.unwrap();
     let shutdown = tokio::spawn({
         let owner = owner.clone();
@@ -164,4 +171,103 @@ async fn shutdown_waits_for_inflight_replay_and_fences_its_late_completion() {
     let replacement = Ownership::new(root.path().to_owned(), Arc::new(Notify::new()));
     replacement.acquire().await.unwrap();
     replacement.shutdown().await.unwrap();
+}
+
+fn open_hooks() -> &'static parking_lot::Mutex<std::collections::HashMap<PathBuf, OpenBarrier>> {
+    static HOOKS: std::sync::OnceLock<
+        parking_lot::Mutex<std::collections::HashMap<PathBuf, OpenBarrier>>,
+    > = std::sync::OnceLock::new();
+    HOOKS.get_or_init(Default::default)
+}
+pub(super) fn take_open_barrier(data: &std::path::Path) -> Option<OpenBarrier> {
+    open_hooks().lock().remove(data)
+}
+impl Ownership {
+    pub(in crate::web::wire) fn test_stall_next_open(
+        data: PathBuf,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let (release, wait) = tokio::sync::oneshot::channel();
+        open_hooks().lock().insert(data, (entered, wait));
+        (started, release)
+    }
+}
+
+async fn stalled_drain(shutdown: bool) {
+    let (root, owner) = fixture();
+    let (entered, ready) = tokio::sync::oneshot::channel();
+    let (release, wait) = std::sync::mpsc::channel();
+    let mut entered = Some(entered);
+    let writer = Writer::test_open(
+        root.path().to_owned(),
+        owner.0.wake.clone(),
+        Box::new(move || {
+            if let Some(entered) = entered.take() {
+                entered.send(()).unwrap();
+                wait.recv_timeout(Duration::from_secs(5))
+                    .expect("test did not release stalled writer");
+            }
+        }),
+    )
+    .await;
+    let mut reply = writer.submit(claim("abandoned")).unwrap();
+    install(&owner, writer).await;
+    within(ready).await.unwrap();
+    let mut caller = tokio::spawn({
+        let owner = owner.clone();
+        async move {
+            if shutdown {
+                owner.shutdown().await
+            } else {
+                owner.freeze().await
+            }
+        }
+    });
+    let result = tokio::time::timeout(Duration::from_secs(2), &mut caller).await;
+    let bounded = result.is_ok();
+    if let Ok(result) = &result {
+        assert!(result.as_ref().unwrap().is_ok());
+    }
+    assert_eq!(owner.0.pending.lock().load(Ordering::Acquire), 1);
+    assert!(matches!(
+        reply.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+    let closed = owner.gate().load(Ordering::Acquire) & 1 == 0;
+    let competing = Writer::open(root.path().to_owned(), Arc::new(Notify::new())).await;
+    assert!(
+        matches!(competing, Err(ErrorCode::SessionBusy)),
+        "stalled writer must retain its exclusive lease"
+    );
+    release.send(()).unwrap();
+    if result.is_err() {
+        within(caller).await.unwrap().unwrap();
+    }
+    within(reply).await.unwrap().unwrap();
+    owner.shutdown().await.unwrap();
+    let replacement = Ownership::new(root.path().to_owned(), Arc::new(Notify::new()));
+    replacement.acquire().await.unwrap();
+    replacement.shutdown().await.unwrap();
+    assert!(closed);
+    assert!(bounded, "caller hung on the stalled journal writer");
+}
+fn check_stalled_drain(shutdown: bool) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let log = crate::logging::capture_logs(|| runtime.block_on(stalled_drain(shutdown)));
+    assert!(log.contains("pending_writes=1"), "{log}");
+    assert!(log.contains("drain"), "{log}");
+}
+#[test]
+fn stalled_shutdown_returns_with_lease_fenced() {
+    check_stalled_drain(true);
+}
+#[test]
+fn stalled_freeze_returns_with_lease_fenced() {
+    check_stalled_drain(false);
 }

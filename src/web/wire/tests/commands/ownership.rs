@@ -52,7 +52,8 @@ fn failed_rollback_reacquire_is_typed_audited_and_never_dispatches() {
             crate::api::error_code::ErrorCode::SessionBusy
         );
         refusal(
-            case.command(&mut socket, "agent.decide", args).await,
+            case.command(&mut socket, "agent.decide", args.clone())
+                .await,
             "session_busy",
             crate::api::error_code::ErrorCode::SessionBusy.exit(),
         );
@@ -62,10 +63,24 @@ fn failed_rollback_reacquire_is_typed_audited_and_never_dispatches() {
         assert_eq!(events[0]["reason"], "session_busy");
         assert_eq!(events[0]["token_id"], "one");
         holder.shutdown().await.unwrap();
-        within(case.server.core.reopen_commands())
-            .await
-            .unwrap()
-            .unwrap();
+        let wake = case.server.wake.clone();
+        within(async {
+            loop {
+                let changed = wake.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                if !case.server.core.shared.commands.full("agent.decide") {
+                    break;
+                }
+                changed.await;
+            }
+        })
+        .await;
+        assert_eq!(
+            case.command(&mut socket, "agent.decide", args).await["ok"],
+            true
+        );
+        case.until(|r| r.handles().len() == 1).await;
         case.stop().await;
     });
 }

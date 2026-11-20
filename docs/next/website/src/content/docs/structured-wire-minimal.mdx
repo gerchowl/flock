@@ -301,13 +301,19 @@ An uncertain retry with `resume_only: true` and no retained result refuses
 `session_unconfirmed`; it never launches again. Retention is in memory and
 ends on server restart or eviction.
 
-Core owns the command-journal lease during normal operation and transfers it
-at handoff ownership commit. Importer preparation does not acquire it. The
-exporter closes command admission before draining and releasing the lease;
-rollback keeps admission closed until reacquisition and replay succeed. A
-failed reacquisition leaves commands refused as `session_busy`, with bounded
-authenticated refusal audit evidence. Shutdown drains the writer. This ownership
-phase does not change the in-memory retention or enable durable command replay.
+Core owns the command-journal lease and acquires it at handoff ownership commit,
+never during importer preparation. Each journal caller waits at most one second.
+A delayed or failed startup/commit acquisition leaves the server running with
+wire commands refused as audited `session_busy`. Background attempts retry every
+250 ms and reopen admission only after acquiring the lease and replaying.
+
+The exporter closes wire admission before requesting a drain. Freeze and shutdown
+proceed after their one-second journal budget, logging pending write counts;
+abandoned I/O retains its exclusive lease until the worker actually stops.
+Rollback remains fenced while it reacquires and replays. A late drain cannot
+close a newer recovered owner. Live commands still use in-memory deduplication,
+so no wire acknowledgement is derived from abandoned journal writes in this
+phase. This ownership work does not enable durable command replay.
 
 `agent.start` permits fresh launches through the existing server-side launch
 gates, including `structured_needs_agent_user`. It cannot resume a structured
