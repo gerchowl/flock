@@ -1,7 +1,6 @@
-//! Dormant command journal: no live wire command uses this backend yet.
+//! Durable wire command claims and outcomes.
 //! Opening and shutdown are asynchronous lease barriers. Compaction copies a fixed
 //! prefix off-thread, catches up appends, then publishes a bounded tail atomically.
-//! J1b2 supplies live admission, fresh authorization, dispatch and outcome-before-ack.
 use super::{ack, Command, ErrorCode, ServerFrame};
 use crate::platform::{file_lock::LockFile, structured as files};
 use serde::{Deserialize, Serialize};
@@ -62,6 +61,13 @@ impl Record {
         )
     }
 }
+pub(super) fn digest(command: &Command) -> Result<[u8; 32], ErrorCode> {
+    Ok(Sha256::digest(
+        serde_json::to_vec(&(&command.verb, &command.args))
+            .map_err(|_| ErrorCode::SerializationError)?,
+    )
+    .into())
+}
 pub(super) enum Admission {
     Claimed(u64),
     Replayed(ServerFrame),
@@ -74,13 +80,18 @@ pub(super) enum Operation {
         command: Command,
         now: u64,
     },
+    #[cfg(test)]
+    Configure {
+        limits: Option<(usize, usize)>,
+        before_sync: Option<Box<dyn FnMut() + Send>>,
+    },
     Finish {
         key: Key,
         admitted_ms: u64,
         result: Result<Value, ErrorCode>,
     },
 }
-type Response = oneshot::Receiver<Result<Admission, ErrorCode>>;
+pub(super) type Response = oneshot::Receiver<Result<Admission, ErrorCode>>;
 type Job = (Operation, oneshot::Sender<Result<Admission, ErrorCode>>);
 enum Message {
     Job(Job),
@@ -362,10 +373,21 @@ impl Journal {
         Ok(())
     }
     fn apply(&mut self, operation: Operation) -> Result<Admission, ErrorCode> {
-        if files::file_link_count(&self.file).map_err(|_| ErrorCode::SessionBusy)? == 0 {
-            return Err(ErrorCode::SessionUnconfirmed);
-        }
+        files::rollout_identity(&self.file, &self.root.join("commands.jsonl"))
+            .map_err(|_| ErrorCode::SessionUnconfirmed)?;
         match operation {
+            #[cfg(test)]
+            Operation::Configure {
+                limits,
+                before_sync,
+            } => {
+                if let Some((principal, global)) = limits {
+                    self.principal_limit = principal;
+                    self.global_limit = global;
+                }
+                self.before_sync = before_sync;
+                Ok(Admission::Pending(0))
+            }
             Operation::Claim {
                 namespace,
                 principal,
@@ -393,11 +415,7 @@ impl Journal {
             principal.to_owned(),
             command.id.clone(),
         );
-        let digest: [u8; 32] = Sha256::digest(
-            serde_json::to_vec(&(&command.verb, &command.args))
-                .map_err(|_| ErrorCode::SerializationError)?,
-        )
-        .into();
+        let digest = digest(command)?;
         if let Some(record) = self.index.records.get(&key) {
             if now.saturating_sub(record.admitted_ms) >= super::super::IDEMPOTENCY_WINDOW_MS {
                 return Err(if command.resume_only {

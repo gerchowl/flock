@@ -2007,14 +2007,21 @@ An oversized outcome leaves its durable claim uncertain instead of truncating
 the result. The namespace is an explicit string (`local` today), so a later
 home-node namespace needs no format change.
 
-**J1 ownership status (#1380).** The append-only backend, bounded off-loop
-writer and compaction are implemented. J1b2a owns the writer, but live commands
-still use the in-memory duplicate list: they neither write this journal nor
-acknowledge journal completions. Abandoned journal I/O therefore cannot produce
-a wire acknowledgement in this slice. J1b2b must preserve the admission-phase
-fence when introducing durable command outcomes.
+**J1 live admission (#1380).** Wire commands use the durable journal as the
+single source of completed outcomes. The app owner submits a claim without
+blocking, polls its durable completion, then rechecks current authorization
+under the token fence through dispatch. Revocation after claim prevents the
+effect. The outcome is synced before acknowledgement. Identical in-flight
+requests join the active claim, retaining each credential's metadata and
+reauthorizing each waiter before returning the stored outcome. Connection closure
+follows the requesting credential's current revocation status. Conflicting
+payloads refuse `invalid_params`. Journal capacity and writer queue pressure
+refuse through the bounded wire refusal audit before dispatch. Recovered pending
+claims and absent, expired or lost resume-only keys refuse `session_unconfirmed`.
+A completion from an earlier ownership phase cannot dispatch after freeze or
+rollback. Completed outcomes replay across restart and ownership transfer.
 
-Every journal caller has a one-second budget (`JOURNAL_WAIT`). Startup and
+Ownership lifecycle callers have a one-second budget (`JOURNAL_WAIT`). Startup and
 post-commit importer acquisition return a running server even when that budget
 expires or open fails; wire commands remain refused as audited `session_busy`
 until the background task holds the lease and finishes replay. Failed attempts
@@ -2035,9 +2042,6 @@ Rollback schedules reacquisition at the same recovery point as mesh custody.
 Generation fencing prevents stale recovery from reopening admission after a
 freeze or shutdown, and prevents an abandoned old drain from closing a newer
 recovered writer. Recovery finishes any earlier drain before replaying.
-J1b2b will replace the duplicate list with durable claims, reauthorization,
-dispatch and outcome-before-ack. J1b2a enables no command recovery across restart
-or handoff.
 
 The backend holds an exclusive writer lease, rebuilds its index and per-principal
 counts by replay once at open, and appends one bounded record per claim/outcome.
@@ -2090,8 +2094,7 @@ A torn final line is archived as raw bytes in private `commands.torn.jsonl`,
 file-synced before the active tail is truncated and synced. The archive is
 bounded to 32 record byte caps; recovery refuses without truncation when full.
 A recovered pending claim remains uncertain and a completed claim returns
-its first acknowledgement. These are backend properties, not active wire
-recovery promises on the live wire.
+its first acknowledgement through the live wire after fresh authorization.
 
 Automatic resend is allowed for the listed §5 verbs only through this durable
 idempotency path, not based on an assumed harmless verb. Permission/question

@@ -585,3 +585,5 @@ impl Writer {
         .unwrap()
     }
 }
+
+mod capacity;

@@ -188,7 +188,7 @@ impl Core {
         let (stop, _) = watch::channel(false);
         let fleet = fleet::Client::new(wake.clone(), stop.subscribe());
         let journal = commands::Ownership::new(data, wake.clone());
-        let (commands, command_owner) = commands::channel(wake.clone(), journal.gate());
+        let (commands, command_owner) = commands::channel(wake.clone(), journal.clone());
         let (admission, admission_owner) = super::local_admission::channel(wake.clone());
         let (histories, owner) = crate::structured::history::owner::channel(wake);
         Ok(Self {
