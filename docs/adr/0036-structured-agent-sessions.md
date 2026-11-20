@@ -1991,6 +1991,38 @@ harmless only with the same principal/id/payload and `resume_only:true`: an
 absent/expired claim still refuses and cannot dispatch. The class is not license
 to resend as a first send or create a new ID; the outbox/expiry rules still apply.
 
+**Bound and overflow (J1, #1380).** Never evict an unexpired claim. Refuse
+new claims before dispatch with `session_busy` (`retry:later`) when either the
+per-principal or global entry cap is reached. The local constants budget four
+sockets per credential times four outstanding commands per socket times 2,880
+30-second acknowledgement windows per day: 46,080 claims per principal. The
+sixteen-socket global limit gives 184,320 claims globally. This supports a
+sustained budget of sixteen new commands per principal per 30 seconds for a
+full day; the transport has concurrency limits, not an enforced command-rate
+limit, so higher sustained traffic can reach the cap and must back off.
+Shared-principal credentials share the principal cap. Persist the payload digest,
+never the payload, and bound each claim/result record to 67,584 encoded bytes
+including its newline; acknowledgements also retain the 65,536-byte wire cap.
+An oversized outcome leaves its durable claim uncertain instead of truncating
+the result. The namespace is an explicit string (`local` today), so a later
+home-node namespace needs no format change.
+
+The J1 snapshot journal uses an exclusive operation lease, reloads authoritative
+records before each operation, and rewrites through a private temporary file,
+file sync, rename and directory sync for both claim and outcome. This is the
+atomic-replacement equivalent of required append/rollback: a failed claim never
+dispatches, and a failed outcome commit reports uncertainty. It costs O(retained
+entries) I/O per mutation; there is no independent in-memory dedupe cache.
+New admissions compact claims at least 24 hours old using an injected Unix
+millisecond clock in tests. Backward clock movement retains claims longer.
+Count-based rotation must never discard unexpired claims. At most one record
+per claim is stored, with one temporary snapshot during replacement. Preserve
+unknown/invalid complete records raw and serve readable cached results, but
+refuse new mutations while such records exist. Preserve a torn final line as
+an opaque `torn_tail` byte array on the next rewrite; these records count against
+the global cap and are bounded to four times the claim-record size plus 32 bytes. Recovered
+pending claims remain uncertain; completed claims replay the first ack.
+
 Automatic resend is allowed for the listed §5 verbs only through this durable
 idempotency path, not based on an assumed harmless verb. Permission/question
 answers retain stable question/request IDs; apply answer validity, principal

@@ -293,13 +293,38 @@ through the remote fleet directory receives the same refusal, even without
 `node_id`. Remote lifecycle forwarding
 remains gated by ADR-0043.
 
-An authenticated replay of the same principal, command ID, verb and arguments
-returns the first lifecycle ack while that entry remains in the owner's bounded
-1,024-command retention set. Reusing a retained ID with different arguments or
-verb refuses `invalid_params`. Revocation and scope checks precede replay.
-An uncertain retry with `resume_only: true` and no retained result refuses
-`session_unconfirmed`; it never launches again. Retention is in memory and
-ends on server restart or eviction.
+Wire commands share a durable journal at `<data dir>/wire/commands.jsonl`.
+The server checks current authorization before claiming or replaying a command.
+It persists the local namespace, principal, command ID, canonical verb/argument
+SHA-256 digest and first-admission time before dispatch, then persists the ack
+before returning it. A restart after saving an ack still returns that first ack.
+The `resume_only` delivery flag is excluded from the digest; changing the verb,
+arguments or target for a retained ID refuses `invalid_params`.
+
+Use `resume_only: false` for the first send and `true` for every uncertain retry,
+with the same principal, ID and payload. A missing, lost, expired or recovered
+unfinished claim returns `session_unconfirmed` (exit 8, `retry: later`) without
+dispatch. That means **unknown outcome**, not cancellation or permission to send
+a fresh ID. Live duplicates of a pending send share its receipt. Inspect the
+subject state when an outcome remains unknown.
+
+Claims expire 24 hours after admission. Unexpired claims are never evicted:
+new claims return `session_busy` (`retry: later`) at 46,080 entries per principal
+or 184,320 globally. These constants budget four sockets times four outstanding
+commands per credential, repeated over 2,880 thirty-second ack windows per day;
+the global cap scales to sixteen sockets. This is a sizing budget, not a rate
+limiter. Faster sustained traffic can reach capacity and must back off. Each
+record is at most 67,584 bytes including its newline, and each ack retains the
+65,536-byte wire limit. Oversized results leave the claim uncertain.
+
+Mutations reload the file under an exclusive lease and use a synced temporary
+snapshot, rename and directory sync. New admissions compact expired records;
+there is no count-based rotation or separate memory cache. Rewrites cost
+O(retained entries). A torn final line is ignored and its raw bytes preserved
+on the next rewrite. Unknown or invalid complete entries are skipped and
+preserved raw; cached readable acks remain available, while new mutations refuse
+`session_busy` pending repair or upgrade. This journal is local; remote command
+forwarding remains gated by ADR-0043.
 
 `agent.start` permits fresh launches through the existing server-side launch
 gates, including `structured_needs_agent_user`. It cannot resume a structured

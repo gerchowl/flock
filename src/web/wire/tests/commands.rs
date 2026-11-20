@@ -395,8 +395,8 @@ fn same_principal_command_id_is_fenced_across_sockets() {
         second.send(json!({"t":"cmd","cmd_id":"same-id","verb":"agent.decide","args":other,"resume_only":false})).await;
         refusal(
             case.ack(&mut second).await,
-            "session_unconfirmed",
-            crate::cli::exit::UNCONFIRMED,
+            "invalid_params",
+            crate::api::error_code::ErrorCode::InvalidParams.exit(),
         );
         assert_eq!(
             case.handles()
@@ -810,3 +810,93 @@ fn previous_runtime_permission_handle_is_refused_after_restart() {
 mod trace_permission;
 
 mod trace_clean;
+
+#[test]
+fn completed_decision_replays_after_wire_restart_and_missing_journal_refuses() {
+    runtime(async {
+        let mut case = Case::new(183130).await;
+        let args = case.prompt().await;
+        let mut socket = case.open().await;
+        socket.send(json!({"t":"cmd","cmd_id":"restart-ack","verb":"agent.decide","args":args,"resume_only":false})).await;
+        let first = json!({"t":"ack","cmd_id":"restart-ack","ok":true,
+            "result":{"request_id":args["request_id"],"decision":args["decision"]}});
+        let wake = case.server.wake.clone();
+        within(async {
+            loop {
+                let changed = wake.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                case.service();
+                let saved =
+                    fs::read_to_string(case.server._root.path().join("wire/commands.jsonl"))
+                        .ok()
+                        .is_some_and(|text| {
+                            text.lines().any(|line| {
+                                let record: Value = serde_json::from_str(line).unwrap();
+                                record["cmd_id"] == "restart-ack" && record["outcome"] == first
+                            })
+                        });
+                if saved {
+                    break;
+                }
+                changed.await;
+            }
+        })
+        .await;
+        // Drop before the client reads its first ack, then recover only through resume.
+        drop(socket);
+        case.server.core.shutdown().await.unwrap();
+        case.server.task.abort();
+        let _ = (&mut case.server.task).await;
+        let core = Core::with_clock(
+            TokenStore::open(case.server._root.path()).unwrap(),
+            case.server._root.path().to_owned(),
+            Arc::new(case.server.clock.clone()),
+            case.server.wake.clone(),
+        )
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        case.server.bind = listener.local_addr().unwrap();
+        let router = core.router();
+        case.server.task = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        case.server.core = Arc::new(core);
+        let mut socket = case.open().await;
+        socket.send(json!({"t":"cmd","cmd_id":"restart-ack","verb":"agent.decide","args":args,"resume_only":true})).await;
+        assert_eq!(case.ack(&mut socket).await, first);
+        fs::remove_file(case.server._root.path().join("wire/commands.jsonl")).unwrap();
+        socket.send(json!({"t":"cmd","cmd_id":"restart-ack","verb":"agent.decide","args":args,"resume_only":true})).await;
+        refusal(
+            case.ack(&mut socket).await,
+            "session_unconfirmed",
+            crate::cli::exit::UNCONFIRMED,
+        );
+        case.stop().await;
+    });
+}
+
+#[test]
+fn journal_claim_failure_refuses_before_permission_mutation() {
+    runtime(async {
+        let mut case = Case::new(183131).await;
+        let args = case.prompt().await;
+        let mut socket = case.open().await;
+        let journal = case.server._root.path().join("wire");
+        crate::platform::structured::ensure_private_dir(&journal).unwrap();
+        fs::create_dir(journal.join("commands.tmp")).unwrap();
+        let handles = case.handles();
+        socket.send(json!({"t":"cmd","cmd_id":"failed-claim","verb":"agent.decide","args":args,"resume_only":false})).await;
+        refusal(
+            case.ack(&mut socket).await,
+            "session_busy",
+            crate::cli::exit::FAILURE,
+        );
+        assert_eq!(case.handles(), handles);
+        assert!(!journal.join("commands.jsonl").exists());
+        fs::remove_dir(journal.join("commands.tmp")).unwrap();
+        socket.send(json!({"t":"cmd","cmd_id":"failed-claim","verb":"agent.decide","args":args,"resume_only":false})).await;
+        assert_eq!(case.ack(&mut socket).await["ok"], true);
+        case.stop().await;
+    });
+}

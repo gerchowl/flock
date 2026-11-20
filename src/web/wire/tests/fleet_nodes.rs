@@ -261,6 +261,7 @@ fn bound_node_status_updates_and_safe_failures_reach_the_public_stream() {
         let _ = (&mut case.server.task).await;
         let core = Core::with_clock(
             TokenStore::open(case.server._root.path()).unwrap(),
+            case.server._root.path().to_owned(),
             Arc::new(case.server.clock.clone()),
             case.server.wake.clone(),
         )

@@ -336,6 +336,7 @@ impl ShellServer {
         let clock = Arc::new(TestClock::new());
         let core = Core::with_clock(
             crate::structured::permissions::auth::tokens::TokenStore::open(root.path()).unwrap(),
+            root.path().to_owned(),
             clock.clone(),
             Arc::new(tokio::sync::Notify::new()),
         )

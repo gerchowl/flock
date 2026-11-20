@@ -127,6 +127,7 @@ impl Core {
         wake: Arc<tokio::sync::Notify>,
         owner: Owner,
     ) -> io::Result<Self> {
+        let journal_data = data.clone();
         let store = super::store_io::shared()
             .run(move || {
                 owner.get(
@@ -139,12 +140,13 @@ impl Core {
             .await
             .ok_or_else(|| io::Error::other("client token store worker unavailable"))?
             .map_err(io::Error::other)?;
-        Self::from_store(store, Arc::new(SystemClock), wake)
+        Self::from_store(store, Arc::new(SystemClock), wake, journal_data)
     }
     /// Embed with a supplied monotonic clock shared by credential and transport deadlines.
     #[cfg(test)]
     pub(crate) fn with_clock(
         store: TokenStore,
+        data: PathBuf,
         clock: Arc<dyn Clock>,
         wake: Arc<tokio::sync::Notify>,
     ) -> io::Result<Self> {
@@ -152,17 +154,19 @@ impl Core {
             Arc::new(Store::new(store, Arc::new(AppClock::new(clock.clone())))),
             clock,
             wake,
+            data,
         )
     }
     fn from_store(
         store: Arc<Store>,
         clock: Arc<dyn Clock>,
         wake: Arc<tokio::sync::Notify>,
+        data: PathBuf,
     ) -> io::Result<Self> {
         let epoch = store.random::<16>().map_err(io::Error::other)?;
         let (stop, _) = watch::channel(false);
         let fleet = fleet::Client::new(wake.clone(), stop.subscribe());
-        let (commands, command_owner) = commands::channel(wake.clone());
+        let (commands, command_owner) = commands::channel(wake.clone(), data);
         let (admission, admission_owner) = super::local_admission::channel(wake.clone());
         let (histories, owner) = crate::structured::history::owner::channel(wake);
         Ok(Self {
