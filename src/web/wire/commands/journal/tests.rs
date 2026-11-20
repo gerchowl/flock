@@ -566,3 +566,22 @@ impl Write for Stream {
 }
 
 mod compaction;
+
+impl Writer {
+    pub(in crate::web::wire) async fn test_open(
+        data: PathBuf,
+        wake: Arc<Notify>,
+        hook: Box<dyn FnMut() + Send>,
+    ) -> Self {
+        Self::spawn(
+            move || {
+                let mut journal = Journal::open(&data)?;
+                journal.before_sync = Some(hook);
+                Ok(journal)
+            },
+            wake,
+        )
+        .await
+        .unwrap()
+    }
+}

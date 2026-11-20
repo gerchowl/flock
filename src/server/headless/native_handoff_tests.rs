@@ -40,9 +40,15 @@ async fn import_bind_waits_for_the_exporters_native_socket_unlink() {
         unlinked = true;
     })
     .unwrap();
-    let core = Core::new(root.path().into(), Arc::new(tokio::sync::Notify::new()))
-        .await
-        .unwrap();
+    let core = Core::new_shared(
+        root.path().into(),
+        Arc::new(tokio::sync::Notify::new()),
+        crate::structured::permissions::auth::tokens::server::Owner::default(),
+        crate::api::EventHub::default(),
+        true,
+    )
+    .await
+    .unwrap();
     let importer = Listener::prepare(
         None,
         Codes::default(),
@@ -59,6 +65,8 @@ async fn import_bind_waits_for_the_exporters_native_socket_unlink() {
         unlinked,
         "import binding must wait even when API and terminal paths are absent"
     );
+    exporter.freeze_commands().await.unwrap();
+    importer.acquire_commands().await.unwrap();
     exporter.shutdown().await.unwrap();
     assert!(
         path.exists(),

@@ -1871,6 +1871,82 @@ fn live_handoff_bad_expected_protocol_rolls_back_old_server() {
     cleanup_test_base(&base);
 }
 
+#[cfg(feature = "web")]
+fn wait_for_command_journal_owner(
+    lock: &Path,
+    socket: &Path,
+    budget: Duration,
+) -> Result<(), String> {
+    let file = fs::File::open(lock).map_err(|error| error.to_string())?;
+    let deadline = Instant::now() + budget;
+    loop {
+        match file.try_lock() {
+            Err(fs::TryLockError::WouldBlock) => return Ok(()),
+            Err(fs::TryLockError::Error(error)) => return Err(error.to_string()),
+            Ok(()) => file.unlock().map_err(|error| error.to_string())?,
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err("command journal lease was not reacquired".into());
+        }
+        let response = match try_request_bounded(
+            socket,
+            serde_json::json!({"id":"journal-owner", "method":"ping", "params":{}}),
+            Some(remaining.min(Duration::from_secs(1))),
+        ) {
+            Ok(response) => response,
+            Err(error) if error.retryable && Instant::now() >= deadline => {
+                return Err("command journal lease was not reacquired".into());
+            }
+            Err(error) => return Err(error.message),
+        };
+        if response.get("error").is_some() {
+            return Err(format!("unexpected ping response: {response}"));
+        }
+    }
+}
+
+#[cfg(feature = "web")]
+#[test]
+fn journal_owner_wait_fails_when_a_live_responsive_server_never_acquires() {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    let root = SocketDir::reserve("jow");
+    let path = root.path().join("api.sock");
+    let lock = root.path().join("journal.lock");
+    fs::File::create(&lock).unwrap();
+    let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let server_stop = stop.clone();
+    let producer = thread::spawn(move || loop {
+        let (mut stream, _) = listener.accept().unwrap();
+        if server_stop.load(Ordering::Acquire) {
+            break;
+        }
+        stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut line = String::new();
+        BufReader::new(stream.try_clone().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(request["method"], "ping");
+        // A peer may close at its probe deadline; keep the producer alive.
+        let _ = writeln!(stream, "{}", serde_json::json!({"result":{"type":"pong"}}));
+    });
+    let result = wait_for_command_journal_owner(&lock, &path, Duration::from_millis(50));
+    stop.store(true, Ordering::Release);
+    let _wake = UnixStream::connect(&path).unwrap();
+    producer.join().unwrap();
+    assert_eq!(
+        result.unwrap_err(),
+        "command journal lease was not reacquired"
+    );
+}
+
 fn live_handoff_import_failure_rolls_back_old_server_at(failure_point: &str) {
     let request = |socket: &Path, value| {
         try_request_bounded(socket, value, Some(Duration::from_secs(10)))
@@ -1998,6 +2074,17 @@ fn live_handoff_import_failure_rolls_back_old_server_at(failure_point: &str) {
         );
     }
     wait_for_api(&api_socket, Duration::from_secs(10));
+    #[cfg(feature = "web")]
+    if committed {
+        wait_for_command_journal_owner(
+            &config_home
+                .join(support::paths::app_dir_name())
+                .join("wire/commands.lock"),
+            &api_socket,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+    }
     UnixStream::connect(&client_socket).expect("handoff client listener is bound");
 
     let after = request(

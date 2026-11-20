@@ -41,7 +41,9 @@ async fn fixture_config(
     let owner = Owner::default();
     let store = owner.get(root.path(), ttl).unwrap();
     let wake = Arc::new(tokio::sync::Notify::new());
-    let core = Core::from_store(store, transport_clock, wake.clone()).unwrap();
+    let core =
+        Core::from_store(store, transport_clock, wake.clone(), root.path().to_owned()).unwrap();
+    core.acquire_commands().await.unwrap();
     let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let bind = socket.local_addr().unwrap();
     let mut app = App::new(
