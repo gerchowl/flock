@@ -152,6 +152,21 @@ sys.stdin.read()
         listed["result"]["structured_agents"][0]["lifecycle"], "offline",
         "{listed}"
     );
+    fixture.app.state.config.structured.profile = "switched-fixture".into();
+    let refused = command(
+        &mut fixture,
+        &mut server,
+        &mut socket,
+        "profile-refusal",
+        "agent.restart",
+        json!({"target":"fixture-launch","reason":"fixture resume"}),
+    )
+    .await;
+    assert_eq!(
+        refused["error"]["code"], "structured_profile_mismatch",
+        "{refused}"
+    );
+    fixture.app.state.config.structured.profile = "fixture".into();
     fixture.app.state.config.structured.run_as = crate::structured::launch::RunAs::Agent;
     let refused = command(
         &mut fixture,
@@ -247,6 +262,12 @@ sys.stdin.read()
     for (command_id, expected_credential, verb, outcome) in [
         ("stop", &first_identity, "agent.stop", "admitted"),
         ("restart", &first_identity, "agent.restart", "admitted"),
+        (
+            "profile-refusal",
+            &first_identity,
+            "agent.restart",
+            "structured_profile_mismatch",
+        ),
         (
             "run-as-refusal",
             &first_identity,
@@ -417,6 +438,34 @@ async fn structured_lifecycle_refusals_audit_target_session_and_principal() {
     let _subscriber = tracing::subscriber::set_default(subscriber);
     let mut socket = Socket::open(&server).await;
     assert_eq!(socket.hello(2, &token.0).await["t"], "welcome");
+    let remote = "00000000-0000-4000-8000-000000003153";
+    let mut peer = crate::peers::PeerSummaryState::new(&crate::config::PeerConfig {
+        name: "remote.example".into(),
+        ..Default::default()
+    });
+    peer.structured_agents
+        .push(crate::api::schema::PeerStructuredAgentSummary {
+            agent_id: remote.into(),
+            agent: None,
+            status: crate::api::schema::AgentStatus::Idle,
+            runtime: crate::structured::registry::StructuredRuntime::Structured,
+        });
+    fixture.app.state.peer_summaries.push(peer);
+    for verb in ["agent.stop", "agent.restart"] {
+        let refused = command(
+            &mut fixture,
+            &mut server,
+            &mut socket,
+            &format!("remote-{verb}"),
+            verb,
+            json!({"target":remote,"reason":"fixture resume"}),
+        )
+        .await;
+        assert_eq!(
+            refused["error"]["code"], "unsupported_for_agent",
+            "{refused}"
+        );
+    }
     let mut reduced = store.authenticate(&token).unwrap();
     store.answer_only_app_for_test(&mut reduced);
     for verb in ["agent.stop", "agent.restart"] {
@@ -431,13 +480,19 @@ async fn structured_lifecycle_refusals_audit_target_session_and_principal() {
         .map(|line| serde_json::from_str::<Value>(line).unwrap())
         .filter(|event| event["fields"]["message"] == "wire lifecycle admission")
         .collect();
-    assert_eq!(audits.len(), 2);
+    assert_eq!(audits.len(), 4);
     for event in audits {
         let fields = &event["fields"];
         assert_eq!(fields["credential"], info.name, "{fields}");
+        assert_eq!(fields["principal"], info.principal, "{fields}");
+        if fields["target"] == remote {
+            assert_eq!(fields["agent_id"], remote, "{fields}");
+            assert_eq!(fields["session_id"], "", "{fields}");
+            assert_eq!(fields["outcome"], "unsupported_for_agent", "{fields}");
+            continue;
+        }
         assert_eq!(fields["target"], "fixture-launch", "{fields}");
         assert_eq!(fields["agent_id"], id, "{fields}");
-        assert_eq!(fields["principal"], info.principal, "{fields}");
         assert_eq!(fields["outcome"], "not_authorized", "{fields}");
         if fields["verb"] == "agent.restart" {
             assert_eq!(fields["session_id"], session_id, "{fields}");

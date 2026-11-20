@@ -44,6 +44,8 @@ pub(crate) use admission::Admission;
 
 /// Internal launch policy, supplied by authenticated admission in #1843.
 pub struct Launch {
+    /// Actual admitted profile; becomes durable only on matching harness init.
+    pub profile_identity: Option<super::registry::ProfileIdentity>,
     /// Attested starter and validated, nonce-framed MCP opening turn; CLI starts stay idle.
     pub opening_turn: Option<(String, crate::spawn::prompt::SpawnPrompt)>,
     /// Stable registered identity.
@@ -183,6 +185,7 @@ impl Workers {
         prepare: impl FnOnce(&Record) -> Result<LaunchProfile, LaunchError> + Send + 'static,
     ) -> Result<u64, ErrorCode> {
         let Launch {
+            profile_identity,
             opening_turn,
             agent_id,
             generation: current,
@@ -235,6 +238,7 @@ impl Workers {
         {
             return Err(ErrorCode::StructuredRecoveryRequired);
         }
+        record.admit_profile(profile_identity.as_ref())?;
         self.reserve_pending(
             &agent_id,
             lineage.as_ref().map(|(id, _)| id.as_str()),
@@ -250,6 +254,12 @@ impl Workers {
                 _ => ErrorCode::AgentStartFailed,
             }
         })?;
+        registry
+            .stage_profile(&agent_id, generation, profile_identity)
+            .map_err(|_| {
+                self.pending.remove(&agent_id);
+                ErrorCode::AgentStartFailed
+            })?;
         let (tx, messages) = mpsc::sync_channel(3);
         let stop = StopRequest::default();
         let cancelled = stop.clone();

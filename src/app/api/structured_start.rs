@@ -7,7 +7,7 @@ use crate::api::{
 };
 use crate::structured::{
     launch::{LaunchError, LaunchMode, LaunchProfile, ProfileConfigDir, VerifiedBinary},
-    registry::{Record, StructuredRuntime},
+    registry::{ProfileIdentity, Record, StructuredRuntime},
     workers::{Admission, Launch},
 };
 use std::{io, path::PathBuf, time::Duration};
@@ -101,6 +101,15 @@ impl App {
         }) {
             return Err(ErrorCode::StructuredRecoveryRequired);
         }
+        let profile_identity = ProfileIdentity {
+            profile: self.state.config.structured.profile.clone(),
+            binding: None,
+        };
+        if let Some((id, _)) = &existing {
+            if let Some((record, _, _)) = self.state.structured_agents.get(id) {
+                record.admit_profile(Some(&profile_identity))?;
+            }
+        }
         self.state
             .config
             .structured
@@ -157,6 +166,7 @@ impl App {
                 .structured_agents
                 .register(Record {
                     harness_established: false,
+                    profile_identity: None,
                     runtime: StructuredRuntime::Structured,
                     agent_id: id.clone(),
                     name: Some(params.name),
@@ -175,6 +185,7 @@ impl App {
         let started = self.structured_workers.start(
             &mut self.state.structured_agents,
             Launch {
+                profile_identity: Some(profile_identity),
                 opening_turn,
                 agent_id: agent_id.clone(),
                 generation,

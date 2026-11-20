@@ -327,30 +327,48 @@ impl Owner {
                         .and_then(Value::as_str)
                         .unwrap_or_default();
                     // Registry context keeps refused decisions attributable without granting authority.
-                    let identity = if target == "self" {
-                        None
-                    } else {
-                        app.state
-                            .structured_agents
-                            .get(target)
-                            .map(|(record, _, _)| {
-                                (record.agent_id.clone(), record.session_id.clone())
+                    let identity = match &outcome {
+                        Ok(Outcome::Decided(value) | Outcome::Replayed(Ok(value))) => {
+                            value.get("agent").and_then(|agent| {
+                                Some((
+                                    agent.get("agent_id")?.as_str()?.to_owned(),
+                                    agent.get("session_id")?.as_str()?.to_owned(),
+                                ))
                             })
-                            .or_else(|| {
-                                app.state
-                                    .structured_agents
-                                    .records()
-                                    .into_iter()
-                                    .find(|record| record.name.as_deref() == Some(target))
-                                    .map(|record| (record.agent_id, record.session_id))
-                            })
-                    };
+                        }
+                        _ => None,
+                    }
+                    .or_else(|| {
+                        if target == "self" {
+                            None
+                        } else {
+                            app.state
+                                .structured_agents
+                                .get(target)
+                                .map(|(record, _, _)| {
+                                    (record.agent_id.clone(), record.session_id.clone())
+                                })
+                                .or_else(|| {
+                                    app.state
+                                        .structured_agents
+                                        .records()
+                                        .into_iter()
+                                        .find(|record| record.name.as_deref() == Some(target))
+                                        .map(|record| (record.agent_id, record.session_id))
+                                })
+                        }
+                    });
+                    let agent_id = identity
+                        .as_ref()
+                        .map(|(agent, _)| agent.clone())
+                        .or_else(|| app.locate_agent(target).map(|location| location.agent_id))
+                        .unwrap_or_default();
                     tracing::info!(
                         event = "wire.lifecycle.admission",
                         credential = request.session.info.name.as_str(),
                         principal = request.session.info.principal.as_str(),
                         target,
-                        agent_id = identity.as_ref().map_or("", |(agent, _)| agent.as_str()),
+                        agent_id = agent_id.as_str(),
                         session_id = identity
                             .as_ref()
                             .map_or("", |(_, session)| session.as_str()),
