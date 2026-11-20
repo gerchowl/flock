@@ -92,15 +92,15 @@ pub(super) fn prepare(entry: &mut Entry, deadline: Option<Instant>) -> Result<()
 }
 
 pub(super) fn unbound(entry: &Entry, reason: &str, json: bool) -> i32 {
-    let message = format!("session_unbound: delegate {} (agent {}, terminal {}): {reason}; inspect with `flk pane read {}`",
-        entry.name, entry.agent_id.as_deref().unwrap_or("unknown"), entry.terminal_id, entry.pane_id);
+    let message = format!("session_unbound: delegate {} (agent {}, terminal {}): {reason}; inspect with `flk pane read {}`; operator repair: `flk delegate rebind {} --agent <id>`",
+        entry.name, entry.agent_id.as_deref().unwrap_or("unknown"), entry.terminal_id, entry.pane_id, entry.name);
     eprintln!("{message}");
     emit_outcome(
         entry,
         "session_unbound",
         Some(
             &serde_json::json!({"error":{"code":"session_unbound","message":message},
-        "agent_id":entry.agent_id,"terminal_id":entry.terminal_id,"pane_id":entry.pane_id}),
+        "reason":reason,"agent_id":entry.agent_id,"terminal_id":entry.terminal_id,"pane_id":entry.pane_id}),
         ),
         json,
         &entry.cursor,

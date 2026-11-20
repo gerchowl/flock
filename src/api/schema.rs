@@ -151,6 +151,9 @@ pub enum Method {
     /// joined with cached state only.
     #[serde(rename = "delegate.list")]
     DelegateList(DelegateListParams),
+    /// Authorize an explicit local registry repair without changing ownership.
+    #[serde(rename = "delegate.rebind")]
+    DelegateRebind(DelegateRebindParams),
     #[serde(rename = "msg.send")]
     MsgSend(MsgSendParams),
     #[serde(rename = "msg.reply")]
@@ -542,6 +545,7 @@ impl Method {
             | Self::ClientAppMint(_)
             | Self::ChannelHello(_)
             | Self::WaitPark(_)
+            | Self::DelegateRebind(_)
             | Self::OwnerBind(_)
             | Self::OwnerUnbind(_)
             | Self::GoalArm(_)
@@ -577,6 +581,14 @@ impl Method {
             | Self::RevertRun(_) => true,
         }
     }
+}
+
+/// Operator-selected identity for a client-side delegate record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DelegateRebindParams {
+    pub name: String,
+    pub agent_id: String,
+    pub previous_agent_id: Option<String>,
 }
 
 /// Binding commits use the same closed plan/digest shape as reviewed enablement.
@@ -2855,6 +2867,8 @@ pub enum EventKind {
     /// #959 / ADR-0027 §1: an attested agent started another agent. See
     /// `EventData::AgentDelegated`.
     AgentDelegated,
+    /// Operator approved a local registry rebind; not an ownership edge.
+    DelegateRebindAuthorized,
     AgentRemoved,
     DeliveryAttemptUpdated,
     MessageQueued,
@@ -2988,6 +3002,7 @@ impl EventKind {
             | Self::PaneAgentStatusChanged
             | Self::AgentRemoved
             | Self::AgentForked
+            | Self::DelegateRebindAuthorized
             | Self::AgentDelegated
             | Self::GoalArmed
             | Self::GoalAmended
@@ -4835,6 +4850,12 @@ pub enum EventData {
         agent_id: String,
         session: String,
         reason: String,
+    },
+    /// Authorization to update a local client record, not proof it was written.
+    DelegateRebindAuthorized {
+        name: String,
+        previous_agent_id: Option<String>,
+        agent_id: String,
     },
     /// #959 / ADR-0027 §1: the architect -> delegate edge. `architect` is the
     /// caller `spawn_caller()` attested, never a request parameter, because
