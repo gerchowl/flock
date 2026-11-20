@@ -4,7 +4,9 @@
 - Date: 2026-10-08
 - Issues: [#661](https://github.com/gerchowl/flock/issues/661),
   [#623](https://github.com/gerchowl/flock/issues/623),
-  [#640](https://github.com/gerchowl/flock/issues/640).
+  [#640](https://github.com/gerchowl/flock/issues/640),
+  [#1380](https://github.com/gerchowl/flock/issues/1380) (version negotiation
+  amendment, accepted 2026-11-19, not yet implemented).
 - Decision owner: operator, accepted 2026-10-08 with the defaults and further
   rulings recorded in the Decisions section below.
   Extends ADR-0009 and clarifies ADR-0008, superseding their affected transport
@@ -524,7 +526,8 @@ commits that change the wire use `!` in the conventional subject or a
 `BREAKING CHANGE` footer. This ADR does not itself bump package versions or
 publish a release.
 
-At each held-edge handshake require identical mesh protocol versions. Refuse
+At each held-edge handshake require identical mesh protocol versions (for
+bumps after the negotiation release see Amendment #1380 below). Refuse
 a mismatch with a clear error naming both local and remote versions and
 `upgrade flk on <peer>` using the configured peer name. v1.0.0 speaks mesh
 protocol 5. Protocol 4 existed only in development builds, whose nodes deny
@@ -577,6 +580,171 @@ archived with their original typed columns before bodies are cleared; a
 failed archive write leaves the row intact. Migration failures name the
 store path and recovery hint; moving it aside starts empty and loses its
 custody, so preserve a backup before any such recovery.
+
+### Amendment #1380: mesh hello version negotiation
+
+Status: Accepted 2026-11-19 by owner decision on
+[#1380](https://github.com/gerchowl/flock/issues/1380); not yet implemented.
+This supersedes "require identical mesh protocol versions" above for every
+bump after the negotiation release. The identical-version rule, its refusal
+text and the `upgrade flk on <peer>` hint remain for a peer outside the
+support window. The mesh VERSION stays 5 until the `command` envelope slice
+(step 2 below) ships.
+
+**Why.** A closed `Kind` enum plus identical-version hello makes every new
+envelope kind a coordinated fleet upgrade (#1380 found this for a `command`
+kind carrying ADR-0036 §5 `cmd`s to another node's agent). Negotiation makes
+later bumps rolling, and the one coordinated upgrade is the release that
+ships negotiation itself.
+
+**1. Hello and the support window.** Each node advertises the closed range
+`[mesh_min, mesh_max]` it implements. The existing `mesh` field carries
+`mesh_max`, so a reader that knows only the old field sees the highest
+version. The window is the current VERSION N and the previous one, N-1,
+floored at 5 because VERSION 4 was development-only: the negotiation release
+advertises `[5, 5]`, the first VERSION 6 build `[5, 6]`, a VERSION 7 build
+`[6, 7]`. The window is a compile-time constant, not configuration.
+
+Both offers are signed in the hello transcript, so the ranges are bound to
+the possession proofs and cannot be changed in transit. Each side computes
+the session VERSION independently as `min(local_max, remote_max)` and
+requires it to be at least `max(local_min, remote_min)`; otherwise the
+ranges do not overlap. The acceptor reports its computed value in its reply
+and the dialer refuses on any disagreement. A range with `mesh_min` below 1
+or above `mesh_max` is invalid and refused.
+
+No overlap is refused at hello with the existing typed code
+`mesh_version_mismatch` and a message naming both ranges:
+`mesh version mismatch: local 5-6, remote 7-8; upgrade flk on this node`.
+The named side is the one whose `mesh_max` is lower. The refusal takes the
+long backoff and shows in `flk peers` and `flk status` with the configured
+peer name, as for any incompatible peer. A peer whose offer has no
+`mesh_min` predates negotiation and is refused before its signature is
+checked, as `upgrade flk on <peer> (peer predates version negotiation)`,
+because the new offer fields change the signed transcript and an old node
+cannot verify it.
+
+**2. Per-peer VERSION and send gating.** The negotiated VERSION is stored
+with the held-edge session of that peer, renegotiated at every hello and
+never persisted. `flk peers` shows it. Every sender, including a forwarding
+hub, checks it per next hop before emitting an envelope kind or a field that
+a version introduced (`deny_unknown_fields` structures stay strict, so a
+field added in VERSION N is also gated). The gate is a single lookup from
+kind or field to the version that introduced it, used at dequeue and at
+forward time, never only at enqueue.
+
+- `message` and `receipt` exist at every negotiable VERSION and are never
+  gated.
+- `command` (VERSION 6) is sent only to a peer at 6 or higher. When the
+  origin's next hop negotiated less, the origin refuses the `cmd` with the
+  existing ADR-0036 §5 `unsupported_for_agent` before any envelope or custody
+  row is created. The peer never sees it, so there is no decode failure on
+  the receiver.
+- A hub that cannot forward a kind to its next hop returns a `refused`
+  receipt to the origin with the same code, and stores nothing. A command
+  whose peer renegotiated lower between accept and dequeue gets the same
+  refusal. A command is never held for a later, newer peer.
+- Held `message`/`receipt` custody to an incompatible peer follows the
+  paragraph above: stored, not sent.
+
+**3. Unknown kinds are protocol violations.** Within a session at VERSION
+`v`, the receiver accepts exactly the kinds that `v` defines. A kind it
+cannot decode, or a known kind introduced after `v`, is a protocol violation,
+never a silent drop and never an unacknowledged skip. The receiver:
+
+1. reads the `kind` tag before decoding the envelope, so the failure is
+   typed rather than a whole-batch serde error;
+2. imports and acknowledges nothing from that batch, so the sender keeps
+   custody of every envelope in it;
+3. logs `mesh_protocol_violation` with the peer, session VERSION and the
+   offending kind name, as audit metadata with no body;
+4. closes and resets the session, which returns to the long refusal backoff
+   after the reconnect, and shows the reason in `flk peers`.
+
+This also covers a peer that claims a VERSION it does not implement: if it
+sends a kind or field above what it negotiated, (3) fires on our side; if it
+claims too much and cannot decode what we send, it resets the session on its
+own side, our send fails as an ordinary stream error and custody is retained.
+
+**4. Rollout.** Shipping negotiation needs one last coordinated upgrade, by
+the rule this ADR already applies: stop sending to a node that cannot hold a
+compatible edge until it is upgraded. Operator procedure:
+
+1. Upgrade every node to the negotiation build (still VERSION 5, window
+   `[5, 5]`). Until the whole fleet runs it, an upgraded node and a
+   pre-negotiation node refuse each other as above, and custody for the
+   refused peer stays stored.
+2. Check `flk peers` on each node: all edges established, no
+   `mesh_version_mismatch`.
+3. Only then deploy a VERSION 6 build. Never deploy it to a fleet that still
+   has a pre-negotiation node.
+
+Afterwards upgrades roll node by node within the window. A build at N
+negotiates with N-1 and N, so a fleet of mixed adjacent builds keeps every
+edge, and new-kind features apply only between peers at the newer VERSION.
+Skipping a release (N-2 to N) has no overlap and is refused: step through
+N-1. Dropping support for N-2 happens only when the window moves.
+
+Downgrade: rolling a node back from N to N-1 renegotiates at the next hello;
+its peers stop sending N-only kinds and refuse N-only operations as in (2),
+with no data loss, because N-only kinds are never custody. Rolling back more
+than one version has no overlap and is refused at hello.
+
+**5. Security.** Negotiation selects a feature set only; it changes no
+authentication or authorization. Node-key pinning, possession proofs, the
+origin binding and `[msg] allow_from` (see "Origin policy and fleet pause"),
+custody dedupe and TTLs apply identically at every negotiated VERSION, and
+nothing at N-1 skips an origin or custody check that N performs. The ranges
+are signed (1), the window is a constant that no peer or configuration can
+lower, and the session VERSION is computed by both sides and compared, so a
+peer cannot downgrade a session below the window, choose a version the other
+side does not support, or strip fields by editing the offer. A peer that
+advertises a lower range than it implements only loses features. A peer that
+advertises a higher one is caught by (3). Hello runs before any envelope is
+accepted, and an offer that fails validation never reaches the pin or policy
+code.
+
+**6. Tests and slices.**
+
+Implementation-slice tests, using the debug-only version override extended to
+a range (it stays under `cfg!(debug_assertions)`, like
+`FLOCK_TEST_MESH_VERSION`):
+
+- Mixed pairs `[5, 5]`/`[5, 6]` and `[5, 6]`/`[6, 7]` negotiate 5 and 6
+  in both dial directions, and both sides report the same VERSION.
+- No overlap (`[5, 5]` against `[7, 8]`, and `[6, 7]` against `[5, 5]`) is
+  refused with `mesh_version_mismatch`, both ranges in the message, the
+  correct side named, and the long backoff.
+- Downgrade attempt: an offer edited to a lower or wider range fails
+  signature verification; a peer that advertises below the local window is
+  refused; both sides disagreeing on the computed VERSION is refused.
+- Invalid ranges (`min > max`, zero) and a peer with no `mesh_min` are refused
+  with their own messages, before signature verification for the latter.
+- The kind/field gate: a kind newer than the session VERSION is never
+  emitted, including after renegotiation and by a forwarding hub; `message`
+  and `receipt` flow at every negotiated VERSION.
+- Receiver: an unknown kind and a known kind above the session VERSION each
+  produce `mesh_protocol_violation`, import and acknowledge nothing from the
+  batch, reset the session and leave sender custody intact.
+- The existing mismatch tests (`mesh_version_refusal_names_both_versions...`,
+  the peer stream mismatch tests) keep passing with range text, and a
+  forged `node_id` or an origin outside `allow_from` is still refused at
+  every negotiated VERSION.
+
+Ordered implementation slices:
+
+1. **Negotiation (VERSION stays 5).** `Offer` ranges and the transcript
+   change, session VERSION in the held-edge session, the kind/field gate
+   helper with its lookup table, receiver violation handling, `flk peers`
+   display, refusal text, tests above, and the rollout procedure in the
+   release notes. A breaking wire change, so the commit uses `!`.
+2. **VERSION 6 `command` envelope (#1380).** `Kind::Command` with `cmd_id`,
+   verb, args, the originating principal and its token scopes; destination
+   authorisation of that principal (ADR-0036 §1a, §5; ADR-0043 §4); the
+   `ack` as a `receipt`; VERSION 5 to 6 and the window `[5, 6]`; the
+   `unsupported_for_agent` path for peers below 6; ADR-0036 §5 and the ADR-0043
+   remote command path updated to match. It lands only after slice 1 has
+   shipped to the whole fleet.
 
 ## Alternatives rejected
 
