@@ -177,7 +177,9 @@ fn real_gui_two_nodes_online() {
             {"expect":"message", "text":"request permission"},
             {"emit":"permission", "request_id":"gui-permission", "input":{"command":"true"}},
             {"expect":"decision", "behavior":"allow"},
-            {"emit":"reply", "text":"permission accepted"}
+            {"emit":"reply", "text":"permission accepted"},
+            {"expect":"message", "text":"after restart"},
+            {"emit":"reply", "text":"resumed fixture reply"}
         ]);
         fs::write(
             node.home.join("gui-fleet.json"),

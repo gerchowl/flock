@@ -70,6 +70,9 @@ export type Sender = {
   readonly decide: (args: AgentDecide) => string;
   /** Queues a structured start through the same durable outbox. */
   readonly start?: (name: string, node: string, cwd: string) => string;
+  /** Queues structured lifecycle actions through the command outbox. */
+  readonly restart?: (agent: string) => string;
+  readonly stop?: (agent: string) => string;
   /** Why sending is impossible right now, or null. */
   readonly blocked: () => string | null;
 };

@@ -320,6 +320,13 @@ credential identity, and outcome. Unresolved identities use empty ID fields.
 Generic ingress refusals (including version, command-ID and capacity checks)
 and queue-full refusals before owner dispatch retain their pre-existing audit gap.
 
+The GUI's agent view and command palette offer **Stop agent** with a confirmation
+and **Restart agent** when the agent is offline. Restart resumes the existing
+session; stop it first if it is still running. A stop acknowledgement says cleanup
+was requested; the view follows the server's state until it reports offline.
+These actions require the operator app on the home node. Browser file credentials
+receive a plain-language refusal with the server code available under **Details**.
+
 File credentials retain `operator_only` for structured stop and
 `runtime_unsupported` for structured restart, even with `operate`. Tokens
 without `operate` receive `not_authorized`. Agent callers and mesh relays gain
