@@ -39,6 +39,8 @@ export type PhoneProps = {
   readonly closed: ClosedIds;
   readonly sender: Sender | null;
   readonly composer: ComposerState;
+  /** Actions for the selected structured agent. */
+  readonly actions?: () => JSX.Element;
   /** Shows the unbuilt tabs and views, disabled, with what they wait for. */
   readonly preview: boolean;
   /** The connection's status dot and popover, beside the Inbox title (wire mode); renders nothing in fixture mode. */
@@ -140,6 +142,7 @@ export function PhoneWorkbench(props: PhoneProps): JSX.Element {
                 <span id={summary}>Summary waits for goal and step records.</span> <span id={pr}>PR waits for a PR source.</span>
               </p>
             </Show>
+            {props.actions?.()}
             <div class="phone__body">
               <Show when={props.unavailable() === null} fallback={<p class="focus__empty">{props.unavailable()}</p>}>
                 <Transcript

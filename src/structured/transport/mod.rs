@@ -332,7 +332,11 @@ impl Transport {
                 let result = pump(
                     stdout, location, &version, output_tx, &b, &u, &c, &plane, &source,
                 );
-                source.finish(result.is_err());
+                // Cancelled delivery leaves fsynced history readable. Storage and
+                // terminal-audit failures still fail the publication authority.
+                source.finish(result.as_ref().is_err_and(|error| {
+                    !error.get_ref().is_some_and(|cause| cause.is::<Cancelled>())
+                }));
                 plane.book.lock().end();
                 if result.is_err() {
                     c.store(true, Ordering::Release);
@@ -701,8 +705,17 @@ impl Write for InputBuffer<'_> {
     }
 }
 
+#[derive(Debug)]
+struct Cancelled;
+impl std::fmt::Display for Cancelled {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("transport cancelled")
+    }
+}
+impl std::error::Error for Cancelled {}
+
 fn cancelled() -> io::Error {
-    io::Error::new(io::ErrorKind::Interrupted, "transport cancelled")
+    io::Error::new(io::ErrorKind::Interrupted, Cancelled)
 }
 
 fn write_inputs(

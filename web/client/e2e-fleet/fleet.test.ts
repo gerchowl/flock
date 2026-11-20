@@ -2,8 +2,10 @@
 import { expect, test } from "bun:test";
 import { GlobalRegistrator } from "@happy-dom/global-registrator";
 import { chromium } from "playwright";
+import { createConnection, createServer, type Socket } from "node:net";
 import { mkdir } from "node:fs/promises";
 import type { KnownSessionEvent } from "../src/gen/KnownSessionEvent";
+import type { StructuredAgentInfo } from "../src/gen/StructuredAgentInfo";
 import type { ServerFrame } from "../src/gen/ServerFrame";
 import { WIRE_PROTOCOL } from "../src/wire/connection";
 
@@ -39,9 +41,85 @@ async function cli(manifest: Manifest, node: Node, args: string[]): Promise<unkn
   }
 }
 
+/** Mint for this long-lived driver process, as an operator app shell does. */
+async function appToken(home: Node): Promise<string> {
+  const socket = createConnection({ path: home.socket });
+  try {
+    return await step("mint operator app session", () => new Promise<string>((resolve, reject) => {
+      let input = "";
+      socket.on("error", reject);
+      socket.on("end", () => reject(new Error("app mint ended without a response")));
+      socket.on("connect", () => socket.write(`${JSON.stringify({ id: "gui-app", method: "client.app.mint", params: {} })}\n`));
+      socket.on("data", chunk => {
+        input += chunk.toString();
+        if (!input.includes("\n")) return;
+        try {
+          const reply = JSON.parse(input.split("\n")[0]!);
+          const token: unknown = reply.result?.issued?.token;
+          if (typeof token !== "string") throw new Error("app mint refused");
+          resolve(token);
+        } catch (error) { reject(error); }
+      });
+    }));
+  } finally { socket.destroy(); }
+}
+
+/** Raw transport relay: the minting process also owns the native Unix connection. */
+async function nativeRelay(home: Node, homeUrl: string): Promise<{ url: string; close: () => Promise<void> }> {
+  const sockets = new Set<Socket>();
+  const endpoint = new URL(homeUrl);
+  const track = (socket: Socket): void => {
+    sockets.add(socket);
+    socket.on("close", () => sockets.delete(socket));
+  };
+  const server = createServer(incoming => {
+    track(incoming);
+    let pending = Buffer.alloc(0);
+    const header = (chunk: Buffer): void => {
+      pending = Buffer.concat([pending, chunk]);
+      const end = pending.indexOf("\r\n\r\n");
+      if (end < 0) { if (pending.length > 8192) incoming.destroy(); return; }
+      incoming.off("data", header);
+      incoming.pause();
+      let request = pending.subarray(0, end).toString();
+      const native = request.startsWith("GET /v1/ws ");
+      const upstream = native
+        ? createConnection({ path: home.socket.replace(/\.sock$/, "-ws.sock") })
+        : createConnection({ host: endpoint.hostname, port: Number(endpoint.port) });
+      track(upstream);
+      incoming.on("error", () => upstream.destroy());
+      upstream.on("error", () => incoming.destroy());
+      if (!native) {
+        request = request.replace(/^host:.*$/im, `Host: ${endpoint.host}`)
+          .replace(/^origin:.*$/im, `Origin: ${endpoint.origin}`)
+          .replace(/^connection:.*$/im, "Connection: close");
+      }
+      upstream.write(`${request}\r\n\r\n`);
+      upstream.write(pending.subarray(end + 4));
+      incoming.pipe(upstream).pipe(incoming);
+      incoming.resume();
+    };
+    incoming.on("data", header);
+    incoming.on("error", () => incoming.destroy());
+  });
+  await step("native relay listen", () => new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  }));
+  const address = server.address();
+  if (!address || typeof address === "string") throw new Error("native relay has no port");
+  return {
+    url: `http://127.0.0.1:${address.port}`,
+    close: () => step("native relay close", () => new Promise<void>((resolve, reject) => {
+      for (const socket of sockets) socket.destroy();
+      server.close(error => error ? reject(error) : resolve());
+    })),
+  };
+}
+
 /** Independent authenticated replay; never reads the browser's session or store. */
 async function history(manifest: Manifest, home: Node, url: string, agent: string): Promise<HistoryEvent[]> {
-  const issued = await cli(manifest, home, ["client", "token", "add", "gui-history-oracle", "--scopes", "read,operate", "--show-token"]) as { result: { issued: { token: string } } };
+  const issued = await cli(manifest, home, ["client", "token", "add", `gui-history-${crypto.randomUUID()}`, "--scopes", "read,operate", "--show-token"]) as { result: { issued: { token: string } } };
   const endpoint = new URL("/v1/ws", url);
   endpoint.protocol = endpoint.protocol === "https:" ? "wss:" : "ws:";
   // DOM declarations hide Bun's supported header overload in this mixed project.
@@ -95,7 +173,7 @@ async function history(manifest: Manifest, home: Node, url: string, agent: strin
 
 let remoteStarted: boolean | undefined;
 
-test("the real GUI converses with a home agent and answers its permission request", async () => {
+test("the real GUI converses, answers permission, resumes and stops a home agent", async () => {
   const path = process.env["FLOCK_GUI_FLEET_MANIFEST"];
   if (!path) throw new Error("Rust fleet driver must provide FLOCK_GUI_FLEET_MANIFEST");
   const manifest = await step("read fleet manifest", () => Bun.file(path).json()) as Manifest;
@@ -107,13 +185,19 @@ test("the real GUI converses with a home agent and answers its permission reques
   await step("start trace", () => context.tracing.start({ screenshots: true, snapshots: true, sources: true }));
   const page = await step("browser page", () => context.newPage());
   let failed = true;
+  let relay: Awaited<ReturnType<typeof nativeRelay>> | undefined;
   try {
     const home = manifest.nodes.find((node) => node.name === manifest.home);
     if (!home) throw new Error("manifest has no home node");
-    // Mint after Chromium is ready: operator codes expire in sixty seconds.
+    // Discover the served endpoint; the app credential below supplies authority.
     const url = await cli(manifest, home, ["client", "open", "--print"]) as string;
     await step("record home URL", () => Bun.write(path, JSON.stringify({ ...manifest, home_url: url })));
-    await step("navigate to real bundle", () => page.goto(url));
+    const token = await appToken(home);
+    relay = await nativeRelay(home, url);
+    await context.addInitScript(({ serverUrl, token }) => {
+      Object.assign(window, { __FLOCK_SHELL_CONFIG__: { transport: "wire", serverUrl, token } });
+    }, { serverUrl: relay.url, token });
+    await step("navigate to real bundle", () => page.goto(relay!.url));
     await step("select fleet scope", () => page.getByRole("button", { name: "All nodes", exact: true }).click());
     for (const node of manifest.nodes) {
       const group = page.getByTestId("group-node").filter({ has: page.locator(".group__name", { hasText: node.id }) });
@@ -177,6 +261,42 @@ test("the real GUI converses with a home agent and answers its permission reques
     const decisionSeq = recorded.find(frame => frame.ev === closed)!.seq!;
     expect(decisionSeq).toBeGreaterThan(recorded.find(frame => frame.ev === opened)!.seq!);
     expect(recorded.find(frame => frame.ev === replies[1])!.seq).toBeGreaterThan(decisionSeq);
+    const observeAgent = async (): Promise<StructuredAgentInfo> => {
+      const list = await cli(manifest, home, ["agent", "list"]) as { result: { structured_agents: StructuredAgentInfo[] } };
+      const agent = list.result.structured_agents.find(agent => agent.agent_id === started!.agent_id);
+      if (!agent) throw new Error("oracle lost the structured agent");
+      return agent;
+    };
+    const original = await observeAgent();
+    expect(original.lifecycle).toBe("live");
+    const focus = page.getByRole("main", { name: "Focused agent", exact: true });
+    await step("stop before resume", () => focus.getByRole("button", { name: "Stop agent", exact: true }).click());
+    await step("confirm pre-resume stop", () => focus.getByRole("button", { name: "Confirm stop", exact: true }).click());
+    await step("offline before resume", () => focus.getByText("offline", { exact: true }).waitFor({ timeout: STEP_MS }));
+    expect((await observeAgent()).lifecycle).toBe("offline");
+    await step("restart through GUI", () => focus.getByRole("button", { name: "Restart agent", exact: true }).click());
+    await step("restart accepted", () => focus.getByRole("status").getByText("Agent restarted.", { exact: true }).waitFor({ timeout: STEP_MS }));
+    await step("resumed agent is online", () => focus.getByText("offline", { exact: true }).waitFor({ state: "hidden", timeout: STEP_MS }));
+    const resumed = await observeAgent();
+    expect(resumed.session_id).toBe(original.session_id);
+    expect(resumed.lifecycle).toBe("live");
+    await step("post-restart prompt", () => composer.getByRole("textbox").fill("after restart"));
+    await step("submit post-restart prompt", () => composer.getByRole("button", { name: "Send", exact: true }).click());
+    await step("post-restart reply", () => transcript.locator(".event--assistant").getByText("resumed fixture reply", { exact: true }).waitFor({ timeout: STEP_MS }));
+    const resumedHistory = await history(manifest, home, url, started!.agent_id);
+    const resumedReplies = resumedHistory.filter(frame => frame.ev.type === "assistant");
+    expect(resumedReplies).toHaveLength(3);
+    expect(resumedReplies[2]?.ev).toMatchObject({ type: "assistant", session_id: original.session_id, message: { role: "assistant", content: [{ type: "text", text: "resumed fixture reply" }] } });
+    await step("open lifecycle palette", () => page.getByTestId("palette-trigger").click());
+    const palette = page.getByRole("dialog", { name: "Command palette", exact: true });
+    await step("find stop command", () => palette.getByRole("combobox").fill("Stop agent"));
+    await step("open stop confirmation from palette", () => palette.getByRole("option").filter({ hasText: "Stop agent" }).click());
+    const confirmation = focus.getByRole("group", { name: "Confirm stop agent", exact: true });
+    await step("stop confirmation visible", () => confirmation.waitFor({ timeout: STEP_MS }));
+    expect((await observeAgent()).lifecycle).toBe("live");
+    await step("confirm stop through GUI", () => confirmation.getByRole("button", { name: "Confirm stop", exact: true }).click());
+    await step("GUI reports stopped", () => focus.getByText("offline", { exact: true }).waitFor({ timeout: STEP_MS }));
+    expect((await observeAgent()).lifecycle).toBe("offline");
     await step("open remote picker", () => page.getByRole("button", { name: "New agent", exact: true }).click());
     await step("name remote agent", () => picker.getByLabel("Name", { exact: true }).fill("gui-remote-agent"));
     await step("choose remote node", () => picker.getByLabel("Node", { exact: true }).selectOption(remote.id));
@@ -203,7 +323,8 @@ test("the real GUI converses with a home agent and answers its permission reques
         await step("discard trace", () => context.tracing.stop());
       }
     } finally {
-      await step("close browser", () => browser.close());
+      try { await step("close browser", () => browser.close()); }
+      finally { await relay?.close(); }
     }
   }
 }, 90_000);

@@ -216,3 +216,17 @@ describe("resume probes", () => {
     expect(h.connection.state).toBe("Reconnecting");
   });
 });
+
+
+test("lifecycle sender uses the wire outbox and preserves target identity", () => {
+  const h = new Harness();
+  live(h);
+  const sender = createWireSender(h.connection, () => 0);
+  const restart = sender.restart!("fixture-agent");
+  const stop = sender.stop!("fixture-agent");
+  expect(sentFrames(h).filter(frame => typeof frame === "object" && frame !== null && "t" in frame && frame.t === "cmd")).toEqual([
+    { t: "cmd", cmd_id: restart, verb: "agent.restart", args: { target: "fixture-agent", reason: "Operator requested restart", when: "after_turn" }, resume_only: false },
+    { t: "cmd", cmd_id: stop, verb: "agent.stop", args: { target: "fixture-agent" }, resume_only: false },
+  ]);
+  expect(h.connection.commands().map(entry => entry.cmd_id)).toEqual([restart, stop]);
+});

@@ -48,6 +48,7 @@ import { SHORTCUTS, bindKeys, formatCombo, pageShortcutAvailable, runPageShortcu
 import { Palette, type PaletteCommand, type WaitingAction } from "./Palette";
 import { createPermissionInbox } from "./permissions";
 import { AgentRowButton, AgentTitle, InboxCards, Waits, createClosedIds } from "./parts";
+import { createLifecycle } from "./lifecycle";
 import { NewAgent } from "./NewAgent";
 import { PhoneWorkbench } from "./Phone";
 import { ShortcutSheet } from "./ShortcutSheet";
@@ -191,6 +192,7 @@ export function Workbench(props: WorkbenchProps): JSX.Element {
     return agentOf(current.focused === null ? undefined : current.tiles[current.focused]?.subject);
   });
   const focusedRow = createMemo(() => rows().find((row) => row.id === focusedAgent()));
+  const lifecycle = createLifecycle(() => props.source === "live" ? props.sender : null, focusedRow);
   // A saved tile identifies a selection, not evidence that its agent is still available.
   const unavailable = createMemo(() => {
     if (focusedRow() !== undefined) return null;
@@ -271,7 +273,7 @@ export function Workbench(props: WorkbenchProps): JSX.Element {
         <Palette
           rows={scoped}
           onOpen={openAgent}
-          commands={[...(props.host === undefined ? [] : hostCommands(props.host)), ...keyCommands(), ...(canStart() ? [{ label: "New agent", hint: "", run: () => { setNewAgent(true); } }] : [])]}
+          commands={[...(props.host === undefined ? [] : hostCommands(props.host)), ...keyCommands(), ...lifecycle.commands(), ...(canStart() ? [{ label: "New agent", hint: "", run: () => { setNewAgent(true); } }] : [])]}
           waiting={preview() ? (focusedAgent() === null ? [] : PANE_ACTIONS) : []}
         />
         <Cluster space={SPACE[2]}>
@@ -308,6 +310,7 @@ export function Workbench(props: WorkbenchProps): JSX.Element {
                   </span>
                 </Show>
               </header>
+              {lifecycle.view()}
               <div class="focus__body">
                 <Show when={unavailable() === null} fallback={<p class="focus__empty">{unavailable()}</p>}>
                   <Transcript
@@ -355,6 +358,7 @@ export function Workbench(props: WorkbenchProps): JSX.Element {
           closed={closed}
           sender={props.sender}
           composer={composer}
+          actions={lifecycle.view}
           preview={preview()}
         />
       </Show>
