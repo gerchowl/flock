@@ -53,6 +53,17 @@ execution with `invalid_params` and usage exit 2, rather than panicking. This ea
 parse error prints on stderr before output-format selection. Native socket paths
 used by the internal handoff importer retain their original OS bytes.
 
+Attach has its own five-second Welcome deadline starting immediately after
+Hello. The complete frame header and payload share that budget, so trickled
+bytes cannot extend it. Expiry restores the terminal before reporting
+`server did not answer attach within 5s (server busy?)` and exits **124**.
+JSON-capable attach commands report `attach_timeout`, `retry: yes`, and
+`data: {"phase": "welcome", "timeout_ms": 5000}`. A timeout does not start an
+automatic attach retry or replay terminal input; the existing bounded retry
+window after an explicit live-handoff refusal remains available. You can retry
+attach with a fresh connection. EOF, malformed frames and version refusals
+retain their existing diagnostics.
+
 ## Exit codes
 
 `flk --help` lists every exit code, what it means and whether retrying is safe, from one registry (`src/cli/exit.rs`). Four cases moved in #1025, and for one release each prints `note: exit code is now N (was M); see CHANGELOG` on stderr when it returns its new code. stdout, `--json` output included, is unchanged.
@@ -614,6 +625,8 @@ flk msg send <target> <text...> [--repo NAME] [--intent fyi|needs-reply|blocking
 flk msg reply <correlation_id> <text...> [--intent fyi|needs-reply|blocking] [-- <text starting with dashes>]
 flk msg list [--pane TARGET]
 flk msg read [--pane TARGET]
+flk msg operator-list --pane TARGET
+flk msg operator-read --pane TARGET
 flk msg status <correlation_id>
 flk msg mute <seconds> [--pane TARGET] [--reason TEXT]
 flk checks list
@@ -676,7 +689,20 @@ attested connection or MCP lease. `--pane self`, the stable native id, or an
 unambiguous native name may name that same inbox; another target is refused as
 `inbox_not_owner` (retry `never`, exit 13), and ambiguous names are refused as
 `agent_target_ambiguous`. Invalid and revoked leases both return `not_authorized`.
-The operator's global `msg list` is unchanged. Reads return only live entries from
+For a legacy pane whose inbox authority is unresolved, the local operator can
+run `flk msg operator-list --pane TARGET` to peek (120-character previews), or
+`flk msg operator-read --pane TARGET` to consume the full messages, from a shell
+outside Flock panes. These are interim recovery commands until migration to a
+structured agent ([#3066](https://github.com/gerchowl/flock/issues/3066)); reading
+does not restore the agent's authority. Both commands refuse structured agents,
+legacy pane callers, mesh relays and unattested callers with `operator_only`
+(exit 13). Successful accesses record a durable `operator_inbox_access` event
+with the pane, operation, caller PID/UID and message count, without message bodies.
+Existing `msg read --pane TARGET` and `msg list --pane TARGET` require the same
+operator check when TARGET is another pane; an attested caller may still read
+its own inbox.
+
+Without `--pane`, `msg list` is scoped to the caller's attested inbox. An unresolved caller receives `caller_pane_unresolved`. Listing all panes or another pane's inbox requires the local operator. Global operator lists record `operator_inbox_access` with `pane: null` and the total message count. Reads return only live entries from
 a mixed expired/live batch, once; each expired entry emits one durable
 `dropped_undeliverable` event. Reading the projection does not submit another turn.
 
@@ -1177,7 +1203,7 @@ Exposed tools:
 | `flock_delegate_list` | `delegate.list` | The delegates an architect started, the rows of `flk delegate list`. `architect` is `self` (default), `all` or an agent id; `branch` returns the owning edge. Read-only. |
 | `flock_msg_send` | `msg.send` | `to` accepts a bare pane id, terminal id, unique agent name or fleet agent id, or a tagged `pane`, `repo_pane` or `agent` object. Queued to the recipient's inbox, which it reads itself; it is nudged at its next turn boundary, so an already-idle recipient waits. Target `{"type":"agent","agent":"<agent_id>"}` to reach another host. `intent` is required: `fyi` (no wake), `needs_reply` (nudged at its next turn boundary), or `blocking` (also operator-visible; past a small per-sender budget it is delivered as `needs_reply`). |
 | `flock_msg_reply` | `msg.reply` | Uses the stored return binding; direct cross-host answers are held for origin collection. `intent` is optional here and defaults to `fyi`. A sender with no inbox gets the reply held for it (`state: "held"`). |
-| `flock_msg_list` | `msg.list` | Peek at the attested structured inbox, or the operator global list; includes local wake attempt evidence. |
+| `flock_msg_list` | `msg.list` | Peek at the attested caller inbox, or the audited operator global list; includes local wake attempt evidence. |
 | `flock_msg_status` | `msg.status` | Sender view by `correlation_id`: mailbox state and submission attempts, including unconfirmed or abandoned reasons. |
 | `flock_msg_read` | `msg.read` | Consume your attested pane or structured inbox once; no additional harness delivery. |
 | `flock_self_compact` | `pane.arm_self_compact` | Compact your OWN context and carry on, unattended: you supply the handoff prompt for your next self, the call arms and returns having typed nothing, and flock completes it at your next turn boundary. `abort: true` drops an arming instead. Optional `instructions` steers what the summary keeps (`/compact <instructions>`; `instructions: true` in the answer confirms they were stored). `state` is `armed` / `aborted` / `pending`; `pending` means refused because one was already armed. Claude Code only. |

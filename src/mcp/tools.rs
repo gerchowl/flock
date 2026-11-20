@@ -213,7 +213,7 @@ pub(super) fn table() -> &'static [Tool] {
         },
         Tool {
             name: "flock_msg_list",
-            description: "Peek at unread messages. Omit `pane` for your attested structured inbox; the operator's global list is unchanged. A native target may only name your own identity. Includes local wake attempt evidence.",
+            description: "Peek at unread messages. Omit `pane` for your attested pane or structured inbox; listing all panes or another inbox requires the local operator and is audited. A native target may only name your own identity. Includes local wake attempt evidence.",
             input_schema: schema_msg_list,
             build: build_msg_list,
         },
@@ -838,7 +838,7 @@ fn schema_msg_list() -> Value {
         "properties": {
             "pane": {
                 "type": "string",
-                "description": "Optional recipient target. Omit for structured self or the operator global list.",
+                "description": "Optional recipient target. Omit for your attested pane or structured inbox, or an audited global list for the local operator.",
             },
         },
         "additionalProperties": false,

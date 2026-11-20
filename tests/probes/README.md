@@ -9,6 +9,12 @@ harness that can drive a pty (this fork's agents use the `tui-probe` skill;
 any tmux driver works). Treat them as reproductions you can re-run against
 two builds, not as CI.
 
+The whole-Welcome acceptance driver runs without tmux:
+`python3 tests/probes/attach_welcome.py --bin target/debug/flk`. It owns isolated
+fake peers and PTYs, checks silent/trickled replies against the real five-second
+deadline, and bounds each client observation to eight seconds. The
+`attach_welcome` nextest integration binary runs this driver in CI as well.
+
 ## Running one
 
 ```sh
