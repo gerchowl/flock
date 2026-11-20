@@ -10,6 +10,7 @@ async fn aggregate_shutdown_ends_native_and_tcp_upgrades_and_retires_app_bearers
         server._root.path().into(),
         server.wake.clone(),
         owner.clone(),
+        app.event_hub.clone(),
     )
     .await
     .unwrap();
