@@ -594,13 +594,19 @@ support window. The mesh VERSION stays 5 until the `command` envelope slice
 **Why.** A closed `Kind` enum plus identical-version hello makes every new
 envelope kind a coordinated fleet upgrade (#1380 found this for a `command`
 kind carrying ADR-0036 §5 `cmd`s to another node's agent). Negotiation makes
-later bumps rolling, and the one coordinated upgrade is the release that
-ships negotiation itself.
+later bumps rolling. Its own release is rolling too (see 4): the offer is
+byte-compatible with the VERSION 5 offer while the range is a single version.
 
 **1. Hello and the support window.** Each node advertises the closed range
 `[mesh_min, mesh_max]` it implements. The existing `mesh` field carries
 `mesh_max`, so a reader that knows only the old field sees the highest
-version. The window is the current VERSION N and the previous one, N-1,
+version. `Offer` gains `mesh_min: Option<u32>` with
+`#[serde(skip_serializing_if = "Option::is_none")]`. A node whose range is a
+single version `[V, V]` omits it, so its offer, and therefore the signed
+hello transcript (which re-serializes the `Offer`), is byte-identical to a
+VERSION 5 node's. An absent `mesh_min` reads as `[mesh, mesh]`. A node whose
+range spans two versions always sends it, and because the offer is signed an
+intermediary cannot strip it to turn `[5, 6]` into `[6, 6]`. The window is the current VERSION N and the previous one, N-1,
 floored at 5 because VERSION 4 was development-only: the negotiation release
 advertises `[5, 5]`, the first VERSION 6 build `[5, 6]`, a VERSION 7 build
 `[6, 7]`. The window is a compile-time constant, not configuration.
@@ -618,11 +624,13 @@ No overlap is refused at hello with the existing typed code
 `mesh version mismatch: local 5-6, remote 7-8; upgrade flk on this node`.
 The named side is the one whose `mesh_max` is lower. The refusal takes the
 long backoff and shows in `flk peers` and `flk status` with the configured
-peer name, as for any incompatible peer. A peer whose offer has no
-`mesh_min` predates negotiation and is refused before its signature is
-checked, as `upgrade flk on <peer> (peer predates version negotiation)`,
-because the new offer fields change the signed transcript and an old node
-cannot verify it.
+peer name, as for any incompatible peer. The error's `data.mesh` carries the
+refusing node's `mesh_max` (never a lower value) and `data.mesh_min` its
+minimum, so a reader that knows only `mesh` still sees the highest version.
+
+A pre-negotiation node is a peer with an absent `mesh_min`: it reads as
+`[5, 5]` and negotiates normally with any range containing 5. It cannot
+accept an offer with `mesh` above 5, which is what 4 relies on.
 
 **2. Per-peer VERSION and send gating.** The negotiated VERSION is stored
 with the held-edge session of that peer, renegotiated at every hello and
@@ -666,18 +674,45 @@ sends a kind or field above what it negotiated, (3) fires on our side; if it
 claims too much and cannot decode what we send, it resets the session on its
 own side, our send fails as an ordinary stream error and custody is retained.
 
-**4. Rollout.** Shipping negotiation needs one last coordinated upgrade, by
-the rule this ADR already applies: stop sending to a node that cannot hold a
-compatible edge until it is upgraded. Operator procedure:
+**4. Rollout.** Slice 1 (negotiation, VERSION 5) is a rolling upgrade with
+no refused-edge window. A node at `[5, 5]` sends the same offer bytes as a
+pre-negotiation node (1), and each reads the other's as `[5, 5]`, so mixed
+fleets keep every edge while nodes are upgraded one at a time, in any order.
+The coordinated-upgrade design was considered and rejected (see
+"Alternatives rejected").
 
-1. Upgrade every node to the negotiation build (still VERSION 5, window
-   `[5, 5]`). Until the whole fleet runs it, an upgraded node and a
-   pre-negotiation node refuse each other as above, and custody for the
-   refused peer stays stored.
+Only slice 2, the first VERSION 6 build, has a precondition: every peer it
+will meet must already run slice 1. Operator procedure:
+
+1. Upgrade every node to the slice 1 build, in any order.
 2. Check `flk peers` on each node: all edges established, no
    `mesh_version_mismatch`.
-3. Only then deploy a VERSION 6 build. Never deploy it to a fleet that still
-   has a pre-negotiation node.
+3. Only then deploy a VERSION 6 build, node by node.
+
+A pre-negotiation node already refuses `mesh` 6, and does so before it looks
+at any signature, because `Offer::validate` compares `mesh` first. Deploying
+VERSION 6 to a fleet that still has one fails on that edge, exactly as
+follows (a VERSION 6 node `S` offers `mesh: 6, mesh_min: 5`):
+
+- `S` dials, old node accepts: the old acceptor fails validation with
+  `mesh version mismatch: local 5, remote 6; upgrade flk on this node`
+  and answers `mesh_version_mismatch` with `data.mesh: 5`. It never reaches a
+  signature check, so no `invalid mesh signature` appears. `S` sees a
+  `mesh_version_mismatch` whose `data.mesh` (5) lies inside its own window,
+  which cannot be a no-overlap refusal, so it reports
+  `mesh version mismatch: peer <peer> predates version negotiation; upgrade flk on <peer>`.
+  The text starts with the permanent prefix, so the edge takes the long
+  backoff, never the transient retry schedule.
+- Old node dials, `S` accepts: `S` reads the offer as `[5, 5]`, finds the
+  overlap at 5 and returns its own signed offer, `mesh: 6, mesh_min: 5`. The
+  old dialer runs `validate` on it and fails with
+  `mesh version mismatch: local 5, remote 6; upgrade flk on this node`,
+  which starts with the same permanent prefix and takes the long backoff. It
+  never prints `local 5, remote 5`, because `S` sends no refusal here and,
+  where it does refuse a no-overlap peer, its `data.mesh` is `mesh_max` (1).
+  The handshake never reaches `Finish`, so on `S` the pending enrollment
+  lapses and the edge stays unenrolled.
+- Custody for that peer stays stored (see above) and nothing is sent to it.
 
 Afterwards upgrades roll node by node within the window. A build at N
 negotiates with N-1 and N, so a fleet of mixed adjacent builds keeps every
@@ -718,8 +753,13 @@ a range (it stays under `cfg!(debug_assertions)`, like
 - Downgrade attempt: an offer edited to a lower or wider range fails
   signature verification; a peer that advertises below the local window is
   refused; both sides disagreeing on the computed VERSION is refused.
-- Invalid ranges (`min > max`, zero) and a peer with no `mesh_min` are refused
-  with their own messages, before signature verification for the latter.
+- Invalid ranges (`min > max`, zero) are refused with their own message.
+- Byte compatibility: an offer at `[5, 5]` serializes with no `mesh_min` and
+  equals a VERSION 5 node's offer and transcript byte for byte; an offer
+  with no `mesh_min` negotiates as `[mesh, mesh]`; removing `mesh_min` from a
+  signed `[5, 6]` offer fails signature verification.
+- A VERSION 6 node against a pre-negotiation node, in both dial directions,
+  produces the refusals described in 4 and takes the long backoff.
 - The kind/field gate: a kind newer than the session VERSION is never
   emitted, including after renegotiation and by a forwarding hub; `message`
   and `receipt` flow at every negotiated VERSION.
@@ -736,17 +776,26 @@ Ordered implementation slices:
 1. **Negotiation (VERSION stays 5).** `Offer` ranges and the transcript
    change, session VERSION in the held-edge session, the kind/field gate
    helper with its lookup table, receiver violation handling, `flk peers`
-   display, refusal text, tests above, and the rollout procedure in the
-   release notes. A breaking wire change, so the commit uses `!`.
+   display, refusal text and the tests above. Not a breaking wire change
+   while the range is `[5, 5]`: it rolls out with no refused-edge window.
 2. **VERSION 6 `command` envelope (#1380).** `Kind::Command` with `cmd_id`,
    verb, args, the originating principal and its token scopes; destination
    authorisation of that principal (ADR-0036 §1a, §5; ADR-0043 §4); the
    `ack` as a `receipt`; VERSION 5 to 6 and the window `[5, 6]`; the
    `unsupported_for_agent` path for peers below 6; ADR-0036 §5 and the ADR-0043
    remote command path updated to match. It lands only after slice 1 has
-   shipped to the whole fleet.
+   shipped to the whole fleet (4) and is the one rollout with a precondition.
 
 ## Alternatives rejected
+
+**One coordinated upgrade to ship negotiation (#1380).** An earlier draft of
+the negotiation amendment changed the offer unconditionally and required
+the whole fleet to upgrade at once. Rejected: `Offer` has no
+`deny_unknown_fields` and `transcript()` re-serializes it, so the only
+obstacle was the extra field in the signed bytes. Omitting `mesh_min` for a
+single-version range removes it, makes slice 1 a rolling upgrade, and moves
+the single precondition to the first VERSION 6 build, which old nodes
+already refuse by the `mesh` comparison.
 
 **Require reciprocal peer entries or a dialable laptop.** Makes roaming/NAT
 an operator configuration failure and repeats #623's asymmetry.
