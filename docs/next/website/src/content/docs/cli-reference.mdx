@@ -702,6 +702,19 @@ Existing `msg read --pane TARGET` and `msg list --pane TARGET` require the same
 operator check when TARGET is another pane; an attested caller may still read
 its own inbox.
 
+Claude's Stop hook resolves its inbox from process attestation, including after a
+fork or resume with a stale `FLOCK_PANE_ID`. Its CLI fallback is `flk msg read`
+without an explicit pane. The `msg.wake` socket method with an explicit `pane`
+uses the same ownership check as a read: another pane requires local operator authority.
+An authority refusal produces one nonblocking recovery notice per server, pane
+claim and harness session; the hook does not keep blocking on unread mail or a
+recap while that refusal persists. A successful wake check resets the notice.
+Resuming a harness in a legacy pane without process-birth evidence does not
+restore that evidence; the migration and operator recovery paths above still
+apply. Forked PTY agents use their own pane identity and inbox, while a resumed
+agent uses the attested pane in which it runs; a harness session ID or environment
+claim cannot transfer another agent's inbox authority (ADR-0008 and ADR-0036 §1a).
+
 Without `--pane`, `msg list` is scoped to the caller's attested inbox. An unresolved caller receives `caller_pane_unresolved`. Listing all panes or another pane's inbox requires the local operator. Global operator lists record `operator_inbox_access` with `pane: null` and the total message count. Reads return only live entries from
 a mixed expired/live batch, once; each expired entry emits one durable
 `dropped_undeliverable` event. Reading the projection does not submit another turn.
