@@ -314,7 +314,8 @@ Rollback remains fenced while it reacquires and replays. A late drain cannot
 close a newer recovered owner. Live commands claim their principal/command key
 durably before dispatch, then recheck current authorization under the token fence. Outcomes sync before
 acknowledgement; identical in-flight requests join and each waiter is
-reauthorized with its own credential. Completed outcomes replay after restart or
+reauthorized with its own credential. Connection closure follows that credential's
+current revocation status. Completed outcomes replay after restart or
 handoff. Conflicting payloads refuse `invalid_params`; journal capacity or writer
 queue pressure returns audited `session_busy` before effects. Ownership phase
 changes fence earlier claim completions from dispatch.

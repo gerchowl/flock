@@ -372,3 +372,33 @@ fn in_flight_digest_conflict_refuses_before_original_dispatch() {
         case.stop().await;
     });
 }
+
+#[test]
+fn stored_revocation_does_not_close_an_authorized_joined_credential() {
+    runtime(async {
+        let mut case = Case::new(183189).await;
+        let args = case.prompt().await;
+        let path = case.server._root.path().join("client-tokens/two.token");
+        let mut token: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        token["principal"] = json!("0123456789abcdef0123456789abcdef");
+        fs::write(&path, token.to_string()).unwrap();
+        let mut first = case.open().await;
+        let mut joined = Socket::open(&case.server).await;
+        joined.hello(1, &"d".repeat(64)).await;
+        let (started, release) = hold_next_sync(&case).await;
+        enqueue(&case, &mut first, "revoked-original", &args).await;
+        case.service();
+        within(started).await.unwrap();
+        enqueue(&case, &mut joined, "revoked-original", &args).await;
+        case.service();
+        fs::remove_file(case.server._root.path().join("client-tokens/one.token")).unwrap();
+        release.send(()).unwrap();
+        let first_ack = case.ack(&mut first).await;
+        assert_eq!(first_ack["error"]["code"], "auth_revoked");
+        assert_eq!(case.ack(&mut joined).await, first_ack);
+        assert_eq!(case.handles().len(), 2);
+        joined.send(json!({"t":"ping","nonce":"authorized"})).await;
+        assert_eq!(joined.text().await["t"], "pong");
+        case.stop().await;
+    });
+}

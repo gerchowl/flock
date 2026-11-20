@@ -37,11 +37,16 @@ pub(super) struct Command {
     pub(super) resume_only: bool,
     pub(super) read_only: bool,
 }
+/// Socket revocation follows the requesting credential's current authorization.
+struct Reply {
+    frame: ServerFrame,
+    credential_revoked: bool,
+}
 struct Request {
     command: Command,
     store: Arc<Store>,
     session: Session,
-    response: oneshot::Sender<ServerFrame>,
+    response: oneshot::Sender<Reply>,
 }
 /// Connection-side mailbox; cancelling a waiter cannot cancel committed input.
 #[derive(Clone)]
@@ -266,7 +271,9 @@ fn authorize<T>(
         })
 }
 fn respond(request: Request, frame: ServerFrame, shared: &Shared, app: &App) {
-    let frame = match authorize(&request, |_| Ok(())) {
+    let authorization = authorize(&request, |_| Ok(()));
+    let credential_revoked = matches!(authorization, Err(ErrorCode::AuthRevoked));
+    let frame = match authorization {
         Ok(()) => frame,
         Err(code) => ack(request.command.id.clone(), Err(code)),
     };
@@ -297,7 +304,10 @@ fn respond(request: Request, frame: ServerFrame, shared: &Shared, app: &App) {
             );
         }
     }
-    let _ = request.response.send(frame);
+    let _ = request.response.send(Reply {
+        frame,
+        credential_revoked,
+    });
 }
 fn trace_lifecycle(app: &App, request: &Request, outcome: &Result<Outcome, ErrorCode>) {
     if lifecycle(&request.command.verb) {
@@ -579,7 +589,10 @@ pub(super) async fn execute(
 ) -> Result<(), ()> {
     let (response, received) = oneshot::channel();
     let lane = usize::from(command.verb == "agent.decide");
-    let frame = match shared.commands.tx[lane].try_send(Request {
+    let Reply {
+        frame,
+        credential_revoked,
+    } = match shared.commands.tx[lane].try_send(Request {
         command,
         store: shared.store.clone(),
         session: session.clone(),
@@ -597,7 +610,10 @@ pub(super) async fn execute(
                 &request.command.args,
                 ErrorCode::SessionBusy,
             );
-            ack(request.command.id, Err(ErrorCode::SessionBusy))
+            Reply {
+                frame: ack(request.command.id, Err(ErrorCode::SessionBusy)),
+                credential_revoked: false,
+            }
         }
         Err(mpsc::error::TrySendError::Closed(request)) => {
             shared.refusals.record(
@@ -610,7 +626,6 @@ pub(super) async fn execute(
             return Err(());
         }
     };
-    let revoked = matches!(&frame, ServerFrame::Ack { error: Some(error), .. } if error.code == ErrorCode::AuthRevoked.as_str());
     let (delivered, flushed) = oneshot::channel();
     let flushed = async {
         data.send(output::Delivery {
@@ -627,7 +642,7 @@ pub(super) async fn execute(
     }
     .await;
     // ADR-0036 §5a: a lost ack must not suppress revocation of this credential’s sockets.
-    if revoked {
+    if credential_revoked {
         shared.revoke(&session);
     }
     flushed

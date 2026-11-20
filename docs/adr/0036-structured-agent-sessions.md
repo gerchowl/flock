@@ -2013,7 +2013,8 @@ blocking, polls its durable completion, then rechecks current authorization
 under the token fence through dispatch. Revocation after claim prevents the
 effect. The outcome is synced before acknowledgement. Identical in-flight
 requests join the active claim, retaining each credential's metadata and
-reauthorizing each waiter before returning the stored outcome. Conflicting
+reauthorizing each waiter before returning the stored outcome. Connection closure
+follows the requesting credential's current revocation status. Conflicting
 payloads refuse `invalid_params`. Journal capacity and writer queue pressure
 refuse through the bounded wire refusal audit before dispatch. Recovered pending
 claims and absent, expired or lost resume-only keys refuse `session_unconfirmed`.
