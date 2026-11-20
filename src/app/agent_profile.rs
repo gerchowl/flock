@@ -87,20 +87,9 @@ impl App {
             return;
         }
         terminal.profile_env_session = Some(session.clone());
-        let carried = terminal
-            .launch_argv
-            .as_deref()
-            .and_then(crate::spawn::env::agent_for_argv)
-            == Some(crate::detect::Agent::Claude)
-            && terminal
-                .launch_env
-                .iter()
-                .any(|(key, value)| key == "CLAUDE_CONFIG_DIR" && !value.is_empty());
-        if !carried {
-            self.record_agent_profile_env(&terminal_id, self.current_api_peer_pid);
-        }
+        self.record_agent_profile_env(&terminal_id, self.current_api_peer_pid);
         // The spawn snapshot survives missing hooks and unreadable peer environments.
-        // Readers resolve by session id, so publish the same selector there too.
+        // The harness hook's own record is stronger evidence and must win.
         if let Some(terminal) = self.state.terminals.get(&terminal_id) {
             if terminal.claude_session_id().as_deref() == Some(session.as_str()) {
                 if let Some((_, config)) = terminal
@@ -108,7 +97,7 @@ impl App {
                     .iter()
                     .find(|(key, value)| key == "CLAUDE_CONFIG_DIR" && !value.is_empty())
                 {
-                    crate::agent_resume::record_claude_config_dir(&session, config);
+                    crate::agent_resume::record_claude_config_dir_if_absent(&session, config);
                 }
             }
         }

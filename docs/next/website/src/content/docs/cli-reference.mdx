@@ -1005,7 +1005,9 @@ If the pane disappears before the readiness subscription is established, `delega
 A Codex that is still starting can swallow the typed brief: the composer stays empty and no turn begins. When a Codex submit cannot be confirmed, `start` watches for the same evidence `not_started` uses — an empty idle composer, no turn and no queued or startup marker, held for 30 s plus `--settle` — and only then types the brief once more. A brief that appears anywhere on screen, or a turn that starts late, is never typed again. opencode keeps its rule that a dropped brief is reported, not retyped.
 
 Claude delegates retain the `CLAUDE_CONFIG_DIR` resolved at spawn and associate it
-with the session when its identity is reported. `delegate result`, `--await` and
+with the session when its identity is reported. A harness hook's recorded directory
+takes precedence over the launch snapshot in either arrival order; the snapshot
+only fills an absent record. `delegate result`, `--await` and
 `agent fork` can then locate that session's transcript without a profile-installed
 hook having written a separate config-directory record. A recorded directory is
 exclusive: a missing transcript never falls back to another profile. Sessions

@@ -339,6 +339,16 @@ pub fn record_claude_config_dir(session_id: &str, config_dir: &str) {
     record_claude_config_dir_in(&claude_config_dir_records_dir(), session_id, config_dir);
 }
 
+/// Fill a missing session record from launch evidence without replacing hook evidence.
+pub fn record_claude_config_dir_if_absent(session_id: &str, config_dir: &str) {
+    write_claude_config_dir_in(
+        &claude_config_dir_records_dir(),
+        session_id,
+        config_dir,
+        false,
+    );
+}
+
 /// The `CLAUDE_CONFIG_DIR` a Claude session was launched under, if recorded.
 pub fn claude_config_dir_for_session(session_id: &str) -> Option<String> {
     claude_config_dir_for_session_in(&claude_config_dir_records_dir(), session_id)
@@ -365,6 +375,10 @@ pub fn recorded_claude_profile(config_dir: String) -> std::collections::BTreeMap
 // Inner forms take the records dir explicitly so they're testable without
 // mutating process-global env (`state_dir()` reads `XDG_STATE_HOME`/`HOME`).
 fn record_claude_config_dir_in(dir: &Path, session_id: &str, config_dir: &str) {
+    write_claude_config_dir_in(dir, session_id, config_dir, true);
+}
+
+fn write_claude_config_dir_in(dir: &Path, session_id: &str, config_dir: &str, replace: bool) {
     let Some(name) = safe_session_file_name(session_id) else {
         return;
     };
@@ -387,7 +401,17 @@ fn record_claude_config_dir_in(dir: &Path, session_id: &str, config_dir: &str) {
             .open(&temporary)?;
         file.write_all(config_dir.as_bytes())?;
         file.sync_all()?;
-        std::fs::rename(&temporary, dir.join(name))?;
+        if replace {
+            std::fs::rename(&temporary, dir.join(name))?;
+        } else {
+            // Publishing a complete file with no replacement closes the hook race.
+            match std::fs::hard_link(&temporary, dir.join(name)) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error),
+            }
+            std::fs::remove_file(&temporary)?;
+        }
         std::fs::File::open(dir)?.sync_all()
     })();
     if result.is_err() {
