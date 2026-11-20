@@ -60,9 +60,9 @@ impl Heartbeat {
         self.next_ping = now + Duration::from_millis(HEARTBEAT_INTERVAL_MS);
         Some(nonce)
     }
-    pub fn pong(&mut self, nonce: &str, now: Instant) {
+    pub fn pong(&mut self, nonce: &str, now: Instant) -> bool {
         if !valid_nonce(nonce) {
-            return;
+            return false;
         }
         if let Some(at) = self
             .pending
@@ -71,6 +71,9 @@ impl Heartbeat {
         {
             self.pending.remove(at);
             self.last_pong = now;
+            true
+        } else {
+            false
         }
     }
 }

@@ -15,6 +15,17 @@ use std::{
     sync::mpsc::{Receiver, TryRecvError},
 };
 use tokio::sync::{oneshot, Notify};
+/// Closed registry shared by wire admission and refusal budget normalization.
+pub(super) fn known_verb(verb: &str) -> Option<&'static str> {
+    match verb {
+        "agent.send" => Some("agent.send"),
+        "agent.decide" => Some("agent.decide"),
+        "agent.start" => Some("agent.start"),
+        "agent.restart" => Some("agent.restart"),
+        "agent.stop" => Some("agent.stop"),
+        _ => None,
+    }
+}
 /// Each command lane and the send receipt set have this fixed capacity.
 const CAPACITY: usize = 32;
 /// Completed principal/command keys retained in FIFO order; pending sends never evict.
@@ -41,6 +52,8 @@ pub(super) struct Client {
 }
 type Receipt = Receiver<Result<AgentSendResult, ErrorCode>>;
 struct Pending {
+    command: Command,
+    session: Session,
     key: (String, String),
     // Shared core shutdown requires Sync; the app owner uses get_mut, never a blocking lock.
     receipt: parking_lot::Mutex<Receipt>,
@@ -239,7 +252,7 @@ impl Owner {
     }
     /// Revalidate under the token revocation lock through bounded admission.
     /// Queue completion is polled separately; no model or stdin completion is awaited.
-    pub(super) fn service(&mut self, app: &mut App) {
+    pub(super) fn service(&mut self, app: &mut App, shared: &Shared) {
         let mut i = 0;
         while i < self.pending.len() {
             let result = match self.pending[i].receipt.get_mut().try_recv() {
@@ -254,6 +267,15 @@ impl Owner {
             let result = result.and_then(|result| {
                 serde_json::to_value(result).map_err(|_| ErrorCode::SerializationError)
             });
+            if let Err(code) = &result {
+                shared.refusals.record(
+                    shared.clock.now(),
+                    &pending.session.info,
+                    &pending.command.verb,
+                    &pending.command.args,
+                    *code,
+                );
+            }
             self.remember(pending.key.clone(), None);
             let _ = pending.response.send(ack(pending.key.1, result));
         }
@@ -386,8 +408,22 @@ impl Owner {
                         "wire lifecycle admission"
                     );
                 }
+                if let Some(code) = match &outcome {
+                    Err(code) | Ok(Outcome::Replayed(Err(code))) => Some(*code),
+                    _ => None,
+                } {
+                    shared.refusals.record(
+                        shared.clock.now(),
+                        &request.session.info,
+                        &request.command.verb,
+                        &request.command.args,
+                        code,
+                    );
+                }
                 match outcome {
                     Ok(Outcome::Queued(receipt)) => self.pending.push(Pending {
+                        command: request.command,
+                        session: request.session,
                         key,
                         receipt: parking_lot::Mutex::new(receipt),
                         response: request.response,
@@ -445,9 +481,25 @@ pub(super) async fn execute(
             received.await.map_err(|_| ())?
         }
         Err(mpsc::error::TrySendError::Full(request)) => {
+            shared.refusals.record(
+                shared.clock.now(),
+                &session.info,
+                &request.command.verb,
+                &request.command.args,
+                ErrorCode::SessionBusy,
+            );
             ack(request.command.id, Err(ErrorCode::SessionBusy))
         }
-        Err(mpsc::error::TrySendError::Closed(_)) => return Err(()),
+        Err(mpsc::error::TrySendError::Closed(request)) => {
+            shared.refusals.record(
+                shared.clock.now(),
+                &session.info,
+                &request.command.verb,
+                &request.command.args,
+                ErrorCode::InternalError,
+            );
+            return Err(());
+        }
     };
     let revoked = matches!(&frame, ServerFrame::Ack { error: Some(error), .. } if error.code == ErrorCode::AuthRevoked.as_str());
     let (delivered, flushed) = oneshot::channel();

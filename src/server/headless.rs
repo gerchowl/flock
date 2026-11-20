@@ -695,6 +695,7 @@ impl HeadlessServer {
             data.clone(),
             self.app.render_notify.clone(),
             self.app.client_auth.clone(),
+            self.app.event_hub.clone(),
         )
         .await?;
         self.client_wire = crate::web::client_listener::Listener::prepare(

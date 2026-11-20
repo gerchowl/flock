@@ -2973,6 +2973,8 @@ pub enum EventKind {
     OwnerPolicyAdopted,
     /// Audited operator access to a named pane inbox, without message bodies.
     OperatorInboxAccess,
+    /// Best-effort authenticated wire refusal or bounded suppression summary.
+    WireRefused,
 }
 
 impl EventKind {
@@ -3052,7 +3054,8 @@ impl EventKind {
             | Self::PrClosed
             | Self::WaitExpired
             | Self::OwnerPolicyAdopted
-            | Self::OperatorInboxAccess => true,
+            | Self::OperatorInboxAccess
+            | Self::WireRefused => true,
             Self::PaneOutputChanged | Self::MeshRoutesChanged | Self::MeshOutboundPending => false,
         }
     }
@@ -5161,6 +5164,17 @@ pub enum EventData {
         child_branch: String,
         /// Whether a pivot prompt seeded the fork's opening turn.
         seeded: bool,
+    },
+    /// Authenticated command refused before dispatch; no command body or secret.
+    /// `suppressed == 0` is an individual event. Positive counts summarize one
+    /// window; null identity/verb/reason denotes aggregate capacity overflow.
+    WireRefused {
+        principal: Option<String>,
+        token_id: Option<String>,
+        verb: Option<String>,
+        target: Option<String>,
+        reason: Option<String>,
+        suppressed: u64,
     },
 }
 

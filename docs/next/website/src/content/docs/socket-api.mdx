@@ -1683,3 +1683,10 @@ On Linux, the native shell must refuse local mint when `ptrace_scope=0`, explain
 that other processes could read its operator credential, and offer explicit
 remote pairing or administrator-enabled `ptrace_scope ≥ 1`. G9a owns that
 native check and fallback presentation; there is no silent fallback.
+
+Every authenticated structured-wire refusal (commands, subscriptions and protocol) emits
+best-effort `wire_refused` events through the event hub. See the
+[structured wire refusal audit contract](../structured-wire-minimal/#refusal-audit-events)
+for fields, exact suppression summaries, the shared 60-second per-key/global
+budgets, graceful shutdown flushing, and the limits at capacity, crash and
+journal failure. Refusal reporting does not replace required mutation audits.
