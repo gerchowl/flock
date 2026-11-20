@@ -35,6 +35,7 @@ struct Bridge {
     stream: BufReader<UnixStream>,
     agent: String,
     seq: u64,
+    operation: String,
 }
 impl Bridge {
     fn start(node: &Node, name: &str, structured: bool) -> Self {
@@ -60,6 +61,7 @@ impl Bridge {
             stream: BufReader::new(stream),
             agent: started["agent"]["agent_id"].as_str().unwrap().into(),
             seq: 0,
+            operation: String::new(),
         };
         bridge.request("initialize", json!({}));
         bridge
@@ -70,6 +72,7 @@ impl Bridge {
     }
     fn begin(&mut self, method: &str, params: Value) {
         self.seq += 1;
+        self.operation = format!("{method} {}", params["name"].as_str().unwrap_or_default());
         writeln!(
             self.stream.get_mut(),
             "{}",
@@ -88,7 +91,11 @@ impl Bridge {
         );
         let value: Value = serde_json::from_str(&line).unwrap();
         assert_eq!(value["id"], self.seq);
-        assert!(value.get("error").is_none(), "MCP refusal: {value}");
+        assert!(
+            value.get("error").is_none(),
+            "MCP refusal for {}: {value}",
+            self.operation
+        );
         value
     }
     fn tool(&mut self, name: &str, arguments: Value) -> Value {

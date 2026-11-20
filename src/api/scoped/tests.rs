@@ -186,3 +186,71 @@ fn legacy_invalid_request_keeps_serde_detail_but_scoped_detail_is_redacted() {
     assert!(legacy.to_string().contains("unknown-fixture-method"));
     assert!(decode(r#"{"request":{"id":"x","method":"secret-canary","params":{}},"credential":"credential-canary"}"#).unwrap_err().is_none());
 }
+
+#[test]
+fn scoped_socket_authenticates_during_a_read_only_lease_census() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let (leases, lease, _scope, peer) = live_scope();
+        let policy = UidPolicy {
+            operator: peer.uid.unwrap(),
+            dedicated: Ok(None).into(),
+        };
+        let (server, mut client) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (release, reader) = leases.test_hold_reader();
+        let server_policy = policy.clone();
+        let task = std::thread::spawn(move || {
+            crate::api::server::handle_connection(
+                server,
+                &tx,
+                &EventHub::default(),
+                &Arc::new(AtomicBool::new(true)),
+                None,
+                &Mutex::default(),
+                &crate::api::client_listener::Health::default(),
+                &server_policy,
+            )
+            .unwrap();
+        });
+        let request = Request {
+            id: "reader-census".into(),
+            method: Method::Ping(crate::api::schema::PingParams::default()),
+        };
+        writeln!(
+            client,
+            "{}",
+            serde_json::to_string(&ScopedRequest {
+                request,
+                credential: Some(lease.credential()),
+            })
+            .unwrap()
+        )
+        .unwrap();
+        let msg = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let reply = msg
+            .scope
+            .as_ref()
+            .unwrap()
+            .probe_reply(&leases, &policy)
+            .unwrap();
+        msg.respond_to.send(reply.into()).unwrap();
+        let mut line = String::new();
+        BufReader::new(client).read_line(&mut line).unwrap();
+        release.send(()).unwrap();
+        reader.join().unwrap();
+        task.join().unwrap();
+        let response: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert!(response.get("error").is_none(), "{response}");
+        assert_eq!(response["result"]["type"], "pong", "{response}");
+    });
+}
