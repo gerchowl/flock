@@ -71,8 +71,13 @@ impl App {
             })
         {
             crate::logging::event_log_write_failed(&error.to_string());
-            return encode_error(id, crate::api::error_code::ErrorCode::DelegateAuditUnavailable.as_str(),
-                "rebind audit unavailable; repair audit storage and restart the server before retrying");
+            return encode_error(
+                id,
+                error
+                    .code(crate::api::error_code::ErrorCode::DelegateAuditUnavailable)
+                    .as_str(),
+                error.to_string(),
+            );
         }
         encode_success(id, ResponseResult::AgentInfo { agent })
     }
