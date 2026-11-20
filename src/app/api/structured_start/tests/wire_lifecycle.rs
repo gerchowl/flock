@@ -55,7 +55,9 @@ async fn app_operate_wire_stop_resume_preserves_session_and_lists_offline() {
             ),
         )
         .unwrap();
-    let first_identity = store.authenticate(&token).unwrap().info.name;
+    let first_info = store.authenticate(&token).unwrap().info;
+    let first_identity = first_info.name;
+    let principal = first_info.principal;
     let second_identity = store.authenticate(&renewed).unwrap().info.name;
     assert_ne!(first_identity, second_identity);
     let root = fixture.fixture.root.path().to_owned();
@@ -129,7 +131,7 @@ sys.stdin.read()
         &mut socket,
         "stop",
         "agent.stop",
-        json!({"target":id}),
+        json!({"target":"fixture-launch"}),
     )
     .await;
     assert_eq!(stopped["ok"], true, "{stopped}");
@@ -157,7 +159,7 @@ sys.stdin.read()
         &mut socket,
         "run-as-refusal",
         "agent.restart",
-        json!({"target":id,"reason":"fixture resume"}),
+        json!({"target":"fixture-launch","reason":"fixture resume"}),
     )
     .await;
     assert_eq!(
@@ -172,7 +174,7 @@ sys.stdin.read()
         &mut socket,
         "restart",
         "agent.restart",
-        json!({"target":id,"reason":"fixture resume"}),
+        json!({"target":"fixture-launch","reason":"fixture resume"}),
     )
     .await;
     assert_eq!(restarted["ok"], true, "{restarted}");
@@ -221,7 +223,7 @@ sys.stdin.read()
         &mut second,
         "stop",
         "agent.stop",
-        json!({"target":id}),
+        json!({"target":"fixture-launch"}),
     )
     .await;
     assert_eq!(replay, stopped);
@@ -242,6 +244,34 @@ sys.stdin.read()
     assert!(audits
         .iter()
         .any(|event| event["fields"]["credential"] == second_identity));
+    for (command_id, expected_credential, verb, outcome) in [
+        ("stop", &first_identity, "agent.stop", "admitted"),
+        ("restart", &first_identity, "agent.restart", "admitted"),
+        (
+            "run-as-refusal",
+            &first_identity,
+            "agent.restart",
+            "structured_needs_agent_user",
+        ),
+        ("stop", &second_identity, "agent.stop", "admitted"),
+    ] {
+        let event = audits
+            .iter()
+            .find(|event| {
+                event["fields"]["cmd_id"] == command_id
+                    && event["fields"]["credential"] == *expected_credential
+            })
+            .expect("lifecycle audit");
+        let fields = &event["fields"];
+        assert_eq!(fields["target"], "fixture-launch", "{fields}");
+        assert_eq!(fields["agent_id"], id, "{fields}");
+        assert_eq!(fields["principal"], principal, "{fields}");
+        assert_eq!(fields["verb"], verb, "{fields}");
+        assert_eq!(fields["outcome"], outcome, "{fields}");
+        if verb == "agent.restart" {
+            assert_eq!(fields["session_id"], session, "{fields}");
+        }
+    }
     drop(second);
     drop(socket);
     server.finish().await;
@@ -348,4 +378,71 @@ async fn structured_peer_cannot_mint_wire_operator_or_resume_socket_record() {
             .unwrap();
     let denied = fixture.request(Method::AgentStart(params)).await;
     assert_eq!(denied["error"]["code"], "operator_only", "{denied}");
+}
+
+#[tokio::test]
+async fn structured_lifecycle_refusals_audit_target_session_and_principal() {
+    let _guard = crate::config::test_config_env_guard();
+    let mut fixture = AdmissionFixture::new("init-restricted", 120_000);
+    let (mut server, _, owner) = app_sessions::fixture().await;
+    fixture.app.client_auth = owner.clone();
+    let token = app_sessions::mint(&mut fixture.app).await;
+    let store = owner
+        .get(
+            server._root.path(),
+            Arc::new(
+                crate::structured::permissions::auth::tokens::app_sessions::SystemClock::new(),
+            ),
+        )
+        .unwrap();
+    let info = store.authenticate(&token).unwrap().info;
+    let (id, _) = fixture.start().await;
+    let session_id = fixture
+        .app
+        .state
+        .structured_agents
+        .get(&id)
+        .unwrap()
+        .0
+        .session_id
+        .clone();
+    let audit_path = fixture.fixture.root.path().join("refusal-audit.jsonl");
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_ansi(false)
+        .with_writer(std::sync::Mutex::new(
+            fs::File::create(&audit_path).unwrap(),
+        ))
+        .finish();
+    let _subscriber = tracing::subscriber::set_default(subscriber);
+    let mut socket = Socket::open(&server).await;
+    assert_eq!(socket.hello(2, &token.0).await["t"], "welcome");
+    let mut reduced = store.authenticate(&token).unwrap();
+    store.answer_only_app_for_test(&mut reduced);
+    for verb in ["agent.stop", "agent.restart"] {
+        let refused = command(&mut fixture, &mut server, &mut socket, verb, verb,
+            json!({"target":"fixture-launch","reason":"fixture resume",
+                "agent_id":"forged-agent", "session_id":"forged-session", "principal":"forged-principal"})).await;
+        assert_eq!(refused["error"]["code"], "not_authorized", "{refused}");
+    }
+    let audits: Vec<Value> = fs::read_to_string(&audit_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|event| event["fields"]["message"] == "wire lifecycle admission")
+        .collect();
+    assert_eq!(audits.len(), 2);
+    for event in audits {
+        let fields = &event["fields"];
+        assert_eq!(fields["credential"], info.name, "{fields}");
+        assert_eq!(fields["target"], "fixture-launch", "{fields}");
+        assert_eq!(fields["agent_id"], id, "{fields}");
+        assert_eq!(fields["principal"], info.principal, "{fields}");
+        assert_eq!(fields["outcome"], "not_authorized", "{fields}");
+        if fields["verb"] == "agent.restart" {
+            assert_eq!(fields["session_id"], session_id, "{fields}");
+        }
+    }
+    drop(socket);
+    server.finish().await;
 }

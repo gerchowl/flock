@@ -320,9 +320,40 @@ impl Owner {
                         })
                     });
                 if is_lifecycle {
+                    let target = request
+                        .command
+                        .args
+                        .get("target")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    // Registry context keeps refused decisions attributable without granting authority.
+                    let identity = if target == "self" {
+                        None
+                    } else {
+                        app.state
+                            .structured_agents
+                            .get(target)
+                            .map(|(record, _, _)| {
+                                (record.agent_id.clone(), record.session_id.clone())
+                            })
+                            .or_else(|| {
+                                app.state
+                                    .structured_agents
+                                    .records()
+                                    .into_iter()
+                                    .find(|record| record.name.as_deref() == Some(target))
+                                    .map(|record| (record.agent_id, record.session_id))
+                            })
+                    };
                     tracing::info!(
                         event = "wire.lifecycle.admission",
                         credential = request.session.info.name.as_str(),
+                        principal = request.session.info.principal.as_str(),
+                        target,
+                        agent_id = identity.as_ref().map_or("", |(agent, _)| agent.as_str()),
+                        session_id = identity
+                            .as_ref()
+                            .map_or("", |(_, session)| session.as_str()),
                         verb = request.command.verb.as_str(),
                         cmd_id = request.command.id.as_str(),
                         outcome = outcome.as_ref().map_or_else(

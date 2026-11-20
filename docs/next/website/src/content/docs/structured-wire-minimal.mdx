@@ -313,8 +313,12 @@ run-as, recovery and spawn admission. An active worker refuses replacement with
 `continue_with` is unsupported for structured
 restart; `when` must be `after_turn` and `reason` must be nonempty plain text
 of at most 1,024 bytes. Stop requests asynchronous cleanup; inspect `agent.list`
-or `agent.get` for confirmed `offline` state. Each stop/restart admission is
-logged with the per-mint `app:<nonce>` credential identity and its outcome.
+or `agent.get` for confirmed `offline` state. Owner-side stop/restart decisions,
+including refusals and replays, log the requested `target`, resolved `agent_id`
+and `session_id` when known, authenticated `principal`, per-mint `app:<nonce>`
+credential identity, and outcome. Unresolved identities use empty ID fields.
+Generic ingress refusals (including version, command-ID and capacity checks)
+and queue-full refusals before owner dispatch retain their pre-existing audit gap.
 
 File credentials retain `operator_only` for structured stop and
 `runtime_unsupported` for structured restart, even with `operate`. Tokens
