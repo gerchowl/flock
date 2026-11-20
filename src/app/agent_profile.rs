@@ -86,8 +86,21 @@ impl App {
         if terminal.profile_env_session.as_deref() == Some(session.as_str()) {
             return;
         }
-        terminal.profile_env_session = Some(session);
+        terminal.profile_env_session = Some(session.clone());
         self.record_agent_profile_env(&terminal_id, self.current_api_peer_pid);
+        // The spawn snapshot survives missing hooks and unreadable peer environments.
+        // The harness hook's own record is stronger evidence and must win.
+        if let Some(terminal) = self.state.terminals.get(&terminal_id) {
+            if terminal.claude_session_id().as_deref() == Some(session.as_str()) {
+                if let Some((_, config)) = terminal
+                    .launch_env
+                    .iter()
+                    .find(|(key, value)| key == "CLAUDE_CONFIG_DIR" && !value.is_empty())
+                {
+                    crate::agent_resume::record_claude_config_dir_if_absent(&session, config);
+                }
+            }
+        }
     }
 
     /// The pane's foreground process: the agent itself when it runs in a

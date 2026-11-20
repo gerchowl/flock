@@ -100,11 +100,10 @@ impl SessionLeases {
         else {
             return Ok(Caller::Uncertain);
         };
-        // Unlike ancestry's compatibility snapshot, scoped auth must never use a
-        // stale view after registry contention or generation replacement.
+        // Read-only census and authentication calls may overlap. A writer still
+        // refuses immediately, without ancestry's compatibility snapshot fallback.
         let entry = self
-            .0
-            .try_lock()
+            .try_read_entries()
             .ok_or(ScopedRefusal::RegistryContended)?
             .values()
             .find(|e| e.generation.live() && e.generation.credential.matches(credential))
