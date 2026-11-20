@@ -150,13 +150,7 @@ impl Server {
     ) -> Self {
         let clock = TestClock::new();
         let wake = Arc::new(tokio::sync::Notify::new());
-        let mut core = Core::with_clock(
-            store,
-            root.path().to_owned(),
-            wrap(clock.clone()),
-            wake.clone(),
-        )
-        .unwrap();
+        let mut core = Core::with_clock(store, wrap(clock.clone()), wake.clone()).unwrap();
         setup(&mut core);
         let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let bind = socket.local_addr().unwrap();

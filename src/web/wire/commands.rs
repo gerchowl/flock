@@ -1,5 +1,7 @@
 //! Bounded app-owner command admission (ADR-0036 §5/§5a, S7-min slice 5).
 use super::*;
+// J1a is dormant until J1b replaces the live duplicate list with journal admission.
+#[allow(dead_code)]
 mod journal;
 use crate::{
     api::error_code::ErrorCode,
@@ -11,10 +13,15 @@ use crate::{
     },
 };
 use serde_json::Value;
-use std::sync::mpsc::{Receiver, TryRecvError};
+use std::{
+    collections::VecDeque,
+    sync::mpsc::{Receiver, TryRecvError},
+};
 use tokio::sync::{oneshot, Notify};
 /// Each command lane and the send receipt set have this fixed capacity.
 const CAPACITY: usize = 32;
+/// Completed principal/command keys retained in FIFO order; pending sends never evict.
+const COMMAND_IDS: usize = 1024;
 /// One decoded first-send command; identity and authority never come from args.
 pub(super) struct Command {
     pub(super) id: String,
@@ -37,20 +44,23 @@ pub(super) struct Client {
 }
 type Receipt = Receiver<Result<AgentSendResult, ErrorCode>>;
 struct Pending {
-    admitted_ms: u64,
     key: (String, String),
     // Shared core shutdown requires Sync; the app owner uses get_mut, never a blocking lock.
     receipt: parking_lot::Mutex<Receipt>,
-    responses: Vec<oneshot::Sender<ServerFrame>>,
+    response: oneshot::Sender<ServerFrame>,
+}
+struct Completed {
+    key: (String, String),
+    lifecycle: Option<(String, Value, Result<Value, ErrorCode>)>,
 }
 /// Only the app owner touches App, runtime permission books and send admission.
 pub(super) struct Owner {
     rx: [mpsc::Receiver<Request>; 2],
-    journal: journal::Journal,
+    completed: VecDeque<Completed>,
     pending: Vec<Pending>,
 }
 /// Share the existing app-loop wake without introducing a second state owner.
-pub(super) fn channel(wake: Arc<Notify>, data: PathBuf) -> (Client, Owner) {
+pub(super) fn channel(wake: Arc<Notify>) -> (Client, Owner) {
     let (send, sends) = mpsc::channel(CAPACITY);
     let (decide, decisions) = mpsc::channel(CAPACITY);
     (
@@ -60,7 +70,7 @@ pub(super) fn channel(wake: Arc<Notify>, data: PathBuf) -> (Client, Owner) {
         },
         Owner {
             rx: [sends, decisions],
-            journal: journal::Journal::new(data),
+            completed: VecDeque::new(),
             pending: Vec::new(),
         },
     )
@@ -74,8 +84,7 @@ impl Client {
 enum Outcome {
     Queued(Receipt),
     Decided(Value),
-    Replayed(ServerFrame),
-    Joined(usize),
+    Replayed(Result<Value, ErrorCode>),
 }
 fn dispatch(
     app: &mut App,
@@ -85,6 +94,10 @@ fn dispatch(
 ) -> Result<Outcome, ErrorCode> {
     if command.read_only {
         return Err(ErrorCode::ServerVersionGap);
+    }
+    // No durable command journal exists in S7-min; uncertain retries never dispatch.
+    if command.resume_only {
+        return Err(ErrorCode::SessionUnconfirmed);
     }
     dispatch_verb(app, command, principal, session)
 }
@@ -217,6 +230,16 @@ pub(super) fn ack(id: String, result: Result<Value, ErrorCode>) -> ServerFrame {
     }
 }
 impl Owner {
+    fn remember(
+        &mut self,
+        key: (String, String),
+        lifecycle: Option<(String, Value, Result<Value, ErrorCode>)>,
+    ) {
+        if self.completed.len() == COMMAND_IDS {
+            self.completed.pop_front();
+        }
+        self.completed.push_back(Completed { key, lifecycle });
+    }
     /// Revalidate under the token revocation lock through bounded admission.
     /// Queue completion is polled separately; no model or stdin completion is awaited.
     pub(super) fn service(&mut self, app: &mut App) {
@@ -234,12 +257,8 @@ impl Owner {
             let result = result.and_then(|result| {
                 serde_json::to_value(result).map_err(|_| ErrorCode::SerializationError)
             });
-            let frame =
-                self.journal
-                    .finish(&pending.key.0, &pending.key.1, pending.admitted_ms, result);
-            for response in pending.responses {
-                let _ = response.send(frame.clone());
-            }
+            self.remember(pending.key.clone(), None);
+            let _ = pending.response.send(ack(pending.key.1, result));
         }
         // Decisions have independent capacity even when every send receipt is pending.
         for lane in [1, 0] {
@@ -265,30 +284,26 @@ impl Owner {
                 } else {
                     Scope::Send
                 };
-                let mut admitted_ms = None;
+                // Only the owner mutates these sets; lookup need not hold the token lock.
+                let completed = self.completed.iter().find(|entry| entry.key == key);
+                let duplicate = completed.is_some() || self.pending.iter().any(|p| p.key == key);
+                let mut dispatched = false;
                 let outcome = request
                     .store
                     .admit(&request.session, scope, |token| {
-                        if request.command.read_only {
-                            return Err(ErrorCode::ServerVersionGap);
-                        }
-                        match self
-                            .journal
-                            .claim(&key.0, &request.command, journal::now_ms())?
-                        {
-                            journal::Admission::Replayed(frame) => {
-                                return Ok(Outcome::Replayed(frame))
+                        if duplicate {
+                            if let Some((verb, args, result)) = completed
+                                .filter(|_| is_lifecycle)
+                                .and_then(|entry| entry.lifecycle.as_ref())
+                            {
+                                if verb != &request.command.verb || args != &request.command.args {
+                                    return Err(ErrorCode::InvalidParams);
+                                }
+                                return Ok(Outcome::Replayed(result.clone()));
                             }
-                            journal::Admission::Pending(stamp) => {
-                                return self
-                                    .pending
-                                    .iter()
-                                    .position(|p| p.key == key && p.admitted_ms == stamp)
-                                    .map(Outcome::Joined)
-                                    .ok_or(ErrorCode::SessionUnconfirmed)
-                            }
-                            journal::Admission::Claimed(stamp) => admitted_ms = Some(stamp),
+                            return Err(ErrorCode::SessionUnconfirmed);
                         }
+                        dispatched = true;
                         dispatch(
                             app,
                             &request.command,
@@ -316,18 +331,14 @@ impl Owner {
                         .unwrap_or_default();
                     // Registry context keeps refused decisions attributable without granting authority.
                     let identity = match &outcome {
-                        Ok(
-                            Outcome::Decided(value)
-                            | Outcome::Replayed(ServerFrame::Ack {
-                                result: Some(value),
-                                ..
-                            }),
-                        ) => value.get("agent").and_then(|agent| {
-                            Some((
-                                agent.get("agent_id")?.as_str()?.to_owned(),
-                                agent.get("session_id")?.as_str()?.to_owned(),
-                            ))
-                        }),
+                        Ok(Outcome::Decided(value) | Outcome::Replayed(Ok(value))) => {
+                            value.get("agent").and_then(|agent| {
+                                Some((
+                                    agent.get("agent_id")?.as_str()?.to_owned(),
+                                    agent.get("session_id")?.as_str()?.to_owned(),
+                                ))
+                            })
+                        }
                         _ => None,
                     }
                     .or_else(|| {
@@ -370,10 +381,7 @@ impl Owner {
                             |code| code.as_str(),
                             |value| {
                                 match value {
-                                    Outcome::Replayed(ServerFrame::Ack {
-                                        error: Some(error),
-                                        ..
-                                    }) => error.code.as_str(),
+                                    Outcome::Replayed(Err(code)) => code.as_str(),
                                     _ => "admitted",
                                 }
                             }
@@ -383,33 +391,36 @@ impl Owner {
                 }
                 match outcome {
                     Ok(Outcome::Queued(receipt)) => self.pending.push(Pending {
-                        admitted_ms: admitted_ms.unwrap_or_default(),
                         key,
                         receipt: parking_lot::Mutex::new(receipt),
-                        responses: vec![request.response],
+                        response: request.response,
                     }),
-                    Ok(Outcome::Joined(index)) => {
-                        self.pending[index].responses.push(request.response)
-                    }
                     Ok(Outcome::Decided(value)) => {
-                        let frame = self.journal.finish(
-                            &key.0,
-                            &key.1,
-                            admitted_ms.unwrap_or_default(),
-                            Ok(value),
-                        );
-                        let _ = request.response.send(frame);
+                        let cached = is_lifecycle.then(|| {
+                            (
+                                request.command.verb.clone(),
+                                request.command.args.clone(),
+                                Ok(value.clone()),
+                            )
+                        });
+                        self.remember(key, cached);
+                        let _ = request.response.send(ack(request.command.id, Ok(value)));
                     }
-                    Ok(Outcome::Replayed(frame)) => {
-                        let _ = request.response.send(frame);
+                    Ok(Outcome::Replayed(result)) => {
+                        let _ = request.response.send(ack(request.command.id, result));
                     }
                     Err(code) => {
-                        let frame = if let Some(stamp) = admitted_ms {
-                            self.journal.finish(&key.0, &key.1, stamp, Err(code))
-                        } else {
-                            ack(request.command.id, Err(code))
-                        };
-                        let _ = request.response.send(frame);
+                        if is_lifecycle && dispatched {
+                            self.remember(
+                                key,
+                                Some((
+                                    request.command.verb.clone(),
+                                    request.command.args.clone(),
+                                    Err(code),
+                                )),
+                            );
+                        }
+                        let _ = request.response.send(ack(request.command.id, Err(code)));
                     }
                 }
             }

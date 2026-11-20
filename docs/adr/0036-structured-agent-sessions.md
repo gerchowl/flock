@@ -2007,21 +2007,34 @@ An oversized outcome leaves its durable claim uncertain instead of truncating
 the result. The namespace is an explicit string (`local` today), so a later
 home-node namespace needs no format change.
 
-The J1 snapshot journal uses an exclusive operation lease, reloads authoritative
-records before each operation, and rewrites through a private temporary file,
-file sync, rename and directory sync for both claim and outcome. This is the
-atomic-replacement equivalent of required append/rollback: a failed claim never
-dispatches, and a failed outcome commit reports uncertainty. It costs O(retained
-entries) I/O per mutation; there is no independent in-memory dedupe cache.
-New admissions compact claims at least 24 hours old using an injected Unix
-millisecond clock in tests. Backward clock movement retains claims longer.
-Count-based rotation must never discard unexpired claims. At most one record
-per claim is stored, with one temporary snapshot during replacement. Preserve
-unknown/invalid complete records raw and serve readable cached results, but
-refuse new mutations while such records exist. Preserve a torn final line as
-an opaque `torn_tail` byte array on the next rewrite; these records count against
-the global cap and are bounded to four times the claim-record size plus 32 bytes. Recovered
-pending claims remain uncertain; completed claims replay the first ack.
+**J1a backend status (#1380).** The append-only backend and bounded off-loop
+writer are implemented but dormant. Live commands still use the existing
+in-memory duplicate list; no request claims or finishes this journal yet.
+J1b replaces that list with asynchronous claim completion, reauthorization,
+dispatch and outcome-before-ack, restoring one live source of truth. J1b also
+adds threshold compaction and its append catch-up/publication protocol.
+
+The backend holds an exclusive writer lease, rebuilds its index and per-principal
+counts by replay once at open, and appends one bounded record per claim/outcome.
+Successful completion follows file sync and index publication; failed appends
+roll back to the previous length and sync it, then fence further writes until
+reopen. Directory sync occurs on file creation; rename publication belongs to
+J1b. Its mailbox holds at most 32 queued jobs plus one active job. Submission
+uses a nonblocking try-send and owns no filesystem or authorization lock.
+Startup recovery and all journal writes run on the dedicated writer thread.
+
+Until J1b compacts, expired entries continue occupying their counts: resume-only
+lookup refuses them as uncertain, and reuse as a new claim refuses busy. No
+entry is evicted. There are at most two records per retained key and a hard
+active-file byte bound of twice the global entry cap times the record byte cap.
+Unknown/invalid complete records stay raw in place, are skipped and logged,
+and fence further writes while readable indexed results remain available.
+A torn final line is archived as raw bytes in private `commands.torn.jsonl`,
+file-synced before the active tail is truncated and synced. The archive is
+bounded to 32 record byte caps; recovery refuses without truncation when full.
+A recovered pending claim remains uncertain and a completed claim returns
+its first acknowledgement. These are backend properties, not active wire
+recovery promises in J1a.
 
 Automatic resend is allowed for the listed §5 verbs only through this durable
 idempotency path, not based on an assumed harmless verb. Permission/question

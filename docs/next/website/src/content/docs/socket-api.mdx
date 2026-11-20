@@ -1661,14 +1661,3 @@ On Linux, the native shell must refuse local mint when `ptrace_scope=0`, explain
 that other processes could read its operator credential, and offer explicit
 remote pairing or administrator-enabled `ptrace_scope ≥ 1`. G9a owns that
 native check and fallback presentation; there is no silent fallback.
-
-## Wire command retry recovery
-
-The WebSocket `cmd` transport persists claims and acknowledgements for 24 hours.
-After uncertain delivery, retry only with the same principal, command ID and
-payload and `resume_only: true`. A missing, expired or unfinished claim reports
-`session_unconfirmed` (exit 8) without dispatch. Changed payloads refuse
-`invalid_params`; capacity refuses new claims with `session_busy` without
-evicting unexpired claims. See [wire command recovery](../structured-wire-minimal/#agent-lifecycle-commands)
-for limits and persistence details. Socket API requests do not implicitly gain
-wire command IDs or retry deduplication.
