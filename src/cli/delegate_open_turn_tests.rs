@@ -37,6 +37,7 @@ fn entry(round: u64) -> Entry {
         agent_id: None,
         lock_resolution: None,
         session: None,
+        extra: Default::default(),
     }
 }
 

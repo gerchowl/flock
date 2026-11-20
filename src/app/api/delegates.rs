@@ -34,6 +34,49 @@ impl App {
         }
     }
 
+    pub(super) fn handle_delegate_rebind(
+        &mut self,
+        id: String,
+        params: crate::api::schema::DelegateRebindParams,
+    ) -> String {
+        if !self.caller_is_local_operator() {
+            return encode_error(
+                id,
+                "operator_only",
+                "delegate rebind requires the local operator",
+            );
+        }
+        let agents: Vec<_> = self
+            .collect_agent_infos()
+            .into_iter()
+            .filter(|agent| agent.agent_id == params.agent_id)
+            .collect();
+        let mut agents = agents.into_iter();
+        let Some(agent) = agents.next().filter(|_| agents.next().is_none()) else {
+            return encode_error(
+                id,
+                "session_unbound",
+                "agent id has no unique live PTY binding",
+            );
+        };
+        if let Err(error) = self
+            .event_hub
+            .try_push_durable(crate::api::schema::EventEnvelope {
+                event: crate::api::schema::EventKind::DelegateRebindAuthorized,
+                data: crate::api::schema::EventData::DelegateRebindAuthorized {
+                    name: params.name,
+                    previous_agent_id: params.previous_agent_id,
+                    agent_id: agent.agent_id.clone(),
+                },
+            })
+        {
+            crate::logging::event_log_write_failed(&error.to_string());
+            return encode_error(id, crate::api::error_code::ErrorCode::DelegateAuditUnavailable.as_str(),
+                "rebind audit unavailable; repair audit storage and restart the server before retrying");
+        }
+        encode_success(id, ResponseResult::AgentInfo { agent })
+    }
+
     pub(super) fn handle_delegate_list(
         &mut self,
         id: String,
@@ -596,5 +639,103 @@ mod handler_tests {
         app.delegations.mark_gone(&delegate);
         assert_eq!(list(&mut app, &["--all"]).unwrap()[0].state, "gone");
         shutdown(app);
+    }
+}
+
+#[cfg(test)]
+mod rebind_tests {
+    use crate::api::{
+        schema::{EventData, EventKind, Request},
+        EventHub,
+    };
+    use crate::app::delegation::handler_tests::{app_on, caller_is_an_agent, temp_log};
+    use serde_json::{json, Value};
+
+    fn request(agent: &str) -> Request {
+        serde_json::from_value(json!({"id":"rebind","method":"delegate.rebind",
+            "params":{"name":"fixture","agent_id":agent,"previous_agent_id":null}}))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn rebind_refuses_failed_audit_append_before_authorizing_the_client() {
+        let log = temp_log("rebind-audit-failed");
+        let hub = EventHub::with_persistence(log.clone());
+        let mut app = app_on(hub.clone());
+        let agent = caller_is_an_agent(&mut app);
+        app.current_api_peer_pid = Some(std::process::id());
+        app.current_api_peer_birth = Some(crate::platform::process_start_time(std::process::id()));
+        let before = std::fs::read(&log).unwrap();
+        hub.fail_appends_for_test();
+        for _ in 0..2 {
+            let response: Value =
+                serde_json::from_str(&app.handle_api_request(request(&agent))).unwrap();
+            assert_eq!(
+                response["error"]["code"], "delegate_audit_unavailable",
+                "{response}"
+            );
+            assert!(response.get("result").is_none());
+        }
+        assert_eq!(std::fs::read(&log).unwrap(), before);
+        assert!(!hub
+            .events_after(0)
+            .unwrap_or_default()
+            .iter()
+            .any(|(_, e)| e.event == EventKind::DelegateRebindAuthorized));
+        assert!(app.delegations.edges().next().is_none());
+        crate::app::delegation::handler_tests::shutdown(app);
+        drop(hub);
+        std::fs::remove_dir_all(log.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn rebind_is_operator_only_audited_and_never_creates_an_edge() {
+        let log = temp_log("rebind");
+        let hub = EventHub::with_persistence(log.clone());
+        let mut app = app_on(hub.clone());
+        let agent = caller_is_an_agent(&mut app);
+        let refused: Value =
+            serde_json::from_str(&app.handle_api_request(request(&agent))).unwrap();
+        assert_eq!(refused["error"]["code"], "operator_only");
+        assert!(!hub
+            .persisted_events_after(0)
+            .iter()
+            .any(|(_, _, e)| e.event == EventKind::DelegateRebindAuthorized));
+
+        app.current_api_peer_pid = Some(std::process::id());
+        app.current_api_peer_birth = Some(crate::platform::process_start_time(std::process::id()));
+        app.runtime_config.uid_policy = crate::structured::identity::UidPolicy {
+            operator: 7,
+            dedicated: Ok(Some(42)).into(),
+        };
+        app.current_api_peer_uid = Some(Some(7));
+        let response: Value =
+            serde_json::from_str(&app.handle_api_request(request(&agent))).unwrap();
+        assert_eq!(response["result"]["agent"]["agent_id"], agent, "{response}");
+        assert!(app.delegations.edges().next().is_none());
+        let events = hub.persisted_events_after(0);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|(_, _, e)| e.event == EventKind::DelegateRebindAuthorized)
+                .count(),
+            1
+        );
+        assert!(events.iter().any(|(_,_,e)|matches!(&e.data, EventData::DelegateRebindAuthorized { name, agent_id, .. } if name=="fixture" && agent_id==&agent)));
+        let reopened = EventHub::with_persistence(log.clone());
+        assert!(reopened
+            .persisted_events_after(0)
+            .iter()
+            .any(|(_, _, e)| e.event == EventKind::DelegateRebindAuthorized));
+        for uid in [Some(42), None] {
+            app.current_api_peer_uid = Some(uid);
+            let refused: Value =
+                serde_json::from_str(&app.handle_api_request(request(&agent))).unwrap();
+            assert_eq!(refused["error"]["code"], "operator_only", "{refused}");
+        }
+        drop(reopened);
+        crate::app::delegation::handler_tests::shutdown(app);
+        drop(hub);
+        std::fs::remove_dir_all(log.parent().unwrap()).unwrap();
     }
 }

@@ -702,6 +702,19 @@ Existing `msg read --pane TARGET` and `msg list --pane TARGET` require the same
 operator check when TARGET is another pane; an attested caller may still read
 its own inbox.
 
+Claude's Stop hook resolves its inbox from process attestation, including after a
+fork or resume with a stale `FLOCK_PANE_ID`. Its CLI fallback is `flk msg read`
+without an explicit pane. The `msg.wake` socket method with an explicit `pane`
+uses the same ownership check as a read: another pane requires local operator authority.
+An authority refusal produces one nonblocking recovery notice per server, pane
+claim and harness session; the hook does not keep blocking on unread mail or a
+recap while that refusal persists. A successful wake check resets the notice.
+Resuming a harness in a legacy pane without process-birth evidence does not
+restore that evidence; the migration and operator recovery paths above still
+apply. Forked PTY agents use their own pane identity and inbox, while a resumed
+agent uses the attested pane in which it runs; a harness session ID or environment
+claim cannot transfer another agent's inbox authority (ADR-0008 and ADR-0036 §1a).
+
 Without `--pane`, `msg list` is scoped to the caller's attested inbox. An unresolved caller receives `caller_pane_unresolved`. Listing all panes or another pane's inbox requires the local operator. Global operator lists record `operator_inbox_access` with `pane: null` and the total message count. Reads return only live entries from
 a mixed expired/live batch, once; each expired entry emits one durable
 `dropped_undeliverable` event. Reading the projection does not submit another turn.
@@ -926,6 +939,7 @@ flk delegate send <name> --brief FILE [--await] [--timeout MS] [--settle MS] [--
 flk delegate wait <name> [--after CURSOR] [--timeout MS] [--settle MS] [--silence DURATION] [--max-chars N] [--json]
 flk delegate result <name> [--max-chars N] [--json]
 flk delegate status <name> [--json]
+flk delegate rebind <name> --agent <id> [--json]
 flk delegate reap <name> [--force] [--json]
 flk delegate list [--mine | --architect <id> | --all] [--branch <b>] [--json]
 ```
@@ -1033,7 +1047,19 @@ If the agent exits before it takes the brief (a harness that dies at launch, say
 
 `pane read --source detection` reads exactly the unscrolled screen used by agent detection, excluding scrollback; `--lines` does not expand that screen. It supports text and ANSI formats. Socket clients can ask `pane.read` for `source: "detection_unfaint"` to get the same screen plus `unfaint`, the same rows with faint cells blanked, from one read; that is how `delegate wait` tells an agent's own dimmed suggestion from a typed draft.
 
-Delegates retain the session ID reported by the harness at launch and follow their stable agent identity across terminal changes. Recovery requires an exact session ID in the Codex rollout or Claude session store. When recovery is needed, a missing ID, an unreadable store, a conflicting identity, or duplicate matching session files returns `session_unbound` (exit **12**) from `delegate wait`, `result`, and `send`. The error names the agent and current terminal and provides `flk pane read <pane>` for diagnostics. Pane captures are never returned as results. Recovery currently supports Codex and Claude; other harnesses return `session_unbound` after a terminal change. Recovery requires a recorded stable agent ID. Legacy records without that ID return `session_unbound`; a matching name or working directory never establishes identity. Records with a stable agent ID but no captured session ID can recover only when that agent reports an authoritative session. Recovery targets the recorded delegate and requires its attested supervisor or the operator. Inspect before retrying, and resume the existing agent or repair its session integration rather than starting a duplicate.
+Delegates retain the session ID reported by the harness at launch and follow their stable agent identity across terminal changes. Recovery requires an exact session ID in the Codex rollout or Claude session store. When recovery is needed, a missing ID, an unreadable store, a conflicting identity, or duplicate matching session files returns `session_unbound` (exit **12**) from `delegate wait`, `result`, and `send`. The error names the agent and current terminal and provides `flk pane read <pane>` for diagnostics. Pane captures are never returned as results. Recovery currently supports Codex and Claude; other harnesses return `session_unbound` after a terminal change. Recovery requires a recorded stable agent ID. For pre-v2 records, the CLI backfills that ID only when the saved harness and native session ID have exactly one live match. Terminal equality, names, and working directories never establish identity. Session-less records remain `session_unbound` (exit **12**, JSON `reason: "saved_session_missing"`); unmatched or duplicate session claims report `saved_session_not_found` or `saved_session_ambiguous`. A structured-only match reports `saved_session_runtime_unsupported`; incomplete live identity fields report `live_binding_incomplete`. Failed inventory reads do not modify the record. Successful backfill persists atomically, preserves unknown fields and the recorded round, and is idempotent across CLI restarts. Records with a stable agent ID but no captured session ID can recover only when that agent reports an authoritative session. Recovery targets the recorded delegate and requires its attested supervisor or the operator. Inspect before retrying, and resume the existing agent or repair its session integration rather than starting a duplicate.
+
+The backfill `reason` values are registered typed codes; the enclosing error remains `session_unbound` (exit **12**):
+
+| Registered reason | Retry class | Meaning |
+| --- | --- | --- |
+| `saved_session_missing` | `after_inspecting` | No usable saved native harness session ID |
+| `saved_session_not_found` | `after_inspecting` | No exact live harness/session match |
+| `saved_session_ambiguous` | `after_inspecting` | Multiple exact session claims |
+| `saved_session_runtime_unsupported` | `after_inspecting` | Only a pane-free runtime matches this PTY delegate |
+| `live_binding_incomplete` | `after_inspecting` | Live record lacks an agent, terminal, or pane identity |
+
+An operator can explicitly repair a local delegate record with `flk delegate rebind <name> --agent <id>`. Run it from an operator shell outside agent panes. The server requires the exact live PTY agent ID and refuses agent, relayed, or unattested callers with `operator_only` (exit **13**). It writes a durable `delegate_rebind_authorized` event with the delegate name, previous ID, and selected ID before returning authorization; this event records approval, and does not claim that the client write completed. If the audit journal is missing or its append/sync fails, the server returns registered error `delegate_audit_unavailable` (exit **1**, retry class `after_human`) without authorizing or changing the client record. A failed writer is closed to protect a potentially torn tail, while the journal path remains available for reading intact prior history; repair audit storage and restart the server before retrying. The CLI then atomically saves the selected agent, terminal, pane, harness session, and observation cursor, preserving the round and submission time. This is explicit replacement of launch evidence: inspect the chosen agent before rebinding. Rebind and automatic backfill grant no new server authority and do not create or restore architect edges, so `delegate list` remains a projection of existing server edges (#3147).
 
 The session ID captured for a delegate is immutable launch evidence. Re-identification preserves it; a different observed or returned session produces `session_unbound` (exit **12**) without replacing the saved ID. The server also requires that delegate's own persisted session record from its native hook or restore path. A supervisor may select the delegate and assert its expected session, but cannot choose another session to bind. A missing server-side record, or a request for the supervisor's session, is refused.
 

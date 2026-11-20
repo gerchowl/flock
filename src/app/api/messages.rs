@@ -962,6 +962,9 @@ impl App {
             Ok(pane) => pane,
             Err(refusal) => return refusal,
         };
+        if let Err(refusal) = self.inbox_operator_access(&id, &pane) {
+            return refusal;
+        }
 
         if let Some(suppression) = self.wake_suppression(&pane, now_ms()) {
             return encode_success(

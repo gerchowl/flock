@@ -1490,6 +1490,7 @@ impl App {
         if matches!(
             request.method,
             Method::AgentStop(_)
+                | Method::DelegateRebind(_)
                 | Method::ProfilePlan(_)
                 | Method::ProfileBind(_)
                 | Method::ProfileRevoke(_)
@@ -1523,6 +1524,7 @@ impl App {
         let code = if matches!(
             request.method,
             Method::StructuredGrantsList(_)
+                | Method::DelegateRebind(_)
                 | Method::ProfilePlan(_)
                 | Method::ProfileBind(_)
                 | Method::ProfileRevoke(_)
@@ -1784,6 +1786,9 @@ impl App {
             Method::AgentRestart(params) => return self.handle_agent_restart(request.id, params),
             Method::AgentLineage(params) => return self.handle_agent_lineage(request.id, params),
             Method::DelegateList(params) => return self.handle_delegate_list(request.id, params),
+            Method::DelegateRebind(params) => {
+                return self.handle_delegate_rebind(request.id, params)
+            }
             Method::MsgSend(params) => return self.handle_msg_send(request.id, params),
             Method::ClientTokenAdd(_)
             | Method::ClientTokenRemove(_)
