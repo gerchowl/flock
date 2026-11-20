@@ -195,9 +195,18 @@ supersedes the older edge. Resetting an inbound pin clears all edges enrolled
 under that identity. Transient connection failures show `retrying` with the
 reason; `refused` identifies a handshake or compatibility refusal.
 
-Held SSH edges authenticate both node keys using fresh challenges and require
-identical mesh protocol versions. Mismatches name both versions and say
-`upgrade flk on <peer>`; upgrade the fleet together. First contact pins the
+Held SSH edges authenticate both node keys using fresh challenges and negotiate
+from their signed mesh protocol support ranges. `peers status` and `status`
+show `mesh N` for an established edge, and JSON rows include `negotiated`.
+Disjoint ranges show both ranges and name the older side with
+`upgrade flk on <peer>` or `upgrade flk on this node`; custody stays stored
+while the edge takes the long refusal backoff.
+
+This build remains at VERSION 5 and can be rolled out one node at a time
+alongside earlier VERSION 5 builds. Upgrade every node to this negotiation
+build and check that all edges are established before deploying a future
+VERSION 6 build. A remaining pre-negotiation peer cannot accept VERSION 6;
+its refusal names that peer and asks for an upgrade. First contact pins the
 identity.
 Enrollment uses trust on first use (TOFU): possession of a node key proves the
 key holder, not that its claimed name belongs to the intended machine. Inbound

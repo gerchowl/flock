@@ -671,14 +671,17 @@ forward time, never only at enqueue.
 cannot decode, or a known kind introduced after `v`, is a protocol violation,
 never a silent drop and never an unacknowledged skip. The receiver:
 
-1. reads the `kind` tag before decoding the envelope, so the failure is
-   typed rather than a whole-batch serde error;
+1. reads the `kind` tag before decoding the envelope (an absent tag means
+   `message`), so the failure is typed rather than a whole-batch serde error;
 2. imports and acknowledges nothing from that batch, so the sender keeps
    custody of every envelope in it;
 3. logs `mesh_protocol_violation` with the peer, session VERSION and the
    offending kind name, as audit metadata with no body;
 4. closes and resets the session, which returns to the long refusal backoff
    after the reconnect, and shows the reason in `flk peers`.
+
+`mesh_protocol_violation` is a new error code in the `after_handoff` retry
+class in `src/api/error_code.rs`; the held edge uses the long refusal backoff.
 
 This also covers a peer that claims a VERSION it does not implement: if it
 sends a kind or field above what it negotiated, (3) fires on our side; if it

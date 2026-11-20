@@ -8,6 +8,55 @@ use crate::mesh::{
 };
 
 impl App {
+    /// Inspect every envelope before decoding or acknowledging any part of a batch.
+    pub(super) fn handle_mesh_payload(
+        &mut self,
+        id: String,
+        params: serde_json::Value,
+        deliver: bool,
+    ) -> String {
+        if let Some(error) = self.check_mesh_session(&id, &params) {
+            return error;
+        }
+        let response = if deliver {
+            match serde_json::from_value(params) {
+                Ok(params) => self.handle_mesh_deliver(id.clone(), params),
+                Err(error) => encode_error(id.clone(), "invalid_request", error.to_string()),
+            }
+        } else {
+            match serde_json::from_value(params) {
+                Ok(params) => self.handle_mesh_collect(id.clone(), params),
+                Err(error) => encode_error(id.clone(), "invalid_request", error.to_string()),
+            }
+        };
+        if let Ok(value) = serde_json::from_str(&response) {
+            if let Some(error) = self.check_mesh_session(&id, &value) {
+                return error;
+            }
+        }
+        response
+    }
+
+    /// Gate the current edge at receive and at dequeue, including forwarded mail.
+    fn check_mesh_session(&mut self, id: &str, value: &serde_json::Value) -> Option<String> {
+        let edge = self
+            .inbound
+            .edge_mut(
+                self.current_api_peer_pid,
+                crate::platform::process_start_time,
+            )
+            .filter(|edge| edge.enrolled())?;
+        let version = edge.enrollment.negotiated.unwrap_or(hello::VERSION);
+        let kind = crate::mesh::version_gate::check(value, version).err()?;
+        let reason = crate::mesh::version_gate::violation(&edge.enrollment.peer, version, &kind);
+        edge.clear(&reason);
+        Some(encode_error(
+            id.to_owned(),
+            "mesh_protocol_violation",
+            reason,
+        ))
+    }
+
     pub(super) fn handle_mesh_hello(&mut self, id: String, hello: Hello) -> String {
         if matches!(&hello, Hello::Begin { .. }) {
             let attached = self.attach_inbound_edge(id.clone());
@@ -32,7 +81,7 @@ impl App {
                         id,
                         "mesh_version_mismatch",
                         reason,
-                        serde_json::json!({"mesh": hello::version()}),
+                        serde_json::json!({"mesh": hello::version(), "mesh_min": hello::window().0}),
                     );
                 }
                 encode_error(id, "mesh_refused", reason)
@@ -74,6 +123,7 @@ impl App {
                     )
                     .ok_or("unattestable relay")?
                     .enrollment = Enrollment {
+                    negotiated: None,
                     peer: if configured_name {
                         "unidentified SSH peer".into()
                     } else {
@@ -92,10 +142,11 @@ impl App {
                     self.current_api_peer_pid,
                     crate::platform::process_start_time,
                 ) {
-                    edge.enrollment.peer = peer;
+                    edge.enrollment.peer = peer.clone();
                 }
                 let identity = NodeIdentity::load().map_err(|e| e.to_string())?;
                 let acceptor = Offer::new(&identity, crate::app::short_host_name())?;
+                let negotiated = hello::negotiate(&acceptor, &offer, &peer)?;
                 let signature = hello::sign(&identity, &offer, &acceptor, "acceptor")?;
                 self.inbound
                     .edge_mut(
@@ -114,6 +165,7 @@ impl App {
                     acceptor: acceptor.clone(),
                 });
                 Ok(Some(hello::Challenge {
+                    negotiated: Some(negotiated),
                     offer: acceptor,
                     signature,
                 }))
@@ -160,6 +212,11 @@ impl App {
                         .map(|origin| origin.unwrap_or_default())
                         .map_err(|e| e.to_string())
                 })?;
+                status.negotiated = Some(hello::negotiate(
+                    &pending.acceptor,
+                    &pending.dialer,
+                    &status.peer,
+                )?);
                 status.node_id = Some(pending.dialer.node_id);
                 status.state = "pinned".into();
                 status.reason = None;
@@ -304,5 +361,138 @@ impl App {
                 mesh_suspended_reason,
             },
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mesh::{hello::legacy, runtime_store::TestStore};
+    use ed25519_dalek::SigningKey;
+    use serde_json::{json, Value};
+
+    fn app() -> App {
+        let (_, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            rx,
+            crate::api::EventHub::default(),
+        );
+        let pid = std::process::id();
+        app.current_api_peer_pid = Some(pid);
+        app.inbound
+            .attach(
+                pid,
+                crate::platform::process_start_time(pid).unwrap(),
+                crate::platform::process_start_time,
+            )
+            .unwrap();
+        app
+    }
+
+    #[tokio::test]
+    async fn real_old_dialer_completes_new_acceptor_hello_and_records_five() {
+        let _guard = crate::config::test_config_env_guard();
+        let _store = TestStore::new();
+        let mut app = app();
+        let key = SigningKey::from_bytes(&[23; 32]);
+        let dialer = legacy::offer(&key, "old.test");
+        let begin: Hello =
+            serde_json::from_value(json!({"phase":"begin", "offer":dialer})).unwrap();
+        let reply = app.mesh_hello(begin).unwrap().unwrap();
+        let wire = serde_json::to_value(&reply).unwrap();
+        let acceptor: legacy::Offer = serde_json::from_value(wire["offer"].clone()).unwrap();
+        let signature: Vec<u8> = serde_json::from_value(wire["signature"].clone()).unwrap();
+        legacy::verify(&dialer, &acceptor, "acceptor", &signature);
+        let signature = legacy::sign(&key, &dialer, &acceptor, "dialer");
+        assert!(app
+            .mesh_hello(Hello::Finish { signature })
+            .unwrap()
+            .is_none());
+        let edge = app
+            .inbound
+            .edge(
+                app.current_api_peer_pid,
+                crate::platform::process_start_time,
+            )
+            .unwrap();
+        assert!(edge.enrolled());
+        assert_eq!(edge.enrollment.negotiated, Some(5));
+    }
+
+    #[tokio::test]
+    async fn old_dialer_refuses_version_six_acceptor_before_finish() {
+        let _guard = crate::config::test_config_env_guard();
+        let _store = TestStore::new();
+        std::env::set_var("FLOCK_TEST_MESH_VERSION", "6");
+        std::env::set_var("FLOCK_TEST_MESH_MIN", "5");
+        let mut app = app();
+        let dialer = legacy::offer(&SigningKey::from_bytes(&[23; 32]), "old.test");
+        let begin: Hello =
+            serde_json::from_value(json!({"phase":"begin", "offer":dialer})).unwrap();
+        let reply = app.mesh_hello(begin).unwrap().unwrap();
+        let wire = serde_json::to_value(reply).unwrap();
+        let acceptor: legacy::Offer = serde_json::from_value(wire["offer"].clone()).unwrap();
+        assert_eq!(wire["offer"]["mesh"], 6);
+        assert_eq!(wire["offer"]["mesh_min"], 5);
+        assert_eq!(
+            legacy::validate(&acceptor).unwrap_err(),
+            "mesh version mismatch: local 5, remote 6; upgrade flk on this node"
+        );
+        let edge = app
+            .inbound
+            .edge(
+                app.current_api_peer_pid,
+                crate::platform::process_start_time,
+            )
+            .unwrap();
+        assert!(!edge.enrolled());
+        assert!(edge.pending.is_some());
+        assert!(edge.enrollment.negotiated.is_none());
+    }
+
+    #[tokio::test]
+    async fn protocol_violation_resets_inbound_session_before_batch_import_or_ack() {
+        let _guard = crate::config::test_config_env_guard();
+        let _store = TestStore::new();
+        for (version, kind) in [(5, "future"), (4, "receipt")] {
+            let mut app = app();
+            let pid = std::process::id();
+            let mut status = app
+                .inbound
+                .edge(Some(pid), crate::platform::process_start_time)
+                .unwrap()
+                .enrollment
+                .clone();
+            status.peer = "peer.test".into();
+            status.node_id = Some("peer.test".into());
+            status.state = "pinned".into();
+            status.negotiated = Some(version);
+            app.inbound
+                .enroll(pid, status, crate::platform::process_start_time)
+                .unwrap();
+            let response = app.handle_mesh_payload(
+                "probe".into(),
+                json!({"outbound":{"ack":[{}, {"receipt":{"kind":kind}}]}}),
+                false,
+            );
+            let response: Value = serde_json::from_str(&response).unwrap();
+            assert_eq!(response["error"]["code"], "mesh_protocol_violation");
+            assert!(response.get("result").is_none());
+            let edge = app
+                .inbound
+                .edge(Some(pid), crate::platform::process_start_time)
+                .unwrap();
+            assert!(!edge.enrolled());
+            assert_eq!(edge.enrollment.negotiated, None);
+            assert!(edge
+                .enrollment
+                .reason
+                .as_deref()
+                .unwrap()
+                .starts_with("mesh_protocol_violation:"));
+        }
     }
 }

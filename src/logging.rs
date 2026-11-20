@@ -5325,6 +5325,11 @@ pub(crate) fn client_wire_unavailable(cause: &'static str, kind: Option<io::Erro
     tracing::debug!(event = "client.wire.unavailable", cause, kind = ?kind, "structured transport unavailable");
 }
 
+/// Record protocol metadata without retaining envelope contents.
+pub(crate) fn mesh_protocol_violation(peer: &str, version: u32, kind: &str) {
+    tracing::warn!(target: "flock::mesh", event = "mesh_protocol_violation", peer, version, kind, "mesh session refused");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

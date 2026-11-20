@@ -94,6 +94,7 @@ impl From<String> for EnrollmentError {
     fn from(detail: String) -> Self {
         let permanent = [
             "mesh version mismatch:",
+            "mesh_protocol_violation:",
             "invalid mesh identity",
             "invalid mesh signature",
             "identity changed for ",
@@ -163,6 +164,8 @@ struct PeerStream {
     stdin: ChildStdin,
     lines: Receiver<String>,
     next_id: u64,
+    /// Selected afresh by this stream's signed hello.
+    negotiated: Option<u32>,
     /// Latest unsolicited summary the peer pushed. One slot, not a queue:
     /// the payload is a snapshot, so an older push carries nothing the newer
     /// one does not already say and queueing them would only serve staleness.
@@ -368,6 +371,7 @@ impl PeerStream {
             stdin,
             lines,
             next_id: 0,
+            negotiated: None,
             latest_push,
             stderr_tail,
             stderr_done,
@@ -375,7 +379,7 @@ impl PeerStream {
         })
     }
 
-    fn enroll(&mut self, peer: &PeerConfig) -> Result<String, EnrollmentError> {
+    fn enroll(&mut self, peer: &PeerConfig) -> Result<(String, u32), EnrollmentError> {
         use crate::mesh::{
             hello::{self, Challenge, Hello, Offer},
             identity::NodeIdentity,
@@ -403,9 +407,21 @@ impl PeerStream {
                     .as_u64()
                     .and_then(|v| u32::try_from(v).ok())
                 {
-                    return Err(
-                        hello::version_mismatch(hello::version(), remote, &peer.name).into(),
-                    );
+                    let min = error["data"]["mesh_min"]
+                        .as_u64()
+                        .and_then(|v| u32::try_from(v).ok())
+                        .unwrap_or(remote);
+                    if error["data"].get("mesh_min").is_none()
+                        && (hello::window().0..=hello::window().1).contains(&remote)
+                    {
+                        return Err(format!("mesh version mismatch: peer {} predates version negotiation; upgrade flk on {}", peer.name, peer.name).into());
+                    }
+                    return Err(hello::version_mismatch(
+                        hello::window(),
+                        (min, remote),
+                        &peer.name,
+                    )
+                    .into());
                 }
             }
             if matches!(
@@ -431,8 +447,8 @@ impl PeerStream {
                     peer.name
                 )
             })?;
+        let negotiated = challenge.verify(&dialer, &peer.name)?;
         challenge.offer.validate(&peer.name)?;
-        hello::verify(&dialer, &challenge.offer, "acceptor", &challenge.signature)?;
         hello::check_pin(
             &peer.name,
             &challenge.offer,
@@ -464,7 +480,8 @@ impl PeerStream {
         if let Ok(mut push) = self.latest_push.lock() {
             *push = None;
         }
-        Ok(challenge.offer.node_id)
+        self.negotiated = Some(negotiated);
+        Ok((challenge.offer.node_id, negotiated))
     }
 
     /// Explain a failed request from what ssh said on the way out.
@@ -651,6 +668,7 @@ fn note_closed_edge(peer: &str) {
         if let Some((status, _)) = statuses.get_mut(peer) {
             if status.state == "pinned" {
                 status.state = "retrying".into();
+                status.negotiated = None;
             }
         }
     }
@@ -671,13 +689,14 @@ pub(crate) fn enrollment_generation() -> u64 {
 
 #[cfg(test)]
 pub(crate) fn test_enroll(peer: &PeerConfig, node: &str) {
-    set_enrollment(peer, Ok(node.into()));
+    set_enrollment(peer, Ok((node.into(), crate::mesh::hello::VERSION)));
 }
 
-fn set_enrollment(peer: &PeerConfig, result: Result<String, EnrollmentError>) {
-    let (node_id, reason, state) = match result {
-        Ok(node) => (Some(node), None, "pinned"),
+fn set_enrollment(peer: &PeerConfig, result: Result<(String, u32), EnrollmentError>) {
+    let (node_id, negotiated, reason, state) = match result {
+        Ok((node, version)) => (Some(node), Some(version), None, "pinned"),
         Err(error) => (
+            None,
             None,
             Some(error.detail),
             if error.transient {
@@ -702,6 +721,7 @@ fn set_enrollment(peer: &PeerConfig, result: Result<String, EnrollmentError>) {
             peer.name.clone(),
             (
                 crate::mesh::hello::Enrollment {
+                    negotiated,
                     peer: peer.name.clone(),
                     source: crate::mesh::store::PinSource::Configured,
                     pin_origin: Default::default(),
@@ -725,6 +745,7 @@ pub(crate) fn enrollment(peer: &PeerConfig) -> crate::mesh::hello::Enrollment {
         .ok()
         .and_then(|s| s.get(&peer.name).map(|s| s.0.clone()))
         .unwrap_or_else(|| crate::mesh::hello::Enrollment {
+            negotiated: None,
             peer: peer.name.clone(),
             source: crate::mesh::store::PinSource::Configured,
             pin_origin: Default::default(),
@@ -916,7 +937,34 @@ fn request_over_with(
     let Some(stream) = slot.stream.as_mut() else {
         return Err("no connection".into());
     };
-    match stream.request(method, params) {
+    let version = stream.negotiated.unwrap_or(crate::mesh::hello::VERSION);
+    let mesh_payload = matches!(method, "mesh.deliver" | "mesh.collect");
+    if mesh_payload {
+        if let Err(kind) = crate::mesh::version_gate::check(&params, version) {
+            return Err(crate::mesh::version_gate::violation(
+                &peer.name, version, &kind,
+            ));
+        }
+    }
+    let result = stream.request(method, params).and_then(|response| {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&response) {
+            if mesh_payload {
+                if let Err(kind) = crate::mesh::version_gate::check(&value, version) {
+                    return Err(crate::mesh::version_gate::violation(
+                        &peer.name, version, &kind,
+                    ));
+                }
+            }
+            if value["error"]["code"] == "mesh_protocol_violation" {
+                return Err(format!(
+                    "mesh_protocol_violation: peer {} refused session VERSION {version}",
+                    peer.name
+                ));
+            }
+        }
+        Ok(response)
+    });
+    match result {
         Ok(response) => {
             if fresh {
                 let down_secs = slot
@@ -928,8 +976,14 @@ fn request_over_with(
             Ok(response)
         }
         Err(err) => {
-            let (detail, tail) = stream.explain(&err);
-            set_enrollment(peer, Err(EnrollmentError::transport(detail.clone())));
+            let (detail, tail) = if err.starts_with("mesh_protocol_violation:") {
+                (err, None)
+            } else {
+                stream.explain(&err)
+            };
+            let error = EnrollmentError::from(detail.clone());
+            let permanent = !error.transient;
+            set_enrollment(peer, Err(error));
             // Drop the stream rather than reuse it: after a timeout the pairing
             // between requests and responses is no longer known to hold.
             note_closed_edge(&peer.name);
@@ -937,12 +991,14 @@ fn request_over_with(
             // A best-effort extra (#410 down-gossip, `spawn: false`) must not
             // cost the poll its connection for a whole backoff: the next poll
             // reconnects at once, exactly as if this line had never been sent.
-            let backoff = if spawn {
+            let backoff = if permanent {
+                RECONNECT_BACKOFF
+            } else if spawn {
                 slot.transient_backoff()
             } else {
                 Duration::ZERO
             };
-            if spawn {
+            if spawn || permanent {
                 slot.retry_after = Some(std::time::Instant::now() + backoff);
             }
             if fresh {
@@ -1200,7 +1256,7 @@ mod tests {
     #[test]
     fn eof_withdraws_a_quiet_enrolled_edge() {
         let peer = peer("route-close.test");
-        set_enrollment(&peer, Ok("node".into()));
+        set_enrollment(&peer, Ok(("node".into(), 5)));
         let (tx, _rx) = std::sync::mpsc::channel();
         route_registered_lines(
             &peer.name,
@@ -1219,7 +1275,7 @@ mod tests {
         let peer = peer("route-replaced.test");
         let old = register_reader(&peer.name);
         register_reader(&peer.name);
-        set_enrollment(&peer, Ok("node".into()));
+        set_enrollment(&peer, Ok(("node".into(), 5)));
         let (tx, _rx) = std::sync::mpsc::channel();
         route_registered_lines(
             &peer.name,
@@ -1235,7 +1291,7 @@ mod tests {
     #[test]
     fn reset_and_refusal_queue_route_withdrawal() {
         let peer = peer("route-reset.test");
-        set_enrollment(&peer, Ok("node".into()));
+        set_enrollment(&peer, Ok(("node".into(), 5)));
         reset_enrollment(&peer.name);
         assert!(take_closed_edges().contains(&peer.name));
         set_enrollment(&peer, Err("refused".to_string().into()));
@@ -1289,7 +1345,7 @@ mod tests {
     #[test]
     fn enrollment_status_distinguishes_retrying_transport_from_handshake_refusal() {
         let target = peer("enrollment-status.test");
-        set_enrollment(&target, Ok("pinned-node".into()));
+        set_enrollment(&target, Ok(("pinned-node".into(), 5)));
         let generation = peer_enrollment_generation(&target);
         for detail in [CONNECTION_CLOSED, "ConnectionReset", "peer relay wedged"] {
             set_enrollment(&target, Err(EnrollmentError::transport(detail.into())));
@@ -1318,7 +1374,7 @@ mod tests {
             assert_eq!(status.state, expected);
             assert_eq!(status.reason.as_deref(), Some(code));
         }
-        set_enrollment(&target, Ok("pinned-node".into()));
+        set_enrollment(&target, Ok(("pinned-node".into(), 5)));
         assert_eq!(enrollment(&target).state, "pinned");
         assert!(enrollment(&target).reason.is_none());
     }
@@ -1410,6 +1466,7 @@ mod tests {
             stdin,
             lines,
             next_id: 0,
+            negotiated: None,
             latest_push: Arc::new(Mutex::new(None)),
             stderr_tail: Arc::new(Mutex::new(Default::default())),
             stderr_done,
@@ -1722,5 +1779,208 @@ mod tests {
             "a still-configured peer keeps its slot, backoff included"
         );
         retain_configured(&[]);
+    }
+}
+
+#[cfg(test)]
+mod negotiation_tests {
+    use super::*;
+    use crate::mesh::{hello::legacy, runtime_store::TestStore};
+    use ed25519_dalek::SigningKey;
+    use serde_json::{json, Value};
+
+    #[test]
+    fn real_old_acceptor_enrolls_a_new_dialer_at_five_without_report() {
+        old_acceptor(false, None, None);
+    }
+
+    #[test]
+    fn old_acceptor_refusal_names_pre_negotiation_peer_and_is_permanent() {
+        old_acceptor(true, None, None);
+    }
+
+    #[test]
+    fn unknown_kind_refuses_whole_response_and_holds_edge_in_long_backoff() {
+        old_acceptor(false, Some("mesh.collect"), None);
+        old_acceptor(false, Some("peers.summary"), None);
+    }
+
+    #[test]
+    fn ranged_acceptor_reply_tampering_is_refused_permanently() {
+        for attack in ["minimum", "report", "disagreement"] {
+            old_acceptor(false, None, Some(attack));
+        }
+    }
+
+    fn old_acceptor(version_six: bool, query: Option<&'static str>, attack: Option<&'static str>) {
+        let _guard = crate::config::test_config_env_guard();
+        let _store = TestStore::new();
+        reset_enrollment("old.test");
+        if version_six || attack.is_some_and(|a| a != "minimum") {
+            std::env::set_var("FLOCK_TEST_MESH_VERSION", "6");
+            std::env::set_var("FLOCK_TEST_MESH_MIN", "5");
+        }
+        let mut child = crate::process::TracedCommand::new("/bin/sh", "peers")
+            .args([
+                "-c",
+                "while IFS= read -r line; do printf '%s\n' \"$line\"; done",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn_traced()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let (tx, lines) = std::sync::mpsc::channel();
+        let fixture = std::thread::spawn(move || {
+            let key = SigningKey::from_bytes(&[22; 32]);
+            let acceptor = legacy::offer(&key, "old.test");
+            let mut requests = BufReader::new(stdout).lines();
+            let begin: Value = serde_json::from_str(&requests.next().unwrap().unwrap()).unwrap();
+            let dialer: legacy::Offer =
+                serde_json::from_value(begin["params"]["offer"].clone()).unwrap();
+            if let Some(attack) = attack {
+                use crate::mesh::{
+                    hello::{self, Offer},
+                    identity::NodeIdentity,
+                };
+                let dialer: Offer =
+                    serde_json::from_value(begin["params"]["offer"].clone()).unwrap();
+                let mut offer: Offer = serde_json::from_value(json!(acceptor)).unwrap();
+                offer.mesh = 6;
+                offer.mesh_min = Some(5);
+                let signature = hello::sign(
+                    &NodeIdentity::fixture([22; 32]),
+                    &dialer,
+                    &offer,
+                    "acceptor",
+                )
+                .unwrap();
+                let mut challenge =
+                    json!({"offer":offer,"signature":signature,"negotiated":dialer.mesh.min(6)});
+                match attack {
+                    "minimum" => {
+                        challenge["offer"]
+                            .as_object_mut()
+                            .unwrap()
+                            .remove("mesh_min");
+                    }
+                    "report" => {
+                        challenge.as_object_mut().unwrap().remove("negotiated");
+                    }
+                    "disagreement" => {
+                        challenge["negotiated"] = json!(5);
+                    }
+                    _ => panic!("unknown attack"),
+                }
+                tx.send(json!({"result":{"challenge":challenge}}).to_string())
+                    .unwrap();
+                return;
+            }
+            if let Err(reason) = legacy::validate(&dialer) {
+                tx.send(json!({"error":{"code":"mesh_version_mismatch", "message":reason, "data":{"mesh":5}}}).to_string()).unwrap();
+                return;
+            }
+            assert!(begin["params"]["offer"].get("mesh_min").is_none());
+            let signature = legacy::sign(&key, &dialer, &acceptor, "acceptor");
+            tx.send(
+                json!({"result":{"challenge":{"offer":acceptor,"signature":signature}}})
+                    .to_string(),
+            )
+            .unwrap();
+            let finish: Value = serde_json::from_str(&requests.next().unwrap().unwrap()).unwrap();
+            let signature: Vec<u8> =
+                serde_json::from_value(finish["params"]["signature"].clone()).unwrap();
+            legacy::verify(&dialer, &acceptor, "dialer", &signature);
+            tx.send(json!({"result":{"type":"ok"}}).to_string())
+                .unwrap();
+            if let Some(method) = query {
+                let query: Value =
+                    serde_json::from_str(&requests.next().unwrap().unwrap()).unwrap();
+                assert_eq!(query["method"], method);
+                tx.send(
+                    json!({"result":{"answers":[{"envelope":{}}, {"envelope":{"kind":"future"}}]}})
+                        .to_string(),
+                )
+                .unwrap();
+            }
+        });
+        let (_done_tx, stderr_done) = std::sync::mpsc::channel();
+        let mut stream = PeerStream {
+            child,
+            stdin,
+            lines,
+            next_id: 0,
+            negotiated: None,
+            latest_push: Arc::new(Mutex::new(None)),
+            stderr_tail: Arc::new(Mutex::new(Default::default())),
+            stderr_done,
+            agent: crate::platform::ssh_agent::AgentSocket::Unset,
+        };
+        let peer = PeerConfig {
+            name: "old.test".into(),
+            ssh: "old.test".into(),
+            ..Default::default()
+        };
+        if let Some(method) = query {
+            let before = std::time::Instant::now();
+            let params = if method == "peers.summary" {
+                json!({"envelope":{"kind":"future"}})
+            } else {
+                json!({})
+            };
+            let result = request_over_with(&peer, method, params, true, |_| Ok(stream));
+            if method == "peers.summary" {
+                assert!(result.is_ok(), "non-mesh metadata: {result:?}");
+                assert_eq!(enrollment(&peer).state, "pinned");
+                reset_enrollment(&peer.name);
+                fixture.join().unwrap();
+                return;
+            }
+            let error = result.unwrap_err();
+            assert!(error.starts_with("mesh_protocol_violation:"), "{error}");
+            assert!(error.contains("future"), "{error}");
+            assert_eq!(enrollment(&peer).state, "refused");
+            let slots = registry().lock().unwrap();
+            let slot = slots[&peer.name].lock().unwrap();
+            assert!(slot.stream.is_none());
+            assert!(slot.retry_after.unwrap() >= before + RECONNECT_BACKOFF);
+            assert!(slot.retry_after.unwrap() <= std::time::Instant::now() + RECONNECT_BACKOFF);
+            drop(slot);
+            drop(slots);
+            assert_eq!(
+                request_over_with(&peer, "mesh.collect", json!({}), true, |_| panic!(
+                    "refused edge must back off"
+                ))
+                .unwrap_err(),
+                error
+            );
+        } else if let Some(attack) = attack {
+            let error = stream.enroll(&peer).expect_err("tampered reply refused");
+            assert!(!error.transient, "{}", error.detail);
+            if attack == "minimum" {
+                assert_eq!(error.detail, "invalid mesh signature");
+            } else {
+                assert!(
+                    error.detail.starts_with("mesh version mismatch:"),
+                    "{}",
+                    error.detail
+                );
+            }
+            drop(stream);
+        } else {
+            let result = stream.enroll(&peer);
+            if version_six {
+                let error = result.expect_err("pre-negotiation refusal");
+                assert_eq!(error.detail, "mesh version mismatch: peer old.test predates version negotiation; upgrade flk on old.test");
+                assert!(!error.transient);
+            } else {
+                let (_, version) = result.map_err(|e| e.detail).unwrap();
+                assert_eq!(version, 5);
+                assert_eq!(stream.negotiated, Some(5));
+            }
+            drop(stream);
+        }
+        fixture.join().unwrap();
     }
 }

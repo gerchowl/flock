@@ -15,3 +15,5 @@ pub mod collect;
 
 pub mod routes;
 pub mod sign;
+
+pub(crate) mod version_gate;
