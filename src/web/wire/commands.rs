@@ -15,6 +15,17 @@ use std::{
     sync::mpsc::{Receiver, TryRecvError},
 };
 use tokio::sync::{oneshot, Notify};
+/// Closed registry shared by wire admission and refusal budget normalization.
+pub(super) fn known_verb(verb: &str) -> Option<&'static str> {
+    match verb {
+        "agent.send" => Some("agent.send"),
+        "agent.decide" => Some("agent.decide"),
+        "agent.start" => Some("agent.start"),
+        "agent.restart" => Some("agent.restart"),
+        "agent.stop" => Some("agent.stop"),
+        _ => None,
+    }
+}
 /// Each command lane and the send receipt set have this fixed capacity.
 const CAPACITY: usize = 32;
 /// Completed principal/command keys retained in FIFO order; pending sends never evict.
@@ -445,6 +456,13 @@ pub(super) async fn execute(
             received.await.map_err(|_| ())?
         }
         Err(mpsc::error::TrySendError::Full(request)) => {
+            shared.refusals.record(
+                shared.clock.now(),
+                &session.info,
+                &request.command.verb,
+                &request.command.args,
+                ErrorCode::SessionBusy,
+            );
             ack(request.command.id, Err(ErrorCode::SessionBusy))
         }
         Err(mpsc::error::TrySendError::Closed(_)) => return Err(()),

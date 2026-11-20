@@ -370,3 +370,44 @@ The next supported command or subscription can use the same socket. Repeating
 an unknown verb on the same server does not make it supported; use a compatible
 server/version before retrying. This command-level refusal does not change the
 existing protocol-close rules for malformed frames or invalid session traffic.
+
+### Refusal audit events
+
+Authenticated `cmd` refusals at ingress (unknown verb, read-only connection,
+invalid command ID, socket concurrency or lane capacity) and a full lane during
+command enqueue produce best-effort `wire_refused` events in the server event
+hub, available through the socket event APIs. Every supported command uses the
+same refusal path. Existing command responses and retry classes are unchanged.
+
+The event data has `type: "wire_refused"`, authenticated `principal`, public
+`token_id` (file-token name or per-mint app-session label), normalized `verb`,
+`target` when parsed from `args.target` or `args.agent` (first 256 Unicode
+characters), registered error-code `reason`, and `suppressed: 0`. Bearer secrets,
+command contents and raw unknown verbs are never recorded. Unknown verbs all
+normalize to `unknown`, including in the budget key.
+
+One server-wide monotonic 60-second window permits eight individual events per
+`(principal, verb, reason)`, with at most 64 resident keys and 128 individual
+events globally. No key is evicted or given a new budget within that window.
+Excess refusals for a resident key accumulate into one summary with the same
+principal, verb and reason, null target/token ID, and the exact `suppressed`
+count. Once either the key capacity or global event budget prevents admission,
+refusals join an aggregate overflow count. At window closure there is at most
+one aggregate summary, with null principal/token ID/verb/target/reason and the
+exact total suppressed by overflow. Per-key counts apply only while resident
+and within the global budget. Shared operator principals share budgets across
+tokens; summaries do not claim attribution to one of those tokens.
+
+Summaries use the same event kind and are outside the individual-event budget:
+at most 65 summaries and 128 individual events per window. The app-owner tick
+or the next refusal closes an expired window, so idle floods also get a
+summary without another request. Delayed ticks delay summaries; shutdown,
+handoff and restart discard pending counts and reset budgets. No global
+lifetime or cross-server rate guarantee is provided.
+
+These refusals have no effect to fence, so events use best-effort
+`EventHub::push`, rather than the required-audit primitive for mutations. Journal
+failure can degrade to memory-only events; refusal responses never depend on
+audit durability. Unauthenticated refusals remain unchanged and emit no
+per-request events: they lack a verified principal and must not provide an
+unauthenticated journal-amplification path.

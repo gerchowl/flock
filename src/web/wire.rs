@@ -2,6 +2,7 @@
 mod commands;
 mod fleet;
 mod output;
+mod refusals;
 mod subscriptions;
 pub(crate) mod timing;
 #[cfg(test)]
@@ -63,6 +64,7 @@ struct Shared {
     fleet: fleet::Client,
     histories: crate::structured::history::owner::Client,
     commands: commands::Client,
+    refusals: refusals::Refusals,
     store: Arc<Store>,
     epoch: String,
     clock: Arc<dyn Clock>,
@@ -119,13 +121,20 @@ impl Core {
     /// New server epoch, independent of durable stream cursors or command identities.
     #[cfg(test)]
     pub(crate) async fn new(data: PathBuf, wake: Arc<tokio::sync::Notify>) -> io::Result<Self> {
-        Self::new_shared(data, wake, Owner::default()).await
+        Self::new_shared(
+            data,
+            wake,
+            Owner::default(),
+            crate::api::EventHub::default(),
+        )
+        .await
     }
     /// Share the socket owner's memory domain; opening runs on the bounded I/O worker.
     pub(crate) async fn new_shared(
         data: PathBuf,
         wake: Arc<tokio::sync::Notify>,
         owner: Owner,
+        event_hub: crate::api::EventHub,
     ) -> io::Result<Self> {
         let store = super::store_io::shared()
             .run(move || {
@@ -139,7 +148,9 @@ impl Core {
             .await
             .ok_or_else(|| io::Error::other("client token store worker unavailable"))?
             .map_err(io::Error::other)?;
-        Self::from_store(store, Arc::new(SystemClock), wake)
+        let core = Self::from_store(store, Arc::new(SystemClock), wake)?;
+        core.shared.refusals.attach(event_hub);
+        Ok(core)
     }
     /// Embed with a supplied monotonic clock shared by credential and transport deadlines.
     #[cfg(test)]
@@ -176,6 +187,7 @@ impl Core {
                 fleet,
                 store,
                 epoch,
+                refusals: refusals::Refusals::new(clock.now()),
                 clock,
                 slots: Arc::new(Semaphore::new(CONNECTIONS as usize)),
                 hellos: std::array::from_fn(|_| Arc::new(Semaphore::new(PENDING_HELLOS))),
@@ -246,6 +258,8 @@ impl Core {
     }
     /// Admit commands on the same owner that services structured workers.
     pub(crate) fn service_commands(&mut self, app: &mut crate::app::App) {
+        self.shared.refusals.attach(app.event_hub.clone());
+        self.shared.refusals.tick(self.shared.clock.now());
         self.admission.service(app);
         self.command_owner.service(app);
     }
@@ -708,7 +722,7 @@ async fn connection(
                     }
                     Ok(ClientFrame::Unsub { sub_id }) => subscriptions.unsubscribe(&sub_id),
                     Ok(ClientFrame::Cmd { cmd_id, verb, args, resume_only }) => {
-                        let refusal = if !matches!(verb.as_str(), "agent.send" | "agent.decide" | "agent.start" | "agent.restart" | "agent.stop") || read_only {
+                        let refusal = if commands::known_verb(&verb).is_none() || read_only {
                             Some(crate::api::error_code::ErrorCode::ServerVersionGap)
                         } else if cmd_id.len() > 128 {
                             Some(crate::api::error_code::ErrorCode::InvalidParams)
@@ -716,6 +730,7 @@ async fn connection(
                             Some(crate::api::error_code::ErrorCode::SessionBusy)
                         } else { None };
                         if let Some(code) = refusal {
+                            shared.refusals.record(shared.clock.now(), &session.info, &verb, &args, code);
                             let Some(ack) = output::encode(commands::ack(cmd_id, Err(code))) else { break unavailable("ack_encoding") };
                             tokio::select! { biased;
                                 _ = stop.changed() => return,

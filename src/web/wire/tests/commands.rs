@@ -810,3 +810,151 @@ fn previous_runtime_permission_handle_is_refused_after_restart() {
 mod trace_permission;
 
 mod trace_clean;
+
+#[test]
+fn ingress_refusal_is_attributable() {
+    runtime(async {
+        let mut case = Case::new(315901).await;
+        case.service();
+        let mut socket = case.open().await;
+        let ack = case
+            .command(
+                &mut socket,
+                "unsupported.verb",
+                json!({"target":"fixture-agent"}),
+            )
+            .await;
+        assert_eq!(ack["error"]["code"], "server_version_gap");
+        let events = case.app.event_hub.events_after(0).unwrap();
+        let events: Vec<Value> = events
+            .into_iter()
+            .map(|(_, e)| serde_json::to_value(e).unwrap())
+            .filter(|e| e["event"] == "wire_refused")
+            .collect();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0]["data"]["principal"],
+            "0123456789abcdef0123456789abcdef"
+        );
+        assert_eq!(events[0]["data"]["token_id"], "one");
+        assert_eq!(events[0]["data"]["verb"], "unknown");
+        assert_eq!(events[0]["data"]["target"], "fixture-agent");
+        assert_eq!(events[0]["data"]["reason"], "server_version_gap");
+        case.stop().await;
+    });
+}
+
+#[test]
+fn execute_queue_full_refusal_is_attributable() {
+    runtime(async {
+        let mut case = Case::new(315902).await;
+        case.service();
+        let mut producers = Vec::new();
+        for token in ["a", "d"] {
+            for connection in 0..4 {
+                let mut socket = Socket::open(&case.server).await;
+                socket.hello(1, &token.repeat(64)).await;
+                for n in 0..4 {
+                    enqueue_without_owner(
+                        &case.server,
+                        &mut socket,
+                        format!("{connection}-{n}"),
+                        &case.worker.id,
+                    )
+                    .await;
+                }
+                producers.push(socket);
+            }
+        }
+        let session = case
+            .server
+            .core
+            .shared
+            .clients
+            .lock()
+            .unwrap()
+            .values()
+            .find(|c| c.session.info.name == "one")
+            .unwrap()
+            .session
+            .clone();
+        let (data, mut delivered) = mpsc::channel(1);
+        let execute = wire_commands::execute(
+            case.server.core.shared.clone(),
+            session,
+            data,
+            wire_commands::Command {
+                id: "overflow".into(),
+                verb: "agent.decide".into(),
+                args: json!({"agent":"fixture-agent"}),
+                resume_only: false,
+                read_only: false,
+            },
+        );
+        tokio::pin!(execute);
+        let delivery = within(async {
+            tokio::select! {
+                delivery = delivered.recv() => delivery.unwrap(),
+                result = &mut execute => panic!("execute ended before ack: {result:?}"),
+            }
+        })
+        .await;
+        assert!(
+            matches!(delivery.frame, ServerFrame::Ack { error: Some(ref e), .. } if e.code == "session_busy")
+        );
+        delivery.delivered.unwrap().send(true).unwrap();
+        assert_eq!(within(execute).await, Ok(()));
+        let events: Vec<Value> = case
+            .app
+            .event_hub
+            .events_after(0)
+            .unwrap()
+            .into_iter()
+            .map(|(_, e)| serde_json::to_value(e).unwrap())
+            .filter(|e| e["event"] == "wire_refused")
+            .collect();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["data"]["token_id"], "one");
+        assert_eq!(
+            events[0]["data"]["principal"],
+            "0123456789abcdef0123456789abcdef"
+        );
+        assert_eq!(events[0]["data"]["verb"], "agent.decide");
+        assert_eq!(events[0]["data"]["target"], "fixture-agent");
+        assert_eq!(events[0]["data"]["reason"], "session_busy");
+        drop(producers);
+        case.stop().await;
+    });
+}
+
+#[test]
+fn ingress_flood_is_summarized_by_owner_tick_without_another_request() {
+    runtime(async {
+        let mut case = Case::new(315903).await;
+        case.service();
+        let mut socket = case.open().await;
+        for n in 0..20 {
+            assert_eq!(
+                case.command(&mut socket, &format!("unknown-{n}"), json!({}))
+                    .await["error"]["code"],
+                "server_version_gap"
+            );
+        }
+        case.server.clock.advance(60_000);
+        case.service();
+        case.service();
+        let events: Vec<Value> = case
+            .app
+            .event_hub
+            .events_after(0)
+            .unwrap()
+            .into_iter()
+            .map(|(_, e)| serde_json::to_value(e).unwrap())
+            .filter(|e| e["event"] == "wire_refused")
+            .collect();
+        assert_eq!(events.len(), 9);
+        assert_eq!(events.last().unwrap()["data"]["suppressed"], 12);
+        assert_eq!(events.last().unwrap()["data"]["verb"], "unknown");
+        case.stop().await;
+    });
+}
