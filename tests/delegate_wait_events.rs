@@ -4,7 +4,7 @@
 //! The fixture below is copied from the frozen `tests/delegate.rs` (a fake
 //! `opencode` whose screen the test draws, an opencode database under an
 //! isolated `XDG_DATA_HOME`, HOME/worktree/git isolation). The waiter talks
-//! to the isolated server through a proxy socket that counts its requests.
+//! to the isolated server through a proxy socket that records each exchange.
 
 // TracedCommand (logging redesign PR-3) polices flock's shipped code; this
 // harness drives the compiled flock binary through raw Command.
@@ -17,7 +17,7 @@ mod support;
 use support::paths::app_dir_name;
 
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -623,55 +623,128 @@ fn committed_repo(server: &Server) -> PathBuf {
     repo
 }
 
-/// Forward every connection on `proxy` to `server`, recording the method of
-/// each request in order.
-fn counting_proxy(proxy: &Path, server: PathBuf) -> std::sync::Arc<std::sync::Mutex<Vec<String>>> {
-    let methods = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+/// Requests and replies are separate evidence: while a read is held, any
+/// intervening request is a budget violation, even before that read answers.
+#[derive(Debug)]
+enum Exchange {
+    Request(serde_json::Value),
+    Reply(serde_json::Value),
+    Failed(String),
+}
+
+fn counting_proxy(proxy: &Path, server: PathBuf) -> std::sync::mpsc::Receiver<Exchange> {
+    let (sent, received) = std::sync::mpsc::channel();
     let listener = std::os::unix::net::UnixListener::bind(proxy).unwrap();
-    let seen = methods.clone();
     thread::spawn(move || {
         for client in listener.incoming() {
-            let Ok(client) = client else { return };
-            let mut reader = BufReader::new(client.try_clone().unwrap());
-            let mut line = String::new();
-            if reader.read_line(&mut line).unwrap_or(0) == 0 {
-                continue;
-            }
-            let request: serde_json::Value = serde_json::from_str(&line).unwrap_or_default();
-            seen.lock()
-                .unwrap()
-                .push(request["method"].as_str().unwrap_or("?").to_string());
-            let Ok(mut upstream) = UnixStream::connect(&server) else {
-                continue;
-            };
-            upstream.write_all(line.as_bytes()).unwrap();
-            let mut down = upstream.try_clone().unwrap();
-            let mut client_out = client;
+            let sent = sent.clone();
+            let server = server.clone();
             thread::spawn(move || {
-                let _ = std::io::copy(&mut reader, &mut upstream);
-            });
-            thread::spawn(move || {
-                let _ = std::io::copy(&mut down, &mut client_out);
-                let _ = client_out.shutdown(std::net::Shutdown::Both);
+                let forward = || -> std::io::Result<()> {
+                    let mut client = client?;
+                    client.set_read_timeout(Some(WITHIN))?;
+                    client.set_write_timeout(Some(WITHIN))?;
+                    let mut line = String::new();
+                    BufReader::new(client.try_clone()?).read_line(&mut line)?;
+                    let request = serde_json::from_str(&line)?;
+                    if sent.send(Exchange::Request(request)).is_err() {
+                        return Ok(());
+                    }
+                    let mut upstream = UnixStream::connect(server)?;
+                    upstream.set_read_timeout(Some(WITHIN))?;
+                    upstream.set_write_timeout(Some(WITHIN))?;
+                    upstream.write_all(line.as_bytes())?;
+                    let mut input = client.try_clone()?;
+                    let mut output = upstream.try_clone()?;
+                    thread::spawn(move || {
+                        let _ = std::io::copy(&mut input, &mut output);
+                        let _ = output.shutdown(std::net::Shutdown::Both);
+                    });
+                    line.clear();
+                    let mut upstream = BufReader::new(upstream);
+                    upstream.read_line(&mut line)?;
+                    let reply = serde_json::from_str(&line)?;
+                    if sent.send(Exchange::Reply(reply)).is_ok() {
+                        client.write_all(line.as_bytes())?;
+                        // Start also uses a readiness subscription. Preserve its
+                        // stream after recording the acknowledgement.
+                        let _ = std::io::copy(&mut upstream, &mut client);
+                    }
+                    Ok(())
+                };
+                if let Err(error) = forward() {
+                    let _ = sent.send(Exchange::Failed(error.to_string()));
+                }
             });
         }
     });
-    methods
+    received
 }
 
-/// #1030: the wait samples on each event about the delegate and once when
-/// the dwell is due, and makes no request while nothing changes. Polling
-/// every 200 ms, as before, cost `agent.get` and a pane read five times a
-/// second for the whole wait.
+/// Kill and reap the waiter even when an evidence assertion panics.
+struct Waiter(Child);
+
+impl Drop for Waiter {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn next_exchange(received: &std::sync::mpsc::Receiver<Exchange>, waiter: &mut Waiter) -> Exchange {
+    let deadline = Instant::now() + WITHIN;
+    loop {
+        assert!(
+            waiter.0.try_wait().unwrap().is_none(),
+            "waiter exited before evidence arrived"
+        );
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "proxy stayed silent while waiter was alive"
+        );
+        match received.recv_timeout(remaining.min(Duration::from_millis(100))) {
+            Ok(Exchange::Failed(reason)) => panic!("proxy failed: {reason}"),
+            Ok(exchange) => return exchange,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(error) => panic!("proxy disconnected: {error}"),
+        }
+    }
+}
+
+fn next_request(
+    received: &std::sync::mpsc::Receiver<Exchange>,
+    waiter: &mut Waiter,
+) -> serde_json::Value {
+    let Exchange::Request(request) = next_exchange(received, waiter) else {
+        panic!("expected a request");
+    };
+    request
+}
+
+fn next_reply(
+    received: &std::sync::mpsc::Receiver<Exchange>,
+    waiter: &mut Waiter,
+) -> serde_json::Value {
+    let exchange = next_exchange(received, waiter);
+    let Exchange::Reply(reply) = exchange else {
+        panic!("expected a reply without another request: {exchange:?}");
+    };
+    reply
+}
+
+/// #1030, #3115: measure the evented settle phase itself. The fake submit's
+/// automatic idle turn used to enter reply grace with no reply, mixing result
+/// polling into an elapsed-time budget that depended on harness scheduling.
 #[test]
 fn a_delegate_wait_requests_once_per_state_change() {
-    let server = start_server();
+    // Keep the same two-second quiet observation, but let the server's empty
+    // long-poll reply establish its completion instead of sleeping across it.
+    let server = start_server_with(false, "[events]\nread_max_wait_ms = 2000\n");
     operator_workspace(&server);
     let b = brief(&server, "task.md", "x\n");
-    // The registry is keyed by the socket path, so the whole delegate talks
-    // through the proxy, and only the wait's own requests are counted.
     let proxy = server.base.join("count.sock");
-    let methods = counting_proxy(&proxy, server.socket.clone());
+    let exchanges = counting_proxy(&proxy, server.socket.clone());
     let work = work_dir(&server);
     let mut child = command(
         &server,
@@ -686,62 +759,128 @@ fn a_delegate_wait_requests_once_per_state_change() {
     .unwrap();
     let pane = make_ready(&server, "d1");
     exited_within(&mut child, WITHIN).expect("start returns after submitting");
-    let cursor = stdout_json(&finish(child))["turn_cursor"]
+    let started = stdout_json(&finish(child));
+    let cursor = started["turn_cursor"]
         .as_str()
-        .expect("turn_cursor")
+        .unwrap_or_else(|| panic!("start did not return a cursor: {started}"))
         .to_string();
-
-    let skip = methods.lock().unwrap().len();
-    let mut waiter = command(
-        &server,
-        &[
-            "delegate",
-            "wait",
-            "d1",
-            "--after",
-            &cursor,
-            "--settle",
-            SETTLE,
-            "--timeout",
-            "30000",
-            "--json",
-        ],
-    )
-    .env("FLOCK_SOCKET_PATH", &proxy)
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped())
-    .spawn()
-    .unwrap();
-    let started = Instant::now();
-    // The submit itself plays a turn on the fake, which the wait settles on
-    // and then rejects for want of a reply: let that pass first.
-    thread::sleep(Duration::from_millis(1500));
+    // Start's final reply was recorded before the child could exit.
+    while exchanges.try_recv().is_ok() {}
+    // The automatic submit turn must finish before the measured turn starts.
+    report(&server, &pane, "idle");
     report(&server, &pane, "working");
-    thread::sleep(Duration::from_millis(500));
-    let quiet_from = methods.lock().unwrap().len();
-    thread::sleep(Duration::from_millis(2000));
-    let quiet = methods.lock().unwrap()[quiet_from..].to_vec();
+
+    let mut waiter = Waiter(
+        command(
+            &server,
+            &[
+                "delegate",
+                "wait",
+                "d1",
+                "--after",
+                &cursor,
+                "--settle",
+                SETTLE,
+                "--timeout",
+                "30000",
+                "--json",
+            ],
+        )
+        .env("FLOCK_SOCKET_PATH", &proxy)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap(),
+    );
+
+    let mut methods = Vec::new();
+    let mut head_seen = false;
+    loop {
+        let request = next_request(&exchanges, &mut waiter);
+        let method = request["method"].as_str().unwrap();
+        assert!(
+            matches!(method, "agent.get" | "ping" | "pane.read" | "events.read"),
+            "unexpected settle request: {request}"
+        );
+        methods.push(method.to_string());
+        let reply = next_reply(&exchanges, &mut waiter);
+        if method != "events.read" {
+            continue;
+        }
+        if request["params"]["subjects"]
+            .as_array()
+            .is_none_or(Vec::is_empty)
+        {
+            assert!(!head_seen, "the head is probed only once");
+            head_seen = true;
+            assert_eq!(reply["error"]["code"], "cursor_ahead", "{reply}");
+            methods.clear();
+            continue;
+        }
+        assert!(request["params"]["subjects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|id| id == &pane));
+        assert!(
+            request["params"]["wait_ms"].as_u64().unwrap() >= 2000,
+            "{request}"
+        );
+        assert_eq!(
+            methods,
+            ["agent.get", "pane.read", "events.read"],
+            "one sample per event"
+        );
+        let events = reply["result"]["events"]
+            .as_array()
+            .expect("events.read succeeded");
+        if events.is_empty() {
+            break;
+        }
+        // Matching startup events may already be queued. Each must lead to
+        // exactly one sample, then another held read, never result polling.
+        methods.clear();
+    }
+
+    // One empty hold permits exactly one resample, then another held read.
+    // A polling fallback, duplicate sample or extra request fails this stage.
+    for expected in ["agent.get", "pane.read"] {
+        let request = next_request(&exchanges, &mut waiter);
+        assert_eq!(request["method"], expected, "{request}");
+        let reply = next_reply(&exchanges, &mut waiter);
+        assert!(reply.get("error").is_none(), "{reply}");
+        if expected == "agent.get" {
+            assert_eq!(reply["result"]["agent"]["agent_status"], "working");
+        }
+    }
+    let held = next_request(&exchanges, &mut waiter);
+    assert_eq!(held["method"], "events.read", "{held}");
+    assert!(
+        held["params"]["wait_ms"].as_u64().unwrap() >= 2000,
+        "{held}"
+    );
     write_reply(&server, "t1", "DONE: counted");
     report(&server, &pane, "idle");
-    let status = exited_within(&mut waiter, WITHIN).expect("the wait returns");
-    let waited = started.elapsed();
-    let out = finish(waiter);
+    let status = exited_within(&mut waiter.0, WITHIN).expect("the wait returns");
+    let mut out = Output {
+        status,
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+    };
+    waiter
+        .0
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_end(&mut out.stdout)
+        .unwrap();
+    waiter
+        .0
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_end(&mut out.stderr)
+        .unwrap();
     assert_eq!(status.code(), Some(0), "stderr {}", stderr(&out));
     assert_eq!(stdout_json(&out)["outcome"], "done");
-
-    let methods = methods.lock().unwrap()[skip..].to_vec();
-    let count = |method: &str| methods.iter().filter(|seen| *seen == method).count();
-    eprintln!("{} requests in {waited:?}: {methods:?}", methods.len());
-    assert!(
-        count("events.read") >= 2,
-        "the wait is evented: {methods:?}"
-    );
-    // Two seconds of a working agent with nothing changing. The polling
-    // wait sampled `agent.get` and the pane every 200 ms: 20 requests.
-    assert!(quiet.len() <= 1, "{quiet:?} while nothing changed");
-    assert!(
-        (methods.len() as f64) < waited.as_secs_f64() * 5.0,
-        "{} requests in {waited:?}: {methods:?}",
-        methods.len()
-    );
 }

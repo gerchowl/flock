@@ -660,7 +660,7 @@ mod tests {
 
     /// #102 (b): `url.<base>.insteadOf` rewrites apply BEFORE
     /// normalization, longest-prefix wins. The GitHub-rename case: the
-    /// user set `url."https://github.com/gerchowl/g-fleet".insteadOf =
+    /// user set `url."https://github.com/gerchowl/fleet-config".insteadOf =
     /// https://github.com/gerchowl/dotfiles` so old remotes still
     /// resolve to the new project key.
     #[test]
@@ -671,13 +671,13 @@ mod tests {
         std::fs::write(
             git_dir.join("config"),
             "[remote \"origin\"]\n\turl = https://github.com/gerchowl/dotfiles.git\n\
-             [url \"https://github.com/gerchowl/g-fleet\"]\n\tinsteadOf = https://github.com/gerchowl/dotfiles\n\
+             [url \"https://github.com/gerchowl/fleet-config\"]\n\tinsteadOf = https://github.com/gerchowl/dotfiles\n\
              [url \"https://ignored.example/\"]\n\tinsteadOf = https://github.com/\n",
         )
         .unwrap();
         assert_eq!(
             project_key_for_common_dir(&git_dir, "dotfiles"),
-            "github.com/gerchowl/g-fleet",
+            "github.com/gerchowl/fleet-config",
             "the longer insteadOf prefix wins"
         );
         std::fs::remove_dir_all(root).unwrap();
@@ -694,12 +694,12 @@ mod tests {
         std::fs::write(
             git_dir.join("config"),
             "[remote \"origin\"]\n\turl = https://github.com/gerchowl/dotfiles.git\n\
-             \tpushurl = https://github.com/gerchowl/g-fleet.git\n",
+             \tpushurl = https://github.com/gerchowl/fleet-config.git\n",
         )
         .unwrap();
         assert_eq!(
             project_key_for_common_dir(&git_dir, "dotfiles"),
-            "github.com/gerchowl/g-fleet"
+            "github.com/gerchowl/fleet-config"
         );
         std::fs::remove_dir_all(root).unwrap();
     }

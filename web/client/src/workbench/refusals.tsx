@@ -16,11 +16,10 @@
  * `src/web/wire.rs`, `src/web/wire/commands.rs`,
  * `src/app/api/structured_queue.rs`, `src/structured/queue/`,
  * `src/structured/workers/queue.rs`, `src/structured/transport/mod.rs` and
- * `src/structured/permissions.rs`. Codes of other verbs never reach this
- * client, which sends only those two: for example `structured_recovery_required`
- * (agent start), `msg_not_allowed` (mail) and `at_agent_capacity` (spawn).
- * Should one arrive anyway, or a code added later, it falls back to copy
- * chosen by the error's retry class, never to the raw message.
+ * `src/structured/permissions.rs`. The new-agent sheet adds start-specific
+ * copy in `NewAgent.tsx`, using this map for shared refusals. An unknown
+ * code falls back to copy chosen by the error's retry class, never to the
+ * raw message.
  *
  * @module
  */

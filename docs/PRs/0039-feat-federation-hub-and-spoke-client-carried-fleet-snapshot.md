@@ -52,6 +52,6 @@ Two wire subtleties worth knowing:
 - e2e (`tests/peer_federation.rs`, extended): hub with two peers (one reachable via the fake-ssh shim, one unreachable "ghost") → clicking the remote row yields `SwitchServer` carrying `Some(fleet)` with ghost included and the hop target excluded → the raw fleet bytes are spliced verbatim into a fresh handshake against the spoke (exactly what the launcher does) → the spoke renders `← <origin> home` + the ghost row → clicking home yields `SwitchServer("<home>")` with no fleet.
 - `cargo fmt` + `cargo clippy --all-targets` clean.
 
-## g-fleet consequence (follow-up, per issue)
+## the fleet configuration repo consequence (follow-up, per issue)
 
 Only the hub generates `[[peers]]`; spokes get none; spoke→hub inbound keys can be dropped. Not part of this PR.

@@ -636,7 +636,7 @@ mod tests {
             &["--name", "worker"],
             &["-n", "worker"],
             &["--plugin-url", "https://example.invalid/p.zip"],
-            &["--remote-control-session-name-prefix", "sage"],
+            &["--remote-control-session-name-prefix", "node-a"],
             &["--system-prompt-snapshot", "off"],
             &["--betas", "first", "second"],
         ];

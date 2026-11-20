@@ -1,6 +1,6 @@
 ---
 number: 149
-title: "g-fleet: retire herdr-web MVP, run an always-on `herdr server` daemon + `herdr web` on atlas"
+title: "the fleet configuration repo: retire herdr-web MVP, run an always-on `herdr server` daemon + `herdr web` on atlas"
 kind: issue
 state: OPEN
 author: gerchowl
@@ -10,9 +10,9 @@ closed:
 url: https://github.com/gerchowl/herdr/issues/149
 ---
 
-# g-fleet: retire herdr-web MVP, run an always-on `herdr server` daemon + `herdr web` on atlas
+# the fleet configuration repo: retire herdr-web MVP, run an always-on `herdr server` daemon + `herdr web` on atlas
 
-Follow-up to #131. The herdr side has landed (`herdr web`, feature-gated, assets embedded). This is the g-fleet (~/dotfiles) side to close #131 acceptance "g-fleet module shrinks to enable + tailscale serve".
+Follow-up to #131. The herdr side has landed (`herdr web`, feature-gated, assets embedded). This is the the fleet configuration repo (~/dotfiles) side to close #131 acceptance "the fleet configuration repo module shrinks to enable + tailscale serve".
 
 ## Deltas (from the scope review)
 - Delete `pkgs/herdr-web/` entirely (Cargo, src, static, vendor, package.nix) — now in-tree.

@@ -497,7 +497,7 @@ retires its re-inject step for every part except the goal (slice 8), and slice
 - **Edge as a parameter (`--architect`).** It is spoofable, and the edge
   carries teardown authority.
 - **Type digests into the architect's pane.** That is exactly the
-  hand-rolled failure (claude-config#18, #559). The inbox exists.
+  hand-rolled failure (#559). The inbox exists.
 - **Rewrite the pending digest in place.** ADR-0026 makes message content
   immutable under its idempotency key. A server-side buffer gives the same
   coalescing without touching custody.

@@ -58,7 +58,9 @@ const HELP_FLAGS: [&str; 2] = ["--help", "-h"];
 /// `pane` is the group to watch when adding rows here: `src/cli/pane.rs` owns
 /// those parsers and its own help text, and this table mirrors them.
 const VERBS: &[(&str, &str, &str)] = &[
-    ("profile", "enable", super::profile::USAGE),
+    ("profile", "enable", super::profile::ENABLE_USAGE),
+    ("msg", "operator-read", "flk msg operator-read --pane TARGET"),
+    ("msg", "operator-list", "flk msg operator-list --pane TARGET"),
     ("structured", "grants", super::grants::USAGE),
     ("server", "stop", "flk server stop"),
     (
@@ -184,7 +186,7 @@ const VERBS: &[(&str, &str, &str)] = &[
         "reply",
         "flk msg reply <correlation_id> <text...> [--intent fyi|needs-reply|blocking] [-- <text starting with dashes>]",
     ),
-    ("msg", "list", "flk msg list [--pane TARGET]   peek at your structured inbox or the operator global list"),
+    ("msg", "list", "flk msg list [--pane TARGET]   peek at your attested pane or structured inbox; listing all panes or another inbox requires the local operator and is audited"),
     ("msg", "read", "flk msg read [--pane TARGET]   consume your attested pane or structured inbox"),
     ("msg", "status", "flk msg status <correlation_id>"),
     (

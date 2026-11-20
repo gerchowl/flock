@@ -6446,33 +6446,32 @@ pub(super) mod tests {
             None => std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR),
         }
         assert_eq!(actual, "host");
-        // #2998: with mba22 (viewer, hub A) and sage-ws (hub B) both polling
-        // `anvil`, `ksb-ws` and each other, hub B pushes a relayed view of
+        // #2998: with node-a (viewer, hub A) and node-b (hub B) both polling
+        // `node-c`, `node-d` and each other, hub B pushes a relayed view of
         // its peers down to A. BEFORE the fold, A's band showed every peer
         // twice — once as its own `direct` config row, once as hub B's
         // `legacy/unverified` claim about the same node — plus a duplicate
         // of A's OWN home row. AFTER the fold, each peer appears exactly
-        // once, with a `+via sage-ws` route hint on the verified row.
+        // once, with a `+via node-b` route hint on the verified row.
         use crate::app::state::{ClaimFoldTarget, RemotePeerRef};
 
         let mut app = AppState::test_new();
-        app.server_node = Some("node-mba22".into());
+        app.server_node = Some("id-home".into());
         // Two pinned peers (as `[[peers]]` with bound identity via local
         // pin or inbound enrollment).
-        let mut sage = peer_named_with_host("sage-ws", "sage-ws.example");
-        sage.node_id = Some("node-sage".into());
-        let mut anvil = peer_named_with_host("anvil", "anvil.example");
-        anvil.node_id = Some("node-anvil".into());
-        let mut ksb = peer_named_with_host("ksb-ws", "ksb-ws.example");
-        ksb.node_id = Some("node-ksb".into());
-        app.peer_summaries = vec![sage, anvil, ksb];
-        app.server_nodes
-            .insert("sage-ws".into(), "node-sage".into());
-        app.server_nodes.insert("anvil".into(), "node-anvil".into());
-        app.server_nodes.insert("ksb-ws".into(), "node-ksb".into());
+        let mut relay = peer_named_with_host("node-b", "node-b.example");
+        relay.node_id = Some("id-relay".into());
+        let mut peer = peer_named_with_host("node-c", "node-c.example");
+        peer.node_id = Some("id-peer".into());
+        let mut spoke = peer_named_with_host("node-d", "node-d.example");
+        spoke.node_id = Some("id-spoke".into());
+        app.peer_summaries = vec![relay, peer, spoke];
+        app.server_nodes.insert("node-b".into(), "id-relay".into());
+        app.server_nodes.insert("node-c".into(), "id-peer".into());
+        app.server_nodes.insert("node-d".into(), "id-spoke".into());
 
-        // Hub B (sage-ws) relays its view of A (mba22), anvil and ksb-ws
-        // down to A through A's own poll of sage-ws. `source_node = None`
+        // Hub B (node-b) relays its view of A (node-a), node-c and node-d
+        // down to A through A's own poll of node-b. `source_node = None`
         // models an unauthenticated carried claim — the claim is a
         // relayed reading, not an ingress-bound one.
         let claim = |peer_name: &str, host: &str, node: &str| crate::peers::RelayedEntry {
@@ -6482,18 +6481,18 @@ pub(super) mod tests {
                 p
             },
             source_node: None,
-            via: Some("sage-ws".into()),
+            via: Some("node-b".into()),
             hub_pushed: true,
         };
         app.relayed_fleet_cache
-            .insert("mba22.claim".into(), claim("mba22", "mba22", "node-mba22"));
+            .insert("node-a.claim".into(), claim("node-a", "node-a", "id-home"));
         app.relayed_fleet_cache.insert(
-            "anvil.claim".into(),
-            claim("anvil", "anvil.example", "node-anvil"),
+            "node-c.claim".into(),
+            claim("node-c", "node-c.example", "id-peer"),
         );
         app.relayed_fleet_cache.insert(
-            "ksb.claim".into(),
-            claim("ksb-ws", "ksb-ws.example", "node-ksb"),
+            "spoke.claim".into(),
+            claim("node-d", "node-d.example", "id-spoke"),
         );
 
         // Hub B's claim about an UNKNOWN node (unpinned, not self) must
@@ -6531,30 +6530,30 @@ pub(super) mod tests {
         // Each verified row picks up the hub that also claimed about it.
         assert_eq!(
             app.fold_hubs(&ClaimFoldTarget::SelfNode),
-            vec!["sage-ws".to_string()],
+            vec!["node-b".to_string()],
             "A's self row is annotated with the hub that claimed about it",
         );
         for peer_idx in 0..app.peer_summaries.len() {
-            // `sage-ws` is folded-into-by its OWN hub label — suppressed
+            // `node-b` is folded-into-by its OWN hub label — suppressed
             // (a row routed via itself is not a new route).
             let hubs = app.fold_hubs(&ClaimFoldTarget::PinnedPeer { peer_idx });
-            if app.peer_summaries[peer_idx].peer == "sage-ws" {
+            if app.peer_summaries[peer_idx].peer == "node-b" {
                 assert!(
                     hubs.is_empty(),
-                    "sage-ws's self-claim is suppressed: {hubs:?}"
+                    "node-b's self-claim is suppressed: {hubs:?}"
                 );
             } else {
                 assert_eq!(
                     hubs,
-                    vec!["sage-ws".to_string()],
-                    "{} picks up the sage-ws hub hint",
+                    vec!["node-b".to_string()],
+                    "{} picks up the node-b hub hint",
                     app.peer_summaries[peer_idx].peer,
                 );
             }
         }
 
         // The rendered band confirms it end-to-end: one row per pinned
-        // peer (plus home/self), each with `+via sage-ws` where a claim
+        // peer (plus home/self), each with `+via node-b` where a claim
         // folded in, and the stranger row still visible and unverified.
         let area = Rect::new(0, 0, 160, 24);
         let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
@@ -6566,7 +6565,7 @@ pub(super) mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
-            text.contains("+via sage-ws"),
+            text.contains("+via node-b"),
             "fold annotation present: {text}"
         );
         assert!(
@@ -7009,8 +7008,8 @@ pub(super) mod tests {
     /// #102 (d): the "same repo?" chip fires when a remote-only leader
     /// shares host+basename with a local group but their full project
     /// keys differ (GitHub rename case: local `gerchowl/dotfiles`,
-    /// remote `gerchowl/g-fleet`, both on `github.com`, both basename
-    /// `dotfiles` vs `g-fleet` — actually here basenames DIFFER, so
+    /// remote `gerchowl/group-config`, both on `github.com`, both basename
+    /// `dotfiles` vs `group-config` — actually here basenames DIFFER, so
     /// chip is silent). Trigger when basenames MATCH: local
     /// `gerchowl/Flock` vs remote `gerchowl-forks/flock` on the SAME
     /// kiln — same basename, different owner path.
@@ -8097,7 +8096,8 @@ pub(super) mod tests {
         let (ws_area, _) =
             expanded_sidebar_sections(area, app.sidebar_section_split, app.sidebar_pane_gap());
         let (servers_area, _) = carve_servers_band(ws_area, servers_section_height(&app));
-        let self_rect = server_slot_rect(server_band_rows_area(servers_area), 0).expect("self");
+        let self_rect = server_slot_rect(server_band_rows_area(servers_area), band_row(&app, None))
+            .expect("self");
         // Quadrant fallback with a single (muted) ring: a solid rectangle.
         assert_eq!(buffer[(self_rect.x, self_rect.y)].symbol(), "\u{2588}");
         // No live agents: the medallion still marks presence in muted color.
@@ -8279,7 +8279,7 @@ pub(super) mod tests {
     #[test]
     fn local_project_with_remote_children_aggregates_under_header() {
         let mut app = crate::app::state::AppState::test_new();
-        let mut ws = workspace_with_project_key("dompt", "github.com/nerd-machines/dompt");
+        let mut ws = workspace_with_project_key("project", "github.com/example/project");
         ws.custom_name = None;
         ws.cached_git_branch = Some("main".into());
         app.workspaces = vec![ws];
@@ -8287,7 +8287,7 @@ pub(super) mod tests {
         app.active = Some(0);
         app.mode = crate::app::Mode::Terminal;
         let mut remote = remote_summary("main", None, None, None);
-        remote.project_key = Some("github.com/nerd-machines/dompt".into());
+        remote.project_key = Some("github.com/example/project".into());
         app.peer_summaries = vec![peer_with_workspaces("atlas", vec![remote])];
 
         // Entry shape: header, local member (indented), remote member (indented).
@@ -8295,7 +8295,7 @@ pub(super) mod tests {
             workspace_list_entries(&app),
             vec![
                 WorkspaceListEntry::Header {
-                    key: "github.com/nerd-machines/dompt".into()
+                    key: "github.com/example/project".into()
                 },
                 WorkspaceListEntry::Workspace {
                     ws_idx: 0,
@@ -8321,7 +8321,7 @@ pub(super) mod tests {
         );
         let header_row = buffer_row_text(&buffer, card.rect, card.rect.y.saturating_sub(1));
         assert!(
-            header_row.contains("nerd-machines/dompt"),
+            header_row.contains("example/project"),
             "the project identity heads the group: {header_row:?}"
         );
     }
@@ -10300,7 +10300,7 @@ pub(super) mod tests {
 
     /// #102 — the merged alphanumeric stream: local, remote-only, and misc
     /// all interleave under the same display-shaped sort key. The screenshot
-    /// case from the issue: `gerchowl/g-fleet · atlas:main` (remote-only)
+    /// case from the issue: `gerchowl/group-config · atlas:main` (remote-only)
     /// renders BETWEEN a local `flock` and a misc `notes`, not trailing
     /// after both.
     #[test]
@@ -10313,24 +10313,24 @@ pub(super) mod tests {
         app.workspaces = vec![
             notes,
             workspace_with_project_key("flock", "github.com/gerchowl/flock"),
-            workspace_with_project_key("ribes", "github.com/gerchowl/ribes"),
+            workspace_with_project_key("local-project", "github.com/gerchowl/local-project"),
         ];
         app.peer_summaries = vec![peer_with_workspaces(
             "atlas",
             vec![remote_summary(
-                "g-fleet",
-                Some("github.com/gerchowl/g-fleet"),
-                Some("g-fleet"),
+                "group-config",
+                Some("github.com/gerchowl/group-config"),
+                Some("group-config"),
                 None,
             )],
         )];
 
         // Sort keys:
         //   local flock    -> "gerchowl/flock"
-        //   local ribes    -> "gerchowl/ribes"
-        //   remote g-fleet -> "gerchowl/g-fleet"
+        //   local project  -> "gerchowl/local-project"
+        //   remote group-config -> "gerchowl/group-config"
         //   misc notes     -> "notes"
-        // Alphabetical: flock < g-fleet < ribes < notes.
+        // Alphabetical: flock < group-config < local-project < notes.
         assert_eq!(
             workspace_list_entries(&app),
             vec![
@@ -10347,7 +10347,7 @@ pub(super) mod tests {
                     indented: false,
                 },
                 WorkspaceListEntry::Header {
-                    key: "github.com/gerchowl/ribes".to_string(),
+                    key: "github.com/gerchowl/local-project".to_string(),
                 },
                 WorkspaceListEntry::Workspace {
                     ws_idx: 2,

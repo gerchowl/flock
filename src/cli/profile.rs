@@ -7,8 +7,11 @@ use crate::structured::profiles::bindings::{
     Scope,
 };
 
-/// CLI syntax for data-only preparation and the inactive enable transaction.
-pub(super) const USAGE: &str = "flk profile plan bind --repo <id> --nodes <ids> --agents <ids> --account <alias> --bundle <digests> --credential-ref <ref> --generation <n> [--grants <ids>] [--binding <id>] | bind|enable --plan <id> --expect <digest> | revoke --binding <id> --reason <text> | status [--format json]";
+/// Verb help for enablement, which remains unavailable until production readiness.
+pub(super) const ENABLE_USAGE: &str = "flk profile enable --plan <id> --expect <digest> (unavailable until production readiness is complete)";
+
+/// Group usage for data-only preparation and the inactive enable transaction.
+const USAGE: &str = "flk profile plan bind --repo <id> --nodes <ids> --agents <ids> --account <alias> --bundle <digests> --credential-ref <ref> --generation <n> [--grants <ids>] [--binding <id>] | bind|enable --plan <id> --expect <digest> | revoke --binding <id> --reason <text> | status [--format json]";
 
 fn parse(args: &[String]) -> Option<Method> {
     let (verb, tail) = args.split_first()?;

@@ -1,6 +1,6 @@
 ---
 number: 131
-title: "port herdr-web bridge into herdr as a first-class option (g-fleet keeps only the tailscale-serve exposure)"
+title: "port herdr-web bridge into herdr as a first-class option (the fleet configuration repo keeps only the tailscale-serve exposure)"
 kind: issue
 state: CLOSED
 author: gerchowl
@@ -10,9 +10,9 @@ closed: 2026-06-15T02:02:39Z
 url: https://github.com/gerchowl/herdr/issues/131
 ---
 
-# port herdr-web bridge into herdr as a first-class option (g-fleet keeps only the tailscale-serve exposure)
+# port herdr-web bridge into herdr as a first-class option (the fleet configuration repo keeps only the tailscale-serve exposure)
 
-The web bridge currently lives in **g-fleet** (`pkgs/herdr-web/`: a 367-line axum + portable-pty + tokio WS server, plus `static/index.html` and vendored xterm). It was built there for #109-MVP speed (atlas-only, Darwin-only launchd, vendored) — but it's a small, self-contained app that is *entirely coupled to herdr's own `HERDR_RENDER_ENCODING=terminal-ansi` output*. It belongs in the product, not in personal dotfiles.
+The web bridge currently lives in **the fleet configuration repo** (`pkgs/herdr-web/`: a 367-line axum + portable-pty + tokio WS server, plus `static/index.html` and vendored xterm). It was built there for #109-MVP speed (atlas-only, Darwin-only launchd, vendored) — but it's a small, self-contained app that is *entirely coupled to herdr's own `HERDR_RENDER_ENCODING=terminal-ansi` output*. It belongs in the product, not in personal dotfiles.
 
 ## Architecture (unchanged)
 ```
@@ -24,17 +24,17 @@ The bridge spawns a herdr **client** in a PTY per WS connection and pumps bytes 
 | Concern | Owner |
 |---|---|
 | WS↔PTY bridge, embedded frontend (xterm + index.html), enable flag/config | **herdr** (first-class) |
-| Which host enables it + the `tailscale serve` rule (loopback→tailnet) | **g-fleet** (topology only) |
+| Which host enables it + the `tailscale serve` rule (loopback→tailnet) | **the fleet configuration repo** (topology only) |
 
 ## Design choices
 1. **`herdr web --bind 127.0.0.1:PORT` subcommand** (separate in-tree binary/crate or cargo feature) vs. baking a listener into `herdr server`. Recommend the subcommand so the web deps (axum/tower/portable-pty) stay behind a feature and a default `herdr` build stays lean. herdr already depends on tokio.
 2. **Embed assets** (include_dir / rust-embed) — drop `--static-dir`, ship a self-contained binary. Fixes #128/#129/#130 in the product instead of in dotfiles.
-3. **Config surface**: a `[web]` block / flags (bind addr/port, session args). g-fleet's module shrinks to `enable + tailscale serve`.
+3. **Config surface**: a `[web]` block / flags (bind addr/port, session args). the fleet configuration repo's module shrinks to `enable + tailscale serve`.
 
 ## Wins
-- Cross-platform for free (the NixOS side is a stub today only because it's hand-rolled). Any host can opt in; g-fleet just picks which.
+- Cross-platform for free (the NixOS side is a stub today only because it's hand-rolled). Any host can opt in; the fleet configuration repo just picks which.
 - Web-view fixes (#128 badge overlap, #129 key bar, #130 mouse forwarding) land in herdr, versioned with it.
-- One release artifact; no vendoring drift in g-fleet.
+- One release artifact; no vendoring drift in the fleet configuration repo.
 
 Parent: #109. Subsumes the home for #128 / #129 / #130.
 
@@ -87,7 +87,7 @@ The MVP almost does this but spawns a fresh default `herdr` per WS connection (e
 - [ ] Web bridge attaches to a **persistent** local headless server; sessions survive WS reconnect.
 - [ ] Phone over `tailscale serve` sees the live local session **and** the fleet sidebar (peer rows/reachability) sourced from that node's gossip.
 - [ ] Assets embedded; no `--static-dir` needed.
-- [ ] g-fleet module shrinks to `enable + tailscale serve`.
+- [ ] the fleet configuration repo module shrinks to `enable + tailscale serve`.
 - [ ] Decision recorded (ADR) on transport, server-attach model, and the 15s-cadence acceptability.
 
 ## References
@@ -95,7 +95,7 @@ The MVP almost does this but spawns a fresh default `herdr` per WS connection (e
 - Headless server: `src/server/headless.rs:3272`; gossip loop: `src/app/mod.rs:304`, `src/app/api.rs:162`; peers: `src/peers.rs`, `src/app/api/peers.rs`, `src/cli/peers.rs`.
 - Render encoding: `src/protocol/wire.rs:78` (`RenderEncoding`), `src/client/mod.rs:1697` (ANSI passthrough), `src/server/render_stream.rs`.
 - Transport/sockets: `src/server/socket_paths.rs`, `src/remote.rs:1794` (`run_client_process`), `src/protocol/wire.rs` (`ClientMessage`/`ServerMessage`).
-- MVP: g-fleet `pkgs/herdr-web/src/main.rs`, `modules/herdr-web.nix`.
+- MVP: the fleet configuration repo `pkgs/herdr-web/src/main.rs`, `modules/herdr-web.nix`.
 - Related: #109 (parent), #128, #129, #130.
 
 ---
@@ -119,13 +119,13 @@ Landed on branch `web-xterm` (commits eaaaafd, 9b9f1f4, 1fabada):
 - [x] Assets embedded; no `--static-dir`
 - [x] Phone sees fleet sidebar from the attached node's gossip
 - [~] Persistent-server attach — works via default-launch; explicit `--session` flag is #151
-- [ ] g-fleet shrinks to `enable + tailscale serve` — #149 (separate repo)
+- [ ] the fleet configuration repo shrinks to `enable + tailscale serve` — #149 (separate repo)
 - [x] Decision recorded (ADR)
 
 ### Follow-ups filed
 - #147 — tailscale identity allow-list (P1)
 - #148 — idle WS timeout + session cap (P1)
-- #149 — g-fleet: retire MVP, run `herdr server` daemon + `herdr web` (P1)
+- #149 — the fleet configuration repo: retire MVP, run `herdr server` daemon + `herdr web` (P1)
 - #150 — native/stdio transport v2 (unblocks #128/#129/#130)
 - #151 — first-class `--session` flag
 
