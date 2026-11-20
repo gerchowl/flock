@@ -136,6 +136,8 @@ def main():
             text = "".join(block["text"] for block in content)
             framed = re.search(r"\n<<<flk-item ([0-9a-f]{32})\n(.*)\nflk-item \1>>>\Z", text, re.DOTALL)
             require((framed[2] if framed else text) == step["text"], "unexpected user text")
+            if "--replay-user-messages" in sys.argv:
+                emit({"type": "user", "uuid": value["uuid"], "message": message})
             active = True
             emit({"type": "command_lifecycle", "command_uuid": value["uuid"], "state": "started"})
         elif step.get("emit") == "stream":

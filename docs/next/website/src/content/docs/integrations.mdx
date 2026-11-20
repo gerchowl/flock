@@ -38,7 +38,7 @@ Claude profiles that register a shared hook script in `settings.json` report tha
 
 The Stop hook asks the server whether the caller may read the inbox before asking the agent to read waiting mail. If native inbox authority is refused, the hook allows the turn to end and reports the refusal once per socket, pane and session. A successful wake check clears that notice, so a later refusal can be reported again.
 
-As a workaround, the operator can read the inbox from their own interactive shell with `flk msg read --pane <pane-id>`. This clears the mail but does not re-attest the agent process. Recovery of legacy process authority remains tracked in [#3000](https://github.com/gerchowl/flock/issues/3000).
+As a workaround, the operator can read the inbox from their own interactive shell with `flk msg operator-read --pane <pane-id>` (or peek with `flk msg operator-list --pane <pane-id>`). These audited commands refuse agent panes, structured agents and mesh relays with `operator_only`. Reading clears the mail but does not re-attest the agent process. This is the interim path until migration to structured agents ([#3066](https://github.com/gerchowl/flock/issues/3066)).
 
 ## Uninstall integrations
 

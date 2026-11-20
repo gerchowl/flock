@@ -13,6 +13,15 @@ on:
           - linux
           - macos
           - all
+          - durable-attach-baseline
+      attach_expectation:
+        description: attach timeout contract to measure
+        required: true
+        default: timeout
+        type: choice
+        options:
+          - baseline
+          - timeout
       libghostty_optimize:
         description: libghostty-vt optimize mode for this build
         required: true
@@ -191,3 +200,43 @@ jobs:
             ${{ matrix.name }}
             BUILD_INFO.txt
           retention-days: 7
+
+  durable-attach-baseline:
+    if: ${{ inputs.build_group == 'durable-attach-baseline' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_INCREMENTAL: '0'
+      PROBE_EXPECTATION: ${{ inputs.attach_expectation }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.15.2
+          use-cache: false
+      - name: Build dynamic debug binary for interposition
+        run: cargo build --locked --bin flk
+      - name: Test measurement and record isolated Linux baseline
+        shell: bash
+        run: |
+          set -o pipefail
+          set -e
+          python3 -m unittest scripts.test_probe_durable_attach
+          if [ "$PROBE_EXPECTATION" = timeout ]; then
+            python3 scripts/probe_durable_attach.py --bin target/debug/flk --assert-attach-timeout
+            python3 tests/probes/attach_welcome.py --bin target/debug/flk
+          else
+            python3 scripts/probe_durable_attach.py --bin target/debug/flk --assert-baseline
+          fi 2>&1 | tee durable-attach-output.txt
+      - name: Upload raw measurement
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: durable-attach-baseline
+          path: durable-attach-output.txt
+          if-no-files-found: warn
+          retention-days: 30

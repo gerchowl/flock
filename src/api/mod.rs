@@ -65,6 +65,7 @@ pub(crate) fn request_changes_ui(request: &Request) -> bool {
             | Method::AgentRestart(_)
             | Method::MsgSend(_)
             | Method::MsgRead(_)
+            | Method::MsgOperatorRead(_)
             | Method::MsgReply(_)
             | Method::PeersHubFleet(_)
             | Method::PaneSplit(_)
