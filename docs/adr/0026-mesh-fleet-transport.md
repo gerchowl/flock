@@ -612,16 +612,23 @@ advertises `[5, 5]`, the first VERSION 6 build `[5, 6]`, a VERSION 7 build
 `[6, 7]`. The window is a compile-time constant, not configuration.
 
 Both offers are signed in the hello transcript, so the ranges are bound to
-the possession proofs and cannot be changed in transit. Each side computes
-the session VERSION independently as `min(local_max, remote_max)` and
-requires it to be at least `max(local_min, remote_min)`; otherwise the
-ranges do not overlap. The acceptor reports its computed value in its reply
-in an optional field, and the dialer refuses on any disagreement. A reply
-with no reported value comes from an acceptor that predates negotiation,
-which is what every pre-negotiation acceptor sends. The dialer then accepts
-at the single common VERSION, 5, if and only if its own range contains 5, and
-otherwise refuses with the existing `mesh_version_mismatch`. A range with `mesh_min` below 1
-or above `mesh_max` is invalid and refused.
+the possession proofs and cannot be changed in transit. Each side always
+computes the session VERSION itself, from the two signed offers, as
+`min(local_max, remote_max)`, and requires it to be at least
+`max(local_min, remote_min)`; otherwise the ranges do not overlap. Nothing
+else selects the VERSION.
+
+The acceptor also reports its computed value in its reply, in an optional
+field of `Challenge`. The transcript signature covers only the role and the
+two offers, so that value is unsigned and strippable: it is a redundant
+cross-check and a diagnostic, never an input. The dialer refuses a reported
+value that differs from its own computation. A missing value is accepted
+only when the acceptor's signed offer is `[5, 5]` (no `mesh_min` and
+`mesh == 5`), which is what every pre-negotiation acceptor sends, and the
+session is then at 5 if and only if the dialer's own range contains 5. If
+the signed offer shows a range, a missing value is refused with
+`mesh_version_mismatch`, so a stripped value cannot lower the session. A
+range with `mesh_min` below 1 or above `mesh_max` is invalid and refused.
 
 No overlap is refused at hello with the existing typed code
 `mesh_version_mismatch` and a message naming both ranges:
@@ -735,7 +742,7 @@ origin binding and `[msg] allow_from` (see "Origin policy and fleet pause"),
 custody dedupe and TTLs apply identically at every negotiated VERSION, and
 nothing at N-1 skips an origin or custody check that N performs. The ranges
 are signed (1), the window is a constant that no peer or configuration can
-lower, and the session VERSION is computed by both sides and compared, so a
+lower, and each side computes the session VERSION from the signed offers, so a
 peer cannot downgrade a session below the window, choose a version the other
 side does not support, or strip fields by editing the offer. A peer that
 advertises a lower range than it implements only loses features. A peer that
@@ -756,7 +763,8 @@ a range (it stays under `cfg!(debug_assertions)`, like
   correct side named, and the long backoff.
 - Downgrade attempt: an offer edited to a lower or wider range fails
   signature verification; a peer that advertises below the local window is
-  refused; both sides disagreeing on the computed VERSION is refused.
+  refused; a reported value that differs from the dialer's own computation is
+  refused.
 - Invalid ranges (`min > max`, zero) are refused with their own message.
 - Byte compatibility: an offer at `[5, 5]` serializes with no `mesh_min` and
   equals a VERSION 5 node's offer and transcript byte for byte; an offer
@@ -766,6 +774,9 @@ a range (it stays under `cfg!(debug_assertions)`, like
   directions: the edge comes up at 5, including the missing reported value
   on the dialer side. A `[6, 7]` dialer against a reply with no reported
   value is refused with `mesh_version_mismatch`.
+- `[5, 6]` acceptor reply with the reported value stripped: refused with
+  `mesh_version_mismatch`, and a `[5, 6]` dialer never settles on 5 while
+  the acceptor runs 6.
 - A VERSION 6 node against a pre-negotiation node, in both dial directions,
   produces the refusals described in 4 and takes the long backoff.
 - The kind/field gate: a kind newer than the session VERSION is never
