@@ -59,7 +59,7 @@ fn bound() -> SessionLeases {
         .reserve("agent", "session", Some(("parent", 1)))
         .unwrap();
     lease.spawned().unwrap();
-    leases.0.lock().get_mut("session").unwrap().process =
+    leases.0.write().get_mut("session").unwrap().process =
         Some(ProcessIdentity { pid: 10, birth: 20 });
     leases.update(|_| ()).unwrap();
     std::mem::drop(lease);
@@ -160,7 +160,7 @@ fn pending_launches_only_restrict_their_own_ancestry() {
         Caller::Unrelated
     );
     pending.spawned().unwrap();
-    leases.0.lock().get_mut("pending").unwrap().root = Root::Process(12);
+    leases.0.write().get_mut("pending").unwrap().root = Root::Process(12);
     assert_eq!(
         leases.resolve(Some(12), |_| Some((1, 40))),
         Caller::Uncertain
@@ -190,12 +190,12 @@ fn failed_bind_and_unconfirmed_cleanup_only_restrict_the_recorded_root() {
     lease.spawned().unwrap();
     // PID zero cannot name a live process on either platform.
     assert!(lease.bind(0).is_err());
-    assert_eq!(leases.0.lock()["session"].root, Root::Process(0));
+    assert_eq!(leases.0.write()["session"].root, Root::Process(0));
     drop(lease);
     assert!(leases.reserve("other", "session", None).is_err());
     // ADR-0036 §1a: a retained session reservation is not a global identity veto.
     assert_eq!(leases.caller(Some(std::process::id())), Caller::Unrelated);
-    leases.0.lock().get_mut("session").unwrap().root = Root::Process(12);
+    leases.0.write().get_mut("session").unwrap().root = Root::Process(12);
     assert_eq!(
         leases.resolve(Some(13), |pid| Some((if pid == 13 { 12 } else { 1 }, 40))),
         Caller::Uncertain
@@ -211,11 +211,11 @@ fn registry_contention_preserves_identity_after_explicit_release() {
     }
 
     let leases = bound();
-    let guard = leases.0.lock();
+    let guard = leases.0.write();
     let (tx, rx) = std::sync::mpsc::channel();
     let reader = leases.clone();
     let worker = std::thread::spawn(move || {
-        let contended = reader.0.try_lock().is_none();
+        let contended = reader.0.try_write().is_none();
         tx.send(ReadStep::Contended(contended)).unwrap();
         tx.send(ReadStep::Resolved(
             reader.resolve(Some(10), |_| Some((1, 20))),
@@ -243,7 +243,7 @@ fn registry_contention_preserves_identity_after_explicit_release() {
 #[test]
 fn bounded_contention_keeps_a_proven_pane_identity() {
     let leases = bound();
-    let _guard = leases.0.lock();
+    let _guard = leases.0.write();
     // ADR-0036 §1a preserves the independently established PTY boundary.
     assert_eq!(
         leases.resolve_with_pane(Some(11), Some(11), |_| None),
@@ -275,7 +275,7 @@ fn long_registry_contention_retains_only_launcher_ancestry_uncertainty() {
     let leases = SessionLeases::default();
     let mut pending = leases.reserve("agent", "session", None).unwrap();
     pending.spawned().unwrap();
-    let _guard = leases.0.lock();
+    let _guard = leases.0.write();
     // The published pre-spawn anchor prevents a child becoming operator during
     // registry contention, while ADR-0036 §1a keeps unrelated callers available.
     assert_eq!(
@@ -326,7 +326,7 @@ fn assert_mutation_wait_is_bounded(action: u8) {
     if action == 2 || action == 3 {
         lease.as_mut().unwrap().spawned().unwrap();
     }
-    let guard = leases.0.lock();
+    let guard = leases.0.write();
     let table = leases.clone();
     let (tx, rx) = std::sync::mpsc::channel();
     let worker = std::thread::spawn(move || {
@@ -352,7 +352,7 @@ fn assert_mutation_wait_is_bounded(action: u8) {
     drop(guard);
     if action == 4 {
         assert!(
-            leases.0.lock().contains_key("session"),
+            leases.0.write().contains_key("session"),
             "busy mutation must retain its reservation"
         );
     }
@@ -411,7 +411,7 @@ fn fork_exec_callback_holds_neither_registry_lock() {
     let leases = SessionLeases::default();
     let mut lease = leases.reserve("agent", "session", None).unwrap();
     let result = lease.spawn(|| {
-        assert!(leases.0.try_lock().is_some());
+        assert!(leases.0.try_write().is_some());
         assert!(leases.1.try_lock().is_some());
         Err(io::Error::other("owned spawn failure"))
     });
@@ -444,7 +444,7 @@ fn retained_lease_log(confirmed: bool) -> String {
         let leases = SessionLeases::default();
         let mut lease = leases.reserve("agent", "session", None).unwrap();
         lease.spawned().unwrap();
-        let _guard = leases.0.lock();
+        let _guard = leases.0.write();
         if confirmed {
             lease.release();
         }
@@ -480,7 +480,7 @@ fn public_lease_state_reports_binding_without_authority_or_waiting() {
     assert_eq!(leases.state("agent", "session"), LeaseState::Reserved);
     assert_eq!(leases.state("other", "session"), LeaseState::Absent);
     {
-        let _guard = leases.0.lock();
+        let _guard = leases.0.write();
         assert_eq!(leases.state("agent", "session"), LeaseState::Uncertain);
     }
     lease.spawned().unwrap();
@@ -506,7 +506,7 @@ fn owner_admission_reads_published_snapshot_without_waiting() {
     let (ready, seen) = std::sync::mpsc::sync_channel(1);
     let (release, wait) = std::sync::mpsc::sync_channel(1);
     let holder = std::thread::spawn(move || {
-        let _held = shared.0.lock();
+        let _held = shared.0.write();
         ready.send(()).unwrap();
         // A blocking-lock regression must fail after this ceiling, never hang CI.
         let _ = wait.recv_timeout(std::time::Duration::from_secs(10));
@@ -538,7 +538,7 @@ fn owner_admission_reports_retryable_contention_when_both_views_are_busy() {
     let (ready, seen) = std::sync::mpsc::sync_channel(1);
     let (release, wait) = std::sync::mpsc::sync_channel(1);
     let holder = std::thread::spawn(move || {
-        let _live = shared.0.lock();
+        let _live = shared.0.write();
         let _published = shared.1.lock();
         ready.send(()).unwrap();
         // Bound a blocking-read regression even if the caller never releases.

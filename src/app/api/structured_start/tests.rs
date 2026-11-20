@@ -121,7 +121,9 @@ impl AdmissionFixture {
             r#"(root / "observed-mcp.json").write_text(json.dumps(registration))"#,
             "(root / \"observed-mcp.pending\").write_text(json.dumps(registration))\nos.replace(root / \"observed-mcp.pending\", root / \"observed-mcp.json\")");
         fixture.file("claude", script.as_bytes(), 0o700);
-        let config: crate::config::Config = toml::from_str(&format!("[sessions]\nstall_ms = {stall_ms}\nblob_min_bytes = 64\n[structured]\nrun_as = 'operator'\nprofile = 'fixture'\ntoken_file = {:?}\n",root.join("token").to_str().unwrap())).unwrap();
+        // These in-process clients have no separate requester environment.
+        // External selector admission is exercised by the delegate_claude binary.
+        let config: crate::config::Config = toml::from_str(&format!("[spawn.env]\nclaude = []\n[sessions]\nstall_ms = {stall_ms}\nblob_min_bytes = 64\n[structured]\nrun_as = 'operator'\nprofile = 'fixture'\ntoken_file = {:?}\n",root.join("token").to_str().unwrap())).unwrap();
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let hub = crate::api::EventHub::default();
         let policy = crate::structured::identity::UidPolicy {
