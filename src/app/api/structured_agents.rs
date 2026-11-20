@@ -95,6 +95,15 @@ impl App {
             .collect()
     }
     pub(super) fn handle_structured_stop(&mut self, id: String, target: AgentTarget) -> String {
+        let caller = self.spawn_caller();
+        self.handle_structured_stop_as(id, target, caller)
+    }
+    pub(super) fn handle_structured_stop_as(
+        &mut self,
+        id: String,
+        target: AgentTarget,
+        caller: SpawnCaller,
+    ) -> String {
         let (agent, generation) = match self.structured_target(&target.target) {
             Ok(Some(target)) => target,
             Err(code) => {
@@ -117,7 +126,7 @@ impl App {
                 };
             }
         };
-        let allowed = may_stop(self.spawn_caller(), &agent);
+        let allowed = may_stop(caller, &agent);
         if !allowed {
             return encode_error(
                 id,

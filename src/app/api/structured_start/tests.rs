@@ -1817,3 +1817,6 @@ async fn preparation_failure_retry_launches_fresh() {
 async fn legacy_record_without_establishment_launches_fresh() {
     unestablished_retry_is_fresh(true).await;
 }
+
+#[cfg(feature = "web")]
+mod wire_lifecycle;

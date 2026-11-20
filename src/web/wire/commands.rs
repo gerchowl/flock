@@ -87,6 +87,7 @@ fn dispatch(
     app: &mut App,
     command: &Command,
     principal: &Principal<'_>,
+    session: &Session,
 ) -> Result<Outcome, ErrorCode> {
     if command.read_only {
         return Err(ErrorCode::ServerVersionGap);
@@ -95,7 +96,7 @@ fn dispatch(
     if command.resume_only {
         return Err(ErrorCode::SessionUnconfirmed);
     }
-    dispatch_verb(app, command, principal)
+    dispatch_verb(app, command, principal, session)
 }
 fn missing_target(app: &App, target: &str) -> ErrorCode {
     if app.locate_agent(target).is_some() || app.resolve_terminal_target(target).is_ok() {
@@ -111,6 +112,7 @@ fn dispatch_verb(
     app: &mut App,
     command: &Command,
     principal: &Principal<'_>,
+    session: &Session,
 ) -> Result<Outcome, ErrorCode> {
     if lifecycle(&command.verb) {
         let mut args = command.args.clone();
@@ -132,7 +134,9 @@ fn dispatch_verb(
             "verb": command.verb, "args": args,
         }))
         .map_err(|_| ErrorCode::InvalidParams)?;
-        return app.wire_agent_lifecycle(typed).map(Outcome::Decided);
+        return app
+            .wire_agent_lifecycle(typed, session)
+            .map(Outcome::Decided);
     }
     match command.verb.as_str() {
         "agent.send" => {
@@ -297,7 +301,12 @@ impl Owner {
                             return Err(ErrorCode::SessionUnconfirmed);
                         }
                         dispatched = true;
-                        dispatch(app, &request.command, &Principal::Token(token))
+                        dispatch(
+                            app,
+                            &request.command,
+                            &Principal::Token(token),
+                            &request.session,
+                        )
                     })
                     .unwrap_or_else(|error| {
                         Err(match error {
@@ -310,6 +319,24 @@ impl Owner {
                             TokenError::Unsafe | TokenError::Io(_) => ErrorCode::InternalError,
                         })
                     });
+                if is_lifecycle {
+                    tracing::info!(
+                        event = "wire.lifecycle.admission",
+                        credential = request.session.info.name.as_str(),
+                        verb = request.command.verb.as_str(),
+                        cmd_id = request.command.id.as_str(),
+                        outcome = outcome.as_ref().map_or_else(
+                            |code| code.as_str(),
+                            |value| {
+                                match value {
+                                    Outcome::Replayed(Err(code)) => code.as_str(),
+                                    _ => "admitted",
+                                }
+                            }
+                        ),
+                        "wire lifecycle admission"
+                    );
+                }
                 match outcome {
                     Ok(Outcome::Queued(receipt)) => self.pending.push(Pending {
                         key,
