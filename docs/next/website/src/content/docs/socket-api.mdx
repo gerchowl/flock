@@ -168,9 +168,19 @@ checks remain required.
 ## Mesh edge enrollment
 
 `mesh.hello` is a held-relay handshake. A `begin` offer carries `mesh`,
-`name`, `node_id`, `public_key`, and a fresh `nonce`. The receiver returns a
+`name`, `node_id`, `public_key`, and a fresh `nonce`. `mesh` is the maximum
+supported version; optional `mesh_min` is the minimum. A single-version offer
+omits `mesh_min` and reads as `[mesh, mesh]`, preserving the old signed bytes.
+Both sides compute the highest common version from the two signed offers.
+The receiver returns a
 `challenge` with its own offer and a signature binding both offers and the
-acceptor direction. `finish` carries the dialer's signature over the same
+acceptor direction. The challenge also reports `negotiated`, an unsigned,
+redundant cross-check. A disagreeing report is refused; a missing report is
+accepted only for an offer with `mesh: 5` and no `mesh_min`. Disjoint or invalid
+ranges return `mesh_version_mismatch`; `data.mesh` remains the refusing node's
+maximum and `data.mesh_min` its minimum. An absent `data.mesh_min` on a
+VERSION 5 refusal identifies a pre-negotiation peer when 5 is in the dialer's
+window. `finish` carries the dialer's signature over the same
 transcript with the dialer direction. Both peers pin the proven key after
 successful verification. `check` verifies that the calling relay still holds
 an enrolled attachment, including after a server restart. Relay methods are
@@ -180,7 +190,9 @@ or, for Tailscale SSH, `tailscaled`. Anything else is refused with
 `relay_not_from_ssh`.
 
 `peers.enrollment` returns `peers` entries containing `peer`, `node_id`,
-`source` (`configured` or `inbound`), `state`, and `reason`. Its `routes` array
+`source` (`configured` or `inbound`), `state`, and `reason`. Established entries
+also contain `negotiated`, the current session version, which is recomputed
+at each hello and never persisted. Its `routes` array
 contains `{node, name, next_hop, hops}` for live shortest paths (at most eight
 hops). Names use locally pinned names when available; other names include an
 eight-character node ID suffix and `(advertised)`. `route_generation` is the
@@ -565,6 +577,14 @@ For terminal recipients, `msg.send` queues a message for another pane's agent. D
 
 Message acceptance commits to the mesh custody store before returning a `message_key` containing `origin_node` and a server-minted ULID `message_id`. Correlation IDs remain caller-selected conversation labels: two accepted sends with the same correlation ID have distinct message keys.
 
+Mesh envelopes and the records that carry them (`Deliver`, `OutboundCollect`,
+and `OutboundAck`) require JSON object form. Sequence-form structs, including
+enclosing records and optional receipt envelopes, cause
+`mesh_protocol_violation`: the entire batch remains unacknowledged and the
+session resets. Explicit envelope `kind` tags must be strings; an absent tag
+means `message`, and enum-map aliases are refused. Optional `receipt: null`
+means no envelope. The collection result's string receipt token is unchanged.
+
 `mesh.deliver` takes a `Deliver` object with these fields:
 
 | Field | Meaning |
@@ -586,10 +606,12 @@ inbox delivery.
 | `loop_detected` | Refuse this route attempt, retain upstream custody and wait for a route change. |
 | `hop_budget_exhausted` | Refuse further forwarding, retain upstream custody and seek another route. |
 | `invalid_signature` | Permanently refuse an envelope whose origin signature fails verification. |
-| `peer_incompatible` | Refuse a new send through a known incompatible peer with an upgrade instruction. The edge handshake diagnostic names both mesh versions, or that the peer runs a pre-mesh flk. |
+| `peer_incompatible` | Refuse a new send through a known incompatible peer with an upgrade instruction. The edge handshake diagnostic names both mesh support ranges, or that the peer runs a pre-mesh flk. |
+| `mesh_version_mismatch` | Refuse hello when support ranges do not overlap or the reported version fails its cross-check. Retry after upgrading the named side. |
+| `mesh_protocol_violation` | Refuse every envelope in a batch containing an unknown kind or a kind above the session version, acknowledge nothing, reset the edge, and take the long refusal backoff. The retry class is `after_handoff`. |
 
 Delivery refusals use `error.code: "mesh_delivery_refused"` with the specific
-reason above in `error.message`; `origin_mismatch` has its own error code.
+route or signature reason above in `error.message`; `origin_mismatch` has its own error code.
 New-send compatibility refusals use `error.code: "peer_incompatible"`. No
 legacy transport or downgrade is attempted. A peer still running a pre-mesh
 release such as v0.11.0 rejects `mesh.hello` as an unknown method; Flock
@@ -1661,3 +1683,10 @@ On Linux, the native shell must refuse local mint when `ptrace_scope=0`, explain
 that other processes could read its operator credential, and offer explicit
 remote pairing or administrator-enabled `ptrace_scope ≥ 1`. G9a owns that
 native check and fallback presentation; there is no silent fallback.
+
+Every authenticated structured-wire refusal (commands, subscriptions and protocol) emits
+best-effort `wire_refused` events through the event hub. See the
+[structured wire refusal audit contract](../structured-wire-minimal/#refusal-audit-events)
+for fields, exact suppression summaries, the shared 60-second per-key/global
+budgets, graceful shutdown flushing, and the limits at capacity, crash and
+journal failure. Refusal reporting does not replace required mutation audits.

@@ -178,10 +178,12 @@ pub enum Method {
     MeshHello(crate::mesh::hello::Hello),
     #[serde(rename = "mesh.routes")]
     MeshRoutes { adverts: Vec<serde_json::Value> },
+    /// Inspect envelope kinds against the session before decoding the payload.
     #[serde(rename = "mesh.deliver")]
-    MeshDeliver(Box<crate::mesh::delivery::Deliver>),
+    MeshDeliver(serde_json::Value),
+    /// Inspect the complete acknowledgement batch before any custody mutation.
     #[serde(rename = "mesh.collect")]
-    MeshCollect(crate::mesh::collect::Collect),
+    MeshCollect(serde_json::Value),
     #[serde(rename = "peers.enroll_reset")]
     PeersEnrollReset(PeersEnrollResetParams),
     #[serde(rename = "peers.enrollment")]
@@ -2971,6 +2973,8 @@ pub enum EventKind {
     OwnerPolicyAdopted,
     /// Audited operator access to a named pane inbox, without message bodies.
     OperatorInboxAccess,
+    /// Best-effort authenticated wire refusal or bounded suppression summary.
+    WireRefused,
 }
 
 impl EventKind {
@@ -3050,7 +3054,8 @@ impl EventKind {
             | Self::PrClosed
             | Self::WaitExpired
             | Self::OwnerPolicyAdopted
-            | Self::OperatorInboxAccess => true,
+            | Self::OperatorInboxAccess
+            | Self::WireRefused => true,
             Self::PaneOutputChanged | Self::MeshRoutesChanged | Self::MeshOutboundPending => false,
         }
     }
@@ -5159,6 +5164,17 @@ pub enum EventData {
         child_branch: String,
         /// Whether a pivot prompt seeded the fork's opening turn.
         seeded: bool,
+    },
+    /// Authenticated command refused before dispatch; no command body or secret.
+    /// `suppressed == 0` is an individual event. Positive counts summarize one
+    /// window; null identity/verb/reason denotes aggregate capacity overflow.
+    WireRefused {
+        principal: Option<String>,
+        token_id: Option<String>,
+        verb: Option<String>,
+        target: Option<String>,
+        reason: Option<String>,
+        suppressed: u64,
     },
 }
 

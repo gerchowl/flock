@@ -2,6 +2,7 @@
 mod commands;
 mod fleet;
 mod output;
+mod refusals;
 mod subscriptions;
 pub(crate) mod timing;
 #[cfg(test)]
@@ -63,6 +64,7 @@ struct Shared {
     fleet: fleet::Client,
     histories: crate::structured::history::owner::Client,
     commands: commands::Client,
+    refusals: refusals::Refusals,
     store: Arc<Store>,
     epoch: String,
     clock: Arc<dyn Clock>,
@@ -119,13 +121,20 @@ impl Core {
     /// New server epoch, independent of durable stream cursors or command identities.
     #[cfg(test)]
     pub(crate) async fn new(data: PathBuf, wake: Arc<tokio::sync::Notify>) -> io::Result<Self> {
-        Self::new_shared(data, wake, Owner::default()).await
+        Self::new_shared(
+            data,
+            wake,
+            Owner::default(),
+            crate::api::EventHub::default(),
+        )
+        .await
     }
     /// Share the socket owner's memory domain; opening runs on the bounded I/O worker.
     pub(crate) async fn new_shared(
         data: PathBuf,
         wake: Arc<tokio::sync::Notify>,
         owner: Owner,
+        event_hub: crate::api::EventHub,
     ) -> io::Result<Self> {
         let store = super::store_io::shared()
             .run(move || {
@@ -139,7 +148,9 @@ impl Core {
             .await
             .ok_or_else(|| io::Error::other("client token store worker unavailable"))?
             .map_err(io::Error::other)?;
-        Self::from_store(store, Arc::new(SystemClock), wake)
+        let core = Self::from_store(store, Arc::new(SystemClock), wake)?;
+        core.shared.refusals.attach(event_hub);
+        Ok(core)
     }
     /// Embed with a supplied monotonic clock shared by credential and transport deadlines.
     #[cfg(test)]
@@ -176,6 +187,7 @@ impl Core {
                 fleet,
                 store,
                 epoch,
+                refusals: refusals::Refusals::new(clock.now()),
                 clock,
                 slots: Arc::new(Semaphore::new(CONNECTIONS as usize)),
                 hellos: std::array::from_fn(|_| Arc::new(Semaphore::new(PENDING_HELLOS))),
@@ -246,8 +258,10 @@ impl Core {
     }
     /// Admit commands on the same owner that services structured workers.
     pub(crate) fn service_commands(&mut self, app: &mut crate::app::App) {
+        self.shared.refusals.attach(app.event_hub.clone());
+        self.shared.refusals.tick(self.shared.clock.now());
         self.admission.service(app);
-        self.command_owner.service(app);
+        self.command_owner.service(app, &self.shared);
     }
     /// Stop and drain every transport lease even when app revocation fails.
     /// Revocation and lease draining each have a five-second caller budget.
@@ -280,6 +294,7 @@ impl Core {
         .await
         .map(|_| ())
         .map_err(io::Error::other);
+        self.shared.refusals.flush(self.shared.clock.now());
         revocation.and(drained)
     }
 }
@@ -698,17 +713,27 @@ async fn connection(
             frame = stream.next() => match frame {
                 Some(Ok(Message::Text(text))) => match serde_json::from_str(&text) {
                     Ok(ClientFrame::Ping { nonce }) => {
+                        let reason = if timing::valid_nonce(&nonce) { crate::api::error_code::ErrorCode::SessionBusy } else { crate::api::error_code::ErrorCode::InvalidParams };
                         if let Some(reply) = output::probe(nonce, &probe_slots) {
-                            if priority.try_send(reply).is_err() { break unavailable("control_capacity"); }
+                            if priority.try_send(reply).is_err() {
+                                shared.refusals.control(shared.clock.now(), &session.info, "ping", crate::api::error_code::ErrorCode::SessionBusy);
+                                break unavailable("control_capacity");
+                            }
+                        } else {
+                            shared.refusals.control(shared.clock.now(), &session.info, "ping", reason);
                         }
                     }
-                    Ok(ClientFrame::Pong { nonce }) => heartbeat.pong(&nonce, shared.clock.now()),
+                    Ok(ClientFrame::Pong { nonce }) => {
+                        if !heartbeat.pong(&nonce, shared.clock.now()) {
+                            shared.refusals.control(shared.clock.now(), &session.info, "pong", crate::api::error_code::ErrorCode::InvalidParams);
+                        }
+                    },
                     Ok(ClientFrame::Sub { sub_id, stream, after }) => {
                         if !subscriptions.subscribe(sub_id, stream, after) { break unavailable("subscription_capacity") }
                     }
                     Ok(ClientFrame::Unsub { sub_id }) => subscriptions.unsubscribe(&sub_id),
                     Ok(ClientFrame::Cmd { cmd_id, verb, args, resume_only }) => {
-                        let refusal = if !matches!(verb.as_str(), "agent.send" | "agent.decide" | "agent.start" | "agent.restart" | "agent.stop") || read_only {
+                        let refusal = if commands::known_verb(&verb).is_none() || read_only {
                             Some(crate::api::error_code::ErrorCode::ServerVersionGap)
                         } else if cmd_id.len() > 128 {
                             Some(crate::api::error_code::ErrorCode::InvalidParams)
@@ -716,6 +741,7 @@ async fn connection(
                             Some(crate::api::error_code::ErrorCode::SessionBusy)
                         } else { None };
                         if let Some(code) = refusal {
+                            shared.refusals.record(shared.clock.now(), &session.info, &verb, &args, code);
                             let Some(ack) = output::encode(commands::ack(cmd_id, Err(code))) else { break unavailable("ack_encoding") };
                             tokio::select! { biased;
                                 _ = stop.changed() => return,
@@ -728,12 +754,22 @@ async fn connection(
                         }
                         running.spawn(commands::execute(shared.clone(), session.clone(), data.clone(), commands::Command { id: cmd_id, verb, args, resume_only, read_only }));
                     }
-                    _ => break POLICY_VIOLATION_CLOSE,
+                    _ => {
+                        let frame = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
+                        shared.refusals.malformed(shared.clock.now(), &session.info, &frame);
+                        break POLICY_VIOLATION_CLOSE;
+                    },
                 },
-                Some(Ok(Message::Binary(_))) => break POLICY_VIOLATION_CLOSE,
+                Some(Ok(Message::Binary(_))) => {
+                    shared.refusals.malformed(shared.clock.now(), &session.info, &serde_json::Value::Null);
+                    break POLICY_VIOLATION_CLOSE;
+                },
                 Some(Ok(Message::Ping(_) | Message::Pong(_))) => (),
                 Some(Ok(Message::Close(_))) => break unavailable("peer_close"),
-                Some(Err(_)) => break unavailable("peer_transport"),
+                Some(Err(_)) => {
+                    shared.refusals.control(shared.clock.now(), &session.info, "protocol", crate::api::error_code::ErrorCode::InternalError);
+                    break unavailable("peer_transport");
+                },
                 None => break unavailable("peer_eof"),
             }
         }
