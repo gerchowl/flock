@@ -45,10 +45,10 @@ fn expiry_threshold_drops_only_expired_records_and_releases_exact_capacity() {
         )
         .unwrap();
     let (tx, rx) = mpsc::sync_channel(QUEUED);
-    journal.start_compaction(NOW, tx);
+    journal.start_compaction(1002, tx);
     assert!(
         journal.compaction.is_none(),
-        "below threshold must not compact"
+        "unexpired entries below the growth threshold must not compact"
     );
     assert!(matches!(
         rx.try_recv(),
@@ -306,7 +306,8 @@ fn shutdown_drains_cancelled_jobs_closes_every_clone_and_releases_lease_before_r
 
 fn crash_hook(step: &str) {
     if std::env::var("FLOCK_JOURNAL_CRASH_STEP").unwrap() == step {
-        std::process::exit(91);
+        // Exit without unwinding, matching the blob publication crash fixture.
+        std::process::exit(crate::cli::exit::SUCCESS);
     }
 }
 #[test]
@@ -366,7 +367,7 @@ fn crash_at_each_compaction_step_leaves_a_complete_replayable_old_or_new_log() {
             }
             std::thread::yield_now();
         };
-        assert_eq!(status.code(), Some(91), "{step}");
+        assert_eq!(status.code(), Some(crate::cli::exit::SUCCESS), "{step}");
         let after = fs::read(root.path().join("wire/commands.jsonl")).unwrap();
         if matches!(
             step,
@@ -510,4 +511,135 @@ fn opaque_row_discovered_by_copier_preserves_the_log_and_fences_writes() {
         journal.claim("local", "p", &command("new"), NOW).err(),
         Some(ErrorCode::SessionBusy)
     );
+}
+
+#[test]
+fn expiry_reclaims_full_capacity_without_log_growth_after_sweep_or_reopen() {
+    for reopen in [false, true] {
+        for (global, principal) in [(1, 2), (3, 1)] {
+            let (root, mut journal) = setup();
+            journal.global_limit = global;
+            journal.principal_limit = principal;
+            claim(&mut journal, "one");
+            let rx = start(&mut journal, 101);
+            finish_compaction(&mut journal, &rx);
+            if reopen {
+                drop(journal);
+                journal = Journal::open(root.path()).unwrap();
+                journal.global_limit = global;
+                journal.principal_limit = principal;
+            }
+            assert!(journal.bytes < journal.next_compaction);
+            let (tx, rx) = mpsc::sync_channel(QUEUED);
+            journal.start_compaction(101, tx);
+            assert!(
+                journal.compaction.is_none(),
+                "unexpired claims must not trigger expiry sweeps"
+            );
+            assert!(matches!(
+                rx.try_recv(),
+                Err(mpsc::TryRecvError::Disconnected)
+            ));
+            let bytes = journal.bytes;
+            assert_eq!(
+                journal.claim("local", "p", &command("two"), NOW).err(),
+                Some(ErrorCode::SessionBusy)
+            );
+            assert_eq!(journal.bytes, bytes);
+            let (tx, rx) = mpsc::sync_channel(QUEUED);
+            journal.start_compaction(NOW, tx);
+            assert!(
+                journal.compaction.is_some(),
+                "expired capacity must recover without log growth"
+            );
+            finish_compaction(&mut journal, &rx);
+            assert!(matches!(
+                journal.claim("local", "p", &command("two"), NOW).unwrap(),
+                Admission::Claimed(NOW)
+            ));
+            assert_eq!(journal.index.records.len(), 1);
+            assert_eq!(journal.index.counts[&("local".into(), "p".into())], 1);
+            assert_eq!(
+                journal.claim("local", "p", &command("three"), NOW).err(),
+                Some(ErrorCode::SessionBusy)
+            );
+        }
+    }
+}
+
+#[test]
+fn expired_capacity_sweep_preserves_unexpired_first_outcome() {
+    let (_root, mut journal) = setup();
+    journal.global_limit = 2;
+    claim(&mut journal, "expired");
+    journal.claim("local", "q", &command("keep"), 1001).unwrap();
+    let keep = ("local".into(), "q".into(), "keep".into());
+    let first = journal
+        .finish(&keep, 1001, Ok(json!({"first":true})))
+        .unwrap();
+    let rx = start(&mut journal, 1002);
+    finish_compaction(&mut journal, &rx);
+    let (tx, rx) = mpsc::sync_channel(QUEUED);
+    journal.start_compaction(NOW, tx);
+    assert!(journal.compaction.is_some());
+    finish_compaction(&mut journal, &rx);
+    journal.claim("local", "p", &command("new"), NOW).unwrap();
+    assert_eq!(journal.index.records.len(), 2);
+    assert_eq!(
+        journal.index.counts,
+        HashMap::from([
+            (("local".into(), "p".into()), 1),
+            (("local".into(), "q".into()), 1)
+        ])
+    );
+    assert!(
+        matches!(journal.claim("local", "q", &command("keep"), NOW).unwrap(), Admission::Replayed(frame) if frame == first)
+    );
+}
+
+#[test]
+fn writer_capacity_refusal_triggers_expiry_sweep_and_retry_succeeds() {
+    super::super::super::super::tests::runtime(async {
+        let (root, mut journal) = setup();
+        claim(&mut journal, "one");
+        let rx = start(&mut journal, 101);
+        finish_compaction(&mut journal, &rx);
+        drop(journal);
+        let (tx, rx) = mpsc::channel();
+        *PUBLISHED.get_or_init(|| Mutex::new(None)).lock().unwrap() = Some(tx);
+        let data = root.path().to_owned();
+        let writer = Writer::spawn(
+            move || {
+                let mut journal = Journal::open(&data)?;
+                journal.global_limit = 1;
+                journal.principal_limit = 1;
+                journal.compaction_hook = Some(published);
+                Ok(journal)
+            },
+            Arc::new(Notify::new()),
+        )
+        .await
+        .unwrap();
+        let attempt = || Operation::Claim {
+            namespace: "local".into(),
+            principal: "p".into(),
+            command: command("two"),
+            now: NOW,
+        };
+        assert_eq!(
+            writer.submit(attempt()).unwrap().await.unwrap().err(),
+            Some(ErrorCode::SessionBusy)
+        );
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("expiry sweep producer exited or never published");
+        assert!(matches!(
+            writer.submit(attempt()).unwrap().await.unwrap().unwrap(),
+            Admission::Claimed(NOW)
+        ));
+        writer.shutdown().await.unwrap();
+        let recovered = Journal::open(root.path()).unwrap();
+        assert!(!recovered.blocked);
+        assert_eq!(recovered.index.records.len(), 1);
+        assert!(recovered.index.records.contains_key(&key("two")));
+    });
 }

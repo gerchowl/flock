@@ -28,6 +28,7 @@ type Key = (String, String, String);
 struct Index {
     records: HashMap<Key, Record>,
     counts: HashMap<(String, String), usize>,
+    oldest_ms: Option<u64>,
 }
 #[cfg(not(test))]
 type Stream = File;
@@ -472,6 +473,10 @@ impl Index {
                 .counts
                 .entry((key.0.clone(), key.1.clone()))
                 .or_default() += 1;
+            self.oldest_ms = Some(
+                self.oldest_ms
+                    .map_or(record.admitted_ms, |oldest| oldest.min(record.admitted_ms)),
+            );
             self.records.insert(key, record);
         }
         true

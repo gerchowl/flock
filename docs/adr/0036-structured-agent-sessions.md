@@ -2032,8 +2032,12 @@ Callers must await shutdown before opening a replacement; opening while the
 lease is held refuses, and a fresh open after release can succeed even when
 closed handles remain alive.
 
-After eight MiB of log growth, a claim attempt starts a separate compaction
-worker with that attempt's clock value and a fixed, complete append prefix.
+After eight MiB of log growth or when the oldest retained claim expires, a
+claim attempt starts a separate compaction worker with that attempt's clock
+value and a fixed, complete append prefix. This also runs after a capacity
+refusal, so a full journal can recover without successful appends. An O(1)
+oldest-admission index is rebuilt during replay and compaction, and maintained
+when claims are inserted; admission never scans the journal to check expiry.
 The copier keeps records younger than 24 hours, conservatively retaining future
 timestamps. It catches up concurrent appends and builds the replacement index
 and per-principal counts off-thread, reserving capacity so publication cannot
@@ -2045,8 +2049,10 @@ Old index destruction also runs on the copier. A crash leaves the complete old
 or new journal; abandoned `commands.compact` files are ignored during replay.
 Copy or publication failures fence further writes. The primary file's identity
 is checked before copying and publication, so a lost or replaced log is not
-resurrected. A failed concurrent append cancels publication rather than replacing an uncertain authoritative tail. A sweep that
-frees nothing waits for another eight MiB of growth before trying again.
+resurrected. A failed concurrent append cancels publication rather than
+replacing an uncertain authoritative tail. A sweep that frees nothing waits
+for another eight MiB of growth or the next retained claim's expiry before
+trying again. Unexpired claims remain retained in either case.
 
 Expired entries occupy their counts until successful compaction: resume-only
 lookup refuses them as uncertain, and reuse as a new claim refuses busy. No

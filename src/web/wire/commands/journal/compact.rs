@@ -1,6 +1,6 @@
 //! Fixed-prefix copying and bounded publication. Opaque journals stay untouched.
 use super::*;
-/// Start another sweep after eight MiB of growth, even if the last sweep freed nothing.
+/// Growth threshold; expired claims independently trigger sweeps without new bytes.
 pub(super) const THRESHOLD: u64 = 8 * 1024 * 1024;
 /// The writer copies at most two bounded records while publishing.
 const TAIL_BYTES: u64 = (ENTRY_BYTES * 2) as u64;
@@ -67,7 +67,13 @@ impl Snapshot {
 }
 impl Journal {
     pub(super) fn start_compaction(&mut self, now: u64, tx: mpsc::SyncSender<Message>) {
-        if self.blocked || self.compaction.is_some() || self.bytes < self.next_compaction {
+        let expired = self.index.oldest_ms.is_some_and(|oldest| {
+            now.saturating_sub(oldest) >= super::super::super::IDEMPOTENCY_WINDOW_MS
+        });
+        if self.blocked
+            || self.compaction.is_some()
+            || (self.bytes < self.next_compaction && !expired)
+        {
             return;
         }
         if let Err(error) = files::rollout_identity(&self.file, &self.root.join("commands.jsonl")) {
@@ -109,6 +115,7 @@ impl Journal {
                         index: Index {
                             records: HashMap::with_capacity(limit),
                             counts: HashMap::with_capacity(limit),
+                            oldest_ms: None,
                         },
                         offset: 0,
                         bytes: 0,
