@@ -55,8 +55,8 @@ fn replay_rebuilds_index_counts_and_first_outcome() {
     drop(journal);
     let mut journal = Journal::open(root.path()).unwrap();
     assert_eq!(journal.bytes, bytes);
-    assert_eq!(journal.records.len(), 2);
-    assert_eq!(journal.counts[&("local".into(), "p".into())], 2);
+    assert_eq!(journal.index.records.len(), 2);
+    assert_eq!(journal.index.counts[&("local".into(), "p".into())], 2);
     assert!(
         matches!(journal.claim("local","p",&command("one"),101).unwrap(),Admission::Replayed(frame) if frame == first)
     );
@@ -100,7 +100,7 @@ fn claim_and_finish_write_one_record_independent_of_retained_size() {
         let original = fs::read(root.path().join("wire/commands.jsonl")).unwrap();
         claim(&mut journal, "one");
         let middle = journal.file.written;
-        let claim_bytes = serde_json::to_vec(&journal.records[&key("one")])
+        let claim_bytes = serde_json::to_vec(&journal.index.records[&key("one")])
             .unwrap()
             .len() as u64
             + 1;
@@ -108,7 +108,7 @@ fn claim_and_finish_write_one_record_independent_of_retained_size() {
             .finish(&key("one"), 100, Ok(json!({"ok":true})))
             .unwrap();
         deltas.push((middle - written, journal.file.written - middle));
-        let outcome_bytes = serde_json::to_vec(&journal.records[&key("one")])
+        let outcome_bytes = serde_json::to_vec(&journal.index.records[&key("one")])
             .unwrap()
             .len() as u64
             + 1;
@@ -149,7 +149,7 @@ fn principal_global_and_byte_caps_refuse_without_eviction() {
         journal.claim("local", "r", &command("four"), 102).err(),
         Some(ErrorCode::SessionBusy)
     );
-    assert_eq!(journal.records.len(), 3);
+    assert_eq!(journal.index.records.len(), 3);
 }
 #[test]
 fn namespace_payload_target_and_delivery_flag_are_bound_correctly() {
@@ -231,7 +231,7 @@ fn torn_tail_is_archived_before_truncation_and_append_remains_readable() {
     claim(&mut journal, "two");
     drop(journal);
     let journal = Journal::open(root.path()).unwrap();
-    assert_eq!(journal.records.len(), 2);
+    assert_eq!(journal.index.records.len(), 2);
 }
 #[test]
 fn complete_corruption_and_oversized_rows_preserve_raw_and_other_results() {
@@ -259,7 +259,7 @@ fn complete_corruption_and_oversized_rows_preserve_raw_and_other_results() {
         let before = fs::read(root.path().join("wire/commands.jsonl")).unwrap();
         let mut journal = Journal::open(root.path()).unwrap();
         assert!(journal.blocked);
-        assert_eq!(journal.records.len(), 2);
+        assert_eq!(journal.index.records.len(), 2);
         assert!(
             matches!(journal.claim("local","p",&command("one"),101).unwrap(),Admission::Replayed(frame) if frame==first)
         );
@@ -300,8 +300,8 @@ fn append_and_sync_failures_roll_back_before_publishing_index() {
             journal.claim("local", "p", &command("two"), 100).err(),
             Some(ErrorCode::SessionBusy)
         );
-        assert_eq!(journal.records.len(), 1);
-        assert_eq!(journal.counts[&("local".into(), "p".into())], 1);
+        assert_eq!(journal.index.records.len(), 1);
+        assert_eq!(journal.index.counts[&("local".into(), "p".into())], 1);
         assert_eq!(
             before,
             fs::read(root.path().join("wire/commands.jsonl")).unwrap()
@@ -324,7 +324,7 @@ fn failed_outcome_keeps_pending_and_failed_rollback_requires_recovery() {
                 .err(),
             Some(ErrorCode::SessionUnconfirmed)
         );
-        assert!(journal.records[&key("one")].outcome.is_none());
+        assert!(journal.index.records[&key("one")].outcome.is_none());
         assert!(journal.blocked);
         drop(journal);
         let mut journal = Journal::open(root.path()).unwrap();
@@ -346,7 +346,7 @@ fn oversized_outcome_does_not_append_or_publish() {
         Some(ErrorCode::SessionUnconfirmed)
     );
     assert_eq!(journal.bytes, before);
-    assert!(journal.records[&key("one")].outcome.is_none());
+    assert!(journal.index.records[&key("one")].outcome.is_none());
 }
 #[test]
 fn exclusive_writer_lease_prevents_stale_parallel_indexes() {
@@ -395,6 +395,7 @@ fn worker_never_blocks_submit_on_sync_and_queue_remains_bounded() {
             },
             Arc::new(Notify::new()),
         )
+        .await
         .unwrap();
         let mut first = submit(&writer, operation("first")).unwrap();
         ready.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -467,8 +468,8 @@ fn worker_never_blocks_submit_on_sync_and_queue_remains_bounded() {
             .unwrap()
             .unwrap();
         let journal = Journal::open(root.path()).unwrap();
-        assert_eq!(journal.records.len(), QUEUED + 1);
-        assert!(journal.records[&key("first")].outcome.is_some());
+        assert_eq!(journal.index.records.len(), QUEUED + 1);
+        assert!(journal.index.records[&key("first")].outcome.is_some());
     });
 }
 
@@ -477,10 +478,10 @@ fn crash_after_synced_outcome_before_index_publication_replays_the_ack() {
     let (root, mut journal) = setup();
     claim(&mut journal, "one");
     let first = ack("one".into(), Ok(json!({"ok":true})));
-    let mut record = journal.records[&key("one")].clone();
+    let mut record = journal.index.records[&key("one")].clone();
     record.outcome = Some(serde_json::to_value(&first).unwrap());
     journal.append(&record).unwrap();
-    assert!(journal.records[&key("one")].outcome.is_none());
+    assert!(journal.index.records[&key("one")].outcome.is_none());
     drop(journal);
     let mut journal = Journal::open(root.path()).unwrap();
     assert!(
@@ -493,7 +494,9 @@ fn public_writer_opens_and_wakes_only_after_durable_completion() {
     super::super::super::tests::runtime(async {
         let root = root();
         let wake = Arc::new(Notify::new());
-        let writer = Writer::open(root.path().to_owned(), wake.clone()).unwrap();
+        let writer = Writer::open(root.path().to_owned(), wake.clone())
+            .await
+            .unwrap();
         let response = submit(&writer, operation("one")).unwrap();
         let notification = wake.notified();
         tokio::time::timeout(Duration::from_secs(5), notification)
@@ -561,3 +564,5 @@ impl Write for Stream {
         self.file.flush()
     }
 }
+
+mod compaction;
