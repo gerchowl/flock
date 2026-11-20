@@ -1,6 +1,7 @@
 //! Shared production admission boundary for ADR-0052 profiles.
 
 pub(crate) mod bindings;
+mod storage;
 
 use crate::api::error_code::ErrorCode;
 
@@ -13,6 +14,7 @@ pub(crate) struct ProfileAdmission {
     store: bindings::BindingStore,
     path: Option<std::path::PathBuf>,
     plans: std::collections::BTreeMap<String, bindings::transactions::Plan>,
+    storage: storage::Status,
 }
 
 /// A profile refusal is terminal for this request, with no legacy-launch fallback.
@@ -79,12 +81,17 @@ impl ProfileAdmission {
             ..Self::default()
         };
         gate.store.load(path);
+        gate.storage = storage::load(path, true);
         gate
     }
 
     /// Return binding metadata only to the authenticated local operator.
     pub(crate) fn status(&self, operator: bool) -> serde_json::Value {
-        self.store.status(operator)
+        let mut status = self.store.status(operator);
+        if operator {
+            status["session_storage"] = serde_json::json!(self.storage);
+        }
+        status
     }
 
     /// Admit a profile operation before any secret, process or mailbox effect.

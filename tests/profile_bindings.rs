@@ -305,3 +305,69 @@ fn cli_binding_round_trip_against_isolated_server() {
     let status = profile_cli(&root, &socket, &["status"], 0);
     assert!(status["result"]["bindings"][0]["revoked"].is_object());
 }
+
+#[test]
+fn socket_native_storage_recovers_staging_without_moving_published_evidence() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = SocketDir::reserve("pb-storage");
+    let root = dir.path().join("c");
+    let state = root.join(support::paths::app_dir_name());
+    fs::create_dir_all(&state).unwrap();
+    fs::write(state.join("config.toml"), "onboarding = false\n").unwrap();
+    let storage = state.join("profile-storage");
+    let sessions = storage.join("sessions");
+    let session = "11111111-1111-4111-8111-111111111111";
+    let published = sessions.join(session);
+    let native = published.join("config");
+    let staging = sessions.join(".alloc-22222222-2222-4222-8222-222222222222");
+    for path in [&storage, &sessions, &published, &native, &staging] {
+        fs::create_dir(path).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let record = json!({"schema":1,"session_id":session,"repo_id":"fixture-repo",
+        "node_id":"node.example","agent_id":"fixture-agent",
+        "binding":{"binding_id":"fixture-binding","revision":7}});
+    let bytes = serde_json::to_vec(&record).unwrap();
+    fs::write(published.join("record.json"), &bytes).unwrap();
+    fs::write(native.join("transcript"), b"published evidence").unwrap();
+    fs::write(staging.join("partial"), b"crash evidence").unwrap();
+    let socket = dir.path().join("s.sock");
+    let mut first = None;
+    for _ in 0..2 {
+        let server = start(&root, &socket);
+        let status = rpc(&socket, "profile.status", json!({}));
+        let storage_status = &status["result"]["session_storage"];
+        assert_eq!(storage_status["sessions"], json!([record]));
+        assert_eq!(storage_status["quarantined"].as_array().unwrap().len(), 1);
+        assert_eq!(storage_status["unavailable"], false);
+        if let Some(previous) = &first {
+            assert_eq!(storage_status, previous);
+        }
+        first = Some(storage_status.clone());
+        assert!(!staging.exists());
+        assert_eq!(fs::read(published.join("record.json")).unwrap(), bytes);
+        assert_eq!(
+            fs::read(native.join("transcript")).unwrap(),
+            b"published evidence"
+        );
+        assert_eq!(
+            rpc(
+                &socket,
+                "profile.enable",
+                json!({"plan":"fixture-plan","expect":"fixture-digest"})
+            )["error"]["code"],
+            "structured_profiles_not_ready"
+        );
+        drop(server);
+        let _ = fs::remove_file(&socket);
+    }
+    let quarantined = fs::read_dir(storage.join("quarantine"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        fs::read(quarantined.path().join("partial")).unwrap(),
+        b"crash evidence"
+    );
+}
