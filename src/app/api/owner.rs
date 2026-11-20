@@ -90,11 +90,13 @@ impl App {
                 policy_version: located.current.clone(),
                 reissued: false,
             };
-            self.owner_policies.apply(&data);
-            self.emit_event(EventEnvelope {
+            if let Err(code) = self.record_owner_event(EventEnvelope {
                 event: EventKind::OwnerPolicyAdopted,
                 data,
-            });
+            }) {
+                return encode_error(id, code.as_str(),
+                    "owner audit unavailable; repair audit storage and restart the server before retrying");
+            }
         }
         match owner_policy::report(&located, self.owner_policies.get(&repo)) {
             Ok(mut report) => {
@@ -140,6 +142,53 @@ mod tests {
     fn operator(app: &mut App) {
         // The test process runs in no pane, so it attests as the operator.
         app.current_api_peer_pid = Some(std::process::id());
+    }
+
+    #[tokio::test]
+    async fn adoption_refuses_failed_audit_before_changing_policy() {
+        for sync_failure in [false, true] {
+            let log = temp_log("owner-policy-audit");
+            let hub = EventHub::with_persistence(log.clone());
+            let mut app = app_on(hub.clone());
+            operator(&mut app);
+            let fixture = Fixture::new("owner-policy-audit", V1);
+            let v1 = fixture.upstream_blob();
+            assert_eq!(
+                call(&mut app, Some(Some(&v1)), &fixture.clone)["result"]["adopted_now"],
+                true
+            );
+            fixture.merge(V2);
+            let v2 = fixture.upstream_blob();
+            let relocated = log.parent().unwrap().with_extension("relocated");
+            if sync_failure {
+                std::fs::rename(log.parent().unwrap(), &relocated).unwrap();
+            } else {
+                hub.fail_appends_for_test();
+            }
+            for _ in 0..2 {
+                let response = call(&mut app, Some(Some(&v2)), &fixture.clone);
+                assert_eq!(response["error"]["code"], "audit_unavailable", "{response}");
+                assert!(response.get("result").is_none());
+                let shown = call(&mut app, None, &fixture.clone);
+                assert_eq!(shown["result"]["adopted"]["policy_version"], v1.as_str());
+                assert_eq!(shown["result"]["policy"]["standup"]["time"], "09:00");
+            }
+            assert_eq!(
+                hub.events_after(0)
+                    .unwrap_or_default()
+                    .iter()
+                    .filter(|(_, e)| e.event == crate::api::schema::EventKind::OwnerPolicyAdopted)
+                    .count(),
+                1
+            );
+            shutdown(app);
+            std::fs::remove_dir_all(if sync_failure {
+                relocated
+            } else {
+                log.parent().unwrap().into()
+            })
+            .unwrap();
+        }
     }
 
     /// ADR-0035 §6.2: a merged change is reported as pending and does not

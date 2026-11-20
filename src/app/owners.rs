@@ -75,11 +75,21 @@ impl OwnerIndex {
 }
 
 impl App {
-    /// The one write path for owner bindings: fold the event, then append
-    /// it, so the live bindings are always the fold of the log.
-    pub(crate) fn record_owner_event(&mut self, event: EventEnvelope) {
+    /// Persist and sync an owner mutation before folding it into live state.
+    /// Reuse the required-audit writer so persistence failure refuses the effect.
+    pub(crate) fn record_owner_event(
+        &mut self,
+        event: EventEnvelope,
+    ) -> Result<(), crate::api::error_code::ErrorCode> {
+        self.event_hub
+            .try_push_durable(event.clone())
+            .map_err(|error| {
+                crate::logging::event_log_write_failed(&error.to_string());
+                crate::api::error_code::ErrorCode::AuditUnavailable
+            })?;
         self.owners.apply(&event.data);
-        self.emit_event(event);
+        self.owner_policies.apply(&event.data);
+        Ok(())
     }
 
     /// Server start: fold the log read the delegation pass already made and
@@ -184,6 +194,97 @@ mod tests {
         EventData::OwnerBound {
             binding,
             reissued: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn bind_refuses_failed_audit_before_changing_the_binding() {
+        for (sync_failure, prebound) in [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let log = temp_log("owner-bind-audit");
+            let hub = EventHub::with_persistence(log.clone());
+            let mut app = app_on(hub.clone());
+            app.current_api_peer_pid = Some(std::process::id());
+            let checkout = checkout(&log);
+            let before = prebound.then(|| bind(&mut app, bind_params(&checkout)).0);
+            let relocated = log.parent().unwrap().with_extension("relocated");
+            let checkout = if sync_failure {
+                std::fs::rename(log.parent().unwrap(), &relocated).unwrap();
+                relocated.join("checkout").display().to_string()
+            } else {
+                hub.fail_appends_for_test();
+                checkout
+            };
+            let mut params = bind_params(&checkout);
+            params.harness = OwnerHarness::Codex;
+            for _ in 0..2 {
+                let response = call(&mut app, Method::OwnerBind(params.clone()));
+                assert_eq!(response["error"]["code"], "audit_unavailable", "{response}");
+                assert!(response.get("result").is_none());
+                assert_eq!(app.owners.get(REPO), before.as_ref());
+            }
+            assert_eq!(
+                hub.events_after(0)
+                    .unwrap_or_default()
+                    .iter()
+                    .filter(|(_, e)| matches!(
+                        e.event,
+                        EventKind::OwnerBound | EventKind::OwnerUnbound
+                    ))
+                    .count(),
+                usize::from(prebound)
+            );
+            shutdown(app);
+            std::fs::remove_dir_all(if sync_failure {
+                relocated
+            } else {
+                log.parent().unwrap().into()
+            })
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn unbind_refuses_failed_audit_before_removing_the_binding() {
+        for sync_failure in [false, true] {
+            let log = temp_log("owner-unbind-audit");
+            let hub = EventHub::with_persistence(log.clone());
+            let mut app = app_on(hub.clone());
+            app.current_api_peer_pid = Some(std::process::id());
+            let (before, _) = bind(&mut app, bind_params(&checkout(&log)));
+            let relocated = log.parent().unwrap().with_extension("relocated");
+            if sync_failure {
+                std::fs::rename(log.parent().unwrap(), &relocated).unwrap();
+            } else {
+                hub.fail_appends_for_test();
+            }
+            for _ in 0..2 {
+                let response = call(
+                    &mut app,
+                    Method::OwnerUnbind(OwnerRepoParams { repo: REPO.into() }),
+                );
+                assert_eq!(response["error"]["code"], "audit_unavailable", "{response}");
+                assert!(response.get("result").is_none());
+                assert_eq!(app.owners.get(REPO), Some(&before));
+            }
+            assert_eq!(
+                hub.events_after(0)
+                    .unwrap_or_default()
+                    .iter()
+                    .filter(|(_, e)| matches!(
+                        e.event,
+                        EventKind::OwnerBound | EventKind::OwnerUnbound
+                    ))
+                    .count(),
+                1
+            );
+            shutdown(app);
+            std::fs::remove_dir_all(if sync_failure {
+                relocated
+            } else {
+                log.parent().unwrap().into()
+            })
+            .unwrap();
         }
     }
 

@@ -938,6 +938,15 @@ rewritten by the owner, including its own caps and gates. **Recommended:**
   files an operator notification (ADR-0016), posts to any channel binding
   that subscribes (ADR-0028 §8), and is listed in the next standup.
 
+**Audit persistence for implemented owner writes (#3156).** `owner.bind`,
+`owner.unbind` and state-changing `owner.policy.adopt` append and sync their
+audit event and sync the journal directory before applying the live change.
+Missing persistence or an append/sync failure returns `audit_unavailable`
+(retry `after_human`, exit 1), with no live owner or policy change. Repair
+storage and restart before retrying. An already adopted policy is a no-op.
+The [socket API](../next/website/src/content/docs/socket-api.mdx) specifies
+the wire behavior; these verbs reuse the required-audit path from #3152.
+
 **Rejected.**
 
 - *A CODEOWNERS file plus a ruleset path rule on `.flk.toml`, with flk

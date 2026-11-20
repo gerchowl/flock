@@ -358,6 +358,8 @@ error_codes! {
         CodexLockUnconfirmed = "codex_lock_unconfirmed",
         SessionMismatch = "session_mismatch";
     AfterHuman:
+        /// Owner mutation could not be durably audited; repair storage and restart.
+        AuditUnavailable = "audit_unavailable",
         /// Rebind authorization could not be durably audited; repair storage and restart.
         DelegateAuditUnavailable = "delegate_audit_unavailable",
         /// Persisted profile policy predates its independent durable revision floor.
@@ -413,6 +415,15 @@ mod tests {
         let code =
             ErrorCode::from_code("delegate_audit_unavailable").expect("registered audit refusal");
         assert_eq!(code.as_str(), "delegate_audit_unavailable");
+        assert_eq!(code.retry().as_str(), "after_human");
+        assert_eq!(code.exit(), crate::cli::exit::FAILURE);
+    }
+
+    #[test]
+    fn owner_audit_failure_requires_human_repair() {
+        let code =
+            ErrorCode::from_code("audit_unavailable").expect("registered owner audit refusal");
+        assert_eq!(code, ErrorCode::AuditUnavailable);
         assert_eq!(code.retry().as_str(), "after_human");
         assert_eq!(code.exit(), crate::cli::exit::FAILURE);
     }
@@ -474,7 +485,7 @@ mod tests {
             ("yes", "attach_timeout remote_checksum_mismatch timeout"),
             ("later", "agent_not_ready at_agent_capacity at_fanout_limit auth_rate_limited channel_token_unavailable fleet_paused handoff_undrained injection_pending input_not_empty input_write_cancelled mail_store_full mailbox_full mesh_not_enrolled msg_rate_limited no_local_server not_settled operator_active preauth_capacity queue_source_cold restart_busy restart_pending restart_rate_limited session_busy session_unconfirmed too_many_waits unknown_composer worktree_merge_unknown worktree_open_pr"),
             ("after_inspecting", "agent_exited_at_start agent_exited_before_ready codex_lock_unconfirmed events_lost input_write_failed input_write_unknown live_binding_incomplete no_result queue_recovery_failed request_outcome_unknown saved_session_ambiguous saved_session_missing saved_session_not_found saved_session_runtime_unsupported self_submit_unconfirmed server_executable_unresolved session_mismatch session_unbound"),
-            ("after_human", "auth_revoked checksum_tool_missing claude_folder_trust claude_folder_trust_with_permissions codex_conversation_locked codex_folder_trust codex_hook_review delegate_audit_unavailable policy_revision_regressed policy_revision_unavailable queue_journal_corrupt structured_endpoint_restart_required structured_harness_version_unsupported structured_needs_agent_user structured_profile_mismatch structured_recovery_required structured_worker_cleanup_failed structured_worker_panicked structured_worker_timeout worktree_checkout_unreachable"),
+            ("after_human", "audit_unavailable auth_revoked checksum_tool_missing claude_folder_trust claude_folder_trust_with_permissions codex_conversation_locked codex_folder_trust codex_hook_review delegate_audit_unavailable policy_revision_regressed policy_revision_unavailable queue_journal_corrupt structured_endpoint_restart_required structured_harness_version_unsupported structured_needs_agent_user structured_profile_mismatch structured_recovery_required structured_worker_cleanup_failed structured_worker_panicked structured_worker_timeout worktree_checkout_unreachable"),
             ("after_handoff", "mail_store_schema_too_new mesh_version_mismatch peer_incompatible queue_journal_newer server_version_gap"),
         ]
         .into_iter()
