@@ -606,8 +606,8 @@ single version `[V, V]` omits it, so its offer, and therefore the signed
 hello transcript (which re-serializes the `Offer`), is byte-identical to a
 VERSION 5 node's. An absent `mesh_min` reads as `[mesh, mesh]`. A node whose
 range spans two versions always sends it, and because the offer is signed an
-intermediary cannot strip it to turn `[5, 6]` into `[6, 6]`. The window is the current VERSION N and the previous one, N-1,
-floored at 5 because VERSION 4 was development-only: the negotiation release
+intermediary cannot strip it to turn `[5, 6]` into `[6, 6]`. The window is
+the current VERSION N and the previous one, N-1, floored at 5 because VERSION 4 was development-only: the negotiation release
 advertises `[5, 5]`, the first VERSION 6 build `[5, 6]`, a VERSION 7 build
 `[6, 7]`. The window is a compile-time constant, not configuration.
 
@@ -616,7 +616,11 @@ the possession proofs and cannot be changed in transit. Each side computes
 the session VERSION independently as `min(local_max, remote_max)` and
 requires it to be at least `max(local_min, remote_min)`; otherwise the
 ranges do not overlap. The acceptor reports its computed value in its reply
-and the dialer refuses on any disagreement. A range with `mesh_min` below 1
+in an optional field, and the dialer refuses on any disagreement. A reply
+with no reported value comes from an acceptor that predates negotiation,
+which is what every pre-negotiation acceptor sends. The dialer then accepts
+at the single common VERSION, 5, if and only if its own range contains 5, and
+otherwise refuses with the existing `mesh_version_mismatch`. A range with `mesh_min` below 1
 or above `mesh_max` is invalid and refused.
 
 No overlap is refused at hello with the existing typed code
@@ -758,6 +762,10 @@ a range (it stays under `cfg!(debug_assertions)`, like
   equals a VERSION 5 node's offer and transcript byte for byte; an offer
   with no `mesh_min` negotiates as `[mesh, mesh]`; removing `mesh_min` from a
   signed `[5, 6]` offer fails signature verification.
+- A `[5, 5]` slice 1 node against a real pre-negotiation node, in both dial
+  directions: the edge comes up at 5, including the missing reported value
+  on the dialer side. A `[6, 7]` dialer against a reply with no reported
+  value is refused with `mesh_version_mismatch`.
 - A VERSION 6 node against a pre-negotiation node, in both dial directions,
   produces the refusals described in 4 and takes the long backoff.
 - The kind/field gate: a kind newer than the session VERSION is never
@@ -796,6 +804,14 @@ obstacle was the extra field in the signed bytes. Omitting `mesh_min` for a
 single-version range removes it, makes slice 1 a rolling upgrade, and moves
 the single precondition to the first VERSION 6 build, which old nodes
 already refuse by the `mesh` comparison.
+
+This departs from the owner's 2026-11-19 wording on #1380 ("one final
+coordinated upgrade to ship negotiation"). The departure is deliberate: the
+coordinated upgrade was only needed to avoid a transcript change, and
+byte-compatibility removes that need, so negotiation costs the fleet nothing
+to adopt. The owner is asked to confirm it. If the owner prefers the
+original wording, slice 1 sends `mesh_min` unconditionally and its rollout
+is the coordinated procedure of the earlier draft.
 
 **Require reciprocal peer entries or a dialable laptop.** Makes roaming/NAT
 an operator configuration failure and repeats #623's asymmetry.
