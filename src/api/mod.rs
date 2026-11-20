@@ -21,7 +21,10 @@ mod subscriptions;
 mod wait;
 pub mod wait_predicate;
 
+#[cfg(test)]
+pub(crate) use event_hub::AuditFault;
 pub use event_hub::EventHub;
+pub(crate) use event_hub::RequiredAuditError;
 pub(crate) use reply_wait::{best_answer, Answer};
 pub(crate) use server::socket_peer_pid;
 pub(crate) use server::start_server;
