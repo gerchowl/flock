@@ -58,7 +58,7 @@ const HELP_FLAGS: [&str; 2] = ["--help", "-h"];
 /// `pane` is the group to watch when adding rows here: `src/cli/pane.rs` owns
 /// those parsers and its own help text, and this table mirrors them.
 const VERBS: &[(&str, &str, &str)] = &[
-    ("profile", "enable", super::profile::USAGE),
+    ("profile", "enable", super::profile::ENABLE_USAGE),
     ("msg", "operator-read", "flk msg operator-read --pane TARGET"),
     ("msg", "operator-list", "flk msg operator-list --pane TARGET"),
     ("structured", "grants", super::grants::USAGE),

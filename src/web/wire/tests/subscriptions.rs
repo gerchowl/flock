@@ -33,6 +33,7 @@ impl Case {
         let generation = registry
             .register(Record {
                 harness_established: false,
+                profile_identity: None,
                 runtime: StructuredRuntime::Structured,
                 agent_id: "fixture-agent".into(),
                 session_id: "history".into(),
@@ -387,6 +388,7 @@ fn selected_agent_gap_fixture_runs_against_cold_persisted_jsonl_and_owner_instal
         case.registry
             .register(Record {
                 harness_established: false,
+                profile_identity: None,
                 runtime: StructuredRuntime::Structured,
                 agent_id: "fixture".into(),
                 session_id: "history".into(),
@@ -608,6 +610,7 @@ fn invalid_stored_subject_is_distinct_from_unknown_stream() {
         case.registry
             .register(Record {
                 harness_established: false,
+                profile_identity: None,
                 runtime: StructuredRuntime::Structured,
                 agent_id: "reserved".into(),
                 session_id: "queue".into(),

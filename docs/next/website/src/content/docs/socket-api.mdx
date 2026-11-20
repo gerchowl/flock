@@ -40,9 +40,9 @@ References contain no resolved secret bytes. Agents and pending or enrolled mesh
 relays receive no binding, account, sibling identity, or usage fields. This API
 only projects data. Production execution remains unavailable.
 
-The following socket-only preparation methods require the authenticated local
-operator. Relays and agents receive `operator_only` before mutation. CLI commands
-and structured-session profile pins follow in slice 2b-2.
+The following preparation methods require the authenticated local operator.
+Relays and agents receive `operator_only` before mutation. The matching CLI
+commands are `profile plan bind`, `profile bind`, `profile revoke` and `profile status`.
 
 - `profile.plan` accepts `{ "action": "bind", "binding_id": "optional-existing-id",
   "target": { "repo_id": "repo", "node_ids": ["node"], "agent_ids": ["agent"] },
@@ -75,6 +75,15 @@ Typed preparation refusals include `profile_plan_invalid`, `profile_plan_expired
 references remain identifiers only; these methods do not resolve secrets,
 activate profiles or launch processes. Every future profile execution path must pass shared admission
 before accessing secrets, starting processes or transferring mailbox ownership.
+
+Structured session records persist `profile_identity` only after matching harness
+init establishes a conversation. It contains the actual legacy `profile` selector
+and a nullable resolved `binding` (`binding_id`, `revision`). A changed profile,
+binding ID or binding revision refuses continuation with
+`structured_profile_mismatch` before launch, without legacy fallback. Missing pins
+remain legacy-compatible; unsupported pin formats are retained inactive like other
+unknown session records. Current single-account launches carry no binding and do
+not activate profile execution.
 
 ## Structured permission decision messages
 

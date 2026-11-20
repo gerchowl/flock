@@ -210,3 +210,98 @@ fn socket_binding_transactions_replay_after_restart_and_revoke_terminally() {
     assert_eq!(status["result"]["execution_switch"], false);
     assert!(status["result"]["bindings"][0]["revoked"].is_object());
 }
+
+fn profile_cli(root: &Path, socket: &Path, args: &[&str], exit: i32) -> Value {
+    let output = Command::new(env!("CARGO_BIN_EXE_flk"))
+        .arg("profile")
+        .args(args)
+        .args(["--format", "json"])
+        .envs(support::environment::isolated_env(
+            root,
+            &root.join("runtime"),
+        ))
+        .env("FLOCK_SOCKET_PATH", socket)
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(exit),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+#[test]
+fn cli_binding_round_trip_against_isolated_server() {
+    let dir = SocketDir::reserve("pb-cli");
+    let root = dir.path().join("c");
+    let state = root.join(support::paths::app_dir_name());
+    fs::create_dir_all(&state).unwrap();
+    fs::write(state.join("config.toml"), "onboarding = false\n").unwrap();
+    let socket = dir.path().join("s.sock");
+    let _server = start(&root, &socket);
+    let plan = profile_cli(
+        &root,
+        &socket,
+        &[
+            "plan",
+            "bind",
+            "--repo",
+            "repo-fixture",
+            "--nodes",
+            "node-fixture,node-other",
+            "--agents",
+            "agent-fixture",
+            "--account",
+            "fixture-account",
+            "--bundle",
+            "fixture-digest",
+            "--credential-ref",
+            "fixture-reference",
+            "--generation",
+            "1",
+            "--grants",
+            "grant-fixture",
+        ],
+        0,
+    );
+    let plan = &plan["result"];
+    assert_eq!(
+        plan["review"]["binding"]["target"]["node_ids"],
+        json!(["node-fixture", "node-other"])
+    );
+    let commit = [
+        "bind",
+        "--plan",
+        plan["plan"].as_str().unwrap(),
+        "--expect",
+        plan["expect"].as_str().unwrap(),
+    ];
+    let bound = profile_cli(&root, &socket, &commit, 0);
+    let id = bound["result"]["binding"]["binding_id"].as_str().unwrap();
+    assert_eq!(profile_cli(&root, &socket, &commit, 0), bound);
+    let status = profile_cli(&root, &socket, &["status"], 0);
+    assert_eq!(status["result"]["bindings"][0]["binding_id"], id);
+    assert_eq!(status["result"]["execution_switch"], false);
+    let invalid = profile_cli(
+        &root,
+        &socket,
+        &[
+            "bind",
+            "--plan",
+            plan["plan"].as_str().unwrap(),
+            "--expect",
+            "altered",
+        ],
+        1,
+    );
+    assert_eq!(invalid["error"]["code"], "profile_plan_invalid");
+    assert_eq!(invalid["error"]["exit"], 1);
+    let revoke = ["revoke", "--binding", id, "--reason", "fixture retirement"];
+    let revoked = profile_cli(&root, &socket, &revoke, 0);
+    assert_eq!(revoked["result"]["binding"]["revision"], 2);
+    assert_eq!(profile_cli(&root, &socket, &revoke, 0), revoked);
+    let status = profile_cli(&root, &socket, &["status"], 0);
+    assert!(status["result"]["bindings"][0]["revoked"].is_object());
+}

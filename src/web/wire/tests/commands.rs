@@ -758,6 +758,7 @@ fn previous_runtime_permission_handle_is_refused_after_restart() {
         fs::remove_file(&path).unwrap();
         let listener = tokio::net::UnixListener::bind(path).unwrap();
         let launch = crate::structured::workers::Launch {
+            profile_identity: None,
             opening_turn: None,
             agent_id: case.worker.id.clone(),
             generation: case.worker.generation,
