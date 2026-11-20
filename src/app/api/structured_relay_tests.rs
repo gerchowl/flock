@@ -80,6 +80,7 @@ fn request(r: &mut AppQueue, d: Deliver) -> mpsc::Receiver<String> {
         .enroll(
             pid,
             crate::mesh::hello::Enrollment {
+                negotiated: None,
                 peer: "hub.example".into(),
                 source: crate::mesh::store::PinSource::Inbound,
                 pin_origin: Default::default(),
@@ -96,7 +97,7 @@ fn request(r: &mut AppQueue, d: Deliver) -> mpsc::Receiver<String> {
             scope: None,
             request: Request {
                 id: "relay".into(),
-                method: Method::MeshDeliver(Box::new(d)),
+                method: Method::MeshDeliver(serde_json::to_value(d).unwrap()),
             },
             respond_to: tx,
             peer_pid: Some(pid),

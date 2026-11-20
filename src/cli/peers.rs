@@ -140,6 +140,9 @@ pub(super) fn enrollment_line(status: &crate::mesh::hello::Enrollment) -> String
             crate::mesh::store::PinOrigin::Unknown => " (pin origin unknown)",
         });
     }
+    if let Some(version) = status.negotiated {
+        line.push_str(&format!("  mesh {version}"));
+    }
     if let Some(reason) = &status.reason {
         line.push_str(&format!(": {}", printable(reason)));
     }
@@ -378,6 +381,7 @@ fn peers_status(args: &[String]) -> std::io::Result<i32> {
             row["source"] = serde_json::json!(status.source);
             row["pin_origin"] = serde_json::json!(status.pin_origin);
             row["node_id"] = serde_json::json!(status.node_id);
+            row["negotiated"] = serde_json::json!(status.negotiated);
             row["enrollment"] = serde_json::json!(status.state);
             row["enrollment_reason"] = serde_json::json!(status.reason);
         }

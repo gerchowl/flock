@@ -17,6 +17,7 @@ impl Default for InboundEdge {
         Self {
             pending: None,
             enrollment: Enrollment {
+                negotiated: None,
                 peer: "unidentified SSH peer".into(),
                 source: PinSource::Inbound,
                 pin_origin: Default::default(),
@@ -35,6 +36,7 @@ impl InboundEdge {
 
     pub(crate) fn clear(&mut self, reason: &str) {
         self.pending = None;
+        self.enrollment.negotiated = None;
         self.enrollment.node_id = None;
         self.enrollment.state = "refused".into();
         self.enrollment.reason = Some(reason.into());
@@ -173,6 +175,7 @@ mod tests {
     }
     fn status(peer: &str, node: &str) -> Enrollment {
         Enrollment {
+            negotiated: None,
             peer: peer.into(),
             node_id: Some(node.into()),
             state: "pinned".into(),
