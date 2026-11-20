@@ -1,8 +1,9 @@
 //! Bounded app-owner command admission (ADR-0036 §5/§5a, S7-min slice 5).
 use super::*;
-// J1a is dormant until J1b replaces the live duplicate list with journal admission.
+// J1b2a owns the journal lease; command claims remain dormant until J1b2b.
 #[allow(dead_code)]
 mod journal;
+mod ownership;
 use crate::{
     api::error_code::ErrorCode,
     app::App,
@@ -12,6 +13,7 @@ use crate::{
         Principal,
     },
 };
+pub(super) use ownership::Ownership;
 use serde_json::Value;
 use std::{
     collections::VecDeque,
@@ -52,6 +54,7 @@ struct Request {
 pub(super) struct Client {
     tx: [mpsc::Sender<Request>; 2],
     wake: Arc<Notify>,
+    gate: Arc<AtomicU64>,
 }
 type Receipt = Receiver<Result<AgentSendResult, ErrorCode>>;
 struct Pending {
@@ -69,20 +72,23 @@ struct Completed {
 /// Only the app owner touches App, runtime permission books and send admission.
 pub(super) struct Owner {
     rx: [mpsc::Receiver<Request>; 2],
+    gate: Arc<AtomicU64>,
     completed: VecDeque<Completed>,
     pending: Vec<Pending>,
 }
 /// Share the existing app-loop wake without introducing a second state owner.
-pub(super) fn channel(wake: Arc<Notify>) -> (Client, Owner) {
+pub(super) fn channel(wake: Arc<Notify>, gate: Arc<AtomicU64>) -> (Client, Owner) {
     let (send, sends) = mpsc::channel(CAPACITY);
     let (decide, decisions) = mpsc::channel(CAPACITY);
     (
         Client {
             tx: [send, decide],
             wake,
+            gate: gate.clone(),
         },
         Owner {
             rx: [sends, decisions],
+            gate,
             completed: VecDeque::new(),
             pending: Vec::new(),
         },
@@ -91,7 +97,8 @@ pub(super) fn channel(wake: Arc<Notify>) -> (Client, Owner) {
 impl Client {
     /// Check admission pressure without allocating a command task or owner request.
     pub(super) fn full(&self, verb: &str) -> bool {
-        self.tx[usize::from(verb == "agent.decide")].capacity() == 0
+        self.gate.load(Ordering::Acquire) & 1 == 0
+            || self.tx[usize::from(verb == "agent.decide")].capacity() == 0
     }
 }
 enum Outcome {
@@ -313,6 +320,9 @@ impl Owner {
                 let outcome = request
                     .store
                     .admit(&request.session, scope, |token| {
+                        if self.gate.load(Ordering::Acquire) & 1 == 0 {
+                            return Err(ErrorCode::SessionBusy);
+                        }
                         if duplicate {
                             if let Some((verb, args, result)) = completed
                                 .filter(|_| is_lifecycle)

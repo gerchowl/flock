@@ -301,6 +301,14 @@ An uncertain retry with `resume_only: true` and no retained result refuses
 `session_unconfirmed`; it never launches again. Retention is in memory and
 ends on server restart or eviction.
 
+Core owns the command-journal lease during normal operation and transfers it
+at handoff ownership commit. Importer preparation does not acquire it. The
+exporter closes command admission before draining and releasing the lease;
+rollback keeps admission closed until reacquisition and replay succeed. A
+failed reacquisition leaves commands refused as `session_busy`, with bounded
+authenticated refusal audit evidence. Shutdown drains the writer. This ownership
+phase does not change the in-memory retention or enable durable command replay.
+
 `agent.start` permits fresh launches through the existing server-side launch
 gates, including `structured_needs_agent_user`. It cannot resume a structured
 record: that receives `operator_only`.

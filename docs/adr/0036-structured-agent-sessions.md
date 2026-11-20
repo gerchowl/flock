@@ -2007,13 +2007,22 @@ An oversized outcome leaves its durable claim uncertain instead of truncating
 the result. The namespace is an explicit string (`local` today), so a later
 home-node namespace needs no format change.
 
-**J1 backend status (#1380).** The append-only backend and bounded off-loop
-writer are implemented but dormant. Live commands still use the existing
-in-memory duplicate list; no request claims or finishes this journal yet.
-J1b1 adds compaction and explicit writer lifecycle barriers to this dormant
-backend. J1b2 will replace the live list with asynchronous claim completion,
-reauthorization, dispatch and outcome-before-ack, restoring one live source of
-truth. These backend changes do not enable command recovery on the live wire.
+**J1 ownership status (#1380).** The append-only backend, bounded off-loop
+writer and compaction are implemented. J1b2a starts and owns the writer at Core
+startup, but live commands still use the existing in-memory duplicate list;
+no request claims or finishes this journal yet. Importer Core preparation does
+not open the journal. At the existing mesh custody freeze point, the exporter
+closes wire command admission, drains accepted writer jobs and releases the
+exclusive lease. The importer acquires and replays only after ownership commit,
+before enabling wire admission. Rollback schedules off-loop reacquisition at the
+same recovery point as mesh custody. Admission remains closed until replay and
+lease acquisition succeed; failure reports `session_busy` through the bounded
+authenticated refusal auditor and logs the recovery failure. Generation fencing
+prevents an old recovery from reopening admission after freeze or shutdown;
+shutdown also waits for an in-progress open to drain and release its lease.
+J1b2b will replace the live duplicate list with durable claims, fresh
+authorization, dispatch and outcome-before-ack. J1b2a does not enable command
+recovery across restart or handoff.
 
 The backend holds an exclusive writer lease, rebuilds its index and per-principal
 counts by replay once at open, and appends one bounded record per claim/outcome.

@@ -108,6 +108,7 @@ impl Drop for Lease {
 pub(crate) struct Core {
     owner: crate::structured::history::owner::Owner,
     command_owner: commands::Owner,
+    journal: commands::Ownership,
     admission: super::local_admission::Owner,
     shared: Arc<Shared>,
     fleet_nodes: fleet::Nodes,
@@ -115,6 +116,7 @@ pub(crate) struct Core {
 impl Drop for Core {
     fn drop(&mut self) {
         self.shared.stop.send_replace(true);
+        self.journal.stop();
     }
 }
 impl Core {
@@ -126,16 +128,20 @@ impl Core {
             wake,
             Owner::default(),
             crate::api::EventHub::default(),
+            false,
         )
         .await
     }
     /// Share the socket owner's memory domain; opening runs on the bounded I/O worker.
+    /// Deferred importer preparation acquires the journal only after ownership commit.
     pub(crate) async fn new_shared(
         data: PathBuf,
         wake: Arc<tokio::sync::Notify>,
         owner: Owner,
         event_hub: crate::api::EventHub,
+        deferred: bool,
     ) -> io::Result<Self> {
+        let journal_data = data.clone();
         let store = super::store_io::shared()
             .run(move || {
                 owner.get(
@@ -148,38 +154,48 @@ impl Core {
             .await
             .ok_or_else(|| io::Error::other("client token store worker unavailable"))?
             .map_err(io::Error::other)?;
-        let core = Self::from_store(store, Arc::new(SystemClock), wake)?;
+        let core = Self::from_store(store, Arc::new(SystemClock), wake, journal_data)?;
+        if !deferred {
+            core.acquire_commands().await?;
+        }
         core.shared.refusals.attach(event_hub);
         Ok(core)
     }
     /// Embed with a supplied monotonic clock shared by credential and transport deadlines.
     #[cfg(test)]
-    pub(crate) fn with_clock(
+    pub(crate) async fn with_clock(
+        data: PathBuf,
         store: TokenStore,
         clock: Arc<dyn Clock>,
         wake: Arc<tokio::sync::Notify>,
     ) -> io::Result<Self> {
-        Self::from_store(
+        let core = Self::from_store(
             Arc::new(Store::new(store, Arc::new(AppClock::new(clock.clone())))),
             clock,
             wake,
-        )
+            data,
+        )?;
+        core.acquire_commands().await?;
+        Ok(core)
     }
     fn from_store(
         store: Arc<Store>,
         clock: Arc<dyn Clock>,
         wake: Arc<tokio::sync::Notify>,
+        data: PathBuf,
     ) -> io::Result<Self> {
         let epoch = store.random::<16>().map_err(io::Error::other)?;
         let (stop, _) = watch::channel(false);
         let fleet = fleet::Client::new(wake.clone(), stop.subscribe());
-        let (commands, command_owner) = commands::channel(wake.clone());
+        let journal = commands::Ownership::new(data, wake.clone());
+        let (commands, command_owner) = commands::channel(wake.clone(), journal.gate());
         let (admission, admission_owner) = super::local_admission::channel(wake.clone());
         let (histories, owner) = crate::structured::history::owner::channel(wake);
         Ok(Self {
             fleet_nodes: Default::default(),
             owner,
             command_owner,
+            journal,
             admission: admission_owner,
             shared: Arc::new(Shared {
                 histories,
@@ -263,11 +279,24 @@ impl Core {
         self.admission.service(app);
         self.command_owner.service(app, &self.shared);
     }
+    /// Journal ownership only: command deduplication remains in memory in J1b2a.
+    pub(crate) async fn freeze_commands(&self) -> io::Result<()> {
+        self.journal.freeze().await.map_err(io::Error::other)
+    }
+    pub(crate) fn reopen_commands(
+        &self,
+    ) -> tokio::task::JoinHandle<Result<(), crate::api::error_code::ErrorCode>> {
+        self.journal.reopen()
+    }
+    pub(crate) async fn acquire_commands(&self) -> io::Result<()> {
+        self.journal.acquire().await.map_err(io::Error::other)
+    }
     /// Stop and drain every transport lease even when app revocation fails.
     /// Revocation and lease draining each have a five-second caller budget.
     /// Abandoned store workers retain their slots/fences until actual completion
     /// (#2742); a timeout does not claim a blocking syscall was cancelled.
     pub(crate) async fn shutdown(&self) -> io::Result<()> {
+        self.journal.stop();
         let store = self.shared.store.clone();
         let revocation = match tokio::time::timeout(SHUTDOWN_WAIT, mutate_apps(store, None)).await {
             Ok(out) => out
@@ -295,7 +324,8 @@ impl Core {
         .map(|_| ())
         .map_err(io::Error::other);
         self.shared.refusals.flush(self.shared.clock.now());
-        revocation.and(drained)
+        let journal = self.journal.shutdown().await.map_err(io::Error::other);
+        revocation.and(drained).and(journal)
     }
 }
 /// Test adapter: clock waits share an elapsed origin without changing transport timing.

@@ -1,0 +1,71 @@
+use super::*;
+
+#[test]
+fn rollback_reopens_wire_admission_before_effect_and_keeps_claims_dormant() {
+    runtime(async {
+        let mut case = Case::new(183170).await;
+        let args = case.prompt().await;
+        let mut socket = case.open().await;
+        case.server.core.freeze_commands().await.unwrap();
+        refusal(
+            case.command(&mut socket, "agent.decide", args.clone())
+                .await,
+            "session_busy",
+            crate::api::error_code::ErrorCode::SessionBusy.exit(),
+        );
+        assert_eq!(case.handles().len(), 2);
+        within(case.server.core.reopen_commands())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            case.command(&mut socket, "agent.decide", args).await["ok"],
+            true
+        );
+        case.until(|r| r.handles().len() == 1).await;
+        assert_eq!(
+            fs::metadata(case.server._root.path().join("wire/commands.jsonl"))
+                .unwrap()
+                .len(),
+            0,
+            "J1b2a owns the journal but live commands do not consult it"
+        );
+        case.stop().await;
+    });
+}
+#[test]
+fn failed_rollback_reacquire_is_typed_audited_and_never_dispatches() {
+    runtime(async {
+        let mut case = Case::new(183171).await;
+        let args = case.prompt().await;
+        let mut socket = case.open().await;
+        case.server.core.freeze_commands().await.unwrap();
+        let holder = Core::new(
+            case.server._root.path().to_owned(),
+            Arc::new(tokio::sync::Notify::new()),
+        )
+        .await
+        .unwrap();
+        let result = within(case.server.core.reopen_commands()).await.unwrap();
+        assert_eq!(
+            result.unwrap_err(),
+            crate::api::error_code::ErrorCode::SessionBusy
+        );
+        refusal(
+            case.command(&mut socket, "agent.decide", args).await,
+            "session_busy",
+            crate::api::error_code::ErrorCode::SessionBusy.exit(),
+        );
+        assert_eq!(case.handles().len(), 2);
+        let events = refusal_events(&case);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["reason"], "session_busy");
+        assert_eq!(events[0]["token_id"], "one");
+        holder.shutdown().await.unwrap();
+        within(case.server.core.reopen_commands())
+            .await
+            .unwrap()
+            .unwrap();
+        case.stop().await;
+    });
+}

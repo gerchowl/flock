@@ -6,11 +6,13 @@ async fn aggregate_shutdown_ends_native_and_tcp_upgrades_and_retires_app_bearers
     let token = app_sessions::mint(&mut app).await;
     let root = crate::test_support::TempDir::socket();
     let path = root.path().join("native.sock");
+    server.core.freeze_commands().await.unwrap();
     let core = Core::new_shared(
         server._root.path().into(),
         server.wake.clone(),
         owner.clone(),
         app.event_hub.clone(),
+        false,
     )
     .await
     .unwrap();

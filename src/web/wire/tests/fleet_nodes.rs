@@ -260,10 +260,12 @@ fn bound_node_status_updates_and_safe_failures_reach_the_public_stream() {
         case.server.task.abort();
         let _ = (&mut case.server.task).await;
         let core = Core::with_clock(
+            case.server._root.path().to_owned(),
             TokenStore::open(case.server._root.path()).unwrap(),
             Arc::new(case.server.clock.clone()),
             case.server.wake.clone(),
         )
+        .await
         .unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         case.server.bind = listener.local_addr().unwrap();

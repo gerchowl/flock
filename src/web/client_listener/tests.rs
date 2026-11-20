@@ -335,10 +335,12 @@ impl ShellServer {
             crate::structured::launch::SessionConfigDir::create(&std::env::temp_dir()).unwrap();
         let clock = Arc::new(TestClock::new());
         let core = Core::with_clock(
+            root.path().to_owned(),
             crate::structured::permissions::auth::tokens::TokenStore::open(root.path()).unwrap(),
             clock.clone(),
             Arc::new(tokio::sync::Notify::new()),
         )
+        .await
         .unwrap();
         let listener = Arc::new(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap());
         let bind = listener.local_addr().unwrap();
