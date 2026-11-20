@@ -116,6 +116,21 @@ impl App {
             .run_as
             .admit()
             .map_err(|e| e.code())?;
+        // A caller's PTY selector cannot silently become another structured account.
+        // Structured launches keep the managed directory required by ADR-0036.
+        let requested = self
+            .resolve_spawn_env(&params.argv, self.current_api_peer_pid, None)
+            .map_err(|_| ErrorCode::AgentProfileUnresolved)?;
+        if let Some((_, directory)) = requested.iter().find(|(key, _)| key == "CLAUDE_CONFIG_DIR") {
+            let managed = crate::session::data_dir()
+                .canonicalize()
+                .map_err(|_| ErrorCode::StructuredProfileMismatch)?
+                .join("structured/claude")
+                .join(&self.state.config.structured.profile);
+            if PathBuf::from(directory).canonicalize().ok().as_ref() != Some(&managed) {
+                return Err(ErrorCode::StructuredProfileMismatch);
+            }
+        }
         let lineage = self
             .admit_spawn(verb, caller, None)
             .map_err(|e| ErrorCode::from_code(e.code()).unwrap_or(ErrorCode::InternalError))?;

@@ -19,7 +19,7 @@ enum SessionCase {
     ConflictingResult,
     ConflictAtReady,
     ConflictAtSubmit,
-    AmbiguousClaude,
+    RecordedClaudeWithDefaultCopy,
     UnreadableClaude,
     Protocol32,
     CachedGrace,
@@ -79,7 +79,7 @@ impl Fixture {
         std::fs::create_dir_all(&registry).unwrap();
         let harness = if matches!(
             case,
-            SessionCase::AmbiguousClaude | SessionCase::UnreadableClaude
+            SessionCase::RecordedClaudeWithDefaultCopy | SessionCase::UnreadableClaude
         ) {
             "claude"
         } else {
@@ -113,7 +113,7 @@ impl Fixture {
         }
         if matches!(
             case,
-            SessionCase::AmbiguousClaude | SessionCase::UnreadableClaude
+            SessionCase::RecordedClaudeWithDefaultCopy | SessionCase::UnreadableClaude
         ) {
             let profile = home.join("profile");
             let records = home
@@ -440,13 +440,20 @@ fn send_conflict_at_readiness_does_not_advance_the_round() {
 }
 
 #[test]
-fn ambiguous_claude_profile_and_default_session_is_unbound() {
-    for verb in ["wait", "result", "send"] {
-        Fixture::case(true, false, false, false, SessionCase::AmbiguousClaude).assert(
-            verb,
-            12,
-            "session_unbound",
-        );
+fn claude_recovery_uses_recorded_profile_even_when_default_reuses_session_id() {
+    for (verb, outcome) in [
+        ("wait", "DONE: rebound"),
+        ("result", "DONE: rebound"),
+        ("send", "\"round\":2"),
+    ] {
+        Fixture::case(
+            true,
+            false,
+            false,
+            false,
+            SessionCase::RecordedClaudeWithDefaultCopy,
+        )
+        .assert(verb, 0, outcome);
     }
 }
 

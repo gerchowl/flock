@@ -86,8 +86,32 @@ impl App {
         if terminal.profile_env_session.as_deref() == Some(session.as_str()) {
             return;
         }
-        terminal.profile_env_session = Some(session);
-        self.record_agent_profile_env(&terminal_id, self.current_api_peer_pid);
+        terminal.profile_env_session = Some(session.clone());
+        let carried = terminal
+            .launch_argv
+            .as_deref()
+            .and_then(crate::spawn::env::agent_for_argv)
+            == Some(crate::detect::Agent::Claude)
+            && terminal
+                .launch_env
+                .iter()
+                .any(|(key, value)| key == "CLAUDE_CONFIG_DIR" && !value.is_empty());
+        if !carried {
+            self.record_agent_profile_env(&terminal_id, self.current_api_peer_pid);
+        }
+        // The spawn snapshot survives missing hooks and unreadable peer environments.
+        // Readers resolve by session id, so publish the same selector there too.
+        if let Some(terminal) = self.state.terminals.get(&terminal_id) {
+            if terminal.claude_session_id().as_deref() == Some(session.as_str()) {
+                if let Some((_, config)) = terminal
+                    .launch_env
+                    .iter()
+                    .find(|(key, value)| key == "CLAUDE_CONFIG_DIR" && !value.is_empty())
+                {
+                    crate::agent_resume::record_claude_config_dir(&session, config);
+                }
+            }
+        }
     }
 
     /// The pane's foreground process: the agent itself when it runs in a

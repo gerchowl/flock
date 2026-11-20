@@ -236,9 +236,9 @@ pub fn branch_plan(
 ///
 /// A session launched under an account profile (`CLAUDE_CONFIG_DIR`) keeps
 /// its transcripts under that directory instead of `~/.claude`. The
-/// `SessionStart` hook records which one (see `record_claude_config_dir`),
-/// so both the recorded profile and `~/.claude` are searched (#977). A session
-/// id must have exactly one matching transcript across those stores.
+/// server or `SessionStart` hook records which one (see `record_claude_config_dir`).
+/// Search that directory alone when recorded; only sessions without a record use
+/// `~/.claude`. A session id must have exactly one matching transcript in its store.
 pub fn claude_transcript_path(home: &Path, session_id: &str) -> Option<std::path::PathBuf> {
     claude_transcript_path_in(home, &claude_config_dir_records_dir(), session_id)
 }
@@ -271,10 +271,9 @@ fn claude_transcript_path_checked_in(
     }
     let profile = crate::session_evidence::store::recorded_profile(&records_dir.join(session_id))?;
     crate::session_evidence::store::lookup(
-        profile
-            .into_iter()
-            .chain(std::iter::once(home.join(".claude")))
-            .map(|config| config.join("projects")),
+        [profile
+            .unwrap_or_else(|| home.join(".claude"))
+            .join("projects")],
         crate::session_evidence::store::Layout::Claude,
         session_id,
     )
@@ -335,7 +334,7 @@ fn safe_session_file_name(session_id: &str) -> Option<&str> {
 }
 
 /// Record which `CLAUDE_CONFIG_DIR` a Claude session was launched under.
-/// Best-effort and silent: a hook must never fail the parent agent.
+/// Best-effort: a hook must never fail the parent agent.
 pub fn record_claude_config_dir(session_id: &str, config_dir: &str) {
     record_claude_config_dir_in(&claude_config_dir_records_dir(), session_id, config_dir);
 }
@@ -375,7 +374,26 @@ fn record_claude_config_dir_in(dir: &Path, session_id: &str, config_dir: &str) {
     if std::fs::create_dir_all(dir).is_err() {
         return;
     }
-    let _ = std::fs::write(dir.join(name), config_dir);
+    let mut random = [0; 16];
+    if getrandom::fill(&mut random).is_err() {
+        return;
+    }
+    let temporary = dir.join(format!(".profile-{:032x}.tmp", u128::from_ne_bytes(random)));
+    let result = (|| -> io::Result<()> {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        file.write_all(config_dir.as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, dir.join(name))?;
+        std::fs::File::open(dir)?.sync_all()
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+        tracing::warn!("failed to record Claude session config directory");
+    }
 }
 
 fn claude_config_dir_for_session_in(dir: &Path, session_id: &str) -> Option<String> {
@@ -850,8 +868,8 @@ mod tests {
         record_claude_config_dir_in(&records, "sess-default", &profile.to_string_lossy());
         assert_eq!(
             claude_transcript_path_in(&home, &records, "sess-default"),
-            Some(default_project.join("sess-default.jsonl")),
-            "a recorded profile without the transcript falls back to ~/.claude"
+            None,
+            "a recorded profile never falls back to a different config directory"
         );
         record_claude_config_dir_in(&records, "sess-relative", "relative/profile");
         assert_eq!(
@@ -863,7 +881,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_transcript_path_rejects_reused_id_across_profile_and_default() {
+    fn claude_transcript_path_uses_recorded_store_when_default_reuses_the_id() {
         let root = crate::test_support::TempDir::socket();
         let home = root.path().join("home");
         let records = root.path().join("records");
@@ -878,11 +896,14 @@ mod tests {
             .unwrap();
         }
         record_claude_config_dir_in(&records, "reused-session", profile.to_str().unwrap());
-        assert!(claude_transcript_path_in(&home, &records, "reused-session").is_none());
+        assert_eq!(
+            claude_transcript_path_in(&home, &records, "reused-session"),
+            Some(profile.join("projects/fixture/reused-session.jsonl"))
+        );
         std::fs::write(profile.join("projects/fixture/reused-session.jsonl"), "").unwrap();
         assert!(
             claude_transcript_path_in(&home, &records, "reused-session").is_none(),
-            "an empty stale file still makes the session id ambiguous"
+            "an empty recorded transcript cannot select the default profile instead"
         );
     }
 
