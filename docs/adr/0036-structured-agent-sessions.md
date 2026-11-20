@@ -1991,6 +1991,51 @@ harmless only with the same principal/id/payload and `resume_only:true`: an
 absent/expired claim still refuses and cannot dispatch. The class is not license
 to resend as a first send or create a new ID; the outbox/expiry rules still apply.
 
+**Bound and overflow (J1, #1380).** Never evict an unexpired claim. Refuse
+new claims before dispatch with `session_busy` (`retry:later`) when either the
+per-principal or global entry cap is reached. The local constants budget four
+sockets per credential times four outstanding commands per socket times 2,880
+30-second acknowledgement windows per day: 46,080 claims per principal. The
+sixteen-socket global limit gives 184,320 claims globally. This supports a
+sustained budget of sixteen new commands per principal per 30 seconds for a
+full day; the transport has concurrency limits, not an enforced command-rate
+limit, so higher sustained traffic can reach the cap and must back off.
+Shared-principal credentials share the principal cap. Persist the payload digest,
+never the payload, and bound each claim/result record to 67,584 encoded bytes
+including its newline; acknowledgements also retain the 65,536-byte wire cap.
+An oversized outcome leaves its durable claim uncertain instead of truncating
+the result. The namespace is an explicit string (`local` today), so a later
+home-node namespace needs no format change.
+
+**J1a backend status (#1380).** The append-only backend and bounded off-loop
+writer are implemented but dormant. Live commands still use the existing
+in-memory duplicate list; no request claims or finishes this journal yet.
+J1b replaces that list with asynchronous claim completion, reauthorization,
+dispatch and outcome-before-ack, restoring one live source of truth. J1b also
+adds threshold compaction and its append catch-up/publication protocol.
+
+The backend holds an exclusive writer lease, rebuilds its index and per-principal
+counts by replay once at open, and appends one bounded record per claim/outcome.
+Successful completion follows file sync and index publication; failed appends
+roll back to the previous length and sync it, then fence further writes until
+reopen. Directory sync occurs on file creation; rename publication belongs to
+J1b. Its mailbox holds at most 32 queued jobs plus one active job. Submission
+uses a nonblocking try-send and owns no filesystem or authorization lock.
+Startup recovery and all journal writes run on the dedicated writer thread.
+
+Until J1b compacts, expired entries continue occupying their counts: resume-only
+lookup refuses them as uncertain, and reuse as a new claim refuses busy. No
+entry is evicted. There are at most two records per retained key and a hard
+active-file byte bound of twice the global entry cap times the record byte cap.
+Unknown/invalid complete records stay raw in place, are skipped and logged,
+and fence further writes while readable indexed results remain available.
+A torn final line is archived as raw bytes in private `commands.torn.jsonl`,
+file-synced before the active tail is truncated and synced. The archive is
+bounded to 32 record byte caps; recovery refuses without truncation when full.
+A recovered pending claim remains uncertain and a completed claim returns
+its first acknowledgement. These are backend properties, not active wire
+recovery promises in J1a.
+
 Automatic resend is allowed for the listed §5 verbs only through this durable
 idempotency path, not based on an assumed harmless verb. Permission/question
 answers retain stable question/request IDs; apply answer validity, principal
