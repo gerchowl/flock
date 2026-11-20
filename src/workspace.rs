@@ -1550,6 +1550,7 @@ mod tests {
             .structured_agents
             .register(Record {
                 harness_established: false,
+                profile_identity: None,
                 runtime: StructuredRuntime::Structured,
                 agent_id: "fixture-agent".into(),
                 name: None,

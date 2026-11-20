@@ -49,6 +49,26 @@ pub struct RetainedInfo {
     pub first_seen_ms: Option<u64>,
 }
 
+/// Exact data-only identity of the profile used by a launch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileIdentity {
+    /// Legacy operator profile directory selector.
+    pub profile: String,
+    /// Resolved operator binding, absent for legacy single-account launches.
+    pub binding: Option<BindingIdentity>,
+}
+
+/// Operator binding identity and the policy revision at which it was resolved.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BindingIdentity {
+    /// Stable operator-issued identity.
+    pub binding_id: String,
+    /// Exact binding revision; a changed revision requires explicit recovery.
+    pub revision: u64,
+}
+
 /// Durable structured identity. The runtime tag cannot describe a PTY record.
 /// This typed record writes no credentials, process ids, attention, ages or lease
 /// proofs. Opaque future fields pass through separately without granting authority.
@@ -69,10 +89,31 @@ pub struct Record {
     /// default to false, so their next launch uses fresh-session creation.
     #[serde(default)]
     pub harness_established: bool,
+    /// Launch identity observed at establishment; absent older records remain legacy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_identity: Option<ProfileIdentity>,
     /// Launch working directory, never a fabricated pane location.
     pub cwd: PathBuf,
     /// Requested model, absent when the provider selects its default.
     pub model: Option<String>,
+}
+
+impl Record {
+    /// Refuse changing the identity of an established conversation before launch.
+    pub(crate) fn admit_profile(
+        &self,
+        actual: Option<&ProfileIdentity>,
+    ) -> Result<(), crate::api::error_code::ErrorCode> {
+        if self.harness_established
+            && self
+                .profile_identity
+                .as_ref()
+                .is_some_and(|pin| Some(pin) != actual)
+        {
+            return Err(crate::api::error_code::ErrorCode::StructuredProfileMismatch);
+        }
+        Ok(())
+    }
 }
 
 /// The only runtime represented by a pane-free registry record.
@@ -124,6 +165,7 @@ impl StateSink for Projection {
 }
 
 struct Entry {
+    pending_profile: Option<ProfileIdentity>,
     record: Record,
     slot: usize,
     generation: u64,
@@ -151,6 +193,7 @@ impl Entry {
             },
         };
         Self {
+            pending_profile: None,
             record,
             slot,
             generation,
@@ -272,6 +315,22 @@ impl Registry {
         Ok(generation)
     }
 
+    /// Stage the admitted launch identity; only matching init makes it durable.
+    pub(crate) fn stage_profile(
+        &mut self,
+        agent_id: &str,
+        generation: u64,
+        identity: Option<ProfileIdentity>,
+    ) -> Result<(), RegistryError> {
+        let entry = self
+            .entries
+            .get_mut(agent_id)
+            .filter(|entry| entry.generation == generation)
+            .ok_or(RegistryError::StaleGeneration)?;
+        entry.pending_profile = identity;
+        Ok(())
+    }
+
     /// Address by stable identity, never by a placement or a caller-supplied pane.
     pub fn get(&self, agent_id: &str) -> Option<(&Record, &Projection, u64)> {
         self.entries
@@ -302,8 +361,14 @@ impl Registry {
                     == Some(entry.record.session_id.as_str())
             {
                 entry.record.harness_established = true;
+                entry.record.profile_identity = entry.pending_profile.take();
                 if let Some(Some(raw)) = self.preserved.get_mut(entry.slot) {
                     raw["harness_established"] = Value::Bool(true);
+                    if let Some(identity) = &entry.record.profile_identity {
+                        raw["profile_identity"] = serde_json::json!(identity);
+                    } else if let Some(raw) = raw.as_object_mut() {
+                        raw.remove("profile_identity");
+                    }
                 }
                 self.establishment_dirty = true;
             }

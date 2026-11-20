@@ -17,6 +17,7 @@ fn agent(id: &str) -> Agent {
     Agent {
         record: Record {
             harness_established: false,
+            profile_identity: None,
             runtime: StructuredRuntime::Structured,
             agent_id: id.into(),
             name: Some(format!("label-{id}")),

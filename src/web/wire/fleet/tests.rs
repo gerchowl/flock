@@ -3,6 +3,7 @@ use crate::structured::{launch::SessionConfigDir, registry::StructuredRuntime};
 fn registry(root: &Path) -> Registry {
     Registry::restore(vec![Record {
         harness_established: false,
+        profile_identity: None,
         runtime: StructuredRuntime::Structured,
         agent_id: "fixture-agent".into(),
         name: None,
