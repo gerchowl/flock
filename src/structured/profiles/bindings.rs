@@ -267,7 +267,10 @@ impl BindingStore {
 
     // All authority observations and effects, including future revision allocation,
     // belong inside this section. Never delete or replace the stable lock file.
-    fn transaction<T>(path: &Path, apply: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
+    pub(super) fn transaction<T>(
+        path: &Path,
+        apply: impl FnOnce() -> io::Result<T>,
+    ) -> io::Result<T> {
         static OWNER: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _owner = OWNER.try_lock().map_err(|_| {
             io::Error::new(io::ErrorKind::WouldBlock, "profile policy transaction busy")
@@ -360,7 +363,7 @@ fn advance_floor(path: &Path, revision: u64) -> io::Result<()> {
     write_private_json(&path.with_extension("floor.json"), &json!(next))
 }
 
-fn write_private_json(path: &Path, value: &Value) -> io::Result<()> {
+pub(super) fn write_private_json(path: &Path, value: &Value) -> io::Result<()> {
     match crate::platform::profile_bindings::open_owned_regular(path, false) {
         Ok(_) => (),
         Err(error) if error.kind() == io::ErrorKind::NotFound => (),
