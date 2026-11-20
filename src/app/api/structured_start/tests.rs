@@ -1595,8 +1595,7 @@ async fn hold_native_ack(
 
 mod native_permissions;
 
-#[tokio::test]
-async fn persisted_session_restart_launches_with_resume() {
+async fn persisted_session_restart_case(pin_case: &str) {
     let _guard = crate::config::test_config_env_guard();
     let mut fixture = AdmissionFixture::new("init-restricted", 120_000);
     fixture.app.no_session = false;
@@ -1676,13 +1675,36 @@ sys.stdin.read()
         serde_json::to_value(&saved.structured_agents).unwrap()[0]["harness_established"],
         true
     );
-    fixture.app.state.structured_agents = saved.structured_agents;
+    let mut records = serde_json::to_value(&saved.structured_agents).unwrap();
+    assert_eq!(records[0]["profile_identity"]["profile"], "fixture");
+    assert!(records[0]["profile_identity"]["binding"].is_null());
+    if pin_case == "legacy" {
+        records[0]
+            .as_object_mut()
+            .unwrap()
+            .remove("profile_identity");
+    }
+    fixture.app.state.structured_agents = serde_json::from_value(records).unwrap();
+    if pin_case != "same" {
+        fixture.app.state.config.structured.profile = "switched-fixture".into();
+    }
     fs::remove_file(root.join("observed-launch.json")).unwrap();
     let params: AgentStartParams = serde_json::from_value(
         json!({"name":"fixture-launch", "runtime":"structured", "argv":["claude"]}),
     )
     .unwrap();
     let restarted = fixture.request(Method::AgentStart(params)).await;
+    if pin_case == "switched" {
+        assert_eq!(
+            restarted["error"]["code"], "structured_profile_mismatch",
+            "{restarted}"
+        );
+        assert!(!root.join("observed-launch.json").exists());
+        assert!(!crate::session::data_dir()
+            .join("structured/claude/switched-fixture")
+            .exists());
+        return;
+    }
     assert_eq!(
         restarted["result"]["agent"]["session_id"], session,
         "{restarted}"
@@ -1816,4 +1838,22 @@ async fn preparation_failure_retry_launches_fresh() {
 #[tokio::test]
 async fn legacy_record_without_establishment_launches_fresh() {
     unestablished_retry_is_fresh(true).await;
+}
+
+#[cfg(feature = "web")]
+mod wire_lifecycle;
+
+#[tokio::test]
+async fn persisted_session_restart_launches_with_resume() {
+    persisted_session_restart_case("same").await;
+}
+
+#[tokio::test]
+async fn profile_switch_between_establishment_and_restart_refused() {
+    persisted_session_restart_case("switched").await;
+}
+
+#[tokio::test]
+async fn legacy_established_record_without_profile_pin_continues() {
+    persisted_session_restart_case("legacy").await;
 }

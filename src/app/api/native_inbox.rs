@@ -17,21 +17,27 @@ impl App {
             && self.caller_pane_candidate().is_some()
             && self.caller_pane().is_none()
         {
-            return super::responses::encode_error(
-                id,
-                ErrorCode::CallerPaneUnresolved.as_str(),
-                format!(
-                    "the calling pane could not be resolved from the caller's attested \
-                     identity: {}. Ask the operator to migrate this agent to a structured \
-                     agent, resuming its harness session (#3066). Until migration, the \
-                     operator can read the inbox from their own interactive shell with \
-                     `flk msg read --pane <id>`. Explicit pane selection does not restore \
-                     agent authority",
-                    self.caller_pane_refusal_reason(),
-                ),
-            );
+            return self.unresolved_message_caller(id);
         }
         super::responses::encode_error(id, code.as_str(), fallback)
+    }
+
+    /// One identity diagnosis and recovery contract for unresolved message callers.
+    pub(super) fn unresolved_message_caller(&self, id: String) -> String {
+        super::responses::encode_error(
+            id,
+            crate::api::error_code::ErrorCode::CallerPaneUnresolved.as_str(),
+            format!(
+                "the calling pane could not be resolved from the caller's attested \
+                 identity: {}. Ask the operator to migrate this agent to a structured \
+                 agent, resuming its harness session (#3066). Until migration, the \
+                 operator can consume the inbox from their own interactive shell with \
+                 `flk msg operator-read --pane <id>` (also `flk msg read --pane <id>`), \
+                 or peek with `flk msg operator-list --pane <id>`. Reading the inbox \
+                 or selecting a pane explicitly does not restore agent authority",
+                self.caller_pane_refusal_reason(),
+            ),
+        )
     }
 
     /// Share native inbox ownership with wake checks without reading message bodies.

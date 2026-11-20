@@ -15,6 +15,8 @@
 mod input;
 pub(crate) mod slots;
 
+mod welcome;
+
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Write as _};
 use std::os::unix::net::UnixStream;
@@ -587,6 +589,8 @@ pub fn take_switch_target(path: &std::path::Path) -> Option<RecordedSwitch> {
 pub enum ClientError {
     /// Could not connect to the server's client socket.
     ConnectionFailed(io::Error),
+    /// The complete Welcome did not arrive within the attach deadline.
+    AttachTimeout,
     /// No usable startup terminal geometry was obtained within its budget.
     TerminalGeometry(io::Error),
     /// Server rejected our handshake.
@@ -610,6 +614,9 @@ impl std::fmt::Display for ClientError {
                 let path = client_socket_path();
                 write!(f, "\nIs flk server running? Start it with `flk server`.")?;
                 write!(f, "\nSocket path: {}", path.display())
+            }
+            ClientError::AttachTimeout => {
+                write!(f, "server did not answer attach within 5s (server busy?)")
             }
             ClientError::TerminalGeometry(err) => write!(f, "terminal geometry: {err}"),
             ClientError::HandshakeRejected { version, error } => {
@@ -1008,17 +1015,9 @@ fn do_handshake(
     protocol::write_message(stream, &hello)
         .map_err(|e| ClientError::ConnectionFailed(io::Error::other(e.to_string())))?;
 
-    // Read Welcome.
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .map_err(ClientError::ConnectionFailed)?;
-    let welcome: ServerMessage = protocol::read_message(stream, MAX_FRAME_SIZE)?;
-    // Clearing the read timeout can fail with EINVAL on a peer that already
-    // half-closed the socket right after the Welcome (a dying mid-handoff
-    // server). The Welcome is already in hand, so a failure here must not mask
-    // a live-handoff refusal as a bare connection error — ignore it and let the
-    // refusal classification below drive the retry (#69).
-    let _ = stream.set_read_timeout(None);
+    // The budget starts after Hello and covers both prefix and payload.
+    let deadline = Instant::now() + welcome::TIMEOUT;
+    let welcome = welcome::read(stream, deadline)?;
 
     match welcome {
         ServerMessage::Welcome {
@@ -2092,7 +2091,10 @@ fn run_client_with_mode(
         // that write, and the active hook (ratatui's, before this fix) would
         // double-panic → abort — the federation-switch crash. `writeln!` just
         // drops the diagnostic.
-        if !is_clean_exit(&err) {
+        let attach_timed_out = matches!(&err, ClientError::AttachTimeout);
+        if attach_timed_out {
+            welcome::report_timeout(&err);
+        } else if !is_clean_exit(&err) {
             let _ = writeln!(io::stderr(), "flock: {err}");
         }
         drop(stdin_reader);
@@ -2110,6 +2112,8 @@ fn run_client_with_mode(
 
         std::process::exit(if gave_up_reconnecting {
             RECONNECT_GAVE_UP_EXIT_CODE
+        } else if attach_timed_out {
+            crate::cli::exit::TIMEOUT
         } else {
             crate::cli::exit::FAILURE
         });

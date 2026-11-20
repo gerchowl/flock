@@ -33,6 +33,7 @@ fn gap_script_checks_cold_owner_install_replay_cursor_and_causal_controls() {
             registry
                 .register(Record {
                     harness_established: false,
+                    profile_identity: None,
                     runtime: StructuredRuntime::Structured,
                     agent_id: "fixture".into(),
                     session_id: "history".into(),

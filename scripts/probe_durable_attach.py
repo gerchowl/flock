@@ -165,6 +165,7 @@ def main():
     assertions = parser.add_mutually_exclusive_group()
     assertions.add_argument("--assert-responsive", action="store_true")
     assertions.add_argument("--assert-baseline", action="store_true")
+    assertions.add_argument("--assert-attach-timeout", action="store_true")
     args = parser.parse_args()
     binary = args.bin.resolve(strict=True)
     if os.getloadavg()[0] >= 10:
@@ -242,12 +243,15 @@ def main():
                           "trigger_seconds": round(time.monotonic() - started, 3),
                           "control": baseline, "stalled": stalled}
                 print(json.dumps(result, sort_keys=True), flush=True)
-                if args.assert_baseline and not (
+                expected_exit = 124 if args.assert_attach_timeout else 1
+                if (args.assert_baseline or args.assert_attach_timeout) and not (
                         result["sync_thread"] == "main" and not stalled["attached"]
                         and stalled["first_frame_seconds"] is None
                         and stalled["welcome_seconds"] is None
-                        and stalled["timeout_error"] and stalled["exit"] == 1):
-                    raise AssertionError("expected main-thread sync and attach timeout without a frame")
+                        and stalled["timeout_error"] and stalled["exit"] == expected_exit
+                        and (not args.assert_attach_timeout or
+                             "server did not answer attach within 5s (server busy?)" in stalled["diagnostic"])):
+                    raise AssertionError(f"expected main-thread sync and attach timeout exit {expected_exit} without a frame")
                 if args.assert_responsive and (not stalled["attached"] or stalled["seconds"] >= 2):
                     raise AssertionError("attach must complete within 2s during stalled fsync")
         finally:

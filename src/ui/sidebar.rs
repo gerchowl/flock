@@ -8096,7 +8096,8 @@ pub(super) mod tests {
         let (ws_area, _) =
             expanded_sidebar_sections(area, app.sidebar_section_split, app.sidebar_pane_gap());
         let (servers_area, _) = carve_servers_band(ws_area, servers_section_height(&app));
-        let self_rect = server_slot_rect(server_band_rows_area(servers_area), 0).expect("self");
+        let self_rect = server_slot_rect(server_band_rows_area(servers_area), band_row(&app, None))
+            .expect("self");
         // Quadrant fallback with a single (muted) ring: a solid rectangle.
         assert_eq!(buffer[(self_rect.x, self_rect.y)].symbol(), "\u{2588}");
         // No live agents: the medallion still marks presence in muted color.

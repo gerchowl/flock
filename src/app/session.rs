@@ -145,6 +145,7 @@ mod tests {
         app.no_session = false;
         let record = Record {
             harness_established: false,
+            profile_identity: None,
             runtime: crate::structured::registry::StructuredRuntime::Structured,
             agent_id: "agent_fixture_structured".into(),
             name: Some("fixture-worker".into()),

@@ -16,6 +16,10 @@
 - S6e amendment Accepted (2026-10-29, #2242/#2731): the owner typed
   "accept all rec with star". All S6e recommendations are decided; no
   question-thread implementation is claimed.
+- §1a amendment Accepted 2026-11-19 (owner decision, #3135; not yet
+  implemented):
+  §1a lets operator app-session `operate` tokens stop and restart structured
+  agents on their home node; file tokens stay refused.
 - Implemented: the S0 probes (#1356); the slices are tracked in #1307.
 - Date: 2026-10-13
 - Issues: #1299 (the spike this records, with the owner decisions of
@@ -324,13 +328,88 @@ and `--add-dir`. The server owns stdin and stdout exclusively.
 record is operator-only (`operator_only`), including an agent resuming itself.
 The original parent and depth survive every resume and lease generation; resume
 never re-parents a conversation. This rule is adjacent to the `may_stop` policy:
-stop remains available only to the operator and the structured agent itself.
+stop remains available only to the operator and the structured agent itself
+(an app-session `operate` token counts as the operator under the accepted
+amendment below).
 MCP spawn is fresh-only. Mesh relays cannot carry structured start/spawn, and the
 server independently refuses recorded mesh edges. Client token scopes, including
 `operate`, grant permission decisions, not local socket operator identity or
-resume authority. The current WebSocket terminal bridge does not dispatch the
+resume authority (**the amendment below, Accepted 2026-11-19 (owner decision),
+narrows this for operator app-session tokens**). The current WebSocket terminal bridge does not dispatch the
 structured `cmd` frame; future command admission must preserve this boundary.
 The cooperative same-UID limitation of #1177 still applies.
+
+#### Amendment, Accepted 2026-11-19 (owner decision): operate app-session tokens may stop and restart structured agents
+
+**Status: Accepted 2026-11-19 (owner decision).** Not yet implemented.
+Until implemented, the `agent.start`, `agent.restart`
+and `agent.stop` wire verbs refuse structured stop/restart for every token with a
+typed error.
+
+*Need.* The GUI must restart (resume the same session) and stop a structured
+agent. It reaches only its home node's wire, authenticated by an app-session
+token (§5). Without this amendment those controls and their end-to-end coverage
+(#3096, #3098) cannot work.
+
+*Decision.* Tokens split by origin, not by who minted them (only the local
+operator can mint any token). An **app-session token** (`Source::App`, minted
+for the operator's own GUI shell under a fresh LocalOperator check; always
+`operate`, principal `app:operator:<uid>`) carries structured **stop** and
+**restart (resume)** authority for structured agents on its **home node**. Per
+§5 an `operate` token *is* the operator's identity for ADR-0014's operator-only
+verbs; `agent.start` already relies on that. An app-session token is therefore
+the operator for the old-rule passages in this section and in the `agent.stop`
+paragraph ("the operator and the structured agent itself only").
+
+*Unchanged.*
+- **File** operate tokens (`Source::File`; `flk client open`,
+  `flk client token add`) stay refused. They are portable bearer credentials
+  that may be used off-host and, with `--allow-non-loopback`, over TCP, so they
+  cannot be tied to the local operator's process.
+- `read`, `send` and `answer` scopes get none.
+- Mesh-relayed frames and lineage parents get none; mesh relays still cannot
+  carry structured start/spawn.
+- Remote targets stay refused until ADR-0043.
+- ADR-0052 profile admission still applies to every resume.
+- The structured agent itself keeps its existing self-stop authority; resume of
+  a record by an agent stays refused.
+- This is consistent with ADR-0052 §1 ("existing operator-only resume authority
+  in ADR-0036 §1a remains in force"), ADR-0044 ("operator-only resume
+  authority") and ADR-0049 (resume is never delegable):
+  the authority belongs to the operator identity, not to any delegate.
+- Every stop or restart is audited with the per-mint credential `app:<nonce>`
+  (the fresh random name of that mint), not only the shared principal
+  `app:operator:<uid>`.
+
+*Threat considered.* App-session bearers are never admitted over TCP. On the
+local unix socket only the minting process may use one, after a fresh
+LocalOperator check and bearer authentication (see "App-session tokens and
+shell origins"). A stolen bearer is therefore not usable by another process.
+The residual risk is control of the GUI shell process itself, for example by
+modifying its memory (#1177); the bounded lifetime and ADR-0038 §6 shell
+hardening narrow it but do not close it. A compromised shell can already start
+agents and act as operator for every ADR-0014 operator-only verb; this adds
+stop/resume of structured agents to that same blast radius.
+
+*Rejected alternative.* Keep §1a as is and give the GUI a separate socket-only
+privileged path for structured stop/resume. The GUI's wire connection already
+runs over the local unix socket, so this would not add isolation; it would add
+a second privileged API surface for the GUI shell and duplicate the authority
+checks the app-session token already performs.
+
+*Follow-up implementation slice.* Larger than lifting a
+refusal:
+- The wire lifecycle handler has no token or session context today
+  (`wire_agent_lifecycle`, `src/app/api/wire_lifecycle.rs`); plumb the
+  authenticated source through it and refuse everything but `Source::App`
+  operate.
+- Wire `agent.restart` is terminal-only and returns `runtime_unsupported` for
+  structured targets, so structured resume over the wire is a new path, not a
+  lifted refusal. Update the "structured resume authority remains socket-only"
+  doc comment in `src/structured_wire/lifecycle.rs`.
+- Add restart and stop steps to `gui-e2e-fleet`.
+
+Part of #3096.
 
 `caller_is_local_operator()` (`src/app/api/mesh.rs:182`) treats a local
 caller with no flk pane in its process ancestry as the operator. A
@@ -618,7 +697,9 @@ omitted until S10. No PTY placement, process id or caller credential is fabricat
 
 `agent.get` and its `agent.status` alias resolve registered identity/name, refusing
 cross-runtime ambiguity. `agent.stop` accepts only a structured target and is
-restricted to the operator and the structured agent itself only. PTY callers
+restricted to the operator and the structured agent itself only (an
+app-session `operate` token counts as the operator under the accepted §1a
+amendment). PTY callers
 and lineage parents receive no stop authority. Stop latches cancellation and
 returns current facts; it does not promise immediate Offline. Offline stop is
 idempotent. A restored Unknown record refuses launch before epoch advancement or
@@ -1664,7 +1745,9 @@ are deferred to S6 (#1429); this types slice names the contracts only.
   whatever the token says unless it is `operate`-scoped. Stated plainly: an
   `operate`-scoped bearer token *is* the operator's identity for ADR-0014's
   operator-only verbs, from any address, and once `--allow-non-loopback`
-  is on that includes other machines (owner decision 9). Token files live in
+  is on that includes other machines (owner decision 9). That reach is why the
+  accepted §1a amendment extends structured stop/restart only to app-session
+  tokens, never to file tokens. Token files live in
   the operator's data dir, which `flk-agent` cannot read (ADR-0035 §6.3), so
   structured agents cannot pick up a client token. `pty` agents that still
   run as the operator's uid until O19a can; that limit is #1177's.

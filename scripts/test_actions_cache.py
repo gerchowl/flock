@@ -213,6 +213,10 @@ class DurableAttachWorkflow(unittest.TestCase):
         self.assertEqual(job['timeout-minutes'], 30)
         probe, = [s for s in job['steps'] if '--assert-baseline' in s.get('run', '')]
         self.assertIn('set -o pipefail', probe['run'])
+        self.assertIn('set -e\n', probe['run'])
+        self.assertIn('--assert-attach-timeout', probe['run'])
+        self.assertIn('tests/probes/attach_welcome.py', probe['run'])
+        self.assertEqual(job['env']['PROBE_EXPECTATION'], '${{ inputs.attach_expectation }}')
         upload, = [s for s in job['steps'] if s.get('uses', '').startswith('actions/upload-artifact@')]
         self.assertEqual(upload['if'], 'always()')
         self.assertEqual(upload['with']['path'], 'durable-attach-output.txt')

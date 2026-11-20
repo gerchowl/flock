@@ -7,7 +7,7 @@ use crate::api::{
 };
 use crate::structured::{
     launch::{LaunchError, LaunchMode, LaunchProfile, ProfileConfigDir, VerifiedBinary},
-    registry::{Record, StructuredRuntime},
+    registry::{ProfileIdentity, Record, StructuredRuntime},
     workers::{Admission, Launch},
 };
 use std::{io, path::PathBuf, time::Duration};
@@ -27,6 +27,25 @@ impl App {
         verb: crate::spawn::SpawnVerb,
         opening_turn: Option<crate::spawn::prompt::SpawnPrompt>,
     ) -> Result<ResponseResult, ErrorCode> {
+        self.start_structured_request_authenticated(params, caller, verb, opening_turn, None)
+    }
+    /// Socket and app-session resumes share every launch and recovery guard.
+    /// ADR-0052 slice 17 wires profile admission here, gating socket and wire together.
+    pub(super) fn start_structured_request_authenticated(
+        &mut self,
+        params: AgentStartParams,
+        caller: &SpawnCaller,
+        verb: crate::spawn::SpawnVerb,
+        opening_turn: Option<crate::spawn::prompt::SpawnPrompt>,
+        app_session: Option<&crate::structured::permissions::auth::tokens::server::Session>,
+    ) -> Result<ResponseResult, ErrorCode> {
+        let app_operator = app_session.is_some_and(|session| {
+            session.app().is_some()
+                && session
+                    .info
+                    .scopes
+                    .contains(&crate::api::client_tokens::Scope::Operate)
+        });
         if params.dry_run
             || params.here
             || params.split.is_some()
@@ -59,10 +78,11 @@ impl App {
         // ADR-0036 §1a: neither history ownership nor a relay grants resume authority.
         if (existing.is_some()
             && (!matches!(caller, SpawnCaller::Operator { .. })
-                || self.current_api_peer_uid.is_none_or(|uid| {
-                    self.runtime_config.uid_policy.classify(uid)
-                        != crate::structured::identity::Principal::Operator
-                })))
+                || (!app_operator
+                    && self.current_api_peer_uid.is_none_or(|uid| {
+                        self.runtime_config.uid_policy.classify(uid)
+                            != crate::structured::identity::Principal::Operator
+                    }))))
             || self
                 .inbound
                 .edge(
@@ -80,6 +100,15 @@ impl App {
                 .is_some_and(|(_, p, _)| p.update.state.lifecycle == Lifecycle::Unknown)
         }) {
             return Err(ErrorCode::StructuredRecoveryRequired);
+        }
+        let profile_identity = ProfileIdentity {
+            profile: self.state.config.structured.profile.clone(),
+            binding: None,
+        };
+        if let Some((id, _)) = &existing {
+            if let Some((record, _, _)) = self.state.structured_agents.get(id) {
+                record.admit_profile(Some(&profile_identity))?;
+            }
         }
         self.state
             .config
@@ -137,6 +166,7 @@ impl App {
                 .structured_agents
                 .register(Record {
                     harness_established: false,
+                    profile_identity: None,
                     runtime: StructuredRuntime::Structured,
                     agent_id: id.clone(),
                     name: Some(params.name),
@@ -155,6 +185,7 @@ impl App {
         let started = self.structured_workers.start(
             &mut self.state.structured_agents,
             Launch {
+                profile_identity: Some(profile_identity),
                 opening_turn,
                 agent_id: agent_id.clone(),
                 generation,
