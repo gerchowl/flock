@@ -1,5 +1,8 @@
 //! Bounded app-owner command admission (ADR-0036 §5/§5a, S7-min slice 5).
 use super::*;
+// J1a is dormant until J1b replaces the live duplicate list with journal admission.
+#[allow(dead_code)]
+mod journal;
 use crate::{
     api::error_code::ErrorCode,
     app::App,
