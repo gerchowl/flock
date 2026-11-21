@@ -2030,7 +2030,9 @@ blocking, polls its durable completion, then rechecks current authorization
 under the token fence through dispatch. Revocation after claim prevents the
 effect. The outcome is synced before acknowledgement. Identical in-flight
 requests join the active claim, retaining each credential's metadata and
-reauthorizing each waiter before returning the stored outcome. Connection closure
+reauthorizing each waiter before returning the stored outcome. Fresh dispatch,
+cached replay and joined replies share verb authorization; permission decisions
+require both current `answer` and `operate` scopes. Connection closure
 follows the requesting credential's current revocation status. Conflicting
 payloads refuse `invalid_params`. Journal capacity and writer queue pressure
 refuse through the bounded wire refusal audit before dispatch. Recovered pending

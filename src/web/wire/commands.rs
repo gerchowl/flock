@@ -239,29 +239,31 @@ pub(super) fn ack(id: String, result: Result<Value, ErrorCode>) -> ServerFrame {
         error,
     }
 }
-fn scope(command: &Command) -> Scope {
-    match command.verb.as_str() {
-        _ if lifecycle(&command.verb) => Scope::Operate,
-        "agent.decide" => Scope::Answer,
-        _ => Scope::Send,
-    }
-}
 fn authorize<T>(
     request: &Request,
     apply: impl for<'a> FnOnce(permissions::auth::VerifiedToken<'a>) -> Result<T, ErrorCode>,
 ) -> Result<T, ErrorCode> {
+    let verb = request.command.verb.as_str();
+    let required = match verb {
+        _ if lifecycle(verb) => Scope::Operate,
+        "agent.decide" => Scope::Answer,
+        _ => Scope::Send,
+    };
     request
         .store
-        .admit(&request.session, scope(&request.command), apply)
-        .unwrap_or_else(|error| {
-            Err(match error {
-                TokenError::Revoked | TokenError::Unauthorized => ErrorCode::AuthRevoked,
-                TokenError::Scope if lifecycle(&request.command.verb) => ErrorCode::NotAuthorized,
-                TokenError::Scope => ErrorCode::Scope,
-                TokenError::Busy => ErrorCode::SessionBusy,
-                TokenError::Unsafe | TokenError::Io(_) => ErrorCode::InternalError,
-            })
+        .admit(&request.session, required, |token| {
+            match (verb, token.decision_subject().is_some()) {
+                ("agent.decide", false) => Err(ErrorCode::NotAuthorized),
+                _ => apply(token),
+            }
         })
+        .map_err(|error| match error {
+            TokenError::Revoked | TokenError::Unauthorized => ErrorCode::AuthRevoked,
+            TokenError::Scope if lifecycle(&request.command.verb) => ErrorCode::NotAuthorized,
+            TokenError::Scope => ErrorCode::Scope,
+            TokenError::Busy => ErrorCode::SessionBusy,
+            TokenError::Unsafe | TokenError::Io(_) => ErrorCode::InternalError,
+        })?
 }
 fn respond(request: Request, frame: ServerFrame, shared: &Shared, app: &App) {
     let authorization = authorize(&request, |_| Ok(()));
@@ -355,20 +357,18 @@ impl Pending {
         journal: &Ownership,
         result: Result<Value, ErrorCode>,
     ) -> Result<(), ErrorCode> {
+        let operation = journal::Operation::Finish {
+            key: (
+                "local".into(),
+                self.request.session.info.principal.clone(),
+                self.request.command.id.clone(),
+            ),
+            admitted_ms: self.admitted_ms,
+            result,
+        };
         self.stage = Stage::Finish(
             journal
-                .submit(
-                    self.phase,
-                    journal::Operation::Finish {
-                        key: (
-                            "local".into(),
-                            self.request.session.info.principal.clone(),
-                            self.request.command.id.clone(),
-                        ),
-                        admitted_ms: self.admitted_ms,
-                        result,
-                    },
-                )
+                .submit(self.phase, operation)
                 .map_err(|_| ErrorCode::SessionUnconfirmed)?,
         );
         Ok(())

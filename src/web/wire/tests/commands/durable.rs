@@ -729,3 +729,160 @@ fn cancellation_after_claim_preserves_the_effect_and_releases_publication() {
         case.stop().await;
     });
 }
+
+#[test]
+fn review_cached_decision_rechecks_removed_operate_scope() {
+    runtime(async {
+        let mut case = Case::new(183210).await;
+        let args = case.prompt().await;
+        let mut socket = case.open().await;
+        assert_eq!(
+            case.command(&mut socket, "agent.decide", args.clone())
+                .await["ok"],
+            true
+        );
+        case.until(|r| r.handles().len() == 1).await;
+        case.scopes(json!(["answer", "read"]));
+        socket.send(json!({"t":"cmd","cmd_id":"command-1","verb":"agent.decide","args":args,"resume_only":true})).await;
+        let frame = case.ack(&mut socket).await;
+        assert_eq!(
+            frame["ok"], false,
+            "cached decision disclosed after operate removal: {frame}"
+        );
+        case.stop().await;
+    });
+}
+
+#[test]
+fn review_joined_decision_rechecks_removed_operate_scope() {
+    runtime(async {
+        let mut case = Case::new(183216).await;
+        let args = case.prompt().await;
+        // Give a second credential the same principal, retaining its own token id.
+        let path = case.server._root.path().join("client-tokens/two.token");
+        let mut token: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        token["principal"] = json!("0123456789abcdef0123456789abcdef");
+        fs::write(&path, token.to_string()).unwrap();
+        let mut first = case.open().await;
+        let mut second = Socket::open(&case.server).await;
+        second.hello(1, &"d".repeat(64)).await;
+        let (started, release) = hold_next_sync(&case).await;
+        enqueue(&case, &mut first, "joined", &args).await;
+        case.service();
+        within(started).await.unwrap();
+        enqueue(&case, &mut second, "joined", &args).await;
+        case.service();
+        let mut token: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        token["scopes"] = json!(["read", "answer"]);
+        fs::write(&path, token.to_string()).unwrap();
+        release.send(()).unwrap();
+        assert_eq!(case.ack(&mut first).await["ok"], true);
+        let joined = case.ack(&mut second).await;
+        assert_eq!(joined["error"]["code"], "not_authorized");
+        case.until(|r| r.handles().len() == 1).await;
+        let events = refusal_events(&case);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["token_id"], "two");
+        case.stop().await;
+    });
+}
+
+async fn enqueue_verb(case: &Case, socket: &mut Socket, id: &str, verb: &str, args: &Value) {
+    let before = case.server.core.command_owner.queued_test();
+    socket
+        .send(json!({"t":"cmd","cmd_id":id,"verb":verb,"args":args,"resume_only":false}))
+        .await;
+    within(async {
+        loop {
+            let changed = case.server.wake.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if case.server.core.command_owner.queued_test() > before {
+                break;
+            }
+            tokio::select! {
+                _ = changed => (),
+                frame = socket.receive() => panic!("ended before owner admission: {frame:?}"),
+            }
+        }
+    })
+    .await;
+}
+
+#[test]
+fn every_verb_cached_and_joined_outcomes_require_current_fresh_dispatch_scopes() {
+    runtime(async {
+        for (index, (verb, removed, expected)) in [
+            ("agent.send", "send", "scope"),
+            ("agent.decide", "answer", "scope"),
+            ("agent.decide", "operate", "not_authorized"),
+            ("agent.start", "operate", "not_authorized"),
+            ("agent.restart", "operate", "not_authorized"),
+            ("agent.stop", "operate", "not_authorized"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for joined in [false, true] {
+                let mut case = Case::new(183230 + index as u32 * 2 + u32::from(joined)).await;
+                let args = if verb == "agent.decide" {
+                    case.prompt().await
+                } else {
+                    json!({})
+                };
+                let path = case.server._root.path().join("client-tokens/two.token");
+                let mut record: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+                record["principal"] = json!("0123456789abcdef0123456789abcdef");
+                fs::write(&path, record.to_string()).unwrap();
+                let mut primary = case.open().await;
+                let mut waiter = Socket::open(&case.server).await;
+                waiter.hello(1, &"d".repeat(64)).await;
+                let scopes: Vec<_> = ["read", "send", "answer", "operate"]
+                    .into_iter()
+                    .filter(|scope| *scope != removed)
+                    .collect();
+                if joined {
+                    let (started, release) = hold_next_sync(&case).await;
+                    enqueue_verb(&case, &mut primary, "scope-matrix", verb, &args).await;
+                    case.service();
+                    within(started).await.unwrap();
+                    enqueue_verb(&case, &mut waiter, "scope-matrix", verb, &args).await;
+                    case.service();
+                    record["scopes"] = json!(scopes);
+                    fs::write(&path, record.to_string()).unwrap();
+                    release.send(()).unwrap();
+                    let first = case.ack(&mut primary).await;
+                    assert_ne!(
+                        first["error"]["code"], expected,
+                        "full authority was refused for {verb}"
+                    );
+                } else {
+                    enqueue_verb(&case, &mut primary, "scope-matrix", verb, &args).await;
+                    let first = case.ack(&mut primary).await;
+                    assert_ne!(
+                        first["error"]["code"], expected,
+                        "full authority was refused for {verb}"
+                    );
+                    record["scopes"] = json!(scopes);
+                    fs::write(&path, record.to_string()).unwrap();
+                    waiter.send(json!({"t":"cmd","cmd_id":"scope-matrix","verb":verb,"args":args,"resume_only":true})).await;
+                }
+                let returned = case.ack(&mut waiter).await;
+                waiter.send(json!({"t":"cmd","cmd_id":"fresh-scope-matrix","verb":verb,"args":args,"resume_only":false})).await;
+                let fresh = case.ack(&mut waiter).await;
+                assert_eq!(
+                    fresh["error"]["code"], expected,
+                    "fresh {verb} without {removed}"
+                );
+                assert_eq!(
+                    returned["error"]["code"], fresh["error"]["code"],
+                    "{verb} joined={joined} returned an outcome without current {removed}"
+                );
+                if verb == "agent.decide" {
+                    case.until(|c| c.handles().len() == 1).await;
+                }
+                case.stop().await;
+            }
+        }
+    });
+}

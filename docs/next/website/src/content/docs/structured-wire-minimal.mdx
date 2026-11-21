@@ -223,7 +223,9 @@ rows and checkpoints, but are dropped when a fresh projection changes the row.
 
 `agent.decide` takes `AgentDecide` arguments: `agent`, `request_id`, required `request_seq`, `decision`
 (`allow_once`, `allow_always` or `deny`), and optional `message`. Only a
-token-authenticated client principal can submit this command. The optional message
+token-authenticated client principal can submit this command. Fresh admission,
+cached replay and joined outcomes require both current `answer` and `operate`
+scopes, checked through the same authorization function. The optional message
 is normalized from CRLF to LF and trimmed, then limited to 2048 UTF-8 bytes
 (`MAX_PERMISSION_DECISION_MESSAGE_BYTES`). The `prompt_control_bytes` rules
 permit newlines and tabs and refuse other controls. Invalid messages return
