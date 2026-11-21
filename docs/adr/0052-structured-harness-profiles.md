@@ -616,7 +616,31 @@ reservation (a lease generation) under the store transaction lock before
 stop; `delete` checks for any reservation under the same lock and refuses if
 one exists. This closes "allocate returns an existing root, delete sees a
 stopped session and renames it, launch uses a deleted path". Reservation
-failure refuses the admission/resume before any launch effect. Status lists eligible roots with age and size so
+failure refuses the admission/resume before any launch effect. The reservation
+check, the required-audit append and the rename into trash all happen within
+**one** hold of the store lock, so no reservation can appear between check and
+effect. A reservation is released on terminal stop and on launch failure (the
+launch path releases it before returning the error), and startup reconciliation
+releases every reservation whose lease generation has no live supervised process,
+so a crash or failed launch never leaks one; a leaked reservation would only
+block deletion (fail-safe) and is reported in status.
+
+**Registry facts (amends ADR-0036).** Neither a stopped time nor a quarantined
+outcome exists today: `src/structured/registry/mod.rs` states the registry is
+pure data and its `Record` writes no ages or lease proofs, following the
+ADR-0036 §4 (Storage) rule that durable records carry identity and launch
+metadata only. This amendment **amends that rule** for exactly two facts, because
+retention cannot be decided from the filesystem (mtime is changed by transcripts
+and copies) or from the lease holder: `stopped_at` (a durable wall-clock time set
+once when the session reaches a terminal stop) and `outcome` (`quarantined` when
+§2 revocation publishes it). They are written by the supervisor that
+publishes the stop, never by agents, grant no process or lease authority, and
+keep the registry otherwise pure data. Records written before this change omit
+both fields, so the new `#[serde(default)]` fields read as absent; absent
+`stopped_at` or unknown outcome means **not eligible**, never an assumed age.
+Roots of pre-existing sessions therefore become deletable only after they next
+stop under the new code, which is the fail-safe default. Unknown newer values
+pass through as opaque data and likewise refuse. Status lists eligible roots with age and size so
 the operator can choose; it never selects for them.
 Never deleted automatically: live roots, roots referenced by a rollback,
 replacement or migration record, quarantined roots, unknown or invalid records,
@@ -718,10 +742,11 @@ against the prior build; all inactive while production execution is unavailable)
 | --- | --- | --- |
 | 3.1 Usage, bounds, typed refusal | Sizing walk, bounds config, status fields, `profile_storage_full`, CLI/socket docs. | Status reports bytes/age/totals for sparse and nested roots and does not follow a symlink out of the root; allocation at either bound refuses typed and leaves no staging or partial state. |
 | 3.2 Staging recovery | Exact-shape staging removal, non-matching quarantine, trash completion, lock-skip reporting. | Shape-matching staging is removed and staging with extra content is quarantined; recovery with the lock held elsewhere skips and reports; a concurrent allocation is never touched (race test). |
+| 3.2b Registry stop facts | Add `stopped_at` and quarantined `outcome` to the registry `Record` (default-absent, older records readable, schema note), set by the stop/revocation publisher; update the ADR-0036 "no ages" rustdoc and §4 note. | Old records load with both absent and report not eligible; stop sets `stopped_at` once and survives restart; a revocation stop persists `quarantined`; unknown outcome values round-trip untouched and refuse. |
 | 3.3 Reservation and quarantine marker | Reservation/lease generation taken under the store lock by admission and resume before `allocate_session` returns; durable `quarantine.json` written before the quarantined outcome. | A resume racing delete either keeps the root or is refused, never launching on a deleted path; a failed or crashed marker write publishes no complete outcome; registry-quarantined roots refuse eligibility without a marker. |
 | 3.4 Operator plan/delete/release | Eligibility, plan digests, required audit before effect, trash rename, `abandoned` outcome, release, quarantine-dir deletion, CLI/socket. If it exceeds 400 production lines, split into plan/audit/delete and release/quarantine-dir parts. | Agent/relay callers refuse; audit failure leaves the root untouched; an indeterminate record with no trash entry keeps the root and is reported; rename failure after append records `abandoned`; a changed digest, reserved/unknown session, young root or unreleased quarantine refuses; a crash between rename and removal completes on restart. |
 
-3.1 and 3.2 depend only on slice 3; 3.3 on slice 3; 3.4 on all three. 3.4 reads session
+3.1, 3.2 and 3.2b depend only on slice 3; 3.3 on slice 3 and 3.2b; 3.4 on all of them. 3.4 reads session
 liveness through an interface that refuses when state is unknown, so it needs no
 launch code; slices 10 and 12 later supply fence and replacement references.
 
