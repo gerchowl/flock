@@ -10,19 +10,56 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Once;
 
 use super::{process_lifetime, process_table};
+
+/// Cheap identity of a private fixture executable, captured before spawn.
+/// This detects replacement and ordinary edits; it is not a content signature.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FileIdentity {
+    device: u64,
+    inode: u64,
+    size: u64,
+    modified_secs: i64,
+    modified_nanos: i64,
+}
+
+impl FileIdentity {
+    fn read(binary: &Path) -> io::Result<Self> {
+        let metadata = fs::symlink_metadata(binary)?;
+        if !metadata.is_file() {
+            return Err(io::Error::other("launch executable is not a regular file"));
+        }
+        Ok(Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            size: metadata.size(),
+            modified_secs: metadata.mtime(),
+            modified_nanos: metadata.mtime_nsec(),
+        })
+    }
+}
+
+/// Immutable before-spawn facts, separate from the child's live process facts.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct LaunchBinary {
+    path: PathBuf,
+    file_identity: FileIdentity,
+}
 
 /// Durable process identity expected in exactly one private sandbox.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ServerRecord {
     /// Server PID returned by spawn, never a process-group selector.
     pub pid: u32,
-    /// Launch executable path; proof does not require that file to survive.
+    /// Canonical launch executable path; the recorded file must still exist.
     pub binary: PathBuf,
+    /// Before-spawn file identity. Older records without it never authorize signals.
+    #[serde(default)]
+    pub file_identity: Option<FileIdentity>,
     /// HOME passed to the server, beneath the sandbox.
     pub home: PathBuf,
     /// XDG_STATE_HOME passed to the server, beneath the sandbox.
@@ -59,6 +96,30 @@ impl ServerRecord {
         if self.start_time != Some(before) {
             return Some(false);
         }
+        let Some(expected) = self.file_identity.as_ref() else {
+            eprintln!(
+                "sandbox server {} retained: missing binary file identity",
+                self.pid
+            );
+            return Some(false);
+        };
+        match FileIdentity::read(&self.binary) {
+            Ok(observed) if &observed == expected => {}
+            Ok(_) => {
+                eprintln!(
+                    "sandbox server {} retained: binary file identity changed",
+                    self.pid
+                );
+                return Some(false);
+            }
+            Err(error) => {
+                eprintln!(
+                    "sandbox server {} retained: binary file identity unavailable: {error}",
+                    self.pid
+                );
+                return Some(false);
+            }
+        }
         let base = base.canonicalize().ok()?;
         let inside = |path: &Path| {
             path.canonicalize()
@@ -73,12 +134,14 @@ impl ServerRecord {
             )
             || !server_argv(&self.argv)
             || (self.argv.first().map(Path::new) != Some(self.binary.as_path())
-                && captured_binary(&base).ok().as_ref() != Some(&self.binary))
+                && !captured_binary(&base).is_ok_and(|launch| {
+                    launch.path == self.binary && Some(launch.file_identity) == self.file_identity
+                }))
         {
             return Some(false);
         }
-        // Birth, exact launch argv and private environment remain stable after
-        // a rebuild. A deleted executable path alone never proves identity.
+        // File identity alone is insufficient: exact live argv, private environment
+        // and birth must independently agree with the before-spawn record.
         let info = process_table::process_info(self.pid).ok()?;
         if info.argv != self.argv {
             return Some(false);
@@ -104,7 +167,7 @@ pub fn server_argv(argv: &[String]) -> bool {
 
 // Relative argv is a launch spelling, not executable identity. Its separate
 // before-spawn fact must still match; live argv and birth are checked too.
-fn captured_binary(base: &Path) -> io::Result<PathBuf> {
+fn captured_binary(base: &Path) -> io::Result<LaunchBinary> {
     File::open(base.join(".launch-binary.json"))
         .and_then(|file| serde_json::from_reader(file).map_err(io::Error::other))
 }
@@ -117,13 +180,17 @@ pub fn prepare_launch(binary: &Path, runtime: &Path) -> io::Result<PathBuf> {
         .filter(|base| owner(base) == Some(std::process::id()))
         .ok_or_else(|| io::Error::other("launch requires an owned sandbox"))?;
     let binary = binary.canonicalize()?;
+    let launch = LaunchBinary {
+        file_identity: FileIdentity::read(&binary)?,
+        path: binary.clone(),
+    };
     let pending = base.join(".launch-binary.pending");
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
         .open(&pending)?;
-    file.write_all(&serde_json::to_vec(&binary)?)?;
+    file.write_all(&serde_json::to_vec(&launch)?)?;
     file.sync_all()?;
     fs::rename(pending, base.join(".launch-binary.json"))?;
     File::open(base)?.sync_all()?;
@@ -142,17 +209,19 @@ fn record_invocation(pid: u32, config: &Path, runtime: &Path, argv: Option<Vec<S
     else {
         return;
     };
-    let binary: PathBuf = match captured_binary(base) {
-        Ok(binary) => binary,
+    let launch = match captured_binary(base) {
+        Ok(launch) => launch,
         Err(error) => {
             eprintln!("sandbox server {pid} retained: no proven launch binary: {error}");
             return;
         }
     };
+    let binary = launch.path;
     let argv = argv.unwrap_or_else(|| vec![binary.to_string_lossy().into_owned(), "server".into()]);
     let record = ServerRecord {
         pid,
         binary,
+        file_identity: Some(launch.file_identity),
         home: config.join("home"),
         state: config.join("state"),
         start_time: process_lifetime::birth(pid),
