@@ -27,10 +27,15 @@ class SccacheWrapperTests(unittest.TestCase):
             'sys.exit(23)\n'
         )
         backend.chmod(0o755)
+        resolver = root / 'account-home'
+        resolver.write_text('#!/bin/sh\nprintf "%s\\n" "$TEST_ACCOUNT_HOME"\n')
+        resolver.chmod(0o755)
         env = {key: value for key, value in os.environ.items()
                if not key.startswith('SCCACHE_')}
         env.update(HOME=str(root), TMPDIR=str(root / 'deleted'),
-                   SCCACHE_REAL=str(backend))
+                   SCCACHE_REAL=str(backend), SCCACHE_PYTHON=str(resolver),
+                   TEST_ACCOUNT_HOME=str(root / 'account'),
+                   SCCACHE_CACHE_SUFFIX='.cache/sccache')
         env.update(overrides)
         if env.get('HOME') is None:
             env.pop('HOME', None)
@@ -45,10 +50,11 @@ class SccacheWrapperTests(unittest.TestCase):
             result = self.invoke(root)
             self.assertEqual(result.returncode, 23)
             state = json.loads(result.stdout)
-            self.assertEqual(state['tmp'], str(root / '.cache/flock-sccache/tmp'))
+            cache = root / 'account/.cache/sccache'
+            self.assertEqual(state['tmp'], str(cache / 'tmp'))
             self.assertTrue(Path(state['tmp']).is_dir())
-            self.assertIsNone(state['cache'])
-            self.assertEqual(state['uds'], str(root / '.cache/flock-sccache/flock.sock'))
+            self.assertEqual(state['cache'], str(cache))
+            self.assertEqual(state['uds'], str(cache / 'flock.sock'))
             self.assertEqual(state['args'], ['argument with spaces', '--show-stats'])
 
     def test_explicit_cache_and_private_port(self):
@@ -80,19 +86,52 @@ class SccacheWrapperTests(unittest.TestCase):
             self.assertIn('cannot create persistent temp directory: ' + str(cache / 'tmp'),
                           result.stderr)
 
-    def test_missing_home_without_explicit_cache_fails_clearly(self):
+    def test_missing_home_uses_account_home(self):
         with tempfile.TemporaryDirectory() as directory:
             result = self.invoke(Path(directory), HOME=None)
+            self.assertEqual(result.returncode, 23)
+            self.assertEqual(json.loads(result.stdout)['cache'],
+                             str(Path(directory) / 'account/.cache/sccache'))
+
+    def test_isolated_homes_share_account_cache_and_socket(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = self.invoke(root, HOME=str(root / 'first'),
+                                XDG_CACHE_HOME=str(root / 'first/cache'))
+            second = self.invoke(root, HOME=str(root / 'second'),
+                                 XDG_CACHE_HOME=str(root / 'second/cache'))
+            self.assertEqual(first.returncode, 23)
+            self.assertEqual(second.returncode, 23)
+            self.assertEqual(first.stdout, second.stdout)
+
+    def test_account_lookup_failure_does_not_run_backend(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.invoke(Path(directory), SCCACHE_PYTHON='/bin/sh')
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(result.stdout, '')
+
+    def test_empty_account_home_fails_clearly(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.invoke(Path(directory), TEST_ACCOUNT_HOME='')
             self.assertEqual(result.returncode, 1)
-            self.assertIn('HOME is unset and SCCACHE_DIR is not given', result.stderr)
+            self.assertIn('cannot resolve account home; set SCCACHE_DIR', result.stderr)
             self.assertEqual(result.stdout, '')
 
     def test_explicit_cache_does_not_require_home(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            result = self.invoke(root, HOME=None, SCCACHE_DIR=str(root / 'cache'))
+            result = self.invoke(root, HOME=None, SCCACHE_DIR=str(root / 'cache'),
+                                 SCCACHE_PYTHON=str(root / 'absent-resolver'))
             self.assertEqual(result.returncode, 23)
             self.assertEqual(json.loads(result.stdout)['cache'], str(root / 'cache'))
+
+    def test_darwin_cache_suffix(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            result = self.invoke(root, SCCACHE_CACHE_SUFFIX='Library/Caches/Mozilla.sccache')
+            self.assertEqual(result.returncode, 23)
+            self.assertEqual(json.loads(result.stdout)['cache'],
+                             str(root / 'account/Library/Caches/Mozilla.sccache'))
 
 
 class ProbeEndpointTests(unittest.TestCase):

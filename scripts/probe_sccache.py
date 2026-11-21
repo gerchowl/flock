@@ -90,6 +90,47 @@ def startup_sandbox():
 
 
 class SccacheStartupProbe(unittest.TestCase):
+    def test_isolated_homes_reuse_account_artifacts_after_restart(self):
+        require_wrapper()
+        with tempfile.TemporaryDirectory(prefix='sc-home-', dir='/tmp') as directory:
+            root = Path(directory)
+            resolver = root / 'account-home'
+            resolver.write_text('#!/bin/sh\nprintf "%s\\n" "$TEST_ACCOUNT_HOME"\n')
+            resolver.chmod(0o755)
+            env = {key: value for key, value in os.environ.items()
+                   if not key.startswith(('SCCACHE_', 'FLOCK_'))}
+            env.update(SCCACHE_REAL=os.environ['FLOCK_TEST_SCCACHE_RAW'],
+                       SCCACHE_PYTHON=str(resolver), SCCACHE_CACHE_SUFFIX='cache',
+                       TEST_ACCOUNT_HOME=directory,
+                       SCCACHE_SERVER_UDS=str(root / 'server.sock'))
+            script = Path(os.environ.get('FLOCK_TEST_SCCACHE_SCRIPT',
+                                        Path(__file__).resolve().parents[1] / 'nix/sccache.sh'))
+            source = root / 'tiny.rs'
+            source.write_text('pub fn answer() -> u32 { 42 }\n')
+
+            def run(*args):
+                assert_private_endpoint(env, root, None)
+                result = subprocess.run(['/bin/sh', '-eu', str(script), *args],
+                                        env=env, text=True, capture_output=True, timeout=60)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                return result.stdout
+
+            for name, expected in [('first', r'Cache misses\s+1\b'),
+                                   ('second', r'Cache hits\s+1\b')]:
+                env.update(HOME=str(root / name), XDG_CACHE_HOME=str(root / name / 'xdg'))
+                Path(env['HOME']).mkdir()
+                try:
+                    run(shutil.which('rustc'), '--crate-name', 'tiny',
+                        '--crate-type', 'rlib', '--emit', 'link', str(source),
+                        '--out-dir', directory)
+                    (root / 'libtiny.rlib').unlink()
+                    stats = run('--show-stats')
+                    self.assertRegex(stats, expected)
+                    self.assertIn(str(root / 'cache'), stats)
+                    print(f'Isolated HOME {name}:\n{stats}', flush=True)
+                finally:
+                    run('--stop-server')
+
     def test_twenty_rounds_of_four_automatic_starters_preserve_live_server(self):
         for trial in range(20):
             with self.subTest(trial=trial), startup_sandbox() as (root, start):
@@ -203,6 +244,7 @@ class SccacheProbe(unittest.TestCase):
                    if not key.startswith(('SCCACHE_', 'FLOCK_'))}
             env.update(HOME=directory, TMPDIR=str(startup),
                        XDG_CACHE_HOME=str(root / 'xdg-cache'),
+                       SCCACHE_DIR=str(root / 'cache'),
                        XDG_CONFIG_HOME=str(root / 'config'))
             port = None
             if private_port:
@@ -256,7 +298,7 @@ class SccacheProbe(unittest.TestCase):
                 run('--stop-server')
                 compile_crate()
                 self.assertRegex(run('--show-stats'), r'Cache hits\s+[1-9]\d*')
-                # Warm the platform-default cache with an unwrapped daemon,
+                # Warm the explicit private cache with an unwrapped daemon,
                 # then require a hit from the wrapper using that same cache.
                 run('--stop-server')
                 source.write_text('pub fn answer() -> u32 { 43 }\n')
@@ -272,14 +314,14 @@ class SccacheProbe(unittest.TestCase):
                 raw_location = next(line for line in raw_stats.splitlines()
                                     if line.startswith('Cache location'))
                 self.assertIn(raw_location, wrapped_stats)
-                print('Raw and wrapped platform cache:', raw_location, flush=True)
+                print('Raw and wrapped private cache:', raw_location, flush=True)
             finally:
                 run('--stop-server')
 
     def test_private_port_survives_deleted_startup_temp_and_retains_hits(self):
         self.probe(private_port=True)
 
-    def test_private_socket_survives_deleted_startup_temp_and_retains_platform_hits(self):
+    def test_private_socket_survives_deleted_startup_temp_and_retains_hits(self):
         self.probe(private_port=False)
 
 
