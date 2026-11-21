@@ -273,6 +273,12 @@ pub enum Method {
     SessionRetainedList(EmptyParams),
     #[serde(rename = "session.retained.purge")]
     SessionRetainedPurge(super::retained::PurgeParams),
+    #[serde(rename = "client.grant.add")]
+    ClientGrantAdd(super::gateway_grants::Grant),
+    #[serde(rename = "client.grant.list")]
+    ClientGrantList(EmptyParams),
+    #[serde(rename = "client.grant.revoke")]
+    ClientGrantRevoke(super::gateway_grants::Revoke),
     #[serde(rename = "client.token.add")]
     ClientTokenAdd(super::client_tokens::AddParams),
     #[serde(rename = "client.token.rm")]
@@ -540,6 +546,9 @@ impl Method {
             | Self::PaneMove(_)
             | Self::PaneRename(_)
             | Self::SessionRetainedPurge(_)
+            | Self::ClientGrantAdd(_)
+            | Self::ClientGrantList(_)
+            | Self::ClientGrantRevoke(_)
             | Self::ClientTokenAdd(_)
             | Self::ClientTokenRemove(_)
             | Self::ClientTokenList(_)
@@ -3208,6 +3217,9 @@ pub enum ResponseResult {
     },
     ClientTokenIssued {
         issued: super::client_tokens::Issued,
+    },
+    ClientGrantList {
+        listing: super::gateway_grants::Listing,
     },
     ClientTokenList {
         entries: Vec<super::client_tokens::Listed>,

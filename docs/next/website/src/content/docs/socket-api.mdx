@@ -1690,3 +1690,36 @@ best-effort `wire_refused` events through the event hub. See the
 for fields, exact suppression summaries, the shared 60-second per-key/global
 budgets, graceful shutdown flushing, and the limits at capacity, crash and
 journal failure. Refusal reporting does not replace required mutation audits.
+
+
+## Destination gateway grants
+
+`client.grant.add`, `client.grant.list`, and `client.grant.revoke` require the
+same kernel-attested local operator as client-token management. Agent panes,
+relays and non-operator callers receive `operator_only`. An enrolled home or a
+client bearer alone cannot manage grants.
+
+Add params are `{name, home_node_id, principals, verbs, scopes, targets}` with
+explicit string arrays for each set. `home_node_id` is the enrolled home's
+pinned digest. Names follow token naming rules; existing names refuse. List
+params are `{}`; revoke params are `{name}`. All three return
+`{type:"client_grant_list", listing:{generation, entries}}`, where `entries`
+maps names to grant records. Invalid/future entries have null authority, remain
+preserved on disk, and may be revoked by name. Revoke of an absent name and
+invalid adds return `invalid_params`; unavailable storage returns
+`internal_error`.
+
+Targets are the union of `agent:<AgentId>`, `workspace:<WorkspaceId>`, and `*`.
+An empty array denies all; `*` is explicit in list output. Workspace membership
+comes from current destination state at admission. Structured start can match
+only `workspace:` or `*`. Display names and filesystem paths are refused.
+Authority is the intersection of current home-token scopes, one matching grant,
+and existing local verb checks. Principals are namespaced by home NodeId.
+`agent.decide` requires `operate`; `send` and `answer` never promote to it.
+The durable generation and admission lock fence revocation against new claims.
+An admitted effect is not undone by a later revoke.
+
+This slice provides dormant evaluation and management; M2 has not connected it
+to mesh commands. Remote `config.*` evaluation returns `unsupported` before
+claim. Remote structured start/stop/restart/resume require `operate` and remain
+`unsupported_for_agent` pending the ADR-0036 §1a / Q9 owner ruling.

@@ -497,6 +497,25 @@ implementation is a dependency for send-only remote structured sends; until it
 lands the stricter current backend refusal remains visible, without silently
 granting operator identity.
 
+**A1 target selectors.** A grant's targets are a list of selectors, each exactly
+`agent:<AgentId>`, `workspace:<WorkspaceId>`, or the explicit wildcard `*`.
+A target matches if **any** selector matches (union). An `agent:` selector
+matches that agent; a `workspace:` selector matches every agent **currently** in
+that workspace, using destination-owned membership read at admission, never
+membership asserted by the request. `*` matches all targets; an empty list
+matches nothing. List output shows `*` distinctly. Structured start matches only
+`workspace:` selectors or `*`, because the new agent does not yet exist. Use
+stable pinned AgentId/WorkspaceId values, never display names, labels or paths.
+
+A1 status: destination-local grant storage, operator Unix-socket management and
+the dormant evaluator are implemented in this slice. M2 must supply authenticated
+origin/current token facts, recheck enrollment, resolve current destination
+membership, and claim under the evaluator's generation lease with the existing
+verb checks. No mesh command forwarding is enabled. Remote structured
+start/stop/restart/resume still require `operate` and are explicitly refused
+under ADR-0036 §1a pending the Q9 owner ruling; this slice does not extend
+app-session lifecycle authority across nodes.
+
 **Config gateway gate.** Every remote config.* verb, including config writes, is
 refused with typed `unsupported` before forwarding, claiming or dispatch, even
 for an operate token. There is no local-write fallback, arbitrary target path or
