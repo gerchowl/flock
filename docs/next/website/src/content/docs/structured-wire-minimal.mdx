@@ -353,6 +353,37 @@ recovery then retries after 250 ms. No second local replay starts while that
 worker is still pending. Startup/importer completion fail closed; rollback's
 running transport keeps issuing typed, audited refusals until recovery succeeds.
 
+If the replay worker never returns, this refusal is indefinite: its owning
+`flk` server process keeps the exclusive journal lease, and background recovery
+cannot retry until that worker stops. Commands on an already running transport
+receive `error.code: "session_busy"` with the exact message
+`error.message: "command refused: session_busy"`. Startup or importer completion
+instead fails with the typed `session_busy` acquisition error before readiness.
+To distinguish a journal replay stall from other busy conditions, look for the
+server JSON log with these exact fields: `"message":"command journal replay"`,
+`"event":"client.journal.replay"` and `"status":"stalled"`. Its `replayed_bytes`
+and `total_bytes` fields show the last observed byte counts. The entry records
+the caller's stall timeout; the worker can remain alive with its lease held.
+
+Recover a permanent stall by restarting the **owning server process**. If its
+API responds, use `flk server stop`; otherwise stop that process using its
+service supervisor or normal process-management tools. Wait for actual process
+exit, which releases the journal lease even if the replay worker never returned.
+Then start `flk server` again, or restart it through the same supervisor, using
+the same data directory.
+A live handoff cannot recover a lease still held by that permanently stalled
+process. These are operator recovery steps; an ordinary command retry does not
+restart the server.
+
+Restarting preserves the durable journal; do not delete or recreate
+`wire/commands.jsonl` to clear the stall. Synced claims and completed outcomes
+remain on disk and are replayed after restart. Reconnect and reauthorize, then
+retry an uncertain command within the 24-hour window using the same principal,
+command ID, verb and arguments with `resume_only: true`. A completed outcome
+returns its original acknowledgement. A recovered pending claim returns
+`session_unconfirmed` without executing again: inspect the subject's state to
+resolve that uncertainty instead of sending a new command ID to force execution.
+
 Watch the server logs for `command journal replay`: `status=replaying` reports
 `replayed_bytes=N` / `total_bytes=M` at the start and roughly every tenth of the
 file; `status=ready` follows successful replay. Startup and importer readiness
