@@ -90,8 +90,9 @@ PID has been reassigned to a live process, are retained.
 The copied probe server is recorded by the wrapper; direct and detached
 auto-detect servers are recorded by shared test support. Before spawning, the
 auto-detect launcher resolves and atomically records its canonical binary path,
-then executes that path. PID recording reads that launch fact rather than using
-live `argv[0]` as the binary identity. Missing or unreadable launch facts are
+then executes the requested launch path, preserving symlink aliases. PID
+recording reads that launch fact rather than using live `argv[0]` as the binary
+identity. Missing or unreadable launch facts are
 logged and remain unproven; a launch path alone never authorizes a signal.
 Rust tests in
 `tests/sandbox_sweep.rs` exercise the actual wrapper, replacement binaries,
