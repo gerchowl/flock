@@ -1166,12 +1166,33 @@ fn ended_history_cut_recovers_after_restart_without_losing_the_socket() {
     runtime(async {
         let mut case = Case::new(183193).await;
         let mut socket = case.open().await;
+        socket
+            .send(json!({"t":"sub","sub_id":"restart-fleet","stream":"fleet"}))
+            .await;
+        within(async {
+            loop {
+                let Received::Text(frame) = case.frame(&mut socket).await else {
+                    panic!("fleet socket ended");
+                };
+                assert_eq!(frame["sub_id"], "restart-fleet");
+                if frame["t"] == "synced" {
+                    break;
+                }
+                assert!(matches!(frame["t"].as_str(), Some("gap" | "ev")));
+            }
+        })
+        .await;
         socket.send(json!({"t":"sub","sub_id":"before-restart","stream":format!("agent/{}",case.worker.id)})).await;
         let mut cursor = 0;
         loop {
             let Received::Text(frame) = case.frame(&mut socket).await else {
                 panic!("history socket ended");
             };
+            if frame["sub_id"] == "restart-fleet" {
+                assert_eq!(frame["t"], "ev");
+                continue;
+            }
+            assert_eq!(frame["sub_id"], "before-restart");
             if let Some(seq) = frame["seq"].as_u64() {
                 cursor = seq;
             }
@@ -1209,15 +1230,63 @@ fn ended_history_cut_recovers_after_restart_without_losing_the_socket() {
             lineage: None,
             admission: None,
         };
+        let factory = case.worker.factory("queue", vec![]);
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let (release, proceed) = std::sync::mpsc::channel();
         case.worker.generation = case
             .app
             .structured_workers
             .start(
                 &mut case.app.state.structured_agents,
                 launch,
-                case.worker.factory("queue", vec![]),
+                move |record| {
+                    let _ = entered.send(());
+                    proceed
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("restart preparation was not released");
+                    factory(record)
+                },
             )
             .unwrap();
+        within(started).await.unwrap();
+        within(async {
+            loop {
+                let Received::Text(frame) = case.frame(&mut socket).await else {
+                    panic!("fleet busy closed the socket");
+                };
+                if frame["t"] == "subfail" {
+                    assert_eq!(frame["sub_id"], "restart-fleet");
+                    assert_eq!(frame["code"], "session_busy");
+                    break;
+                }
+                assert_eq!(frame["t"], "ev");
+                match frame["sub_id"].as_str() {
+                    Some("before-restart") => cursor = frame["seq"].as_u64().unwrap(),
+                    Some("restart-fleet") => (),
+                    _ => panic!("unexpected restart frame: {frame:?}"),
+                }
+            }
+        })
+        .await;
+        socket
+            .send(json!({"t":"ping","nonce":"scoped-busy-kept-socket"}))
+            .await;
+        within(async {
+            loop {
+                let Received::Text(frame) = case.frame(&mut socket).await else {
+                    panic!("scoped refusal lost the socket");
+                };
+                if frame["t"] == "pong" {
+                    assert_eq!(frame["nonce"], "scoped-busy-kept-socket");
+                    break;
+                }
+                assert_eq!(frame["t"], "ev");
+                assert_eq!(frame["sub_id"], "before-restart");
+                cursor = frame["seq"].as_u64().unwrap();
+            }
+        })
+        .await;
+        release.send(()).unwrap();
         case.driver = within(listener.accept()).await.unwrap().0;
         case.worker
             .ready(
@@ -1228,7 +1297,7 @@ fn ended_history_cut_recovers_after_restart_without_losing_the_socket() {
             )
             .await;
 
-        within(async {
+        tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let Received::Text(frame) = case.frame(&mut socket).await else {
                     panic!("restart closed the socket");
@@ -1243,7 +1312,10 @@ fn ended_history_cut_recovers_after_restart_without_losing_the_socket() {
                 break;
             }
         })
-        .await;
+        .await
+        .expect(
+            "scoped fleet refusal kept the socket alive, but replacement history never recovered",
+        );
         socket.send(json!({"t":"sub","sub_id":"after-restart","stream":format!("agent/{}",case.worker.id),"after":cursor})).await;
         loop {
             let Received::Text(frame) = case.frame(&mut socket).await else {

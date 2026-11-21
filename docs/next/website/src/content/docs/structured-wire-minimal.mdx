@@ -142,7 +142,9 @@ server owner and endpoint, including absent-row completion.
 An agent history cut that reaches its producer's end waits at the registry
 owner for a replacement producer. Once that producer is installed, `lagged`
 closes the old subscription ID; a fresh-ID subscription continues from the
-applied cursor on the same connection.
+applied cursor on the same connection. A fleet `session_busy` refusal preserves
+the authenticated connection, so rebinding that reader keeps an existing
+transcript receiving events after restart.
 
 ### Fleet-lite store recovery
 
