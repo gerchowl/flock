@@ -3,15 +3,15 @@
 import argparse
 import ctypes
 import ctypes.util
-import sys
 import json
 import os
-from pathlib import Path
 import selectors
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
+from pathlib import Path
 
 
 def process_birth(pid):
