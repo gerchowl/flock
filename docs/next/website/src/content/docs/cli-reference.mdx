@@ -1431,6 +1431,31 @@ creating a token. Token names cannot begin with `-`; an operand named
 `--show-token` is not consent. Use `token rm --entry HEX_ID` to revoke an
 older unsafe record by the identifier reported by list.
 
+Destination gateway grants use the same local-operator boundary:
+
+```sh
+flk client grant add NAME --home NODE_ID --principals PRINCIPAL,... --verbs VERB,... --scopes read,send,answer,operate --targets SELECTOR,...
+flk client grant list
+flk client grant revoke NAME
+```
+
+`NODE_ID` must be an enrolled home's pinned node digest. Each named grant sets
+maximum authority for those home-issued principals, exact verbs and scopes.
+Names follow token naming rules; adding an existing name refuses (revoke first).
+Selectors are `agent:<AgentId>`, `workspace:<WorkspaceId>`, or explicit `*`.
+Quote `--targets '*'` to avoid shell expansion. Selectors combine as a union;
+`--targets ''` matches nothing. Workspace selectors use current destination
+membership at admission; names and paths are not selectors. Structured start
+matches only workspace selectors or `*`. List returns the durable generation
+and entries; an invalid/future entry has null authority and can be revoked by
+name. Stored grants survive restart in the private `gateway-grants` directory
+beside `client-tokens`. Revocation advances a generation that fences racing
+admission; it cannot undo an already admitted effect.
+
+These commands prepare destination policy only. Mesh commands remain disabled;
+remote lifecycle verbs are refused pending the owner ruling. A grant never
+widens token scopes, and remote `config.*` remains `unsupported`.
+
 `flk client open [--print]` creates or reuses the operator credential and opens
 a new browser tab or window at a configured loopback URL containing a single-use
 code in its fragment. `--print` prints only the URL, including with `--json`.

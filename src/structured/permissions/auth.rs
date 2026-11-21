@@ -26,3 +26,7 @@ pub(crate) fn fixture(subject: &str, operate: bool) -> VerifiedToken<'_> {
 }
 
 pub(crate) mod tokens;
+
+// Dormant destination authority API, consumed by M2 admission, never local tokens.
+#[allow(dead_code)]
+pub(crate) mod gateway;

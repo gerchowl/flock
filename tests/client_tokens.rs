@@ -385,3 +385,73 @@ fn client_management_inside_an_agent_pane_is_operator_only_exit_thirteen() {
     assert!(text.contains("CLIENT_EXIT=13"), "{text}");
     assert!(!server.directory().join("forbidden.token").exists());
 }
+
+#[test]
+fn destination_gateway_grants_require_enrollment_and_roundtrip_through_cli_and_socket() {
+    let server = Server::start();
+    let home = "a".repeat(64);
+    let args = [
+        "client",
+        "grant",
+        "add",
+        "tablet",
+        "--home",
+        &home,
+        "--principals",
+        "client-1",
+        "--verbs",
+        "agent.send",
+        "--scopes",
+        "send",
+        "--targets",
+        "*",
+        "--json",
+    ];
+    let refused = server.cli(&args);
+    assert!(!refused.status.success());
+    let refused: Value = serde_json::from_slice(&refused.stdout).unwrap();
+    assert_eq!(refused["error"]["code"], "invalid_params");
+    // Seed an explicit fictional enrollment in this isolated destination's store.
+    let database = server
+        .config
+        .join("state")
+        .join(support::paths::app_dir_name())
+        .join("mesh-mail.sqlite");
+    let db = rusqlite::Connection::open(database).unwrap();
+    db.execute("INSERT INTO identity_pins(source,peer,node_id,public_key,origin) VALUES('configured',?1,?2,?3,'configured')", rusqlite::params!["atlas", home, vec![1u8; 32]]).unwrap();
+    drop(db);
+    let added = server.cli(&args);
+    assert!(
+        added.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&added.stdout),
+        String::from_utf8_lossy(&added.stderr)
+    );
+    let added: Value = serde_json::from_slice(&added.stdout).unwrap();
+    assert_eq!(added["result"]["listing"]["generation"], 1);
+    let listed = server.api("client.grant.list", json!({}));
+    assert_eq!(
+        listed["result"]["listing"]["entries"]["tablet"]["targets"],
+        json!(["*"])
+    );
+    let path = server.directory().parent().unwrap().join("gateway-grants");
+    assert_eq!(
+        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    assert_eq!(
+        fs::metadata(path.join("grants.json"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    let duplicate = server.cli(&args);
+    assert!(!duplicate.status.success());
+    let revoked = server.cli(&["client", "grant", "revoke", "tablet", "--json"]);
+    assert!(revoked.status.success());
+    let listed = server.api("client.grant.list", json!({}));
+    assert_eq!(listed["result"]["listing"]["generation"], 2);
+    assert_eq!(listed["result"]["listing"]["entries"], json!({}));
+}
