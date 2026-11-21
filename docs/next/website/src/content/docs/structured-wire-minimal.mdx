@@ -333,16 +333,69 @@ acknowledgement. An absent, expired, lost or recovered pending claim refuses
 unexpired claims are never evicted.
 
 Core owns the command-journal lease and acquires it at handoff ownership commit,
-never during importer preparation. Each journal caller waits at most one second.
-Startup and post-commit acquisition succeed only after holding the lease and
-finishing replay. Failure returns the typed acquisition error (`session_busy`
-on timeout) within that budget, before reporting ready. Like listener and token
-store setup, journal acquisition is a startup prerequisite. Rollback recovery
-remains fenced and retries every 250 ms before reopening admission.
+never during importer preparation. Lease acquisition waits at most one second,
+including any earlier writer drain. Once the lease is held, startup, post-commit
+acquisition and rollback await replay without a total-duration deadline. Replay work
+is bounded by the captured file length and the journal byte and entry caps.
+Readiness requires completed replay; a slow machine can replay a near-full
+journal without repeatedly failing startup. Lease timeout or open failure returns
+typed `session_busy` before reporting ready. Rollback retries failed acquisition
+every 250 ms and remains fenced until replay finishes.
+
+Replay has a separate ten-second stall window (`REPLAY_STALL`): completing lease
+setup, consuming a nonempty read chunk or applying a record resets the window.
+A long replay that keeps progressing can exceed ten seconds overall. A read,
+torn-tail repair or sync that stops making progress for ten seconds returns
+typed `session_busy` and logs `status=stalled` with the last byte counts.
+Admission stays closed, and the existing worker retains its exclusive lease
+until it actually stops. Its late completion cannot reopen admission; background
+recovery then retries after 250 ms. No second local replay starts while that
+worker is still pending. Startup/importer completion fail closed; rollback's
+running transport keeps issuing typed, audited refusals until recovery succeeds.
+
+If the replay worker never returns, this refusal is indefinite: its owning
+`flk` server process keeps the exclusive journal lease, and background recovery
+cannot retry until that worker stops. Commands on an already running transport
+receive `error.code: "session_busy"` with the exact message
+`error.message: "command refused: session_busy"`. Startup or importer completion
+instead fails with the typed `session_busy` acquisition error before readiness.
+To distinguish a journal replay stall from other busy conditions, look for the
+server JSON log with these exact fields: `"message":"command journal replay"`,
+`"event":"client.journal.replay"` and `"status":"stalled"`. Its `replayed_bytes`
+and `total_bytes` fields show the last observed byte counts. The entry records
+the caller's stall timeout; the worker can remain alive with its lease held.
+
+Recover a permanent stall by restarting the **owning server process**. If its
+API responds, use `flk server stop`; otherwise stop that process using its
+service supervisor or normal process-management tools. Wait for actual process
+exit, which releases the journal lease even if the replay worker never returned.
+Then start `flk server` again, or restart it through the same supervisor, using
+the same data directory.
+A live handoff cannot recover a lease still held by that permanently stalled
+process. These are operator recovery steps; an ordinary command retry does not
+restart the server.
+
+Restarting preserves the durable journal; do not delete or recreate
+`wire/commands.jsonl` to clear the stall. Synced claims and completed outcomes
+remain on disk and are replayed after restart. Reconnect and reauthorize, then
+retry an uncertain command within the 24-hour window using the same principal,
+command ID, verb and arguments with `resume_only: true`. A completed outcome
+returns its original acknowledgement. A recovered pending claim returns
+`session_unconfirmed` without executing again: inspect the subject's state to
+resolve that uncertainty instead of sending a new command ID to force execution.
+
+Watch the server logs for `command journal replay`: `status=replaying` reports
+`replayed_bytes=N` / `total_bytes=M` at the start and roughly every tenth of the
+file; `status=ready` follows successful replay. Startup and importer readiness
+wait during replay. An already running rollback transport refuses commands with
+typed, audited `session_busy` until replay completes, without dispatching them.
 
 The exporter closes wire admission before requesting a drain. Freeze and shutdown
 proceed after their one-second journal budget, logging pending write counts;
 abandoned I/O retains its exclusive lease until the worker actually stops.
+The separate five-second credential-revocation and transport-drain waits do not
+read the journal; journal writes and compaction drain under their own caller
+budget. Even a stalled replay cannot extend that shutdown caller budget.
 Rollback remains fenced while it reacquires and replays. A late drain cannot
 close a newer recovered owner. Live commands claim their principal/command key
 durably before dispatch, then recheck current authorization under the token fence. Outcomes sync before
