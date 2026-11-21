@@ -402,3 +402,330 @@ fn stored_revocation_does_not_close_an_authorized_joined_credential() {
         case.stop().await;
     });
 }
+
+async fn slow_outcome_publication(fleet: bool) {
+    let mut case = Case::new(if fleet { 183198 } else { 183190 }).await;
+    let args = case.prompt().await;
+    let mut socket = case.open().await;
+    socket.send(json!({"t":"sub","sub_id":"permission-order","stream":if fleet { "fleet".to_owned() } else { format!("agent/{}",case.worker.id) }})).await;
+    loop {
+        match case.frame(&mut socket).await {
+            Received::Text(frame) if frame["t"] == "synced" => break,
+            Received::Text(frame) => assert!(matches!(frame["t"].as_str(), Some("ev" | "gap"))),
+            other => panic!("bootstrap ended before synced: {other:?}"),
+        }
+    }
+    let (entered, mut started) = oneshot::channel();
+    let (release, resume) = std::sync::mpsc::channel();
+    let mut barrier = Some((entered, resume));
+    let mut writes = 0;
+    case.server
+        .core
+        .journal
+        .configure_test(
+            None,
+            Some(Box::new(move || {
+                writes += 1;
+                if writes == 2 {
+                    let (entered, resume) = barrier.take().unwrap();
+                    let _ = entered.send(());
+                    resume
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("outcome sync was not released");
+                }
+            })),
+        )
+        .await;
+    enqueue(&case, &mut socket, "permission-order", &args).await;
+    let owner = case.server.wake.clone();
+    let worker = case.notify.clone();
+    within(async {
+        loop {
+            let changed = owner.notified();
+            let produced = worker.notified();
+            tokio::pin!(changed, produced);
+            changed.as_mut().enable();
+            produced.as_mut().enable();
+            case.service();
+            tokio::select! { biased;
+                result = &mut started => { result.unwrap(); break; }
+                _ = &mut changed => (), _ = &mut produced => (),
+            }
+        }
+    })
+    .await;
+    within(async {
+        loop {
+            if case.events().iter().any(|r| {
+                r["type"] == "flk_permission_request"
+                    && r["request_id"] == "first-request"
+                    && r["state"] == "closed"
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    socket
+        .send(json!({"t":"ping","nonce":"outcome-sync-held"}))
+        .await;
+    assert_eq!(
+        socket.text().await["t"],
+        "pong",
+        "caused permission event preceded durable ACK"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), case.frame(&mut socket))
+            .await
+            .is_err(),
+        "permission publication escaped while Finish was held"
+    );
+    release.send(()).unwrap();
+    assert_eq!(case.ack(&mut socket).await["ok"], true);
+    let Received::Text(closed) = case.frame(&mut socket).await else {
+        panic!("missing permission close");
+    };
+    if !fleet {
+        assert_eq!(closed["ev"]["state"], "closed");
+    } else {
+        assert_eq!(closed["sub_id"], "permission-order");
+    }
+    case.stop().await;
+}
+
+#[test]
+fn durable_ack_precedes_the_permission_event_it_caused() {
+    runtime(slow_outcome_publication(false));
+}
+#[test]
+fn durable_ack_precedes_the_fleet_projection_it_caused() {
+    runtime(slow_outcome_publication(true));
+}
+
+async fn joined_publication(vanish: bool) {
+    let mut case = Case::new(if vanish { 183200 } else { 183199 }).await;
+    let args = case.prompt().await;
+    let mut origin = case.open().await;
+    let first_id = *case
+        .server
+        .core
+        .shared
+        .clients
+        .lock()
+        .unwrap()
+        .keys()
+        .next()
+        .unwrap();
+    let mut observer = case.open().await;
+    let (id, session) = case
+        .server
+        .core
+        .shared
+        .clients
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(id, _)| **id != first_id)
+        .map(|(id, client)| (*id, client.session.clone()))
+        .unwrap();
+    observer.send(json!({"t":"sub","sub_id":"joined-observer","stream":format!("agent/{}",case.worker.id)})).await;
+    loop {
+        let Received::Text(frame) = case.frame(&mut observer).await else {
+            panic!("observer lost");
+        };
+        if frame["t"] == "synced" {
+            break;
+        }
+    }
+    let (started, release) = hold_next_sync(&case).await;
+    enqueue(&case, &mut origin, "joined-order", &args).await;
+    case.service();
+    within(started).await.unwrap();
+    let (data, mut received) = mpsc::channel(1);
+    let joined = tokio::spawn(wire_commands::execute(
+        case.server.core.shared.clone(),
+        session,
+        data,
+        wire_commands::Command {
+            id: "joined-order".into(),
+            verb: "agent.decide".into(),
+            args,
+            resume_only: true,
+            read_only: false,
+        },
+        id,
+    ));
+    within(async {
+        loop {
+            let changed = case.server.wake.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if case.server.core.command_owner.queued_test() != 0 {
+                break;
+            }
+            changed.await;
+        }
+    })
+    .await;
+    case.service();
+    release.send(()).unwrap();
+    assert_eq!(case.ack(&mut origin).await["ok"], true);
+    let delivery = within(received.recv()).await.unwrap();
+    assert!(matches!(delivery.frame, ServerFrame::Ack { ok: true, .. }));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), case.frame(&mut observer))
+            .await
+            .is_err(),
+        "joined ACK guard did not retain the original command's publication"
+    );
+    if vanish {
+        drop(observer);
+        within(async {
+            loop {
+                if !case
+                    .server
+                    .core
+                    .shared
+                    .clients
+                    .lock()
+                    .unwrap()
+                    .contains_key(&id)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        // Keep the unsent ACK guard alive: origin teardown must release it.
+        case.until(|c| c.handles().len() == 1).await;
+    } else {
+        delivery.delivered.unwrap().send(true).unwrap();
+        drop(delivery.causal);
+        assert_eq!(within(joined).await.unwrap(), Ok(()));
+        let Received::Text(frame) = case.frame(&mut observer).await else {
+            panic!("close missing");
+        };
+        assert_eq!(frame["ev"]["state"], "closed");
+        case.stop().await;
+        return;
+    }
+    drop(delivery);
+    assert!(within(joined).await.unwrap().is_err());
+    case.stop().await;
+}
+#[test]
+fn joined_resume_only_waiter_holds_publication_until_its_ack_flushes() {
+    runtime(joined_publication(false));
+}
+#[test]
+fn joined_origin_loss_releases_an_unsent_ack_still_owned_by_the_command() {
+    runtime(joined_publication(true));
+}
+
+#[test]
+fn near_global_capacity_publication_latency_uses_the_real_wire_path() {
+    runtime(async {
+        let mut case = Case::new(183201).await;
+        within(case.server.core.journal.seed_capacity_test()).await;
+        let args = case.prompt().await;
+        let mut socket = case.open().await;
+        socket
+            .send(
+                json!({"t":"sub","sub_id":"capacity","stream":format!("agent/{}",case.worker.id)}),
+            )
+            .await;
+        loop {
+            let Received::Text(frame) = case.frame(&mut socket).await else {
+                panic!("bootstrap lost");
+            };
+            if frame["t"] == "synced" {
+                break;
+            }
+        }
+        let start = Instant::now();
+        let ack = case.command(&mut socket, "agent.decide", args).await;
+        assert_eq!(ack["ok"], true);
+        let acknowledged = Instant::now();
+        let Received::Text(frame) = case.frame(&mut socket).await else {
+            panic!("close missing");
+        };
+        assert_eq!(frame["ev"]["state"], "closed");
+        eprintln!("capacity real wire claim+dispatch+finish+ACK {:?}; ACK receive to caused publication receive {:?}", acknowledged.duration_since(start), acknowledged.elapsed());
+        case.stop().await;
+    });
+}
+
+#[test]
+fn cancellation_after_claim_preserves_the_effect_and_releases_publication() {
+    runtime(async {
+        let mut case = Case::new(183202).await;
+        let args = case.prompt().await;
+        let mut socket = case.open().await;
+        let (id, session) = case
+            .server
+            .core
+            .shared
+            .clients
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, client)| (*id, client.session.clone()))
+            .next()
+            .unwrap();
+        socket.send(json!({"t":"sub","sub_id":"cancelled-command","stream":format!("agent/{}",case.worker.id)})).await;
+        loop {
+            let Received::Text(frame) = case.frame(&mut socket).await else {
+                panic!("bootstrap lost");
+            };
+            if frame["t"] == "synced" {
+                break;
+            }
+        }
+        let (started, release) = hold_next_sync(&case).await;
+        let (data, _unused) = mpsc::channel(1);
+        let command = tokio::spawn(wire_commands::execute(
+            case.server.core.shared.clone(),
+            session,
+            data,
+            wire_commands::Command {
+                id: "cancelled".into(),
+                verb: "agent.decide".into(),
+                args,
+                resume_only: false,
+                read_only: false,
+            },
+            id,
+        ));
+        within(async {
+            loop {
+                let changed = case.server.wake.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                if case.server.core.command_owner.queued_test() != 0 {
+                    break;
+                }
+                changed.await;
+            }
+        })
+        .await;
+        case.service();
+        within(started).await.unwrap();
+        command.abort();
+        assert!(within(command).await.unwrap_err().is_cancelled());
+        release.send(()).unwrap();
+        let Received::Text(closed) = case.frame(&mut socket).await else {
+            panic!("publication leaked its receipt");
+        };
+        assert_eq!(closed["ev"]["state"], "closed");
+        let rows =
+            fs::read_to_string(case.server._root.path().join("wire/commands.jsonl")).unwrap();
+        assert_eq!(rows.lines().count(), 2);
+        socket
+            .send(json!({"t":"ping","nonce":"cancellation-kept-origin"}))
+            .await;
+        assert_eq!(socket.text().await["nonce"], "cancellation-kept-origin");
+        case.stop().await;
+    });
+}

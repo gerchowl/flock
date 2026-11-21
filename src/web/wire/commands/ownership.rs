@@ -34,6 +34,10 @@ struct Inner {
 #[derive(Clone)]
 pub(in crate::web::wire) struct Ownership(Arc<Inner>);
 impl Ownership {
+    pub(in crate::web::wire) fn data(&self) -> &std::path::Path {
+        &self.0.data
+    }
+
     pub(in crate::web::wire) fn new(data: PathBuf, wake: Arc<Notify>) -> Self {
         #[cfg(test)]
         let open_barrier = tests::take_open_barrier(&data);
@@ -47,6 +51,17 @@ impl Ownership {
             #[cfg(test)]
             open_barrier: parking_lot::Mutex::new(open_barrier),
         }))
+    }
+    #[cfg(test)]
+    pub(in crate::web::wire) async fn seed_capacity_test(&self) {
+        self.submit(
+            self.0.phase.load(Ordering::Acquire),
+            super::journal::Operation::SeedCapacity,
+        )
+        .unwrap()
+        .await
+        .unwrap()
+        .unwrap();
     }
     #[cfg(test)]
     pub(in crate::web::wire) async fn configure_test(

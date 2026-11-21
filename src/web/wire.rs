@@ -55,7 +55,6 @@ const GOING_AWAY_CLOSE: u16 = 1001;
 const POLICY_VIOLATION_CLOSE: u16 = 1008;
 /// Socket identity remains owned until teardown; later dispatch uses this verified session.
 struct Client {
-    #[allow(dead_code)] // P2 adds registration; this field already owns socket teardown.
     causal: crate::structured::publication::causal::Origin,
     session: Session,
     read_only: bool,
@@ -256,23 +255,6 @@ impl Core {
             Some(projection),
         );
     }
-    /// Capture the command's projection before the next ordinary observation.
-    #[allow(dead_code)] // P1 tests the producer seam independently of journal admission.
-    pub(crate) fn service_app_caused(
-        &mut self,
-        app: &mut crate::app::App,
-        root: &std::path::Path,
-        publication: fleet::Publication,
-    ) {
-        let projection = self.fleet_nodes.observe(app, self.shared.clock.now());
-        publication.observe(
-            &app.state.structured_agents,
-            &app.structured_workers,
-            root,
-            app.node_id.as_deref(),
-            Some(projection),
-        );
-    }
     /// Mount only behind S2b-mount's loopback, Host/Origin and funnel guards.
     pub(crate) fn router(&self) -> Router {
         self.endpoint(false)
@@ -296,9 +278,10 @@ impl Core {
         self.shared.refusals.attach(app.event_hub.clone());
         self.shared.refusals.tick(self.shared.clock.now());
         self.admission.service(app);
-        self.command_owner.service(app, &self.shared);
+        self.command_owner
+            .service(app, &self.shared, &mut self.fleet_nodes);
     }
-    /// Journal ownership only: command deduplication remains in memory in J1b2a.
+    /// Fence durable command admission before draining the journal for handoff.
     pub(crate) async fn freeze_commands(&self) -> io::Result<()> {
         self.journal.freeze().await.map_err(io::Error::other)
     }
@@ -803,7 +786,7 @@ async fn connection(
                             }
                             continue;
                         }
-                        running.spawn(commands::execute(shared.clone(), session.clone(), data.clone(), commands::Command { id: cmd_id, verb, args, resume_only, read_only }));
+                        running.spawn(commands::execute(shared.clone(), session.clone(), data.clone(), commands::Command { id: cmd_id, verb, args, resume_only, read_only }, id));
                     }
                     _ => {
                         let frame = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);

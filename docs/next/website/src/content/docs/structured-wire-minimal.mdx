@@ -275,17 +275,22 @@ have no preceding open. Other reasons include `ended`, `cancelled`, `result`,
 `interrupted`, `permission_request_too_large`, and `session_ended` (a prior
 runtime left an unmatched open). Existing closed JSON is preserved apart from `request_seq`.
 
-The server guarantees ACK-before-caused-events on every connection: a command's
-ACK flush precedes publication of its caused history and fleet events, including
-to observers and subscriptions opened during the command. Durable effects can
-exist before publication; replay captures only the published head and byte cut.
-Ordinary snapshots and caused projections use the same publication boundary,
-so a snapshot request cannot bypass an outstanding hold.
-Joined command waiters retain the hold until each ACK flushes or its socket is
-lost. Socket loss releases its waiter without rolling back durable effects.
-Later facts on that stream preserve sequence order; independent producers keep
-running. The bounded producer receipt is introduced separately from the journal
-admission integration (#1380 P2); the current synchronous path is unchanged.
+For journal-admitted permission decisions, the command ACK must be written and flushed
+before its caused permission closed event or transport audit is published. The same
+ordering applies to caused fleet/lifecycle projections, including the fleet rows clients
+render. This holds on every connection, including observers and subscriptions opened
+while the command is pending. Durable Finish precedes the ACK. Joined waiters retain the
+publication hold until each ACK flushes or its originating socket is lost; socket loss
+releases that waiter without rolling back durable effects. Initial replay cuts and
+ordinary projections cannot bypass an active hold. Later records on the fenced stream
+preserve sequence order, while independent producers continue.
+
+This guarantee excludes history records that constitute the command outcome or
+downstream transport output: accepted input and queue admission cuts for `agent.send`,
+and lifecycle launch/terminal transport history. These records may precede the ACK.
+Correlate command outcomes using `cmd_id`; do not infer a universal history fence.
+Universal producer fencing is a separate owner decision tracked in
+[#3198](https://github.com/gerchowl/flock/issues/3198).
 
 The `permission-decision` fixture shows open, `agent.decide` acknowledgement,
 then closed. The ack acknowledges admission; remove the card when the durable

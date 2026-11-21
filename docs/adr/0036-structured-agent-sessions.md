@@ -1432,19 +1432,22 @@ that A authenticated, how the `ack` comes back) in #1380. Until then a
 opening a real terminal to a session, which is a `pty` agent's pane (the
 `terminal/<pane>` stream) served by the node that runs it, as today.
 
-A command's ACK is flushed before any event it caused is published, on every
-connection, including observer and newly opened subscriptions. Producers persist
-effects first, then retain their publication behind a causal receipt until the
-ACK writer flushes; losing an originating socket releases its waiter, and joined
-waiters retain the receipt until all flush or disappear. Published history head
-and replay byte cut advance atomically, with dense stream sequences. Ordinary
-projection capture and caused submission share one ordering boundary, including
-initial snapshot requests; a later ordinary observation cannot bypass a hold. Later facts
-on the same stream stay ordered behind the held fact; independent producers keep
-running. The hold uses bounded producer admission and existing storage and
-backpressure, with no per-connection event buffer. P1 introduces the opt-in
-producer seam; #1380 P2 connects journal Finish to ACK flush and receipt release,
-while the current synchronous admission path retains its existing order.
+For journal-admitted permission decisions, the command ACK must be written and flushed
+before its caused permission closed event or transport audit is published. The same
+ordering applies to caused fleet/lifecycle projections, including the fleet rows clients
+render. This holds on every connection, including observers and subscriptions opened
+while the command is pending. Durable Finish precedes the ACK. Joined waiters retain the
+publication hold until each ACK flushes or its originating socket is lost; socket loss
+releases that waiter without rolling back durable effects. Initial replay cuts and
+ordinary projections cannot bypass an active hold. Later records on the fenced stream
+preserve sequence order, while independent producers continue.
+
+This guarantee excludes history records that constitute the command outcome or
+downstream transport output: accepted input and queue admission cuts for `agent.send`,
+and lifecycle launch/terminal transport history. These records may precede the ACK.
+Correlate command outcomes using `cmd_id`; do not infer a universal history fence.
+Universal producer fencing is a separate owner decision tracked in
+[#3198](https://github.com/gerchowl/flock/issues/3198).
 
 The stream and its history stay the JSONL store of §4 and the endpoint
 below. The open item of whether they should run on the Grafana Labs stack

@@ -74,6 +74,9 @@ pub(super) enum Admission {
     Pending(u64),
 }
 pub(super) enum Operation {
+    #[cfg(test)]
+    SeedCapacity,
+
     Claim {
         namespace: String,
         principal: String,
@@ -270,6 +273,31 @@ impl Journal {
         journal.replay()?;
         Ok(journal)
     }
+    #[cfg(test)]
+    fn seed_capacity_test(&mut self) -> io::Result<()> {
+        use std::io::{Seek, SeekFrom};
+        let mut file = io::BufWriter::new(self.file.try_clone()?);
+        for n in 0..GLOBAL_LIMIT - 1 {
+            let record = Record {
+                version: 1,
+                namespace: "local".into(),
+                principal: format!("p{}", n / PRINCIPAL_LIMIT),
+                cmd_id: format!("id{n}"),
+                digest: [0; 32],
+                admitted_ms: crate::app::notifications::now_ms(),
+                outcome: None,
+            };
+            serde_json::to_writer(&mut file, &record)?;
+            file.write_all(b"\n")?;
+        }
+        file.flush()?;
+        file.get_ref().sync_all()?;
+        drop(file);
+        self.file.try_clone()?.seek(SeekFrom::Start(0))?;
+        self.bytes = self.file.metadata()?.len();
+        self.index = Index::default();
+        self.replay()
+    }
     fn replay(&mut self) -> io::Result<()> {
         let mut reader = io::BufReader::new(self.file.try_clone()?);
         let mut good = 0;
@@ -376,6 +404,13 @@ impl Journal {
         files::rollout_identity(&self.file, &self.root.join("commands.jsonl"))
             .map_err(|_| ErrorCode::SessionUnconfirmed)?;
         match operation {
+            #[cfg(test)]
+            Operation::SeedCapacity => {
+                self.seed_capacity_test()
+                    .map_err(|_| ErrorCode::InternalError)?;
+                Ok(Admission::Pending(0))
+            }
+
             #[cfg(test)]
             Operation::Configure {
                 limits,
