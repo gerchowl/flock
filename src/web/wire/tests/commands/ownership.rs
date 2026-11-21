@@ -1,6 +1,39 @@
 use super::*;
 
 #[test]
+fn rollback_replay_refuses_typed_audited_commands_until_ready() {
+    runtime(async {
+        let mut case = Case::new(183172).await;
+        let args = case.prompt().await;
+        let mut socket = case.open().await;
+        case.server.core.freeze_commands().await.unwrap();
+        let (started, release) = crate::web::wire::commands::Ownership::test_stall_replay(
+            case.server._root.path().to_owned(),
+        );
+        let recovery = case.server.core.reopen_commands();
+        within(started).await.unwrap();
+        refusal(
+            case.command(&mut socket, "agent.decide", args.clone())
+                .await,
+            "session_busy",
+            crate::api::error_code::ErrorCode::SessionBusy.exit(),
+        );
+        assert_eq!(case.handles().len(), 2);
+        let events = refusal_events(&case);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["reason"], "session_busy");
+        release.send(()).unwrap();
+        within(recovery).await.unwrap().unwrap();
+        assert_eq!(
+            case.command(&mut socket, "agent.decide", args).await["ok"],
+            true
+        );
+        case.until(|r| r.handles().len() == 1).await;
+        case.stop().await;
+    });
+}
+
+#[test]
 fn rollback_reopens_wire_admission_before_effect_and_persists_outcome() {
     runtime(async {
         let mut case = Case::new(183170).await;

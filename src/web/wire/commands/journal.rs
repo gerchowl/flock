@@ -109,8 +109,30 @@ pub(super) struct Writer {
 impl Writer {
     /// Return only after replay and exclusive lease acquisition succeed off-thread.
     /// A held lease returns typed busy, never a permanently failed usable writer.
+    #[cfg(test)]
     pub(super) async fn open(data: PathBuf, wake: Arc<Notify>) -> Result<Self, ErrorCode> {
-        Self::spawn(move || Journal::open(&data), wake).await
+        Self::open_signalled(data, wake, None).await
+    }
+    /// Notify the owner after lease setup, before starting the work-bounded replay.
+    pub(super) async fn open_signalled(
+        data: PathBuf,
+        wake: Arc<Notify>,
+        acquired: Option<oneshot::Sender<()>>,
+    ) -> Result<Self, ErrorCode> {
+        Self::spawn(
+            move || {
+                let mut journal = Journal::lease(&data)?;
+                if let Some(acquired) = acquired {
+                    let _ = acquired.send(());
+                }
+                #[cfg(test)]
+                tests::replay_barrier(&data)?;
+                journal.replay()?;
+                Ok(journal)
+            },
+            wake,
+        )
+        .await
     }
     async fn spawn(
         open: impl FnOnce() -> io::Result<Journal> + Send + 'static,
@@ -236,7 +258,14 @@ struct Journal {
     compaction_hook: Option<fn(&str)>,
 }
 impl Journal {
+    #[cfg(test)]
     fn open(data: &Path) -> io::Result<Self> {
+        let mut journal = Self::lease(data)?;
+        tests::replay_barrier(data)?;
+        journal.replay()?;
+        Ok(journal)
+    }
+    fn lease(data: &Path) -> io::Result<Self> {
         let root = data.canonicalize()?.join("wire");
         match files::create_private_dir(&root) {
             Ok(()) => File::open(data)?.sync_all()?,
@@ -252,7 +281,7 @@ impl Journal {
         if bytes > LOG_BYTES {
             return Err(io::Error::other("command journal byte bound"));
         }
-        let mut journal = Self {
+        Ok(Self {
             file,
             root,
             _lease: lease,
@@ -269,9 +298,7 @@ impl Journal {
             before_sync: None,
             #[cfg(test)]
             compaction_hook: None,
-        };
-        journal.replay()?;
-        Ok(journal)
+        })
     }
     #[cfg(test)]
     fn seed_capacity_test(&mut self) -> io::Result<()> {
@@ -299,9 +326,16 @@ impl Journal {
         self.replay()
     }
     fn replay(&mut self) -> io::Result<()> {
-        let mut reader = io::BufReader::new(self.file.try_clone()?);
+        // Read only the captured, byte-capped prefix even if the file grows.
+        let total = self.bytes;
+        let mut reader = io::BufReader::new(self.file.try_clone()?.take(total));
         let mut good = 0;
+        let mut next_report = 0;
         loop {
+            if good >= next_report {
+                crate::logging::client_journal_replay("replaying", good, total);
+                next_report = good.saturating_add((total / 10).max(1));
+            }
             let mut line = Vec::new();
             if reader
                 .by_ref()
@@ -352,6 +386,7 @@ impl Journal {
                 tracing::warn!("opaque command journal entry skipped and preserved");
             }
         }
+        crate::logging::client_journal_replay("ready", total, total);
         Ok(())
     }
     fn append(&mut self, record: &Record) -> Result<(), ErrorCode> {

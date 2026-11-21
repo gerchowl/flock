@@ -587,3 +587,46 @@ impl Writer {
 }
 
 mod capacity;
+
+#[test]
+fn replay_reports_byte_progress_without_record_contents() {
+    let root = root();
+    let mut journal = Journal::open(root.path()).unwrap();
+    journal.apply(operation("private-command-id")).unwrap();
+    drop(journal);
+    let log = crate::logging::capture_logs(|| {
+        drop(Journal::open(root.path()).unwrap());
+    });
+    assert!(log.contains("status=\"replaying\""), "{log}");
+    assert!(log.contains("status=\"ready\""), "{log}");
+    assert!(log.contains("replayed_bytes="), "{log}");
+    assert!(log.contains("total_bytes="), "{log}");
+    assert!(!log.contains("private-command-id"), "{log}");
+}
+
+type ReplayBarrier = (oneshot::Sender<()>, mpsc::Receiver<()>);
+fn replay_hooks() -> &'static parking_lot::Mutex<HashMap<PathBuf, ReplayBarrier>> {
+    static HOOKS: std::sync::OnceLock<parking_lot::Mutex<HashMap<PathBuf, ReplayBarrier>>> =
+        std::sync::OnceLock::new();
+    HOOKS.get_or_init(Default::default)
+}
+pub(super) fn replay_barrier(data: &Path) -> io::Result<()> {
+    let barrier = replay_hooks().lock().remove(data);
+    if let Some((entered, release)) = barrier {
+        let _ = entered.send(());
+        release
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .map_err(io::Error::other)?;
+    }
+    Ok(())
+}
+impl Writer {
+    pub(in crate::web::wire) fn test_stall_replay(
+        data: PathBuf,
+    ) -> (oneshot::Receiver<()>, mpsc::Sender<()>) {
+        let (entered, started) = oneshot::channel();
+        let (release, wait) = mpsc::channel();
+        replay_hooks().lock().insert(data, (entered, wait));
+        (started, release)
+    }
+}

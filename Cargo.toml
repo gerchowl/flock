@@ -96,7 +96,7 @@ pulldown-cmark = { version = "=0.13.6", default-features = false }
 
 [dev-dependencies]
 # Await fixture FIFO reports and bound scripted CLI subprocess lifetimes.
-tokio = { version = "1", features = ["net", "io-util", "process"] }
+tokio = { version = "1", features = ["net", "io-util", "process", "test-util"] }
 # Count SQLite VM operations in store complexity regression tests.
 rusqlite = { version = "0.41.1", features = ["hooks"] }
 

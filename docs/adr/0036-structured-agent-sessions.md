@@ -2040,14 +2040,24 @@ claims and absent, expired or lost resume-only keys refuse `session_unconfirmed`
 A completion from an earlier ownership phase cannot dispatch after freeze or
 rollback. Completed outcomes replay across restart and ownership transfer.
 
-Every journal caller has a one-second budget (`JOURNAL_WAIT`). Startup and
-post-commit importer acquisition succeed only with the journal lease held and
-replay complete; timeout returns typed `session_busy`, and open failure retains
-its typed error, before reporting ready. Acquisition is a prerequisite like token
-store and listener setup. Rollback recovery remains fenced and retries every
-250 ms (`ACQUIRE_RETRY`). Importer preparation never opens the journal. The
-existing watchdog may be disarmed before ownership commit because
-the subsequent journal caller wait is bounded independently.
+Lease acquisition has a one-second budget (`JOURNAL_WAIT`), including any earlier
+writer drain. Startup, post-commit importer acquisition and rollback then await
+replay without a wall-clock deadline. Replay work is bounded by the captured
+journal byte length, checked against `LOG_BYTES`, and the global index cap;
+machine speed cannot turn a valid near-cap journal into a startup refusal.
+Readiness requires both the lease and completed replay. Lease timeout and open
+failure return typed `session_busy`. Acquisition is a prerequisite like token
+store and listener setup. Rollback recovery remains fenced and retries failed
+acquisition every 250 ms (`ACQUIRE_RETRY`). Importer preparation never opens the
+journal. The import watchdog covers preparation and is disarmed before ownership
+commit; post-commit replay is bounded by journal work, not that watchdog.
+
+Server logs report `command journal replay` with `status=replaying`,
+`replayed_bytes=N` and `total_bytes=M` at the start and approximately each tenth
+of the captured file, then `status=ready` after successful replay. Startup and
+importer readiness wait throughout replay. During rollback the running transport
+continues refusing commands with typed, audited `session_busy` until replay
+finishes; it never dispatches using a partial index.
 
 At the existing mesh custody freeze point, the exporter closes wire admission
 and requests a drain. Freeze and shutdown stop waiting after one second, log
@@ -2057,6 +2067,11 @@ the worker retains the exclusive lease until it actually stops. A replacement
 fails closed and retries while that lease is held, never becoming a second
 holder. Shutdown retains its existing separate five-second revocation and
 transport-drain budgets, plus at most one second for the journal caller.
+Neither five-second wait traverses the journal: revocation retires credential
+authorization fences and transport draining waits for socket/fleet leases.
+Journal I/O and compaction drain separately, so increasing journal size does not
+require increasing those budgets. A slow or stalled replay also remains fenced
+when the shutdown journal caller stops waiting.
 
 Rollback schedules reacquisition at the same recovery point as mesh custody.
 Generation fencing prevents stale recovery from reopening admission after a

@@ -173,6 +173,31 @@ async fn shutdown_waits_for_inflight_replay_and_fences_its_late_completion() {
     replacement.shutdown().await.unwrap();
 }
 
+#[tokio::test]
+async fn shutdown_during_leased_replay_is_bounded_and_fences_late_completion() {
+    let (root, owner) = fixture();
+    let (started, release) = Writer::test_stall_replay(root.path().to_owned());
+    let opening = tokio::spawn({
+        let owner = owner.clone();
+        async move { owner.acquire().await }
+    });
+    within(started).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), owner.shutdown())
+        .await
+        .expect("shutdown waited on replay instead of detaching")
+        .unwrap();
+    assert_eq!(owner.gate().load(Ordering::Acquire) & 1, 0);
+    assert!(matches!(
+        Writer::open(root.path().to_owned(), Arc::new(Notify::new())).await,
+        Err(ErrorCode::SessionBusy)
+    ));
+    release.send(()).unwrap();
+    assert_eq!(within(opening).await.unwrap(), Err(ErrorCode::SessionBusy));
+    let replacement = Ownership::new(root.path().to_owned(), Arc::new(Notify::new()));
+    replacement.acquire().await.unwrap();
+    replacement.shutdown().await.unwrap();
+}
+
 fn open_hooks() -> &'static parking_lot::Mutex<std::collections::HashMap<PathBuf, OpenBarrier>> {
     static HOOKS: std::sync::OnceLock<
         parking_lot::Mutex<std::collections::HashMap<PathBuf, OpenBarrier>>,
@@ -183,6 +208,11 @@ pub(super) fn take_open_barrier(data: &std::path::Path) -> Option<OpenBarrier> {
     open_hooks().lock().remove(data)
 }
 impl Ownership {
+    pub(in crate::web::wire) fn test_stall_replay(
+        data: PathBuf,
+    ) -> (oneshot::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        Writer::test_stall_replay(data)
+    }
     pub(in crate::web::wire) fn test_stall_next_open(
         data: PathBuf,
     ) -> (

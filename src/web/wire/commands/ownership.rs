@@ -9,13 +9,17 @@ use std::{
     time::Duration,
 };
 use tokio::sync::{oneshot, Mutex, Notify};
-/// Each startup/commit, rollback, freeze and shutdown journal caller waits at most
-/// one second. Expiry detaches work; it never cancels I/O or releases its lease.
+/// Lease acquisition and drain callers wait at most one second. Replay is bounded
+/// by journal work. Expiry detaches I/O without cancelling it or releasing its lease.
 const JOURNAL_WAIT: Duration = Duration::from_secs(1);
 /// Failed acquisitions retry off-loop, without reopening command admission.
 const ACQUIRE_RETRY: Duration = Duration::from_millis(250);
 #[cfg(test)]
 type OpenBarrier = (oneshot::Sender<()>, oneshot::Receiver<()>);
+type OpenReply = (
+    oneshot::Receiver<()>,
+    oneshot::Receiver<Result<(), ErrorCode>>,
+);
 #[derive(Default)]
 struct Slot {
     phase: u64,
@@ -151,7 +155,7 @@ impl Ownership {
         );
     }
     /// Startup/commit succeeds only after lease acquisition and replay.
-    /// The bounded wait returns its typed error before reporting readiness.
+    /// Only lease acquisition has a wall-clock deadline; replay has a work cap.
     pub(in crate::web::wire) async fn acquire(&self) -> Result<(), ErrorCode> {
         if self.0.stopped.load(Ordering::Acquire) {
             return Err(ErrorCode::SessionBusy);
@@ -164,14 +168,16 @@ impl Ownership {
             Ok(())
         }
     }
-    fn recover(&self, notify: bool) -> oneshot::Receiver<Result<(), ErrorCode>> {
+    fn recover(&self, notify: bool) -> OpenReply {
         let phase = self.close();
+        let (acquired, lease) = oneshot::channel();
         let (send, reply) = oneshot::channel();
         let owner = self.clone();
         tokio::spawn(async move {
             let mut send = Some(send);
+            let mut acquired = Some(acquired);
             loop {
-                let result = owner.acquire_at(phase).await;
+                let result = owner.acquire_at(phase, acquired.take()).await;
                 let delivered = send.take().is_some_and(|send| send.send(result).is_ok());
                 // Synchronous startup already observes its reply. Only later
                 // recovery or rollback needs to wake the running owner loop.
@@ -184,14 +190,11 @@ impl Ownership {
                 tokio::time::sleep(ACQUIRE_RETRY).await;
             }
         });
-        reply
+        (lease, reply)
     }
-    async fn wait_open(
-        &self,
-        reply: oneshot::Receiver<Result<(), ErrorCode>>,
-    ) -> Result<(), ErrorCode> {
-        let result = match tokio::time::timeout(JOURNAL_WAIT, reply).await {
-            Ok(Ok(result)) => result,
+    async fn wait_open(&self, (lease, reply): OpenReply) -> Result<(), ErrorCode> {
+        let result = match tokio::time::timeout(JOURNAL_WAIT, lease).await {
+            Ok(Ok(())) => reply.await.unwrap_or(Err(ErrorCode::SessionBusy)),
             _ => Err(ErrorCode::SessionBusy),
         };
         if result.is_err() {
@@ -199,7 +202,11 @@ impl Ownership {
         }
         result
     }
-    async fn acquire_at(&self, phase: u64) -> Result<(), ErrorCode> {
+    async fn acquire_at(
+        &self,
+        phase: u64,
+        acquired: Option<oneshot::Sender<()>>,
+    ) -> Result<(), ErrorCode> {
         let mut slot = self.0.writer.lock().await;
         if !self.current(phase) {
             return Err(ErrorCode::SessionBusy);
@@ -223,10 +230,13 @@ impl Ownership {
                         .map_err(|_| ErrorCode::SessionBusy)?;
                 }
             }
-            let writer = Writer::open(self.0.data.clone(), self.0.wake.clone()).await?;
+            let writer =
+                Writer::open_signalled(self.0.data.clone(), self.0.wake.clone(), acquired).await?;
             *self.0.pending.lock() = writer.pending();
             slot.phase = phase;
             slot.writer = Some(writer);
+        } else if let Some(acquired) = acquired {
+            let _ = acquired.send(());
         }
         if self.0.stopped.load(Ordering::Acquire)
             || self
@@ -264,7 +274,7 @@ impl Ownership {
         }
         Ok(())
     }
-    /// The first wait is bounded; retries retain fencing after it returns.
+    /// The first lease wait is bounded; replay and retries retain admission fencing.
     pub(in crate::web::wire) fn reopen(&self) -> tokio::task::JoinHandle<Result<(), ErrorCode>> {
         let reply = self.recover(true);
         let owner = self.clone();

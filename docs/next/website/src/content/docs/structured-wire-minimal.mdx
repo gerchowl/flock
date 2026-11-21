@@ -333,16 +333,27 @@ acknowledgement. An absent, expired, lost or recovered pending claim refuses
 unexpired claims are never evicted.
 
 Core owns the command-journal lease and acquires it at handoff ownership commit,
-never during importer preparation. Each journal caller waits at most one second.
-Startup and post-commit acquisition succeed only after holding the lease and
-finishing replay. Failure returns the typed acquisition error (`session_busy`
-on timeout) within that budget, before reporting ready. Like listener and token
-store setup, journal acquisition is a startup prerequisite. Rollback recovery
-remains fenced and retries every 250 ms before reopening admission.
+never during importer preparation. Lease acquisition waits at most one second,
+including any earlier writer drain. Once the lease is held, startup, post-commit
+acquisition and rollback await replay without a wall-clock deadline. Replay work
+is bounded by the captured file length and the journal byte and entry caps.
+Readiness requires completed replay; a slow machine can replay a near-full
+journal without repeatedly failing startup. Lease timeout or open failure returns
+typed `session_busy` before reporting ready. Rollback retries failed acquisition
+every 250 ms and remains fenced until replay finishes.
+
+Watch the server logs for `command journal replay`: `status=replaying` reports
+`replayed_bytes=N` / `total_bytes=M` at the start and roughly every tenth of the
+file; `status=ready` follows successful replay. Startup and importer readiness
+wait during replay. An already running rollback transport refuses commands with
+typed, audited `session_busy` until replay completes, without dispatching them.
 
 The exporter closes wire admission before requesting a drain. Freeze and shutdown
 proceed after their one-second journal budget, logging pending write counts;
 abandoned I/O retains its exclusive lease until the worker actually stops.
+The separate five-second credential-revocation and transport-drain waits do not
+read the journal; journal writes and compaction drain under their own caller
+budget. Even a stalled replay cannot extend that shutdown caller budget.
 Rollback remains fenced while it reacquires and replays. A late drain cannot
 close a newer recovered owner. Live commands claim their principal/command key
 durably before dispatch, then recheck current authorization under the token fence. Outcomes sync before

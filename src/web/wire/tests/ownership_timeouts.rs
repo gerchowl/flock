@@ -1,5 +1,60 @@
 use super::*;
 
+#[tokio::test]
+async fn near_cap_startup_importer_and_rollback_allow_replay_past_lease_budget() {
+    use crate::web::wire::commands::Ownership;
+    let root = crate::structured::launch::SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+    let data = root.path().to_owned();
+    let seed = Core::new(data.clone(), Arc::new(tokio::sync::Notify::new()))
+        .await
+        .unwrap();
+    seed.journal.seed_capacity_test().await;
+    seed.shutdown().await.unwrap();
+    for mode in 0..3 {
+        let (started, release) = Ownership::test_stall_replay(data.clone());
+        let path = data.clone();
+        let mut caller = Box::pin(async move {
+            let core = Core::new_shared(
+                path,
+                Arc::new(tokio::sync::Notify::new()),
+                Owner::default(),
+                crate::api::EventHub::default(),
+                mode != 0,
+            )
+            .await?;
+            if mode == 1 {
+                core.acquire_commands().await?;
+            } else if mode == 2 {
+                core.reopen_commands()
+                    .await
+                    .map_err(io::Error::other)?
+                    .map_err(io::Error::other)?;
+            }
+            Ok::<_, io::Error>(core)
+        });
+        tokio::select! {
+            entered = within(started) => entered.unwrap(),
+            result = &mut caller => panic!("mode {mode} completed before replay: {:?}", result.err()),
+        }
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(2)).await;
+        // Poll after the old deadline while the actual replay worker is held.
+        let premature = futures_util::poll!(caller.as_mut()).is_ready();
+        tokio::time::resume();
+        release.send(()).unwrap();
+        assert!(
+            !premature,
+            "mode {mode} exhausted the replay wall-clock budget"
+        );
+        let result = tokio::time::timeout(Duration::from_secs(30), &mut caller)
+            .await
+            .expect("replay worker failed to complete after release");
+        let core = result.unwrap();
+        assert!(!core.shared.commands.full("agent.decide"));
+        core.shutdown().await.unwrap();
+    }
+}
+
 async fn stalled_open_fails_before_ready(deferred: bool) {
     let root = crate::structured::launch::SessionConfigDir::create(&std::env::temp_dir()).unwrap();
     let data = root.path().to_owned();
