@@ -53,6 +53,17 @@ impl Ownership {
         }))
     }
     #[cfg(test)]
+    pub(in crate::web::wire) async fn observe_writes_test(&self, observed: Arc<AtomicU64>) {
+        self.submit(
+            self.0.phase.load(Ordering::Acquire),
+            super::journal::Operation::ObserveWrites(observed),
+        )
+        .unwrap()
+        .await
+        .unwrap()
+        .unwrap();
+    }
+    #[cfg(test)]
     pub(in crate::web::wire) async fn seed_capacity_test(&self) {
         self.submit(
             self.0.phase.load(Ordering::Acquire),

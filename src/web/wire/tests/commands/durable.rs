@@ -624,36 +624,125 @@ fn joined_origin_loss_releases_an_unsent_ack_still_owned_by_the_command() {
     runtime(joined_publication(true));
 }
 
-#[test]
-fn near_global_capacity_publication_latency_uses_the_real_wire_path() {
-    runtime(async {
-        let mut case = Case::new(183201).await;
-        within(case.server.core.journal.seed_capacity_test()).await;
-        let args = case.prompt().await;
-        let mut socket = case.open().await;
-        socket
-            .send(
-                json!({"t":"sub","sub_id":"capacity","stream":format!("agent/{}",case.worker.id)}),
-            )
-            .await;
-        loop {
-            let Received::Text(frame) = case.frame(&mut socket).await else {
-                panic!("bootstrap lost");
-            };
-            if frame["t"] == "synced" {
-                break;
-            }
-        }
-        let start = Instant::now();
-        let ack = case.command(&mut socket, "agent.decide", args).await;
-        assert_eq!(ack["ok"], true);
-        let acknowledged = Instant::now();
-        let Received::Text(frame) = case.frame(&mut socket).await else {
-            panic!("close missing");
+async fn capacity_publication(near_capacity: bool, report: bool) -> (u64, u64) {
+    let mut case = Case::new(183201).await;
+    let clock = case.server.clock.clone();
+    if near_capacity {
+        case.server.core.journal.seed_capacity_test().await;
+    }
+    let args = case.prompt().await;
+    let mut socket = case.open().await;
+    socket
+        .send(json!({"t":"sub","sub_id":"capacity","stream":format!("agent/{}",case.worker.id)}))
+        .await;
+    loop {
+        let Received::Text(frame) = clock.within(case.frame_without_deadline(&mut socket)).await
+        else {
+            panic!("bootstrap lost");
         };
-        assert_eq!(frame["ev"]["state"], "closed");
+        if frame["t"] == "synced" {
+            break;
+        }
+    }
+    let written = Arc::new(AtomicU64::new(0));
+    case.server
+        .core
+        .journal
+        .observe_writes_test(written.clone())
+        .await;
+    let syncs = Arc::new(Mutex::new(Vec::new()));
+    let samples = syncs.clone();
+    case.server
+        .core
+        .journal
+        .configure_test(
+            None,
+            Some(Box::new(move || {
+                samples.lock().unwrap().push(written.load(Ordering::SeqCst));
+            })),
+        )
+        .await;
+    let start = Instant::now();
+    socket.send(json!({"t":"cmd","cmd_id":"capacity-command","verb":"agent.decide","args":args,"resume_only":false})).await;
+    let Received::Text(ack) = clock.within(case.frame_without_deadline(&mut socket)).await else {
+        panic!("ack missing");
+    };
+    assert_eq!(ack["t"], "ack");
+    assert_eq!(ack["ok"], true);
+    let acknowledged = Instant::now();
+    let Received::Text(frame) = clock.within(case.frame_without_deadline(&mut socket)).await else {
+        panic!("close missing");
+    };
+    assert_eq!(frame["ev"]["state"], "closed");
+    if report {
         eprintln!("capacity real wire claim+dispatch+finish+ACK {:?}; ACK receive to caused publication receive {:?}", acknowledged.duration_since(start), acknowledged.elapsed());
-        case.stop().await;
+    }
+    let rows = syncs.lock().unwrap().clone();
+    assert_eq!(rows.len(), 2, "one sync per claim and finish");
+    let deltas = (rows[0], rows[1] - rows[0]);
+    let path = case.server._root.path().join("wire/commands.jsonl");
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = fs::File::open(path).unwrap();
+    file.seek(SeekFrom::End(-(rows[1] as i64))).unwrap();
+    let mut tail = Vec::new();
+    file.read_to_end(&mut tail).unwrap();
+    let records: Vec<_> = tail.split_inclusive(|b| *b == b'\n').collect();
+    assert_eq!(records.len(), 2, "only claim and outcome were written");
+    assert_eq!(deltas, (records[0].len() as u64, records[1].len() as u64));
+    assert!(serde_json::from_slice::<Value>(records[0]).unwrap()["outcome"].is_null());
+    assert_eq!(
+        serde_json::from_slice::<Value>(records[1]).unwrap()["outcome"]["ok"],
+        true
+    );
+    let widths: Vec<_> = records
+        .iter()
+        .map(|record| {
+            let record: Value = serde_json::from_slice(record).unwrap();
+            record["admitted_ms"].to_string().len() as u64
+                + serde_json::to_vec(&record["digest"]).unwrap().len() as u64
+        })
+        .collect();
+    case.stop().await;
+    (deltas.0 - widths[0], deltas.1 - widths[1])
+}
+
+#[test]
+fn capacity_silent_producer_fails_when_injected_deadline_expires() {
+    runtime(async {
+        let clock = TestClock::new();
+        let timer = clock.clone();
+        let producer = tokio::spawn(async move {
+            timer.within(std::future::pending::<()>()).await;
+        });
+        clock.deadline(5000).await;
+        assert!(!producer.is_finished());
+        clock.advance(5000);
+        let error = within(producer).await.unwrap_err();
+        assert!(error.is_panic());
+        let panic = error.into_panic();
+        assert_eq!(
+            panic.downcast_ref::<&str>(),
+            Some(&"transport producer stayed silent on injected clock")
+        );
+    });
+}
+
+#[test]
+fn near_global_capacity_publication_writes_one_record_per_claim_and_finish() {
+    runtime(async {
+        let empty = capacity_publication(false, false).await;
+        let full = capacity_publication(true, false).await;
+        // Normalize variable decimal widths of the timestamp and payload digest.
+        assert_eq!(empty, full);
+        assert!(full.0 < 2048 && full.1 < 2048);
+    });
+}
+
+#[test]
+#[ignore = "reporting probe; run just capacity-publication-probe"]
+fn near_global_capacity_publication_latency_report() {
+    runtime(async {
+        capacity_publication(true, true).await;
     });
 }
 

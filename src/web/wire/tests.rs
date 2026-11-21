@@ -33,6 +33,15 @@ impl TestClock {
             deadlines: Mutex::new(Vec::new()),
         }))
     }
+    async fn within<T>(&self, work: impl Future<Output = T>) -> T {
+        tokio::select! {
+            biased;
+            result = work => result,
+            _ = self.until(self.now() + Duration::from_secs(5)) => {
+                panic!("transport producer stayed silent on injected clock");
+            }
+        }
+    }
     pub(crate) fn advance(&self, ms: u64) {
         self.0
             .elapsed
@@ -245,34 +254,32 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> Socket<S> {
         .await;
     }
     pub(crate) async fn receive(&mut self) -> Received {
-        within(async {
-            loop {
-                let flags = match self.0.read_u8().await {
-                    Ok(v) => v,
-                    Err(_) => return Received::End,
-                };
-                assert_eq!(flags & 0x70, 0, "server negotiated or emitted compression");
-                let length = self.0.read_u8().await.unwrap();
-                assert_eq!(length & 0x80, 0);
-                let length = match length & 127 {
-                    126 => u64::from(self.0.read_u16().await.unwrap()),
-                    127 => self.0.read_u64().await.unwrap(),
-                    n => u64::from(n),
-                };
-                assert!(length <= MAX_MESSAGE as u64);
-                let mut bytes = vec![0; length as usize];
-                self.0.read_exact(&mut bytes).await.unwrap();
-                match flags & 15 {
-                    1 => return Received::Text(serde_json::from_slice(&bytes).unwrap()),
-                    8 => {
-                        return Received::Close(u16::from_be_bytes(bytes[..2].try_into().unwrap()))
-                    }
-                    9 | 10 => (),
-                    _ => panic!("unexpected websocket opcode"),
-                }
+        within(self.receive_frames()).await
+    }
+    async fn receive_frames(&mut self) -> Received {
+        loop {
+            let flags = match self.0.read_u8().await {
+                Ok(v) => v,
+                Err(_) => return Received::End,
+            };
+            assert_eq!(flags & 0x70, 0, "server negotiated or emitted compression");
+            let length = self.0.read_u8().await.unwrap();
+            assert_eq!(length & 0x80, 0);
+            let length = match length & 127 {
+                126 => u64::from(self.0.read_u16().await.unwrap()),
+                127 => self.0.read_u64().await.unwrap(),
+                n => u64::from(n),
+            };
+            assert!(length <= MAX_MESSAGE as u64);
+            let mut bytes = vec![0; length as usize];
+            self.0.read_exact(&mut bytes).await.unwrap();
+            match flags & 15 {
+                1 => return Received::Text(serde_json::from_slice(&bytes).unwrap()),
+                8 => return Received::Close(u16::from_be_bytes(bytes[..2].try_into().unwrap())),
+                9 | 10 => (),
+                _ => panic!("unexpected websocket opcode"),
             }
-        })
-        .await
+        }
     }
     async fn text(&mut self) -> Value {
         match self.receive().await {

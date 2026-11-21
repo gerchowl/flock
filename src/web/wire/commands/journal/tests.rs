@@ -542,10 +542,15 @@ fn public_writer_opens_and_wakes_only_after_durable_completion() {
 pub(super) struct Stream {
     file: File,
     written: u64,
+    pub(super) observed: Option<Arc<std::sync::atomic::AtomicU64>>,
 }
 impl From<File> for Stream {
     fn from(file: File) -> Self {
-        Self { file, written: 0 }
+        Self {
+            file,
+            written: 0,
+            observed: None,
+        }
     }
 }
 impl std::ops::Deref for Stream {
@@ -558,6 +563,9 @@ impl Write for Stream {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         let count = self.file.write(bytes)?;
         self.written += count as u64;
+        if let Some(observed) = &self.observed {
+            observed.fetch_add(count as u64, Ordering::SeqCst);
+        }
         Ok(count)
     }
     fn flush(&mut self) -> io::Result<()> {

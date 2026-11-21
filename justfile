@@ -310,3 +310,7 @@ ts-check:
 # and runtime styles and type suppressions cannot bypass the gates (ESLint).
 client-lint:
     cd web/client && bun install --frozen-lockfile && bun run lint
+
+# Non-gating real wire publication timings at near-global journal capacity.
+capacity-publication-probe:
+    cargo nextest run --locked --features web,ts --bin flk --test-threads 2 --retries 0 --run-ignored only -E 'test(near_global_capacity_publication_latency_report)' --success-output immediate
