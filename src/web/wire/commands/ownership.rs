@@ -135,14 +135,14 @@ impl Ownership {
             "command journal caller stopped waiting; work remains fenced"
         );
     }
-    /// Success permits the server to run; only the gate proves lease/replay readiness.
-    /// Open failure or timeout keeps the gate closed and recovery running off-loop.
+    /// Startup/commit succeeds only after lease acquisition and replay.
+    /// The bounded wait returns its typed error before reporting readiness.
     pub(in crate::web::wire) async fn acquire(&self) -> Result<(), ErrorCode> {
         if self.0.stopped.load(Ordering::Acquire) {
             return Err(ErrorCode::SessionBusy);
         }
         let reply = self.recover(false);
-        let _ = self.wait_open(reply).await;
+        self.wait_open(reply).await?;
         if self.0.stopped.load(Ordering::Acquire) {
             Err(ErrorCode::SessionBusy)
         } else {

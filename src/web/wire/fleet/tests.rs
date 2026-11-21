@@ -30,10 +30,10 @@ async fn unavailable_observation_preserves_rows_and_fresh_readers_can_recover() 
         }
         let path = root.path().join("fleet.json");
         let before = std::fs::read(&path).unwrap();
-        client.updates.send_replace(Some(Arc::new((
+        client.updates.observe(Arc::new((
             path.clone(),
             Err(crate::api::error_code::ErrorCode::SessionBusy),
-        ))));
+        )));
         assert!(
             matches!(client.subscribe(Some(2)).await, Err(e) if e.kind()==io::ErrorKind::WouldBlock)
         );
@@ -213,7 +213,7 @@ async fn non_utf8_observation_keeps_the_publisher_and_live_reader_running() {
         let path = root.path().join("fleet.json");
         client
             .updates
-            .send_replace(Some(Arc::new((path.clone(), Ok(local.clone())))));
+            .observe(Arc::new((path.clone(), Ok(local.clone()))));
         let mut cut = client.subscribe(None).await.unwrap();
         let mut rows = Vec::new();
         loop {
@@ -240,9 +240,7 @@ async fn non_utf8_observation_keeps_the_publisher_and_live_reader_running() {
             1
         );
         local.agents.pop();
-        client
-            .updates
-            .send_replace(Some(Arc::new((path, Ok(local)))));
+        client.updates.observe(Arc::new((path, Ok(local))));
         let mut removed = Vec::new();
         for _ in 0..2 {
             let ServerFrame::Ev {
@@ -261,4 +259,188 @@ async fn non_utf8_observation_keeps_the_publisher_and_live_reader_running() {
     })
     .await
     .expect("fleet observation producer stayed silent");
+}
+
+#[tokio::test]
+async fn causal_fleet_persists_before_publish_and_fences_new_cuts() {
+    use crate::structured::publication::causal::Cause;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+        let (stop, stopped) = watch::channel(false);
+        let wake = Arc::new(Notify::new());
+        let client = Client::new(wake.clone(), stopped);
+        let mut registry = registry(root.path());
+        let workers = Workers::new(wake);
+        client.observe(&registry, &workers, root.path(), None, None);
+        let mut old = client.subscribe(None).await.unwrap();
+        let cursor = loop {
+            if let ServerFrame::Synced { seq, .. } = old.next("old").await.unwrap() { break seq; }
+        };
+        let (cause, lease) = Cause::hold();
+        let publication = client.reserve(cause.clone()).unwrap();
+        let generation = registry.get("fixture-agent").unwrap().2;
+        let removed = registry.remove("fixture-agent", generation).unwrap();
+        publication.observe(&registry, &workers, root.path(), None, None);
+        let path = root.path().join("fleet.json");
+        loop {
+            let value: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            if value["high_water"].as_u64().unwrap() > cursor { break; }
+            tokio::task::yield_now().await;
+        }
+        // Existing readers and requests for new snapshots cannot see the durable effect.
+        assert!(tokio::time::timeout(Duration::from_millis(20), old.next("old")).await.is_err());
+        assert!(tokio::time::timeout(Duration::from_millis(20), client.subscribe(None)).await.is_err());
+        // Unrelated producers continue; the held source allocates no event buffer.
+        let other_root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+        let other = Client::new(Arc::new(Notify::new()), stop.subscribe());
+        other.observe(&Registry::default(), &workers, other_root.path(), None, None);
+        let mut independent = other.subscribe(None).await.unwrap();
+        assert!(matches!(independent.next("independent").await.unwrap(), ServerFrame::Gap { .. }));
+        // A later ordinary observation must not overwrite the caused projection.
+        registry.register(removed).unwrap();
+        client.observe(&registry, &workers, root.path(), None, None);
+        drop(lease);
+        let ServerFrame::Ev { seq: Some(removed), ev: WireEvent::Json(value), .. } = old.next("old").await.unwrap() else { panic!("remove required") };
+        assert_eq!(removed, cursor + 1);
+        assert_eq!(value["type"], "fleet.remove");
+        let ServerFrame::Ev { seq: Some(restored), .. } = old.next("old").await.unwrap() else { panic!("upsert required") };
+        assert_eq!(restored, removed + 1);
+        let mut fresh = client.subscribe(None).await.unwrap();
+        assert!(matches!(fresh.next("fresh").await.unwrap(), ServerFrame::Gap { to, .. } if to == restored));
+        stop.send_replace(true);
+        client.closed().await;
+        other.closed().await;
+    }).await.expect("causal fleet owner stayed silent");
+}
+
+#[tokio::test]
+async fn causal_fleet_admission_is_bounded_before_effects_and_loss_releases_wait() {
+    use crate::structured::publication::causal::Cause;
+    let (stop, stopped) = watch::channel(false);
+    let client = Client::new(Arc::new(Notify::new()), stopped);
+    let (cause, lease) = Cause::hold();
+    let mut reservations = Vec::new();
+    for _ in 0..32 {
+        reservations.push(client.reserve(cause.clone()).unwrap());
+    }
+    assert!(
+        matches!(client.reserve(cause.clone()), Err(e) if e.kind() == io::ErrorKind::WouldBlock)
+    );
+    drop(reservations);
+    let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+    client.reserve(cause).unwrap().observe(
+        &Registry::default(),
+        &Workers::new(Arc::new(Notify::new())),
+        root.path(),
+        None,
+        None,
+    );
+    stop.send_replace(true);
+    drop(lease);
+    tokio::time::timeout(Duration::from_secs(5), client.closed())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn causal_first_observation_can_serve_later_cuts_without_an_ordinary_update() {
+    use crate::structured::publication::causal::Cause;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+        let (stop, stopped) = watch::channel(false);
+        let client = Client::new(Arc::new(Notify::new()), stopped);
+        let (cause, lease) = Cause::hold();
+        client.reserve(cause).unwrap().observe(
+            &registry(root.path()),
+            &Workers::new(Arc::new(Notify::new())),
+            root.path(),
+            None,
+            None,
+        );
+        // The initial causal observation also initializes the snapshot authority.
+        while !root.path().join("fleet.json").exists() {
+            tokio::task::yield_now().await;
+        }
+        drop(lease);
+        let mut cut = client.subscribe(None).await.unwrap();
+        assert!(matches!(
+            cut.next("first").await.unwrap(),
+            ServerFrame::Gap { to: 1, .. }
+        ));
+        assert!(matches!(
+            cut.next("first").await.unwrap(),
+            ServerFrame::Ev { .. }
+        ));
+        assert!(matches!(
+            cut.next("first").await.unwrap(),
+            ServerFrame::Synced { seq: 2, .. }
+        ));
+        stop.send_replace(true);
+        client.closed().await;
+    })
+    .await
+    .expect("initial causal observation stayed silent");
+}
+
+// Instance-scoped scheduling only: never changes captured data or publication.
+#[derive(Default)]
+pub(super) struct Schedule {
+    selected: parking_lot::Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
+    boundary: parking_lot::Mutex<Option<oneshot::Sender<()>>>,
+}
+impl Schedule {
+    pub(super) async fn selected(&self) {
+        let pause = self.selected.lock().take();
+        if let Some((entered, resume)) = pause {
+            let _ = entered.send(());
+            let _ = resume.await;
+        }
+    }
+    pub(super) fn boundary(&self) {
+        if let Some(entered) = self.boundary.lock().take() {
+            let _ = entered.send(());
+        }
+    }
+}
+#[tokio::test]
+async fn ordinary_snapshot_cannot_publish_a_cause_arriving_after_selection() {
+    use crate::structured::publication::causal::Cause;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+        let (stop, stopped) = watch::channel(false);
+        let wake = Arc::new(Notify::new());
+        let client = Client::new(wake.clone(), stopped);
+        let mut registry = registry(root.path());
+        let workers = Workers::new(wake);
+        client.observe(&registry, &workers, root.path(), None, None);
+        let mut initial = client.subscribe(None).await.unwrap();
+        let cursor = loop {
+            if let ServerFrame::Synced {seq, ..} = initial.next("initial").await.unwrap() { break seq; }
+        };
+        let (entered, selected) = oneshot::channel();
+        let (resume, proceed) = oneshot::channel();
+        *client.schedule.selected.lock() = Some((entered, proceed));
+        let (reply, mut cut) = oneshot::channel();
+        client.requests.send((None,reply)).await.unwrap();
+        selected.await.unwrap();
+        let (cause, lease) = Cause::hold();
+        let publication = client.reserve(cause).unwrap();
+        let generation = registry.get("fixture-agent").unwrap().2;
+        registry.remove("fixture-agent",generation).unwrap();
+        publication.observe(&registry,&workers,root.path(),None,None);
+        client.observe(&registry,&workers,root.path(),None,None);
+        let (prepared, boundary) = oneshot::channel();
+        *client.schedule.boundary.lock() = Some(prepared);
+        resume.send(()).unwrap();
+        boundary.await.unwrap();
+        let public_head = initial.head.load(Ordering::Acquire);
+        assert_eq!(public_head,cursor,"ordinary snapshot published held removal before ACK");
+        assert!(matches!(cut.try_recv(), Err(oneshot::error::TryRecvError::Empty)));
+        drop(lease);
+        let mut cut = cut.await.unwrap().unwrap();
+        assert!(matches!(cut.next("after-ack").await.unwrap(), ServerFrame::Gap {to, ..} if to==cursor+1));
+        assert!(matches!(initial.next("initial").await.unwrap(), ServerFrame::Ev {seq:Some(seq), ..} if seq==cursor+1));
+        stop.send_replace(true);
+        client.closed().await;
+    }).await.expect("snapshot ordering owner stayed silent");
 }

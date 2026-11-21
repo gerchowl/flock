@@ -1,87 +1,81 @@
 use super::*;
 
-async fn stalled_open(deferred: bool) {
+async fn stalled_open_fails_before_ready(deferred: bool) {
     let root = crate::structured::launch::SessionConfigDir::create(&std::env::temp_dir()).unwrap();
     let data = root.path().to_owned();
     let wake = Arc::new(tokio::sync::Notify::new());
-    let events = crate::api::EventHub::default();
     let (started, release) =
         crate::web::wire::commands::Ownership::test_stall_next_open(data.clone());
-    let mut caller = tokio::spawn({
-        let wake = wake.clone();
-        let events = events.clone();
-        async move {
-            let core = Core::new_shared(data, wake, Owner::default(), events, deferred)
-                .await
-                .unwrap();
-            if deferred {
-                core.acquire_commands().await.unwrap();
-            }
-            core
+    let mut caller = tokio::spawn(async move {
+        let core = Core::new_shared(
+            data,
+            wake,
+            Owner::default(),
+            crate::api::EventHub::default(),
+            deferred,
+        )
+        .await?;
+        if deferred {
+            core.acquire_commands().await?;
         }
+        Ok::<_, io::Error>(core)
     });
     within(started).await.unwrap();
-    let early = tokio::time::timeout(Duration::from_secs(2), &mut caller).await;
-    let bounded = early.is_ok();
-    if !bounded {
-        release.send(()).unwrap();
-        let core = within(caller).await.unwrap();
-        core.shutdown().await.unwrap();
-        panic!("startup/importer waited indefinitely for journal open");
-    }
-    let core = early.unwrap().unwrap();
-    assert!(core.shared.commands.full("agent.decide"));
-    let token = root.path().join("client-tokens/probe.token");
-    fs::write(
-        &token,
-        json!({"token":"a".repeat(64),"principal":"c".repeat(32),"scopes":["read","answer"]})
-            .to_string(),
-    )
-    .unwrap();
-    fs::set_permissions(&token, fs::Permissions::from_mode(0o600)).unwrap();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let bind = listener.local_addr().unwrap();
-    let router = core.router();
-    let task = tokio::spawn(async move {
-        axum::serve(listener, router).await.unwrap();
-    });
-    let server = Server {
-        core: Arc::new(core),
-        bind,
-        task,
-        clock: TestClock::new(),
-        _root: root,
-        wake: wake.clone(),
-    };
-    let mut socket = Socket::open(&server).await;
-    socket.hello(1, &"a".repeat(64)).await;
-    socket.send(json!({"t":"cmd","cmd_id":"unavailable","verb":"agent.decide","args":{},"resume_only":false})).await;
-    let ack = socket.text().await;
-    assert_eq!(ack["error"]["code"], "session_busy");
-    let audit = events.events_after(0).unwrap();
-    assert!(audit
-        .iter()
-        .any(|(_, event)| serde_json::to_value(event).unwrap()["event"] == "wire_refused"));
+    let bounded = tokio::time::timeout(Duration::from_secs(2), &mut caller).await;
+    // Release the producer even when the old behavior wrongly returns a Core.
     release.send(()).unwrap();
-    within(async {
-        loop {
-            let changed = wake.notified();
-            tokio::pin!(changed);
-            changed.as_mut().enable();
-            if !server.core.shared.commands.full("agent.decide") {
-                break;
-            }
-            changed.await;
+    let result = bounded
+        .expect("startup/importer waited indefinitely for journal open")
+        .unwrap();
+    let error = match result {
+        Err(error) => error,
+        Ok(core) => {
+            core.shutdown().await.unwrap();
+            panic!("reported ready before command journal lease and replay completed");
         }
-    })
-    .await;
-    server.finish().await;
+    };
+    assert_eq!(
+        error
+            .get_ref()
+            .and_then(|error| error.downcast_ref::<crate::api::error_code::ErrorCode>()),
+        Some(&crate::api::error_code::ErrorCode::SessionBusy),
+    );
 }
 #[test]
-fn stalled_startup_runs_with_audited_wire_refusal_then_recovers() {
-    runtime(stalled_open(false));
+fn stalled_startup_fails_with_typed_error_before_ready() {
+    runtime(stalled_open_fails_before_ready(false));
 }
 #[test]
-fn stalled_importer_after_commit_runs_with_audited_wire_refusal_then_recovers() {
-    runtime(stalled_open(true));
+fn stalled_importer_commit_fails_with_typed_error_before_ready() {
+    runtime(stalled_open_fails_before_ready(true));
+}
+#[test]
+fn importer_preparation_does_not_acquire_exporters_lease() {
+    runtime(async {
+        let root =
+            crate::structured::launch::SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+        let exporter = Core::new(root.path().to_owned(), Arc::new(tokio::sync::Notify::new()))
+            .await
+            .unwrap();
+        let importer = Core::new_shared(
+            root.path().to_owned(),
+            Arc::new(tokio::sync::Notify::new()),
+            Owner::default(),
+            crate::api::EventHub::default(),
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(importer.shared.commands.full("agent.decide"));
+        exporter.freeze_commands().await.unwrap();
+        importer.acquire_commands().await.unwrap();
+        assert!(!importer.shared.commands.full("agent.decide"));
+        let contender =
+            Core::new(root.path().to_owned(), Arc::new(tokio::sync::Notify::new())).await;
+        assert!(
+            matches!(contender, Err(error) if error.get_ref().and_then(|e| e.downcast_ref::<crate::api::error_code::ErrorCode>()) == Some(&crate::api::error_code::ErrorCode::SessionBusy))
+        );
+        importer.shutdown().await.unwrap();
+        exporter.shutdown().await.unwrap();
+    });
 }

@@ -1432,6 +1432,20 @@ that A authenticated, how the `ack` comes back) in #1380. Until then a
 opening a real terminal to a session, which is a `pty` agent's pane (the
 `terminal/<pane>` stream) served by the node that runs it, as today.
 
+A command's ACK is flushed before any event it caused is published, on every
+connection, including observer and newly opened subscriptions. Producers persist
+effects first, then retain their publication behind a causal receipt until the
+ACK writer flushes; losing an originating socket releases its waiter, and joined
+waiters retain the receipt until all flush or disappear. Published history head
+and replay byte cut advance atomically, with dense stream sequences. Ordinary
+projection capture and caused submission share one ordering boundary, including
+initial snapshot requests; a later ordinary observation cannot bypass a hold. Later facts
+on the same stream stay ordered behind the held fact; independent producers keep
+running. The hold uses bounded producer admission and existing storage and
+backpressure, with no per-connection event buffer. P1 introduces the opt-in
+producer seam; #1380 P2 connects journal Finish to ACK flush and receipt release,
+while the current synchronous admission path retains its existing order.
+
 The stream and its history stay the JSONL store of §4 and the endpoint
 below. The open item of whether they should run on the Grafana Labs stack
 (#1323) was resolved by the owner on 2026-10-16 (ADR-0038 §11 item 5):
@@ -1945,7 +1959,7 @@ the wire enum; implementation registers any new API error codes where needed):
 | `invalid_agent` | Unsafe or reserved stored agent namespace. Retry class `never`: select a valid subject rather than retrying unchanged. |
 | `unknown_stream` | Unknown stream kind or removed subject. Show unavailable and stop that subscription until the user selects a valid stream. |
 | `scope` | Token lacks read scope for the stream. Show refusal and stop that subscription until authorization changes. |
-| `session_busy` | Token mutation is pending. Retry class `later`: retry only this stream with fresh IDs after 250, 500 and 1000 ms (three automatic same-socket retries since the last `synced`), then remain visibly Refused until reopened or a later reconnect supplies a new welcome. Sibling subscriptions and the authenticated socket stay connected. |
+| `session_busy` | Token mutation is pending, or the fleet permission book is temporarily unavailable during worker preparation or read contention. Retry class `later`: retry only this stream with fresh IDs after 250, 500 and 1000 ms (three automatic same-socket retries since the last `synced`), then remain visibly Refused until reopened or a later reconnect supplies a new welcome. Sibling subscriptions and the authenticated socket stay connected. |
 | `sub_id_reused` | ID was already used on this connection, live or closed. Refuse the registration; treat this as a client allocation error and use a fresh ID for any new subscription. |
 
 Start the 30 s progress deadline at sub registration, or when a new gap starts
@@ -2021,12 +2035,13 @@ claims and absent, expired or lost resume-only keys refuse `session_unconfirmed`
 A completion from an earlier ownership phase cannot dispatch after freeze or
 rollback. Completed outcomes replay across restart and ownership transfer.
 
-Ownership lifecycle callers have a one-second budget (`JOURNAL_WAIT`). Startup and
-post-commit importer acquisition return a running server even when that budget
-expires or open fails; wire commands remain refused as audited `session_busy`
-until the background task holds the lease and finishes replay. Failed attempts
-retry every 250 ms (`ACQUIRE_RETRY`). Importer preparation never opens the
-journal. The existing watchdog may be disarmed before ownership commit because
+Every journal caller has a one-second budget (`JOURNAL_WAIT`). Startup and
+post-commit importer acquisition succeed only with the journal lease held and
+replay complete; timeout returns typed `session_busy`, and open failure retains
+its typed error, before reporting ready. Acquisition is a prerequisite like token
+store and listener setup. Rollback recovery remains fenced and retries every
+250 ms (`ACQUIRE_RETRY`). Importer preparation never opens the journal. The
+existing watchdog may be disarmed before ownership commit because
 the subsequent journal caller wait is bounded independently.
 
 At the existing mesh custody freeze point, the exporter closes wire admission

@@ -158,7 +158,10 @@ export function createWireFleet(connection: WireConnection): FleetSource {
         reset: () => {
           if (open) observer.reset();
         },
-        refused: (refusal) => end(refusal.message),
+        refused: (refusal) => {
+          if (refusal.code === "session_busy") observer.failed(refusal.message, true);
+          else end(refusal.message);
+        },
       }).close;
       return () => {
         if (!open) return;

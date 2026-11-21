@@ -188,6 +188,7 @@ pub(super) async fn deliver(
             frame,
             active: Some(live.clone()),
             delivered: Some(tx),
+            causal: None,
         })
         .await
         .is_err()
@@ -301,7 +302,17 @@ pub(super) async fn replay(
                 sub_id: id.into(),
                 skipped_to,
             },
-            Item::End => return Ok(()),
+            Item::End => {
+                owner
+                    .replacement(stream[6..].into(), wake.clone())
+                    .await
+                    .map_err(|_| None)?
+                    .ok_or(SubfailCode::UnknownStream)?;
+                ServerFrame::Lagged {
+                    sub_id: id.into(),
+                    skipped_to: cursor,
+                }
+            }
             Item::Pending => {
                 notified.await;
                 continue;

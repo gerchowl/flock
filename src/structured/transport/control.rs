@@ -10,6 +10,7 @@ struct Admission {
 }
 
 pub(super) struct Recorder<'a> {
+    cause: Option<super::super::publication::causal::Cause>,
     file: &'a mut File,
     seq: &'a mut u64,
     version: &'a str,
@@ -41,6 +42,7 @@ impl<'a> Recorder<'a> {
         ),
     ) -> Self {
         Self {
+            cause: None,
             file,
             seq,
             version,
@@ -60,7 +62,7 @@ impl<'a> Recorder<'a> {
         grant_request_id: Option<&str>,
         request_seq: Option<u64>,
     ) -> io::Result<Received> {
-        persist(
+        persist_caused(
             self.file,
             self.seq,
             raw,
@@ -71,7 +73,12 @@ impl<'a> Recorder<'a> {
             synthetic,
             grant_request_id,
             request_seq,
-            self.storage,
+            (
+                self.storage.0,
+                self.storage.1,
+                self.storage.2,
+                self.cause.as_ref().map(|cause| (cause, self.cancel)),
+            ),
         )
     }
     fn audit(&mut self, value: &impl Serialize) -> io::Result<Received> {
@@ -92,7 +99,14 @@ impl<'a> Recorder<'a> {
     }
     pub fn command(&mut self, command: Command) -> io::Result<()> {
         match command {
-            Command::Decide(control) => self.answer(control),
+            Command::Decide(mut control) => {
+                self.cause = control.cause.take();
+                let result = self.answer(control);
+                if result.is_ok() {
+                    self.cause = None;
+                }
+                result
+            }
             Command::Close(closings) => self.close(closings),
         }
     }
@@ -155,7 +169,13 @@ impl<'a> Recorder<'a> {
     }
     pub fn finish(&mut self) -> io::Result<()> {
         let closings = self.controls.book.lock().terminal();
-        self.close(closings)
+        let result = self.close(closings);
+        // An audit failure cannot expose its terminal cleanup before the ACK.
+        if let Some(cause) = &self.cause {
+            let released = cause.wait(self.cancel);
+            return result.and(released);
+        }
+        result
     }
     fn permission(
         &self,
@@ -316,7 +336,11 @@ impl<'a> Recorder<'a> {
         }
         if let Some(answer) = admission.answer {
             let bytes = encode(&answer.response)?;
-            self.answer(Control { answer, bytes })?;
+            self.answer(Control {
+                answer,
+                bytes,
+                cause: None,
+            })?;
         }
         if let Some(answer) = admission.refusal {
             // Reuse cancel-aware bounded delivery: a slow stdin delays this deny

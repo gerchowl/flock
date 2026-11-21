@@ -98,9 +98,10 @@ fn fleet_endpoint_empty_and_nonempty_bootstrap() {
     });
 }
 struct Controlled {
+    data: mpsc::Sender<super::super::output::Delivery>,
     subscriptions: super::super::subscriptions::Subscriptions,
     frames: mpsc::Receiver<super::super::output::Delivery>,
-    _priority: mpsc::Receiver<super::super::output::Control>,
+    priority: mpsc::Receiver<super::super::output::Control>,
 }
 impl Controlled {
     fn new(case: &Case) -> Self {
@@ -109,11 +110,12 @@ impl Controlled {
         let shared = case.server.core.shared.clone();
         let session = shared.store.authenticate(&Bearer("a".repeat(64))).unwrap();
         Self {
+            data: data.clone(),
             subscriptions: super::super::subscriptions::Subscriptions::new(
                 shared, data, session, priority,
             ),
             frames,
-            _priority: control,
+            priority: control,
         }
     }
     async fn delivery(&mut self) -> super::super::output::Delivery {
@@ -756,6 +758,248 @@ fn pre_entity_wire_receives_lossless_unknown_node_and_project_payloads() {
             unknown,
             vec![json!("fleet.node.upsert"), json!("fleet.project.upsert")]
         );
+        case.server.finish().await;
+    });
+}
+
+#[test]
+fn preparing_worker_refuses_only_the_fleet_subscription_and_keeps_the_socket() {
+    runtime(async {
+        use crate::structured::workers::tests::Case as Worker;
+        let mut case = Case::new().await;
+        case.service();
+        let mut socket = case.open().await;
+        socket
+            .send(json!({"t":"sub","sub_id":"before-preparation","stream":"fleet"}))
+            .await;
+        assert_eq!(case.frame(&mut socket).await["t"], "gap");
+        assert_eq!(case.frame(&mut socket).await["t"], "synced");
+        let (mut worker, launch, factory) =
+            Worker::prepare(&mut case.registry, 183191, "state-reducer", vec![]);
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let (release, proceed) = std::sync::mpsc::channel();
+        worker.generation = case
+            .workers
+            .start(&mut case.registry, launch, move |record| {
+                entered.send(()).unwrap();
+                proceed
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("worker preparation was not released");
+                factory(record)
+            })
+            .unwrap();
+        within(started).await.unwrap();
+        case.service();
+        let refused = case.frame(&mut socket).await;
+        assert_eq!(refused["t"], "subfail");
+        assert_eq!(refused["code"], "session_busy");
+        socket
+            .send(json!({"t":"sub","sub_id":"during-preparation","stream":"fleet"}))
+            .await;
+        let initial_refusal = case.frame(&mut socket).await;
+        assert_eq!(initial_refusal["t"], "subfail");
+        assert_eq!(initial_refusal["sub_id"], "during-preparation");
+        assert_eq!(initial_refusal["code"], "session_busy");
+        socket
+            .send(json!({"t":"ping","nonce":"fleet-still-connected"}))
+            .await;
+        assert_eq!(socket.text().await["t"], "pong");
+        release.send(()).unwrap();
+        let wake = case.server.wake.clone();
+        worker
+            .ready(&mut case.registry, &mut case.workers, &wake, Instant::now())
+            .await;
+        case.service();
+        socket
+            .send(json!({"t":"sub","sub_id":"after-preparation","stream":"fleet"}))
+            .await;
+        loop {
+            if case.frame(&mut socket).await["t"] == "synced" {
+                break;
+            }
+        }
+        worker
+            .finish(
+                &mut case.registry,
+                &mut case.workers,
+                &wake,
+                Instant::now(),
+                None,
+            )
+            .await;
+        case.server.finish().await;
+    });
+}
+
+#[test]
+fn fleet_busy_refusal_uses_the_ack_lane_without_priority_close() {
+    runtime(async {
+        let mut case = Case::new().await;
+        case.service();
+        let mut wire = Controlled::new(&case);
+        wire.sub("busy-after-ack", None);
+        assert_eq!(wire.frame().await["t"], "gap");
+        assert_eq!(wire.frame().await["t"], "synced");
+        let (flushed, receipt) = tokio::sync::oneshot::channel();
+        wire.data
+            .send(super::super::output::Delivery {
+                frame: super::super::commands::ack("earlier-command".into(), Ok(json!({}))),
+                active: None,
+                delivered: Some(flushed),
+                causal: None,
+            })
+            .await
+            .unwrap();
+        // The absent live book makes this a real unavailable fleet observation.
+        let (mut worker, launch, factory) = crate::structured::workers::tests::Case::prepare(
+            &mut case.registry,
+            183192,
+            "state-reducer",
+            vec![],
+        );
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let (release, proceed) = std::sync::mpsc::channel();
+        worker.generation = case
+            .workers
+            .start(&mut case.registry, launch, move |record| {
+                let _ = entered.send(());
+                proceed
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("worker preparation was not released");
+                factory(record)
+            })
+            .unwrap();
+        within(started).await.unwrap();
+        case.service();
+        let ack = wire.frame().await;
+        assert_eq!(ack["cmd_id"], "earlier-command");
+        assert_eq!(within(receipt).await, Ok(true));
+        let delivery = within(async {
+            tokio::select! { biased;
+                close = wire.priority.recv() => panic!("fleet refusal bypassed pending data with priority control: {close:?}"),
+                frame = wire.frames.recv() => frame.expect("fleet subscription ended without refusal"),
+            }
+        }).await;
+        let refusal = serde_json::to_value(delivery.frame).unwrap();
+        delivery.delivered.unwrap().send(true).unwrap();
+        assert_eq!(refusal["t"], "subfail");
+        assert_eq!(refusal["code"], "session_busy");
+        assert!(matches!(
+            wire.priority.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        release.send(()).unwrap();
+        let wake = case.server.wake.clone();
+        worker
+            .ready(&mut case.registry, &mut case.workers, &wake, Instant::now())
+            .await;
+        worker
+            .finish(
+                &mut case.registry,
+                &mut case.workers,
+                &wake,
+                Instant::now(),
+                None,
+            )
+            .await;
+        case.server.finish().await;
+    });
+}
+
+#[test]
+fn causal_fleet_socket_observers_and_new_subscription_wait_for_origin_ack() {
+    use crate::structured::publication::causal::Cause;
+    runtime(async {
+        let mut case = Case::new().await;
+        case.add("fixture-agent");
+        case.service();
+        let mut origin = case.open().await;
+        let origin_data = case
+            .server
+            .core
+            .shared
+            .clients
+            .lock()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap()
+            .data
+            .clone();
+        let mut observer = case.open().await;
+        let mut cursor = 0;
+        for socket in [&mut origin, &mut observer] {
+            socket
+                .send(json!({"t":"sub","sub_id":"fleet","stream":"fleet"}))
+                .await;
+            loop {
+                let frame = case.frame(socket).await;
+                if frame["t"] == "synced" {
+                    cursor = frame["seq"].as_u64().unwrap();
+                    break;
+                }
+            }
+        }
+        let (cause, lease) = Cause::hold();
+        let publication = case.server.core.shared.fleet.reserve(cause).unwrap();
+        case.remove("fixture-agent");
+        publication.observe(
+            &case.registry,
+            &case.workers,
+            case.server._root.path(),
+            None,
+            None,
+        );
+        within(async {
+            loop {
+                let bytes = fs::read(case.server._root.path().join("fleet.json")).unwrap();
+                let disk: Value = serde_json::from_slice(&bytes).unwrap();
+                if disk["high_water"].as_u64().unwrap() > cursor {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        let mut fresh = case.open().await;
+        fresh
+            .send(json!({"t":"sub","sub_id":"fresh","stream":"fleet"}))
+            .await;
+        for socket in [&mut origin, &mut observer, &mut fresh] {
+            socket.send(json!({"t":"ping","nonce":"held-fleet"})).await;
+            assert_eq!(
+                case.frame(socket).await,
+                json!({"t":"pong","nonce":"held-fleet"})
+            );
+        }
+        // Pongs have priority; also prove no data frame is merely queued behind one.
+        for socket in [&mut origin, &mut observer, &mut fresh] {
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), case.frame(socket))
+                    .await
+                    .is_err()
+            );
+        }
+        origin_data
+            .send(output::Delivery {
+                frame: super::super::commands::ack("lifecycle-effect".into(), Ok(json!({}))),
+                active: None,
+                delivered: None,
+                causal: Some(lease),
+            })
+            .await
+            .unwrap();
+        assert_eq!(case.frame(&mut origin).await["t"], "ack");
+        for socket in [&mut origin, &mut observer] {
+            let frame = case.frame(socket).await;
+            assert_eq!(frame["t"], "ev");
+            assert_eq!(frame["ev"]["type"], "fleet.remove");
+            assert_eq!(frame["seq"], cursor + 1);
+        }
+        let fresh_cut = case.frame(&mut fresh).await;
+        assert_eq!(fresh_cut["t"], "gap");
+        assert_eq!(fresh_cut["to"], cursor + 1);
+        assert_eq!(case.frame(&mut fresh).await["t"], "synced");
         case.server.finish().await;
     });
 }

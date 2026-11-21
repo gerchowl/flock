@@ -11,7 +11,7 @@ use crate::api::{
 };
 use std::io::IsTerminal;
 
-const USAGE: &str = "flk client token add NAME --scopes read,send,answer,operate [--show-token] | token rm NAME | token rm --entry ID | token list | open [--print]";
+const USAGE: &str = "flk client token add NAME --scopes read,send,answer,operate [--show-token] | token rm NAME | token rm --entry ID | token list | open [--print] | grant add NAME --home NODE_ID --principals P,... --verbs V,... --scopes S,... --targets SELECTOR,... | grant list | grant revoke NAME";
 pub(super) fn run(args: &[String]) -> std::io::Result<i32> {
     if super::help::asks_for_help(args) || args.first().is_some_and(|s| s == "help") {
         println!("usage: {USAGE}");
@@ -56,6 +56,34 @@ fn parse(args: &[String]) -> Option<(Method, bool)> {
     let mut show_token = false;
     let method = match args.as_slice() {
         ["open"] | ["open", "--print"] => Method::ClientOpen(EmptyParams {}),
+        ["grant", "list"] => Method::ClientGrantList(EmptyParams {}),
+        ["grant", "revoke", name] => {
+            Method::ClientGrantRevoke(crate::api::gateway_grants::Revoke {
+                name: (*name).into(),
+            })
+        }
+        ["grant", "add", name, "--home", home, "--principals", principals, "--verbs", verbs, "--scopes", scopes, "--targets", targets] =>
+        {
+            let set = |s: &str| {
+                if s.is_empty() {
+                    std::collections::BTreeSet::new()
+                } else {
+                    s.split(',').map(str::to_owned).collect()
+                }
+            };
+            Method::ClientGrantAdd(crate::api::gateway_grants::Grant {
+                name: (*name).into(),
+                home_node_id: (*home).into(),
+                principals: set(principals),
+                verbs: set(verbs),
+                targets: set(targets),
+                scopes: set(scopes)
+                    .into_iter()
+                    .map(|s| serde_json::from_value(serde_json::json!(s)))
+                    .collect::<Result<_, _>>()
+                    .ok()?,
+            })
+        }
         ["token", "list"] => Method::ClientTokenList(EmptyParams {}),
         ["token", "rm", name] => Method::ClientTokenRemove(RemoveParams {
             name: Some((*name).into()),
@@ -120,5 +148,41 @@ mod tests {
         assert!(parse(&["token", "add", "phone", "--scopes", "operator"]).is_none());
         assert!(parse(&["token", "rm", "phone", "--entry", "aa"]).is_none());
         assert!(parse(&["open", "--print", "http://example.test"]).is_none());
+    }
+}
+
+#[cfg(test)]
+mod gateway_tests {
+    #[test]
+    fn gateway_management_cli_accepts_explicit_selectors_and_empty_targets() {
+        for targets in ["*", "", "agent:agent_atlas_1,workspace:w1"] {
+            let args: Vec<String> = [
+                "grant",
+                "add",
+                "tablet",
+                "--home",
+                &"a".repeat(64),
+                "--principals",
+                "client-1",
+                "--verbs",
+                "agent.send",
+                "--scopes",
+                "send",
+                "--targets",
+                targets,
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+            assert!(
+                super::parse(&args).is_some(),
+                "grant add must parse explicit targets"
+            );
+        }
+        for words in [vec!["grant", "list"], vec!["grant", "revoke", "tablet"]] {
+            assert!(
+                super::parse(&words.into_iter().map(str::to_owned).collect::<Vec<_>>()).is_some()
+            );
+        }
     }
 }

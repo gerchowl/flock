@@ -21,3 +21,5 @@ pub(crate) trait Subscription {
     /// Coalesced readiness hint. Enable before paging, then recheck after waking.
     fn waker(&self) -> std::sync::Arc<tokio::sync::Notify>;
 }
+
+pub(crate) mod causal;
