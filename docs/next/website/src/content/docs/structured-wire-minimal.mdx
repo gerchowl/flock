@@ -139,6 +139,13 @@ bootstrap, live updates/removal and recovery on the client.
 `tests/fixtures/structured-wire/fleet-server.jsonl` separately drives the real
 server owner and endpoint, including absent-row completion.
 
+An agent history cut that reaches its producer's end waits at the registry
+owner for a replacement producer. Once that producer is installed, `lagged`
+closes the old subscription ID; a fresh-ID subscription continues from the
+applied cursor on the same connection. A fleet `session_busy` refusal preserves
+the authenticated connection, so rebinding that reader keeps an existing
+transcript receiving events after restart.
+
 ### Fleet-lite store recovery
 
 An empty, unmarked lock with neither data record opens at zero. This includes an
@@ -178,9 +185,14 @@ replay, under those cut limits. The latest coherent owner-turn materialization
 may replace an unprocessed one;
 use the agent journal for every intermediate event.
 
-An unavailable permission-book observation leaves stored rows intact and fails
-its readers instead of publishing an empty attention list. This includes a
-preparing worker or one with unconfirmed cleanup: an absent Runtime book is
+An unavailable permission-book observation leaves stored rows intact and refuses
+only its fleet subscription with retryable `subfail session_busy`, through the
+normal data writer after already queued acknowledgements. The socket and sibling
+subscriptions stay connected. Retry with a fresh subscription ID after 250, 500
+and 1000 ms, as for other `session_busy` subscription refusals, instead of
+publishing an empty attention list. Fleet readers retain their shared
+subscription and last coherent rows through this retry cycle, show refusal
+while unavailable, and recover from the next snapshot without reconnecting. This includes a preparing worker or one with unconfirmed cleanup: an absent Runtime book is
 empty only when no worker exists or its producer is joined and its authority
 released. A later coherent
 observation can serve fresh readers. Storage failure stops the fleet owner,
@@ -303,9 +315,11 @@ ends on server restart or eviction.
 
 Core owns the command-journal lease and acquires it at handoff ownership commit,
 never during importer preparation. Each journal caller waits at most one second.
-A delayed or failed startup/commit acquisition leaves the server running with
-wire commands refused as audited `session_busy`. Background attempts retry every
-250 ms and reopen admission only after acquiring the lease and replaying.
+Startup and post-commit acquisition succeed only after holding the lease and
+finishing replay. Failure returns the typed acquisition error (`session_busy`
+on timeout) within that budget, before reporting ready. Like listener and token
+store setup, journal acquisition is a startup prerequisite. Rollback recovery
+remains fenced and retries every 250 ms before reopening admission.
 
 The exporter closes wire admission before requesting a drain. Freeze and shutdown
 proceed after their one-second journal budget, logging pending write counts;
