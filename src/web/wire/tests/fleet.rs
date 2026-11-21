@@ -941,7 +941,7 @@ fn causal_fleet_socket_observers_and_new_subscription_wait_for_origin_ack() {
             }
         }
         let (cause, lease) = Cause::hold();
-        let publication = case.server.core.causal_fleet(cause).unwrap();
+        let publication = case.server.core.shared.fleet.reserve(cause).unwrap();
         case.remove("fixture-agent");
         publication.observe(
             &case.registry,

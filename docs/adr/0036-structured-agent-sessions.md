@@ -1437,7 +1437,9 @@ connection, including observer and newly opened subscriptions. Producers persist
 effects first, then retain their publication behind a causal receipt until the
 ACK writer flushes; losing an originating socket releases its waiter, and joined
 waiters retain the receipt until all flush or disappear. Published history head
-and replay byte cut advance atomically, with dense stream sequences. Later facts
+and replay byte cut advance atomically, with dense stream sequences. Ordinary
+projection capture and caused submission share one ordering boundary, including
+initial snapshot requests; a later ordinary observation cannot bypass a hold. Later facts
 on the same stream stay ordered behind the held fact; independent producers keep
 running. The hold uses bounded producer admission and existing storage and
 backpressure, with no per-connection event buffer. P1 introduces the opt-in

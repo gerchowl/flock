@@ -30,12 +30,9 @@ async fn unavailable_observation_preserves_rows_and_fresh_readers_can_recover() 
         }
         let path = root.path().join("fleet.json");
         let before = std::fs::read(&path).unwrap();
-        client.updates.send_replace(Some((
-            client.serial.fetch_add(1, Ordering::Relaxed),
-            Arc::new((
-                path.clone(),
-                Err(crate::api::error_code::ErrorCode::SessionBusy),
-            )),
+        client.updates.observe(Arc::new((
+            path.clone(),
+            Err(crate::api::error_code::ErrorCode::SessionBusy),
         )));
         assert!(
             matches!(client.subscribe(Some(2)).await, Err(e) if e.kind()==io::ErrorKind::WouldBlock)
@@ -214,10 +211,9 @@ async fn non_utf8_observation_keeps_the_publisher_and_live_reader_running() {
         // Exercise the typed publisher boundary. Registry JSON admission already
         // rejects non-UTF-8 paths, independently of this projection's contract.
         let path = root.path().join("fleet.json");
-        client.updates.send_replace(Some((
-            client.serial.fetch_add(1, Ordering::Relaxed),
-            Arc::new((path.clone(), Ok(local.clone()))),
-        )));
+        client
+            .updates
+            .observe(Arc::new((path.clone(), Ok(local.clone()))));
         let mut cut = client.subscribe(None).await.unwrap();
         let mut rows = Vec::new();
         loop {
@@ -244,10 +240,7 @@ async fn non_utf8_observation_keeps_the_publisher_and_live_reader_running() {
             1
         );
         local.agents.pop();
-        client.updates.send_replace(Some((
-            client.serial.fetch_add(1, Ordering::Relaxed),
-            Arc::new((path, Ok(local))),
-        )));
+        client.updates.observe(Arc::new((path, Ok(local))));
         let mut removed = Vec::new();
         for _ in 0..2 {
             let ServerFrame::Ev {
@@ -387,4 +380,67 @@ async fn causal_first_observation_can_serve_later_cuts_without_an_ordinary_updat
     })
     .await
     .expect("initial causal observation stayed silent");
+}
+
+// Instance-scoped scheduling only: never changes captured data or publication.
+#[derive(Default)]
+pub(super) struct Schedule {
+    selected: parking_lot::Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
+    boundary: parking_lot::Mutex<Option<oneshot::Sender<()>>>,
+}
+impl Schedule {
+    pub(super) async fn selected(&self) {
+        let pause = self.selected.lock().take();
+        if let Some((entered, resume)) = pause {
+            let _ = entered.send(());
+            let _ = resume.await;
+        }
+    }
+    pub(super) fn boundary(&self) {
+        if let Some(entered) = self.boundary.lock().take() {
+            let _ = entered.send(());
+        }
+    }
+}
+#[tokio::test]
+async fn ordinary_snapshot_cannot_publish_a_cause_arriving_after_selection() {
+    use crate::structured::publication::causal::Cause;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+        let (stop, stopped) = watch::channel(false);
+        let wake = Arc::new(Notify::new());
+        let client = Client::new(wake.clone(), stopped);
+        let mut registry = registry(root.path());
+        let workers = Workers::new(wake);
+        client.observe(&registry, &workers, root.path(), None, None);
+        let mut initial = client.subscribe(None).await.unwrap();
+        let cursor = loop {
+            if let ServerFrame::Synced {seq, ..} = initial.next("initial").await.unwrap() { break seq; }
+        };
+        let (entered, selected) = oneshot::channel();
+        let (resume, proceed) = oneshot::channel();
+        *client.schedule.selected.lock() = Some((entered, proceed));
+        let (reply, mut cut) = oneshot::channel();
+        client.requests.send((None,reply)).await.unwrap();
+        selected.await.unwrap();
+        let (cause, lease) = Cause::hold();
+        let publication = client.reserve(cause).unwrap();
+        let generation = registry.get("fixture-agent").unwrap().2;
+        registry.remove("fixture-agent",generation).unwrap();
+        publication.observe(&registry,&workers,root.path(),None,None);
+        client.observe(&registry,&workers,root.path(),None,None);
+        let (prepared, boundary) = oneshot::channel();
+        *client.schedule.boundary.lock() = Some(prepared);
+        resume.send(()).unwrap();
+        boundary.await.unwrap();
+        let public_head = initial.head.load(Ordering::Acquire);
+        assert_eq!(public_head,cursor,"ordinary snapshot published held removal before ACK");
+        assert!(matches!(cut.try_recv(), Err(oneshot::error::TryRecvError::Empty)));
+        drop(lease);
+        let mut cut = cut.await.unwrap().unwrap();
+        assert!(matches!(cut.next("after-ack").await.unwrap(), ServerFrame::Gap {to, ..} if to==cursor+1));
+        assert!(matches!(initial.next("initial").await.unwrap(), ServerFrame::Ev {seq:Some(seq), ..} if seq==cursor+1));
+        stop.send_replace(true);
+        client.closed().await;
+    }).await.expect("snapshot ordering owner stayed silent");
 }

@@ -31,6 +31,20 @@ fn sender(case: &Case, id: u64) -> mpsc::Sender<output::Delivery> {
         .data
         .clone()
 }
+fn bind(case: &Case, id: u64, ack: Ack) -> Ack {
+    case.server
+        .core
+        .shared
+        .clients
+        .lock()
+        .unwrap()
+        .get_mut(&id)
+        .unwrap()
+        .causal
+        .bind(ack)
+        .unwrap()
+}
+
 fn ack(lease: Ack) -> output::Delivery {
     output::Delivery {
         frame: wire_commands::ack("causal-command".into(), Ok(json!({}))),
@@ -75,13 +89,8 @@ async fn trace(vanish: bool) {
         .unwrap()
         .clone();
     let (cause, lease) = Cause::hold();
-    let lease = case.server.core.causal_ack(origin_id, lease).unwrap();
-    let joined = (!vanish).then(|| {
-        case.server
-            .core
-            .causal_ack(observer_id, cause.join().unwrap())
-            .unwrap()
-    });
+    let lease = bind(&case, origin_id, lease);
+    let joined = (!vanish).then(|| bind(&case, observer_id, cause.join().unwrap()));
     let runtime = case
         .app
         .structured_workers

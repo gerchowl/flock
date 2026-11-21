@@ -55,6 +55,7 @@ const GOING_AWAY_CLOSE: u16 = 1001;
 const POLICY_VIOLATION_CLOSE: u16 = 1008;
 /// Socket identity remains owned until teardown; later dispatch uses this verified session.
 struct Client {
+    #[allow(dead_code)] // P2 adds registration; this field already owns socket teardown.
     causal: crate::structured::publication::causal::Origin,
     session: Session,
     read_only: bool,
@@ -254,30 +255,6 @@ impl Core {
             app.node_id.as_deref(),
             Some(projection),
         );
-    }
-    /// Bind before dispatch; socket teardown releases even an unqueued ACK waiter.
-    #[allow(dead_code)] // P2 binds command waiters before journal admission.
-    pub(crate) fn causal_ack(
-        &self,
-        id: u64,
-        ack: crate::structured::publication::causal::Ack,
-    ) -> io::Result<crate::structured::publication::causal::Ack> {
-        self.shared
-            .clients
-            .lock()
-            .map_err(|_| io::ErrorKind::BrokenPipe)?
-            .get_mut(&id)
-            .ok_or(io::ErrorKind::BrokenPipe)?
-            .causal
-            .bind(ack)
-    }
-    /// Reserve before lifecycle mutation; P2 carries this through dispatch.
-    #[allow(dead_code)] // Dormant until journal admission is connected in #1380 P2.
-    pub(crate) fn causal_fleet(
-        &self,
-        cause: crate::structured::publication::causal::Cause,
-    ) -> io::Result<fleet::Publication> {
-        self.shared.fleet.reserve(cause)
     }
     /// Capture the command's projection before the next ordinary observation.
     #[allow(dead_code)] // P1 tests the producer seam independently of journal admission.

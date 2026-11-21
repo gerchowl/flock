@@ -279,6 +279,8 @@ The server guarantees ACK-before-caused-events on every connection: a command's
 ACK flush precedes publication of its caused history and fleet events, including
 to observers and subscriptions opened during the command. Durable effects can
 exist before publication; replay captures only the published head and byte cut.
+Ordinary snapshots and caused projections use the same publication boundary,
+so a snapshot request cannot bypass an outstanding hold.
 Joined command waiters retain the hold until each ACK flushes or its socket is
 lost. Socket loss releases its waiter without rolling back durable effects.
 Later facts on that stream preserve sequence order; independent producers keep

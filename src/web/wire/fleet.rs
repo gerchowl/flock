@@ -6,6 +6,7 @@ use super::{
 };
 use crate::structured::{
     fleet_lite::{Delta, Provider, Store, StructuredAgent},
+    publication::causal::projection::{Projection, Reader, Reservation},
     registry::{Record, Registry},
     workers::Workers,
 };
@@ -69,18 +70,9 @@ impl Provider for Local {
     }
 }
 type Observation = (PathBuf, Result<Local, crate::api::error_code::ErrorCode>);
-type Caused = (
-    u64,
-    Arc<Observation>,
-    crate::structured::publication::causal::Cause,
-);
 /// Reserve bounded producer capacity before mutating lifecycle state (P2).
 #[allow(dead_code)] // Journal dispatch connects this seam in #1380 P2.
-pub(crate) struct Publication {
-    slot: mpsc::OwnedPermit<Caused>,
-    serial: Arc<AtomicU64>,
-    cause: crate::structured::publication::causal::Cause,
-}
+pub(crate) struct Publication(Reservation<Arc<Observation>>);
 impl Publication {
     #[allow(dead_code)] // Called after lifecycle dispatch by P2, never by admission in P1.
     pub(super) fn observe(
@@ -91,12 +83,8 @@ impl Publication {
         home: Option<&str>,
         nodes: Option<nodes::Projection>,
     ) {
-        let serial = self.serial.fetch_add(1, Ordering::Relaxed);
-        self.slot.send((
-            serial,
-            observation(registry, workers, root, home, nodes),
-            self.cause,
-        ));
+        self.0
+            .send(observation(registry, workers, root, home, nodes));
     }
 }
 type Request = (Option<u64>, oneshot::Sender<io::Result<Cut>>);
@@ -119,29 +107,40 @@ fn refusal(error: io::Error) -> Option<SubfailCode> {
 }
 #[derive(Clone)]
 pub(super) struct Client {
-    updates: watch::Sender<Option<(u64, Arc<Observation>)>>,
-    caused: mpsc::Sender<Caused>,
-    serial: Arc<AtomicU64>,
+    #[cfg(test)]
+    schedule: Arc<tests::Schedule>,
+    updates: Arc<Projection<Arc<Observation>>>,
     requests: mpsc::Sender<Request>,
     wake: Arc<Notify>,
     done: watch::Receiver<bool>,
 }
 impl Client {
     pub(super) fn new(wake: Arc<Notify>, stop: watch::Receiver<bool>) -> Self {
-        let (updates, observations) = watch::channel(None);
+        let (updates, observations) = Projection::channel();
         let (requests, rx) = mpsc::channel(32);
-        let (caused, publications) = mpsc::channel(32);
         let (done, closed) = watch::channel(false);
+        #[cfg(test)]
+        let schedule = Arc::new(tests::Schedule::default());
+        #[cfg(test)]
+        let scheduling = schedule.clone();
         tokio::spawn(async move {
-            if let Err(error) = run(observations, publications, rx, stop).await {
+            if let Err(error) = run(
+                observations,
+                rx,
+                stop,
+                #[cfg(test)]
+                scheduling,
+            )
+            .await
+            {
                 crate::logging::structured_fleet_stopped(&error);
             }
             done.send_replace(true);
         });
         Self {
+            #[cfg(test)]
+            schedule,
             updates,
-            caused,
-            serial: Arc::new(AtomicU64::new(1)),
             requests,
             wake,
             done: closed,
@@ -156,17 +155,8 @@ impl Client {
         home: Option<&str>,
         nodes: Option<nodes::Projection>,
     ) {
-        let observation = observation(registry, workers, root, home, nodes);
-        self.updates.send_if_modified(|old| {
-            if old.as_ref().is_some_and(|(serial, prior)| {
-                prior == &observation
-                    && serial.checked_add(1) == Some(self.serial.load(Ordering::Relaxed))
-            }) {
-                return false;
-            }
-            *old = Some((self.serial.fetch_add(1, Ordering::Relaxed), observation));
-            true
-        });
+        self.updates
+            .observe(observation(registry, workers, root, home, nodes));
     }
     /// Reserve before effects: a full causal lane refuses admission, never drops it.
     #[allow(dead_code)] // Journal admission connects this in #1380 P2.
@@ -174,15 +164,7 @@ impl Client {
         &self,
         cause: crate::structured::publication::causal::Cause,
     ) -> io::Result<Publication> {
-        Ok(Publication {
-            slot: self
-                .caused
-                .clone()
-                .try_reserve_owned()
-                .map_err(|_| io::ErrorKind::WouldBlock)?,
-            serial: self.serial.clone(),
-            cause,
-        })
+        self.updates.reserve(cause).map(Publication)
     }
     pub(super) async fn subscribe(&self, after: Option<u64>) -> io::Result<Cut> {
         let (tx, rx) = oneshot::channel();
@@ -268,54 +250,39 @@ fn checkpoint(
     Ok((end, frames))
 }
 async fn run(
-    mut updates: watch::Receiver<Option<(u64, Arc<Observation>)>>,
-    mut caused: mpsc::Receiver<Caused>,
+    mut updates: Reader<Arc<Observation>>,
     mut requests: mpsc::Receiver<Request>,
     mut stop: watch::Receiver<bool>,
+    #[cfg(test)] schedule: Arc<tests::Schedule>,
 ) -> io::Result<()> {
     let mut store: Option<Store> = None;
     let (frames, _) = broadcast::channel(LIVE);
     let head = Arc::new(AtomicU64::new(0));
-    let mut applied = 0;
     let mut current: Option<Arc<Observation>> = None;
     loop {
-        let (request, mut publication) = tokio::select! { biased;
+        let mut request = tokio::select! { biased;
             _ = stop.changed() => return Ok(()),
-            publication = caused.recv() => match publication { Some(publication) => (None, Some(publication)), None => return Ok(()) },
-            request = requests.recv() => match request { Some(request) => (Some(request), None), None => return Ok(()) },
-            changed = updates.changed() => { if changed.is_err() { return Ok(()); } (None, None) },
+            request = requests.recv() => match request { Some(request) => Some(request), None => return Ok(()) },
+            _ = updates.changed() => None,
         };
+        #[cfg(test)]
+        schedule.selected().await;
         if request.as_ref().is_some_and(|(_, reply)| reply.is_closed()) {
+            request = None;
+        }
+        let mut publication = updates.take();
+        if publication.is_none() && request.is_none() {
             continue;
         }
-        while publication.is_none() && current.is_none() && updates.borrow().is_none() {
+        while publication.is_none() && current.is_none() {
             tokio::select! { biased;
                 _ = stop.changed() => return Ok(()),
-                next = caused.recv() => publication = Some(next.ok_or(io::ErrorKind::BrokenPipe)?),
-                changed = updates.changed() => { changed.map_err(|_| io::ErrorKind::BrokenPipe)?; },
+                _ = updates.changed() => publication = updates.take(),
             }
         }
-        let (serial, observation, cause) = match publication {
-            Some((serial, observation, cause)) => (serial, observation, Some(cause)),
-            None => {
-                let (serial, observation) = updates
-                    .borrow_and_update()
-                    .clone()
-                    .or_else(|| current.clone().map(|observation| (applied, observation)))
-                    .ok_or(io::ErrorKind::BrokenPipe)?;
-                // A late coalesced observation cannot roll back a causal projection.
-                if serial < applied {
-                    (
-                        applied,
-                        current.clone().ok_or(io::ErrorKind::InvalidData)?,
-                        None,
-                    )
-                } else {
-                    (serial, observation, None)
-                }
-            }
-        };
-        applied = serial;
+        let (observation, cause) = publication
+            .or_else(|| current.clone().map(|observation| (observation, None)))
+            .ok_or(io::ErrorKind::BrokenPipe)?;
         current = Some(observation.clone());
         if let Err(code) = &observation.1 {
             if let Some(cause) = cause {
@@ -377,9 +344,13 @@ async fn run(
         .map_err(io::Error::other)??;
         // Persisted projections remain private, including snapshot requests.
         if let Some(cause) = cause {
+            #[cfg(test)]
+            schedule.boundary();
             cause.released().await;
         }
         head.store(next.high_water(), Ordering::Release);
+        #[cfg(test)]
+        schedule.boundary();
         store = Some(next);
         for delta in deltas {
             let _ = frames.send(Ok(delta));
