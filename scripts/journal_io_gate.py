@@ -6,7 +6,7 @@ This is an architecture gate, not a Rust sandbox. The journal reserves `fs`,
 paths are checked alike, so aliases, grouped imports, raw identifiers and leading
 `::` cannot opt out. Outside imports and qualified paths require a reviewed allowlist
 entry, including macros. External globs, namespace injection, path overrides and
-included Rust code and symlinks are refused. Internal globs only reach other scanned modules.
+included Rust code and symlinks are refused. Only enumerated existing internal globs are allowed.
 Comments and literals are ignored. There is no escape marker.
 """
 from __future__ import annotations
@@ -74,20 +74,12 @@ def tokens(text: str) -> list[tuple[str, int]]:
 # Descendants cover associated items (or the explicitly named safe namespace).
 ALLOWLIST = {
     'std::collections::HashMap': 'journal indexes',
-    'std::io': 'stream traits, buffered adapters and error values',
-    'std::path::Path': 'journal path arguments',
-    'std::path::PathBuf': 'owned journal paths',
     'std::sync': 'in-memory synchronization and channels',
     'std::task::Poll': 'test readiness assertions',
     'std::time': 'stall windows and test deadlines',
     'std::thread': 'journal workers and test coordination',
     'std::mem::swap': 'publish the compacted index',
     'std::future::Future': 'ownership asynchronous result type',
-    'std::ops::Deref': 'test stream wrapper',
-    'std::env::temp_dir': 'isolated test fixture location',
-    'std::env::current_exe': 'journal subprocess test executable',
-    'std::env::var': 'journal subprocess test selection',
-    'std::process::exit': 'journal subprocess test completion',
     'serde::Deserialize': 'decode journal records',
     'serde::Serialize': 'encode journal records',
     'serde_json::Value': 'stored command arguments and outcomes',
@@ -104,8 +96,6 @@ ALLOWLIST = {
     'tokio::time': 'bounded ownership waits',
     'tokio::task::JoinHandle': 'ownership recovery worker handle',
     'tokio::task::yield_now': 'test worker coordination',
-    'tokio::test': 'ownership asynchronous tests',
-    'tokio::runtime::Builder': 'ownership test runtime',
     'tokio::spawn': 'ownership recovery task',
     'tokio::pin': 'ownership wait futures',
     'tokio::select': 'ownership progress and stall arbitration',
@@ -115,10 +105,6 @@ ALLOWLIST = {
     'crate::app::notifications::now_ms': 'journal admission timestamps',
     'crate::logging::client_wire_unavailable': 'journal availability diagnostics',
     'crate::logging::client_journal_replay': 'journal replay progress diagnostics',
-    'crate::logging::capture_logs': 'test replay diagnostics',
-    'crate::structured::launch::SessionConfigDir': 'isolated test directory lifetime',
-    'crate::process::TracedCommand': 'journal subprocess test launcher',
-    'crate::cli::exit::SUCCESS': 'journal subprocess expected status',
     'crate::web::wire::commands::ack': 'wire acknowledgement construction',
     'crate::web::wire::commands::Command': 'journal command input',
     'crate::web::wire::commands::ErrorCode': 'typed journal refusals',
@@ -128,8 +114,63 @@ ALLOWLIST = {
     'crate::web::wire::CONNECTIONS': 'journal global capacity bound',
     'crate::web::wire::MAX_MESSAGE': 'journal record size bound',
     'crate::web::wire::IDEMPOTENCY_WINDOW_MS': 'journal retention window',
+}
+# Path values are needed in signatures and imports, but this does not authorize
+# filesystem methods. Namespace imports similarly grant no descendants.
+TYPE_ONLY_ALLOWLIST = {
+    'std::path::Path': 'journal path arguments, type references only',
+    'std::path::PathBuf': 'owned journal paths, type references only',
+    'std::io': 'namespace for the individual stream adapters below',
+}
+ALLOWLIST.update({
+    'std::path::Path::new': 'pure path borrowing',
+    'std::io::BufRead': 'counted stream trait',
+    'std::io::Read': 'counted stream trait',
+    'std::io::Write': 'counted stream trait',
+    'std::io::Seek': 'counted stream positioning',
+    'std::io::SeekFrom': 'stream offset values',
+    'std::io::BufReader': 'buffer an existing counted stream',
+    'std::io::BufWriter': 'buffer an existing counted stream',
+    'std::io::Error': 'typed stream errors',
+    'std::io::ErrorKind': 'typed stream error classification',
+    'std::io::Result': 'stream result alias',
+})
+# These capabilities are restricted by source path, never a caller-supplied cfg.
+TEST_ONLY_ALLOWLIST = {
+    'std::ops::Deref': 'test stream wrapper',
+    'std::env::temp_dir': 'isolated test fixture location',
+    'std::env::current_exe': 'journal subprocess test executable',
+    'std::env::var': 'journal subprocess test selection',
+    'std::process::exit': 'journal subprocess test completion',
+    'tokio::test': 'ownership asynchronous tests',
+    'tokio::runtime::Builder': 'ownership test runtime',
+    'crate::logging::capture_logs': 'test replay diagnostics',
+    'crate::structured::launch::SessionConfigDir': 'isolated test directory lifetime',
+    'crate::process::TracedCommand': 'journal subprocess test launcher',
+    'crate::cli::exit::SUCCESS': 'journal subprocess expected status',
     'crate::web::wire::tests::runtime': 'test asynchronous runtime',
 }
+# Keep precisely one existing `use super::*` in each listed module. New globs,
+# nested copies and duplicates require an explicit review here.
+EXISTING_GLOBS = {
+    COMMANDS / 'journal/compact.rs': 'compaction shares journal types and counted adapters',
+    COMMANDS / 'journal/tests.rs': 'journal fixture access to private journal state',
+    COMMANDS / 'journal/tests/capacity.rs': 'capacity fixtures share journal test helpers',
+    COMMANDS / 'journal/tests/compaction.rs': 'compaction fixtures share journal test helpers',
+    COMMANDS / 'ownership/tests.rs': 'ownership fixtures inspect private lifecycle state',
+}
+# Keys are (definition source path, macro name), with a review reason as value.
+# No crate-defined macros currently need to cross into the journal.
+CRATE_MACRO_ALLOWLIST = {}
+
+
+def test_source(path: Path) -> bool:
+    relative = path.relative_to(COMMANDS)
+    return any(relative == Path(tree + '/tests.rs')
+               or relative.is_relative_to(Path(tree + '/tests'))
+               for tree in ('journal', 'ownership'))
+
+
 BUILTIN_MACROS = {
     'assert', 'assert_eq', 'assert_ne', 'debug_assert', 'debug_assert_eq',
     'debug_assert_ne', 'matches', 'format', 'vec', 'panic', 'unreachable',
@@ -139,7 +180,7 @@ BUILTIN_MACROS = {
 JOURNAL = ('crate', 'web', 'wire', 'commands', 'journal')
 OWNERSHIP = JOURNAL[:-1] + ('ownership',)
 # Built-in attributes and serde's reviewed derive helper introduce no new code.
-ATTRIBUTES = {'cfg', 'derive', 'serde', 'test', 'allow', 'deny', 'warn', 'forbid'}
+ATTRIBUTES = {'cfg', 'derive', 'serde', 'test', 'allow', 'deny', 'warn', 'forbid', 'macro_export'}
 DERIVES = {'Clone', 'Copy', 'Debug', 'Default', 'PartialEq', 'Eq', 'Hash'}
 
 
@@ -187,12 +228,12 @@ def import_paths(names: list[str], start: int):
     return entries, end + 1
 
 
-def import_findings(code, path):
+def import_findings(code, path, local_macros):
     """Resolve explicit relative paths; refuse source/namespace escape constructs.
 
     This intentionally does not follow re-exports. Outside modules cannot be
     imported wholesale, so every new external dependency requires review here.
-    Internal globs are safe because their source is scanned by this same gate.
+    Only the enumerated existing internal globs may share scanned modules.
     """
     names = [name for name, _ in code]
     findings = []
@@ -201,6 +242,8 @@ def import_findings(code, path):
     imports = [{}]
     imported = imports[-1]
     i = 0
+    seen_globs = set()
+    allowed_items = ALLOWLIST | (TEST_ONLY_ALLOWLIST if test_source(path) else {})
 
     def check(parts, index):
         original = parts[:]
@@ -217,6 +260,10 @@ def import_findings(code, path):
             parts = list(context) + parts
         elif parts[0] == 'self':
             parts = list(modules[-1]) + parts[1:]
+        elif parts[0] in {'io', 'mpsc', 'oneshot', 'watch'}:
+            namespace = ['std', 'io'] if parts[0] == 'io' else (
+                ['std', 'sync', 'mpsc'] if parts[0] == 'mpsc' else ['tokio', 'sync', parts[0]])
+            parts = namespace + parts[1:]
         elif parts[0] in {'filesystem', 'tests', 'compact', 'journal'}:
             # Bare local modules are resolved relative to the current Rust module.
             parts = list(modules[-1]) + parts
@@ -226,13 +273,26 @@ def import_findings(code, path):
             tail = parts[parts.index('std', len(JOURNAL)):]
             if len(tail) > 1:
                 parts = tail
+        # Parent globs also expose these standard path types. Preserve the
+        # type-only restriction through internal aliases and qualified names.
+        for item in ('Path', 'PathBuf'):
+            if parts[0] == item or (parts[:len(JOURNAL)] == list(JOURNAL) and item in parts):
+                parts = ['std', 'path'] + parts[parts.index(item):]
         resolved = tuple(parts)
         internal = resolved[:len(JOURNAL)] == JOURNAL or (
             base[:len(OWNERSHIP)] == OWNERSHIP
             and resolved[:len(OWNERSHIP)] == OWNERSHIP)
         allowed = any(resolved[:len(key.split('::'))] == tuple(key.split('::'))
-                      for key in ALLOWLIST)
-        if not internal and (not allowed or '*' in parts):
+                      for key in allowed_items)
+        allowed = allowed or '::'.join(parts) in TYPE_ONLY_ALLOWLIST
+        if '*' in parts:
+            existing = (path in EXISTING_GLOBS and modules[-1] == base
+                        and original == ['super', '*'] and internal
+                        and path not in seen_globs)
+            seen_globs.add(path)
+            if not existing:
+                findings.append((code[index][1], 'journal glob import is not an enumerated existing use'))
+        elif not internal and not allowed:
             findings.append((code[index][1],
                              'outside journal import/path is not allowlisted: '
                              + '::'.join(original)))
@@ -279,15 +339,20 @@ def import_findings(code, path):
             modules.pop()
             imports.pop()
             imported = imports[-1]
-        elif name in {'extern', 'macro_rules', 'macro_use'}:
+        elif name in {'extern', 'macro_use'}:
             findings.append((code[i][1], 'external/macro namespace injection is forbidden'))
+        elif name == 'mod' and names[i + 1:i + 2] == ['tests']:
+            # File-path test permissions depend on every entry into a tests
+            # subtree having the exact built-in cfg(test), not cfg_attr.
+            if not test_source(path) and names[max(0, i - 7):i] != ['#', '[', 'cfg', '(', 'test', ')', ']']:
+                findings.append((code[i][1], 'test modules require an explicit cfg(test) entry'))
         elif name == 'mod' and names[i + 2:i + 3] == [';']:
             # The scanner must cover every out-of-line module's default location.
             child = modules[-1] + (names[i + 1],)
             if child[:len(JOURNAL)] != JOURNAL and child[:len(OWNERSHIP)] != OWNERSHIP:
                 findings.append((code[i][1], 'module declaration escapes the journal source scan'))
         elif ((name in {'crate', 'super', 'self', 'std', 'core', 'alloc'}
-               or name[:1].islower())
+               or name[:1].islower() or name in imported or name in {'Path', 'PathBuf'})
               and names[i + 1:i + 2] == ['::']
               and names[max(0, i - 1):i] != ['.']):
             # Skip pub(in ...) visibility paths: they import no executable item.
@@ -304,14 +369,14 @@ def import_findings(code, path):
                     end += 2
                 # Local method/type paths are not outside dependencies. Explicit
                 # roots and lowercase dependency paths still require review.
-                if name in imported or name not in {'files', 'io', 'mpsc', 'oneshot', 'watch'}:
+                if name in imported or name != 'files':
                     check(parts, i)
                 i = end
                 continue
         if (names[i + 1:i + 2] == ['!']
                 and names[i + 2:i + 3] in (['('], ['{'], ['['])
                 and IDENT.fullmatch(name)):
-            if name not in BUILTIN_MACROS and name not in imported and not any(
+            if name not in BUILTIN_MACROS and name not in imported and name not in local_macros and not any(
                     key.endswith('::' + name) for key in ALLOWLIST):
                 check([name], i)
         i += 1
@@ -332,13 +397,20 @@ def boundary_path(names: list[str], index: int) -> bool:
                 and all(part == "super" for part in parts[:-1])))
 
 
-def check_text(text: str, path: Path) -> list[tuple[int, str]]:
+def check_text(text: str, path: Path, crate_macros=None, macro_uses=()) -> list[tuple[int, str]]:
     if path == BOUNDARY:
         return []
     code = tokens(text)
     names = [name for name, _ in code]
+    local = macro_definitions(code)
+    if crate_macros is None:
+        crate_macros = {name: {path} for name in local}
+    local |= {name for name, sources in crate_macros.items()
+              if all(source == COMMANDS / 'journal.rs'
+                     or source.is_relative_to(COMMANDS / 'journal')
+                     or (source, name) in CRATE_MACRO_ALLOWLIST for source in sources)}
     findings = [(text.count("\n", 0, offset) + 1, reason)
-                for offset, reason in import_findings(code, path)]
+                for offset, reason in import_findings(code, path, local)]
     attribute_depth = 0
     for i, (name, offset) in enumerate(code):
         if name == "[" and (attribute_depth or names[max(0, i - 1):i] == ["#"]
@@ -348,6 +420,14 @@ def check_text(text: str, path: Path) -> list[tuple[int, str]]:
             attribute_depth -= 1
         following = names[i + 1:i + 3]
         reason = None
+        if following[:1] == ['!'] and names[i + 2:i + 3] in (['('], ['{'], ['[']):
+            trusted_name = name in BUILTIN_MACROS or any(
+                key.endswith('::' + name) for key in ALLOWLIST)
+            for source in crate_macros.get(name, set()) | set(macro_uses):
+                inside = source == COMMANDS / 'journal.rs' or source.is_relative_to(COMMANDS / 'journal')
+                if (not inside or trusted_name or source in macro_uses) and (source, name) not in CRATE_MACRO_ALLOWLIST:
+                    findings.append((text.count('\n', 0, offset) + 1,
+                                     f'unreviewed crate macro provenance: {name} from {source}'))
         if name == "fs" and not (i >= 2 and names[i - 1] == "::"
                                  and boundary_path(names, i - 2)):
             reason = "filesystem paths/imports must use filesystem::fs"
@@ -360,6 +440,8 @@ def check_text(text: str, path: Path) -> list[tuple[int, str]]:
         elif name == "mod" and following[:1] == ["filesystem"]:
             if path != COMMANDS / "journal.rs" or following != ["filesystem", ";"]:
                 reason = "only journal.rs may declare the filesystem.rs boundary"
+        elif name == ">" and following[:1] == ["::"]:
+            reason = "type-qualified paths would bypass journal path resolution"
         elif name == "include" and following[:1] == ["!"]:
             reason = "included Rust code would escape the journal source scan"
         elif attribute_depth and name == "path" and following[:1] == ["="]:
@@ -382,14 +464,54 @@ def protected_files(root: Path) -> list[Path]:
     return sorted(files)
 
 
+def macro_definitions(code):
+    names = [name for name, _ in code]
+    return {names[i + 2] for i in range(len(names) - 2)
+            if names[i:i + 2] == ['macro_rules', '!']}
+
+
+def crate_macro_sources(root):
+    """Inventory definitions and exported/imported macro namespaces crate-wide.
+
+    Rust macro scope is textual and can cross module boundaries without `use`.
+    Any colliding crate definition is therefore checked, even under a cfg or
+    in a sibling that the gate does not try to prove unreachable.
+    """
+    definitions, macro_uses = {}, set()
+    for source in (root / 'src').rglob('*.rs'):
+        text = source.read_text()
+        if not any(marker in text for marker in ('macro_rules', 'macro_export', 'macro_use')):
+            continue
+        code = tokens(text)
+        relative = source.relative_to(root)
+        for name in macro_definitions(code):
+            if not IDENT.fullmatch(name):
+                # A macro generating another macro can choose its name at an
+                # expansion site. Refuse this uninspectable namespace too.
+                macro_uses.add(relative)
+            else:
+                definitions.setdefault(name, set()).add(relative)
+        names = [name for name, _ in code]
+        for i, name in enumerate(names):
+            if name in {'macro_use', 'macro_export'} and (
+                    names[max(0, i - 2):i] == ['#', '[']
+                    or names[max(0, i - 3):i] == ['#', '!', '[']):
+                # macro_export names are already recorded by macro_rules above.
+                # macro_use can inject names from a dependency we cannot inspect.
+                if name == 'macro_use':
+                    macro_uses.add(relative)
+    return definitions, macro_uses
+
+
 def check_tree(root: Path) -> list[str]:
     findings = []
+    crate_macros, macro_uses = crate_macro_sources(root)
     for path in protected_files(root):
         relative = path.relative_to(root)
         if path.is_symlink():
             findings.append(f"{relative}:1: symlinks escape the journal source scan")
             continue
-        for line, reason in check_text(path.read_text(), relative):
+        for line, reason in check_text(path.read_text(), relative, crate_macros, macro_uses):
             findings.append(f"{relative}:{line}: {reason}")
     return findings
 
