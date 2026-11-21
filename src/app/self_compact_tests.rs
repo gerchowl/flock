@@ -710,10 +710,26 @@ async fn a_turn_longer_than_the_timeout_still_completes() {
     app.tick_self_compacts(now);
     app.self_compact_on_session_start(&pane, Some("compact"), now);
     app.tick_self_compacts(now);
-    app.tick_self_compacts(now + GAP);
+    assert!(written(&mut pty).contains("carry on"));
+
+    // The normal submit gap exceeds this test's 1 ms timeout. Make Enter due
+    // inside that window without widening the timeout or using a real clock.
+    let submit_at = now + Duration::from_micros(500);
+    terminal(&mut app)
+        .armed_self_compact
+        .as_mut()
+        .expect("the typed continuation is still awaiting Enter")
+        .submit_at = Some(submit_at);
+    app.tick_self_compacts(submit_at);
     assert!(
-        written(&mut pty).contains("carry on"),
-        "and the sequence still completes"
+        !drain(&mut pty).is_empty(),
+        "the continuation's Enter must be a separate write"
+    );
+    assert_eq!(armed_continuation(&app), None);
+    assert_eq!(
+        terminal_const(&app).last_self_compact_completed,
+        Some(submit_at),
+        "the sequence must complete successfully, not time out"
     );
 }
 
