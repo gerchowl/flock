@@ -305,7 +305,7 @@ impl Journal {
         Ok(journal)
     }
     fn lease(data: &Path) -> io::Result<Self> {
-        let root = data.canonicalize()?.join("wire");
+        let root = filesystem::canonical_path(data)?.join("wire");
         match files::create_private_dir(&root) {
             Ok(()) => filesystem::sync_directory(data)?,
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => files::check_private_dir(&root)?,
