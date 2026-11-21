@@ -35,6 +35,8 @@ pub(super) struct Delivery {
     pub(super) active: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// True after flush, false when fenced out; channel closure means writer failure.
     pub(super) delivered: Option<tokio::sync::oneshot::Sender<bool>>,
+    /// Released after ACK flush, or on writer/connection loss.
+    pub(super) causal: Option<crate::structured::publication::causal::Ack>,
 }
 impl From<ServerFrame> for Delivery {
     fn from(frame: ServerFrame) -> Self {
@@ -42,6 +44,7 @@ impl From<ServerFrame> for Delivery {
             frame,
             active: None,
             delivered: None,
+            causal: None,
         }
     }
 }
@@ -53,8 +56,8 @@ pub(super) async fn writer<S: Sink<Message> + Unpin>(
     mut data: mpsc::Receiver<Delivery>,
 ) {
     loop {
-        let (frame, delivered, probe) = tokio::select! { biased;
-            frame = priority.recv() => match frame { Some(control) => (control.frame, None, control.probe), None => return },
+        let (frame, delivered, probe, causal) = tokio::select! { biased;
+            frame = priority.recv() => match frame { Some(control) => (control.frame, None, control.probe, None), None => return },
             next = data.recv() => {
                 let Some(next) = next else { return };
                 if next.active.as_ref().is_some_and(|active| !active.load(Ordering::Acquire)) {
@@ -62,7 +65,7 @@ pub(super) async fn writer<S: Sink<Message> + Unpin>(
                     continue;
                 }
                 let Some(frame) = encode(next.frame) else { return };
-                (frame, next.delivered, None)
+                (frame, next.delivered, None, next.causal)
             },
         };
         let closing = matches!(frame, Message::Close(_));
@@ -79,6 +82,7 @@ pub(super) async fn writer<S: Sink<Message> + Unpin>(
             return;
         }
         drop(probe);
+        drop(causal);
         if let Some(done) = delivered {
             let _ = done.send(true);
         }
