@@ -609,6 +609,8 @@ registry's durable stopped timestamp (never the root's mtime, which transcripts
 and copies change); no pending replacement or migration journal (slices 12, 19,
 20) references it; and it is neither marked nor registry-reported quarantined
 (A3). Unknown liveness or a missing stopped timestamp refuses.
+Status lists eligible roots with age and size so the operator can choose; it
+never selects for them.
 Liveness is owned by the session registry, not the store lock, so the lock alone
 cannot exclude a resume. Therefore admission **and** resume must take a
 reservation (a lease generation) under the store transaction lock before
@@ -628,11 +630,14 @@ block deletion (fail-safe) and is reported in status.
 **Registry facts (amends ADR-0036).** Neither a stopped time nor a quarantined
 outcome exists today: `src/structured/registry/mod.rs` states the registry is
 pure data and its `Record` writes no ages or lease proofs, following the
-ADR-0036 §4 (Storage) rule that durable records carry identity and launch
-metadata only. This amendment **amends that rule** for exactly two facts, because
+S3a-3 registry amendment under ADR-0036 §2 ("Cold restore retains metadata only
+… no clock ages, outstanding questions, deadlines, process ids or lease proofs
+survive"; cited by `src/structured/registry/mod.rs` as §1/S3a-3/S4). This
+amendment **amends that rule** for exactly two facts, because
 retention cannot be decided from the filesystem (mtime is changed by transcripts
 and copies) or from the lease holder: `stopped_at` (a durable wall-clock time set
-once when the session reaches a terminal stop) and `outcome` (`quarantined` when
+once when the session reaches a terminal stop, recorded together with the lease
+generation of that stop) and `outcome` (`quarantined` when
 §2 revocation publishes it). They are written by the supervisor that
 publishes the stop, never by agents, grant no process or lease authority, and
 keep the registry otherwise pure data. Records written before this change omit
@@ -640,8 +645,11 @@ both fields, so the new `#[serde(default)]` fields read as absent; absent
 `stopped_at` or unknown outcome means **not eligible**, never an assumed age.
 Roots of pre-existing sessions therefore become deletable only after they next
 stop under the new code, which is the fail-safe default. Unknown newer values
-pass through as opaque data and likewise refuse. Status lists eligible roots with age and size so
-the operator can choose; it never selects for them.
+pass through as opaque data and likewise refuse. Rollback caveat: an older
+binary that preserves unknown fields can carry a stale `stopped_at` across a later
+run and stop it does not record. Eligibility therefore requires the recorded stop
+generation to equal the session's last lease generation; a mismatch or absent
+generation means not eligible, so a root never looks older after re-upgrade.
 Never deleted automatically: live roots, roots referenced by a rollback,
 replacement or migration record, quarantined roots, unknown or invalid records,
 and digest tombstones.
@@ -742,8 +750,8 @@ against the prior build; all inactive while production execution is unavailable)
 | --- | --- | --- |
 | 3.1 Usage, bounds, typed refusal | Sizing walk, bounds config, status fields, `profile_storage_full`, CLI/socket docs. | Status reports bytes/age/totals for sparse and nested roots and does not follow a symlink out of the root; allocation at either bound refuses typed and leaves no staging or partial state. |
 | 3.2 Staging recovery | Exact-shape staging removal, non-matching quarantine, trash completion, lock-skip reporting. | Shape-matching staging is removed and staging with extra content is quarantined; recovery with the lock held elsewhere skips and reports; a concurrent allocation is never touched (race test). |
-| 3.2b Registry stop facts | Add `stopped_at` and quarantined `outcome` to the registry `Record` (default-absent, older records readable, schema note), set by the stop/revocation publisher; update the ADR-0036 "no ages" rustdoc and §4 note. | Old records load with both absent and report not eligible; stop sets `stopped_at` once and survives restart; a revocation stop persists `quarantined`; unknown outcome values round-trip untouched and refuse. |
-| 3.3 Reservation and quarantine marker | Reservation/lease generation taken under the store lock by admission and resume before `allocate_session` returns; durable `quarantine.json` written before the quarantined outcome. | A resume racing delete either keeps the root or is refused, never launching on a deleted path; a failed or crashed marker write publishes no complete outcome; registry-quarantined roots refuse eligibility without a marker. |
+| 3.2b Registry stop facts | Add `stopped_at` and quarantined `outcome` to the registry `Record` (default-absent, older records readable, schema note), set by the stop/revocation publisher; amend the ADR-0036 §2 S3a-3 "no clock ages … or lease proofs survive" rule and the matching registry rustdoc; record the stop's lease generation and require it to match for eligibility. | Old records load with both absent and report not eligible; stop sets `stopped_at` once and survives restart; a revocation stop persists `quarantined`; unknown outcome values round-trip untouched and refuse. |
+| 3.3 Reservation and quarantine marker | Reservation/lease generation taken under the store lock by admission and resume before `allocate_session` returns; durable `quarantine.json` written before the quarantined outcome. | A reservation is released after a failed launch and by startup reconciliation after a crash; a resume racing delete either keeps the root or is refused, never launching on a deleted path; a failed or crashed marker write publishes no complete outcome; registry-quarantined roots refuse eligibility without a marker. |
 | 3.4 Operator plan/delete/release | Eligibility, plan digests, required audit before effect, trash rename, `abandoned` outcome, release, quarantine-dir deletion, CLI/socket. If it exceeds 400 production lines, split into plan/audit/delete and release/quarantine-dir parts. | Agent/relay callers refuse; audit failure leaves the root untouched; an indeterminate record with no trash entry keeps the root and is reported; rename failure after append records `abandoned`; a changed digest, reserved/unknown session, young root or unreleased quarantine refuses; a crash between rename and removal completes on restart. |
 
 3.1, 3.2 and 3.2b depend only on slice 3; 3.3 on slice 3 and 3.2b; 3.4 on all of them. 3.4 reads session
