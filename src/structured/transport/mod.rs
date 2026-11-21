@@ -520,7 +520,7 @@ impl InputHandle {
     ) -> Result<(), ErrorCode> {
         self.agent_decide_caused(principal, args, None)
     }
-    // P2 passes the producer receipt without changing today's synchronous order.
+    // Wire decisions carry an ACK receipt; ordinary callers retain their order.
     #[allow(dead_code)]
     pub(crate) fn agent_decide_caused(
         &self,

@@ -1,5 +1,6 @@
 //! Producer-owned ACK fence. No event payloads or per-connection buffers live here.
-// P1 supplies the seam; journal admission connects it in #1380 P2.
+// Wire admission retains the receipt through durable Finish and ACK flush.
+// The receipt endpoints also build without the optional web consumer.
 #![allow(dead_code)]
 use parking_lot::{Condvar, Mutex};
 use std::{

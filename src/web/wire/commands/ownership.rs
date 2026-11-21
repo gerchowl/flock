@@ -1,7 +1,4 @@
 //! Journal ownership follows handoff admission, not process lifetime.
-//! J1b2a keeps command deduplication in memory: no live command writes this journal
-//! or acknowledges its completions. An abandoned journal write cannot produce a
-//! wire acknowledgement. Closing the phase fences admission until replay succeeds.
 use super::{journal::Writer, ErrorCode};
 use std::{
     path::PathBuf,
@@ -37,6 +34,10 @@ struct Inner {
 #[derive(Clone)]
 pub(in crate::web::wire) struct Ownership(Arc<Inner>);
 impl Ownership {
+    pub(in crate::web::wire) fn data(&self) -> &std::path::Path {
+        &self.0.data
+    }
+
     pub(in crate::web::wire) fn new(data: PathBuf, wake: Arc<Notify>) -> Self {
         #[cfg(test)]
         let open_barrier = tests::take_open_barrier(&data);
@@ -50,6 +51,75 @@ impl Ownership {
             #[cfg(test)]
             open_barrier: parking_lot::Mutex::new(open_barrier),
         }))
+    }
+    #[cfg(test)]
+    pub(in crate::web::wire) async fn seed_capacity_test(&self) {
+        self.submit(
+            self.0.phase.load(Ordering::Acquire),
+            super::journal::Operation::SeedCapacity,
+        )
+        .unwrap()
+        .await
+        .unwrap()
+        .unwrap();
+    }
+    #[cfg(test)]
+    pub(in crate::web::wire) async fn configure_test(
+        &self,
+        limits: Option<(usize, usize)>,
+        before_sync: Option<Box<dyn FnMut() + Send>>,
+    ) {
+        let phase = self.0.phase.load(Ordering::Acquire);
+        self.submit(
+            phase,
+            super::journal::Operation::Configure {
+                limits,
+                before_sync,
+            },
+        )
+        .unwrap()
+        .await
+        .unwrap()
+        .unwrap();
+    }
+    #[cfg(test)]
+    pub(in crate::web::wire) fn claim_test(
+        &self,
+        command: super::Command,
+    ) -> impl std::future::Future<Output = ()> {
+        let phase = self.0.phase.load(Ordering::Acquire);
+        let reply = self
+            .submit(
+                phase,
+                super::journal::Operation::Claim {
+                    namespace: "local".into(),
+                    principal: "seed".into(),
+                    command,
+                    now: crate::app::notifications::now_ms(),
+                },
+            )
+            .unwrap();
+        async move {
+            reply.await.unwrap().unwrap();
+        }
+    }
+    pub(super) fn submit(
+        &self,
+        phase: u64,
+        operation: super::journal::Operation,
+    ) -> Result<super::journal::Response, ErrorCode> {
+        let slot = self
+            .0
+            .writer
+            .try_lock()
+            .map_err(|_| ErrorCode::SessionBusy)?;
+        if !self.current(phase) || phase & 1 == 0 || slot.phase | 1 != phase {
+            return Err(ErrorCode::SessionBusy);
+        }
+        slot.writer
+            .as_ref()
+            .ok_or(ErrorCode::SessionBusy)?
+            .submit(operation)
     }
     pub(in crate::web::wire) fn gate(&self) -> Arc<AtomicU64> {
         self.0.phase.clone()

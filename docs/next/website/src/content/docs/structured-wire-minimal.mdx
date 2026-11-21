@@ -223,7 +223,9 @@ rows and checkpoints, but are dropped when a fresh projection changes the row.
 
 `agent.decide` takes `AgentDecide` arguments: `agent`, `request_id`, required `request_seq`, `decision`
 (`allow_once`, `allow_always` or `deny`), and optional `message`. Only a
-token-authenticated client principal can submit this command. The optional message
+token-authenticated client principal can submit this command. Fresh admission,
+cached replay and joined outcomes require both current `answer` and `operate`
+scopes, checked through the same authorization function. The optional message
 is normalized from CRLF to LF and trimmed, then limited to 2048 UTF-8 bytes
 (`MAX_PERMISSION_DECISION_MESSAGE_BYTES`). The `prompt_control_bytes` rules
 permit newlines and tabs and refuse other controls. Invalid messages return
@@ -275,17 +277,22 @@ have no preceding open. Other reasons include `ended`, `cancelled`, `result`,
 `interrupted`, `permission_request_too_large`, and `session_ended` (a prior
 runtime left an unmatched open). Existing closed JSON is preserved apart from `request_seq`.
 
-The server guarantees ACK-before-caused-events on every connection: a command's
-ACK flush precedes publication of its caused history and fleet events, including
-to observers and subscriptions opened during the command. Durable effects can
-exist before publication; replay captures only the published head and byte cut.
-Ordinary snapshots and caused projections use the same publication boundary,
-so a snapshot request cannot bypass an outstanding hold.
-Joined command waiters retain the hold until each ACK flushes or its socket is
-lost. Socket loss releases its waiter without rolling back durable effects.
-Later facts on that stream preserve sequence order; independent producers keep
-running. The bounded producer receipt is introduced separately from the journal
-admission integration (#1380 P2); the current synchronous path is unchanged.
+For journal-admitted permission decisions, the command ACK must be written and flushed
+before its caused permission closed event or transport audit is published. The same
+ordering applies to caused fleet/lifecycle projections, including the fleet rows clients
+render. This holds on every connection, including observers and subscriptions opened
+while the command is pending. Durable Finish precedes the ACK. Joined waiters retain the
+publication hold until each ACK flushes or its originating socket is lost; socket loss
+releases that waiter without rolling back durable effects. Initial replay cuts and
+ordinary projections cannot bypass an active hold. Later records on the fenced stream
+preserve sequence order, while independent producers continue.
+
+This guarantee excludes history records that constitute the command outcome or
+downstream transport output: accepted input and queue admission cuts for `agent.send`,
+and lifecycle launch/terminal transport history. These records may precede the ACK.
+Correlate command outcomes using `cmd_id`; do not infer a universal history fence.
+Universal producer fencing is a separate owner decision tracked in
+[#3198](https://github.com/gerchowl/flock/issues/3198).
 
 The `permission-decision` fixture shows open, `agent.decide` acknowledgement,
 then closed. The ack acknowledges admission; remove the card when the durable
@@ -318,12 +325,12 @@ through the remote fleet directory receives the same refusal, even without
 remains gated by ADR-0043.
 
 An authenticated replay of the same principal, command ID, verb and arguments
-returns the first lifecycle ack while that entry remains in the owner's bounded
-1,024-command retention set. Reusing a retained ID with different arguments or
-verb refuses `invalid_params`. Revocation and scope checks precede replay.
-An uncertain retry with `resume_only: true` and no retained result refuses
-`session_unconfirmed`; it never launches again. Retention is in memory and
-ends on server restart or eviction.
+returns the first lifecycle ack within the journal's 24-hour retention window.
+Reusing a retained ID with different arguments or verb refuses `invalid_params`. Revocation and scope checks precede replay.
+An uncertain retry with `resume_only: true` returns the first durable
+acknowledgement. An absent, expired, lost or recovered pending claim refuses
+`session_unconfirmed` and never launches again. Claims are retained for 24 hours;
+unexpired claims are never evicted.
 
 Core owns the command-journal lease and acquires it at handoff ownership commit,
 never during importer preparation. Each journal caller waits at most one second.
@@ -337,9 +344,14 @@ The exporter closes wire admission before requesting a drain. Freeze and shutdow
 proceed after their one-second journal budget, logging pending write counts;
 abandoned I/O retains its exclusive lease until the worker actually stops.
 Rollback remains fenced while it reacquires and replays. A late drain cannot
-close a newer recovered owner. Live commands still use in-memory deduplication,
-so no wire acknowledgement is derived from abandoned journal writes in this
-phase. This ownership work does not enable durable command replay.
+close a newer recovered owner. Live commands claim their principal/command key
+durably before dispatch, then recheck current authorization under the token fence. Outcomes sync before
+acknowledgement; identical in-flight requests join and each waiter is
+reauthorized with its own credential. Connection closure follows that credential's
+current revocation status. Completed outcomes replay after restart or
+handoff. Conflicting payloads refuse `invalid_params`; journal capacity or writer
+queue pressure returns audited `session_busy` before effects. Ownership phase
+changes fence earlier claim completions from dispatch.
 
 `agent.start` permits fresh launches through the existing server-side launch
 gates, including `structured_needs_agent_user`. It cannot resume a structured
@@ -357,8 +369,9 @@ or `agent.get` for confirmed `offline` state. Owner-side stop/restart decisions,
 including refusals and replays, log the requested `target`, resolved `agent_id`
 and `session_id` when known, authenticated `principal`, per-mint `app:<nonce>`
 credential identity, and outcome. Unresolved identities use empty ID fields.
-Generic ingress refusals (including version, command-ID and capacity checks)
-and queue-full refusals before owner dispatch retain their pre-existing audit gap.
+Authenticated ingress and owner refusals, including journal capacity and writer
+queue pressure, use the bounded `wire_refused` audit with the requesting
+credential's identity.
 
 The GUI's agent view and command palette offer **Stop agent** with a confirmation
 and **Restart agent** when the agent is offline. Restart resumes the existing
