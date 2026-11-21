@@ -10,6 +10,11 @@ pub(in crate::web::wire) use counted::Observation;
 #[cfg(test)]
 pub(super) use counted::{files, std, File, LockFile};
 
+/// Resolve the journal root inside the filesystem boundary.
+pub(super) fn canonical_path(path: &::std::path::Path) -> ::std::io::Result<::std::path::PathBuf> {
+    path.canonicalize()
+}
+
 /// Sync the containing directory without exposing a new file constructor.
 pub(super) fn sync_directory(path: &::std::path::Path) -> ::std::io::Result<()> {
     File::open(path)?.sync_all()

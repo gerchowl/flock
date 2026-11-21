@@ -41,12 +41,11 @@ class JournalIoGate(unittest.TestCase):
         source = '''
 mod filesystem;
 use filesystem::{File, files, LockFile};
-use super::filesystem;
-filesystem::fs::read(path)?;
-filesystem::rename(from, to)?;
+use self::filesystem;
+use filesystem::fs;
 filesystem::sync_directory(root)?;
 files::open_append_file(path)?;
-file.try_clone()?.write_all(bytes)?;
+self.source.read(bytes)?;
 // ::std::fs::write(path, bytes)
 /* outer /* tokio::fs */ OpenOptions */
 let message = "::std::fs::write";
@@ -71,7 +70,7 @@ let lifetime: &'static str = "File::open";
             boundary = root / gate.BOUNDARY
             boundary.write_text('::std::fs::write(path, bytes)?;')
             findings = gate.check_tree(root)
-            self.assertEqual(len(findings), 5)
+            self.assertEqual(len({finding.split(":")[0] for finding in findings}), 5)
             self.assertTrue(any('ownership.rs:' in finding for finding in findings))
             self.assertTrue(any('nested/filesystem.rs:' in finding for finding in findings))
 
@@ -86,6 +85,279 @@ let lifetime: &'static str = "File::open";
 
     def test_boundary_cannot_be_redeclared_in_a_child(self):
         self.assertTrue(gate.check_text('mod filesystem;', gate.COMMANDS / 'journal/new.rs'))
+
+    def test_sibling_reexport_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            commands = root / gate.COMMANDS
+            commands.mkdir(parents=True)
+            (commands / 'ownership.rs').write_text('')
+            (commands / 'sibling.rs').write_text(
+                'pub use std::fs::write as helper;')
+            (commands / 'journal.rs').write_text(
+                'use super::sibling::helper; fn bypass() { helper(path, bytes); }')
+            self.assertTrue(gate.check_tree(root))
+
+    def test_unreviewed_imports_paths_and_macros_are_rejected(self):
+        for source in [
+            'use crate::other::helper;',
+            'use crate::r#sibling::r#helper as renamed;',
+            'use super::ownership::helper;',
+            'pub use super::{sibling::{helper as renamed}};',
+            'use ::crate::other::helper as renamed;',
+            'crate::other::helper(path, bytes);',
+            '::crate::other::helper(path, bytes);',
+            'return ::crate::other::helper(path, bytes);',
+            'return ::other::helper(path, bytes);',
+            'super::sibling::helper(path, bytes);',
+            'use std::process::Command as Launcher;',
+            '::std::process::Command::new("program");',
+            'use std::sync::*;',
+            'use crate::web::wire::commands::*;',
+            'use super::*;',
+            'use std as native;',
+            'use std::sync as shared; use shared::*;',
+            'crate::other::write!(path);',
+            '::other::write!(path);',
+            'write_from_sibling!(path);',
+            '#[write_from_sibling] fn bypass() {}',
+            '#[cfg_attr(test, write_from_sibling)] fn bypass() {}',
+            '#[derive(WriteFromSibling)] struct Data;',
+            'use filesystem::std as native; native::os::fd::OwnedFd::from(value);',
+            'use self::filesystem::std::os::fd::OwnedFd;',
+            'filesystem::std::os::fd::OwnedFd::from(value);',
+            'extern crate other as helper;',
+            '#[macro_use] mod extra;',
+            'mod nested { use super::super::sibling::helper; }',
+            'mod nested { use super::super::*; }',
+            'mod nested { ::crate::other::helper(); }',
+        ]:
+            with self.subTest(source=source):
+                self.assertTrue(gate.check_text(source, gate.COMMANDS / 'journal.rs'))
+
+    def test_reviewed_imports_relative_paths_and_macros_are_allowed(self):
+        source = '''
+use crate::web::wire::commands::{Command as Input, ErrorCode};
+use ::std::{sync::{Arc as Shared}, path::PathBuf};
+use serde_json::json as payload;
+#[derive(serde::Serialize)]
+struct Data;
+crate::logging::client_journal_replay("ready", 1, 1);
+::std::sync::Arc::new(value);
+serde_json::json!({});
+payload!({});
+mod nested {
+    use super::{filesystem, Command};
+    use super::super::ErrorCode;
+    super::super::ack(id, result);
+}
+'''
+        self.assertEqual(gate.check_text(source, gate.COMMANDS / 'journal.rs'), [])
+
+    def test_symlinked_modules_are_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            commands = root / gate.COMMANDS
+            journal = commands / 'journal'
+            journal.mkdir(parents=True)
+            (commands / 'journal.rs').write_text('mod external;')
+            (commands / 'ownership.rs').write_text('')
+            outside = root / 'outside'
+            outside.mkdir()
+            (outside / 'mod.rs').write_text('pub use std::fs::write as helper;')
+            (journal / 'external').symlink_to(outside, target_is_directory=True)
+            self.assertTrue(gate.check_tree(root))
+
+    def test_crate_macro_shadowing_is_rejected(self):
+        for name in ['println', 'json']:
+            for location in ['src/main.rs', 'src/web/wire/commands/sibling.rs']:
+                with self.subTest(name=name, location=location):
+                    with tempfile.TemporaryDirectory() as directory:
+                        root = Path(directory)
+                        commands = root / gate.COMMANDS
+                        commands.mkdir(parents=True)
+                        (commands / 'journal.rs').write_text(name + '!("payload");')
+                        (commands / 'ownership.rs').write_text('')
+                        definition = root / location
+                        definition.parent.mkdir(parents=True, exist_ok=True)
+                        definition.write_text(
+                            '#[macro_export] macro_rules! ' + name
+                            + ' { ($($arg:tt)*) => { std::fs::write(path, bytes) } }')
+                        self.assertTrue(gate.check_tree(root))
+
+    def test_filesystem_and_process_capabilities_are_not_general(self):
+        for source in [
+            'std::path::Path::read_dir(path);',
+            'use std::path::Path; Path::read_dir(path);',
+            'use std::path::Path as Input; Input::metadata(path);',
+            'crate::structured::launch::SessionConfigDir::create(path);',
+            'crate::process::TracedCommand::new("program").status();',
+            'use crate::process::TracedCommand as Runner; Runner::new("program");',
+            'use crate::structured::launch::SessionConfigDir as Dir; Dir::create(path);',
+        ]:
+            with self.subTest(source=source):
+                self.assertTrue(gate.check_text(source, gate.COMMANDS / 'journal.rs'))
+
+    def test_new_internal_globs_are_rejected(self):
+        for path in ['journal.rs', 'journal/compact.rs', 'journal/tests.rs']:
+            with self.subTest(path=path):
+                self.assertTrue(gate.check_text(
+                    'mod x {} use self::x::*;', gate.COMMANDS / path))
+
+    def test_test_capabilities_require_test_file_paths(self):
+        source = """
+use crate::structured::launch::SessionConfigDir as Directory;
+use crate::process::TracedCommand as Runner;
+Directory::create(path);
+Runner::new("program").status();
+std::process::exit(0);
+"""
+        for relative in ['journal/tests.rs', 'journal/tests/compaction.rs', 'ownership/tests.rs']:
+            with self.subTest(relative=relative):
+                self.assertEqual(gate.check_text(source, gate.COMMANDS / relative), [])
+        for relative in ['journal.rs', 'journal/helpers.rs', 'journal/tests_extra.rs']:
+            with self.subTest(relative=relative):
+                self.assertTrue(gate.check_text(source, gate.COMMANDS / relative))
+        self.assertTrue(gate.check_text(
+            '#[cfg(test)] mod fixtures { ' + source + ' }', gate.COMMANDS / 'journal.rs'))
+
+    def test_test_subtree_entry_requires_cfg_test(self):
+        for source in ['mod tests;', 'mod tests {}', '#[cfg(any(test, feature="web"))] mod tests;']:
+            with self.subTest(source=source):
+                self.assertTrue(gate.check_text(source, gate.COMMANDS / 'journal.rs'))
+        self.assertEqual(gate.check_text(
+            '#[cfg(test)] mod tests;', gate.COMMANDS / 'journal.rs'), [])
+
+    def test_existing_glob_permissions_are_exact_and_single_use(self):
+        for path in ['journal/compact.rs', 'journal/tests.rs', 'journal/tests/capacity.rs',
+                     'journal/tests/compaction.rs', 'ownership/tests.rs']:
+            with self.subTest(path=path):
+                self.assertEqual(gate.check_text('use super::*;', gate.COMMANDS / path), [])
+                self.assertTrue(gate.check_text(
+                    'use super::*; use super::*;', gate.COMMANDS / path))
+                self.assertTrue(gate.check_text(
+                    'mod nested { use super::*; }', gate.COMMANDS / path))
+                self.assertTrue(gate.check_text(
+                    'fn nested() { use super::*; }', gate.COMMANDS / path))
+
+    def test_path_permissions_do_not_grant_filesystem_members(self):
+        for source in [
+            'Path::read_dir(path);',
+            '<std::path::Path>::read_dir(path);',
+            'use std::path::Path as Alias; <Alias>::read_dir(path);',
+            'PathBuf::metadata(path);',
+            'use super::Path as Input; Input::read_dir(path);',
+            'use self::PathBuf as Input; Input::metadata(path);',
+            'use std::path::{Path as Input}; Input::read_link(path);',
+            'use std::io as streams; streams::stdout();',
+            'io::stdout();',
+        ]:
+            with self.subTest(source=source):
+                self.assertTrue(gate.check_text(source, gate.COMMANDS / 'journal.rs'))
+        self.assertEqual(gate.check_text(
+            'use std::path::{Path, PathBuf}; Path::new(value);', gate.COMMANDS / 'journal.rs'), [])
+
+    def test_in_tree_macros_are_checked_and_cannot_shadow_reviewed_names(self):
+        path = gate.COMMANDS / 'journal.rs'
+        self.assertEqual(gate.check_text(
+            'macro_rules! safe { () => { 1 } } safe!();', path), [])
+        self.assertTrue(gate.check_text(
+            'macro_rules! hidden { () => { std::fs::write(path, bytes) } } hidden!();', path))
+        self.assertTrue(gate.check_text(
+            'macro_rules! println { () => { 1 } } println!();', path))
+        self.assertTrue(gate.check_text(
+            'macro_rules! json { () => { 1 } } serde_json::json!();', path))
+
+    def test_macro_namespace_injection_and_raw_shadowing_are_rejected(self):
+        for definition in [
+            'macro_rules! make { ($name:ident) => { macro_rules! $name { () => { 1 } } } } make!(println);',
+            '#[macro_use] extern crate external;',
+            '#![macro_use] extern crate external;',
+            'macro_rules! r#println { () => { 1 } }',
+        ]:
+            with self.subTest(definition=definition):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    commands = root / gate.COMMANDS
+                    commands.mkdir(parents=True)
+                    (commands / 'journal.rs').write_text('println!("message");')
+                    (commands / 'ownership.rs').write_text('')
+                    (root / 'src/main.rs').write_text(definition)
+                    self.assertTrue(gate.check_tree(root))
+                    (root / 'src/main.rs').write_text('// ' + definition)
+                    self.assertEqual(gate.check_tree(root), [])
+
+    def test_receiver_typed_filesystem_probe_is_rejected(self):
+        source = 'fn probe() { let _ = std::path::Path::new(".").read_dir(); }'
+        self.assertTrue(gate.check_text(source, gate.COMMANDS / 'journal.rs'))
+
+    def test_type_alias_and_late_import_probes_are_rejected(self):
+        for source in [
+            'type InputPath = std::path::Path; fn probe() { InputPath::read_dir(path); }',
+            'fn probe() { InputPath::read_dir(path); } use std::path::Path as InputPath;',
+        ]:
+            with self.subTest(source=source):
+                self.assertTrue(gate.check_text(source, gate.COMMANDS / 'journal.rs'))
+
+    def test_method_layer_refuses_any_receiver_and_associated_type(self):
+        methods = """read_dir metadata symlink_metadata exists try_exists is_file is_dir
+is_symlink canonicalize read_link read_to_string read write create create_new open
+remove_file remove_dir remove_dir_all create_dir create_dir_all rename copy hard_link
+set_permissions spawn output status""".split()
+        for name in methods:
+            for source in ['object.' + name + '(value);', 'Input::' + name + '(value);']:
+                with self.subTest(source=source):
+                    self.assertTrue(gate.check_text(source, gate.COMMANDS / 'journal.rs'))
+        for source in ['let operation = Unknown::read_dir; operation(value);',
+                       'object.r#read_dir();', 'object.read::<u8>(value);',
+                       'Input::write::<u8>(value);', 'object.read("literal ) { text");']:
+            with self.subTest(source=source):
+                self.assertTrue(gate.check_text(source, gate.COMMANDS / 'journal.rs'))
+
+    def test_alias_resolution_is_independent_of_the_method_layer(self):
+        for source in [
+            'fn probe() { InputPath::unreviewed(); } type InputPath = std::path::Path;',
+            'fn probe() { InputPath::unreviewed(); } use std::path::Path as InputPath;',
+            'fn probe() { InputPath::unreviewed(); } type InputPath = Other; type Other = std::path::Path;',
+            'fn probe() { InputPath::unreviewed(); } use Other as InputPath; use std::path::Path as Other;',
+            'types::Input::unreviewed(); mod types { type Input = std::path::Path; }',
+            'fn probe() { self::Input::unreviewed(); } type Input = std::path::Path;',
+            'type One = Two; type Two = One; One::new(value);',
+        ]:
+            with self.subTest(source=source):
+                self.assertTrue(gate.check_text(source, gate.COMMANDS / 'journal.rs'))
+        for source in [
+            'fn probe() { Shared::new(value); } use std::sync::Arc as Shared;',
+            'fn probe() { InputPath::new(value); } type InputPath = std::path::Path;',
+            'fn probe() { InputPath::new(value); } type InputPath = Other; use std::path::Path as Other;',
+            'type Input = std::path::Path; mod inner { type Input = std::sync::Arc; fn probe() { Input::new(value); } }',
+            'types::Input::new(value); mod types { type Input = std::path::Path; }',
+        ]:
+            with self.subTest(source=source):
+                self.assertEqual(gate.check_text(source, gate.COMMANDS / 'journal.rs'), [])
+
+    def test_call_exceptions_require_exact_file_arguments_and_occurrence_limit(self):
+        path = gate.COMMANDS / 'journal.rs'
+        self.assertEqual(gate.check_text('self.source.read(bytes);', path), [])
+        for source, other_path in [
+            ('self.source.read(other);', path),
+            ('self.source.read(bytes);', gate.COMMANDS / 'journal/compact.rs'),
+            ('self.source.read(bytes); self.source.read(bytes);', path),
+            ('file.write_all(b"other");', path),
+        ]:
+            with self.subTest(source=source, path=other_path):
+                self.assertTrue(gate.check_text(source, other_path))
+        self.assertEqual(gate.check_text('file.write_all(b"\\n");', path), [])
+
+    def test_method_layer_skips_only_boundary_and_path_enforced_test_files(self):
+        for relative in ['journal/filesystem.rs', 'journal/tests.rs', 'journal/tests/compaction.rs']:
+            with self.subTest(relative=relative):
+                self.assertEqual(gate.check_text('object.read_dir();', gate.COMMANDS / relative), [])
+        self.assertTrue(gate.check_text(
+            '#[cfg(test)] fn probe() { object.read_dir(); }', gate.COMMANDS / 'journal.rs'))
+        self.assertEqual(gate.check_text(
+            '// object.read_dir();\nlet text = "object.read_dir()"; fn read_dir() {}',
+            gate.COMMANDS / 'journal.rs'), [])
 
     def test_repository_uses_counted_boundary(self):
         self.assertEqual(gate.check_tree(gate.ROOT), [])
