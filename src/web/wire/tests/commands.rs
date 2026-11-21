@@ -97,30 +97,31 @@ impl Case {
         core.service_commands(&mut self.app);
     }
     async fn frame(&mut self, socket: &mut Socket) -> Received {
+        within(self.frame_without_deadline(socket)).await
+    }
+    // Capacity tests rely on nextest's hang ceiling, not a latency assertion.
+    async fn frame_without_deadline(&mut self, socket: &mut Socket) -> Received {
         let owner = self.server.wake.clone();
         let worker = self.notify.clone();
-        within(async {
-            loop {
-                let changed = owner.notified();
-                let produced = worker.notified();
-                tokio::pin!(changed, produced);
-                changed.as_mut().enable();
-                produced.as_mut().enable();
-                self.service();
-                assert!(
-                    self.app
-                        .structured_workers
-                        .report(&self.worker.id, self.worker.generation)
-                        .is_none(),
-                    "harness exited before frame"
-                );
-                tokio::select! { biased;
-                    frame = socket.receive() => return frame,
-                    _ = &mut changed => (), _ = &mut produced => (),
-                }
+        loop {
+            let changed = owner.notified();
+            let produced = worker.notified();
+            tokio::pin!(changed, produced);
+            changed.as_mut().enable();
+            produced.as_mut().enable();
+            self.service();
+            assert!(
+                self.app
+                    .structured_workers
+                    .report(&self.worker.id, self.worker.generation)
+                    .is_none(),
+                "harness exited before frame"
+            );
+            tokio::select! { biased;
+                frame = socket.receive_frames() => return frame,
+                _ = &mut changed => (), _ = &mut produced => (),
             }
-        })
-        .await
+        }
     }
     async fn ack(&mut self, socket: &mut Socket) -> Value {
         match self.frame(socket).await {

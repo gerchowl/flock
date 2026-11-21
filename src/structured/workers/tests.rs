@@ -294,7 +294,11 @@ impl Case {
 }
 
 pub(crate) async fn wait(notify: &Arc<Notify>, mut condition: impl FnMut() -> bool) {
-    tokio::time::timeout(LIMIT, async {
+    #[cfg(feature = "web")]
+    use crate::test_support::deadline::timeout;
+    #[cfg(not(feature = "web"))]
+    use tokio::time::timeout;
+    timeout(LIMIT, async {
         loop {
             if condition() {
                 return;

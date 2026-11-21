@@ -51,11 +51,15 @@ log-budget seconds='60':
     guardrails-log-budget
 
 # Run fast local lint checks
-lint: changelog-check ts-check client-lint
+lint: changelog-check journal-io-check ts-check client-lint
     cargo fmt --check
     cargo clippy --all-targets --locked -- -D warnings
     cargo clippy --all-targets --locked --features ts -- -D warnings
     cargo clippy --locked --bin flk --features web -- -D warnings
+
+# Keep all journal I/O observable, including fully qualified filesystem paths.
+journal-io-check:
+    python3 scripts/journal_io_gate.py
 
 # Validate fragments with the same rules used to prepare a release.
 changelog-check:
@@ -310,3 +314,7 @@ ts-check:
 # and runtime styles and type suppressions cannot bypass the gates (ESLint).
 client-lint:
     cd web/client && bun install --frozen-lockfile && bun run lint
+
+# Non-gating real wire publication timings at near-global journal capacity.
+capacity-publication-probe:
+    cargo nextest run --locked --features web,ts --bin flk --test-threads 2 --retries 0 --run-ignored only -E 'test(near_global_capacity_publication_latency_report)' --success-output immediate

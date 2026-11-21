@@ -120,6 +120,14 @@ repos:
         pass_filenames: false
         files: (^docs/adr/|^FEATURE-MATRIX\.md$)
 
+      # Journal writes must remain observable, including fully qualified paths.
+      - id: journal-io
+        name: "journal I/O uses the counted filesystem boundary"
+        entry: sh scripts/run_guardrail.sh python3 scripts/journal_io_gate.py
+        language: system
+        pass_filenames: false
+        files: ^(src/web/wire/commands/(journal[^/]*(/.*)?\.rs|ownership\.rs)|scripts/(test_)?journal_io_gate\.py)$
+
       # --- hard gates ----------------------------------------------------------
       - id: gitleaks
         name: secrets scan
