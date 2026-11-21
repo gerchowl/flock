@@ -362,8 +362,9 @@ instead fails with the typed `session_busy` acquisition error before readiness.
 To distinguish a journal replay stall from other busy conditions, look for the
 server JSON log with these exact fields: `"message":"command journal replay"`,
 `"event":"client.journal.replay"` and `"status":"stalled"`. Its `replayed_bytes`
-and `total_bytes` fields show the last observed byte counts. The entry records
-the caller's stall timeout; the worker can remain alive with its lease held.
+and `total_bytes` fields show the last observed byte counts. The log entry is
+written when the 10 s no-progress stall timeout fires; the worker can remain
+alive with its lease held.
 
 Recover a permanent stall by restarting the **owning server process**. If its
 API responds, use `flk server stop`; otherwise stop that process using its

@@ -41,7 +41,7 @@ class JournalIoGate(unittest.TestCase):
         source = '''
 mod filesystem;
 use filesystem::{File, files, LockFile};
-use super::filesystem;
+use self::filesystem;
 filesystem::fs::read(path)?;
 filesystem::rename(from, to)?;
 filesystem::sync_directory(root)?;
@@ -71,7 +71,7 @@ let lifetime: &'static str = "File::open";
             boundary = root / gate.BOUNDARY
             boundary.write_text('::std::fs::write(path, bytes)?;')
             findings = gate.check_tree(root)
-            self.assertEqual(len(findings), 5)
+            self.assertEqual(len({finding.split(":")[0] for finding in findings}), 5)
             self.assertTrue(any('ownership.rs:' in finding for finding in findings))
             self.assertTrue(any('nested/filesystem.rs:' in finding for finding in findings))
 
@@ -86,6 +86,90 @@ let lifetime: &'static str = "File::open";
 
     def test_boundary_cannot_be_redeclared_in_a_child(self):
         self.assertTrue(gate.check_text('mod filesystem;', gate.COMMANDS / 'journal/new.rs'))
+
+    def test_sibling_reexport_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            commands = root / gate.COMMANDS
+            commands.mkdir(parents=True)
+            (commands / 'ownership.rs').write_text('')
+            (commands / 'sibling.rs').write_text(
+                'pub use std::fs::write as helper;')
+            (commands / 'journal.rs').write_text(
+                'use super::sibling::helper; fn bypass() { helper(path, bytes); }')
+            self.assertTrue(gate.check_tree(root))
+
+    def test_unreviewed_imports_paths_and_macros_are_rejected(self):
+        for source in [
+            'use crate::other::helper;',
+            'use crate::r#sibling::r#helper as renamed;',
+            'use super::ownership::helper;',
+            'pub use super::{sibling::{helper as renamed}};',
+            'use ::crate::other::helper as renamed;',
+            'crate::other::helper(path, bytes);',
+            '::crate::other::helper(path, bytes);',
+            'return ::crate::other::helper(path, bytes);',
+            'return ::other::helper(path, bytes);',
+            'super::sibling::helper(path, bytes);',
+            'use std::process::Command as Launcher;',
+            '::std::process::Command::new("program");',
+            'use std::sync::*;',
+            'use crate::web::wire::commands::*;',
+            'use super::*;',
+            'use std as native;',
+            'use std::sync as shared; use shared::*;',
+            'crate::other::write!(path);',
+            '::other::write!(path);',
+            'write_from_sibling!(path);',
+            '#[write_from_sibling] fn bypass() {}',
+            '#[cfg_attr(test, write_from_sibling)] fn bypass() {}',
+            '#[derive(WriteFromSibling)] struct Data;',
+            'use filesystem::std as native; native::os::fd::OwnedFd::from(value);',
+            'use self::filesystem::std::os::fd::OwnedFd;',
+            'filesystem::std::os::fd::OwnedFd::from(value);',
+            'extern crate other as helper;',
+            '#[macro_use] mod extra;',
+            'macro_rules! hidden { () => {} }',
+            'mod nested { use super::super::sibling::helper; }',
+            'mod nested { use super::super::*; }',
+            'mod nested { ::crate::other::helper(); }',
+        ]:
+            with self.subTest(source=source):
+                self.assertTrue(gate.check_text(source, gate.COMMANDS / 'journal.rs'))
+
+    def test_reviewed_imports_relative_paths_and_macros_are_allowed(self):
+        source = '''
+use crate::web::wire::commands::{Command as Input, ErrorCode};
+use ::std::{sync::{Arc as Shared}, path::PathBuf};
+use serde_json::json as payload;
+#[derive(serde::Serialize)]
+struct Data;
+crate::logging::client_journal_replay("ready", 1, 1);
+::std::sync::Arc::new(value);
+serde_json::json!({});
+payload!({});
+mod nested {
+    use super::{filesystem, Command};
+    use super::*;
+    use super::super::ErrorCode;
+    super::super::ack(id, result);
+}
+'''
+        self.assertEqual(gate.check_text(source, gate.COMMANDS / 'journal.rs'), [])
+
+    def test_symlinked_modules_are_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            commands = root / gate.COMMANDS
+            journal = commands / 'journal'
+            journal.mkdir(parents=True)
+            (commands / 'journal.rs').write_text('mod external;')
+            (commands / 'ownership.rs').write_text('')
+            outside = root / 'outside'
+            outside.mkdir()
+            (outside / 'mod.rs').write_text('pub use std::fs::write as helper;')
+            (journal / 'external').symlink_to(outside, target_is_directory=True)
+            self.assertTrue(gate.check_tree(root))
 
     def test_repository_uses_counted_boundary(self):
         self.assertEqual(gate.check_tree(gate.ROOT), [])
