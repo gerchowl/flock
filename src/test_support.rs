@@ -631,3 +631,6 @@ mod tests {
         program_path("flock-definitely-not-a-real-program");
     }
 }
+
+#[cfg(feature = "web")]
+pub(crate) mod deadline;
