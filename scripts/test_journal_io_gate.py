@@ -42,11 +42,10 @@ class JournalIoGate(unittest.TestCase):
 mod filesystem;
 use filesystem::{File, files, LockFile};
 use self::filesystem;
-filesystem::fs::read(path)?;
-filesystem::rename(from, to)?;
+use filesystem::fs;
 filesystem::sync_directory(root)?;
 files::open_append_file(path)?;
-file.try_clone()?.write_all(bytes)?;
+self.source.read(bytes)?;
 // ::std::fs::write(path, bytes)
 /* outer /* tokio::fs */ OpenOptions */
 let message = "::std::fs::write";
@@ -238,6 +237,8 @@ std::process::exit(0);
                     'use super::*; use super::*;', gate.COMMANDS / path))
                 self.assertTrue(gate.check_text(
                     'mod nested { use super::*; }', gate.COMMANDS / path))
+                self.assertTrue(gate.check_text(
+                    'fn nested() { use super::*; }', gate.COMMANDS / path))
 
     def test_path_permissions_do_not_grant_filesystem_members(self):
         for source in [
@@ -285,6 +286,78 @@ std::process::exit(0);
                     self.assertTrue(gate.check_tree(root))
                     (root / 'src/main.rs').write_text('// ' + definition)
                     self.assertEqual(gate.check_tree(root), [])
+
+    def test_receiver_typed_filesystem_probe_is_rejected(self):
+        source = 'fn probe() { let _ = std::path::Path::new(".").read_dir(); }'
+        self.assertTrue(gate.check_text(source, gate.COMMANDS / 'journal.rs'))
+
+    def test_type_alias_and_late_import_probes_are_rejected(self):
+        for source in [
+            'type InputPath = std::path::Path; fn probe() { InputPath::read_dir(path); }',
+            'fn probe() { InputPath::read_dir(path); } use std::path::Path as InputPath;',
+        ]:
+            with self.subTest(source=source):
+                self.assertTrue(gate.check_text(source, gate.COMMANDS / 'journal.rs'))
+
+    def test_method_layer_refuses_any_receiver_and_associated_type(self):
+        methods = """read_dir metadata symlink_metadata exists try_exists is_file is_dir
+is_symlink canonicalize read_link read_to_string read write create create_new open
+remove_file remove_dir remove_dir_all create_dir create_dir_all rename copy hard_link
+set_permissions spawn output status""".split()
+        for name in methods:
+            for source in ['object.' + name + '(value);', 'Input::' + name + '(value);']:
+                with self.subTest(source=source):
+                    self.assertTrue(gate.check_text(source, gate.COMMANDS / 'journal.rs'))
+        for source in ['let operation = Unknown::read_dir; operation(value);',
+                       'object.r#read_dir();', 'object.read::<u8>(value);',
+                       'Input::write::<u8>(value);', 'object.read("literal ) { text");']:
+            with self.subTest(source=source):
+                self.assertTrue(gate.check_text(source, gate.COMMANDS / 'journal.rs'))
+
+    def test_alias_resolution_is_independent_of_the_method_layer(self):
+        for source in [
+            'fn probe() { InputPath::unreviewed(); } type InputPath = std::path::Path;',
+            'fn probe() { InputPath::unreviewed(); } use std::path::Path as InputPath;',
+            'fn probe() { InputPath::unreviewed(); } type InputPath = Other; type Other = std::path::Path;',
+            'fn probe() { InputPath::unreviewed(); } use Other as InputPath; use std::path::Path as Other;',
+            'types::Input::unreviewed(); mod types { type Input = std::path::Path; }',
+            'fn probe() { self::Input::unreviewed(); } type Input = std::path::Path;',
+            'type One = Two; type Two = One; One::new(value);',
+        ]:
+            with self.subTest(source=source):
+                self.assertTrue(gate.check_text(source, gate.COMMANDS / 'journal.rs'))
+        for source in [
+            'fn probe() { Shared::new(value); } use std::sync::Arc as Shared;',
+            'fn probe() { InputPath::new(value); } type InputPath = std::path::Path;',
+            'fn probe() { InputPath::new(value); } type InputPath = Other; use std::path::Path as Other;',
+            'type Input = std::path::Path; mod inner { type Input = std::sync::Arc; fn probe() { Input::new(value); } }',
+            'types::Input::new(value); mod types { type Input = std::path::Path; }',
+        ]:
+            with self.subTest(source=source):
+                self.assertEqual(gate.check_text(source, gate.COMMANDS / 'journal.rs'), [])
+
+    def test_call_exceptions_require_exact_file_arguments_and_occurrence_limit(self):
+        path = gate.COMMANDS / 'journal.rs'
+        self.assertEqual(gate.check_text('self.source.read(bytes);', path), [])
+        for source, other_path in [
+            ('self.source.read(other);', path),
+            ('self.source.read(bytes);', gate.COMMANDS / 'journal/compact.rs'),
+            ('self.source.read(bytes); self.source.read(bytes);', path),
+            ('file.write_all(b"other");', path),
+        ]:
+            with self.subTest(source=source, path=other_path):
+                self.assertTrue(gate.check_text(source, other_path))
+        self.assertEqual(gate.check_text('file.write_all(b"\\n");', path), [])
+
+    def test_method_layer_skips_only_boundary_and_path_enforced_test_files(self):
+        for relative in ['journal/filesystem.rs', 'journal/tests.rs', 'journal/tests/compaction.rs']:
+            with self.subTest(relative=relative):
+                self.assertEqual(gate.check_text('object.read_dir();', gate.COMMANDS / relative), [])
+        self.assertTrue(gate.check_text(
+            '#[cfg(test)] fn probe() { object.read_dir(); }', gate.COMMANDS / 'journal.rs'))
+        self.assertEqual(gate.check_text(
+            '// object.read_dir();\nlet text = "object.read_dir()"; fn read_dir() {}',
+            gate.COMMANDS / 'journal.rs'), [])
 
     def test_repository_uses_counted_boundary(self):
         self.assertEqual(gate.check_tree(gate.ROOT), [])

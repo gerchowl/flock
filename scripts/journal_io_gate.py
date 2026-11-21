@@ -8,6 +8,17 @@ paths are checked alike, so aliases, grouped imports, raw identifiers and leadin
 entry, including macros. External globs, namespace injection, path overrides and
 included Rust code and symlinks are refused. Only enumerated existing internal globs are allowed.
 Comments and literals are ignored. There is no escape marker.
+
+Known limits: this is a text scanner, not a Rust parser or type checker. It does
+not infer receiver types, expand arbitrary macros, or model trait dispatch and
+generic instantiation. The independent method-name layer defends receiver-typed
+calls even when path resolution cannot identify their origin. References to
+associated capability functions are refused too, preventing an indirect call
+through a function value. Exact call-text
+exceptions trust the reviewed receiver bindings in those source files; they are
+not proof of Rust type identity. Alias collection covers the whole file and its
+lexical/inline-module scopes before uses are checked. Unsupported source and
+namespace injection constructs fail closed as documented above.
 """
 from __future__ import annotations
 
@@ -163,6 +174,353 @@ EXISTING_GLOBS = {
 # No crate-defined macros currently need to cross into the journal.
 CRATE_MACRO_ALLOWLIST = {}
 
+# Independent of path/alias resolution: these std and Tokio names can perform
+# filesystem or process operations on a value whose type the scanner cannot infer.
+CAPABILITY_METHODS = frozenset({
+    'read_dir', 'metadata', 'symlink_metadata', 'exists', 'try_exists',
+    'is_file', 'is_dir', 'is_symlink', 'canonicalize', 'read_link',
+    'read_to_string', 'read', 'write', 'create', 'create_new', 'open',
+    'remove_file', 'remove_dir', 'remove_dir_all', 'create_dir', 'create_dir_all',
+    'rename', 'copy', 'hard_link', 'set_permissions', 'spawn', 'output', 'status',
+    # Stream, file-handle and lock operations also need counted-wrapper review.
+    'read_exact', 'read_to_end', 'read_vectored', 'read_buf', 'read_buf_exact',
+    'write_all', 'write_fmt', 'write_vectored', 'write_buf', 'write_all_buf',
+    'flush', 'seek', 'rewind', 'stream_position', 'set_len', 'sync_all', 'sync_data',
+    'try_clone', 'lock', 'lock_shared', 'try_lock', 'try_lock_shared', 'unlock',
+    'set_modified', 'set_accessed', 'set_times',
+    # Process management and current-directory mutation are capabilities too.
+    'kill', 'wait', 'wait_with_output', 'try_wait', 'exec', 'set_current_dir',
+})
+
+
+def call_span(code, index):
+    """Return the exact receiver/associated-call source span, including arguments."""
+    names = [name for name, _ in code]
+    if names[index - 1:index] not in (['.'], ['::']):
+        return None
+    opening = index + 1
+    if names[opening:opening + 2] == ['::', '<']:
+        opening += 2
+        depth = 1
+        while opening < len(names) and depth:
+            depth += (names[opening] == '<') - (
+                names[opening] == '>' and names[opening - 1] != '-')
+            opening += 1
+    if names[opening:opening + 1] != ['(']:
+        # A capability-bearing generic reference that cannot be resolved must
+        # not silently opt out of the independent call-name layer.
+        return (code[index][1], code[index][1] + len(names[index])) if opening > index + 1 else None
+
+    def matching(end):
+        pairs = {')': '(', ']': '[', '}': '{', '>': '<'}
+        left, depth = pairs[names[end]], 1
+        cursor = end - 1
+        while cursor >= 0:
+            depth += (names[cursor] == names[end]) - (names[cursor] == left)
+            if not depth:
+                return cursor
+            cursor -= 1
+        return 0
+
+    def receiver(end):
+        if end < 0:
+            return 0
+        if names[end] == '?':
+            return receiver(end - 1)
+        start = matching(end) if names[end] in {')', ']', '}', '>'} else end
+        if start and names[end] in {')', ']'} and (
+                IDENT.fullmatch(names[start - 1]) or names[start - 1] in {')', ']', '>'}):
+            start = receiver(start - 1)
+        if start >= 2 and names[start - 1] in {'.', '::'}:
+            start = receiver(start - 2)
+        return start
+
+    start = receiver(index - 2)
+    stack = ['(']
+    end = opening + 1
+    pairs = {')': '(', ']': '[', '}': '{'}
+    while end < len(names) and stack:
+        if names[end] in {'(', '[', '{'}:
+            stack.append(names[end])
+        elif names[end] in pairs:
+            if stack[-1] != pairs[names[end]]:
+                return None
+            stack.pop()
+        end += 1
+    if stack:
+        return None
+    return code[start][1], code[end - 1][1] + 1
+
+
+def method_findings(text, code, path):
+    if path == BOUNDARY or test_source(path):
+        return []
+    findings, seen = [], {}
+    for i, (name, offset) in enumerate(code):
+        if name not in CAPABILITY_METHODS:
+            continue
+        span = call_span(code, i)
+        if span is None:
+            if i and code[i - 1][0] == '::':
+                findings.append((text.count('\n', 0, offset) + 1,
+                                 f'associated capability reference requires review: {name}'))
+            continue
+        key = (path, text[span[0]:span[1]])
+        seen[key] = seen.get(key, 0) + 1
+        exception = CALL_EXCEPTIONS.get(key)
+        if exception is None or seen[key] > exception[1]:
+            findings.append((text.count('\n', 0, offset) + 1,
+                             f'filesystem/process-capable call requires an exact exception: {name}'))
+    return findings
+
+# Each key is the file plus the complete, literal call text (including arguments
+# and closure bodies). Values record the reason and maximum existing occurrences.
+# Receiver bindings are trusted only for these reviewed source expressions.
+CALL_EXCEPTIONS = {
+    (COMMANDS / 'journal/compact.rs', r'''self.file.write_all(&line)'''): (
+        'existing counted File/Stream or its buffered writer; boundary retains I/O observation', 1),
+    (COMMANDS / 'journal/compact.rs', r'''self.file.try_clone()'''): (
+        'existing counted File/Stream or its buffered writer; boundary retains I/O observation', 1),
+    (COMMANDS / 'journal/compact.rs', r'''std::thread::Builder::new()
+            .name("wire-compact".into())
+            .spawn(move || {
+                let initial = (|| -> io::Result<Snapshot> {
+                    let path = root.join("commands.compact");
+                    match filesystem::remove_file(&path) {
+                        Ok(()) => (),
+                        Err(e) if e.kind() == io::ErrorKind::NotFound => (),
+                        Err(e) => return Err(e),
+                    }
+                    drop(files::create_private_file(&path)?);
+                    let mut snapshot = Snapshot {
+                        reader: io::BufReader::new(Positioned {
+                            file: source,
+                            offset: 0,
+                        }),
+                        file: files::open_append_file(&path)?,
+                        // Reserve on the copier so the bounded publication tail cannot rehash.
+                        index: Index {
+                            records: HashMap::with_capacity(limit),
+                            counts: HashMap::with_capacity(limit),
+                            oldest_ms: None,
+                        },
+                        offset: 0,
+                        bytes: 0,
+                        now,
+                        limit,
+                        #[cfg(test)]
+                        hook,
+                    };
+                    #[cfg(test)]
+                    snapshot.checkpoint("created");
+                    snapshot.copy_to(prefix)?;
+                    #[cfg(test)]
+                    snapshot.checkpoint("prefix_copied");
+                    Ok(snapshot)
+                })();
+                if tx.send(Message::Compacted(initial)).is_err() {
+                    return;
+                }
+                while let Ok(next) = control.recv() {
+                    match next {
+                        Continue::CatchUp(mut snapshot, target) => {
+                            let result = snapshot.copy_to(target).map(|()| snapshot);
+                            if tx.send(Message::Compacted(result)).is_err() {
+                                break;
+                            }
+                        }
+                        Continue::Retire(index) => {
+                            drop(index);
+                            break;
+                        }
+                    }
+                }
+            })'''): (
+        'existing journal worker thread, not a child process; body scanned independently', 1),
+    (COMMANDS / 'journal/compact.rs', r'''filesystem::remove_file(&path)'''): (
+        'existing counted filesystem boundary adapter', 1),
+    (COMMANDS / 'journal/compact.rs', r'''snapshot.file.sync_all()'''): (
+        'existing counted File/Stream or its buffered writer; boundary retains I/O observation', 1),
+    (COMMANDS / 'journal/compact.rs', r'''filesystem::rename(
+                self.root.join("commands.compact"),
+                self.root.join("commands.jsonl"),
+            )'''): (
+        'existing counted filesystem boundary adapter', 1),
+    (COMMANDS / 'journal/compact.rs', r'''snapshot.file.try_clone()'''): (
+        'existing counted File/Stream or its buffered writer; boundary retains I/O observation', 2),
+    (COMMANDS / 'journal.rs', r'''self.source.read(bytes)'''): (
+        'existing replay stream delegates to the counted File', 1),
+    (COMMANDS / 'journal.rs', r'''Self::spawn(
+            move || {
+                let mut journal = Journal::lease(&data)?;
+                journal.replay_progress = progress;
+                journal.replay_advanced(0);
+                if let Some(acquired) = acquired {
+                    let _ = acquired.send(());
+                }
+                #[cfg(test)]
+                tests::replay_barrier(&data)?;
+                journal.replay()?;
+                Ok(journal)
+            },
+            wake,
+        )'''): (
+        'existing journal Writer factory; closure uses the counted boundary', 1),
+    (COMMANDS / 'journal.rs', r'''std::thread::Builder::new()
+            .name("wire-journal".into())
+            .spawn(move || {
+                if let Ok(mut journal) = open().inspect_err(unavailable) {
+                    let _ = opened.send(Ok(()));
+                    while let Ok(message) = rx.recv() {
+                        match message {
+                            Message::Job((operation, reply)) => {
+                                let now = match &operation {
+                                    Operation::Claim { now, .. } => Some(*now),
+                                    _ => None,
+                                };
+                                let result = journal.apply(operation);
+                                // Counted I/O has no published completion yet.
+                                worker_pending.fetch_sub(1, Ordering::AcqRel);
+                                let _ = reply.send(result);
+                                if let Some(now) = now {
+                                    if let Some(admission) = weak.upgrade() {
+                                        let tx = admission.lock().as_ref().cloned();
+                                        if let Some(tx) = tx {
+                                            journal.start_compaction(now, tx);
+                                        }
+                                    }
+                                }
+                            }
+                            Message::Compacted(result) => journal.compacted(result),
+                        }
+                        wake.notify_one();
+                    }
+                    // The lease is released before shutdown completion becomes observable.
+                    drop(journal);
+                } else {
+                    let _ = opened.send(Err(ErrorCode::SessionBusy));
+                }
+                closed.send_replace(true);
+            })'''): (
+        'existing journal worker thread, not a child process; body scanned independently', 1),
+    (COMMANDS / 'journal.rs', r'''admission.lock()'''): (
+        'existing in-memory ownership/admission mutex, not a filesystem lock', 1),
+    (COMMANDS / 'journal.rs', r'''self
+            .admission
+            .lock()'''): (
+        'existing in-memory ownership/admission mutex, not a filesystem lock', 1),
+    (COMMANDS / 'journal.rs', r'''self.admission.lock()'''): (
+        'existing in-memory ownership/admission mutex, not a filesystem lock', 1),
+    (COMMANDS / 'journal.rs', r'''file.sync_all()'''): (
+        'existing counted File/Stream or its buffered writer; boundary retains I/O observation', 2),
+    (COMMANDS / 'journal.rs', r'''lease.try_lock()'''): (
+        'existing counted LockFile wrapper', 1),
+    (COMMANDS / 'journal.rs', r'''file.metadata()'''): (
+        'existing counted File/Stream or its buffered writer; boundary retains I/O observation', 2),
+    (COMMANDS / 'journal.rs', r'''self.file.try_clone()'''): (
+        'existing counted File/Stream or its buffered writer; boundary retains I/O observation', 3),
+    (COMMANDS / 'journal.rs', r'''file.write_all(b"\n")'''): (
+        'existing counted File/Stream or its buffered writer; boundary retains I/O observation', 3),
+    (COMMANDS / 'journal.rs', r'''file.flush()'''): (
+        'existing counted File/Stream or its buffered writer; boundary retains I/O observation', 1),
+    (COMMANDS / 'journal.rs', r'''file.get_ref().sync_all()'''): (
+        'existing counted File/Stream or its buffered writer; boundary retains I/O observation', 1),
+    (COMMANDS / 'journal.rs', r'''self.file.try_clone()?.seek(SeekFrom::Start(0))'''): (
+        'existing counted File/Stream or its buffered writer; boundary retains I/O observation', 1),
+    (COMMANDS / 'journal.rs', r'''self.file.metadata()'''): (
+        'existing counted File/Stream or its buffered writer; boundary retains I/O observation', 1),
+    (COMMANDS / 'journal.rs', r'''file.write_all(&archive)'''): (
+        'existing counted File/Stream or its buffered writer; boundary retains I/O observation', 1),
+    (COMMANDS / 'journal.rs', r'''self.file.set_len(good)'''): (
+        'existing counted File/Stream or its buffered writer; boundary retains I/O observation', 1),
+    (COMMANDS / 'journal.rs', r'''self.file.sync_all()'''): (
+        'existing counted File/Stream or its buffered writer; boundary retains I/O observation', 2),
+    (COMMANDS / 'journal.rs', r'''self.file.write_all(&line[..line.len() / 2])'''): (
+        'existing counted File/Stream or its buffered writer; boundary retains I/O observation', 1),
+    (COMMANDS / 'journal.rs', r'''self.file.write_all(&line)'''): (
+        'existing counted File/Stream or its buffered writer; boundary retains I/O observation', 1),
+    (COMMANDS / 'journal.rs', r'''self.file.sync_data()'''): (
+        'existing counted File/Stream or its buffered writer; boundary retains I/O observation', 1),
+    (COMMANDS / 'journal.rs', r'''self.file.set_len(before)'''): (
+        'existing counted File/Stream or its buffered writer; boundary retains I/O observation', 1),
+    (COMMANDS / 'ownership.rs', r'''self
+            .0
+            .writer
+            .try_lock()'''): (
+        'existing in-memory ownership/admission mutex, not a filesystem lock', 1),
+    (COMMANDS / 'ownership.rs', r'''self.0.pending.lock()'''): (
+        'existing in-memory ownership/admission mutex, not a filesystem lock', 2),
+    (COMMANDS / 'ownership.rs', r'''tokio::spawn(async move {
+            let mut send = Some(send);
+            let mut acquired = Some(acquired);
+            loop {
+                let (progress, mut advanced) = watch::channel((0, 0));
+                let stalled = Arc::new(AtomicBool::new(false));
+                let opening = owner.acquire_at(phase, acquired.take(), progress, stalled.clone());
+                tokio::pin!(opening);
+                let idle = tokio::time::sleep(REPLAY_STALL);
+                tokio::pin!(idle);
+                let mut observing = true;
+                let result = loop {
+                    tokio::select! {
+                        biased;
+                        result = &mut opening => break result,
+                        changed = advanced.changed(), if observing => {
+                            observing = changed.is_ok();
+                            if observing {
+                                idle.as_mut().reset(tokio::time::Instant::now() + REPLAY_STALL);
+                                #[cfg(test)]
+                                tests::replay_observed(&owner.0.data, *advanced.borrow());
+                            }
+                        }
+                        _ = &mut idle => {
+                            stalled.store(true, Ordering::Release);
+                            let (bytes, total) = *advanced.borrow();
+                            crate::logging::client_journal_replay("stalled", bytes, total);
+                            if let Some(send) = send.take() {
+                                let _ = send.send(Err(ErrorCode::SessionBusy));
+                            }
+                            owner.0.wake.notify_one();
+                            // Retain the worker and its lease until it stops. A
+                            // late completion must drain, never reopen admission.
+                            break opening.await;
+                        }
+                    }
+                };
+                let delivered = send.take().is_some_and(|send| send.send(result).is_ok());
+                // Synchronous startup already observes its reply. Only later
+                // recovery or rollback needs to wake the running owner loop.
+                if notify || !delivered {
+                    owner.0.wake.notify_one();
+                }
+                if result.is_ok() || !owner.current(phase) {
+                    break;
+                }
+                tokio::time::sleep(ACQUIRE_RETRY).await;
+            }
+        })'''): (
+        'existing ownership future task, not a child process; body scanned independently', 1),
+    (COMMANDS / 'ownership.rs', r'''self.0.writer.lock()'''): (
+        'existing in-memory ownership/admission mutex, not a filesystem lock', 1),
+    (COMMANDS / 'ownership.rs', r'''self.0.open_barrier.lock()'''): (
+        'existing in-memory ownership/admission mutex, not a filesystem lock', 1),
+    (COMMANDS / 'ownership.rs', r'''tokio::spawn(async move {
+            let mut slot = owner.0.writer.lock().await;
+            // An abandoned old drain must not close a newer recovered owner.
+            if slot.phase <= phase {
+                if let Some(writer) = slot.writer.take() {
+                    writer.shutdown().await?;
+                }
+            }
+            Ok::<_, ErrorCode>(())
+        })'''): (
+        'existing ownership future task, not a child process; body scanned independently', 1),
+    (COMMANDS / 'ownership.rs', r'''owner.0.writer.lock()'''): (
+        'existing in-memory ownership/admission mutex, not a filesystem lock', 1),
+    (COMMANDS / 'ownership.rs', r'''tokio::spawn(async move { owner.wait_open(reply).await })'''): (
+        'existing ownership future task, not a child process; body scanned independently', 1),
+}
+
 
 def test_source(path: Path) -> bool:
     relative = path.relative_to(COMMANDS)
@@ -228,6 +586,100 @@ def import_paths(names: list[str], start: int):
     return entries, end + 1
 
 
+class AliasIndex:
+    """Collect use/type aliases before resolving any occurrence in a scope.
+
+    Simple path aliases are followed recursively, including qualified aliases
+    in inline modules. Wrapper arguments and tuple elements are still inspected
+    by the ordinary path scan; generic parameters are not instantiated.
+    """
+
+    def __init__(self, names, base):
+        self.scopes = [{'parent': None, 'module': base, 'aliases': {}}]
+        self.at = [0] * len(names)
+        self.modules = {base: 0}
+        scope, i = 0, 0
+        while i < len(names):
+            self.at[i] = scope
+            if names[i] == 'use':
+                try:
+                    entries, end = import_paths(names, i + 1)
+                    for parts, _, alias in entries:
+                        if alias != '*':
+                            self.scopes[scope]['aliases'][alias] = parts
+                    self.at[i:end] = [scope] * (end - i)
+                    i = end
+                    continue
+                except (ValueError, IndexError):
+                    pass  # The checking pass reports unsupported imports.
+            elif names[i] == 'type' and names[i + 2:i + 3] == ['=']:
+                parts, end = [], i + 3
+                if names[end:end + 1] == ['::']:
+                    end += 1
+                while end < len(names) and IDENT.fullmatch(names[end]):
+                    parts.append(names[end])
+                    end += 1
+                    if names[end:end + 1] != ['::']:
+                        break
+                    end += 1
+                if parts:
+                    self.scopes[scope]['aliases'][names[i + 1]] = parts
+            elif names[i] == '{':
+                module = self.scopes[scope]['module']
+                is_module = i >= 2 and names[i - 2] == 'mod'
+                if is_module:
+                    module += (names[i - 1],)
+                self.scopes.append({'parent': scope, 'module': module, 'aliases': {}})
+                scope = len(self.scopes) - 1
+                if is_module:
+                    self.modules[module] = scope
+            elif names[i] == '}' and self.scopes[scope]['parent'] is not None:
+                scope = self.scopes[scope]['parent']
+            i += 1
+
+    def visible(self, scope):
+        result = {}
+        module = self.scopes[scope]['module']
+        while scope is not None and self.scopes[scope]['module'] == module:
+            for name in self.scopes[scope]['aliases']:
+                result.setdefault(name, scope)
+            scope = self.scopes[scope]['parent']
+        return result
+
+    def resolve(self, parts, scope, seen=frozenset()):
+        if not parts:
+            return parts
+        module = self.scopes[scope]['module']
+        visible = self.visible(scope)
+        binding = None
+        if parts[0] in visible:
+            binding = (visible[parts[0]], parts[0], parts[1:])
+        else:
+            if parts[0] == 'self':
+                parts = list(module) + parts[1:]
+            elif parts[0] == 'super':
+                while parts and parts[0] == 'super':
+                    module, parts = module[:-1], parts[1:]
+                parts = list(module) + parts
+            elif tuple(module + (parts[0],)) in self.modules:
+                parts = list(module) + parts
+            for end in range(1, len(parts)):
+                owner = self.modules.get(tuple(parts[:end]))
+                if owner is not None and parts[end] in self.scopes[owner]['aliases']:
+                    binding = (owner, parts[end], parts[end + 1:])
+                    break
+        if binding is None:
+            return parts
+        owner, name, tail = binding
+        key = (owner, name)
+        if key in seen:
+            # An identity module re-export is harmless; real alias cycles fail.
+            identity = list(self.scopes[owner]['module']) + [name]
+            return identity + tail if parts == identity + tail else ['cyclic_alias', name]
+        target = self.resolve(self.scopes[owner]['aliases'][name], owner, seen | {key})
+        return target + tail
+
+
 def import_findings(code, path, local_macros):
     """Resolve explicit relative paths; refuse source/namespace escape constructs.
 
@@ -238,35 +690,28 @@ def import_findings(code, path, local_macros):
     names = [name for name, _ in code]
     findings = []
     base = module_path(path)
-    modules = [base]
-    imports = [{}]
-    imported = imports[-1]
+    module = base
+    aliases = AliasIndex(names, base)
+    scope = 0
+    imported = aliases.visible(scope)
     i = 0
     seen_globs = set()
     allowed_items = ALLOWLIST | (TEST_ONLY_ALLOWLIST if test_source(path) else {})
 
     def check(parts, index):
         original = parts[:]
-        if parts and parts[0] in imported:
-            parts = list(imported[parts[0]]) + parts[1:]
+        parts = aliases.resolve(parts, scope)
         if parts[-1:] == ['self']:
             parts = parts[:-1]
         if not parts:
             return
-        if parts[0] == 'super':
-            context = modules[-1]
-            while parts and parts[0] == 'super':
-                context, parts = context[:-1], parts[1:]
-            parts = list(context) + parts
-        elif parts[0] == 'self':
-            parts = list(modules[-1]) + parts[1:]
-        elif parts[0] in {'io', 'mpsc', 'oneshot', 'watch'}:
+        if parts[0] in {'io', 'mpsc', 'oneshot', 'watch'}:
             namespace = ['std', 'io'] if parts[0] == 'io' else (
                 ['std', 'sync', 'mpsc'] if parts[0] == 'mpsc' else ['tokio', 'sync', parts[0]])
             parts = namespace + parts[1:]
         elif parts[0] in {'filesystem', 'tests', 'compact', 'journal'}:
             # Bare local modules are resolved relative to the current Rust module.
-            parts = list(modules[-1]) + parts
+            parts = list(module) + parts
         # The counted boundary re-exports std for tests. Its non-filesystem
         # members must receive the same review as a direct std path.
         if parts[:len(JOURNAL)] == list(JOURNAL) and 'std' in parts[len(JOURNAL):]:
@@ -286,7 +731,7 @@ def import_findings(code, path, local_macros):
                       for key in allowed_items)
         allowed = allowed or '::'.join(parts) in TYPE_ONLY_ALLOWLIST
         if '*' in parts:
-            existing = (path in EXISTING_GLOBS and modules[-1] == base
+            existing = (path in EXISTING_GLOBS and scope == 0
                         and original == ['super', '*'] and internal
                         and path not in seen_globs)
             seen_globs.add(path)
@@ -299,6 +744,9 @@ def import_findings(code, path, local_macros):
         return resolved
 
     while i < len(names):
+        scope = aliases.at[i]
+        imported = aliases.visible(scope)
+        module = aliases.scopes[scope]['module']
         name = names[i]
         attribute = names[max(0, i - 2):i] == ['#', '['] or (
             names[max(0, i - 3):i] == ['#', '!', '['])
@@ -321,25 +769,12 @@ def import_findings(code, path, local_macros):
             try:
                 entries, end = import_paths(names, i + 1)
                 for parts, index, alias in entries:
-                    resolved = check(parts, index)
-                    if alias != "*":
-                        imported[alias] = resolved
+                    check(parts, index)
                 i = end
                 continue
             except (ValueError, IndexError):
                 findings.append((code[i][1], 'unsupported journal use tree'))
-        if name == '{':
-            child = modules[-1]
-            if i >= 2 and names[i - 2] == 'mod':
-                child += (names[i - 1],)
-            modules.append(child)
-            imports.append(imported.copy())
-            imported = imports[-1]
-        elif name == '}' and len(modules) > 1:
-            modules.pop()
-            imports.pop()
-            imported = imports[-1]
-        elif name in {'extern', 'macro_use'}:
+        if name in {'extern', 'macro_use'}:
             findings.append((code[i][1], 'external/macro namespace injection is forbidden'))
         elif name == 'mod' and names[i + 1:i + 2] == ['tests']:
             # File-path test permissions depend on every entry into a tests
@@ -348,7 +783,7 @@ def import_findings(code, path, local_macros):
                 findings.append((code[i][1], 'test modules require an explicit cfg(test) entry'))
         elif name == 'mod' and names[i + 2:i + 3] == [';']:
             # The scanner must cover every out-of-line module's default location.
-            child = modules[-1] + (names[i + 1],)
+            child = module + (names[i + 1],)
             if child[:len(JOURNAL)] != JOURNAL and child[:len(OWNERSHIP)] != OWNERSHIP:
                 findings.append((code[i][1], 'module declaration escapes the journal source scan'))
         elif ((name in {'crate', 'super', 'self', 'std', 'core', 'alloc'}
@@ -411,6 +846,7 @@ def check_text(text: str, path: Path, crate_macros=None, macro_uses=()) -> list[
                      or (source, name) in CRATE_MACRO_ALLOWLIST for source in sources)}
     findings = [(text.count("\n", 0, offset) + 1, reason)
                 for offset, reason in import_findings(code, path, local)]
+    findings.extend(method_findings(text, code, path))
     attribute_depth = 0
     for i, (name, offset) in enumerate(code):
         if name == "[" and (attribute_depth or names[max(0, i - 1):i] == ["#"]
