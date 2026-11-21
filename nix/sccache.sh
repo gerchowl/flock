@@ -1,15 +1,17 @@
 # shellcheck shell=sh
 # sccache 0.18 has no server-only TMPDIR setting. Apply it on every invocation
 # so automatic startup, explicit startup, and idle restarts use the same root.
-# Leave artifact storage unset by default so sccache keeps its platform cache.
-if [ -n "${SCCACHE_DIR:-}" ]; then
-  sccache_runtime_root="$SCCACHE_DIR"
-elif [ -n "${HOME:-}" ]; then
-  sccache_runtime_root="$HOME/.cache/flock-sccache"
-else
-  printf 'sccache: HOME is unset and SCCACHE_DIR is not given\n' >&2
-  exit 1
+# Resolve the account home, not an agent's isolated HOME or XDG_CACHE_HOME.
+# Keep the usual platform artifact location warm across isolated environments.
+if [ -z "${SCCACHE_DIR:-}" ]; then
+  sccache_account_home=$("$SCCACHE_PYTHON" -c 'import os, pwd; print(pwd.getpwuid(os.getuid()).pw_dir)') || exit 1
+  if [ -z "$sccache_account_home" ]; then
+    printf 'sccache: cannot resolve account home; set SCCACHE_DIR\n' >&2
+    exit 1
+  fi
+  export SCCACHE_DIR="$sccache_account_home/$SCCACHE_CACHE_SUFFIX"
 fi
+sccache_runtime_root="$SCCACHE_DIR"
 export TMPDIR="$sccache_runtime_root/tmp"
 if ! mkdir -p "$TMPDIR"; then
   printf 'sccache: cannot create persistent temp directory: %s\n' "$TMPDIR" >&2

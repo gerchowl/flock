@@ -41,6 +41,10 @@
         pkgs.writeShellScriptBin "sccache" ''
           set -eu
           SCCACHE_REAL=${patchedSccacheFor pkgs}/bin/sccache
+          SCCACHE_PYTHON=${pkgs.python3}/bin/python3
+          SCCACHE_CACHE_SUFFIX=${
+            if pkgs.stdenv.hostPlatform.isDarwin then "Library/Caches/Mozilla.sccache" else ".cache/sccache"
+          }
           ${builtins.readFile ./nix/sccache.sh}
         '';
     in
@@ -102,6 +106,7 @@
                 RUSTC_WRAPPER = "${stableSccacheFor pkgs}/bin/sccache";
                 FLOCK_TEST_SCCACHE_WRAPPER = "${stableSccacheFor pkgs}/bin/sccache";
                 FLOCK_TEST_SCCACHE_RAW = "${patchedSccacheFor pkgs}/bin/sccache";
+                FLOCK_TEST_SCCACHE_SCRIPT = ./nix/sccache.sh;
               }
               ''
                 python3 ${./scripts/probe_sccache.py}
@@ -206,7 +211,7 @@
           default = guardrails.lib.${system}.mkDevShell {
             inherit pkgs;
             extra = lintTools ++ [ (pkgs.callPackage ./nix/nextest.nix { }) ];
-            # Leave sccache's platform artifact cache unchanged and give the daemon a
+            # Use the account's platform artifact cache and give the daemon a
             # persistent TMPDIR and its own socket (#1325). A wrapper covers
             # lazy startup and idle restarts without changing the shell TMPDIR.
             # SCCACHE_DIR alone only controls artifacts, not temporary files.
