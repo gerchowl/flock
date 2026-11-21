@@ -553,8 +553,12 @@ immediate destination-side fence. Bound outstanding commands; no new indefinite
 offline command queue disguised as reliable agent mail. Use a 30-second
 destination-admission budget starting at the home, matching S7's acknowledgement
 ceiling. Decrement it by monotonic residence at every hop, including pause;
-rerouting never renews it. A recovered unadmitted request whose age cannot be
-established refuses, never gets a new budget. Destination checks expiry
+rerouting never renews it. The home signs immutable `budget_ms` (30,000 ms);
+hops carry nondecreasing `elapsed_ms` outside that signature over authenticated
+edges, adding local monotonic residence including pause, so a compromised trusted
+hop can under-report residence within the existing ADR-0026 trust boundary.
+A recovered unadmitted request whose age cannot be established refuses, never
+gets a new budget. Destination checks expiry
 atomically before claiming. Expiry cannot cancel an already admitted operation
 or justify a new ID. #1380 must encode and test this budget separately from
 agent mail's seven-day custody TTL; a queued command is not ordinary mail.
@@ -818,6 +822,10 @@ Dependencies: A1; #1380; coordinated upgrade decision
 Fail-first acceptance: VERSION 5/6 mismatch yields peer_incompatible with no
 dispatch; origin/target/payload substitution fails; no credential occurs in
 serialized frames. This is the only slice authorized to bump VERSION.
+
+M1 lands dormant at VERSION 5. ADR-0026's negotiation amendment requires
+`unsupported_for_agent` when the next hop is below 6; M4 must reconcile the
+older `peer_incompatible` wording in this acceptance text when enabling VERSION 6.
 
 **M2 destination journal dispatch**
 

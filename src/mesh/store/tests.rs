@@ -5681,3 +5681,18 @@ fn native_reply_status_does_not_restore_an_expired_payload() {
         "deleted reply payload must stay unavailable"
     );
 }
+
+#[test]
+fn commands_never_enter_agent_mail_custody_or_inbox() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open(0);
+    let mut command = envelope();
+    command.kind = Kind::Command;
+    for admission in [Admission::Custody, Admission::Held, Admission::Inbox] {
+        assert!(matches!(
+            store.accept(&command, 30_000, admission, 0),
+            Err(Error::InvalidEnvelope)
+        ));
+        assert!(store.get(&command.key).unwrap().is_none());
+    }
+}
