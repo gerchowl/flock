@@ -940,11 +940,7 @@ fn request_over_with(
     let version = stream.negotiated.unwrap_or(crate::mesh::hello::VERSION);
     let mesh_payload = matches!(method, "mesh.deliver" | "mesh.collect");
     if mesh_payload {
-        if let Err(kind) = crate::mesh::version_gate::check(&params, version) {
-            return Err(crate::mesh::version_gate::violation(
-                &peer.name, version, &kind,
-            ));
-        }
+        crate::mesh::version_gate::check_send(&params, version, &peer.name)?;
     }
     let result = stream.request(method, params).and_then(|response| {
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(&response) {

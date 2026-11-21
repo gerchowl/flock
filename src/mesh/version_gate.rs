@@ -1,6 +1,15 @@
 //! One kind-version lookup for held-edge sends and receives.
 use serde_json::Value;
 
+/// Single introduction table shared by command construction and wire validation.
+pub(crate) fn introduced(kind: &str) -> Option<u32> {
+    match kind {
+        "message" | "receipt" => Some(5),
+        "command" => Some(6),
+        _ => None,
+    }
+}
+
 /// Validate canonical object-form mesh records before any typed decoding.
 /// Envelopes and their delivery, outbound-collection and acknowledgement
 /// containers cannot use serde's positional struct sequences. Explicit kinds
@@ -11,6 +20,18 @@ pub(crate) fn check(value: &Value, version: u32) -> Result<(), String> {
         return Err("<non-object mesh record>".into());
     }
     walk(value, version, "")
+}
+
+/// An older next hop is a command refusal, not a receiver protocol violation.
+/// This check runs immediately before the transport writes any request bytes.
+pub(crate) fn check_send(value: &Value, version: u32, peer: &str) -> Result<(), String> {
+    check(value, version).map_err(|kind| {
+        if kind == "command" && introduced(&kind).is_some_and(|minimum| version < minimum) {
+            "unsupported_for_agent".into()
+        } else {
+            violation(peer, version, &kind)
+        }
+    })
 }
 
 /// Enforce the object boundaries of every wire slot that can carry an envelope.
@@ -31,10 +52,7 @@ fn walk(value: &Value, version: u32, parent: &str) -> Result<(), String> {
                 if envelope {
                     let fields = value.as_object().ok_or("<non-object envelope>")?;
                     let kind = fields.get("kind").map_or(Some("message"), Value::as_str);
-                    let introduced = match kind {
-                        Some("message" | "receipt") => Some(5),
-                        _ => None,
-                    };
+                    let introduced = kind.and_then(introduced);
                     if introduced.is_none_or(|minimum| version < minimum) {
                         return Err(kind.unwrap_or("<invalid>").chars().take(128).collect());
                     }
@@ -66,6 +84,33 @@ pub(crate) fn violation(peer: &str, version: u32, kind: &str) -> String {
 pub(crate) mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn command_send_gate_refuses_without_writing_to_an_older_next_hop() {
+        let frame = json!({"envelope":{"kind":"command"},"elapsed_ms":10});
+        let mut writes = Vec::new();
+        let send = |version, writes: &mut Vec<Value>| -> Result<(), String> {
+            check_send(&frame, version, "peer.example")?;
+            writes.push(frame.clone());
+            Ok(())
+        };
+        assert_eq!(send(5, &mut writes), Err("unsupported_for_agent".into()));
+        assert!(writes.is_empty());
+        assert_eq!(send(6, &mut writes), Ok(()));
+        assert_eq!(writes, vec![frame]);
+    }
+
+    #[test]
+    fn command_requires_six_and_decodes_at_six() {
+        let mut envelope = serde_json::to_value(crate::mesh::sign::tests::signed()).unwrap();
+        envelope["kind"] = json!("command");
+        let frame = json!({"envelope":envelope});
+        assert_eq!(check(&frame, 5), Err("command".into()));
+        assert_eq!(check(&frame, 6), Ok(()));
+        assert!(serde_json::from_value::<crate::mesh::store::Envelope>(envelope).is_ok());
+        assert_eq!(crate::mesh::hello::VERSION, 5);
+        assert_eq!(crate::mesh::hello::MIN_VERSION, 5);
+    }
 
     #[test]
     fn absent_kind_is_message_and_every_current_kind_flows_at_five() {

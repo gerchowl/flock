@@ -190,6 +190,8 @@ pub enum Kind {
     #[default]
     Message,
     Receipt,
+    /// Dormant VERSION 6 command; never admitted to the mail custody store.
+    Command,
 }
 impl Kind {
     fn is_message(&self) -> bool {
@@ -199,6 +201,7 @@ impl Kind {
         match self {
             Self::Message => "message",
             Self::Receipt => "receipt",
+            Self::Command => "command",
         }
     }
 }
@@ -651,6 +654,9 @@ impl<D: DiskSpace> Store<D> {
         route: Option<(u8, &[String], &str)>,
         local_recipient: Option<(&str, &str)>,
     ) -> Result<Accepted> {
+        if envelope.kind == Kind::Command {
+            return Err(Error::InvalidEnvelope);
+        }
         if self.clock()?.paused {
             return Err(Error::Paused);
         }
