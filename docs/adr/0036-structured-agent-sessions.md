@@ -1432,6 +1432,20 @@ that A authenticated, how the `ack` comes back) in #1380. Until then a
 opening a real terminal to a session, which is a `pty` agent's pane (the
 `terminal/<pane>` stream) served by the node that runs it, as today.
 
+A command's ACK is flushed before any event it caused is published, on every
+connection, including observer and newly opened subscriptions. Producers persist
+effects first, then retain their publication behind a causal receipt until the
+ACK writer flushes; losing an originating socket releases its waiter, and joined
+waiters retain the receipt until all flush or disappear. Published history head
+and replay byte cut advance atomically, with dense stream sequences. Ordinary
+projection capture and caused submission share one ordering boundary, including
+initial snapshot requests; a later ordinary observation cannot bypass a hold. Later facts
+on the same stream stay ordered behind the held fact; independent producers keep
+running. The hold uses bounded producer admission and existing storage and
+backpressure, with no per-connection event buffer. P1 introduces the opt-in
+producer seam; #1380 P2 connects journal Finish to ACK flush and receipt release,
+while the current synchronous admission path retains its existing order.
+
 The stream and its history stay the JSONL store of §4 and the endpoint
 below. The open item of whether they should run on the Grafana Labs stack
 (#1323) was resolved by the owner on 2026-10-16 (ADR-0038 §11 item 5):

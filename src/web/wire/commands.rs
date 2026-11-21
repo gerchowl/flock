@@ -521,6 +521,7 @@ pub(super) async fn execute(
             frame,
             active: None,
             delivered: Some(delivered),
+            causal: None,
         })
         .await
         .map_err(|_| ())?;

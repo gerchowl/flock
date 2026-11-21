@@ -529,6 +529,7 @@ fn unsubscribe_api_fences_an_already_queued_jsonl_event_before_the_writer_starts
             frame: data_frame("sibling"),
             active: None,
             delivered: Some(done),
+            causal: None,
         })
         .unwrap();
         priority

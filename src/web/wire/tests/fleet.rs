@@ -846,6 +846,7 @@ fn fleet_busy_refusal_uses_the_ack_lane_without_priority_close() {
                 frame: super::super::commands::ack("earlier-command".into(), Ok(json!({}))),
                 active: None,
                 delivered: Some(flushed),
+                causal: None,
             })
             .await
             .unwrap();
@@ -901,6 +902,104 @@ fn fleet_busy_refusal_uses_the_ack_lane_without_priority_close() {
                 None,
             )
             .await;
+        case.server.finish().await;
+    });
+}
+
+#[test]
+fn causal_fleet_socket_observers_and_new_subscription_wait_for_origin_ack() {
+    use crate::structured::publication::causal::Cause;
+    runtime(async {
+        let mut case = Case::new().await;
+        case.add("fixture-agent");
+        case.service();
+        let mut origin = case.open().await;
+        let origin_data = case
+            .server
+            .core
+            .shared
+            .clients
+            .lock()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap()
+            .data
+            .clone();
+        let mut observer = case.open().await;
+        let mut cursor = 0;
+        for socket in [&mut origin, &mut observer] {
+            socket
+                .send(json!({"t":"sub","sub_id":"fleet","stream":"fleet"}))
+                .await;
+            loop {
+                let frame = case.frame(socket).await;
+                if frame["t"] == "synced" {
+                    cursor = frame["seq"].as_u64().unwrap();
+                    break;
+                }
+            }
+        }
+        let (cause, lease) = Cause::hold();
+        let publication = case.server.core.shared.fleet.reserve(cause).unwrap();
+        case.remove("fixture-agent");
+        publication.observe(
+            &case.registry,
+            &case.workers,
+            case.server._root.path(),
+            None,
+            None,
+        );
+        within(async {
+            loop {
+                let bytes = fs::read(case.server._root.path().join("fleet.json")).unwrap();
+                let disk: Value = serde_json::from_slice(&bytes).unwrap();
+                if disk["high_water"].as_u64().unwrap() > cursor {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        let mut fresh = case.open().await;
+        fresh
+            .send(json!({"t":"sub","sub_id":"fresh","stream":"fleet"}))
+            .await;
+        for socket in [&mut origin, &mut observer, &mut fresh] {
+            socket.send(json!({"t":"ping","nonce":"held-fleet"})).await;
+            assert_eq!(
+                case.frame(socket).await,
+                json!({"t":"pong","nonce":"held-fleet"})
+            );
+        }
+        // Pongs have priority; also prove no data frame is merely queued behind one.
+        for socket in [&mut origin, &mut observer, &mut fresh] {
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), case.frame(socket))
+                    .await
+                    .is_err()
+            );
+        }
+        origin_data
+            .send(output::Delivery {
+                frame: super::super::commands::ack("lifecycle-effect".into(), Ok(json!({}))),
+                active: None,
+                delivered: None,
+                causal: Some(lease),
+            })
+            .await
+            .unwrap();
+        assert_eq!(case.frame(&mut origin).await["t"], "ack");
+        for socket in [&mut origin, &mut observer] {
+            let frame = case.frame(socket).await;
+            assert_eq!(frame["t"], "ev");
+            assert_eq!(frame["ev"]["type"], "fleet.remove");
+            assert_eq!(frame["seq"], cursor + 1);
+        }
+        let fresh_cut = case.frame(&mut fresh).await;
+        assert_eq!(fresh_cut["t"], "gap");
+        assert_eq!(fresh_cut["to"], cursor + 1);
+        assert_eq!(case.frame(&mut fresh).await["t"], "synced");
         case.server.finish().await;
     });
 }

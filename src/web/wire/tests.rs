@@ -1361,6 +1361,7 @@ fn closed_subscription_discards_queued_output_without_harming_sibling_or_ping() 
                 frame: data_frame(id),
                 active: Some(fence.clone()),
                 delivered: Some(delivered),
+                causal: None,
             })
             .unwrap();
             acknowledgements.push((id, acknowledgement));
@@ -1478,6 +1479,7 @@ fn owner_lookup_replay_consumes_real_storage_and_the_verified_socket_writer() {
                 frame,
                 active: Some(Arc::new(std::sync::atomic::AtomicBool::new(true))),
                 delivered: Some(delivered),
+                causal: None,
             })
             .unwrap();
         assert!(within(ack).await.unwrap());
@@ -1700,3 +1702,50 @@ fn resume_probe_wrong_nonce_shape_is_refused_like_heartbeat_pong() {
 }
 
 mod ownership_timeouts;
+
+#[test]
+fn causal_writer_holds_until_flush_and_releases_on_failure() {
+    use crate::structured::publication::causal::Cause;
+    runtime(async {
+        for fail in [false, true] {
+            let (sink, release, started, mut frames, _) = gated_sink();
+            let (_priority, high) = mpsc::channel(4);
+            let (data, low) = mpsc::channel(8);
+            let (cause, lease) = Cause::hold();
+            let (delivered, flushed) = tokio::sync::oneshot::channel();
+            data.try_send(output::Delivery {
+                frame: super::commands::ack("caused".into(), Ok(json!({}))),
+                active: None,
+                delivered: Some(delivered),
+                causal: Some(lease),
+            })
+            .unwrap();
+            let task = tokio::spawn(output::writer(sink, Arc::new(TestClock::new()), high, low));
+            within(started).await.unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), cause.released())
+                    .await
+                    .is_err()
+            );
+            if fail {
+                drop(release);
+            } else {
+                release.send(()).unwrap();
+            }
+            within(cause.released()).await;
+            if fail {
+                assert!(within(flushed).await.is_err());
+                assert!(frames.try_recv().is_err());
+            } else {
+                assert!(within(flushed).await.unwrap());
+                assert!(matches!(
+                    within(frames.recv()).await,
+                    Some(Message::Text(_))
+                ));
+            }
+            drop(data);
+            task.abort();
+            let _ = task.await;
+        }
+    });
+}

@@ -188,6 +188,7 @@ pub(super) async fn deliver(
             frame,
             active: Some(live.clone()),
             delivered: Some(tx),
+            causal: None,
         })
         .await
         .is_err()
