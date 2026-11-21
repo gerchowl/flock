@@ -14,7 +14,8 @@ impl<'a> VerifiedToken<'a> {
     fn new(subject: &'a str, operate: bool) -> Self {
         Self { subject, operate }
     }
-    pub(super) fn decision_subject(&self) -> Option<&str> {
+    /// Current decision authority sealed by token admission, never session metadata.
+    pub(crate) fn decision_subject(&self) -> Option<&str> {
         (self.operate && !self.subject.is_empty()).then_some(self.subject)
     }
 }

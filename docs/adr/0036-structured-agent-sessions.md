@@ -1432,19 +1432,22 @@ that A authenticated, how the `ack` comes back) in #1380. Until then a
 opening a real terminal to a session, which is a `pty` agent's pane (the
 `terminal/<pane>` stream) served by the node that runs it, as today.
 
-A command's ACK is flushed before any event it caused is published, on every
-connection, including observer and newly opened subscriptions. Producers persist
-effects first, then retain their publication behind a causal receipt until the
-ACK writer flushes; losing an originating socket releases its waiter, and joined
-waiters retain the receipt until all flush or disappear. Published history head
-and replay byte cut advance atomically, with dense stream sequences. Ordinary
-projection capture and caused submission share one ordering boundary, including
-initial snapshot requests; a later ordinary observation cannot bypass a hold. Later facts
-on the same stream stay ordered behind the held fact; independent producers keep
-running. The hold uses bounded producer admission and existing storage and
-backpressure, with no per-connection event buffer. P1 introduces the opt-in
-producer seam; #1380 P2 connects journal Finish to ACK flush and receipt release,
-while the current synchronous admission path retains its existing order.
+For journal-admitted permission decisions, the command ACK must be written and flushed
+before its caused permission closed event or transport audit is published. The same
+ordering applies to caused fleet/lifecycle projections, including the fleet rows clients
+render. This holds on every connection, including observers and subscriptions opened
+while the command is pending. Durable Finish precedes the ACK. Joined waiters retain the
+publication hold until each ACK flushes or its originating socket is lost; socket loss
+releases that waiter without rolling back durable effects. Initial replay cuts and
+ordinary projections cannot bypass an active hold. Later records on the fenced stream
+preserve sequence order, while independent producers continue.
+
+This guarantee excludes history records that constitute the command outcome or
+downstream transport output: accepted input and queue admission cuts for `agent.send`,
+and lifecycle launch/terminal transport history. These records may precede the ACK.
+Correlate command outcomes using `cmd_id`; do not infer a universal history fence.
+Universal producer fencing is a separate owner decision tracked in
+[#3198](https://github.com/gerchowl/flock/issues/3198).
 
 The stream and its history stay the JSONL store of §4 and the endpoint
 below. The open item of whether they should run on the Grafana Labs stack
@@ -2021,12 +2024,21 @@ An oversized outcome leaves its durable claim uncertain instead of truncating
 the result. The namespace is an explicit string (`local` today), so a later
 home-node namespace needs no format change.
 
-**J1 ownership status (#1380).** The append-only backend, bounded off-loop
-writer and compaction are implemented. J1b2a owns the writer, but live commands
-still use the in-memory duplicate list: they neither write this journal nor
-acknowledge journal completions. Abandoned journal I/O therefore cannot produce
-a wire acknowledgement in this slice. J1b2b must preserve the admission-phase
-fence when introducing durable command outcomes.
+**J1 live admission (#1380).** Wire commands use the durable journal as the
+single source of completed outcomes. The app owner submits a claim without
+blocking, polls its durable completion, then rechecks current authorization
+under the token fence through dispatch. Revocation after claim prevents the
+effect. The outcome is synced before acknowledgement. Identical in-flight
+requests join the active claim, retaining each credential's metadata and
+reauthorizing each waiter before returning the stored outcome. Fresh dispatch,
+cached replay and joined replies share verb authorization; permission decisions
+require both current `answer` and `operate` scopes. Connection closure
+follows the requesting credential's current revocation status. Conflicting
+payloads refuse `invalid_params`. Journal capacity and writer queue pressure
+refuse through the bounded wire refusal audit before dispatch. Recovered pending
+claims and absent, expired or lost resume-only keys refuse `session_unconfirmed`.
+A completion from an earlier ownership phase cannot dispatch after freeze or
+rollback. Completed outcomes replay across restart and ownership transfer.
 
 Every journal caller has a one-second budget (`JOURNAL_WAIT`). Startup and
 post-commit importer acquisition succeed only with the journal lease held and
@@ -2050,9 +2062,6 @@ Rollback schedules reacquisition at the same recovery point as mesh custody.
 Generation fencing prevents stale recovery from reopening admission after a
 freeze or shutdown, and prevents an abandoned old drain from closing a newer
 recovered writer. Recovery finishes any earlier drain before replaying.
-J1b2b will replace the duplicate list with durable claims, reauthorization,
-dispatch and outcome-before-ack. J1b2a enables no command recovery across restart
-or handoff.
 
 The backend holds an exclusive writer lease, rebuilds its index and per-principal
 counts by replay once at open, and appends one bounded record per claim/outcome.
@@ -2105,8 +2114,7 @@ A torn final line is archived as raw bytes in private `commands.torn.jsonl`,
 file-synced before the active tail is truncated and synced. The archive is
 bounded to 32 record byte caps; recovery refuses without truncation when full.
 A recovered pending claim remains uncertain and a completed claim returns
-its first acknowledgement. These are backend properties, not active wire
-recovery promises on the live wire.
+its first acknowledgement through the live wire after fresh authorization.
 
 Automatic resend is allowed for the listed §5 verbs only through this durable
 idempotency path, not based on an assumed harmless verb. Permission/question

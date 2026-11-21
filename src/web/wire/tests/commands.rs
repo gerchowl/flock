@@ -395,8 +395,8 @@ fn same_principal_command_id_is_fenced_across_sockets() {
         second.send(json!({"t":"cmd","cmd_id":"same-id","verb":"agent.decide","args":other,"resume_only":false})).await;
         refusal(
             case.ack(&mut second).await,
-            "session_unconfirmed",
-            crate::cli::exit::UNCONFIRMED,
+            "invalid_params",
+            crate::api::error_code::ErrorCode::InvalidParams.exit(),
         );
         assert_eq!(
             case.handles()
@@ -653,6 +653,16 @@ fn revoked_principal_closes_other_socket_even_when_ack_flush_fails() {
                     resume_only: false,
                     read_only: false,
                 },
+                *case
+                    .server
+                    .core
+                    .shared
+                    .clients
+                    .lock()
+                    .unwrap()
+                    .keys()
+                    .next()
+                    .unwrap(),
             ));
             let wake = case.server.wake.clone();
             let delivered = within(async {
@@ -890,6 +900,16 @@ fn execute_queue_full_refusal_is_attributable() {
                 resume_only: false,
                 read_only: false,
             },
+            *case
+                .server
+                .core
+                .shared
+                .clients
+                .lock()
+                .unwrap()
+                .keys()
+                .next()
+                .unwrap(),
         );
         tokio::pin!(execute);
         let delivery = within(async {
@@ -1161,6 +1181,8 @@ fn subscription_resource_refusal_and_invalid_probes_are_audited() {
 
 mod ownership;
 
+mod durable;
+
 #[test]
 fn ended_history_cut_recovers_after_restart_without_losing_the_socket() {
     runtime(async {
@@ -1361,6 +1383,25 @@ fn ended_history_cut_recovers_after_restart_without_losing_the_socket() {
             }
         })
         .await;
+        let args = case.prompt().await;
+        let mut opened = 0;
+        while opened != 2 {
+            let Received::Text(frame) = case.frame(&mut socket).await else {
+                panic!("restart prompt lost socket");
+            };
+            assert_eq!(frame["t"], "ev");
+            if frame["ev"]["type"] == "flk_permission_request" && frame["ev"]["state"] == "open" {
+                opened += 1;
+            }
+        }
+        socket.send(json!({"t":"cmd","cmd_id":"restart-reply","verb":"agent.decide","args":args,"resume_only":false})).await;
+        let ack = case.ack(&mut socket).await;
+        assert_eq!(ack["cmd_id"], "restart-reply");
+        assert_eq!(ack["ok"], true);
+        let Received::Text(closed) = case.frame(&mut socket).await else {
+            panic!("restart reply lost socket");
+        };
+        assert_eq!(closed["ev"]["state"], "closed");
         case.stop().await;
     });
 }
