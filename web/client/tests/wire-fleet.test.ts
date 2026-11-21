@@ -237,3 +237,43 @@ test("a newer phase keeps the fleet row and renders unknown", () => {
   send(h, upsert(1, row("fixture-agent", { state: agentState("dancing" as Phase) })));
   expect(last().map((value) => [value.id, value.state])).toEqual([["fixture-agent", "unknown"]]);
 });
+
+test("busy fleet refusals retain the shared reader and recover on the same socket", () => {
+  const h = new Harness();
+  live(h);
+  const source = createWireFleet(h.connection);
+  const watched = watch(source);
+  send(h, { t: "gap", sub_id: "s1", from: 1, to: 0, snapshot_to: 1 });
+  send(h, upsert(1, row("atlas", { state: agentState("offline") })));
+  send(h, { t: "synced", sub_id: "s1", seq: 1 });
+  send(h, { t: "subfail", sub_id: "s1", code: "session_busy", message: "preparing worker" });
+  expect(watched.seen.at(-1)).toEqual({ failed: "preparing worker" });
+  expect(watched.last().map((r) => [r.id, r.state])).toEqual([["atlas", "offline"]]);
+  const second = createRoot(() => fleetStore(source).read());
+  expect(sentFrames(h).filter((frame) => (frame as { t: string }).t === "sub")).toHaveLength(1);
+  h.clock.advanceTo(h.clock.now() + 250);
+  expect(sentFrames(h).at(-1)).toEqual({ t: "sub", sub_id: "s2", stream: "fleet", after: 1 });
+  send(h, { t: "gap", sub_id: "s2", from: 2, to: 1, snapshot_to: 2 });
+  send(h, { ...upsert(2, row("atlas")), sub_id: "s2" } as ServerFrame);
+  send(h, { t: "synced", sub_id: "s2", seq: 2 });
+  expect(watched.last().map((r) => r.id)).toEqual(["atlas"]);
+  expect(second.agents.items().map((r) => r.id)).toEqual(["atlas"]);
+  expect(second.agents.progress()).toEqual({ phase: "current" });
+  second.release();
+  watched.close();
+  expect(sentFrames(h).at(-1)).toEqual({ t: "unsub", sub_id: "s2" });
+});
+
+test("busy fleet recovery retains the existing three-retry bound and visible refusal", () => {
+  const watched = subscribed();
+  for (const [index, delay] of [250, 500, 1000].entries()) {
+    send(watched.h, { t: "subfail", sub_id: `s${index + 1}`, code: "session_busy", message: "preparing worker" });
+    watched.h.clock.advanceTo(watched.h.clock.now() + delay);
+    expect(sentFrames(watched.h).at(-1)).toEqual({ t: "sub", sub_id: `s${index + 2}`, stream: "fleet" });
+  }
+  send(watched.h, { t: "subfail", sub_id: "s4", code: "session_busy", message: "still unavailable" });
+  watched.h.clock.advanceTo(watched.h.clock.now() + 2000);
+  expect(sentFrames(watched.h).filter((frame) => (frame as { t: string }).t === "sub")).toHaveLength(4);
+  expect(watched.seen.at(-1)).toEqual({ failed: "still unavailable" });
+  watched.close();
+});

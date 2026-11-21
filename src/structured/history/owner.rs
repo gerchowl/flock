@@ -17,7 +17,11 @@ pub(crate) struct Client {
     io: Budget,
 }
 /// Owner half, serviced against the owner's current registry and worker set.
-pub(crate) struct Owner(mpsc::Receiver<Request>);
+pub(crate) struct Owner {
+    requests: mpsc::Receiver<Request>,
+    // At most one follow per live cut, bounded by the wire's subscription caps.
+    following: Vec<Follow>,
+}
 /// Off-executor work retains its capacity through completion, even on cancellation.
 #[derive(Clone)]
 struct Budget(Arc<Semaphore>);
@@ -40,7 +44,9 @@ impl Budget {
         .map_err(io::Error::other)
     }
 }
+type Follow = (String, Arc<Notify>, oneshot::Sender<Option<History>>);
 enum Request {
+    Follow(Follow),
     Lookup(String, oneshot::Sender<Option<Located>>),
     Install(String, u64, History, oneshot::Sender<io::Result<History>>),
 }
@@ -59,7 +65,10 @@ pub(crate) fn channel(wake: Arc<Notify>) -> (Client, Owner) {
             wake,
             io: Budget(Arc::new(Semaphore::new(RECOVERIES))),
         },
-        Owner(rx),
+        Owner {
+            requests: rx,
+            following: Vec::new(),
+        },
     )
 }
 impl Client {
@@ -72,6 +81,21 @@ impl Client {
         response
             .await
             .map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))
+    }
+    /// Wait for a replacement canonical producer, or removal of the agent.
+    /// Backpressure and cancellation stay on the cut task, never the app owner.
+    pub(crate) async fn replacement(
+        &self,
+        id: String,
+        previous: Arc<Notify>,
+    ) -> io::Result<Option<History>> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .send(Request::Follow((id, previous, tx)))
+            .await
+            .map_err(|_| io::ErrorKind::BrokenPipe)?;
+        self.wake.notify_one();
+        rx.await.map_err(|_| io::ErrorKind::BrokenPipe.into())
     }
     /// None means unknown subject. Unsafe/reserved namespaces fail InvalidInput.
     /// Overload is WouldBlock, owner loss BrokenPipe,
@@ -102,10 +126,11 @@ impl Owner {
     /// source selection; a concurrent recovery cannot replace the winner.
     pub(crate) fn service(&mut self, registry: &Registry, workers: &mut Workers, root: &Path) {
         for _ in 0..REQUESTS {
-            let Ok(request) = self.0.try_recv() else {
+            let Ok(request) = self.requests.try_recv() else {
                 break;
             };
             match request {
+                Request::Follow(follow) => self.following.push(follow),
                 Request::Lookup(id, reply) => {
                     if reply.is_closed() {
                         continue;
@@ -168,6 +193,27 @@ impl Owner {
                     })();
                     let _ = reply.send(result);
                 }
+            }
+        }
+        let mut i = 0;
+        while i < self.following.len() {
+            let (id, previous, reply) = &self.following[i];
+            let next = if registry.get(id).is_none() {
+                Some(None)
+            } else {
+                workers
+                    .history(registry, id)
+                    .filter(|source| !Arc::ptr_eq(&source.waker(), previous))
+                    .cloned()
+                    .map(Some)
+            };
+            if reply.is_closed() || next.is_some() {
+                let (_, _, reply) = self.following.swap_remove(i);
+                if let Some(next) = next {
+                    let _ = reply.send(next);
+                }
+            } else {
+                i += 1;
             }
         }
     }
