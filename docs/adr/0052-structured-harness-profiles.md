@@ -582,6 +582,182 @@ recovery waits for exit/fence proof. Emergency revocation never rolls back on a
 partial failure. Status separately reports provider-side credential revocation
 pending/confirmed so a local tombstone is not mistaken for provider invalidation.
 
+## Amendment A (Proposed, owner decision pending): retention and cleanup of per-session native roots
+
+- Status: Proposed (owner decision pending)
+- Issue: [#3140](https://github.com/gerchowl/flock/issues/3140), part of #3066
+- Scope: completes the retention gap left in §2 for roots allocated by slice 3
+  (`src/structured/profiles/storage.rs`). It changes no accepted behaviour until
+  the owner accepts it.
+
+**Current behaviour.** `allocate` creates `profile-storage/sessions/.alloc-<session-id>/`
+(`config/` plus private `record.json`) inside the binding-store transaction lock,
+then renames it to `sessions/<session-id>/`. A failed call removes only its own
+staging. Startup `scan(recover=true)` (called from `profiles.rs` at gate load)
+moves any `.alloc-<uuid>` entry to `profile-storage/quarantine/<name>-<nonce>`
+and lists it in operator-only `profile.status.session_storage`. Published roots
+are never deleted, sized or counted, and nothing bounds total use. Unknown or
+invalid records stay untouched and inactive.
+
+**A1. When a root may be deleted.**
+*Recommended:* only by an explicit operator command, never automatically. A root
+is eligible when all hold: its session is terminal (stopped, no live lease
+generation and no reservation, below) as proven by the session registry; it has
+been terminal for at least a minimum age (default 7 days, operator-configurable;
+a guard against fat-fingered cleanup, not a deletion trigger), measured from the
+registry's durable stopped timestamp (never the root's mtime, which transcripts
+and copies change); no pending replacement or migration journal (slices 12, 19,
+20) references it; and it is neither marked nor registry-reported quarantined
+(A3). Unknown liveness or a missing stopped timestamp refuses.
+Status lists eligible roots with age and size so the operator can choose; it
+never selects for them.
+Liveness is owned by the session registry, not the store lock, so the lock alone
+cannot exclude a resume. Therefore admission **and** resume must take a
+reservation (a lease generation) under the store transaction lock before
+`allocate_session` returns the root path, and release it only on terminal
+stop; `delete` checks for any reservation under the same lock and refuses if
+one exists. This closes "allocate returns an existing root, delete sees a
+stopped session and renames it, launch uses a deleted path". Reservation
+failure refuses the admission/resume before any launch effect. The reservation
+check, the required-audit append and the rename into trash all happen within
+**one** hold of the store lock, so no reservation can appear between check and
+effect. A reservation is released on terminal stop and on launch failure (the
+launch path releases it before returning the error), and startup reconciliation
+releases every reservation whose lease generation has no live supervised process,
+so a crash or failed launch never leaks one; a leaked reservation would only
+block deletion (fail-safe) and is reported in status.
+
+**Registry facts (amends ADR-0036).** Neither a stopped time nor a quarantined
+outcome exists today: `src/structured/registry/mod.rs` states the registry is
+pure data and its `Record` writes no ages or lease proofs, following the
+S3a-3 registry amendment under ADR-0036 §2 ("Cold restore retains metadata only
+… no clock ages, outstanding questions, deadlines, process ids or lease proofs
+survive"; cited by `src/structured/registry/mod.rs` as §1/S3a-3/S4). This
+amendment **amends that rule** for exactly two facts, because
+retention cannot be decided from the filesystem (mtime is changed by transcripts
+and copies) or from the lease holder: `stopped_at` (a durable wall-clock time set
+once when the session reaches a terminal stop, recorded together with the lease
+generation of that stop) and `outcome` (`quarantined` when
+§2 revocation publishes it). They are written by the supervisor that
+publishes the stop, never by agents, grant no process or lease authority, and
+keep the registry otherwise pure data. Records written before this change omit
+both fields, so the new `#[serde(default)]` fields read as absent; absent
+`stopped_at` or unknown outcome means **not eligible**, never an assumed age.
+Roots of pre-existing sessions therefore become deletable only after they next
+stop under the new code, which is the fail-safe default. Unknown newer values
+pass through as opaque data and likewise refuse. Rollback caveat: an older
+binary that preserves unknown fields can carry a stale `stopped_at` across a later
+run and stop it does not record. Eligibility therefore requires the recorded stop
+generation to equal the session's last lease generation; a mismatch or absent
+generation means not eligible, so a root never looks older after re-upgrade.
+Never deleted automatically: live roots, roots referenced by a rollback,
+replacement or migration record, quarantined roots, unknown or invalid records,
+and digest tombstones.
+*Rejected:* age-based auto-delete (silently destroys transcripts that §2 treats
+as recovery evidence, and a clock step or restart could mass-delete); count cap
+with eviction (evicts by recency, not by value); a combination (inherits both
+failures; the age floor above stays only as a guard on the manual command).
+
+**A2. Who may delete.**
+*Recommended:* the operator authority only; agents, relays and sessions cannot
+request deletion. Deletion is two-phase: `plan` (read-only) returns the exact
+roots with their `record.json` digests and a plan ID; `delete <plan-id>`
+re-verifies eligibility and digests under the store transaction lock. The
+required-audit append (reason, principal, operation ID, roots, digests) happens
+**before** any effect, through the required-audit writer of ADR-0035 (#3156
+semantics, #3170): an append failure refuses with `audit_unavailable` and
+nothing changes; `audit_indeterminate` refuses all later deletions until
+restart. The effect is an atomic rename into
+`profile-storage/trash/<session-id>-<nonce>/` with parent fsync, then removal of
+the trash entry. Startup finishes removal of any trash entry whose delete record
+is confirmed in the journal; it is already audited and carries no further
+decision.
+Fail-safe recovery rules. (a) A delete record whose append outcome was
+`audit_indeterminate` and for which no trash entry exists is treated as **not
+deleted**: the root is kept, never re-run and never deleted on that record, and
+startup reports it in status for the operator to re-plan. A trash entry exists
+only after a confirmed append, so an indeterminate record never authorizes
+removal. (b) If the rename fails after a successful append, the server appends an
+`abandoned` outcome entry for that operation ID (reason, root unchanged) before
+returning the error; if that append also fails, startup finds a delete record
+with neither trash entry nor root change and reports it as abandoned. The trail
+therefore never claims a delete that did not happen. Entries in
+`profile-storage/quarantine/` (crash staging, A4) are deleted only by the same
+plan/delete path, with no minimum age, and are never removed by startup.
+*Rejected:* delete without a plan step (no review of what disappears);
+best-effort audit (breaks fail-closed); in-place `remove_dir_all` (a crash
+leaves a half-deleted root that looks like a valid record).
+
+**A3. Revocation quarantine.**
+*Recommended:* a root whose consuming session was quarantined by §2 revocation is
+marked by a separate `quarantine.json` (the allocation `record.json` stays
+immutable). The marker is written durably (fsync file and parent) **before** the
+stopped/quarantined outcome is published; if the write fails, the outcome is
+not published as complete and the session stays fenced and pending. Eligibility
+also refuses whenever the registry outcome says quarantined, so a lost marker
+alone cannot make the root deletable (defence in depth). The root is retained until an explicit, separately audited operator
+`release` carrying a reason. Release only makes the root eligible under A1; it
+never makes it resumable or executable (§2: resume needs a fresh reviewed
+recovery path). Release and delete may be one operator command that writes both
+audit records first.
+*Rejected:* a bounded retention period (an unattended timer destroys the evidence
+of a security incident, and expiry says nothing about whether it was examined);
+automatic release when a bundle is re-adopted (a corrected bundle needs a new
+digest, so no automatic link exists).
+
+**A4. Crash-left allocation staging.**
+*Recommended:* detect at startup under the same store transaction lock that
+`allocate` holds for its whole duration. A lock holder cannot coexist with a live
+allocation, so staging seen by startup scan is by construction crash-left; no
+pid, mtime or heartbeat guess is involved. Staging whose shape is exactly the
+allocator's (empty `config/` plus a valid `record.json`, nothing else) holds no
+session data, because no launch precedes publication, and is removed with a
+typed log event (this replaces the unconditional quarantining stated in §2's
+slice 3 paragraph for exact-shape staging only). Staging with any other content
+is moved to `quarantine/` as today and deleted only through A2. An allocator instance nonce written into the
+staging record is diagnostic only; because `Allocation` is
+`deny_unknown_fields`, adding it bumps `schema` to 2 with readers accepting 1
+and 2 and slice 3 roots staying valid. If the lock cannot be acquired, recovery is
+skipped and reported, never forced.
+*Rejected:* pid/start-time liveness checks (reuse and cross-host ambiguity); age
+thresholds (a slow allocation could be raced); quarantining all staging forever
+(grows without bound, though nothing was lost).
+
+**A5. Disk bounds and reporting.**
+*Recommended:* usage is the sum of allocated bytes and file count per root,
+walked without following symlinks or crossing devices, computed lazily and
+cached with the scan generation. `profile.status.session_storage` and the CLI
+profile status report per-root size and age, totals, quarantine and trash sizes
+and the configured bounds, operator-only. Operator-configured bounds
+`max_bytes` (default 10 GiB) and `max_sessions` (default 256) are checked at
+allocation against a cache refreshed if older than 60 seconds; at a bound,
+allocation refuses with the typed error `profile_storage_full` (retry after
+operator action) and creates no staging. The bounds apply to allocating new
+roots only; resuming an existing root is never refused by them. With
+`max_sessions` 256 and manual-only deletion, allocation hard-fails at the 256th
+retained root until the operator deletes some; the owner must accept this
+operational cost, or raise the default, when accepting the amendment. A warning event fires at 80%. Growth of
+an existing session beyond the bound is reported, not killed.
+*Rejected:* evicting the oldest eligible root at the bound (deletion without a
+human decision or audit, possibly of the evidence the operator needs); reporting
+only (the disk fills and every session fails untyped); server-enforced
+per-session byte quotas (needs OS support not present before slice 9).
+
+**A6. Following slices** (each at most 400 production lines, failing-first
+against the prior build; all inactive while production execution is unavailable):
+
+| Slice | Deliverable | Failing-first acceptance |
+| --- | --- | --- |
+| 3.1 Usage, bounds, typed refusal | Sizing walk, bounds config, status fields, `profile_storage_full`, CLI/socket docs. | Status reports bytes/age/totals for sparse and nested roots and does not follow a symlink out of the root; allocation at either bound refuses typed and leaves no staging or partial state. |
+| 3.2 Staging recovery | Exact-shape staging removal, non-matching quarantine, trash completion, lock-skip reporting. | Shape-matching staging is removed and staging with extra content is quarantined; recovery with the lock held elsewhere skips and reports; a concurrent allocation is never touched (race test). |
+| 3.2b Registry stop facts | Add `stopped_at` and quarantined `outcome` to the registry `Record` (default-absent, older records readable, schema note), set by the stop/revocation publisher; amend the ADR-0036 §2 S3a-3 "no clock ages … or lease proofs survive" rule and the matching registry rustdoc; record the stop's lease generation and require it to match for eligibility. | Old records load with both absent and report not eligible; stop sets `stopped_at` once and survives restart; a revocation stop persists `quarantined`; unknown outcome values round-trip untouched and refuse. |
+| 3.3 Reservation and quarantine marker | Reservation/lease generation taken under the store lock by admission and resume before `allocate_session` returns; durable `quarantine.json` written before the quarantined outcome. | A reservation is released after a failed launch and by startup reconciliation after a crash; a resume racing delete either keeps the root or is refused, never launching on a deleted path; a failed or crashed marker write publishes no complete outcome; registry-quarantined roots refuse eligibility without a marker. |
+| 3.4 Operator plan/delete/release | Eligibility, plan digests, required audit before effect, trash rename, `abandoned` outcome, release, quarantine-dir deletion, CLI/socket. If it exceeds 400 production lines, split into plan/audit/delete and release/quarantine-dir parts. | Agent/relay callers refuse; audit failure leaves the root untouched; an indeterminate record with no trash entry keeps the root and is reported; rename failure after append records `abandoned`; a changed digest, reserved/unknown session, young root or unreleased quarantine refuses; a crash between rename and removal completes on restart. |
+
+3.1, 3.2 and 3.2b depend only on slice 3; 3.3 on slice 3 and 3.2b; 3.4 on all of them. 3.4 reads session
+liveness through an interface that refuses when state is unknown, so it needs no
+launch code; slices 10 and 12 later supply fence and replacement references.
+
 ## Ordered implementation slices
 
 Every numbered row is a separate PR with **at most 400 production lines**,
