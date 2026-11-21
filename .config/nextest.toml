@@ -35,7 +35,7 @@ retries = 0
 
 [[profile.default.overrides]]
 # #1894: mount.rs belongs to client_tokens; all optional web acceptance tests run once.
-filter = 'binary(=client_tokens) | binary(=gui_feature_gate) | binary(=gui_bundle_build) | (binary(=flk) & (test(web::) | test(server::headless::tests::fatal_client_accept_)))'
+filter = 'binary(=client_tokens) | binary(=gui_build) | (binary(=flk) & (test(web::) | test(server::headless::tests::fatal_client_accept_)))'
 retries = 0
 
 [[profile.default.overrides]]
