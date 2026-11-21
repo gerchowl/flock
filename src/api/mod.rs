@@ -7,6 +7,7 @@ pub(crate) mod deadline;
 pub(crate) mod error_code;
 mod event_hub;
 mod events_read;
+pub mod gateway_grants;
 pub(crate) mod peer_discovery;
 pub mod question;
 pub mod queue_event;
@@ -21,7 +22,10 @@ mod subscriptions;
 mod wait;
 pub mod wait_predicate;
 
+#[cfg(test)]
+pub(crate) use event_hub::AuditFault;
 pub use event_hub::EventHub;
+pub(crate) use event_hub::RequiredAuditError;
 pub(crate) use reply_wait::{best_answer, Answer};
 pub(crate) use server::socket_peer_pid;
 pub(crate) use server::start_server;
@@ -65,6 +69,7 @@ pub(crate) fn request_changes_ui(request: &Request) -> bool {
             | Method::AgentRestart(_)
             | Method::MsgSend(_)
             | Method::MsgRead(_)
+            | Method::MsgOperatorRead(_)
             | Method::MsgReply(_)
             | Method::PeersHubFleet(_)
             | Method::PaneSplit(_)

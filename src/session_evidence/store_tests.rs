@@ -109,6 +109,8 @@ fn adversarial_store_validation_table() {
                             "store-session",
                             profile.to_str().unwrap(),
                         );
+                        // The recorded directory excludes the default store.
+                        expected = "found";
                     } else {
                         std::fs::create_dir_all(second.parent().unwrap()).unwrap();
                         std::fs::write(&second, &body).unwrap();
@@ -145,6 +147,12 @@ fn adversarial_store_validation_table() {
                 }
             }
             let result = checked_path(&session);
+            if agent == "claude" && matches!(case, Case::TwoStores) {
+                assert_eq!(
+                    result.as_ref().unwrap().as_ref(),
+                    Some(&profile.join("projects/fixture").join(name))
+                );
+            }
             if matches!(case, Case::UnreadableDir) {
                 std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o700)).unwrap();
             }

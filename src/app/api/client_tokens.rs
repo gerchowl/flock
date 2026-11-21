@@ -92,6 +92,41 @@ impl App {
             }
         };
         let result = (|| {
+            use crate::structured::permissions::auth::gateway::{Change, Store};
+            let change = match &method {
+                Method::ClientGrantAdd(grant) => {
+                    let enrolled = crate::mesh::hello::with_store(|store| {
+                        store
+                            .origin_name(&grant.home_node_id)
+                            .map_err(|e| e.to_string())
+                    })
+                    .map_err(|_| TokenError::Unsafe)?
+                    .is_some();
+                    if !enrolled {
+                        return Err(TokenError::Unsafe);
+                    }
+                    Some(Change::Add(grant.clone()))
+                }
+                Method::ClientGrantRevoke(params) => Some(Change::Revoke(params.name.clone())),
+                _ => None,
+            };
+            if matches!(
+                method,
+                Method::ClientGrantAdd(_)
+                    | Method::ClientGrantList(_)
+                    | Method::ClientGrantRevoke(_)
+            ) {
+                return Store::open(&crate::session::data_dir())
+                    .and_then(|store| store.manage(&authority, change))
+                    .map(|listing| ResponseResult::ClientGrantList { listing })
+                    .map_err(|code| {
+                        if code == crate::api::error_code::ErrorCode::InvalidParams {
+                            TokenError::Unsafe
+                        } else {
+                            TokenError::Busy
+                        }
+                    });
+            }
             let store = TokenStore::open(&crate::session::data_dir())?;
             match method {
                 Method::ClientTokenAdd(params) => store
@@ -124,7 +159,7 @@ impl App {
             Err(TokenError::Unsafe) => encode_error(
                 id,
                 "invalid_params",
-                "invalid client name, scopes, unsafe storage, or missing [client] loopback bind",
+                "invalid client token or gateway grant parameters, unsafe storage, unenrolled home, or missing [client] loopback bind",
             ),
             Err(_) => encode_error(
                 id,

@@ -49,6 +49,26 @@ pub struct RetainedInfo {
     pub first_seen_ms: Option<u64>,
 }
 
+/// Exact data-only identity of the profile used by a launch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileIdentity {
+    /// Legacy operator profile directory selector.
+    pub profile: String,
+    /// Resolved operator binding, absent for legacy single-account launches.
+    pub binding: Option<BindingIdentity>,
+}
+
+/// Operator binding identity and the policy revision at which it was resolved.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BindingIdentity {
+    /// Stable operator-issued identity.
+    pub binding_id: String,
+    /// Exact binding revision; a changed revision requires explicit recovery.
+    pub revision: u64,
+}
+
 /// Durable structured identity. The runtime tag cannot describe a PTY record.
 /// This typed record writes no credentials, process ids, attention, ages or lease
 /// proofs. Opaque future fields pass through separately without granting authority.
@@ -64,10 +84,36 @@ pub struct Record {
     pub harness: String,
     /// Native conversation identity, exclusively reserved while registered.
     pub session_id: String,
+    /// True only after a matching harness `system/init` was observed.
+    /// Persisted with the session snapshot. Older records omit this field and
+    /// default to false, so their next launch uses fresh-session creation.
+    #[serde(default)]
+    pub harness_established: bool,
+    /// Launch identity observed at establishment; absent older records remain legacy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_identity: Option<ProfileIdentity>,
     /// Launch working directory, never a fabricated pane location.
     pub cwd: PathBuf,
     /// Requested model, absent when the provider selects its default.
     pub model: Option<String>,
+}
+
+impl Record {
+    /// Refuse changing the identity of an established conversation before launch.
+    pub(crate) fn admit_profile(
+        &self,
+        actual: Option<&ProfileIdentity>,
+    ) -> Result<(), crate::api::error_code::ErrorCode> {
+        if self.harness_established
+            && self
+                .profile_identity
+                .as_ref()
+                .is_some_and(|pin| Some(pin) != actual)
+        {
+            return Err(crate::api::error_code::ErrorCode::StructuredProfileMismatch);
+        }
+        Ok(())
+    }
 }
 
 /// The only runtime represented by a pane-free registry record.
@@ -119,6 +165,7 @@ impl StateSink for Projection {
 }
 
 struct Entry {
+    pending_profile: Option<ProfileIdentity>,
     record: Record,
     slot: usize,
     generation: u64,
@@ -146,6 +193,7 @@ impl Entry {
             },
         };
         Self {
+            pending_profile: None,
             record,
             slot,
             generation,
@@ -161,6 +209,7 @@ impl Entry {
 pub struct Registry {
     entries: BTreeMap<String, Entry>,
     generation: u64,
+    establishment_dirty: bool,
     preserved: Vec<Option<Value>>,
     unparsed: Option<Value>,
     retained: BTreeMap<usize, retention::Retained>,
@@ -168,6 +217,12 @@ pub struct Registry {
     retention_opaque: Option<Value>,
 }
 impl Registry {
+    /// Consume new establishment evidence so the owner schedules its normal
+    /// synced session-snapshot writer. Cold snapshots carry no pending save work.
+    pub(crate) fn take_establishment_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.establishment_dirty)
+    }
+
     /// Whether there is nothing durable, including inactive retained records.
     /// Unknown-only sessions must survive the application's empty-session cleanup.
     pub fn is_empty(&self) -> bool {
@@ -260,6 +315,22 @@ impl Registry {
         Ok(generation)
     }
 
+    /// Stage the admitted launch identity; only matching init makes it durable.
+    pub(crate) fn stage_profile(
+        &mut self,
+        agent_id: &str,
+        generation: u64,
+        identity: Option<ProfileIdentity>,
+    ) -> Result<(), RegistryError> {
+        let entry = self
+            .entries
+            .get_mut(agent_id)
+            .filter(|entry| entry.generation == generation)
+            .ok_or(RegistryError::StaleGeneration)?;
+        entry.pending_profile = identity;
+        Ok(())
+    }
+
     /// Address by stable identity, never by a placement or a caller-supplied pane.
     pub fn get(&self, agent_id: &str) -> Option<(&Record, &Projection, u64)> {
         self.entries
@@ -284,6 +355,24 @@ impl Registry {
             .get_mut(agent_id)
             .filter(|entry| entry.generation == generation)
             .ok_or(RegistryError::StaleGeneration)?;
+        if let Input::Event(super::claude::SessionEvent::Init(init)) = &input {
+            if !entry.record.harness_established
+                && init.session_id.as_ref().and_then(Option::as_deref)
+                    == Some(entry.record.session_id.as_str())
+            {
+                entry.record.harness_established = true;
+                entry.record.profile_identity = entry.pending_profile.take();
+                if let Some(Some(raw)) = self.preserved.get_mut(entry.slot) {
+                    raw["harness_established"] = Value::Bool(true);
+                    if let Some(identity) = &entry.record.profile_identity {
+                        raw["profile_identity"] = serde_json::json!(identity);
+                    } else if let Some(raw) = raw.as_object_mut() {
+                        raw.remove("profile_identity");
+                    }
+                }
+                self.establishment_dirty = true;
+            }
+        }
         entry
             .reducer
             .publish(input, now, unix_ms, stall_after, &mut entry.projection);
@@ -364,6 +453,7 @@ impl Registry {
                 })
                 .collect(),
             generation: self.generation,
+            establishment_dirty: false,
             preserved: self.preserved.clone(),
             unparsed: self.unparsed.clone(),
             retained: self.retained.clone(),

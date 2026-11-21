@@ -6,8 +6,8 @@ use crate::api::{
     schema::{AgentStartParams, ResponseResult},
 };
 use crate::structured::{
-    launch::{LaunchError, LaunchProfile, ProfileConfigDir, VerifiedBinary},
-    registry::{Record, StructuredRuntime},
+    launch::{LaunchError, LaunchMode, LaunchProfile, ProfileConfigDir, VerifiedBinary},
+    registry::{ProfileIdentity, Record, StructuredRuntime},
     workers::{Admission, Launch},
 };
 use std::{io, path::PathBuf, time::Duration};
@@ -27,6 +27,25 @@ impl App {
         verb: crate::spawn::SpawnVerb,
         opening_turn: Option<crate::spawn::prompt::SpawnPrompt>,
     ) -> Result<ResponseResult, ErrorCode> {
+        self.start_structured_request_authenticated(params, caller, verb, opening_turn, None)
+    }
+    /// Socket and app-session resumes share every launch and recovery guard.
+    /// ADR-0052 slice 17 wires profile admission here, gating socket and wire together.
+    pub(super) fn start_structured_request_authenticated(
+        &mut self,
+        params: AgentStartParams,
+        caller: &SpawnCaller,
+        verb: crate::spawn::SpawnVerb,
+        opening_turn: Option<crate::spawn::prompt::SpawnPrompt>,
+        app_session: Option<&crate::structured::permissions::auth::tokens::server::Session>,
+    ) -> Result<ResponseResult, ErrorCode> {
+        let app_operator = app_session.is_some_and(|session| {
+            session.app().is_some()
+                && session
+                    .info
+                    .scopes
+                    .contains(&crate::api::client_tokens::Scope::Operate)
+        });
         if params.dry_run
             || params.here
             || params.split.is_some()
@@ -59,10 +78,11 @@ impl App {
         // ADR-0036 §1a: neither history ownership nor a relay grants resume authority.
         if (existing.is_some()
             && (!matches!(caller, SpawnCaller::Operator { .. })
-                || self.current_api_peer_uid.is_none_or(|uid| {
-                    self.runtime_config.uid_policy.classify(uid)
-                        != crate::structured::identity::Principal::Operator
-                })))
+                || (!app_operator
+                    && self.current_api_peer_uid.is_none_or(|uid| {
+                        self.runtime_config.uid_policy.classify(uid)
+                            != crate::structured::identity::Principal::Operator
+                    }))))
             || self
                 .inbound
                 .edge(
@@ -81,12 +101,36 @@ impl App {
         }) {
             return Err(ErrorCode::StructuredRecoveryRequired);
         }
+        let profile_identity = ProfileIdentity {
+            profile: self.state.config.structured.profile.clone(),
+            binding: None,
+        };
+        if let Some((id, _)) = &existing {
+            if let Some((record, _, _)) = self.state.structured_agents.get(id) {
+                record.admit_profile(Some(&profile_identity))?;
+            }
+        }
         self.state
             .config
             .structured
             .run_as
             .admit()
             .map_err(|e| e.code())?;
+        // A caller's PTY selector cannot silently become another structured account.
+        // Structured launches keep the managed directory required by ADR-0036.
+        let requested = self
+            .resolve_spawn_env(&params.argv, self.current_api_peer_pid, None)
+            .map_err(|_| ErrorCode::AgentProfileUnresolved)?;
+        if let Some((_, directory)) = requested.iter().find(|(key, _)| key == "CLAUDE_CONFIG_DIR") {
+            let managed = crate::session::data_dir()
+                .canonicalize()
+                .map_err(|_| ErrorCode::StructuredProfileMismatch)?
+                .join("structured/claude")
+                .join(&self.state.config.structured.profile);
+            if PathBuf::from(directory).canonicalize().ok().as_ref() != Some(&managed) {
+                return Err(ErrorCode::StructuredProfileMismatch);
+            }
+        }
         let lineage = self
             .admit_spawn(verb, caller, None)
             .map_err(|e| ErrorCode::from_code(e.code()).unwrap_or(ErrorCode::InternalError))?;
@@ -96,6 +140,16 @@ impl App {
             .clone()
             .ok_or(ErrorCode::StructuredEndpointRestartRequired)?;
         let is_new = existing.is_none();
+        let mode = if existing.as_ref().is_some_and(|(id, _)| {
+            self.state
+                .structured_agents
+                .get(id)
+                .is_some_and(|(record, _, _)| record.harness_established)
+        }) {
+            LaunchMode::Continuation
+        } else {
+            LaunchMode::Fresh
+        };
         let (agent_id, generation) = if let Some((id, generation)) = existing {
             if params.cwd.is_some() || params.model.is_some() {
                 return Err(ErrorCode::InvalidParams);
@@ -126,6 +180,8 @@ impl App {
                 .state
                 .structured_agents
                 .register(Record {
+                    harness_established: false,
+                    profile_identity: None,
                     runtime: StructuredRuntime::Structured,
                     agent_id: id.clone(),
                     name: Some(params.name),
@@ -144,6 +200,7 @@ impl App {
         let started = self.structured_workers.start(
             &mut self.state.structured_agents,
             Launch {
+                profile_identity: Some(profile_identity),
                 opening_turn,
                 agent_id: agent_id.clone(),
                 generation,
@@ -191,9 +248,14 @@ impl App {
                     }
                     String::from_utf8(output.stdout).map_err(io::Error::other)
                 })?;
-                LaunchProfile::prepare(&config, &prepare_state, &record.session_id, binary, |key| {
-                    std::env::var_os(key)
-                })
+                LaunchProfile::prepare(
+                    &config,
+                    &prepare_state,
+                    &record.session_id,
+                    mode,
+                    binary,
+                    |key| std::env::var_os(key),
+                )
             },
         );
         let generation = match started {

@@ -210,6 +210,7 @@ async fn relay_refused(method: Method, enrolled: bool) {
         .attach(pid, started, crate::platform::process_start_time)
         .unwrap();
     let status = crate::mesh::hello::Enrollment {
+        negotiated: None,
         peer: "relay.example".into(),
         source: crate::mesh::store::PinSource::Inbound,
         pin_origin: Default::default(),

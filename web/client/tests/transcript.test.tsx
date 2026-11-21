@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, onTestFinished, test } from "bun:test";
 import { render } from "solid-js/web";
 
 import { permissionLifecycle } from "../src/gen/FixtureExamples";
@@ -138,7 +138,15 @@ describe("App", () => {
     const config = { transport: "fixture", fixtureJsonl: await readFixture(), source: "events.jsonl" } as const;
     const root = mount(() => <App config={{ ok: true, config }} />);
     expect(root.querySelector('[data-testid="replay-badge"]')?.textContent).toBe("Fixture replayevents.jsonl");
-    await Promise.resolve();
+    await new Promise<void>((resolve) => {
+      const rendered = (): void => {
+        if (root.querySelector('[data-testid="known-event"]') !== null) resolve();
+      };
+      const observer = new MutationObserver(rendered);
+      observer.observe(root, { childList: true, subtree: true });
+      onTestFinished(() => observer.disconnect());
+      rendered();
+    });
     expect(root.querySelectorAll('[data-testid="known-event"]').length).toBeGreaterThan(0);
   });
 });

@@ -17,7 +17,7 @@ url: https://github.com/gerchowl/herdr/pull/153
 
 Closes #131. Parent #109.
 
-Ports the g-fleet herdr-web MVP into herdr as a feature-gated `herdr web` subcommand: an axum WebSocket↔PTY bridge that spawns a `herdr` client (`HERDR_RENDER_ENCODING=terminal-ansi`) per connection and pipes the server-diffed ANSI straight to xterm.js. On an always-on host the client attaches to the persistent `herdr server` daemon, so a phone over `tailscale serve` shares that node's live session and its fleet gossip view independently of the hopper.
+Ports the the fleet configuration repo herdr-web MVP into herdr as a feature-gated `herdr web` subcommand: an axum WebSocket↔PTY bridge that spawns a `herdr` client (`HERDR_RENDER_ENCODING=terminal-ansi`) per connection and pipes the server-diffed ANSI straight to xterm.js. On an always-on host the client attaches to the persistent `herdr server` daemon, so a phone over `tailscale serve` shares that node's live session and its fleet gossip view independently of the hopper.
 
 ## What's in it
 - `herdr web` behind `--features web` (axum/futures-util/rust-embed/anyhow + tokio net/io-util are feature-only; **default build unaffected**). Dispatch routed through `cli::maybe_run` (single cfg site; non-web build prints how to enable).
@@ -31,6 +31,6 @@ Ports the g-fleet herdr-web MVP into herdr as a feature-gated `herdr web` subcom
 - Live smoke tests: HTTP routes + embedded assets, cross-origin WS → 403, and an end-to-end WS test proving `HERDR_*` is stripped from the spawned child.
 
 ## Spike trail
-Two fresh-agent review rounds (transport, fleet-topology, security, packaging; then correctness + scope). Follow-ups: #147 (tailscale identity), #148 (idle timeout/cap), #149 (g-fleet retirement + daemon), #150 (native transport v2 → #128/#129/#130), #151 (`--session`).
+Two fresh-agent review rounds (transport, fleet-topology, security, packaging; then correctness + scope). Follow-ups: #147 (tailscale identity), #148 (idle timeout/cap), #149 (the fleet configuration repo retirement + daemon), #150 (native transport v2 → #128/#129/#130), #151 (`--session`).
 
 Note: adds a `.gitignore` exception for `/docs/adr/` (mirrors the existing `/docs/next/` one) so the ADR is versioned.

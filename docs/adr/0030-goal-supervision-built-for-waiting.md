@@ -191,11 +191,11 @@ Consequences of the order:
   remaining budget). Without one, a judge failure means **allow the stop and
   mark the goal `degraded`**, visible in `flk goal status` and sent to the
   supervisor. A judge failure is never `met`, and never a silent HOLD
-  (claude-config#12's opencode bug).
+  (an agent configuration bug in opencode).
 - **Calibration is owned in this repo** (#882): the question set and thresholds
   are versioned together, the labelled corpus is committed (aggregated,
   redacted), and `flk goal judge revalidate` re-scores it on every model change.
-  The routine AUC drop on Clef (0.935 → 0.723, claude-config#70) is a known
+  The routine AUC drop on Clef (0.935 → 0.723) is a known
   open item that this command exists to track.
 - **Every decision is logged with all scores and a label slot** (#886), as a
   `GoalVerdict` event, so labels can be attached later from the owner's next
@@ -300,7 +300,7 @@ the dialog scraping in `spawn-claude.sh` (with #605 already landed).
   queue no longer turns into timeouts.
 - Goal state is versioned and auditable, and it outlives compactions, restarts
   and pane moves.
-- goal-s1 shrinks to a shim (claude-config#24) once G1–G3 ship.
+- goal-s1 shrinks to a shim once G1–G3 ship.
 
 ## Alternatives considered
 
@@ -349,7 +349,7 @@ The decisions for ADR-0028 and ADR-0029 are listed at the end of each.
 1. **Judge failure default.** Decided: allow the stop and mark the goal
    `degraded` (visible, reported to the supervisor, never `met`). Rejected:
    hold the stop until the judge returns, which turns a System One outage into
-   a fleet that cannot stop (the opencode twin's bug, claude-config#12).
+   a fleet that cannot stop (the opencode twin's bug).
 2. **Compaction vs operator.** Decided: the operator first, compaction
    second (§4). Compaction beats goal continuation in the stop ladder (rung 2)
    either way.

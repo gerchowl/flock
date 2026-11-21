@@ -722,7 +722,7 @@ fn stop_hook_inbox_authority_notice_is_once_and_never_blocks_the_real_cli() {
                 if wakes == 3 {
                     serde_json::json!({"id":request["id"], "result":{"type":"msg_wake", "count":2}})
                 } else {
-                    serde_json::json!({"id":request["id"], "error":{"code":"not_authorized", "message":"native inbox authority refused or unavailable"}})
+                    serde_json::json!({"id":request["id"], "error":{"code":"caller_pane_unresolved", "message":"caller pane authority unavailable"}})
                 }
             } else {
                 serde_json::json!({"id":request["id"], "result":{"type":"ok"}})
@@ -780,7 +780,7 @@ fn stop_hook_inbox_authority_notice_is_once_and_never_blocks_the_real_cli() {
                 assert!(value["systemMessage"]
                     .as_str()
                     .unwrap()
-                    .contains("flk msg read"));
+                    .contains("flk msg operator-read --pane"));
             }
         }
     }
@@ -3740,6 +3740,41 @@ fn needs_reply(socket_path: &Path, correlation_id: &str, body: &str) {
         ],
     );
     assert_eq!(sent["result"]["correlation_id"], correlation_id, "{sent}");
+}
+
+#[test]
+fn operator_inbox_commands_peek_then_consume_a_named_pane() {
+    let (flock, base, socket_path) = spawn_recipient();
+    needs_reply(&socket_path, "operator-cli", "operator recovery body");
+    for _ in 0..2 {
+        let peek = run_cli_json(&socket_path, &["msg", "operator-list", "--pane", "1-1"]);
+        assert_eq!(
+            peek["result"]["messages"].as_array().unwrap().len(),
+            1,
+            "{peek}"
+        );
+        assert_eq!(
+            peek["result"]["messages"][0]["preview"],
+            "operator recovery body"
+        );
+    }
+    let read = run_cli_json(&socket_path, &["msg", "operator-read", "--pane", "1-1"]);
+    assert_eq!(
+        read["result"]["messages"].as_array().unwrap().len(),
+        1,
+        "{read}"
+    );
+    assert_eq!(
+        read["result"]["messages"][0]["body"],
+        "operator recovery body"
+    );
+    let empty = run_cli_json(&socket_path, &["msg", "operator-read", "--pane", "1-1"]);
+    assert_eq!(
+        empty["result"]["messages"],
+        serde_json::json!([]),
+        "{empty}"
+    );
+    cleanup_spawned_flock(flock, base);
 }
 
 /// #576: the recipient read a question from a sender with no inbox and

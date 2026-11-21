@@ -157,8 +157,7 @@ async fn fake_claude_calls(mcp: bool) {
     let endpoint = if mcp {
         // The ordinary cargo/nextest all-target build provides the sibling CLI.
         // Derive it from this test artifact, never PATH or an installed binary.
-        let executable = std::env::current_exe().unwrap();
-        let binary = executable.parent().unwrap().parent().unwrap().join("flk");
+        let binary = crate::test_support::flk_binary();
         crate::structured::launch::SessionMcp::new(&binary, &socket)
             .expect("missing sibling flk binary from cargo/nextest all-target build")
     } else {

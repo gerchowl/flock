@@ -11,7 +11,7 @@ use std::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 async fn within<T>(work: impl Future<Output = T>) -> T {
-    tokio::time::timeout(Duration::from_secs(5), work)
+    crate::test_support::deadline::timeout(Duration::from_secs(5), work)
         .await
         .expect("transport producer stayed silent")
 }
@@ -32,6 +32,26 @@ impl TestClock {
             signal,
             deadlines: Mutex::new(Vec::new()),
         }))
+    }
+    async fn scope<T>(&self, work: impl Future<Output = T>) -> T {
+        let clock = self.clone();
+        crate::test_support::deadline::scope(
+            Arc::new(move |duration| {
+                let clock = clock.clone();
+                Box::pin(async move { clock.until(clock.now() + duration).await })
+            }),
+            work,
+        )
+        .await
+    }
+    async fn within<T>(&self, work: impl Future<Output = T>) -> T {
+        tokio::select! {
+            biased;
+            result = work => result,
+            _ = self.until(self.now() + Duration::from_secs(5)) => {
+                panic!("transport producer stayed silent on injected clock");
+            }
+        }
     }
     pub(crate) fn advance(&self, ms: u64) {
         self.0
@@ -150,7 +170,14 @@ impl Server {
     ) -> Self {
         let clock = TestClock::new();
         let wake = Arc::new(tokio::sync::Notify::new());
-        let mut core = Core::with_clock(store, wrap(clock.clone()), wake.clone()).unwrap();
+        let mut core = Core::with_clock(
+            root.path().to_owned(),
+            store,
+            wrap(clock.clone()),
+            wake.clone(),
+        )
+        .await
+        .unwrap();
         setup(&mut core);
         let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let bind = socket.local_addr().unwrap();
@@ -238,34 +265,32 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> Socket<S> {
         .await;
     }
     pub(crate) async fn receive(&mut self) -> Received {
-        within(async {
-            loop {
-                let flags = match self.0.read_u8().await {
-                    Ok(v) => v,
-                    Err(_) => return Received::End,
-                };
-                assert_eq!(flags & 0x70, 0, "server negotiated or emitted compression");
-                let length = self.0.read_u8().await.unwrap();
-                assert_eq!(length & 0x80, 0);
-                let length = match length & 127 {
-                    126 => u64::from(self.0.read_u16().await.unwrap()),
-                    127 => self.0.read_u64().await.unwrap(),
-                    n => u64::from(n),
-                };
-                assert!(length <= MAX_MESSAGE as u64);
-                let mut bytes = vec![0; length as usize];
-                self.0.read_exact(&mut bytes).await.unwrap();
-                match flags & 15 {
-                    1 => return Received::Text(serde_json::from_slice(&bytes).unwrap()),
-                    8 => {
-                        return Received::Close(u16::from_be_bytes(bytes[..2].try_into().unwrap()))
-                    }
-                    9 | 10 => (),
-                    _ => panic!("unexpected websocket opcode"),
-                }
+        within(self.receive_frames()).await
+    }
+    async fn receive_frames(&mut self) -> Received {
+        loop {
+            let flags = match self.0.read_u8().await {
+                Ok(v) => v,
+                Err(_) => return Received::End,
+            };
+            assert_eq!(flags & 0x70, 0, "server negotiated or emitted compression");
+            let length = self.0.read_u8().await.unwrap();
+            assert_eq!(length & 0x80, 0);
+            let length = match length & 127 {
+                126 => u64::from(self.0.read_u16().await.unwrap()),
+                127 => self.0.read_u64().await.unwrap(),
+                n => u64::from(n),
+            };
+            assert!(length <= MAX_MESSAGE as u64);
+            let mut bytes = vec![0; length as usize];
+            self.0.read_exact(&mut bytes).await.unwrap();
+            match flags & 15 {
+                1 => return Received::Text(serde_json::from_slice(&bytes).unwrap()),
+                8 => return Received::Close(u16::from_be_bytes(bytes[..2].try_into().unwrap())),
+                9 | 10 => (),
+                _ => panic!("unexpected websocket opcode"),
             }
-        })
-        .await
+        }
     }
     async fn text(&mut self) -> Value {
         match self.receive().await {
@@ -285,6 +310,24 @@ pub(crate) fn runtime(work: impl Future<Output = ()>) {
         .unwrap()
         .block_on(work);
 }
+/// Separate transport features from authenticated operation grants in older fixtures.
+fn granted_scopes(welcome: &Value) -> Value {
+    let capabilities = welcome["capabilities"].as_array().unwrap();
+    assert_eq!(
+        capabilities
+            .iter()
+            .filter(|c| **c == "resume_probe")
+            .count(),
+        1
+    );
+    Value::Array(
+        capabilities
+            .iter()
+            .filter(|c| **c != "resume_probe")
+            .cloned()
+            .collect(),
+    )
+}
 #[test]
 fn hello_uses_generated_contracts_epoch_identity_and_read_only_metadata() {
     runtime(async {
@@ -294,7 +337,7 @@ fn hello_uses_generated_contracts_epoch_identity_and_read_only_metadata() {
         assert_eq!(welcome["protocol"], WIRE_JSON_VERSION);
         assert_eq!(welcome["principal"], "c".repeat(32));
         assert_eq!(
-            welcome["capabilities"],
+            granted_scopes(&welcome),
             json!(["read", "send", "answer", "operate"])
         );
         assert_eq!(welcome["idempotency_window_ms"], 86_400_000);
@@ -306,7 +349,7 @@ fn hello_uses_generated_contracts_epoch_identity_and_read_only_metadata() {
         ));
         let mut newer = Socket::open(&server).await;
         let newer_welcome = newer.hello(WIRE_JSON_VERSION + 1, &"d".repeat(64)).await;
-        assert_eq!(newer_welcome["capabilities"], json!(["read"]));
+        assert_eq!(granted_scopes(&newer_welcome), json!(["read"]));
         assert_eq!(newer_welcome["server_epoch"], welcome["server_epoch"]);
         server.clock.deadline(15_000).await;
         {
@@ -327,7 +370,7 @@ fn assert_welcome_grants(scopes: Value, expected: Value) {
         let mut socket = Socket::open(&server).await;
         let welcome = socket.hello(WIRE_JSON_VERSION, &"a".repeat(64)).await;
         server.finish().await;
-        assert_eq!(welcome["capabilities"], expected);
+        assert_eq!(granted_scopes(&welcome), expected);
     });
 }
 #[test]
@@ -367,7 +410,7 @@ fn newer_protocol_welcome_advertises_only_explicit_read() {
             let mut socket = Socket::open(&server).await;
             let welcome = socket.hello(WIRE_JSON_VERSION + 1, &"a".repeat(64)).await;
             server.finish().await;
-            assert_eq!(welcome["capabilities"], expected);
+            assert_eq!(granted_scopes(&welcome), expected);
         }
     });
 }
@@ -645,7 +688,8 @@ fn writer_prioritizes_ping_between_bounded_data_writes() {
                 output::encode(ServerFrame::Ping {
                     nonce: "priority".into(),
                 })
-                .unwrap(),
+                .unwrap()
+                .into(),
             )
             .unwrap();
         release.send(()).unwrap();
@@ -810,7 +854,7 @@ fn covers_selected_fixture_handshake_vectors_run_against_the_core() {
                 assert_eq!(welcome["t"], "welcome");
                 assert_eq!(welcome["protocol"], WIRE_JSON_VERSION);
                 assert_eq!(
-                    welcome["capabilities"],
+                    granted_scopes(&welcome),
                     if newer_protocol {
                         json!(["read"])
                     } else {
@@ -1335,6 +1379,7 @@ fn closed_subscription_discards_queued_output_without_harming_sibling_or_ping() 
                 frame: data_frame(id),
                 active: Some(fence.clone()),
                 delivered: Some(delivered),
+                causal: None,
             })
             .unwrap();
             acknowledgements.push((id, acknowledgement));
@@ -1345,7 +1390,8 @@ fn closed_subscription_discards_queued_output_without_harming_sibling_or_ping() 
                 output::encode(ServerFrame::Ping {
                     nonce: "priority".into(),
                 })
-                .unwrap(),
+                .unwrap()
+                .into(),
             )
             .unwrap();
         release.send(()).unwrap();
@@ -1385,6 +1431,8 @@ fn owner_lookup_replay_consumes_real_storage_and_the_verified_socket_writer() {
         let mut registry = Registry::default();
         registry
             .register(Record {
+                harness_established: false,
+                profile_identity: None,
                 runtime: StructuredRuntime::Structured,
                 agent_id: "fixture-agent".into(),
                 name: None,
@@ -1449,6 +1497,7 @@ fn owner_lookup_replay_consumes_real_storage_and_the_verified_socket_writer() {
                 frame,
                 active: Some(Arc::new(std::sync::atomic::AtomicBool::new(true))),
                 delivered: Some(delivered),
+                causal: None,
             })
             .unwrap();
         assert!(within(ack).await.unwrap());
@@ -1583,3 +1632,138 @@ mod trace_protocol;
 mod trace_ping;
 
 mod trace_revocation;
+
+#[test]
+fn resume_probe_echoes_nonce() {
+    runtime(async {
+        let server = Server::new().await;
+        let mut client = Socket::open(&server).await;
+        client.hello(WIRE_JSON_VERSION, &"a".repeat(64)).await;
+        client.send(json!({"t":"ping","nonce":"resume-1"})).await;
+        assert_eq!(client.text().await, json!({"t":"pong","nonce":"resume-1"}));
+        client.send(json!({"t":"ping","nonce":"resume-2"})).await;
+        assert_eq!(client.text().await, json!({"t":"pong","nonce":"resume-2"}));
+        server.finish().await;
+    });
+}
+
+#[test]
+fn resume_probe_ignores_invalid_nonces_without_renewing_heartbeat() {
+    runtime(async {
+        let server = Server::new().await;
+        let mut client = Socket::open(&server).await;
+        client.hello(WIRE_JSON_VERSION, &"a".repeat(64)).await;
+        for nonce in [String::new(), "x".repeat(129), "é".repeat(65)] {
+            client.send(json!({"t":"ping","nonce":nonce})).await;
+        }
+        let nonce = "é".repeat(64);
+        client.send(json!({"t":"ping","nonce":nonce})).await;
+        assert_eq!(client.text().await, json!({"t":"pong","nonce":nonce}));
+        // Even a valid client probe does not replace a pong to the server's heartbeat.
+        server.clock.advance(LIVENESS_WINDOW_MS);
+        assert!(matches!(
+            client.receive().await,
+            Received::Close(GOING_AWAY_CLOSE)
+        ));
+        server.finish().await;
+    });
+}
+
+#[test]
+fn resume_probe_budget_is_held_until_flush_and_is_per_connection() {
+    runtime(async {
+        let slots = Arc::new(Semaphore::new(1));
+        let (sink, release, ready, mut received, _) = gated_sink();
+        let (priority, high) = mpsc::channel(4);
+        let (_data, low) = mpsc::channel(8);
+        priority
+            .try_send(output::probe("first".into(), &slots).unwrap())
+            .unwrap();
+        // No second response can queue while the first is waiting for the writer.
+        assert!(output::probe("queued".into(), &slots).is_none());
+        let task = tokio::spawn(output::writer(sink, Arc::new(TestClock::new()), high, low));
+        within(ready).await.unwrap();
+        // Nor can one queue while the first write is stalled at flush.
+        assert!(output::probe("writing".into(), &slots).is_none());
+        let independent = Arc::new(Semaphore::new(1));
+        assert!(output::probe("other-connection".into(), &independent).is_some());
+        release.send(()).unwrap();
+        assert_eq!(
+            within(received.recv()).await.unwrap(),
+            output::encode(ServerFrame::Pong {
+                nonce: "first".into()
+            })
+            .unwrap()
+        );
+        // The received frame proves flush completed; the live writer has released the slot.
+        assert!(output::probe("after-flush".into(), &slots).is_some());
+        priority.try_send(close(1000).into()).unwrap();
+        within(task).await.unwrap();
+    });
+}
+
+#[test]
+fn resume_probe_wrong_nonce_shape_is_refused_like_heartbeat_pong() {
+    runtime(async {
+        let server = Server::new().await;
+        for tag in ["ping", "pong"] {
+            let mut client = Socket::open(&server).await;
+            client.hello(WIRE_JSON_VERSION, &"a".repeat(64)).await;
+            client.send(json!({"t":tag,"nonce":null})).await;
+            assert!(matches!(
+                client.receive().await,
+                Received::Close(POLICY_VIOLATION_CLOSE)
+            ));
+        }
+        server.finish().await;
+    });
+}
+
+mod ownership_timeouts;
+
+#[test]
+fn causal_writer_holds_until_flush_and_releases_on_failure() {
+    use crate::structured::publication::causal::Cause;
+    runtime(async {
+        for fail in [false, true] {
+            let (sink, release, started, mut frames, _) = gated_sink();
+            let (_priority, high) = mpsc::channel(4);
+            let (data, low) = mpsc::channel(8);
+            let (cause, lease) = Cause::hold();
+            let (delivered, flushed) = tokio::sync::oneshot::channel();
+            data.try_send(output::Delivery {
+                frame: super::commands::ack("caused".into(), Ok(json!({}))),
+                active: None,
+                delivered: Some(delivered),
+                causal: Some(lease),
+            })
+            .unwrap();
+            let task = tokio::spawn(output::writer(sink, Arc::new(TestClock::new()), high, low));
+            within(started).await.unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), cause.released())
+                    .await
+                    .is_err()
+            );
+            if fail {
+                drop(release);
+            } else {
+                release.send(()).unwrap();
+            }
+            within(cause.released()).await;
+            if fail {
+                assert!(within(flushed).await.is_err());
+                assert!(frames.try_recv().is_err());
+            } else {
+                assert!(within(flushed).await.unwrap());
+                assert!(matches!(
+                    within(frames.recv()).await,
+                    Some(Message::Text(_))
+                ));
+            }
+            drop(data);
+            task.abort();
+            let _ = task.await;
+        }
+    });
+}

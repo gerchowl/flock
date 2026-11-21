@@ -27,6 +27,7 @@ export type PhoneProps = {
   readonly fleetNote: () => string | null;
   readonly agent: () => string | null;
   readonly row: () => AgentRow | undefined;
+  readonly unavailable: () => string | null;
   /** Focuses the agent; true when that pushed a layout tile. */
   readonly open: (agentId: string) => boolean;
   readonly back: () => void;
@@ -38,6 +39,8 @@ export type PhoneProps = {
   readonly closed: ClosedIds;
   readonly sender: Sender | null;
   readonly composer: ComposerState;
+  /** Actions for the selected structured agent. */
+  readonly actions?: () => JSX.Element;
   /** Shows the unbuilt tabs and views, disabled, with what they wait for. */
   readonly preview: boolean;
   /** The connection's status dot and popover, beside the Inbox title (wire mode); renders nothing in fixture mode. */
@@ -139,16 +142,19 @@ export function PhoneWorkbench(props: PhoneProps): JSX.Element {
                 <span id={summary}>Summary waits for goal and step records.</span> <span id={pr}>PR waits for a PR source.</span>
               </p>
             </Show>
+            {props.actions?.()}
             <div class="phone__body">
-              <Transcript
-                transport={props.transport}
-                stream={`agent/${agent}`}
-                source={props.source}
-                onEntry={(seq, text) => props.composer.observe(agent, seq, text)}
-                onCurrent={(current) => props.composer.current(agent, current)}
-              />
+              <Show when={props.unavailable() === null} fallback={<p class="focus__empty">{props.unavailable()}</p>}>
+                <Transcript
+                  transport={props.transport}
+                  stream={`agent/${agent}`}
+                  source={props.source}
+                  onEntry={(seq, text) => props.composer.observe(agent, seq, text)}
+                  onCurrent={(current) => props.composer.current(agent, current)}
+                />
+              </Show>
             </div>
-            <Composer agent={agent} row={props.row()} sender={props.sender} state={props.composer} />
+            <Composer unavailable={props.unavailable()} agent={agent} row={props.row()} sender={props.sender} state={props.composer} />
           </main>
           );
         }}

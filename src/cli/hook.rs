@@ -240,9 +240,7 @@ pub(super) fn run_hook_command(args: &[String]) -> std::io::Result<i32> {
     // The count comes from `msg.wake`, not `msg.list`: the server decides
     // whether a wake may fire at all (a paused fleet, a muted recipient) and
     // answers with a number rather than message previews (#316).
-    let wake = matches!(action, Action::Stop)
-        .then(|| wake_messages(&pane_id))
-        .flatten();
+    let wake = matches!(action, Action::Stop).then(wake_messages).flatten();
     let pending_messages = wake.as_ref().map_or(0, wake_count_from_response);
     // #415: an older harness hands the hook no `last_assistant_message`, so
     // `plan_stop` has only the transcript — and the turn's final reply may not
@@ -261,7 +259,7 @@ pub(super) fn run_hook_command(args: &[String]) -> std::io::Result<i32> {
             );
         }
     }
-    // The account profile the session is running under (g-fleet's claude-auth):
+    // The account profile the session is running under (an account switcher):
     // read here, at the IO edge, so `plan` stays a pure function of its inputs.
     let config_dir = env_nonempty("CLAUDE_CONFIG_DIR");
     let mut outcome = plan(
@@ -644,7 +642,7 @@ fn plan_stop(
         // turns that had ended with one, on nearly every turn of every
         // session, so the recap is left alone — mail still wakes.
         return HookOutcome {
-            stdout: mail_nudge(pending_messages, false, pane_id),
+            stdout: mail_nudge(pending_messages, false),
             ..HookOutcome::default()
         };
     };
@@ -684,7 +682,7 @@ fn plan_stop(
                 seq: Some(seq()),
             }));
         // A clean turn still has to be told about mail.
-        outcome.stdout = mail_nudge(pending_messages, false, pane_id);
+        outcome.stdout = mail_nudge(pending_messages, false);
         return outcome;
     }
 
@@ -692,16 +690,16 @@ fn plan_stop(
     // Skip when we saw no assistant text, this is a subagent, or this turn is
     // already the nudge's continuation, so we don't loop on nothing.
     if !last_assistant.is_empty() && !is_subagent && !stop_hook_active {
-        outcome.stdout = mail_nudge(pending_messages, true, pane_id);
+        outcome.stdout = mail_nudge(pending_messages, true);
     } else {
-        outcome.stdout = mail_nudge(pending_messages, false, pane_id);
+        outcome.stdout = mail_nudge(pending_messages, false);
     }
     outcome
 }
 
 /// The `decision:block` payload that wakes an agent at its turn boundary.
 ///
-/// ADR-0008: this names the count, inbox readers and pane, never a body.
+/// ADR-0008: this names the count and inbox readers, never a body.
 /// Message content is pulled through MCP or the CLI, so nothing another
 /// agent wrote can arrive dressed as the operator's instruction — the wake
 /// channel carries no attacker-controlled text.
@@ -713,7 +711,7 @@ fn plan_stop(
 /// acknowledged and dropped (#408). So mail pending means read AND act, with
 /// no word of stopping; the recap is asked for at the next boundary, when the
 /// inbox is empty and the turn really is over.
-fn mail_nudge(pending_messages: usize, want_recap: bool, pane_id: &str) -> Option<String> {
+fn mail_nudge(pending_messages: usize, want_recap: bool) -> Option<String> {
     let reason = match (pending_messages, want_recap) {
         (0, false) => return None,
         (0, true) => "End your turn with a single sentinel line: `※ recap: \
@@ -721,7 +719,7 @@ fn mail_nudge(pending_messages: usize, want_recap: bool, pane_id: &str) -> Optio
             .to_string(),
         (n, _) => format!(
             "You have {n} unread message{} from other agents. Read {} with the \
-             `flock_msg_read` tool (or `flk msg read --pane {pane_id}` if the tool is \
+             `flock_msg_read` tool (or `flk msg read` if the tool is \
              unavailable) and act on any that need a reply before you end your turn.",
             if n == 1 { "" } else { "s" },
             if n == 1 { "it" } else { "them" }
@@ -741,12 +739,12 @@ fn mail_nudge(pending_messages: usize, want_recap: bool, pane_id: &str) -> Optio
 ///
 /// Failures contribute no mail count. Authority refusals also suppress the
 /// recap nudge and produce one nonblocking notice; transport failures remain quiet.
-fn wake_messages(pane_id: &str) -> Option<serde_json::Value> {
+fn wake_messages() -> Option<serde_json::Value> {
+    // A fork/resume can inherit a stale pane claim. Count only the inbox
+    // the server attests for this process, just as an implicit read does.
     let request = Request {
         id: format!("flock:hook:{}", seq()),
-        method: Method::MsgWake(crate::api::schema::MsgWakeParams {
-            pane: Some(pane_id.to_string()),
-        }),
+        method: Method::MsgWake(crate::api::schema::MsgWakeParams { pane: None }),
     };
     ApiClient::local()
         .request_value_with_timeout(&request, HOOK_TIMEOUT)
@@ -774,11 +772,12 @@ fn apply_wake_authority(
     wake: &serde_json::Value,
     marker: &std::path::Path,
 ) {
-    if matches!(
-        wake.pointer("/error/code")
-            .and_then(serde_json::Value::as_str),
-        Some("not_authorized" | "inbox_not_owner")
-    ) {
+    if let Some(
+        code @ ("not_authorized" | "inbox_not_owner" | "caller_pane_unresolved" | "operator_only"),
+    ) = wake
+        .pointer("/error/code")
+        .and_then(serde_json::Value::as_str)
+    {
         outcome.stdout = None;
         let first = marker.parent().is_some_and(|parent| {
             std::fs::create_dir_all(parent).is_ok()
@@ -790,7 +789,7 @@ fn apply_wake_authority(
         });
         if first {
             outcome.stdout = Some(serde_json::json!({
-                "systemMessage": "Inbox authority unavailable for this process. Ask the operator to read this pane's inbox from their own interactive shell with `flk msg read --pane <pane-id>`. This does not restore agent authority; see #3000."
+                "systemMessage": format!("Inbox authority unavailable for this process ({code}). Ask the operator to read this pane's inbox from their own interactive shell with `flk msg operator-read --pane <pane-id>` (peek with `flk msg operator-list --pane <pane-id>`). For a legacy handoff pane, ask the operator to migrate this agent to a structured agent, resuming its harness session (#3066). Reading the inbox does not restore agent authority; see #3000.")
             }).to_string());
         }
     } else if wake.get("result").is_some() {
@@ -1033,16 +1032,22 @@ mod tests {
         let root =
             crate::structured::launch::SessionConfigDir::create(&std::env::temp_dir()).unwrap();
         let marker = root.path().join("notices").join("session");
-        for code in ["not_authorized", "inbox_not_owner"] {
+        for code in [
+            "not_authorized",
+            "inbox_not_owner",
+            "caller_pane_unresolved",
+            "operator_only",
+        ] {
             let refused = json!({"error": {"code": code}});
             let mut outcome = HookOutcome {
-                stdout: mail_nudge(3, true, "p_1"),
+                stdout: mail_nudge(3, true),
                 ..Default::default()
             };
             apply_wake_authority(&mut outcome, &refused, &marker);
             let notice: serde_json::Value =
                 serde_json::from_str(outcome.stdout.as_ref().unwrap()).unwrap();
             assert!(notice.get("decision").is_none(), "{notice}");
+            assert!(notice["systemMessage"].as_str().unwrap().contains(code));
             assert!(notice["systemMessage"]
                 .as_str()
                 .unwrap()
@@ -1050,10 +1055,15 @@ mod tests {
             assert!(notice["systemMessage"]
                 .as_str()
                 .unwrap()
-                .contains("flk msg read"));
+                .contains("flk msg operator-read --pane"));
             assert!(notice["systemMessage"].as_str().unwrap().contains("#3000"));
+            assert!(notice["systemMessage"].as_str().unwrap().contains("#3066"));
+            assert!(notice["systemMessage"]
+                .as_str()
+                .unwrap()
+                .contains("migrate"));
             for count in [0, 3] {
-                outcome.stdout = mail_nudge(count, true, "p_1");
+                outcome.stdout = mail_nudge(count, true);
                 apply_wake_authority(&mut outcome, &refused, &marker);
                 assert!(
                     outcome.stdout.is_none(),
@@ -1061,7 +1071,7 @@ mod tests {
                 );
             }
             let readable = json!({"result": {"count": 3, "type": "msg_wake"}});
-            outcome.stdout = mail_nudge(wake_count_from_response(&readable), false, "p_1");
+            outcome.stdout = mail_nudge(wake_count_from_response(&readable), false);
             let original = outcome.stdout.clone();
             apply_wake_authority(&mut outcome, &readable, &marker);
             assert_eq!(
@@ -1079,7 +1089,7 @@ mod tests {
         let parent = root.path().join("file");
         std::fs::write(&parent, "fixture").unwrap();
         let mut outcome = HookOutcome {
-            stdout: mail_nudge(2, true, "p_1"),
+            stdout: mail_nudge(2, true),
             ..Default::default()
         };
         apply_wake_authority(
@@ -1110,6 +1120,8 @@ mod tests {
         ];
         app.state.ensure_test_terminals();
         app.state.active = Some(0);
+        // These explicit cross-pane queries model an identified local operator.
+        app.current_api_peer_pid = Some(std::process::id());
         let pane = {
             let pane_id = app.state.workspaces[1].focused_pane_id().expect("pane");
             app.state.public_pane_id(1, pane_id).expect("public id")
@@ -1133,7 +1145,7 @@ mod tests {
         }
         let answered = wire(wake.clone());
         assert_eq!(
-            mail_nudge(wake_count_from_response(&answered), false, &pane),
+            mail_nudge(wake_count_from_response(&answered), false),
             None,
             "notices alone must not cost the recipient a turn: {answered}"
         );
@@ -1142,7 +1154,7 @@ mod tests {
             .get("result")
             .is_some());
         let answered = wire(wake);
-        let nudge = mail_nudge(wake_count_from_response(&answered), false, &pane)
+        let nudge = mail_nudge(wake_count_from_response(&answered), false)
             .expect("a question wakes the recipient");
         assert!(
             nudge.contains("3 unread messages"),
@@ -1185,7 +1197,7 @@ mod tests {
         });
         assert_eq!(wake_count_from_response(&suppressed), 0);
         assert_eq!(
-            mail_nudge(wake_count_from_response(&suppressed), false, "p_1"),
+            mail_nudge(wake_count_from_response(&suppressed), false),
             None
         );
 
@@ -1714,11 +1726,11 @@ mod tests {
             "SessionStart",
             "p_1",
             0,
-            Some("/home/u/.claude-profiles/work"),
+            Some("/home/u/.config/profile-a"),
         );
         assert_eq!(
             out.config_dir_record,
-            Some(("sid-9".into(), "/home/u/.claude-profiles/work".into()))
+            Some(("sid-9".into(), "/home/u/.config/profile-a".into()))
         );
     }
 
@@ -1746,7 +1758,7 @@ mod tests {
             "",
             "p_1",
             0,
-            Some("/home/u/.claude-profiles/work"),
+            Some("/home/u/.config/profile-a"),
         )
         .config_dir_record
         .is_none());
@@ -1923,7 +1935,7 @@ mod tests {
         assert!(nudge.contains("\"decision\":\"block\""), "{nudge}");
         assert!(nudge.contains("2 unread messages"), "{nudge}");
         assert!(nudge.contains("flock_msg_read"), "{nudge}");
-        assert!(nudge.contains("`flk msg read --pane p_1`"), "{nudge}");
+        assert!(nudge.contains("`flk msg read`"), "{nudge}");
 
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
@@ -1942,14 +1954,14 @@ mod tests {
         assert!(nudge.contains("1 unread message"), "{nudge}");
         assert!(!nudge.contains("1 unread messages"), "singular: {nudge}");
         assert!(nudge.contains("flock_msg_read"), "{nudge}");
-        assert!(nudge.contains("`flk msg read --pane p_1`"), "{nudge}");
+        assert!(nudge.contains("`flk msg read`"), "{nudge}");
         assert!(nudge.contains("act on"), "{nudge}");
         assert!(
             !nudge.contains("recap"),
             "the recap waits for an empty inbox: {nudge}"
         );
         for (pending, want_recap) in [(1, false), (1, true), (3, false), (3, true)] {
-            let nudge = mail_nudge(pending, want_recap, "p_1").expect("mail wakes");
+            let nudge = mail_nudge(pending, want_recap).expect("mail wakes");
             assert!(
                 !nudge.to_lowercase().contains("stop"),
                 "a mail wake must never tell the agent to stop: {nudge}"
@@ -1960,7 +1972,7 @@ mod tests {
     }
 
     #[test]
-    fn mail_fallback_targets_the_stopping_pane_even_without_a_transcript() {
+    fn mail_fallback_uses_attested_self_even_without_a_transcript() {
         for pane_id in ["p_1", "w2:p3"] {
             for pending in [1, 3] {
                 let out = plan(
@@ -1975,10 +1987,7 @@ mod tests {
                 let nudge: serde_json::Value =
                     serde_json::from_str(&out.stdout.expect("mail wakes")).unwrap();
                 let reason = nudge["reason"].as_str().unwrap();
-                assert!(
-                    reason.contains(&format!("`flk msg read --pane {pane_id}`")),
-                    "{reason}"
-                );
+                assert!(reason.contains("`flk msg read`"), "{reason}");
                 assert!(reason.contains("if the tool is unavailable"), "{reason}");
             }
         }

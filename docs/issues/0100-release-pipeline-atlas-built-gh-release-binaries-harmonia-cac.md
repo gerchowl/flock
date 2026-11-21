@@ -12,7 +12,7 @@ url: https://github.com/gerchowl/herdr/issues/100
 
 # release pipeline: atlas-built GH release binaries + harmonia cache (transport v2)
 
-## Follow-on to the atlas-builder wiring (g-fleet)
+## Follow-on to the atlas-builder wiring (the fleet configuration repo)
 
 Landed today: atlas signs its builds (secret-key-files), hopper trusts the key, `just herdr-prebuild` builds the pinned rev on atlas and nix-copies the signed path over user ssh. Linux already builds once (kiln via --build-host; bastion consumes).
 
@@ -22,4 +22,4 @@ Remaining for the full vision:
 3. **Drv-identity check**: confirm the dotfiles-consumed herdr drv == herdr's own flake build (input follows could fork them); if they differ, align the inputs or prebuild via the dotfiles flake eval instead.
 
 ## References
-g-fleet commit 'atlas as signing builder', #75 (client-anchor arc), ADR-027.
+the fleet configuration repo commit 'atlas as signing builder', #75 (client-anchor arc), ADR-027.

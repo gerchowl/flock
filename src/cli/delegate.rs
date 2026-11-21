@@ -733,6 +733,7 @@ pub(super) fn run_delegate_command(args: &[String]) -> io::Result<i32> {
         "wait" => delegate_wait(&args[1..]),
         "result" => delegate_result(&args[1..]),
         "status" => delegate_status(&args[1..]),
+        "rebind" => backfill::rebind(&args[1..]),
         "reap" => delegate_reap(&args[1..]),
         "list" => super::delegate_list::delegate_list(&args[1..]),
         "help" | "--help" | "-h" => {
@@ -753,6 +754,7 @@ fn print_delegate_help() {
     eprintln!("  {WAIT_USAGE}");
     eprintln!("  {RESULT_USAGE}");
     eprintln!("  {STATUS_USAGE}");
+    eprintln!("  {}", backfill::USAGE);
     eprintln!("  {REAP_USAGE}");
     eprintln!("  {}", super::delegate_list::LIST_USAGE);
 }
@@ -840,7 +842,7 @@ struct Entry {
     /// knew only it called a delegate that survived a restart "not a
     /// delegate". The agent id survives, and a match on it re-points the
     /// entry at the new terminal. Absent in entries written before it; those
-    /// are backfilled the first time a verb proves the terminal still matches.
+    /// are backfilled only from a unique exact saved harness session match.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     agent_id: Option<String>,
     /// Latest explicit lock-resolution intent; false does not prove a key was sent.
@@ -849,6 +851,8 @@ struct Entry {
     /// Harness-reported session retained for exact recovery after terminal replacement.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     session: Option<serde_json::Value>,
+    #[serde(flatten)]
+    extra: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 impl Entry {
@@ -859,6 +863,7 @@ impl Entry {
     }
 }
 
+pub(super) mod backfill;
 mod refusal_guidance;
 mod session;
 pub(super) use refusal_guidance::enrich_draft_refusal;
@@ -2884,6 +2889,7 @@ fn delegate_start(args: &[String]) -> io::Result<i32> {
         agent_id: field(&agent, "agent_id").map(str::to_string),
         lock_resolution: None,
         session: agent.get("agent_session").filter(|v| !v.is_null()).cloned(),
+        extra: Default::default(),
     };
     let failed = |entry: &Entry, written: bool, reason: Option<&str>| {
         fail_started(entry, &cleanup, written, &flags, reason, None)
@@ -4227,7 +4233,7 @@ fn delegate_send(args: &[String]) -> io::Result<i32> {
         Err("busy") => return Ok(fail(format!("delegate {name} is busy"))),
         Err(reason) => return Ok(fail(format!("delegate {name}: {reason}"))),
     };
-    let mut entry = match require_delegate_no_deadline(name, flags.json) {
+    let mut entry = match require_delegate_no_deadline(name, flags.json, true) {
         Ok(Recorded::Live(entry)) => entry,
         // Nothing to type into: the round is not started, and the record stays.
         Ok(Recorded::Gone(entry)) => {
@@ -4419,7 +4425,7 @@ fn delegate_wait(args: &[String]) -> io::Result<i32> {
         .timeout_ms
         .map(|ms| Instant::now() + Duration::from_millis(ms));
 
-    let entry = match require_delegate(name, deadline) {
+    let entry = match require_delegate(name, deadline, false) {
         Ok(Recorded::Live(entry)) => entry,
         // The same answer the await gives when the pane closes under it.
         Ok(Recorded::Gone(entry)) => {
@@ -4511,7 +4517,7 @@ fn delegate_result(args: &[String]) -> io::Result<i32> {
         Ok(flags) => flags,
         Err(reason) => return Ok(usage(reason)),
     };
-    let mut entry = match require_delegate_no_deadline(name, flags.json) {
+    let mut entry = match require_delegate_no_deadline(name, flags.json, false) {
         Ok(Recorded::Live(entry)) => entry,
         // No agent to ask for a reply: the same answer `delegate wait` gives.
         Ok(Recorded::Gone(entry)) => {
@@ -4626,7 +4632,7 @@ fn delegate_status(args: &[String]) -> io::Result<i32> {
         Ok(flags) => flags,
         Err(reason) => return Ok(usage(reason)),
     };
-    let (entry, gone) = match require_delegate_no_deadline(name, flags.json) {
+    let (entry, gone) = match require_delegate_no_deadline(name, flags.json, false) {
         Ok(Recorded::Live(entry)) => (entry, false),
         Ok(Recorded::Gone(entry)) => (entry, true),
         Err(code) => return Ok(code),
@@ -4777,7 +4783,11 @@ enum RequireFailure {
 /// recorded delegate whose agent no longer exists is handed back as `Gone`, and
 /// every verb answers `gone` from the record. A name reused by another agent, or
 /// an agent renamed away from it, is still not this delegate.
-fn require_delegate(name: &str, deadline: Option<Instant>) -> Result<Recorded, RequireFailure> {
+fn require_delegate(
+    name: &str,
+    deadline: Option<Instant>,
+    locked: bool,
+) -> Result<Recorded, RequireFailure> {
     if let Err(reason) = validate_name(name) {
         eprintln!("{reason}");
         return Err(RequireFailure::NotDelegate);
@@ -4795,10 +4805,18 @@ fn require_delegate(name: &str, deadline: Option<Instant>) -> Result<Recorded, R
         return Ok(Recorded::Gone(entry));
     }
     if entry.agent_id.is_none() {
-        return Err(RequireFailure::SessionUnbound(
-            Box::new(entry),
-            "no stable agent identity was recorded",
-        ));
+        let _upgrade_lock = if locked {
+            None
+        } else {
+            Some(take_lock(name).map_err(|reason| RequireFailure::Failed(reason.into()))?)
+        };
+        let fresh = read_entry(name).ok_or(RequireFailure::NotDelegate)?;
+        let live = if fresh.agent_id.is_none() {
+            backfill::upgrade(fresh, deadline)?
+        } else {
+            fresh
+        };
+        return Ok(Recorded::Live(live));
     }
     let before = entry.clone();
     let by_name = agent_record(name, deadline);
@@ -4891,8 +4909,8 @@ fn require_decide(entry: Entry, fetch: AgentFetch) -> Result<Entry, RequireFailu
 /// Map a `RequireFailure` into an exit code for callers that do not want to
 /// emit a `timeout` outcome object: `NotDelegate` is a usage error (exit 2),
 /// `TimedOut`/`Failed` print on stderr and exit 1.
-fn require_delegate_no_deadline(name: &str, json: bool) -> Result<Recorded, i32> {
-    match require_delegate(name, None) {
+fn require_delegate_no_deadline(name: &str, json: bool, locked: bool) -> Result<Recorded, i32> {
+    match require_delegate(name, None, locked) {
         Ok(recorded) => Ok(recorded),
         Err(RequireFailure::SessionUnbound(entry, reason)) => {
             Err(session::unbound(&entry, reason, json))

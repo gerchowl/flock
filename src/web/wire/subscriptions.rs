@@ -39,14 +39,14 @@ pub(super) struct Subscriptions {
     data: mpsc::Sender<Delivery>,
     shared: Arc<Shared>,
     session: Session,
-    priority: mpsc::Sender<Message>,
+    priority: mpsc::Sender<output::Control>,
 }
 impl Subscriptions {
     pub(super) fn new(
         shared: Arc<Shared>,
         data: mpsc::Sender<Delivery>,
         session: Session,
-        priority: mpsc::Sender<Message>,
+        priority: mpsc::Sender<output::Control>,
     ) -> Self {
         let owner = shared.histories.clone();
         Self {
@@ -71,6 +71,11 @@ impl Subscriptions {
     /// False requests a resource close. Refusals consume the ID too.
     pub(super) fn subscribe(&mut self, id: String, stream: String, after: Option<u64>) -> bool {
         if id.len() > ID_BYTES || stream.len() > 256 {
+            self.shared.refusals.malformed(
+                self.shared.clock.now(),
+                &self.session.info,
+                &serde_json::json!({"t":"sub","stream":stream}),
+            );
             return false;
         }
         self.active.retain(|_, sub| !sub.task.is_finished());
@@ -78,12 +83,24 @@ impl Subscriptions {
             self.unsubscribe(&id);
             Some(SubfailCode::SubIdReused)
         } else if self.used.len() == IDS {
+            self.shared.refusals.subscription(
+                self.shared.clock.now(),
+                &self.session.info,
+                &stream,
+                Some(&SubfailCode::SessionBusy),
+            );
             return false;
         } else {
             self.used.insert(id.clone());
             None
         };
         if self.active.len() == ACTIVE {
+            self.shared.refusals.subscription(
+                self.shared.clock.now(),
+                &self.session.info,
+                &stream,
+                Some(&SubfailCode::SessionBusy),
+            );
             return false;
         }
         let live = Arc::new(AtomicBool::new(true));
@@ -106,8 +123,9 @@ impl Subscriptions {
             } else {
                 use crate::structured::permissions::auth::tokens::{Scope, TokenError};
                 let store = shared.store.clone();
+                let admitted = session.clone();
                 match super::super::store_io::shared()
-                    .run(move || store.admit(&session, Scope::Read, |_| ()))
+                    .run(move || store.admit(&admitted, Scope::Read, |_| ()))
                     .await
                 {
                     Some(Ok(())) => {
@@ -122,15 +140,28 @@ impl Subscriptions {
                     }
                     Some(Err(TokenError::Scope)) => Err(Some(SubfailCode::Scope)),
                     Some(Err(TokenError::Unauthorized | TokenError::Revoked)) => {
-                        let _ = priority.send(close(AUTH_REVOKED_CLOSE)).await;
+                        shared.refusals.subscription_revoked(
+                            shared.clock.now(),
+                            &session.info,
+                            &stream,
+                        );
+                        let _ = priority.send(close(AUTH_REVOKED_CLOSE).into()).await;
                         return;
                     }
                     Some(Err(TokenError::Busy)) => Err(Some(SubfailCode::SessionBusy)),
                     Some(Err(TokenError::Unsafe | TokenError::Io(_))) | None => Err(None),
                 }
             };
+            if let Err(code) = &result {
+                shared.refusals.subscription(
+                    shared.clock.now(),
+                    &session.info,
+                    &stream,
+                    code.as_ref(),
+                );
+            }
             if result == Err(None) {
-                let _ = priority.send(close(GOING_AWAY_CLOSE)).await;
+                let _ = priority.send(close(GOING_AWAY_CLOSE).into()).await;
                 return;
             }
             if let Err(Some(code)) = result {
@@ -157,6 +188,7 @@ pub(super) async fn deliver(
             frame,
             active: Some(live.clone()),
             delivered: Some(tx),
+            causal: None,
         })
         .await
         .is_err()
@@ -270,7 +302,17 @@ pub(super) async fn replay(
                 sub_id: id.into(),
                 skipped_to,
             },
-            Item::End => return Ok(()),
+            Item::End => {
+                owner
+                    .replacement(stream[6..].into(), wake.clone())
+                    .await
+                    .map_err(|_| None)?
+                    .ok_or(SubfailCode::UnknownStream)?;
+                ServerFrame::Lagged {
+                    sub_id: id.into(),
+                    skipped_to: cursor,
+                }
+            }
             Item::Pending => {
                 notified.await;
                 continue;

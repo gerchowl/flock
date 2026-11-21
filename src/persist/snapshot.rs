@@ -1015,6 +1015,8 @@ mod tests {
         use crate::structured::registry::Record;
         let mut state = state_with_workspaces(&["registry-fixture"]);
         let record = Record {
+            harness_established: false,
+            profile_identity: None,
             runtime: crate::structured::registry::StructuredRuntime::Structured,
             agent_id: "agent_fixture_structured".into(),
             name: Some("fixture-worker".into()),
@@ -1079,6 +1081,8 @@ mod tests {
             workspace.identity_cwd = root.path().to_owned();
         }
         let record = Record {
+            harness_established: false,
+            profile_identity: None,
             runtime: StructuredRuntime::Structured,
             agent_id: "agent_fixture_structured".into(),
             name: Some("fixture-worker".into()),

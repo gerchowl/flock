@@ -68,6 +68,11 @@ export type Sender = {
   readonly send: (agent: string, text: string, echoAfter: number | null) => string;
   /** Queues `agent.decide`; throws when no principal is known yet. */
   readonly decide: (args: AgentDecide) => string;
+  /** Queues a structured start through the same durable outbox. */
+  readonly start?: (name: string, node: string, cwd: string) => string;
+  /** Queues structured lifecycle actions through the command outbox. */
+  readonly restart?: (agent: string) => string;
+  readonly stop?: (agent: string) => string;
   /** Why sending is impossible right now, or null. */
   readonly blocked: () => string | null;
 };
@@ -128,7 +133,7 @@ export function phaseLine(state: Phase): PhaseLine {
 
 /** The phase line for `row`, which may not be listed. */
 export function rowLine(row: AgentRow | undefined): PhaseLine {
-  return row === undefined ? { line: "Agent not in the agent list", open: true } : phaseLine(row.state);
+  return row === undefined ? { line: explain({ code: "agent_not_found", message: "" }).line, open: false } : phaseLine(row.state);
 }
 
 /** The send shortcut as this platform writes it: the HIG's ⌘↩ on Apple platforms. */
@@ -212,6 +217,7 @@ export function createComposerState(): ComposerState {
 export function Composer(props: {
   readonly agent: string;
   readonly row: AgentRow | undefined;
+  readonly unavailable?: string | null;
   readonly sender: Sender | null;
   readonly state: ComposerState;
 }): JSX.Element {
@@ -223,6 +229,7 @@ export function Composer(props: {
   };
   const [error, setError] = createSignal<string | null>(null);
   const blocked = (): string | null => {
+    if (props.unavailable != null) return props.unavailable;
     if (props.sender === null) return "Replay: sending needs a live server.";
     const mode = rowLine(props.row);
     return mode.open ? props.sender.blocked() : mode.line;

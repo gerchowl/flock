@@ -64,9 +64,16 @@ impl ErrorCode {
     /// `cli::error_code_exit` (#1024).
     pub(crate) const fn exit(self) -> i32 {
         match self {
-            ErrorCode::RequestOutcomeUnknown => exit::REQUEST_OUTCOME_UNKNOWN,
-            ErrorCode::Timeout => exit::TIMEOUT,
-            ErrorCode::SessionUnbound => exit::SESSION_UNBOUND,
+            ErrorCode::RequestOutcomeUnknown | ErrorCode::AuditIndeterminate => {
+                exit::REQUEST_OUTCOME_UNKNOWN
+            }
+            ErrorCode::Timeout | ErrorCode::AttachTimeout => exit::TIMEOUT,
+            ErrorCode::SessionUnbound
+            | ErrorCode::SavedSessionMissing
+            | ErrorCode::SavedSessionNotFound
+            | ErrorCode::SavedSessionAmbiguous
+            | ErrorCode::SavedSessionRuntimeUnsupported
+            | ErrorCode::LiveBindingIncomplete => exit::SESSION_UNBOUND,
             ErrorCode::CodexConversationLocked => exit::AGENT_BLOCKED,
             ErrorCode::CodexLockUnconfirmed => exit::UNCONFIRMED,
             ErrorCode::InputWriteCancelled
@@ -108,6 +115,20 @@ impl std::error::Error for ErrorCode {}
 
 error_codes! {
     Never:
+        /// Review plan is missing, altered or belongs to another operator.
+        ProfilePlanInvalid = "profile_plan_invalid",
+        /// An uncommitted review plan exceeded its five-minute monotonic lifetime.
+        ProfilePlanExpired = "profile_plan_expired",
+        /// Current authority differs from the reviewed predecessor; prepare again.
+        ProfileRevisionConflict = "profile_revision_conflict",
+        /// A terminal binding tombstone cannot be replaced by another binding plan.
+        ProfileBindingRevoked = "profile_binding_revoked",
+        /// No usable binding exists for this operator request.
+        ProfileBindingNotFound = "profile_binding_not_found",
+        /// Production profile execution has not been enabled by the operator.
+        StructuredProfilesDisabled = "structured_profiles_disabled",
+        /// This build lacks the complete ADR-0052 production readiness set.
+        StructuredProfilesNotReady = "structured_profiles_not_ready",
         Scope = "scope",
         TerminalUnavailable = "terminal_unavailable",
         RuntimeUnsupported = "runtime_unsupported",
@@ -124,6 +145,12 @@ error_codes! {
         AlreadyHibernated = "already_hibernated",
         AmbiguousWorktreeBranch = "ambiguous_worktree_branch",
         AtLineageDepth = "at_lineage_depth",
+        /// Caller pane identity could not be attested (CLI exit 1, retry never).
+        /// Message verbs name the missing evidence and direct the operator to
+        /// structured-agent migration (#3066) or `flk msg read --pane <id>`.
+        /// MCP reports -32000 with `data.refusal = "caller_pane_unresolved"`,
+        /// `data.exit = 1` and `data.retry = "never"`. Explicit pane selection
+        /// does not restore authority to a legacy handoff pane.
         CallerPaneUnresolved = "caller_pane_unresolved",
         ChannelNotOwner = "channel_not_owner",
         ChannelUnauthorized = "channel_unauthorized",
@@ -229,6 +256,7 @@ error_codes! {
         TranscriptNotFound = "transcript_not_found",
         UnknownAgentKind = "unknown_agent_kind",
         UnsafeText = "unsafe_text",
+        Unsupported = "unsupported",
         UnsupportedForAgent = "unsupported_for_agent",
         UnsupportedInAppMode = "unsupported_in_app_mode",
         WaitDeadlineTooLong = "wait_deadline_too_long",
@@ -273,6 +301,8 @@ error_codes! {
         WorktreeRemoveFailed = "worktree_remove_failed",
         WriteFailed = "write_failed";
     Yes:
+        /// The server did not complete Welcome within the five-second attach deadline.
+        AttachTimeout = "attach_timeout",
         RemoteChecksumMismatch = "remote_checksum_mismatch",
         Timeout = "timeout";
     Later:
@@ -307,12 +337,24 @@ error_codes! {
         WorktreeMergeUnknown = "worktree_merge_unknown",
         WorktreeOpenPr = "worktree_open_pr";
     AfterInspecting:
+        /// Audit rollback failed; inspect the authoritative journal after restart.
+        AuditIndeterminate = "audit_indeterminate",
         RequestOutcomeUnknown = "request_outcome_unknown",
         QueueRecoveryFailed = "queue_recovery_failed",
         EventsLost = "events_lost",
         InputWriteFailed = "input_write_failed",
         InputWriteUnknown = "input_write_unknown",
         SessionUnbound = "session_unbound",
+        /// Legacy delegate has no usable saved native harness session ID.
+        SavedSessionMissing = "saved_session_missing",
+        /// No live agent claims the recorded harness and native session ID.
+        SavedSessionNotFound = "saved_session_not_found",
+        /// More than one live agent claims the recorded harness session ID.
+        SavedSessionAmbiguous = "saved_session_ambiguous",
+        /// Only a pane-free runtime claims this PTY delegate's saved session.
+        SavedSessionRuntimeUnsupported = "saved_session_runtime_unsupported",
+        /// Matching live record lacks an agent, terminal, or pane identity.
+        LiveBindingIncomplete = "live_binding_incomplete",
         AgentExitedAtStart = "agent_exited_at_start",
         AgentExitedBeforeReady = "agent_exited_before_ready",
         NoResult = "no_result",
@@ -321,9 +363,19 @@ error_codes! {
         CodexLockUnconfirmed = "codex_lock_unconfirmed",
         SessionMismatch = "session_mismatch";
     AfterHuman:
+        /// Owner mutation could not be durably audited; repair storage and restart.
+        AuditUnavailable = "audit_unavailable",
+        /// Rebind authorization could not be durably audited; repair storage and restart.
+        DelegateAuditUnavailable = "delegate_audit_unavailable",
+        /// Persisted profile policy predates its independent durable revision floor.
+        PolicyRevisionRegressed = "policy_revision_regressed",
+        /// Current profile policy or its durable revision floor is unreadable.
+        PolicyRevisionUnavailable = "policy_revision_unavailable",
         ChecksumToolMissing = "checksum_tool_missing",
         AuthRevoked = "auth_revoked",
         StructuredEndpointRestartRequired = "structured_endpoint_restart_required",
+        /// Established conversation belongs to a different profile or binding revision.
+        StructuredProfileMismatch = "structured_profile_mismatch",
         StructuredRecoveryRequired = "structured_recovery_required",
         WorktreeCheckoutUnreachable = "worktree_checkout_unreachable",
         StructuredWorkerPanicked = "structured_worker_panicked",
@@ -340,6 +392,8 @@ error_codes! {
     AfterHandoff:
         MailStoreSchemaTooNew = "mail_store_schema_too_new",
         MeshVersionMismatch = "mesh_version_mismatch",
+        /// The peer sent a kind outside the held session's feature set.
+        MeshProtocolViolation = "mesh_protocol_violation",
         PeerIncompatible = "peer_incompatible",
         QueueJournalNewer = "queue_journal_newer",
         ServerVersionGap = "server_version_gap";
@@ -350,6 +404,45 @@ mod tests {
     use super::ErrorCode;
 
     mod compatibility;
+
+    #[test]
+    fn delegate_binding_reason_wire_strings_retry_classes_and_exits_are_pinned() {
+        for wire in [
+            "saved_session_missing",
+            "saved_session_not_found",
+            "saved_session_ambiguous",
+            "saved_session_runtime_unsupported",
+            "live_binding_incomplete",
+        ] {
+            let code = ErrorCode::from_code(wire).expect("registered delegate binding reason");
+            assert_eq!(code.as_str(), wire);
+            assert_eq!(code.retry().as_str(), "after_inspecting");
+            assert_eq!(code.exit(), crate::cli::exit::SESSION_UNBOUND);
+        }
+        let code =
+            ErrorCode::from_code("delegate_audit_unavailable").expect("registered audit refusal");
+        assert_eq!(code.as_str(), "delegate_audit_unavailable");
+        assert_eq!(code.retry().as_str(), "after_human");
+        assert_eq!(code.exit(), crate::cli::exit::FAILURE);
+    }
+
+    #[test]
+    fn indeterminate_audit_is_an_unknown_outcome_not_a_definite_refusal() {
+        let code = ErrorCode::from_code("audit_indeterminate").unwrap();
+        assert_eq!(code, ErrorCode::AuditIndeterminate);
+        assert_eq!(code.retry().as_str(), "after_inspecting");
+        assert_eq!(code.exit(), crate::cli::exit::REQUEST_OUTCOME_UNKNOWN);
+        assert_eq!(crate::cli::refusal_exit(code.as_str()), 14);
+    }
+
+    #[test]
+    fn owner_audit_failure_requires_human_repair() {
+        let code =
+            ErrorCode::from_code("audit_unavailable").expect("registered owner audit refusal");
+        assert_eq!(code, ErrorCode::AuditUnavailable);
+        assert_eq!(code.retry().as_str(), "after_human");
+        assert_eq!(code.exit(), crate::cli::exit::FAILURE);
+    }
 
     #[test]
     fn unreachable_checkout_requires_recovery_not_force() {
@@ -403,13 +496,13 @@ mod tests {
             })
             .collect();
         let expected: Vec<(&str, String)> = [
-            ("never", "agent_here_unavailable agent_name_taken agent_no_active_workspace agent_not_found agent_placement_conflict agent_placement_not_found agent_placement_required agent_profile_unresolved agent_spawn_disabled agent_target_ambiguous already_hibernated ambiguous_worktree_branch at_lineage_depth caller_pane_unresolved channel_not_owner channel_unauthorized check_not_found checksum_mismatch cursor_ahead dirty_worktree_requires_force goal_already_armed goal_caller_refused goal_not_armed goal_not_paused handoff_not_found handoff_too_large hibernate_unsupported hop_budget_exhausted identity_pin_conflict identity_unknown inbox_not_owner invalid_agent invalid_agent_argv invalid_agent_name invalid_custody_state invalid_envelope invalid_header_field invalid_key invalid_metadata_request invalid_params invalid_regex invalid_request invalid_session_name invalid_signature invalid_state_label lineage_not_found linked_worktree_source loop_detected mesh_collection_refused mesh_refused message_expired message_key_conflict message_not_found msg_not_allowed msg_target_ambiguous msg_target_not_found no_agent_session no_branch no_caller_pane no_checkout not_an_edge not_authorized not_found not_from_a_pane not_git_worktree not_hibernated not_implemented not_linked_worktree operator_only origin_mismatch owner_policy_changed owner_policy_unreadable pane_gone pane_not_found parked peer_process_changed permission_decision_unsupported permission_grant_limit permission_grant_stale_generation permission_grant_unknown permission_input_already_held permission_request_closed permission_request_limit permission_request_too_large permission_request_unknown prompt_control_bytes prompt_empty prompt_too_long questions_widening_refused queue_item_conflict queue_item_too_large queue_kind_reserved queue_mode_unsupported queue_not_found recipient_gone relay_not_from_ssh relay_unattestable reply_unavailable restart_disabled restart_unsupported retained_collection_shape runtime_unsupported scope self_compact_instructions_unsupported self_compact_unavailable self_kill_unconfirmed self_message_forbidden sender_unresolved spawn_caller_unknown stash_empty structured_mcp_lease_required structured_submit_required submodule_worktree_requires_force tab_not_found target_pane_not_found terminal_unavailable too_many_header_fields transcript_not_found unknown_agent_kind unsafe_text unsupported_for_agent unsupported_in_app_mode wait_deadline_too_long wait_predicate_invalid wait_predicate_unsupported workspace_not_found worktree_not_found"),
+            ("never", "agent_here_unavailable agent_name_taken agent_no_active_workspace agent_not_found agent_placement_conflict agent_placement_not_found agent_placement_required agent_profile_unresolved agent_spawn_disabled agent_target_ambiguous already_hibernated ambiguous_worktree_branch at_lineage_depth caller_pane_unresolved channel_not_owner channel_unauthorized check_not_found checksum_mismatch cursor_ahead dirty_worktree_requires_force goal_already_armed goal_caller_refused goal_not_armed goal_not_paused handoff_not_found handoff_too_large hibernate_unsupported hop_budget_exhausted identity_pin_conflict identity_unknown inbox_not_owner invalid_agent invalid_agent_argv invalid_agent_name invalid_custody_state invalid_envelope invalid_header_field invalid_key invalid_metadata_request invalid_params invalid_regex invalid_request invalid_session_name invalid_signature invalid_state_label lineage_not_found linked_worktree_source loop_detected mesh_collection_refused mesh_refused message_expired message_key_conflict message_not_found msg_not_allowed msg_target_ambiguous msg_target_not_found no_agent_session no_branch no_caller_pane no_checkout not_an_edge not_authorized not_found not_from_a_pane not_git_worktree not_hibernated not_implemented not_linked_worktree operator_only origin_mismatch owner_policy_changed owner_policy_unreadable pane_gone pane_not_found parked peer_process_changed permission_decision_unsupported permission_grant_limit permission_grant_stale_generation permission_grant_unknown permission_input_already_held permission_request_closed permission_request_limit permission_request_too_large permission_request_unknown profile_binding_not_found profile_binding_revoked profile_plan_expired profile_plan_invalid profile_revision_conflict prompt_control_bytes prompt_empty prompt_too_long questions_widening_refused queue_item_conflict queue_item_too_large queue_kind_reserved queue_mode_unsupported queue_not_found recipient_gone relay_not_from_ssh relay_unattestable reply_unavailable restart_disabled restart_unsupported retained_collection_shape runtime_unsupported scope self_compact_instructions_unsupported self_compact_unavailable self_kill_unconfirmed self_message_forbidden sender_unresolved spawn_caller_unknown stash_empty structured_mcp_lease_required structured_profiles_disabled structured_profiles_not_ready structured_submit_required submodule_worktree_requires_force tab_not_found target_pane_not_found terminal_unavailable too_many_header_fields transcript_not_found unknown_agent_kind unsafe_text unsupported unsupported_for_agent unsupported_in_app_mode wait_deadline_too_long wait_predicate_invalid wait_predicate_unsupported workspace_not_found worktree_not_found"),
             ("maybe", "agent_fork_failed agent_start_failed checkout_prepare_failed delegate_unreachable digest_write_failed handoff_failed handoff_unreadable integration_install_failed integration_uninstall_failed internal_error mail_store_unavailable mesh_delivery_refused mesh_store_unavailable pane_move_failed pane_send_failed pane_split_failed pause_persist_failed serialization_error server_unavailable session_broken session_delete_failed session_stop_failed spawn_failed spawn_location_unresolved tab_close_failed tab_create_failed transcript_unreadable transport workspace_create_failed worktree_create_failed worktree_list_failed worktree_open_failed worktree_prune_failed worktree_remove_failed write_failed"),
-            ("yes", "remote_checksum_mismatch timeout"),
+            ("yes", "attach_timeout remote_checksum_mismatch timeout"),
             ("later", "agent_not_ready at_agent_capacity at_fanout_limit auth_rate_limited channel_token_unavailable fleet_paused handoff_undrained injection_pending input_not_empty input_write_cancelled mail_store_full mailbox_full mesh_not_enrolled msg_rate_limited no_local_server not_settled operator_active preauth_capacity queue_source_cold restart_busy restart_pending restart_rate_limited session_busy session_unconfirmed too_many_waits unknown_composer worktree_merge_unknown worktree_open_pr"),
-            ("after_inspecting", "agent_exited_at_start agent_exited_before_ready codex_lock_unconfirmed events_lost input_write_failed input_write_unknown no_result queue_recovery_failed request_outcome_unknown self_submit_unconfirmed server_executable_unresolved session_mismatch session_unbound"),
-            ("after_human", "auth_revoked checksum_tool_missing claude_folder_trust claude_folder_trust_with_permissions codex_conversation_locked codex_folder_trust codex_hook_review queue_journal_corrupt structured_endpoint_restart_required structured_harness_version_unsupported structured_needs_agent_user structured_recovery_required structured_worker_cleanup_failed structured_worker_panicked structured_worker_timeout worktree_checkout_unreachable"),
-            ("after_handoff", "mail_store_schema_too_new mesh_version_mismatch peer_incompatible queue_journal_newer server_version_gap"),
+            ("after_inspecting", "agent_exited_at_start agent_exited_before_ready audit_indeterminate codex_lock_unconfirmed events_lost input_write_failed input_write_unknown live_binding_incomplete no_result queue_recovery_failed request_outcome_unknown saved_session_ambiguous saved_session_missing saved_session_not_found saved_session_runtime_unsupported self_submit_unconfirmed server_executable_unresolved session_mismatch session_unbound"),
+            ("after_human", "audit_unavailable auth_revoked checksum_tool_missing claude_folder_trust claude_folder_trust_with_permissions codex_conversation_locked codex_folder_trust codex_hook_review delegate_audit_unavailable policy_revision_regressed policy_revision_unavailable queue_journal_corrupt structured_endpoint_restart_required structured_harness_version_unsupported structured_needs_agent_user structured_profile_mismatch structured_recovery_required structured_worker_cleanup_failed structured_worker_panicked structured_worker_timeout worktree_checkout_unreachable"),
+            ("after_handoff", "mail_store_schema_too_new mesh_protocol_violation mesh_version_mismatch peer_incompatible queue_journal_newer server_version_gap"),
         ]
         .into_iter()
         .map(|(class, codes)| (class, codes.to_string()))
@@ -428,9 +521,14 @@ mod tests {
     fn registry_exits_match_protocol_policy_and_input_write_contract() {
         for code in ErrorCode::ALL {
             let want = match code {
-                ErrorCode::RequestOutcomeUnknown => 14,
-                ErrorCode::Timeout => 124,
-                ErrorCode::SessionUnbound => 12,
+                ErrorCode::RequestOutcomeUnknown | ErrorCode::AuditIndeterminate => 14,
+                ErrorCode::Timeout | ErrorCode::AttachTimeout => 124,
+                ErrorCode::SessionUnbound
+                | ErrorCode::SavedSessionMissing
+                | ErrorCode::SavedSessionNotFound
+                | ErrorCode::SavedSessionAmbiguous
+                | ErrorCode::SavedSessionRuntimeUnsupported
+                | ErrorCode::LiveBindingIncomplete => 12,
                 ErrorCode::CodexConversationLocked => crate::cli::exit::AGENT_BLOCKED,
                 ErrorCode::CodexLockUnconfirmed => crate::cli::exit::UNCONFIRMED,
                 ErrorCode::InputWriteCancelled

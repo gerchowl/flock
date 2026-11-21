@@ -13,10 +13,15 @@ struct PersistedEvent {
     envelope: EventEnvelope,
 }
 
+#[cfg(all(test, feature = "web"))]
+type PushHook = std::sync::Arc<std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>>;
+
 #[derive(Clone, Default)]
 pub struct EventHub {
     reply_waiters: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, usize>>>,
     inner: std::sync::Arc<std::sync::Mutex<EventHubState>>,
+    #[cfg(all(test, feature = "web"))]
+    before_push: PushHook,
     /// The newest sequence pushed, behind its own lock so a waiter can sleep
     /// on it (#438). Kept apart from `inner` because a condvar pairs with ONE
     /// mutex, and `inner` is held across disk writes — a waiter must never
@@ -64,11 +69,64 @@ struct EventHubState {
     ring_cap: Option<usize>,
     events: Vec<(u64, EventEnvelope)>,
     log: Option<PersistentLog>,
+    audit_indeterminate: bool,
+}
+
+/// A required audit either aborted durably or has an uncertain disk outcome.
+#[derive(Debug)]
+pub(crate) struct RequiredAuditError {
+    indeterminate: bool,
+    cause: std::io::Error,
+}
+
+impl From<std::io::Error> for RequiredAuditError {
+    fn from(cause: std::io::Error) -> Self {
+        Self {
+            indeterminate: false,
+            cause,
+        }
+    }
+}
+
+impl RequiredAuditError {
+    pub(crate) fn code(
+        &self,
+        unavailable: crate::api::error_code::ErrorCode,
+    ) -> crate::api::error_code::ErrorCode {
+        if self.indeterminate {
+            crate::api::error_code::ErrorCode::AuditIndeterminate
+        } else {
+            unavailable
+        }
+    }
+}
+
+impl std::fmt::Display for RequiredAuditError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.indeterminate {
+            write!(f, "audit outcome indeterminate; the mutation may or may not take effect after restart; repair storage, restart and inspect journal-derived state before retrying: {}", self.cause)
+        } else {
+            write!(f, "audit unavailable; no mutation committed; repair audit storage and restart the server before retrying: {}", self.cause)
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AuditFault {
+    Append,
+    PartialWrite,
+    FileSync,
+    DirectorySync,
+    Rollback,
 }
 
 struct PersistentLog {
     path: PathBuf,
-    file: std::fs::File,
+    #[cfg(test)]
+    audit_fault: Option<AuditFault>,
+    /// Closing an unavailable writer must retain the path for history readers.
+    file: Option<std::fs::File>,
     /// Events written to the active file since open/rotation.
     active_events: u64,
     /// Bytes written to the active file since open/rotation.
@@ -100,7 +158,9 @@ impl PersistentLog {
         let active_bytes = file.metadata().map(|meta| meta.len()).unwrap_or(0);
         Ok(Self {
             path,
-            file,
+            #[cfg(test)]
+            audit_fault: None,
+            file: Some(file),
             // Only used to bound the active file; recounting lines on open
             // is not worth it — the byte bound covers a restarted file.
             active_events: 0,
@@ -115,16 +175,102 @@ impl PersistentLog {
 
     /// Append one line, rotating past either bound.
     fn append(&mut self, event: &PersistedEvent) -> std::io::Result<()> {
+        #[cfg(test)]
+        if self.audit_fault == Some(AuditFault::Append) {
+            return Err(std::io::Error::other("injected append failure"));
+        }
         let mut line = serde_json::to_vec(event)
             .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
         line.push(b'\n');
-        self.file.write_all(&line)?;
-        self.file.sync_data()?;
+        let file = self.file.as_mut().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "durable event writer unavailable",
+            )
+        })?;
+        file.write_all(&line)?;
+        file.sync_data()?;
         self.active_bytes += line.len() as u64;
         self.active_events += 1;
         if self.active_bytes >= MAX_ACTIVE_BYTES || self.active_events >= MAX_ACTIVE_EVENTS {
             self.rotate()?;
         }
+        Ok(())
+    }
+
+    /// Complete rotation before writing so rollback always targets this handle.
+    fn append_required(&mut self, event: &PersistedEvent) -> Result<(), RequiredAuditError> {
+        let mut line = serde_json::to_vec(event)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        line.push(b'\n');
+        let directory = self
+            .path
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let directory = std::fs::File::open(directory)?;
+        if self.active_bytes.saturating_add(line.len() as u64) >= MAX_ACTIVE_BYTES
+            || self.active_events.saturating_add(1) >= MAX_ACTIVE_EVENTS
+        {
+            self.rotate()?;
+        }
+        directory.sync_all()?;
+        let file = self.file.as_mut().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "durable event writer unavailable",
+            )
+        })?;
+        let before = file.metadata()?.len();
+        #[cfg(test)]
+        let fault = self.audit_fault;
+        let result = (|| -> std::io::Result<()> {
+            #[cfg(test)]
+            if fault == Some(AuditFault::Append) {
+                return Err(std::io::Error::other("injected append failure"));
+            }
+            #[cfg(test)]
+            if fault == Some(AuditFault::PartialWrite) {
+                file.write_all(&line[..line.len() / 2])?;
+                return Err(std::io::Error::other("injected partial write"));
+            }
+            file.write_all(&line)?;
+            #[cfg(test)]
+            if fault == Some(AuditFault::FileSync) {
+                return Err(std::io::Error::other("injected file sync failure"));
+            }
+            file.sync_data()?;
+            #[cfg(test)]
+            if matches!(
+                fault,
+                Some(AuditFault::DirectorySync | AuditFault::Rollback)
+            ) {
+                return Err(std::io::Error::other("injected directory sync failure"));
+            }
+            directory.sync_all()
+        })();
+        if let Err(write_error) = result {
+            let rollback = (|| -> std::io::Result<()> {
+                #[cfg(test)]
+                if fault == Some(AuditFault::Rollback) {
+                    return Err(std::io::Error::other("injected rollback failure"));
+                }
+                file.set_len(before)?;
+                file.sync_all()?;
+                directory.sync_all()
+            })();
+            return Err(match rollback {
+                Ok(()) => write_error.into(),
+                Err(rollback_error) => RequiredAuditError {
+                    indeterminate: true,
+                    cause: std::io::Error::other(format!(
+                        "{write_error}; rollback: {rollback_error}"
+                    )),
+                },
+            });
+        }
+        self.active_bytes = before + line.len() as u64;
+        self.active_events += 1;
         Ok(())
     }
 
@@ -140,10 +286,12 @@ impl PersistentLog {
             }
         }
         std::fs::rename(&self.path, self.rotated_path(1))?;
-        self.file = std::fs::File::options()
-            .append(true)
-            .create(true)
-            .open(&self.path)?;
+        self.file = Some(
+            std::fs::File::options()
+                .append(true)
+                .create(true)
+                .open(&self.path)?,
+        );
         self.active_events = 0;
         self.active_bytes = 0;
         self.rotations
@@ -307,6 +455,10 @@ impl Drop for ReplyWaitGuard {
 }
 
 impl EventHub {
+    #[cfg(all(test, feature = "web"))]
+    pub(crate) fn before_push_for_test(&self, hook: impl FnOnce() + Send + 'static) {
+        *self.before_push.lock().unwrap() = Some(Box::new(hook));
+    }
     pub(crate) fn track_reply_wait(&self, correlation: &str) -> ReplyWaitGuard {
         if let Ok(mut waiters) = self.reply_waiters.lock() {
             *waiters.entry(correlation.into()).or_default() += 1;
@@ -417,7 +569,80 @@ impl EventHub {
         hub
     }
 
+    #[cfg(test)]
+    pub(crate) fn fail_appends_for_test(&self) {
+        self.fail_audit_for_test(AuditFault::Append);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_audit_for_test(&self, fault: AuditFault) {
+        self.inner
+            .lock()
+            .unwrap()
+            .log
+            .as_mut()
+            .expect("persistent fixture log")
+            .audit_fault = Some(fault);
+    }
+
+    /// Commit rotation and sync its directory before appending, with no rotation
+    /// during the append. Publish only after the file and directory sync succeed.
+    /// On append/sync failure, truncate through the retained file handle and sync
+    /// both file and directory before returning a definite unavailable refusal.
+    /// If rollback fails, return `audit_indeterminate`: do not apply live state,
+    /// and refuse every later required audit with that code until restart. The
+    /// mutation may or may not replay then; the reopened journal is authoritative.
+    /// Both failures close the writer but retain the path for history reads.
+    /// Ordinary best-effort `push` behavior is unchanged.
+    pub(crate) fn try_push_durable(&self, event: EventEnvelope) -> Result<(), RequiredAuditError> {
+        use std::io::{Error, ErrorKind};
+        if !event.event.is_persisted() {
+            return Err(Error::new(ErrorKind::InvalidInput, "event kind is not durable").into());
+        }
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| Error::other("event hub unavailable"))?;
+        if state.audit_indeterminate {
+            return Err(RequiredAuditError {
+                indeterminate: true,
+                cause: Error::other("required audit writer disabled until restart"),
+            });
+        }
+        let sequence = state.next_sequence + 1;
+        let persisted = PersistedEvent {
+            seq: sequence,
+            ts_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_millis().min(u128::from(u64::MAX)) as u64)
+                .unwrap_or(0),
+            envelope: event.clone(),
+        };
+        let result = state
+            .log
+            .as_mut()
+            .filter(|log| log.file.is_some())
+            .ok_or_else(|| Error::new(ErrorKind::NotConnected, "durable event log unavailable"))?
+            .append_required(&persisted);
+        // An uncertain append may have written bytes; never reuse its sequence.
+        state.next_sequence = sequence;
+        if let Err(error) = result {
+            state.audit_indeterminate = error.indeterminate;
+            if let Some(log) = state.log.as_mut() {
+                log.file = None;
+            }
+            return Err(error);
+        }
+        state.durable_sequence = sequence;
+        self.publish_event(state, sequence, event);
+        Ok(())
+    }
+
     pub fn push(&self, event: EventEnvelope) {
+        #[cfg(all(test, feature = "web"))]
+        if let Some(hook) = self.before_push.lock().unwrap().take() {
+            hook();
+        }
         let Ok(mut state) = self.inner.lock() else {
             return;
         };
@@ -439,6 +664,15 @@ impl EventHub {
                 }
             }
         }
+        self.publish_event(state, sequence, event);
+    }
+
+    fn publish_event(
+        &self,
+        mut state: std::sync::MutexGuard<'_, EventHubState>,
+        sequence: u64,
+        event: EventEnvelope,
+    ) {
         state.events.push((sequence, event));
         #[cfg(test)]
         let cap = state.ring_cap.unwrap_or(Self::MAX_EVENTS);
@@ -794,6 +1028,201 @@ mod tests {
                 workspace_id: label.to_string(),
             },
         }
+    }
+
+    #[test]
+    fn review_failed_audit_keeps_existing_history_readable() {
+        let path = temp_log("review-existing-history");
+        let hub = EventHub::with_persistence(path.clone());
+        hub.push(workspace_event("existing"));
+        assert_eq!(hub.persisted_events_after(0).len(), 1);
+        let before = std::fs::read(&path).unwrap();
+        hub.fail_appends_for_test();
+        assert!(hub.try_push_durable(workspace_event("rejected")).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let count = hub.persisted_events_after(0).len();
+        drop(hub);
+        cleanup(&path);
+        assert_eq!(
+            count, 1,
+            "failed audit must not hide intact prior journal history"
+        );
+    }
+
+    #[test]
+    fn best_effort_push_after_required_failure_matches_dev_append_failure() {
+        let dev_path = temp_log("dev-best-effort");
+        let path = temp_log("required-best-effort");
+        let dev = EventHub::with_persistence(dev_path.clone());
+        let hub = EventHub::with_persistence(path.clone());
+        for candidate in [&dev, &hub] {
+            candidate.push(workspace_event("existing"));
+            candidate.fail_appends_for_test();
+        }
+        assert!(hub.try_push_durable(workspace_event("rejected")).is_err());
+        let before = std::fs::read(&path).unwrap();
+        for event in [
+            workspace_event("later"),
+            output_event(),
+            workspace_event("last"),
+        ] {
+            for candidate in [&dev, &hub] {
+                let previous = candidate.current_sequence();
+                let previous_durable = candidate.durable_sequence();
+                let warnings = crate::logging::capture_logs(|| candidate.push(event.clone()));
+                assert_eq!(
+                    warnings.contains("event_log.write"),
+                    event.event.is_persisted()
+                );
+                assert_eq!(candidate.current_sequence(), previous + 1);
+                assert_eq!(
+                    candidate.durable_sequence(),
+                    if event.event.is_persisted() {
+                        previous + 1
+                    } else {
+                        previous_durable
+                    }
+                );
+                assert_eq!(
+                    candidate.events_after(previous).unwrap(),
+                    [(previous + 1, event.clone())]
+                );
+                assert!(candidate.wait_after(previous, std::time::Duration::ZERO));
+            }
+        }
+        assert_eq!(hub.persisted_events_after(0).len(), 1);
+        assert_eq!(dev.persisted_events_after(0).len(), 1);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        drop(dev);
+        drop(hub);
+        cleanup(&dev_path);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn failed_required_audit_preserves_rotated_and_cold_history_reads() {
+        let path = temp_log("required-cold-history");
+        let hub = EventHub::with_persistence(path.clone());
+        hub.set_ring_cap(1);
+        hub.push(workspace_event("first"));
+        hub.rotate_on_next_push();
+        hub.push(workspace_event("second"));
+        hub.push(workspace_event("third"));
+        hub.fail_appends_for_test();
+        assert!(hub.try_push_durable(workspace_event("rejected")).is_err());
+        let history = hub.persisted_events_after(0);
+        assert_eq!(
+            history.iter().map(|(seq, _, _)| *seq).collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
+        let cold_before = hub.cold_read_count();
+        let read = hub.read(0, 10, |_| true);
+        assert_eq!(hub.cold_read_count(), cold_before + 1);
+        assert_eq!(
+            read.events.iter().map(|(seq, _)| *seq).collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
+        assert_eq!(read.next_after, 3);
+        assert_eq!(read.gap, None);
+        assert!(hub
+            .try_push_durable(workspace_event("still-rejected"))
+            .is_err());
+        assert_eq!(hub.persisted_events_after(0).len(), 3);
+        drop(hub);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn required_audit_finishes_rotation_before_appending() {
+        let path = temp_log("required-rotation");
+        let hub = EventHub::with_persistence(path.clone());
+        hub.push(workspace_event("existing"));
+        hub.rotate_on_next_push();
+        hub.try_push_durable(workspace_event("committed")).unwrap();
+        assert_eq!(hub.rotations(), 1);
+        assert_eq!(read_log_file(&path).unwrap().0.len(), 1);
+        assert_eq!(
+            read_log_file(&path).unwrap().0[0].envelope,
+            workspace_event("committed")
+        );
+        let reopened = EventHub::with_persistence(path.clone());
+        assert_eq!(reopened.persisted_events_after(0).len(), 2);
+        drop(reopened);
+        drop(hub);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn required_audit_append_is_replayable_before_publication() {
+        let path = temp_log("required-success");
+        let hub = EventHub::with_persistence(path.clone());
+        hub.set_ring_cap(1);
+        hub.push(workspace_event("existing"));
+        hub.try_push_durable(workspace_event("required")).unwrap();
+        assert_eq!(hub.durable_sequence(), 2);
+        assert_eq!(hub.events_after(1).unwrap().len(), 1);
+        assert!(hub.wait_after(1, std::time::Duration::ZERO));
+        let reopened = EventHub::with_persistence(path.clone());
+        let persisted = reopened.persisted_events_after(0);
+        assert_eq!(persisted.len(), 2);
+        assert_eq!(persisted[1].2, workspace_event("required"));
+        drop(reopened);
+        drop(hub);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn required_audit_failure_never_publishes_or_advances_the_durable_cursor() {
+        let path = temp_log("required-failure");
+        let hub = EventHub::with_persistence(path.clone());
+        hub.push(workspace_event("existing"));
+        let before = std::fs::read(&path).unwrap();
+        hub.fail_appends_for_test();
+        assert!(hub.try_push_durable(workspace_event("rejected")).is_err());
+        assert_eq!(hub.durable_sequence(), 1);
+        assert_eq!(hub.current_sequence(), 2);
+        assert!(hub.events_after(1).unwrap().is_empty());
+        assert!(!hub.wait_after(1, std::time::Duration::ZERO));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(hub
+            .try_push_durable(workspace_event("still-rejected"))
+            .is_err());
+        assert_eq!(hub.current_sequence(), 2);
+        drop(hub);
+        let reopened = EventHub::with_persistence(path.clone());
+        reopened
+            .try_push_durable(workspace_event("recovered"))
+            .unwrap();
+        assert_eq!(reopened.persisted_events_after(0).len(), 2);
+        drop(reopened);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn required_audit_refuses_when_the_log_directory_cannot_be_synced() {
+        let path = temp_log("required-directory");
+        let hub = EventHub::with_persistence(path.clone());
+        let directory = path.parent().unwrap();
+        let relocated = directory.with_extension("relocated");
+        std::fs::rename(directory, &relocated).unwrap();
+        assert!(hub
+            .try_push_durable(workspace_event("unconfirmed"))
+            .is_err());
+        assert_eq!(hub.durable_sequence(), 0);
+        assert!(!hub.wait_after(0, std::time::Duration::ZERO));
+        assert!(hub.events_after(0).unwrap_or_default().is_empty());
+        drop(hub);
+        std::fs::remove_dir_all(relocated).unwrap();
+    }
+
+    #[test]
+    fn required_audits_reject_memory_only_hubs_and_non_durable_kinds() {
+        let hub = EventHub::default();
+        assert!(hub.try_push_durable(workspace_event("required")).is_err());
+        assert!(hub.try_push_durable(output_event()).is_err());
+        assert_eq!(hub.current_sequence(), 0);
+        hub.push(workspace_event("best-effort"));
+        assert_eq!(hub.events_after(0).unwrap().len(), 1);
     }
 
     #[test]

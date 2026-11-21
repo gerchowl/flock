@@ -12,6 +12,21 @@ pub struct Request {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "method", content = "params")]
 pub enum Method {
+    /// Operator-only immutable binding review; never executes profile assets.
+    #[serde(rename = "profile.plan")]
+    ProfilePlan(crate::structured::profiles::bindings::transactions::PlanRequest),
+    /// Operator-only compare-and-swap of the exact reviewed binding.
+    #[serde(rename = "profile.bind")]
+    ProfileBind(ProfileBindParams),
+    /// Operator-only terminal binding revocation, without preview.
+    #[serde(rename = "profile.revoke")]
+    ProfileRevoke(crate::structured::profiles::bindings::transactions::RevokeRequest),
+    /// Read-only binding metadata, redacted for non-operator callers.
+    #[serde(rename = "profile.status")]
+    ProfileStatus(EmptyParams),
+    /// Operator-only request to enable reviewed profile execution (ADR-0052 §9).
+    #[serde(rename = "profile.enable")]
+    ProfileEnable(ProfileEnableParams),
     #[serde(rename = "ping")]
     Ping(PingParams),
     #[serde(rename = "structured.grants.list")]
@@ -136,6 +151,9 @@ pub enum Method {
     /// joined with cached state only.
     #[serde(rename = "delegate.list")]
     DelegateList(DelegateListParams),
+    /// Authorize an explicit local registry repair without changing ownership.
+    #[serde(rename = "delegate.rebind")]
+    DelegateRebind(DelegateRebindParams),
     #[serde(rename = "msg.send")]
     MsgSend(MsgSendParams),
     #[serde(rename = "msg.reply")]
@@ -144,6 +162,11 @@ pub enum Method {
     MsgList(MsgListParams),
     #[serde(rename = "msg.read")]
     MsgRead(MsgReadParams),
+    /// Operator recovery for one legacy pane inbox (#3089).
+    #[serde(rename = "msg.operator_list")]
+    MsgOperatorList(MsgOperatorInboxParams),
+    #[serde(rename = "msg.operator_read")]
+    MsgOperatorRead(MsgOperatorInboxParams),
     #[serde(rename = "msg.status")]
     MsgStatus(MsgStatusParams),
     /// #576: block until a message is answered, deferred or expires.
@@ -155,10 +178,12 @@ pub enum Method {
     MeshHello(crate::mesh::hello::Hello),
     #[serde(rename = "mesh.routes")]
     MeshRoutes { adverts: Vec<serde_json::Value> },
+    /// Inspect envelope kinds against the session before decoding the payload.
     #[serde(rename = "mesh.deliver")]
-    MeshDeliver(Box<crate::mesh::delivery::Deliver>),
+    MeshDeliver(serde_json::Value),
+    /// Inspect the complete acknowledgement batch before any custody mutation.
     #[serde(rename = "mesh.collect")]
-    MeshCollect(crate::mesh::collect::Collect),
+    MeshCollect(serde_json::Value),
     #[serde(rename = "peers.enroll_reset")]
     PeersEnrollReset(PeersEnrollResetParams),
     #[serde(rename = "peers.enrollment")]
@@ -248,6 +273,12 @@ pub enum Method {
     SessionRetainedList(EmptyParams),
     #[serde(rename = "session.retained.purge")]
     SessionRetainedPurge(super::retained::PurgeParams),
+    #[serde(rename = "client.grant.add")]
+    ClientGrantAdd(super::gateway_grants::Grant),
+    #[serde(rename = "client.grant.list")]
+    ClientGrantList(EmptyParams),
+    #[serde(rename = "client.grant.revoke")]
+    ClientGrantRevoke(super::gateway_grants::Revoke),
     #[serde(rename = "client.token.add")]
     ClientTokenAdd(super::client_tokens::AddParams),
     #[serde(rename = "client.token.rm")]
@@ -368,6 +399,7 @@ impl Method {
         matches!(
             self,
             Self::Ping(_)
+                | Self::ProfileStatus(_)
                 | Self::SessionRetainedList(_)
                 | Self::StructuredGrantsList(_)
                 | Self::NotificationList(_)
@@ -390,6 +422,7 @@ impl Method {
                 | Self::GoalStatus(_)
                 | Self::DelegateList(_)
                 | Self::MsgList(_)
+                | Self::MsgOperatorList(_)
                 | Self::MsgStatus(_)
                 | Self::PeersEnrollment(_)
                 | Self::OwnerPolicyShow(_)
@@ -419,7 +452,8 @@ impl Method {
             return false;
         }
         match self {
-            Self::Ping(_)
+            Self::ProfileStatus(_)
+            | Self::Ping(_)
             | Self::StructuredGrantsList(_)
             | Self::ServerStop(_)
             | Self::ServerLiveHandoff(_)
@@ -449,6 +483,8 @@ impl Method {
             | Self::DelegateList(_)
             | Self::MsgList(_)
             | Self::MsgRead(_)
+            | Self::MsgOperatorList(_)
+            | Self::MsgOperatorRead(_)
             | Self::MsgStatus(_)
             | Self::MsgWaitReply(_)
             | Self::MeshHello(_)
@@ -510,6 +546,9 @@ impl Method {
             | Self::PaneMove(_)
             | Self::PaneRename(_)
             | Self::SessionRetainedPurge(_)
+            | Self::ClientGrantAdd(_)
+            | Self::ClientGrantList(_)
+            | Self::ClientGrantRevoke(_)
             | Self::ClientTokenAdd(_)
             | Self::ClientTokenRemove(_)
             | Self::ClientTokenList(_)
@@ -517,6 +556,7 @@ impl Method {
             | Self::ClientAppMint(_)
             | Self::ChannelHello(_)
             | Self::WaitPark(_)
+            | Self::DelegateRebind(_)
             | Self::OwnerBind(_)
             | Self::OwnerUnbind(_)
             | Self::GoalArm(_)
@@ -545,9 +585,37 @@ impl Method {
             | Self::FleetPause(_)
             | Self::FleetResume(_)
             | Self::StructuredGrantsRevoke(_)
+            | Self::ProfileEnable(_)
+            | Self::ProfilePlan(_)
+            | Self::ProfileBind(_)
+            | Self::ProfileRevoke(_)
             | Self::RevertRun(_) => true,
         }
     }
+}
+
+/// Operator-selected identity for a client-side delegate record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DelegateRebindParams {
+    pub name: String,
+    pub agent_id: String,
+    pub previous_agent_id: Option<String>,
+}
+
+/// Binding commits use the same closed plan/digest shape as reviewed enablement.
+pub type ProfileBindParams = ProfileEnableParams;
+
+/// Reviewed enable transaction identifiers (ADR-0052 §9).
+///
+/// Slice 1 refuses before consulting a plan. Slice 17 implements plan lookup,
+/// digest/revision validation and the complete production activation transaction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileEnableParams {
+    /// Operator-reviewed plan identifier.
+    pub plan: String,
+    /// Expected immutable review-plan digest.
+    pub expect: String,
 }
 
 /// `revert.run` params.
@@ -1022,6 +1090,7 @@ pub struct TabRenameParams {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct AgentTarget {
     pub target: String,
 }
@@ -1173,6 +1242,7 @@ pub struct RestartDroppedFlag {
 /// Queue a server-owned restart. The caller must finish its requesting turn.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct AgentRestartParams {
     #[serde(default = "restart_self")]
     pub target: String,
@@ -1213,6 +1283,7 @@ impl AgentRuntime {
     }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct AgentStartParams {
     /// Explicit opt-in, sent only to a server advertising structured_agents.
     #[serde(default, skip_serializing_if = "AgentRuntime::is_pty")]
@@ -1684,7 +1755,7 @@ pub struct MsgReplyParams {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct MsgListParams {
-    /// Recipient target. Omitted means structured self or the operator global list.
+    /// Recipient target. Omitted means attested self, or an audited operator global list.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pane: Option<String>,
 }
@@ -1702,6 +1773,13 @@ pub struct MsgReadParams {
     /// the connection. A native target cannot claim another agent's inbox.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pane: Option<String>,
+}
+
+/// A required local pane target; operator authority is checked before lookup.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MsgOperatorInboxParams {
+    pub pane: String,
 }
 
 /// `msg.status` — what became of one message, asked by whoever sent it.
@@ -1976,6 +2054,7 @@ pub struct PaneSplitParams {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub enum SplitDirection {
     Right,
     Down,
@@ -2799,6 +2878,8 @@ pub enum EventKind {
     /// #959 / ADR-0027 §1: an attested agent started another agent. See
     /// `EventData::AgentDelegated`.
     AgentDelegated,
+    /// Operator approved a local registry rebind; not an ownership edge.
+    DelegateRebindAuthorized,
     AgentRemoved,
     DeliveryAttemptUpdated,
     MessageQueued,
@@ -2899,6 +2980,10 @@ pub enum EventKind {
     /// ADR-0035 §6.2 (#1195): the operator adopted a repo's owner policy.
     /// See `EventData::OwnerPolicyAdopted`.
     OwnerPolicyAdopted,
+    /// Audited operator access to a named pane inbox, without message bodies.
+    OperatorInboxAccess,
+    /// Best-effort authenticated wire refusal or bounded suppression summary.
+    WireRefused,
 }
 
 impl EventKind {
@@ -2930,6 +3015,7 @@ impl EventKind {
             | Self::PaneAgentStatusChanged
             | Self::AgentRemoved
             | Self::AgentForked
+            | Self::DelegateRebindAuthorized
             | Self::AgentDelegated
             | Self::GoalArmed
             | Self::GoalAmended
@@ -2976,7 +3062,9 @@ impl EventKind {
             | Self::PrMerged
             | Self::PrClosed
             | Self::WaitExpired
-            | Self::OwnerPolicyAdopted => true,
+            | Self::OwnerPolicyAdopted
+            | Self::OperatorInboxAccess
+            | Self::WireRefused => true,
             Self::PaneOutputChanged | Self::MeshRoutesChanged | Self::MeshOutboundPending => false,
         }
     }
@@ -3097,6 +3185,18 @@ pub struct ApiListenerHealth {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResponseResult {
+    /// Operator review data or a durable binding mutation receipt.
+    ProfileTransaction {
+        /// Identifiers and reviewed metadata, never resolved credential bytes.
+        #[serde(flatten)]
+        data: serde_json::Value,
+    },
+    /// Inactive binding state, containing no metadata for non-operator callers.
+    ProfileStatus {
+        /// Authorized operator fields; empty for other principals.
+        #[serde(flatten)]
+        status: serde_json::Value,
+    },
     Retained {
         records: Vec<crate::structured::registry::RetainedInfo>,
         forward: usize,
@@ -3117,6 +3217,9 @@ pub enum ResponseResult {
     },
     ClientTokenIssued {
         issued: super::client_tokens::Issued,
+    },
+    ClientGrantList {
+        listing: super::gateway_grants::Listing,
     },
     ClientTokenList {
         entries: Vec<super::client_tokens::Listed>,
@@ -4458,6 +4561,15 @@ pub struct AgentPhaseEvent {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum EventData {
+    /// Successful operator peek or consumption of pane inboxes.
+    OperatorInboxAccess {
+        /// Named pane, or `None` for a global operator list.
+        pane: Option<String>,
+        operation: String,
+        peer_pid: Option<u32>,
+        peer_uid: Option<u32>,
+        message_count: usize,
+    },
     /// Payload-free directory invalidation; the envelope sequence is its version.
     DirectoryChanged {},
     StructuredGrantRevoked {
@@ -4755,6 +4867,12 @@ pub enum EventData {
         agent_id: String,
         session: String,
         reason: String,
+    },
+    /// Authorization to update a local client record, not proof it was written.
+    DelegateRebindAuthorized {
+        name: String,
+        previous_agent_id: Option<String>,
+        agent_id: String,
     },
     /// #959 / ADR-0027 §1: the architect -> delegate edge. `architect` is the
     /// caller `spawn_caller()` attested, never a request parameter, because
@@ -5058,6 +5176,17 @@ pub enum EventData {
         child_branch: String,
         /// Whether a pivot prompt seeded the fork's opening turn.
         seeded: bool,
+    },
+    /// Authenticated command refused before dispatch; no command body or secret.
+    /// `suppressed == 0` is an individual event. Positive counts summarize one
+    /// window; null identity/verb/reason denotes aggregate capacity overflow.
+    WireRefused {
+        principal: Option<String>,
+        token_id: Option<String>,
+        verb: Option<String>,
+        target: Option<String>,
+        reason: Option<String>,
+        suppressed: u64,
     },
 }
 

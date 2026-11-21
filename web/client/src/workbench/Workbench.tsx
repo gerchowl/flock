@@ -42,12 +42,14 @@ import { Transcript, type TranscriptSource } from "../views/Transcript";
 import { createBadgeWriter } from "./badge";
 import { attentionCards, needsYou } from "./attention";
 import type { InboxCard } from "./inbox";
-import { Composer, createComposerState, type Sender } from "./Composer";
+import { Composer, createComposerState, rowLine, type Sender } from "./Composer";
 import { HEALTH_LABELS, HostStatus, type HostView } from "./HostStatus";
 import { SHORTCUTS, bindKeys, formatCombo, pageShortcutAvailable, runPageShortcut } from "./keys";
 import { Palette, type PaletteCommand, type WaitingAction } from "./Palette";
 import { createPermissionInbox } from "./permissions";
 import { AgentRowButton, AgentTitle, InboxCards, Waits, createClosedIds } from "./parts";
+import { createLifecycle } from "./lifecycle";
+import { NewAgent } from "./NewAgent";
 import { PhoneWorkbench } from "./Phone";
 import { ShortcutSheet } from "./ShortcutSheet";
 import { HOME_UNKNOWN, NeedsYou, SidebarTrees } from "./Sidebar";
@@ -56,10 +58,6 @@ import { waitingOnYou } from "./waiting";
 import { createWindowActive } from "./window-focus";
 import "./workbench.css";
 
-/** The toolbars' unbuilt actions, shown only in preview; each is a button and, dimmed, a palette command. */
-const NEW_AGENT: WaitingAction = { label: "New agent", waitsFor: "the harness picker" };
-/** Unbuilt toolbar actions, also listed by the preview palette. */
-const TOOLBAR_WAITING: readonly WaitingAction[] = [NEW_AGENT];
 const PANE_ACTIONS: readonly WaitingAction[] = [
   { label: "Diff", waitsFor: "the diff tile" },
   { label: "Fork", waitsFor: "forks" },
@@ -104,6 +102,9 @@ function agentOf(subject: string | undefined): string | null {
 
 /** The workbench: three regions on desktop, inbox-first tabs on a phone. */
 export function Workbench(props: WorkbenchProps): JSX.Element {
+  const [newAgent, setNewAgent] = createSignal(false);
+  const canStart = (): boolean => props.source === "live" && props.sender?.start !== undefined;
+  const newAgentButton = (): JSX.Element => <Show when={canStart()}><button type="button" class="action" onClick={() => setNewAgent(true)}>New agent</button></Show>;
   const [width, setWidth] = createSignal(window.innerWidth);
   const onResize = (): void => void setWidth(window.innerWidth);
   window.addEventListener("resize", onResize);
@@ -191,6 +192,14 @@ export function Workbench(props: WorkbenchProps): JSX.Element {
     return agentOf(current.focused === null ? undefined : current.tiles[current.focused]?.subject);
   });
   const focusedRow = createMemo(() => rows().find((row) => row.id === focusedAgent()));
+  const lifecycle = createLifecycle(() => props.source === "live" ? props.sender : null, focusedRow);
+  // A saved tile identifies a selection, not evidence that its agent is still available.
+  const unavailable = createMemo(() => {
+    if (focusedRow() !== undefined) return null;
+    const progress = fleet.agents.progress();
+    if (progress.phase === "loading") return "Loading the agent list…";
+    return progress.phase === "failed" ? progress.message : rowLine(undefined).line;
+  });
   /** Focuses `id`'s tile; true when that pushed a tile, which `back` may then pop. */
   const openAgent = (id: string): boolean => {
     if (focusedAgent() === id) return false;
@@ -254,7 +263,6 @@ export function Workbench(props: WorkbenchProps): JSX.Element {
       {props.banner?.()}
     </div>
   );
-  const waits = (action: WaitingAction): JSX.Element => <Waits label={action.label} waitsFor={action.waitsFor} />;
   const desktop = (): JSX.Element => (
     <SplitShell active={windowActive()}>
       <Cluster as="header" class="topbar" justify="space-between" space={SPACE[4]}>
@@ -265,16 +273,14 @@ export function Workbench(props: WorkbenchProps): JSX.Element {
         <Palette
           rows={scoped}
           onOpen={openAgent}
-          commands={[...(props.host === undefined ? [] : hostCommands(props.host)), ...keyCommands()]}
-          waiting={preview() ? [...TOOLBAR_WAITING, ...(focusedAgent() === null ? [] : PANE_ACTIONS)] : []}
+          commands={[...(props.host === undefined ? [] : hostCommands(props.host)), ...keyCommands(), ...lifecycle.commands(), ...(canStart() ? [{ label: "New agent", hint: "", run: () => { setNewAgent(true); } }] : [])]}
+          waiting={preview() ? (focusedAgent() === null ? [] : PANE_ACTIONS) : []}
         />
         <Cluster space={SPACE[2]}>
           <button type="button" class="action" data-testid="needs-you-count" aria-label={attentionCommand()} disabled={!pageShortcutAvailable("attention.first")} onClick={() => void runPageShortcut("attention.first")}>
             {attentionLabel()}
           </button>
-          <Show when={preview()}>
-            <For each={TOOLBAR_WAITING}>{waits}</For>
-          </Show>
+          {newAgentButton()}
           {toggleButton("inspector")}
         </Cluster>
       </Cluster>
@@ -304,16 +310,19 @@ export function Workbench(props: WorkbenchProps): JSX.Element {
                   </span>
                 </Show>
               </header>
+              {lifecycle.view()}
               <div class="focus__body">
-                <Transcript
-                  transport={props.transport}
-                  stream={`agent/${agent}`}
-                  source={props.source}
-                  onEntry={(seq, text) => composer.observe(agent, seq, text)}
-                  onCurrent={(current) => composer.current(agent, current)}
-                />
+                <Show when={unavailable() === null} fallback={<p class="focus__empty">{unavailable()}</p>}>
+                  <Transcript
+                    transport={props.transport}
+                    stream={`agent/${agent}`}
+                    source={props.source}
+                    onEntry={(seq, text) => composer.observe(agent, seq, text)}
+                    onCurrent={(current) => composer.current(agent, current)}
+                  />
+                </Show>
               </div>
-              <Composer agent={agent} row={focusedRow()} sender={props.sender} state={composer} />
+              <Composer unavailable={unavailable()} agent={agent} row={focusedRow()} sender={props.sender} state={composer} />
             </>
           )}
         </Show>
@@ -328,26 +337,31 @@ export function Workbench(props: WorkbenchProps): JSX.Element {
     </SplitShell>
   );
   return (
-    <Show when={phone()} fallback={desktop()}>
-      {banners()}
-      <PhoneWorkbench
-        host={hostStatus}
-        rows={scoped}
-        waiting={() => waiting().description}
-        fleetNote={() => fleetNote() ?? (prefs().scope === "node" && home() === null ? HOME_UNKNOWN : null)}
-        agent={focusedAgent}
-        row={focusedRow}
-        open={openAgent}
-        back={back}
-        widened={() => !phone()}
-        transport={props.transport}
-        source={props.source}
-        inbox={cards()}
-        closed={closed}
-        sender={props.sender}
-        composer={composer}
-        preview={preview()}
-      />
-    </Show>
+    <>
+      <Show when={newAgent() && props.sender} keyed>{sender => <NewAgent sender={sender} nodes={fleet.nodes.items()} projects={fleet.projects.items()} home={home()} close={() => setNewAgent(false)} />}</Show>
+      <Show when={phone()} fallback={desktop()}>
+        {banners()}
+        <PhoneWorkbench
+          host={() => <>{hostStatus()}{newAgentButton()}</>}
+          rows={scoped}
+          waiting={() => waiting().description}
+          fleetNote={() => fleetNote() ?? (prefs().scope === "node" && home() === null ? HOME_UNKNOWN : null)}
+          agent={focusedAgent}
+          row={focusedRow}
+          unavailable={unavailable}
+          open={openAgent}
+          back={back}
+          widened={() => !phone()}
+          transport={props.transport}
+          source={props.source}
+          inbox={cards()}
+          closed={closed}
+          sender={props.sender}
+          composer={composer}
+          actions={lifecycle.view}
+          preview={preview()}
+        />
+      </Show>
+    </>
   );
 }

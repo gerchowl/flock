@@ -10,7 +10,8 @@ impl App {
     }
 
     pub(crate) fn sync_session_save_schedule(&mut self) {
-        if self.state.session_dirty {
+        let established = self.state.structured_agents.take_establishment_dirty();
+        if self.state.session_dirty || established {
             self.state.session_dirty = false;
             self.schedule_session_save();
         }
@@ -143,6 +144,8 @@ mod tests {
         assert!(app.state.workspaces.is_empty());
         app.no_session = false;
         let record = Record {
+            harness_established: false,
+            profile_identity: None,
             runtime: crate::structured::registry::StructuredRuntime::Structured,
             agent_id: "agent_fixture_structured".into(),
             name: Some("fixture-worker".into()),

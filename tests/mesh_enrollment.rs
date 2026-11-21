@@ -182,10 +182,10 @@ fn refused_mode(tag: &str, mode: MeshMode, expected: &str) {
     );
     if let MeshMode::VersionMismatch(version) = mode {
         assert!(
-            status["reason"]
-                .as_str()
-                .unwrap()
-                .contains(&format!("local 5, remote {version}")),
+            status["reason"].as_str().unwrap().contains(&format!(
+                "local 5-5, remote {}-{version}",
+                version.saturating_sub(1).max(5).min(version)
+            )),
             "{status}"
         );
     }
@@ -1097,4 +1097,65 @@ fn status_shows_quarantine_count() {
     assert_eq!(status["result"]["mesh_quarantined"], 1, "{status}");
     let text = cli_text(node, &["status"]);
     assert!(text.contains("mesh quarantined: 1"), "{text}");
+}
+
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
+#[test]
+fn overlapping_ranges_establish_and_report_the_same_version_in_both_directions() {
+    for (a, b, expected) in [((5, 5), (5, 6), 5), ((5, 6), (6, 7), 6)] {
+        for reversed in [false, true] {
+            let specs = [
+                NodeSpec::new("dialer.test", "range-dialer", &["acceptor.test"]).with_mesh(
+                    MeshMode::VersionRange(
+                        if reversed { b.0 } else { a.0 },
+                        if reversed { b.1 } else { a.1 },
+                    ),
+                ),
+                NodeSpec::new("acceptor.test", "range-acceptor", &[]).with_mesh(
+                    MeshMode::VersionRange(
+                        if reversed { a.0 } else { b.0 },
+                        if reversed { a.1 } else { b.1 },
+                    ),
+                ),
+            ];
+            let fleet = fleet::spawn("mesh-overlap", &specs);
+            for (node, peer) in [
+                ("dialer.test", "acceptor.test"),
+                ("acceptor.test", "dialer.test"),
+            ] {
+                let status = enrollment(fleet.node(node), peer, "pinned");
+                assert_eq!(status["negotiated"], expected, "{status}");
+                assert!(cli_text(fleet.node(node), &["peers", "status"])
+                    .contains(&format!("mesh {expected}")));
+            }
+        }
+    }
+}
+
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
+#[test]
+fn disjoint_ranges_refuse_with_both_ranges_and_correct_upgrade_side() {
+    for (a, b, older) in [
+        ((5, 5), (7, 8), "this node"),
+        ((6, 7), (5, 5), "acceptor.test"),
+    ] {
+        let specs = [
+            NodeSpec::new("dialer.test", "range-dialer", &["acceptor.test"])
+                .with_mesh(MeshMode::VersionRange(a.0, a.1)),
+            NodeSpec::new("acceptor.test", "range-acceptor", &[])
+                .with_mesh(MeshMode::VersionRange(b.0, b.1)),
+        ];
+        let fleet = fleet::spawn("mesh-disjoint", &specs);
+        let status = enrollment(fleet.node("dialer.test"), "acceptor.test", "refused");
+        assert_eq!(
+            status["reason"],
+            format!(
+                "mesh version mismatch: local {}-{}, remote {}-{}; upgrade flk on {older}",
+                a.0, a.1, b.0, b.1
+            )
+        );
+        assert!(status["negotiated"].is_null());
+    }
 }

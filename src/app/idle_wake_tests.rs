@@ -57,6 +57,7 @@ fn rig() -> Rig {
     app.state.workspaces = vec![sender, recipient];
     app.state.ensure_test_terminals();
     app.state.active = Some(0);
+    app.current_api_peer_pid = Some(std::process::id());
     let pane = app.public_pane_id(1, focused).expect("public id");
     Rig { app, pane, pty }
 }
@@ -156,12 +157,14 @@ fn tick_past_gap(app: &mut App) {
 }
 
 fn read_inbox(app: &mut App, pane: &str) {
+    let caller = app.current_api_peer_pid.replace(std::process::id());
     app.handle_api_request(Request {
         id: "req".into(),
         method: Method::MsgRead(MsgReadParams {
             pane: Some(pane.into()),
         }),
     });
+    app.current_api_peer_pid = caller;
 }
 
 #[tokio::test]

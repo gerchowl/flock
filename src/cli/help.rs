@@ -58,6 +58,9 @@ const HELP_FLAGS: [&str; 2] = ["--help", "-h"];
 /// `pane` is the group to watch when adding rows here: `src/cli/pane.rs` owns
 /// those parsers and its own help text, and this table mirrors them.
 const VERBS: &[(&str, &str, &str)] = &[
+    ("profile", "enable", super::profile::ENABLE_USAGE),
+    ("msg", "operator-read", "flk msg operator-read --pane TARGET"),
+    ("msg", "operator-list", "flk msg operator-list --pane TARGET"),
     ("structured", "grants", super::grants::USAGE),
     ("server", "stop", "flk server stop"),
     (
@@ -92,6 +95,7 @@ const VERBS: &[(&str, &str, &str)] = &[
     ("delegate", "wait", super::delegate::WAIT_USAGE),
     ("delegate", "result", super::delegate::RESULT_USAGE),
     ("delegate", "status", super::delegate::STATUS_USAGE),
+    ("delegate", "rebind", super::delegate::backfill::USAGE),
     ("delegate", "reap", super::delegate::REAP_USAGE),
     ("delegate", "list", super::delegate_list::LIST_USAGE),
     (
@@ -183,7 +187,7 @@ const VERBS: &[(&str, &str, &str)] = &[
         "reply",
         "flk msg reply <correlation_id> <text...> [--intent fyi|needs-reply|blocking] [-- <text starting with dashes>]",
     ),
-    ("msg", "list", "flk msg list [--pane TARGET]   peek at your structured inbox or the operator global list"),
+    ("msg", "list", "flk msg list [--pane TARGET]   peek at your attested pane or structured inbox; listing all panes or another inbox requires the local operator and is audited"),
     ("msg", "read", "flk msg read [--pane TARGET]   consume your attested pane or structured inbox"),
     ("msg", "status", "flk msg status <correlation_id>"),
     (
@@ -625,7 +629,8 @@ mod tests {
             "notification" => include_str!("notification.rs"),
             "delegate" => concat!(
                 include_str!("delegate.rs"),
-                include_str!("delegate_list.rs")
+                include_str!("delegate_list.rs"),
+                include_str!("delegate/backfill.rs")
             ),
             "agent" => include_str!("agent.rs"),
             "msg" => include_str!("msg.rs"),
@@ -640,6 +645,7 @@ mod tests {
             "owner" => include_str!("owner.rs"),
             "goal" => include_str!("goal.rs"),
             "structured" => include_str!("grants.rs"),
+            "profile" => include_str!("profile.rs"),
             "events" => include_str!("events.rs"),
             "adapter" => include_str!("adapter.rs"),
             // `wait park` shares the `events` parser.
@@ -822,6 +828,7 @@ mod tests {
                     "delegate" => vec![
                         include_str!("delegate.rs"),
                         include_str!("delegate_list.rs"),
+                        include_str!("delegate/backfill.rs"),
                     ],
                     "wait" => vec![DISPATCH_SOURCE, include_str!("events.rs")],
                     "session" => vec![DISPATCH_SOURCE, include_str!("retained.rs")],

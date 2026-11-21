@@ -9,6 +9,12 @@ harness that can drive a pty (this fork's agents use the `tui-probe` skill;
 any tmux driver works). Treat them as reproductions you can re-run against
 two builds, not as CI.
 
+The whole-Welcome acceptance driver runs without tmux:
+`python3 tests/probes/attach_welcome.py --bin target/debug/flk`. It owns isolated
+fake peers and PTYs, checks silent/trickled replies against the real five-second
+deadline, and bounds each client observation to eight seconds. The
+`attach_welcome` nextest integration binary runs this driver in CI as well.
+
 ## Running one
 
 ```sh
@@ -110,6 +116,15 @@ needed. Local checks likewise require Python. A missing interpreter is
 an explicit setup failure rather than an unnoticed loss of the Rust crash proof.
 
 ## Socket-driven measurement scripts
+
+`fork_resume_messaging.py --bin <binary> --mode fork|resume` drives an owned fake
+Claude harness through an isolated server. The fork case uses `agent.fork` with
+a fixture transcript; the resume case launches `claude --resume` through
+`agent.start`. Both inject a stale pane environment into real Stop-hook and
+inbox-read CLI processes, verify wake/read ownership agrees, and exercise send
+and reply without model calls. The `fork_resume_messaging` nextest binary runs
+both cases. All sockets use a short sandbox, inherited `FLOCK_*` variables are
+cleared, and every producer wait has a failure ceiling.
 
 `agent_wake.py` is not a TUI runbook: it drives an isolated flk over its socket
 to time wakes (idle, mid-turn, with a harness background task), and it reads an

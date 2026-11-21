@@ -23,13 +23,14 @@
 
 # One leg per required check, `check (<leg>)`. `filter` is what that leg's
 # single job used to run, and the shards partition exactly that set.
+# Both Rust legs exclude the browser fleet; its dedicated job owns the run.
 [legs.ubuntu-latest]
-filter = "all()"
+filter = "not binary(=gui_e2e_fleet)"
 
 [legs.macos-15]
 # live_handoff has been skipped on macOS since 3503209b ("ci: skip live
 # handoff tests on macos"), carried over unchanged here.
-filter = "not binary(live_handoff)"
+filter = "not binary(live_handoff) & not binary(=gui_e2e_fleet)"
 
 # Measured on CI run 38151232176 (cumulative test seconds, macOS / ubuntu).
 # The parallel shards each get about half of the rest, which runs ~3 tests at

@@ -43,6 +43,7 @@ mod owner;
 pub(crate) mod pane;
 mod peers;
 mod preflight;
+mod profile;
 pub(crate) mod questions;
 mod ready;
 mod report;
@@ -125,7 +126,7 @@ fn run(args: &[String]) -> std::io::Result<CommandOutcome> {
     if command == "client"
         && !matches!(
             args.get(2).map(String::as_str),
-            Some("token" | "open" | "help" | "--help" | "-h")
+            Some("token" | "grant" | "open" | "help" | "--help" | "-h")
         )
     {
         return Ok(CommandOutcome::NotCli);
@@ -241,6 +242,7 @@ fn dispatch(args: &[String], command: &str) -> std::io::Result<CommandOutcome> {
         "wait" => run_wait_command(&args[2..])?,
         "integration" => integration::run_integration_command(&args[2..])?,
         "preflight" => preflight::run_preflight_command(&args[2..])?,
+        "profile" => profile::run(&args[2..])?,
         "checks" => checks::run_checks_command(&args[2..])?,
         "digest" => digest::run_digest_command(&args[2..])?,
         "events" => events::run_events_command(&args[2..])?,

@@ -1,6 +1,9 @@
 #[cfg(test)]
 mod peer_uid_tests;
 #[cfg(test)]
+mod profile_tests;
+mod profiles;
+#[cfg(test)]
 mod scoped_mcp_tests;
 #[cfg(test)]
 mod structured_lease_tests;
@@ -49,6 +52,8 @@ pub(crate) mod structured_queue;
 mod structured_relay;
 mod structured_start;
 mod tabs;
+#[cfg(feature = "web")]
+mod wire_lifecycle;
 pub(crate) mod workspaces;
 mod worktrees;
 
@@ -1485,6 +1490,13 @@ impl App {
         if matches!(
             request.method,
             Method::AgentStop(_)
+                | Method::DelegateRebind(_)
+                | Method::ProfilePlan(_)
+                | Method::ProfileBind(_)
+                | Method::ProfileRevoke(_)
+                | Method::ProfileEnable(_)
+                | Method::MsgOperatorList(_)
+                | Method::MsgOperatorRead(_)
                 | Method::AgentFork(_)
                 | Method::ServerStop(_)
                 | Method::ServerReloadConfig(_)
@@ -1504,16 +1516,30 @@ impl App {
                 "this operation requires local authority, not a mesh relay",
             ));
         }
+        // Status has no non-operator fields; origin is resolved again at projection.
+        if matches!(request.method, Method::ProfileStatus(_)) {
+            return None;
+        }
         let uid = self.current_api_peer_uid?;
         let code = if matches!(
             request.method,
             Method::StructuredGrantsList(_)
+                | Method::DelegateRebind(_)
+                | Method::ProfilePlan(_)
+                | Method::ProfileBind(_)
+                | Method::ProfileRevoke(_)
+                | Method::ProfileEnable(_)
+                | Method::MsgOperatorList(_)
+                | Method::MsgOperatorRead(_)
                 | Method::StructuredGrantsRevoke(_)
                 | Method::ServerStop(_)
                 | Method::ServerReloadConfig(_)
                 | Method::ServerLiveHandoff(_)
                 | Method::SessionRetainedList(_)
                 | Method::SessionRetainedPurge(_)
+                | Method::ClientGrantAdd(_)
+                | Method::ClientGrantList(_)
+                | Method::ClientGrantRevoke(_)
                 | Method::ClientTokenAdd(_)
                 | Method::ClientTokenRemove(_)
                 | Method::ClientTokenList(_)
@@ -1573,6 +1599,15 @@ impl App {
         if let Some(response) = self.peer_uid_refusal(&request) {
             return response;
         }
+        if matches!(request.method, Method::ProfileStatus(_)) {
+            let operator = self.caller_is_local_operator();
+            return responses::encode_success(
+                request.id,
+                ResponseResult::ProfileStatus {
+                    status: self.structured_profiles.status(operator),
+                },
+            );
+        }
         if self.waits_for_mesh_recovery(&request.method) {
             self.pending_recovery_park = Some((
                 request,
@@ -1611,6 +1646,32 @@ impl App {
             );
         }
         let response = match request.method {
+            Method::ProfileStatus(_) => unreachable!("status projected before relay dispatch"),
+            method @ (Method::ProfilePlan(_)
+            | Method::ProfileBind(_)
+            | Method::ProfileRevoke(_)) => {
+                return self.handle_profile_mutation(request.id, method);
+            }
+            Method::ProfileEnable(_) => {
+                if !self.caller_is_local_operator() {
+                    return responses::encode_error(
+                        request.id,
+                        crate::api::error_code::ErrorCode::OperatorOnly.as_str(),
+                        "profile enable requires the local operator",
+                    );
+                }
+                if let Err(refusal) = self.structured_profiles.enable() {
+                    return responses::encode_error(
+                        request.id,
+                        refusal.code().as_str(),
+                        refusal.message(),
+                    );
+                }
+                SuccessResponse {
+                    id: request.id,
+                    result: ResponseResult::Ok {},
+                }
+            }
             Method::StructuredGrantsList(p) => {
                 return self.handle_structured_grants(
                     request.id,
@@ -1728,8 +1789,14 @@ impl App {
             Method::AgentRestart(params) => return self.handle_agent_restart(request.id, params),
             Method::AgentLineage(params) => return self.handle_agent_lineage(request.id, params),
             Method::DelegateList(params) => return self.handle_delegate_list(request.id, params),
+            Method::DelegateRebind(params) => {
+                return self.handle_delegate_rebind(request.id, params)
+            }
             Method::MsgSend(params) => return self.handle_msg_send(request.id, params),
-            Method::ClientTokenAdd(_)
+            Method::ClientGrantAdd(_)
+            | Method::ClientGrantList(_)
+            | Method::ClientGrantRevoke(_)
+            | Method::ClientTokenAdd(_)
             | Method::ClientTokenRemove(_)
             | Method::ClientTokenList(_)
             | Method::ClientOpen(_)
@@ -1754,14 +1821,24 @@ impl App {
             Method::MsgReply(params) => return self.handle_msg_reply(request.id, params),
             Method::MsgList(params) => return self.handle_msg_list(request.id, params),
             Method::MsgRead(params) => return self.handle_msg_read(request.id, params),
+            Method::MsgOperatorList(params) => {
+                return self.handle_operator_inbox(request.id, params, false)
+            }
+            Method::MsgOperatorRead(params) => {
+                return self.handle_operator_inbox(request.id, params, true)
+            }
             Method::MsgStatus(params) => return self.handle_msg_status(request.id, params),
             Method::MsgWake(params) => return self.handle_msg_wake(request.id, params),
             Method::HookDecide(params) => return self.handle_hook_decide(request.id, params),
             Method::MsgMute(params) => return self.handle_msg_mute(request.id, params),
             Method::MeshRoutes { adverts } => return self.handle_mesh_routes(request.id, adverts),
             Method::MeshHello(params) => return self.handle_mesh_hello(request.id, params),
-            Method::MeshDeliver(params) => return self.handle_mesh_deliver(request.id, *params),
-            Method::MeshCollect(params) => return self.handle_mesh_collect(request.id, params),
+            Method::MeshDeliver(params) => {
+                return self.handle_mesh_payload(request.id, params, true)
+            }
+            Method::MeshCollect(params) => {
+                return self.handle_mesh_payload(request.id, params, false)
+            }
             Method::PeersEnrollReset(params) => {
                 return self.handle_peers_enroll_reset(request.id, params)
             }

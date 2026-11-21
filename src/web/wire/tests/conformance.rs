@@ -310,16 +310,17 @@ fn selected_welcome_capabilities_match_the_actual_endpoint() {
                 let grants =
                     serde_json::to_value(crate::api::client_tokens::operator_scopes()).unwrap();
                 assert_eq!(
-                    expected["capabilities"], grants,
+                    granted_scopes(&expected),
+                    grants,
                     "{name}: ClientOpen grants"
                 );
                 grants
             } else {
                 let path = server._root.path().join("client-tokens/one.token");
                 let mut token: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-                token["scopes"] = expected["capabilities"].clone();
+                token["scopes"] = granted_scopes(&expected);
                 fs::write(path, serde_json::to_vec(&token).unwrap()).unwrap();
-                expected["capabilities"].clone()
+                granted_scopes(&expected)
             };
             let mut client = Socket::open(&server).await;
             let actual = client
@@ -327,7 +328,8 @@ fn selected_welcome_capabilities_match_the_actual_endpoint() {
                 .await;
             server.finish().await;
             assert_eq!(
-                actual["capabilities"], scopes,
+                granted_scopes(&actual),
+                scopes,
                 "{name}: granted welcome capabilities"
             );
             for field in ["protocol", "idempotency_window_ms"] {
@@ -355,7 +357,7 @@ fn replay_credential_without_answer_gets_typed_scope_refusal() {
         );
         let mut socket = Socket::open(&server).await;
         assert_eq!(
-            socket.hello(1, &"a".repeat(64)).await["capabilities"],
+            granted_scopes(&socket.hello(1, &"a".repeat(64)).await),
             json!(["read", "send"])
         );
         // Scope admission precedes target lookup; no agent or permission book is needed.

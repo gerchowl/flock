@@ -16,6 +16,10 @@
 - S6e amendment Accepted (2026-10-29, #2242/#2731): the owner typed
   "accept all rec with star". All S6e recommendations are decided; no
   question-thread implementation is claimed.
+- §1a amendment Accepted 2026-11-19 (owner decision, #3135; not yet
+  implemented):
+  §1a lets operator app-session `operate` tokens stop and restart structured
+  agents on their home node; file tokens stay refused.
 - Implemented: the S0 probes (#1356); the slices are tracked in #1307.
 - Date: 2026-10-13
 - Issues: #1299 (the spike this records, with the owner decisions of
@@ -232,8 +236,8 @@ and `--add-dir`. The server owns stdin and stdout exclusively.
   agent never runs as the operator's uid. Its `CLAUDE_CONFIG_DIR` is a
   private dir per profile in the `flk-agent` user's `HOME`
   (`~flk-agent/.flk/claude/<profile>`). The login is a `claude setup-token`
-  token only (owner decision 1, narrowed 2026-10-14): g-fleet renders it
-  from sops as a 0600 file owned by `flk-agent` (g-fleet#476), and flk
+  token only (owner decision 1, narrowed 2026-10-14): the fleet configuration repo renders it
+  from sops as a 0600 file owned by `flk-agent`, and flk
   passes it into the session's environment as `CLAUDE_CODE_OAUTH_TOKEN`
   and never logs it. `claude /login` is not used for agents: as a macOS
   user with no GUI session it cannot save its login (no keychain, and no
@@ -324,13 +328,88 @@ and `--add-dir`. The server owns stdin and stdout exclusively.
 record is operator-only (`operator_only`), including an agent resuming itself.
 The original parent and depth survive every resume and lease generation; resume
 never re-parents a conversation. This rule is adjacent to the `may_stop` policy:
-stop remains available only to the operator and the structured agent itself.
+stop remains available only to the operator and the structured agent itself
+(an app-session `operate` token counts as the operator under the accepted
+amendment below).
 MCP spawn is fresh-only. Mesh relays cannot carry structured start/spawn, and the
 server independently refuses recorded mesh edges. Client token scopes, including
 `operate`, grant permission decisions, not local socket operator identity or
-resume authority. The current WebSocket terminal bridge does not dispatch the
+resume authority (**the amendment below, Accepted 2026-11-19 (owner decision),
+narrows this for operator app-session tokens**). The current WebSocket terminal bridge does not dispatch the
 structured `cmd` frame; future command admission must preserve this boundary.
 The cooperative same-UID limitation of #1177 still applies.
+
+#### Amendment, Accepted 2026-11-19 (owner decision): operate app-session tokens may stop and restart structured agents
+
+**Status: Accepted 2026-11-19 (owner decision).** Not yet implemented.
+Until implemented, the `agent.start`, `agent.restart`
+and `agent.stop` wire verbs refuse structured stop/restart for every token with a
+typed error.
+
+*Need.* The GUI must restart (resume the same session) and stop a structured
+agent. It reaches only its home node's wire, authenticated by an app-session
+token (§5). Without this amendment those controls and their end-to-end coverage
+(#3096, #3098) cannot work.
+
+*Decision.* Tokens split by origin, not by who minted them (only the local
+operator can mint any token). An **app-session token** (`Source::App`, minted
+for the operator's own GUI shell under a fresh LocalOperator check; always
+`operate`, principal `app:operator:<uid>`) carries structured **stop** and
+**restart (resume)** authority for structured agents on its **home node**. Per
+§5 an `operate` token *is* the operator's identity for ADR-0014's operator-only
+verbs; `agent.start` already relies on that. An app-session token is therefore
+the operator for the old-rule passages in this section and in the `agent.stop`
+paragraph ("the operator and the structured agent itself only").
+
+*Unchanged.*
+- **File** operate tokens (`Source::File`; `flk client open`,
+  `flk client token add`) stay refused. They are portable bearer credentials
+  that may be used off-host and, with `--allow-non-loopback`, over TCP, so they
+  cannot be tied to the local operator's process.
+- `read`, `send` and `answer` scopes get none.
+- Mesh-relayed frames and lineage parents get none; mesh relays still cannot
+  carry structured start/spawn.
+- Remote targets stay refused until ADR-0043.
+- ADR-0052 profile admission still applies to every resume.
+- The structured agent itself keeps its existing self-stop authority; resume of
+  a record by an agent stays refused.
+- This is consistent with ADR-0052 §1 ("existing operator-only resume authority
+  in ADR-0036 §1a remains in force"), ADR-0044 ("operator-only resume
+  authority") and ADR-0049 (resume is never delegable):
+  the authority belongs to the operator identity, not to any delegate.
+- Every stop or restart is audited with the per-mint credential `app:<nonce>`
+  (the fresh random name of that mint), not only the shared principal
+  `app:operator:<uid>`.
+
+*Threat considered.* App-session bearers are never admitted over TCP. On the
+local unix socket only the minting process may use one, after a fresh
+LocalOperator check and bearer authentication (see "App-session tokens and
+shell origins"). A stolen bearer is therefore not usable by another process.
+The residual risk is control of the GUI shell process itself, for example by
+modifying its memory (#1177); the bounded lifetime and ADR-0038 §6 shell
+hardening narrow it but do not close it. A compromised shell can already start
+agents and act as operator for every ADR-0014 operator-only verb; this adds
+stop/resume of structured agents to that same blast radius.
+
+*Rejected alternative.* Keep §1a as is and give the GUI a separate socket-only
+privileged path for structured stop/resume. The GUI's wire connection already
+runs over the local unix socket, so this would not add isolation; it would add
+a second privileged API surface for the GUI shell and duplicate the authority
+checks the app-session token already performs.
+
+*Follow-up implementation slice.* Larger than lifting a
+refusal:
+- The wire lifecycle handler has no token or session context today
+  (`wire_agent_lifecycle`, `src/app/api/wire_lifecycle.rs`); plumb the
+  authenticated source through it and refuse everything but `Source::App`
+  operate.
+- Wire `agent.restart` is terminal-only and returns `runtime_unsupported` for
+  structured targets, so structured resume over the wire is a new path, not a
+  lifted refusal. Update the "structured resume authority remains socket-only"
+  doc comment in `src/structured_wire/lifecycle.rs`.
+- Add restart and stop steps to `gui-e2e-fleet`.
+
+Part of #3096.
 
 `caller_is_local_operator()` (`src/app/api/mesh.rs:182`) treats a local
 caller with no flk pane in its process ancestry as the operator. A
@@ -618,7 +697,9 @@ omitted until S10. No PTY placement, process id or caller credential is fabricat
 
 `agent.get` and its `agent.status` alias resolve registered identity/name, refusing
 cross-runtime ambiguity. `agent.stop` accepts only a structured target and is
-restricted to the operator and the structured agent itself only. PTY callers
+restricted to the operator and the structured agent itself only (an
+app-session `operate` token counts as the operator under the accepted §1a
+amendment). PTY callers
 and lineage parents receive no stop authority. Stop latches cancellation and
 returns current facts; it does not promise immediate Offline. Offline stop is
 idempotent. A restored Unknown record refuses launch before epoch advancement or
@@ -1351,6 +1432,23 @@ that A authenticated, how the `ack` comes back) in #1380. Until then a
 opening a real terminal to a session, which is a `pty` agent's pane (the
 `terminal/<pane>` stream) served by the node that runs it, as today.
 
+For journal-admitted permission decisions, the command ACK must be written and flushed
+before its caused permission closed event or transport audit is published. The same
+ordering applies to caused fleet/lifecycle projections, including the fleet rows clients
+render. This holds on every connection, including observers and subscriptions opened
+while the command is pending. Durable Finish precedes the ACK. Joined waiters retain the
+publication hold until each ACK flushes or its originating socket is lost; socket loss
+releases that waiter without rolling back durable effects. Initial replay cuts and
+ordinary projections cannot bypass an active hold. Later records on the fenced stream
+preserve sequence order, while independent producers continue.
+
+This guarantee excludes history records that constitute the command outcome or
+downstream transport output: accepted input and queue admission cuts for `agent.send`,
+and lifecycle launch/terminal transport history. These records may precede the ACK.
+Correlate command outcomes using `cmd_id`; do not infer a universal history fence.
+Universal producer fencing is a separate owner decision tracked in
+[#3198](https://github.com/gerchowl/flock/issues/3198).
+
 The stream and its history stay the JSONL store of §4 and the endpoint
 below. The open item of whether they should run on the Grafana Labs stack
 (#1323) was resolved by the owner on 2026-10-16 (ADR-0038 §11 item 5):
@@ -1389,6 +1487,7 @@ client → server
                                             stream ∈ agent/<id>, agent/<id>/live,
                                               queue/<id>, events, terminal/<pane>,
                                               fleet, inbox, artifacts, work
+  ping    { nonce }                          resume probe, with resume_probe capability
   pong    { nonce }                          echo the server ping nonce
   unsub   { sub_id }                         closes id; drop late frames for it
   cmd     { cmd_id, verb, args, resume_only } cmd_id is the idempotency key
@@ -1396,6 +1495,7 @@ server → client
   welcome { protocol, server_version, capabilities, principal,
             server_epoch, idempotency_window_ms }
   ping    { nonce }                          application heartbeat (§5a)
+  pong    { nonce }                          echo the client resume probe nonce
   ev      { sub_id, stream, seq, ts_ms, ev }  ev is the typed event (§6)
   synced  { sub_id, seq }                    replay barrier on every seq stream
   subfail { sub_id, code, message }          closes id; drop late frames (§5a)
@@ -1662,7 +1762,9 @@ are deferred to S6 (#1429); this types slice names the contracts only.
   whatever the token says unless it is `operate`-scoped. Stated plainly: an
   `operate`-scoped bearer token *is* the operator's identity for ADR-0014's
   operator-only verbs, from any address, and once `--allow-non-loopback`
-  is on that includes other machines (owner decision 9). Token files live in
+  is on that includes other machines (owner decision 9). That reach is why the
+  accepted §1a amendment extends structured stop/restart only to app-session
+  tokens, never to file tokens. Token files live in
   the operator's data dir, which `flk-agent` cannot read (ADR-0035 §6.3), so
   structured agents cannot pick up a client token. `pty` agents that still
   run as the operator's uid until O19a can; that limit is #1177's.
@@ -1721,6 +1823,30 @@ causing false Stale merely because the heartbeat waited behind its data backlog.
 Discard every frame from the abandoned socket, including late pings; send no
 pong for them and let no old callback advance a cursor or renew liveness.
 A stream's independent progress deadline still applies during traffic.
+
+**Resume probes (#2977).** `welcome.capabilities` advertises the additive
+`resume_probe` transport capability independently of the authenticated operation
+grants. Clients send JSON `ping { nonce }` only when that capability is present;
+the server echoes `pong { nonce }` through its priority writer. Nonces are opaque,
+nonempty strings of at most 128 UTF-8 bytes, accommodating the heartbeat's
+bounded epoch/connection/sequence identities. Like invalid heartbeat pongs,
+empty or oversized probe nonces are ignored and renew no liveness deadline.
+One probe response per connection may be queued or writing: the server ignores
+additional probes until that response has flushed. This bounds probe buffering
+without blocking heartbeat or subscription processing. Probe requests never
+renew the server's heartbeat deadline; clients must still answer server pings.
+
+On persisted `pageshow` or hidden-to-visible `visibilitychange`, the GUI sends
+one probe and gives it 3 s. Concurrent resume signals share that probe and its
+original deadline. Only its matching pong satisfies it; unrelated traffic and
+wrong, old or replayed pongs cannot do so. A healthy response leaves the visible
+connection state unchanged. On expiry, the client shows Reconnecting, closes the
+abandoned socket, and uses the existing reconnect backoff and applied cursors.
+For older servers without the capability it sends no unsupported frame: any
+valid server frame within the 15 s heartbeat interval plus 2 s scheduling grace
+proves liveness; otherwise it reconnects through the same path. Resume establishes
+this bounded window even when the pre-suspension liveness timer was overdue.
+Disconnect cancels the probe, and client disposal removes both browser listeners.
 
 **Reconnect and failure scope.** Connect/handshake expiry, protocol failure,
 socket loss or heartbeat failure ends the connection attempt and enters
@@ -1836,7 +1962,7 @@ the wire enum; implementation registers any new API error codes where needed):
 | `invalid_agent` | Unsafe or reserved stored agent namespace. Retry class `never`: select a valid subject rather than retrying unchanged. |
 | `unknown_stream` | Unknown stream kind or removed subject. Show unavailable and stop that subscription until the user selects a valid stream. |
 | `scope` | Token lacks read scope for the stream. Show refusal and stop that subscription until authorization changes. |
-| `session_busy` | Token mutation is pending. Retry class `later`: retry only this stream with fresh IDs after 250, 500 and 1000 ms (three automatic same-socket retries since the last `synced`), then remain visibly Refused until reopened or a later reconnect supplies a new welcome. Sibling subscriptions and the authenticated socket stay connected. |
+| `session_busy` | Token mutation is pending, or the fleet permission book is temporarily unavailable during worker preparation or read contention. Retry class `later`: retry only this stream with fresh IDs after 250, 500 and 1000 ms (three automatic same-socket retries since the last `synced`), then remain visibly Refused until reopened or a later reconnect supplies a new welcome. Sibling subscriptions and the authenticated socket stay connected. |
 | `sub_id_reused` | ID was already used on this connection, live or closed. Refuse the registration; treat this as a client allocation error and use a fresh ID for any new subscription. |
 
 Start the 30 s progress deadline at sub registration, or when a new gap starts
@@ -1881,6 +2007,114 @@ unresolved original is not falsely presented as a completed first ack.
 harmless only with the same principal/id/payload and `resume_only:true`: an
 absent/expired claim still refuses and cannot dispatch. The class is not license
 to resend as a first send or create a new ID; the outbox/expiry rules still apply.
+
+**Bound and overflow (J1, #1380).** Never evict an unexpired claim. Refuse
+new claims before dispatch with `session_busy` (`retry:later`) when either the
+per-principal or global entry cap is reached. The local constants budget four
+sockets per credential times four outstanding commands per socket times 2,880
+30-second acknowledgement windows per day: 46,080 claims per principal. The
+sixteen-socket global limit gives 184,320 claims globally. This supports a
+sustained budget of sixteen new commands per principal per 30 seconds for a
+full day; the transport has concurrency limits, not an enforced command-rate
+limit, so higher sustained traffic can reach the cap and must back off.
+Shared-principal credentials share the principal cap. Persist the payload digest,
+never the payload, and bound each claim/result record to 67,584 encoded bytes
+including its newline; acknowledgements also retain the 65,536-byte wire cap.
+An oversized outcome leaves its durable claim uncertain instead of truncating
+the result. The namespace is an explicit string (`local` today), so a later
+home-node namespace needs no format change.
+
+**J1 live admission (#1380).** Wire commands use the durable journal as the
+single source of completed outcomes. The app owner submits a claim without
+blocking, polls its durable completion, then rechecks current authorization
+under the token fence through dispatch. Revocation after claim prevents the
+effect. The outcome is synced before acknowledgement. Identical in-flight
+requests join the active claim, retaining each credential's metadata and
+reauthorizing each waiter before returning the stored outcome. Fresh dispatch,
+cached replay and joined replies share verb authorization; permission decisions
+require both current `answer` and `operate` scopes. Connection closure
+follows the requesting credential's current revocation status. Conflicting
+payloads refuse `invalid_params`. Journal capacity and writer queue pressure
+refuse through the bounded wire refusal audit before dispatch. Recovered pending
+claims and absent, expired or lost resume-only keys refuse `session_unconfirmed`.
+A completion from an earlier ownership phase cannot dispatch after freeze or
+rollback. Completed outcomes replay across restart and ownership transfer.
+
+Every journal caller has a one-second budget (`JOURNAL_WAIT`). Startup and
+post-commit importer acquisition succeed only with the journal lease held and
+replay complete; timeout returns typed `session_busy`, and open failure retains
+its typed error, before reporting ready. Acquisition is a prerequisite like token
+store and listener setup. Rollback recovery remains fenced and retries every
+250 ms (`ACQUIRE_RETRY`). Importer preparation never opens the journal. The
+existing watchdog may be disarmed before ownership commit because
+the subsequent journal caller wait is bounded independently.
+
+At the existing mesh custody freeze point, the exporter closes wire admission
+and requests a drain. Freeze and shutdown stop waiting after one second, log
+the number of accepted queued/active journal writes, and proceed. Counts retire
+before their completion is published. Timed-out work is detached, not cancelled;
+the worker retains the exclusive lease until it actually stops. A replacement
+fails closed and retries while that lease is held, never becoming a second
+holder. Shutdown retains its existing separate five-second revocation and
+transport-drain budgets, plus at most one second for the journal caller.
+
+Rollback schedules reacquisition at the same recovery point as mesh custody.
+Generation fencing prevents stale recovery from reopening admission after a
+freeze or shutdown, and prevents an abandoned old drain from closing a newer
+recovered writer. Recovery finishes any earlier drain before replaying.
+
+The backend holds an exclusive writer lease, rebuilds its index and per-principal
+counts by replay once at open, and appends one bounded record per claim/outcome.
+Successful completion follows file sync and index publication; failed appends
+roll back to the previous length and sync it, then fence further writes until
+reopen. Directory sync occurs on file creation and compaction publication.
+Its mailbox holds at most 32 queued messages plus one active job. Submission
+uses a nonblocking try-send and owns no filesystem or authorization lock.
+Startup recovery and journal writes run on the dedicated writer thread.
+Asynchronous open returns a usable handle only after replay and exclusive lease
+acquisition succeed; a held lease returns typed `session_busy`. There is no
+usable handle retaining a failed open. Shutdown closes admission across all
+clones, drains accepted writes and compaction, and reports completion only after
+lease release. Cancelling a started shutdown waiter does not cancel the drain.
+Callers must await shutdown before opening a replacement; opening while the
+lease is held refuses, and a fresh open after release can succeed even when
+closed handles remain alive.
+
+After eight MiB of log growth or when the oldest retained claim expires, a
+claim attempt starts a separate compaction worker with that attempt's clock
+value and a fixed, complete append prefix. This also runs after a capacity
+refusal, so a full journal can recover without successful appends. An O(1)
+oldest-admission index is rebuilt during replay and compaction, and maintained
+when claims are inserted; admission never scans the journal to check expiry.
+The copier keeps records younger than 24 hours, conservatively retaining future
+timestamps. It catches up concurrent appends and builds the replacement index
+and per-principal counts off-thread, reserving capacity so publication cannot
+rehash the index. If more than two record byte caps remain, catch-up returns to
+the copier. Otherwise the writer copies the bounded final tail, syncs the
+private temporary file, renames it onto the active journal, syncs the directory
+and publishes matching index/count removals before serving another message.
+Old index destruction also runs on the copier. A crash leaves the complete old
+or new journal; abandoned `commands.compact` files are ignored during replay.
+Copy or publication failures fence further writes. The primary file's identity
+is checked before copying and publication, so a lost or replaced log is not
+resurrected. A failed concurrent append cancels publication rather than
+replacing an uncertain authoritative tail. A sweep that frees nothing waits
+for another eight MiB of growth or the next retained claim's expiry before
+trying again. Unexpired claims remain retained in either case.
+
+Expired entries occupy their counts until successful compaction: resume-only
+lookup refuses them as uncertain, and reuse as a new claim refuses busy. No
+unexpired entry is evicted. There are at most two records per retained key and
+a hard active-file byte bound of twice the global entry cap times the record byte cap.
+Unknown/invalid complete records stay raw in place, are skipped and logged,
+and fence further writes while readable indexed results remain available.
+Opaque journals are not compacted, preserving every raw row and the recovery
+fence rather than attempting expiry inference from unknown data.
+A torn final line is archived as raw bytes in private `commands.torn.jsonl`,
+file-synced before the active tail is truncated and synced. The archive is
+bounded to 32 record byte caps; recovery refuses without truncation when full.
+A recovered pending claim remains uncertain and a completed claim returns
+its first acknowledgement through the live wire after fresh authorization.
 
 Automatic resend is allowed for the listed §5 verbs only through this durable
 idempotency path, not based on an assumed harmless verb. Permission/question
@@ -2027,7 +2261,7 @@ controlled socket faults and bounded receives, not sleeps or live models.
 | subfail scope | Insufficient token scope refuses only that sub until authorization changes; sibling streams remain live. |
 | Per-stream progress deadline | Replay exceeds 30 s overall but progresses within each window and succeeds. A stalled sub expires despite duplicate/unrelated/heartbeat traffic: unsub the stalled ID, then re-subscribe with a fresh ID from its applied cursor, retaining resync marker and the connection. |
 | Ack timeout and delayed original | Missing ack marks only that cmd uncertain; no same-socket resend or teardown. A late current-socket ack resolves it. After reconnect, deliver resume-only lookup before buffered original: show unknown outcome while the original may later execute once; never manufacture a new ID. Verify retry:later remains harmless with resume_only. |
-| Mobile suspend and remote outage | Foreground invalidates old socket and resumes. Local heartbeat does not clear remote stale state; cross-node cmd still refuses under VERSION 5. |
+| Mobile suspend and remote outage | Browser resume probes the old socket and reconnects on a miss. Local heartbeat does not clear remote stale state; cross-node cmd still refuses under VERSION 5. |
 
 #### S7-min agent subscription resource bounds (§5a implementation)
 
@@ -2106,7 +2340,8 @@ S7a. The server supplies the wrapper before sending, not the frontend reducer.
 
 The initial `WIRE_JSON_VERSION` is 1. Wire streams are strings using §5's paths;
 unknown paths decode so the server can return `subfail unknown_stream`. The
-`welcome` principal is the token name and capabilities are operation strings;
+`welcome` principal is the token name and capabilities include operation strings
+and the additive `resume_probe` transport feature;
 a newer client's read-only welcome advertises no command capability. `ev.seq`
 is omitted only for `agent/<id>/live`; its timestamp is still present. Ack
 success/error fields are exclusive; successful void commands may omit result.
@@ -3261,8 +3496,8 @@ decision by the owner.
    file (2.1.287); a `setup-token` token in `CLAUDE_CODE_OAUTH_TOKEN`
    worked for the same user (A.16).
    *Owner decision, 2026-10-14 (#1404):* agent users log in with
-   `setup-token` only. g-fleet renders it from sops as a 0600 file owned by
-   `flk-agent` (g-fleet#476); flk passes it into the session env and never
+   `setup-token` only. The fleet configuration repo renders it from sops as a 0600 file owned by
+   `flk-agent`; flk passes it into the session env and never
    logs it. `/login` is kept for GUI operators only. Rejected alternative:
    unlocking a keychain at boot. (§1, S3)
 2. **Build on `--resume-session-at`.** As recommended: yes, behind the §9
@@ -3394,7 +3629,7 @@ remaining slice-8 acceptance is tracked in #2467; #1833 and #1746 stay open.
 | S0 | Complete (2026-10-14): the probes landed (#1356); the A.13 controls and token-path re-runs, the concurrency-safe call behind an open permission, and A.16 are recorded (#1404). Probes, recorded in the appendix: the messaging socket of E16 (what it accepts, its owner and mode, a switch to disable it); the placeholder carrier, `deny` versus `allow` with placeholder answers, and that the model keeps working after it (§2a); parallel control requests, an `AskUserQuestion` while a permission is open (§2b); the harness's own queue in `-p`: take-back, edit and send-now behind `interrupt_cancel_queued_v1` / `interrupt_send_now_v1` (§3); `set_permission_mode` over stdio (§10b); `claude /login` and its keychain item for a macOS user without a GUI login (owner decision 1) | — | 0 (probe) |
 | S1 | `SessionEvent` types for Claude stream-json: known variants with `extra`, `Unknown{raw, shape}`, shape key; redacted probe fixtures as tests | — | 350 |
 | S2 | `session.unknown_shape` persisted kind (skip test per ADR-0028 §3a), once-per-shape registry logging through `tracing` only (#1300), `flk report --unknown-events` | S1 | 250 |
-| S3 | Structured runtime: spawn as `flk-agent` with the §1 launch profile (the login from the 0600 `setup-token` file g-fleet renders (g-fleet#476), passed as `CLAUDE_CODE_OAUTH_TOKEN` in the session env and never logged, owner decision 1; `--restricted`; the restricted-versus-unrestricted `system/init` diff; refuse a session that reports `messaging_socket_path`), session lease (`session_busy`), lease-based caller identity and the uid check of §1a, stdout pump into the per-agent stream, blob store, truthful outcome | S0, S1, O19a #1208 | 400 |
+| S3 | Structured runtime: spawn as `flk-agent` with the §1 launch profile (the login from the 0600 `setup-token` file the fleet configuration repo renders, passed as `CLAUDE_CODE_OAUTH_TOKEN` in the session env and never logged, owner decision 1; `--restricted`; the restricted-versus-unrestricted `system/init` diff; refuse a session that reports `messaging_socket_path`), session lease (`session_busy`), lease-based caller identity and the uid check of §1a, stdout pump into the per-agent stream, blob store, truthful outcome | S0, S1, O19a #1208 | 400 |
 | S4 | Pure per-agent state reducer: `StateSource::Session`, turn / attention / limit from events, stall observation and in-process phase/needs-human facts; registry seam for #1439 and S7-min #1746. Pane-free EventHub events deferred to #1804 | S3 | 300 |
 | S5 | Input queue: `queue/<agent>` stream, producers, gate, `command_lifecycle` acks, independent `delivery` (`at_idle` / `steer` / `interrupt`) and `priority` ordering, one batch per turn with the FIFO rules 1 to 4 and batch messages, `flk agent send` and msg delivery routed to it | S3 | 400 |
 | S5c | Queue UX: `queue.update` / `edit` leases / `move` / `delete`, named stashes with `stash` / `pop` / `clear` / `stashes`, `send_now` (`steer`, or `interrupt` through the harness's `interrupt{send_now}`), `take_back` through `cancel_async_message` (§3, A.14, owner decision 4) | S0, S5 | 300 |

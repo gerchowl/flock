@@ -32,6 +32,7 @@ import { createSidebarStore } from "./layout/sidebar";
 import { previewMode } from "./layout/phone";
 import { createFixtureTransport } from "./transport/fixture";
 import { WireConnection } from "./wire/connection";
+import { watchResume } from "./wire/resume";
 import { browserClock, browserSockets, endpointUrl, type Clock, type KeyValueStore, type SocketFactory } from "./wire/env";
 import { createWireFleet } from "./wire/fleet";
 import { captureCode, type CodePage } from "./capture-code";
@@ -125,6 +126,7 @@ function WireApp(props: { readonly config: WireShellConfig | BridgeShellConfig; 
   // With a code, nothing connects until its exchange settles (a shell that owns the tokens never exchanges one).
   let current = props.code === null ? held() : null;
   const connection = new WireConnection(url === null ? { bridged: true, client: CLIENT, ...options } : { url, token: current, sockets, client: CLIENT, ...options });
+  onCleanup(watchResume(connection));
   const [exchanging, setExchanging] = createSignal(props.code !== null && !shellOwned);
   /** The last code failed: NeedsToken says so instead of only asking for one. */
   const [failed, setFailed] = createSignal(false);

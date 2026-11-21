@@ -493,7 +493,7 @@ export const step = (body: Body): Step => ({ v: 1, ...body }) as Step;
 /** The fixture server's `welcome`. */
 export const WELCOME: ServerFrame = {
   t: "welcome",
-  protocol: 1,
+  protocol: WIRE_PROTOCOL,
   server_version: "fixture",
   capabilities: ["read", "send"],
   principal: "fixture-principal",
@@ -502,7 +502,7 @@ export const WELCOME: ServerFrame = {
 };
 
 /** given → connect → open → hello → welcome: Live (or as `welcome` decides), with no subscriptions. */
-export function live(h: Harness, given: Partial<Extract<Step, { step: "given" }>> = {}, welcome: ServerFrame = WELCOME, protocol = 1): void {
+export function live(h: Harness, given: Partial<Extract<Step, { step: "given" }>> = {}, welcome: ServerFrame = WELCOME, protocol = WIRE_PROTOCOL): void {
   h.step(step({ step: "given", cursors: {}, outbox: [], ...given }));
   h.step(step({ step: "client", action: { kind: "connect" } }));
   h.step(step({ step: "expect_connect", within_ms: 1 }));

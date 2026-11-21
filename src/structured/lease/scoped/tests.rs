@@ -137,7 +137,7 @@ fn scoped_kernel_identity_loss_reuse_and_orphan_refuse() {
 fn scoped_contention_refuses_and_revocation_precedes_registry_removal() {
     let (leases, lease) = fixture();
     let credential = lease.credential();
-    let held = leases.0.lock();
+    let held = leases.0.write();
     assert_eq!(
         leases.scoped_for_test(Some(&credential), peer(), facts),
         Caller::Uncertain
@@ -176,7 +176,7 @@ fn scoped_owner_drop_revokes_even_when_cleanup_retains_the_reservation() {
 #[test]
 fn scoped_busy_registry_is_typed_nonblocking_and_does_no_fact_work() {
     let (leases, lease) = fixture();
-    let _busy = leases.0.lock();
+    let _busy = leases.0.write();
     let result = leases.scoped_with(Some(&lease.credential()), peer(), |_| {
         panic!("no fact read under contention")
     });

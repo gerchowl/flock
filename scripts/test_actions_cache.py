@@ -40,6 +40,7 @@ class ActionsCachePolicy(unittest.TestCase):
             ('preview.yml', 'build'), ('release.yml', 'build'),
             ('build-artifacts-manual.yml', 'build-linux'),
             ('build-artifacts-manual.yml', 'build-macos'),
+            ('build-artifacts-manual.yml', 'durable-attach-baseline'),
         })
 
     def test_ci_zig_cache_has_stable_keys_and_dev_only_save(self):
@@ -200,3 +201,22 @@ class ActionsCachePolicy(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class DurableAttachWorkflow(unittest.TestCase):
+    def test_baseline_is_manual_and_uploads_raw_evidence_even_on_failure(self):
+        document = workflow('build-artifacts-manual.yml')
+        self.assertEqual(set(document['on']), {'workflow_dispatch'})
+        job = document['jobs']['durable-attach-baseline']
+        self.assertEqual(job['runs-on'], 'ubuntu-latest')
+        self.assertIn("inputs.build_group == 'durable-attach-baseline'", job['if'])
+        self.assertEqual(job['timeout-minutes'], 30)
+        probe, = [s for s in job['steps'] if '--assert-baseline' in s.get('run', '')]
+        self.assertIn('set -o pipefail', probe['run'])
+        self.assertIn('set -e\n', probe['run'])
+        self.assertIn('--assert-attach-timeout', probe['run'])
+        self.assertIn('tests/probes/attach_welcome.py', probe['run'])
+        self.assertEqual(job['env']['PROBE_EXPECTATION'], '${{ inputs.attach_expectation }}')
+        upload, = [s for s in job['steps'] if s.get('uses', '').startswith('actions/upload-artifact@')]
+        self.assertEqual(upload['if'], 'always()')
+        self.assertEqual(upload['with']['path'], 'durable-attach-output.txt')
