@@ -71,10 +71,18 @@ test's capture pipe on macOS and falsely report leaked handles
 rejects older runners; the devShell provides 0.9.146. Leak detection and its
 timeout stay enabled.
 
-Run `nix develop` for the contributor toolchain. The devShell wraps sccache
-with a persistent `$HOME/.cache/flock-sccache/tmp` directory and a separate
-`$HOME/.cache/flock-sccache/flock.sock` server socket, shared across worktrees
-for the same user. This implements the stable-directory/separate-endpoint design
+Run `nix develop` for the contributor toolchain. Development and test builds
+keep file and line information for flock backtraces, but omit dependency debug
+information and local variable/type details to reduce build storage. Cargo's
+`test` profile inherits these settings from `dev`. For full flock debugger
+information, use `CARGO_PROFILE_DEV_DEBUG=true cargo build` or
+`CARGO_PROFILE_TEST_DEBUG=true cargo nextest run`. To debug dependencies too,
+add `--config 'profile.dev.package."*".debug=true'` (use `profile.test` for
+nextest). Release settings are unchanged.
+
+The devShell wraps sccache with a persistent artifact cache, temporary directory,
+and separate server socket shared across worktrees and isolated agent homes for
+the same OS account. This extends the stable-directory/separate-endpoint design
 accepted in [issue #1325](https://github.com/gerchowl/flock/issues/1325).
 
 The pinned sccache 0.18.0 carries the startup fix approved in
@@ -95,10 +103,16 @@ Each dev shell picks up the patched binary on its next `nix develop`. A running
 shared server keeps its old binary until it next restarts naturally. Nobody
 restarts it deliberately for this rollout.
 
-Artifact storage keeps sccache's existing configuration or platform default, including
-`~/Library/Caches/Mozilla.sccache` on macOS, so existing caches remain warm.
-The wrapper preserves an explicit `SCCACHE_DIR` and uses its `tmp` subdirectory
-and `flock.sock` for daemon runtime state instead of the default runtime root.
+The default `SCCACHE_DIR` is the OS account home's
+`Library/Caches/Mozilla.sccache` on macOS or `.cache/sccache` on Linux. The
+wrapper resolves that home through the OS account database rather than `HOME`
+or `XDG_CACHE_HOME`, so isolated agent environments reuse artifacts and the
+same daemon. This preserves the usual platform cache location; an existing
+custom XDG cache can be retained by setting `SCCACHE_DIR` explicitly.
+
+Set `SCCACHE_DIR` to an absolute, persistent, writable directory to override
+artifact storage and runtime state. Its `tmp` subdirectory holds temporary files
+and `flock.sock` is the default server endpoint.
 [sccache 0.18 supports Unix sockets and explicit ports](https://github.com/mozilla/sccache/blob/v0.18.0/README.md#usage),
 while [`SCCACHE_DIR` selects artifact storage](https://github.com/mozilla/sccache/blob/v0.18.0/docs/Configuration.md#disk-local).
 There is no server-only temporary-directory setting, so the wrapper sets
@@ -110,23 +124,26 @@ a disposable directory.
 
 Explicit `SCCACHE_SERVER_UDS` or `SCCACHE_SERVER_PORT` overrides the default
 socket. Ensure that endpoint's daemon was also started through the wrapper.
-Keep runtime paths absolute, persistent, and writable, and do not delete them
-while their daemon runs. Unix socket path limits apply (roughly 104 bytes on
-macOS), so choose a shorter persistent `SCCACHE_DIR` or an explicit private
-port for a long home path. An unset HOME requires an explicit `SCCACHE_DIR`.
+Do not delete runtime paths while their daemon runs. Unix socket path limits
+apply (roughly 104 bytes on macOS), so choose a shorter persistent `SCCACHE_DIR`
+or an explicit private port for a long account home path. An unset `HOME` is
+supported; a failed account lookup requires an explicit `SCCACHE_DIR`.
 Directory-creation failure prints the path and fails the build.
 `RUSTC_WRAPPER=""` disables Rust caching, and custom wrappers remain intact.
 
 Run `nix develop --command just test-sccache` to check deleted startup temp
 directories, 20 rounds of four concurrent automatic starts, live-listener
 preservation, stale sockets left by a killed private server, unsafe paths,
-explicit and lazy restarts, and hits from a platform-default cache
+explicit and lazy restarts, and hits from an explicit private cache
 warmed by an unwrapped daemon. The probe always supplies and asserts private
 endpoints. Outside the devShell it exits before contacting any server with
 `run inside nix develop (the wrapper is not active)`. The endpoint guard also
 remains active under `python3 -O`. The probe isolates HOME and
-XDG paths, so it exercises platform default cache selection without accessing
-or stopping the host's shared cache server. Nix CI executes this check on Linux
+XDG paths and sets a private `SCCACHE_DIR`, so it never accesses or stops
+the shared cache server. Wrapper unit tests pin the account-home resolver to
+verify that different isolated homes select the same default cache and socket.
+The real probe pins that resolver too and proves a disk-cache hit after a restart
+under a second isolated home. Nix CI executes this check on Linux
 and evaluates Darwin checks without building them. The Darwin probe can be
 built locally with `nix build .#checks.aarch64-darwin.sccache --no-link`.
 
