@@ -1945,7 +1945,7 @@ the wire enum; implementation registers any new API error codes where needed):
 | `invalid_agent` | Unsafe or reserved stored agent namespace. Retry class `never`: select a valid subject rather than retrying unchanged. |
 | `unknown_stream` | Unknown stream kind or removed subject. Show unavailable and stop that subscription until the user selects a valid stream. |
 | `scope` | Token lacks read scope for the stream. Show refusal and stop that subscription until authorization changes. |
-| `session_busy` | Token mutation is pending. Retry class `later`: retry only this stream with fresh IDs after 250, 500 and 1000 ms (three automatic same-socket retries since the last `synced`), then remain visibly Refused until reopened or a later reconnect supplies a new welcome. Sibling subscriptions and the authenticated socket stay connected. |
+| `session_busy` | Token mutation is pending, or the fleet permission book is temporarily unavailable during worker preparation or read contention. Retry class `later`: retry only this stream with fresh IDs after 250, 500 and 1000 ms (three automatic same-socket retries since the last `synced`), then remain visibly Refused until reopened or a later reconnect supplies a new welcome. Sibling subscriptions and the authenticated socket stay connected. |
 | `sub_id_reused` | ID was already used on this connection, live or closed. Refuse the registration; treat this as a client allocation error and use a fresh ID for any new subscription. |
 
 Start the 30 s progress deadline at sub registration, or when a new gap starts
@@ -2015,11 +2015,12 @@ a wire acknowledgement in this slice. J1b2b must preserve the admission-phase
 fence when introducing durable command outcomes.
 
 Every journal caller has a one-second budget (`JOURNAL_WAIT`). Startup and
-post-commit importer acquisition return a running server even when that budget
-expires or open fails; wire commands remain refused as audited `session_busy`
-until the background task holds the lease and finishes replay. Failed attempts
-retry every 250 ms (`ACQUIRE_RETRY`). Importer preparation never opens the
-journal. The existing watchdog may be disarmed before ownership commit because
+post-commit importer acquisition succeed only with the journal lease held and
+replay complete; timeout returns typed `session_busy`, and open failure retains
+its typed error, before reporting ready. Acquisition is a prerequisite like token
+store and listener setup. Rollback recovery remains fenced and retries every
+250 ms (`ACQUIRE_RETRY`). Importer preparation never opens the journal. The
+existing watchdog may be disarmed before ownership commit because
 the subsequent journal caller wait is bounded independently.
 
 At the existing mesh custody freeze point, the exporter closes wire admission

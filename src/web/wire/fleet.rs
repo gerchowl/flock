@@ -72,7 +72,21 @@ type Observation = (PathBuf, Result<Local, crate::api::error_code::ErrorCode>);
 type Request = (Option<u64>, oneshot::Sender<io::Result<Cut>>);
 // Shared ring: sixteen frames, each within the existing 64 KiB writer limit.
 const LIVE: usize = 16;
-type Frame = Option<Arc<ServerFrame>>;
+type Frame = Result<Arc<ServerFrame>, crate::api::error_code::ErrorCode>;
+fn unavailable(code: crate::api::error_code::ErrorCode) -> io::Error {
+    if code == crate::api::error_code::ErrorCode::SessionBusy {
+        io::ErrorKind::WouldBlock.into()
+    } else {
+        io::ErrorKind::BrokenPipe.into()
+    }
+}
+fn refusal(error: io::Error) -> Option<SubfailCode> {
+    match error.kind() {
+        io::ErrorKind::InvalidInput => Some(SubfailCode::CursorAhead),
+        io::ErrorKind::WouldBlock => Some(SubfailCode::SessionBusy),
+        _ => None,
+    }
+}
 #[derive(Clone)]
 pub(super) struct Client {
     updates: watch::Sender<Option<Arc<Observation>>>,
@@ -215,9 +229,9 @@ async fn run(
             .ok_or(io::ErrorKind::BrokenPipe)?;
         if let Err(code) = &observation.1 {
             tracing::warn!(code = code.as_str(), "fleet provider unavailable");
-            let _ = frames.send(None);
+            let _ = frames.send(Err(*code));
             if let Some((_, reply)) = request {
-                let _ = reply.send(Err(io::ErrorKind::WouldBlock.into()));
+                let _ = reply.send(Err(unavailable(*code)));
             }
             continue;
         }
@@ -271,7 +285,7 @@ async fn run(
         head.store(next.high_water(), Ordering::Release);
         store = Some(next);
         for delta in deltas {
-            let _ = frames.send(Some(delta));
+            let _ = frames.send(Ok(delta));
             tokio::task::yield_now().await;
         }
         if let Some((after, reply)) = request {
@@ -318,7 +332,8 @@ impl Cut {
             frame
         } else {
             match self.frames.recv().await {
-                Ok(Some(frame)) => frame,
+                Ok(Ok(frame)) => frame,
+                Ok(Err(code)) => return Err(unavailable(code)),
                 Err(broadcast::error::RecvError::Lagged(_)) => lagged(),
                 _ => return Err(io::ErrorKind::BrokenPipe.into()),
             }
@@ -365,13 +380,11 @@ pub(super) async fn replay(
     after: Option<u64>,
     protocol: u32,
 ) -> Result<(), Option<SubfailCode>> {
-    let mut cut = client.subscribe(after).await.map_err(|e| {
-        (e.kind() == io::ErrorKind::InvalidInput).then_some(SubfailCode::CursorAhead)
-    })?;
+    let mut cut = client.subscribe(after).await.map_err(refusal)?;
     loop {
         let mut frame = cut.next(id).await.map_err(|error| {
             crate::logging::client_wire_unavailable("fleet_replay", Some(error.kind()));
-            None
+            refusal(error)
         })?;
         // Node/project kinds belong to the initial unreleased wire version 1.
         // A lower protocol receives the lossless sender-scoped unknown wrapper.

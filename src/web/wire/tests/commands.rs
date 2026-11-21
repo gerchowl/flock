@@ -1160,3 +1160,135 @@ fn subscription_resource_refusal_and_invalid_probes_are_audited() {
 }
 
 mod ownership;
+
+#[test]
+fn ended_history_cut_recovers_after_restart_without_losing_the_socket() {
+    runtime(async {
+        let mut case = Case::new(183193).await;
+        let mut socket = case.open().await;
+        socket.send(json!({"t":"sub","sub_id":"before-restart","stream":format!("agent/{}",case.worker.id)})).await;
+        let mut cursor = 0;
+        loop {
+            let Received::Text(frame) = case.frame(&mut socket).await else {
+                panic!("history socket ended");
+            };
+            if let Some(seq) = frame["seq"].as_u64() {
+                cursor = seq;
+            }
+            if frame["t"] == "synced" {
+                break;
+            }
+            assert_eq!(frame["t"], "ev");
+        }
+        case.worker
+            .finish(
+                &mut case.app.state.structured_agents,
+                &mut case.app.structured_workers,
+                &case.notify,
+                Instant::now(),
+                None,
+            )
+            .await;
+        let fixture = case.worker.fixture.clone();
+        let path = fixture.root.path().join("queue.sock");
+        fs::remove_file(&path).unwrap();
+        let listener = tokio::net::UnixListener::bind(path).unwrap();
+        let launch = crate::structured::workers::Launch {
+            profile_identity: None,
+            opening_turn: None,
+            agent_id: case.worker.id.clone(),
+            generation: case.worker.generation,
+            leases: case.worker.leases.clone(),
+            state: fixture.root.path().to_owned(),
+            storage: Default::default(),
+            mcp: fixture.mcp(),
+            stall_after: Duration::from_secs(60),
+            queue_rewrite_bytes: crate::config::Config::default()
+                .sessions
+                .queue_rewrite_bytes,
+            lineage: None,
+            admission: None,
+        };
+        case.worker.generation = case
+            .app
+            .structured_workers
+            .start(
+                &mut case.app.state.structured_agents,
+                launch,
+                case.worker.factory("queue", vec![]),
+            )
+            .unwrap();
+        case.driver = within(listener.accept()).await.unwrap().0;
+        case.worker
+            .ready(
+                &mut case.app.state.structured_agents,
+                &mut case.app.structured_workers,
+                &case.notify,
+                Instant::now(),
+            )
+            .await;
+
+        within(async {
+            loop {
+                let Received::Text(frame) = case.frame(&mut socket).await else {
+                    panic!("restart closed the socket");
+                };
+                if frame["t"] == "ev" {
+                    assert_eq!(frame["sub_id"], "before-restart");
+                    cursor = frame["seq"].as_u64().unwrap();
+                    continue;
+                }
+                assert_eq!(frame["t"], "lagged");
+                assert_eq!(frame["sub_id"], "before-restart");
+                break;
+            }
+        })
+        .await;
+        socket.send(json!({"t":"sub","sub_id":"after-restart","stream":format!("agent/{}",case.worker.id),"after":cursor})).await;
+        loop {
+            let Received::Text(frame) = case.frame(&mut socket).await else {
+                panic!("history socket ended");
+            };
+            if let Some(seq) = frame["seq"].as_u64() {
+                cursor = seq;
+            }
+            if frame["t"] == "synced" {
+                break;
+            }
+            assert_eq!(frame["t"], "ev");
+        }
+        let event = crate::structured::workers::tests::event("assistant");
+        let expected = event["message"]["content"][0]["text"].clone();
+        within(
+            case.driver
+                .write_all(format!("{}\n", json!({"op":"event","event":event})).as_bytes()),
+        )
+        .await
+        .unwrap();
+        within(async {
+            loop {
+                let Received::Text(frame) = case.frame(&mut socket).await else {
+                    panic!("missing replacement producer event");
+                };
+                assert_eq!(frame["t"], "ev");
+                assert_eq!(frame["sub_id"], "after-restart");
+                let seq = frame["seq"].as_u64().unwrap();
+                assert!(seq > cursor);
+                cursor = seq;
+                match frame["ev"]["type"].as_str() {
+                    Some("system") => assert!(matches!(
+                        frame["ev"]["subtype"].as_str(),
+                        Some("hook_started" | "init")
+                    )),
+                    Some("assistant") => {
+                        assert_eq!(frame["ev"]["message"]["content"][0]["text"], expected);
+                        break;
+                    }
+                    _ => panic!("unexpected replacement producer event: {frame:?}"),
+                }
+            }
+        })
+        .await;
+        case.stop().await;
+    });
+}
