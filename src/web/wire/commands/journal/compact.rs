@@ -1,4 +1,6 @@
 //! Fixed-prefix copying and bounded publication. Opaque journals stay untouched.
+#[cfg(test)]
+use super::std;
 use super::*;
 /// Growth threshold; expired claims independently trigger sweeps without new bytes.
 pub(super) const THRESHOLD: u64 = 8 * 1024 * 1024;

@@ -624,7 +624,17 @@ fn joined_origin_loss_releases_an_unsent_ack_still_owned_by_the_command() {
     runtime(joined_publication(true));
 }
 
-async fn capacity_publication(near_capacity: bool, report: bool) -> (u64, u64) {
+async fn capacity_publication(near_capacity: bool, report: bool, race: bool) -> (u64, u64) {
+    TestClock::new()
+        .scope(Box::pin(capacity_publication_scoped(
+            near_capacity,
+            report,
+            race,
+        )))
+        .await
+}
+
+async fn capacity_publication_scoped(near_capacity: bool, report: bool, race: bool) -> (u64, u64) {
     let mut case = Case::new(183201).await;
     let clock = case.server.clock.clone();
     if near_capacity {
@@ -644,45 +654,79 @@ async fn capacity_publication(near_capacity: bool, report: bool) -> (u64, u64) {
             break;
         }
     }
-    let written = Arc::new(AtomicU64::new(0));
-    case.server
-        .core
-        .journal
-        .observe_writes_test(written.clone())
-        .await;
+    let observation = case.server.core.journal.observe_writes_test();
+    let observed = observation.clone();
     let syncs = Arc::new(Mutex::new(Vec::new()));
     let samples = syncs.clone();
+    let (claimed, claim_ready) = oneshot::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let mut claimed = Some(claimed);
     case.server
         .core
         .journal
         .configure_test(
             None,
             Some(Box::new(move || {
-                samples.lock().unwrap().push(written.load(Ordering::SeqCst));
+                samples.lock().unwrap().push(observed.sample().appended);
+                if race {
+                    if let Some(claimed) = claimed.take() {
+                        claimed.send(()).unwrap();
+                        released
+                            .recv()
+                            .expect("compaction race controller disappeared");
+                    }
+                }
             })),
         )
         .await;
-    let start = Instant::now();
-    socket.send(json!({"t":"cmd","cmd_id":"capacity-command","verb":"agent.decide","args":args,"resume_only":false})).await;
+    let start = report.then(Instant::now);
+    if race {
+        enqueue(&case, &mut socket, "capacity-command", &args).await;
+        case.service();
+        within(claim_ready).await.unwrap();
+        release.send(()).unwrap();
+        // Let the copier publish before the owner consumes the durable claim.
+        // This forces Finish to use the replacement file without wall time.
+        within(observation.renamed()).await;
+        assert_eq!(syncs.lock().unwrap().len(), 1);
+    } else {
+        socket.send(json!({"t":"cmd","cmd_id":"capacity-command","verb":"agent.decide","args":args,"resume_only":false})).await;
+    }
     let Received::Text(ack) = clock.within(case.frame_without_deadline(&mut socket)).await else {
         panic!("ack missing");
     };
     assert_eq!(ack["t"], "ack");
     assert_eq!(ack["ok"], true);
-    let acknowledged = Instant::now();
+    let acknowledged = report.then(Instant::now);
     let Received::Text(frame) = clock.within(case.frame_without_deadline(&mut socket)).await else {
         panic!("close missing");
     };
     assert_eq!(frame["ev"]["state"], "closed");
-    if report {
+    if let (Some(start), Some(acknowledged)) = (start, acknowledged) {
         eprintln!("capacity real wire claim+dispatch+finish+ACK {:?}; ACK receive to caused publication receive {:?}", acknowledged.duration_since(start), acknowledged.elapsed());
     }
     let rows = syncs.lock().unwrap().clone();
     assert_eq!(rows.len(), 2, "one sync per claim and finish");
     let deltas = (rows[0], rows[1] - rows[0]);
+    assert!(
+        deltas.0 < 2048 && deltas.1 < 2048,
+        "foreground journal I/O exceeded one record: {deltas:?}"
+    );
+    if near_capacity {
+        within(observation.renamed()).await;
+    }
+    let counts = observation.sample();
+    assert_eq!(counts.other, 0, "unexpected journal-directory writes");
+    assert_eq!(
+        counts.appended, rows[1],
+        "writes outside claim/finish syncs"
+    );
     let path = case.server._root.path().join("wire/commands.jsonl");
     use std::io::{Read, Seek, SeekFrom};
     let mut file = fs::File::open(path).unwrap();
+    // One background snapshot may copy the retained log once, including catch-up.
+    assert!(counts.compacted <= file.metadata().unwrap().len());
+    assert_eq!(counts.renames, usize::from(near_capacity));
     file.seek(SeekFrom::End(-(rows[1] as i64))).unwrap();
     let mut tail = Vec::new();
     file.read_to_end(&mut tail).unwrap();
@@ -708,7 +752,7 @@ async fn capacity_publication(near_capacity: bool, report: bool) -> (u64, u64) {
 
 #[test]
 fn capacity_silent_producer_fails_when_injected_deadline_expires() {
-    runtime(async {
+    runtime(TestClock::new().scope(async {
         let clock = TestClock::new();
         let timer = clock.clone();
         let producer = tokio::spawn(async move {
@@ -724,14 +768,44 @@ fn capacity_silent_producer_fails_when_injected_deadline_expires() {
             panic.downcast_ref::<&str>(),
             Some(&"transport producer stayed silent on injected clock")
         );
-    });
+    }));
+}
+
+#[test]
+fn capacity_scope_injects_wire_and_worker_harness_deadlines() {
+    runtime(TestClock::new().scope(async {
+        for worker_wait in [false, true] {
+            let clock = TestClock::new();
+            let timer = clock.clone();
+            let pending = tokio::spawn(async move {
+                timer
+                    .scope(async {
+                        if worker_wait {
+                            crate::structured::workers::tests::wait(
+                                &Arc::new(tokio::sync::Notify::new()),
+                                || false,
+                            )
+                            .await;
+                        } else {
+                            within(std::future::pending::<()>()).await;
+                        }
+                    })
+                    .await;
+            });
+            let deadline = if worker_wait { 10000 } else { 5000 };
+            clock.deadline(deadline).await;
+            assert!(!pending.is_finished());
+            clock.advance(deadline);
+            assert!(within(pending).await.unwrap_err().is_panic());
+        }
+    }));
 }
 
 #[test]
 fn near_global_capacity_publication_writes_one_record_per_claim_and_finish() {
     runtime(async {
-        let empty = capacity_publication(false, false).await;
-        let full = capacity_publication(true, false).await;
+        let empty = capacity_publication(false, false, false).await;
+        let full = capacity_publication(true, false, false).await;
         // Normalize variable decimal widths of the timestamp and payload digest.
         assert_eq!(empty, full);
         assert!(full.0 < 2048 && full.1 < 2048);
@@ -739,10 +813,17 @@ fn near_global_capacity_publication_writes_one_record_per_claim_and_finish() {
 }
 
 #[test]
+fn near_global_capacity_publication_survives_compaction_between_claim_and_finish() {
+    runtime(async {
+        capacity_publication(true, false, true).await;
+    });
+}
+
+#[test]
 #[ignore = "reporting probe; run just capacity-publication-probe"]
 fn near_global_capacity_publication_latency_report() {
     runtime(async {
-        capacity_publication(true, true).await;
+        capacity_publication(true, true, false).await;
     });
 }
 

@@ -2,7 +2,12 @@
 //! Opening and shutdown are asynchronous lease barriers. Compaction copies a fixed
 //! prefix off-thread, catches up appends, then publishes a bounded tail atomically.
 use super::{ack, Command, ErrorCode, ServerFrame};
+#[cfg(not(test))]
 use crate::platform::{file_lock::LockFile, structured as files};
+#[cfg(test)]
+pub(in crate::web::wire) mod filesystem;
+#[cfg(test)]
+use filesystem::{files, std, LockFile};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -76,8 +81,6 @@ pub(super) enum Admission {
 pub(super) enum Operation {
     #[cfg(test)]
     SeedCapacity,
-    #[cfg(test)]
-    ObserveWrites(Arc<std::sync::atomic::AtomicU64>),
 
     Claim {
         namespace: String,
@@ -406,11 +409,6 @@ impl Journal {
         files::rollout_identity(&self.file, &self.root.join("commands.jsonl"))
             .map_err(|_| ErrorCode::SessionUnconfirmed)?;
         match operation {
-            #[cfg(test)]
-            Operation::ObserveWrites(observed) => {
-                self.file.observed = Some(observed);
-                Ok(Admission::Pending(0))
-            }
             #[cfg(test)]
             Operation::SeedCapacity => {
                 self.seed_capacity_test()

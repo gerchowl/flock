@@ -11,7 +11,7 @@ use std::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 async fn within<T>(work: impl Future<Output = T>) -> T {
-    tokio::time::timeout(Duration::from_secs(5), work)
+    crate::test_support::deadline::timeout(Duration::from_secs(5), work)
         .await
         .expect("transport producer stayed silent")
 }
@@ -32,6 +32,17 @@ impl TestClock {
             signal,
             deadlines: Mutex::new(Vec::new()),
         }))
+    }
+    async fn scope<T>(&self, work: impl Future<Output = T>) -> T {
+        let clock = self.clone();
+        crate::test_support::deadline::scope(
+            Arc::new(move |duration| {
+                let clock = clock.clone();
+                Box::pin(async move { clock.until(clock.now() + duration).await })
+            }),
+            work,
+        )
+        .await
     }
     async fn within<T>(&self, work: impl Future<Output = T>) -> T {
         tokio::select! {
