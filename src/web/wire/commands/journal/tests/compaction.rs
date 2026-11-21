@@ -156,8 +156,7 @@ fn concurrent_appends_and_multiple_catchup_rounds_keep_exact_index_and_first_out
     assert!(
         matches!(journal.claim("local", "p", &command("keep"), NOW).unwrap(), Admission::Replayed(frame) if frame == first)
     );
-    let records =
-        serde_json::to_value(&journal.index.records.values().collect::<Vec<_>>()).unwrap();
+    let records = serde_json::to_value(journal.index.records.values().collect::<Vec<_>>()).unwrap();
     let counts = journal.index.counts.clone();
     drop(journal);
     let recovered = Journal::open(root.path()).unwrap();
@@ -343,7 +342,8 @@ fn crash_at_each_compaction_step_leaves_a_complete_replayable_old_or_new_log() {
             .unwrap();
         let before = filesystem::fs::read(root.path().join("wire/commands.jsonl")).unwrap();
         drop(journal);
-        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        let mut child =
+            crate::process::TracedCommand::new(std::env::current_exe().unwrap(), "journal-test");
         child
             .args([
                 "--exact",
@@ -355,7 +355,7 @@ fn crash_at_each_compaction_step_leaves_a_complete_replayable_old_or_new_log() {
             .env_remove("FLOCK_SOCKET_PATH")
             .env_remove("FLOCK_PANE_ID")
             .env_remove("FLOCK_AGENT_ID");
-        let mut child = child.spawn().unwrap();
+        let mut child = child.spawn_traced().unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         let status = loop {
             if let Some(status) = child.try_wait().unwrap() {

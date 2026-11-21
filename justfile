@@ -55,7 +55,7 @@ lint: changelog-check journal-io-check ts-check client-lint
     cargo fmt --check
     cargo clippy --all-targets --locked -- -D warnings
     cargo clippy --all-targets --locked --features ts -- -D warnings
-    cargo clippy --locked --bin flk --features web -- -D warnings
+    cargo clippy --all-targets --locked --features {{ci_features}} -- -D warnings
 
 # Keep all journal I/O observable, including fully qualified filesystem paths.
 journal-io-check:
