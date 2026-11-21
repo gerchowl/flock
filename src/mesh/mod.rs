@@ -15,3 +15,9 @@ pub mod collect;
 
 pub mod routes;
 pub mod sign;
+
+pub(crate) mod version_gate;
+
+// Dormant VERSION 6 transport API; M2/M3 supply admission and gateway callers.
+#[allow(dead_code)]
+pub(crate) mod command;

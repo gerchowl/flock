@@ -1,7 +1,8 @@
 //! Server-owned, opt-in structured transport; no PTY or model dispatch.
 mod commands;
-mod fleet;
+pub(crate) mod fleet;
 mod output;
+mod refusals;
 mod subscriptions;
 pub(crate) mod timing;
 #[cfg(test)]
@@ -54,6 +55,7 @@ const GOING_AWAY_CLOSE: u16 = 1001;
 const POLICY_VIOLATION_CLOSE: u16 = 1008;
 /// Socket identity remains owned until teardown; later dispatch uses this verified session.
 struct Client {
+    causal: crate::structured::publication::causal::Origin,
     session: Session,
     read_only: bool,
     data: mpsc::Sender<output::Delivery>,
@@ -63,6 +65,7 @@ struct Shared {
     fleet: fleet::Client,
     histories: crate::structured::history::owner::Client,
     commands: commands::Client,
+    refusals: refusals::Refusals,
     store: Arc<Store>,
     epoch: String,
     clock: Arc<dyn Clock>,
@@ -106,6 +109,7 @@ impl Drop for Lease {
 pub(crate) struct Core {
     owner: crate::structured::history::owner::Owner,
     command_owner: commands::Owner,
+    journal: commands::Ownership,
     admission: super::local_admission::Owner,
     shared: Arc<Shared>,
     fleet_nodes: fleet::Nodes,
@@ -113,20 +117,32 @@ pub(crate) struct Core {
 impl Drop for Core {
     fn drop(&mut self) {
         self.shared.stop.send_replace(true);
+        self.journal.stop();
     }
 }
 impl Core {
     /// New server epoch, independent of durable stream cursors or command identities.
     #[cfg(test)]
     pub(crate) async fn new(data: PathBuf, wake: Arc<tokio::sync::Notify>) -> io::Result<Self> {
-        Self::new_shared(data, wake, Owner::default()).await
+        Self::new_shared(
+            data,
+            wake,
+            Owner::default(),
+            crate::api::EventHub::default(),
+            false,
+        )
+        .await
     }
     /// Share the socket owner's memory domain; opening runs on the bounded I/O worker.
+    /// Deferred importer preparation acquires the journal only after ownership commit.
     pub(crate) async fn new_shared(
         data: PathBuf,
         wake: Arc<tokio::sync::Notify>,
         owner: Owner,
+        event_hub: crate::api::EventHub,
+        deferred: bool,
     ) -> io::Result<Self> {
+        let journal_data = data.clone();
         let store = super::store_io::shared()
             .run(move || {
                 owner.get(
@@ -139,36 +155,48 @@ impl Core {
             .await
             .ok_or_else(|| io::Error::other("client token store worker unavailable"))?
             .map_err(io::Error::other)?;
-        Self::from_store(store, Arc::new(SystemClock), wake)
+        let core = Self::from_store(store, Arc::new(SystemClock), wake, journal_data)?;
+        if !deferred {
+            core.acquire_commands().await?;
+        }
+        core.shared.refusals.attach(event_hub);
+        Ok(core)
     }
     /// Embed with a supplied monotonic clock shared by credential and transport deadlines.
     #[cfg(test)]
-    pub(crate) fn with_clock(
+    pub(crate) async fn with_clock(
+        data: PathBuf,
         store: TokenStore,
         clock: Arc<dyn Clock>,
         wake: Arc<tokio::sync::Notify>,
     ) -> io::Result<Self> {
-        Self::from_store(
+        let core = Self::from_store(
             Arc::new(Store::new(store, Arc::new(AppClock::new(clock.clone())))),
             clock,
             wake,
-        )
+            data,
+        )?;
+        core.acquire_commands().await?;
+        Ok(core)
     }
     fn from_store(
         store: Arc<Store>,
         clock: Arc<dyn Clock>,
         wake: Arc<tokio::sync::Notify>,
+        data: PathBuf,
     ) -> io::Result<Self> {
         let epoch = store.random::<16>().map_err(io::Error::other)?;
         let (stop, _) = watch::channel(false);
         let fleet = fleet::Client::new(wake.clone(), stop.subscribe());
-        let (commands, command_owner) = commands::channel(wake.clone());
+        let journal = commands::Ownership::new(data, wake.clone());
+        let (commands, command_owner) = commands::channel(wake.clone(), journal.clone());
         let (admission, admission_owner) = super::local_admission::channel(wake.clone());
         let (histories, owner) = crate::structured::history::owner::channel(wake);
         Ok(Self {
             fleet_nodes: Default::default(),
             owner,
             command_owner,
+            journal,
             admission: admission_owner,
             shared: Arc::new(Shared {
                 histories,
@@ -176,6 +204,7 @@ impl Core {
                 fleet,
                 store,
                 epoch,
+                refusals: refusals::Refusals::new(clock.now()),
                 clock,
                 slots: Arc::new(Semaphore::new(CONNECTIONS as usize)),
                 hellos: std::array::from_fn(|_| Arc::new(Semaphore::new(PENDING_HELLOS))),
@@ -246,14 +275,31 @@ impl Core {
     }
     /// Admit commands on the same owner that services structured workers.
     pub(crate) fn service_commands(&mut self, app: &mut crate::app::App) {
+        self.shared.refusals.attach(app.event_hub.clone());
+        self.shared.refusals.tick(self.shared.clock.now());
         self.admission.service(app);
-        self.command_owner.service(app);
+        self.command_owner
+            .service(app, &self.shared, &mut self.fleet_nodes);
+    }
+    /// Fence durable command admission before draining the journal for handoff.
+    pub(crate) async fn freeze_commands(&self) -> io::Result<()> {
+        self.journal.freeze().await.map_err(io::Error::other)
+    }
+    pub(crate) fn reopen_commands(
+        &self,
+    ) -> tokio::task::JoinHandle<Result<(), crate::api::error_code::ErrorCode>> {
+        self.journal.reopen()
+    }
+    pub(crate) async fn acquire_commands(&self) -> io::Result<()> {
+        self.journal.acquire().await.map_err(io::Error::other)
     }
     /// Stop and drain every transport lease even when app revocation fails.
-    /// Revocation and lease draining each have a five-second caller budget.
+    /// Revocation and transport draining each have a five-second caller budget.
+    /// The journal adds a one-second caller wait; abandoned I/O retains its lease.
     /// Abandoned store workers retain their slots/fences until actual completion
     /// (#2742); a timeout does not claim a blocking syscall was cancelled.
     pub(crate) async fn shutdown(&self) -> io::Result<()> {
+        self.journal.stop();
         let store = self.shared.store.clone();
         let revocation = match tokio::time::timeout(SHUTDOWN_WAIT, mutate_apps(store, None)).await {
             Ok(out) => out
@@ -280,7 +326,9 @@ impl Core {
         .await
         .map(|_| ())
         .map_err(io::Error::other);
-        revocation.and(drained)
+        self.shared.refusals.flush(self.shared.clock.now());
+        let journal = self.journal.shutdown().await.map_err(io::Error::other);
+        revocation.and(drained).and(journal)
     }
 }
 /// Test adapter: clock waits share an elapsed origin without changing transport timing.
@@ -559,6 +607,7 @@ async fn connection(
                         clients.insert(
                             id,
                             Client {
+                                causal: Default::default(),
                                 session: session.clone(),
                                 read_only,
                                 data,
@@ -598,7 +647,7 @@ async fn connection(
         }
     };
     // ADR-0036 §5/§6: advertise exact grants, while admission rechecks authority.
-    let capabilities = session
+    let mut capabilities: Vec<String> = session
         .info
         .scopes
         .iter()
@@ -613,6 +662,7 @@ async fn connection(
             .to_owned()
         })
         .collect();
+    capabilities.push("resume_probe".to_owned());
     let principal = session.info.principal.clone();
     let welcome = ServerFrame::Welcome {
         protocol: WIRE_JSON_VERSION,
@@ -673,6 +723,7 @@ async fn connection(
     .for_protocol(client_protocol);
     let mut running = tokio::task::JoinSet::new();
     let mut heartbeat = Heartbeat::new(shared.clock.now());
+    let probe_slots = Arc::new(Semaphore::new(1));
     let mut code = loop {
         tokio::select! { biased;
             code = &mut lifetime => break code,
@@ -691,17 +742,32 @@ async fn connection(
             _ = shared.clock.until(heartbeat.next_ping) => {
                 let Some(nonce) = heartbeat.ping(shared.clock.now(), &format!("{}/{id}", shared.epoch)) else { break unavailable("heartbeat_budget") };
                 let Some(frame) = output::encode(ServerFrame::Ping { nonce }) else { break unavailable("ping_encoding") };
-                if priority.try_send(frame).is_err() { break unavailable("control_capacity"); }
+                if priority.try_send(frame.into()).is_err() { break unavailable("control_capacity"); }
             }
             frame = stream.next() => match frame {
                 Some(Ok(Message::Text(text))) => match serde_json::from_str(&text) {
-                    Ok(ClientFrame::Pong { nonce }) => heartbeat.pong(&nonce, shared.clock.now()),
+                    Ok(ClientFrame::Ping { nonce }) => {
+                        let reason = if timing::valid_nonce(&nonce) { crate::api::error_code::ErrorCode::SessionBusy } else { crate::api::error_code::ErrorCode::InvalidParams };
+                        if let Some(reply) = output::probe(nonce, &probe_slots) {
+                            if priority.try_send(reply).is_err() {
+                                shared.refusals.control(shared.clock.now(), &session.info, "ping", crate::api::error_code::ErrorCode::SessionBusy);
+                                break unavailable("control_capacity");
+                            }
+                        } else {
+                            shared.refusals.control(shared.clock.now(), &session.info, "ping", reason);
+                        }
+                    }
+                    Ok(ClientFrame::Pong { nonce }) => {
+                        if !heartbeat.pong(&nonce, shared.clock.now()) {
+                            shared.refusals.control(shared.clock.now(), &session.info, "pong", crate::api::error_code::ErrorCode::InvalidParams);
+                        }
+                    },
                     Ok(ClientFrame::Sub { sub_id, stream, after }) => {
                         if !subscriptions.subscribe(sub_id, stream, after) { break unavailable("subscription_capacity") }
                     }
                     Ok(ClientFrame::Unsub { sub_id }) => subscriptions.unsubscribe(&sub_id),
                     Ok(ClientFrame::Cmd { cmd_id, verb, args, resume_only }) => {
-                        let refusal = if !matches!(verb.as_str(), "agent.send" | "agent.decide") || read_only {
+                        let refusal = if commands::known_verb(&verb).is_none() || read_only {
                             Some(crate::api::error_code::ErrorCode::ServerVersionGap)
                         } else if cmd_id.len() > 128 {
                             Some(crate::api::error_code::ErrorCode::InvalidParams)
@@ -709,24 +775,35 @@ async fn connection(
                             Some(crate::api::error_code::ErrorCode::SessionBusy)
                         } else { None };
                         if let Some(code) = refusal {
+                            shared.refusals.record(shared.clock.now(), &session.info, &verb, &args, code);
                             let Some(ack) = output::encode(commands::ack(cmd_id, Err(code))) else { break unavailable("ack_encoding") };
                             tokio::select! { biased;
                                 _ = stop.changed() => return,
                                 _ = revoked.changed() => break AUTH_REVOKED_CLOSE,
                                 _ = &mut writer => return,
                                 _ = shared.clock.until(heartbeat.expires()) => break unavailable("heartbeat_expired"),
-                                sent = priority.send(ack) => if sent.is_err() { return },
+                                sent = priority.send(ack.into()) => if sent.is_err() { return },
                             }
                             continue;
                         }
-                        running.spawn(commands::execute(shared.clone(), session.clone(), data.clone(), commands::Command { id: cmd_id, verb, args, resume_only, read_only }));
+                        running.spawn(commands::execute(shared.clone(), session.clone(), data.clone(), commands::Command { id: cmd_id, verb, args, resume_only, read_only }, id));
                     }
-                    _ => break POLICY_VIOLATION_CLOSE,
+                    _ => {
+                        let frame = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
+                        shared.refusals.malformed(shared.clock.now(), &session.info, &frame);
+                        break POLICY_VIOLATION_CLOSE;
+                    },
                 },
-                Some(Ok(Message::Binary(_))) => break POLICY_VIOLATION_CLOSE,
+                Some(Ok(Message::Binary(_))) => {
+                    shared.refusals.malformed(shared.clock.now(), &session.info, &serde_json::Value::Null);
+                    break POLICY_VIOLATION_CLOSE;
+                },
                 Some(Ok(Message::Ping(_) | Message::Pong(_))) => (),
                 Some(Ok(Message::Close(_))) => break unavailable("peer_close"),
-                Some(Err(_)) => break unavailable("peer_transport"),
+                Some(Err(_)) => {
+                    shared.refusals.control(shared.clock.now(), &session.info, "protocol", crate::api::error_code::ErrorCode::InternalError);
+                    break unavailable("peer_transport");
+                },
                 None => break unavailable("peer_eof"),
             }
         }
@@ -756,7 +833,7 @@ async fn connection(
             code = GOING_AWAY_CLOSE;
         }
     }
-    if priority.try_send(close(code)).is_ok() {
+    if priority.try_send(close(code).into()).is_ok() {
         tokio::select! { biased; _ = &mut writer => (), _ = shared.clock.until(close_deadline) => () }
     }
 }

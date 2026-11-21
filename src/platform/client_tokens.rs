@@ -29,7 +29,11 @@ pub(crate) struct Namespace {
 }
 impl Namespace {
     pub(crate) fn open(data: &Path) -> io::Result<Self> {
-        let root = data.canonicalize()?.join("client-tokens");
+        Self::open_named(data, "client-tokens")
+    }
+    pub(crate) fn open_named(data: &Path, name: &str) -> io::Result<Self> {
+        Self::name(name)?;
+        let root = data.canonicalize()?.join(name);
         super::structured::ensure_private_dir(&root)?;
         let directory = OpenOptions::new()
             .read(true)

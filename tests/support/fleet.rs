@@ -62,6 +62,8 @@ pub struct NodeSpec {
     /// setting the shared fixture does not carry.
     pub extra_config: &'static str,
     pub mesh: MeshMode,
+    /// Additional sandbox executables, after the SSH shim and before ambient PATH.
+    pub tool_path: Option<PathBuf>,
     pub push_concurrency: Option<usize>,
     /// How long a hub waits on a looping route before reporting it (#928).
     pub loop_grace_ms: Option<u64>,
@@ -79,6 +81,7 @@ impl NodeSpec {
             peers,
             extra_config: "",
             mesh: MeshMode::Native,
+            tool_path: None,
             push_concurrency: None,
             loop_grace_ms: None,
         }
@@ -91,6 +94,11 @@ impl NodeSpec {
 
     pub const fn with_loop_grace_ms(mut self, ms: u64) -> Self {
         self.loop_grace_ms = Some(ms);
+        self
+    }
+
+    pub fn with_tool_path(mut self, path: PathBuf) -> Self {
+        self.tool_path = Some(path);
         self
     }
 
@@ -120,6 +128,8 @@ pub enum MeshMode {
     RelayReset,
     LegacyDialer,
     VersionMismatch(u32),
+    /// Explicit range for negotiation probes, independent of the compiled VERSION.
+    VersionRange(u32, u32),
 }
 
 /// A spawned node, with everything a test needs to talk to it.
@@ -132,6 +142,7 @@ pub struct Node {
     pub client_socket: PathBuf,
     pub repo: PathBuf,
     shim_dir: PathBuf,
+    tool_path: Option<PathBuf>,
     mesh: MeshMode,
     push_concurrency: Option<usize>,
     loop_grace_ms: Option<u64>,
@@ -228,8 +239,20 @@ impl Node {
         if let MeshMode::VersionMismatch(version) = self.mesh {
             cmd.env("FLOCK_TEST_MESH_VERSION", version.to_string());
         }
+        if let MeshMode::VersionRange(min, max) = self.mesh {
+            cmd.env("FLOCK_TEST_MESH_MIN", min.to_string());
+            cmd.env("FLOCK_TEST_MESH_VERSION", max.to_string());
+        }
         let outer_path = std::env::var("PATH").unwrap_or_default();
-        cmd.env("PATH", format!("{}:{outer_path}", self.shim_dir.display()));
+        let tools = self
+            .tool_path
+            .as_ref()
+            .map(|path| format!("{}:", path.display()))
+            .unwrap_or_default();
+        cmd.env(
+            "PATH",
+            format!("{}:{tools}{outer_path}", self.shim_dir.display()),
+        );
         super::environment::assert_pty_isolated(&cmd);
         let child = super::environment::spawn_pty(pair.slave.as_ref(), cmd).unwrap();
         drop(pair.slave);
@@ -664,9 +687,13 @@ pub fn spawn_with_startup_probe(
             // Remote commands use a login shell. System profiles can reset
             // PATH, so the sandbox supplies its own path to the test binary.
             let fixture_path = format!(
-                "{}:{}:{}",
+                "{}:{}:{}{}",
                 bin_dir.display(),
                 shim_dir.display(),
+                spec.tool_path
+                    .as_ref()
+                    .map(|path| format!("{}:", path.display()))
+                    .unwrap_or_default(),
                 std::env::var("PATH").unwrap_or_default()
             );
             fs::write(
@@ -684,6 +711,7 @@ pub fn spawn_with_startup_probe(
                 client_socket: path.client_socket.clone(),
                 repo: path.repo.clone(),
                 shim_dir: shim_dir.clone(),
+                tool_path: spec.tool_path.clone(),
                 mesh: spec.mesh,
                 push_concurrency: spec.push_concurrency,
                 loop_grace_ms: spec.loop_grace_ms,

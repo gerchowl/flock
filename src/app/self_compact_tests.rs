@@ -668,9 +668,9 @@ async fn the_continuation_lands_in_the_panes_prompt_history() {
 /// submits the command. An agent arms mid-turn, so a turn longer than the
 /// timeout used to leave `/compact` typed and then dropped before its Enter.
 ///
-/// Driven in real time with a tiny timeout rather than by moving the clock
-/// forward: a synthetic future collides with the hook's own real clock, and a
-/// test that has to reconcile two clocks is testing the harness, not the rule.
+/// Drive the tick and session-start handler with the same injected time, as
+/// the pure state-machine tests do. The socket-to-hook routing is covered by
+/// `the_whole_sequence_runs_unattended` above.
 #[tokio::test]
 async fn a_turn_longer_than_the_timeout_still_completes() {
     let Rig {
@@ -690,8 +690,8 @@ async fn a_turn_longer_than_the_timeout_still_completes() {
         Instant::now(),
     );
     arm(&mut app, &pane, "carry on");
-    std::thread::sleep(Duration::from_millis(40));
-    app.tick_self_compacts(Instant::now());
+    let now = Instant::now() + Duration::from_millis(40);
+    app.tick_self_compacts(now);
     assert!(
         written(&mut pty).is_empty(),
         "still mid-turn: nothing may be typed"
@@ -699,19 +699,37 @@ async fn a_turn_longer_than_the_timeout_still_completes() {
 
     // The turn ends, far later than the timeout measured from arming would
     // allow.
-    claude_idle_for(&mut app, SETTLED);
-    app.tick_self_compacts(Instant::now());
+    claude_idle_at(&mut app, SETTLED, now);
+    app.tick_self_compacts(now);
     assert!(
         written(&mut pty).contains("/compact"),
         "a long turn must not eat the timeout: nothing was waiting on the \
          harness until now, so nothing could time out"
     );
-    app.tick_self_compacts(Instant::now() + GAP);
-    session_started_with(&mut app, &pane, "compact");
-    deliver_continuation(&mut app, &mut pty);
+    let now = now + GAP;
+    app.tick_self_compacts(now);
+    app.self_compact_on_session_start(&pane, Some("compact"), now);
+    app.tick_self_compacts(now);
+    assert!(written(&mut pty).contains("carry on"));
+
+    // The normal submit gap exceeds this test's 1 ms timeout. Make Enter due
+    // inside that window without widening the timeout or using a real clock.
+    let submit_at = now + Duration::from_micros(500);
+    terminal(&mut app)
+        .armed_self_compact
+        .as_mut()
+        .expect("the typed continuation is still awaiting Enter")
+        .submit_at = Some(submit_at);
+    app.tick_self_compacts(submit_at);
     assert!(
-        written(&mut pty).contains("carry on"),
-        "and the sequence still completes"
+        !drain(&mut pty).is_empty(),
+        "the continuation's Enter must be a separate write"
+    );
+    assert_eq!(armed_continuation(&app), None);
+    assert_eq!(
+        terminal_const(&app).last_self_compact_completed,
+        Some(submit_at),
+        "the sequence must complete successfully, not time out"
     );
 }
 

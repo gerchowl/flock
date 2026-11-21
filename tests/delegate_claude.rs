@@ -106,6 +106,7 @@ fn write_fake_claude(base: &Path) {
         "#!/bin/sh\n\
          printf '%s\\n' \"$*\" >> '{base}/argv.log'\n\
          printf '%s\\n' \"$PWD\" >> '{base}/cwd.log'\n\
+         printf '%s\\n' \"$CLAUDE_CONFIG_DIR\" >> '{base}/profile.log'\n\
          if [ -e '{base}/die' ]; then exit 1; fi\n\
          ( last=; while :; do now=$(cat '{base}/screen' 2>/dev/null); \
          if [ \"$now\" != \"$last\" ]; then printf '\\033[2J\\033[H%s\\n' \"$now\"; last=$now; fi; \
@@ -119,6 +120,10 @@ fn write_fake_claude(base: &Path) {
 }
 
 fn start_server() -> Server {
+    start_server_with_profile(false)
+}
+
+fn start_server_with_profile(profile: bool) -> Server {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -143,6 +148,15 @@ fn start_server() -> Server {
     )
     .unwrap();
     write_fake_claude(&base);
+    if profile {
+        fs::create_dir_all(base.join("profile")).unwrap();
+    }
+    if profile {
+        let config = config_home.join(app_dir_name()).join("config.toml");
+        let mut contents = fs::read_to_string(&config).unwrap();
+        contents.push_str("\n[structured]\nrun_as = 'operator'\n");
+        fs::write(config, contents).unwrap();
+    }
     support::write_fake_gh(&bin_dir(&base));
 
     let pair = native_pty_system()
@@ -168,8 +182,9 @@ fn start_server() -> Server {
     cmd.env("FLOCK_SOCKET_PATH", &socket);
     cmd.env_remove("FLOCK_CLIENT_SOCKET_PATH");
     cmd.env("SHELL", "/bin/sh");
+    cmd.env_remove("CLAUDE_CONFIG_DIR");
     cmd.env_remove("FLOCK_ENV");
-    cmd.env_remove("FLOCK_HOST_NAME");
+    cmd.env("FLOCK_HOST_NAME", "host");
     cmd.env_remove("FLOCK_DISABLE_SOUND");
     support::environment::assert_pty_isolated(&cmd);
     let child = support::environment::spawn_pty(pair.slave.as_ref(), cmd).unwrap();
@@ -205,7 +220,11 @@ fn command(server: &Server, args: &[&str]) -> Command {
         .env("HOME", server.base.join("home"))
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("PATH", search_path(&server.base));
+        .env("PATH", search_path(&server.base))
+        .env_remove("CLAUDE_CONFIG_DIR");
+    if server.base.join("profile").is_dir() {
+        cmd.env("CLAUDE_CONFIG_DIR", server.base.join("profile"));
+    }
     cmd
 }
 
@@ -416,10 +435,12 @@ fn report_session(server: &Server, pane_id: &str) {
 /// session, under any project directory of the pane's `$HOME`. The slug is a
 /// fixture (`-work`), derived from this fixture's own directory name.
 fn transcript_path(server: &Server) -> PathBuf {
-    server
-        .base
-        .join("home")
-        .join(".claude")
+    let config = if server.base.join("profile").is_dir() {
+        server.base.join("profile")
+    } else {
+        server.base.join("home/.claude")
+    };
+    config
         .join("projects")
         .join("-work")
         .join(format!("{SES}.jsonl"))
@@ -624,7 +645,16 @@ fn committed_repo(server: &Server) -> PathBuf {
 /// table has to get right that a reply cannot show.
 #[test]
 fn c1_claude_start_await_and_result() {
-    let server = start_server();
+    claude_start_await_and_result(false);
+}
+
+#[test]
+fn nondefault_profile_start_await_finds_reply_without_hook_record() {
+    claude_start_await_and_result(true);
+}
+
+fn claude_start_await_and_result(profile: bool) {
+    let server = start_server_with_profile(profile);
     let operator = operator_workspace(&server);
     let before = workspaces(&server).len();
     let b = brief(&server, "task.md", "build it\n");
@@ -689,6 +719,262 @@ fn c1_claude_start_await_and_result() {
     assert_eq!(
         delegate_ws["pane_count"], 1,
         "the workspace holds the agent alone: {delegate_ws}"
+    );
+}
+
+#[test]
+fn nondefault_profile_without_hook_record_resolves_delegate_result_and_fork() {
+    let server = start_server_with_profile(true);
+    operator_workspace(&server);
+    let repo = committed_repo(&server);
+    let b = brief(&server, "profile-task.md", "build it\n");
+    let mut child = cli_spawn(
+        &server,
+        &[
+            "delegate",
+            "start",
+            "profile-delegate",
+            "--harness",
+            "claude",
+            "--brief",
+            &b,
+            "--cwd",
+            repo.to_str().unwrap(),
+            "--settle",
+            SETTLE,
+            "--json",
+        ],
+    );
+    let pane = make_ready(&server, "profile-delegate");
+    wait_typed(&server, 1);
+    assert_eq!(
+        read_lines(&server.base.join("profile.log")),
+        vec![server.base.join("profile").to_string_lossy().into_owned()],
+        "the requested config directory reaches the child"
+    );
+    assert!(exited_within(&mut child, WITHIN).unwrap().success());
+    let out = finish(child);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let rejected = request(
+        &server,
+        &serde_json::json!({
+            "id":"nested", "method":"pane.report_agent_session", "params":{
+                "pane_id":pane, "source":CLAUDE_HOOK_SOURCE, "agent":"claude",
+                "agent_session_id":"nested-session", "session_start_source":"startup"
+            }
+        })
+        .to_string(),
+    );
+    assert!(rejected.get("error").is_none(), "{rejected}");
+    assert!(
+        !server
+            .base
+            .join("state")
+            .join(app_dir_name())
+            .join("claude-config-dirs/nested-session")
+            .exists(),
+        "an unaccepted nested session cannot acquire the pane's config directory"
+    );
+    write_reply(&server, "t1", "DONE: profile reply");
+    let result = command(
+        &server,
+        &["delegate", "result", "profile-delegate", "--json"],
+    )
+    .output()
+    .unwrap();
+    let fork = command(
+        &server,
+        &[
+            "agent",
+            "fork",
+            "profile-delegate",
+            "--branch",
+            "fixture-fork",
+            "--no-pivot",
+        ],
+    )
+    .env_remove("CLAUDE_CONFIG_DIR")
+    .output()
+    .unwrap();
+    assert!(
+        result.status.success() && fork.status.success(),
+        "result: {} {}\nfork: {} {}",
+        stdout(&result),
+        stderr(&result),
+        stdout(&fork),
+        stderr(&fork)
+    );
+}
+
+#[test]
+fn hook_profile_before_launch_report_remains_authoritative() {
+    hook_profile_ordering(true);
+}
+
+#[test]
+fn hook_profile_after_launch_report_replaces_snapshot() {
+    hook_profile_ordering(false);
+}
+
+fn hook_profile_ordering(hook_first: bool) {
+    let server = start_server_with_profile(true);
+    let actual = server.base.join("actual-profile");
+    fs::create_dir_all(&actual).unwrap();
+    let script = bin_dir(&server.base).join("claude");
+    let contents = fs::read_to_string(&script).unwrap();
+    fs::write(
+        &script,
+        contents.replacen(
+            "#!/bin/sh\n",
+            &format!(
+                "#!/bin/sh\nexport CLAUDE_CONFIG_DIR='{}'\n",
+                actual.display()
+            ),
+            1,
+        ),
+    )
+    .unwrap();
+    operator_workspace(&server);
+    let repo = committed_repo(&server);
+    let b = brief(&server, "profile-ordering.md", "build it\n");
+    let mut child = cli_spawn(
+        &server,
+        &[
+            "delegate",
+            "start",
+            "profile-delegate",
+            "--harness",
+            "claude",
+            "--brief",
+            &b,
+            "--cwd",
+            repo.to_str().unwrap(),
+            "--settle",
+            SETTLE,
+            "--json",
+        ],
+    );
+    let pane = delegate_pane(&server, "profile-delegate");
+    let record = server
+        .base
+        .join("state")
+        .join(app_dir_name())
+        .join("claude-config-dirs")
+        .join(SES);
+    if !hook_first {
+        report_session(&server, &pane);
+        assert_eq!(
+            fs::read_to_string(&record).unwrap(),
+            server.base.join("profile").to_str().unwrap()
+        );
+    }
+    // Persist through the real hook, then deliver its report independently.
+    // An unavailable owned socket separates persistence from either report order.
+    let mut hook = command(&server, &["hook", "claude", "session"])
+        .env("FLOCK_SOCKET_PATH", server.base.join("not-listening.sock"))
+        .env("FLOCK_ENV", "1")
+        .env("FLOCK_PANE_ID", &pane)
+        .env("CLAUDE_CONFIG_DIR", &actual)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    hook.stdin
+        .take()
+        .unwrap()
+        .write_all(
+            serde_json::json!({
+                "hook_event_name":"SessionStart", "session_id":SES, "source":"startup"
+            })
+            .to_string()
+            .as_bytes(),
+        )
+        .unwrap();
+    assert!(exited_within(&mut hook, WITHIN)
+        .expect("hook finishes")
+        .success());
+    let out = finish(hook);
+    assert!(out.status.success(), "{}", stderr(&out));
+    report_session(&server, &pane);
+    report(&server, &pane, "idle");
+    wait_typed(&server, 1);
+    assert_eq!(
+        read_lines(&server.base.join("profile.log")),
+        vec![actual.to_string_lossy().into_owned()]
+    );
+    assert!(exited_within(&mut child, WITHIN)
+        .expect("start finishes")
+        .success());
+    let out = finish(child);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        fs::read_to_string(&record).unwrap(),
+        actual.to_str().unwrap(),
+        "the harness hook is authoritative in either ordering"
+    );
+    write_reply(&server, "t1", "DONE: actual profile reply");
+    let transcript = actual.join("projects/-work").join(format!("{SES}.jsonl"));
+    fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+    fs::rename(transcript_path(&server), transcript).unwrap();
+    let result = command(
+        &server,
+        &["delegate", "result", "profile-delegate", "--json"],
+    )
+    .output()
+    .unwrap();
+    let fork = command(
+        &server,
+        &[
+            "agent",
+            "fork",
+            "profile-delegate",
+            "--branch",
+            "fixture-fork",
+            "--no-pivot",
+        ],
+    )
+    .env_remove("CLAUDE_CONFIG_DIR")
+    .output()
+    .unwrap();
+    assert!(
+        result.status.success() && fork.status.success(),
+        "result: {} {}\nfork: {} {}",
+        stdout(&result),
+        stderr(&result),
+        stdout(&fork),
+        stderr(&fork)
+    );
+}
+
+#[test]
+fn structured_start_refuses_an_incompatible_caller_config_directory() {
+    let server = start_server_with_profile(true);
+    let out = command(
+        &server,
+        &[
+            "agent",
+            "start",
+            "profile-structured",
+            "--runtime",
+            "structured",
+            "--cwd",
+            &work_dir(&server),
+            "--",
+            "claude",
+        ],
+    )
+    .output()
+    .unwrap();
+    assert!(!out.status.success(), "{}", stdout(&out));
+    assert!(
+        stderr(&out).contains("structured_profile_mismatch"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(
+        read_lines(&server.base.join("argv.log")).is_empty(),
+        "refusal happens before launching the harness"
     );
 }
 

@@ -41,7 +41,9 @@ async fn fixture_config(
     let owner = Owner::default();
     let store = owner.get(root.path(), ttl).unwrap();
     let wake = Arc::new(tokio::sync::Notify::new());
-    let core = Core::from_store(store, transport_clock, wake.clone()).unwrap();
+    let core =
+        Core::from_store(store, transport_clock, wake.clone(), root.path().to_owned()).unwrap();
+    core.acquire_commands().await.unwrap();
     let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let bind = socket.local_addr().unwrap();
     let mut app = App::new(
@@ -150,7 +152,7 @@ fn socket_mint_is_fixed_scoped_shared_memory_only_and_renews_independently() {
         let mut ws = Socket::open(&server).await;
         let welcome = ws.hello(WIRE_JSON_VERSION, &token.0).await;
         assert_eq!(
-            welcome["capabilities"],
+            granted_scopes(&welcome),
             json!(["read", "send", "answer", "operate"])
         );
         let renewed = mint(&mut app).await;

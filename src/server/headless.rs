@@ -689,12 +689,15 @@ impl HeadlessServer {
         &mut self,
         inherited: Option<std::net::TcpListener>,
         local_owner: Option<crate::ipc::SocketOwner>,
+        deferred: bool,
     ) -> io::Result<()> {
         let data = crate::session::data_dir();
         let core = crate::web::wire::Core::new_shared(
             data.clone(),
             self.app.render_notify.clone(),
             self.app.client_auth.clone(),
+            self.app.event_hub.clone(),
+            deferred,
         )
         .await?;
         self.client_wire = crate::web::client_listener::Listener::prepare(
@@ -779,7 +782,7 @@ impl HeadlessServer {
             }
 
             // 3. Drain API requests.
-            if self.drain_api_requests_with_shutdown_check() {
+            if self.drain_api_requests_with_shutdown_check().await {
                 needs_render = true;
                 needs_full_render = true;
                 crate::render_prof::event("full_render_cause.api_requests");
@@ -1055,7 +1058,7 @@ impl HeadlessServer {
                     }
                 }
                 LoopEvent::Api(msg) => {
-                    if self.handle_api_request_with_shutdown_check(msg) {
+                    if self.handle_api_request_with_shutdown_check(msg).await {
                         needs_render = true;
                         needs_full_render = true;
                     }
@@ -1249,7 +1252,7 @@ impl HeadlessServer {
     }
 
     #[cfg(unix)]
-    fn perform_live_handoff(
+    async fn perform_live_handoff(
         &mut self,
         params: crate::api::schema::ServerLiveHandoffParams,
     ) -> Result<Vec<api::schema::UndrainedPane>, HandoffError> {
@@ -1436,6 +1439,13 @@ impl HeadlessServer {
             .iter()
             .map(|(_, runtime)| runtime.clone())
             .collect();
+        #[cfg(feature = "web")]
+        if let Some(wire) = &self.client_wire {
+            if let Err(error) = wire.freeze_commands().await {
+                self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
+                return Err(error.into());
+            }
+        }
         let store_generation = match crate::mesh::runtime_store::suspend() {
             Ok(generation) => generation,
             Err(err) => {
@@ -1612,7 +1622,7 @@ impl HeadlessServer {
     }
 
     #[cfg(not(unix))]
-    fn perform_live_handoff(
+    async fn perform_live_handoff(
         &mut self,
         _params: crate::api::schema::ServerLiveHandoffParams,
     ) -> Result<Vec<api::schema::UndrainedPane>, HandoffError> {
@@ -1693,6 +1703,10 @@ impl HeadlessServer {
             if let Some(runtime) = self.app.terminal_runtimes.get(terminal_id) {
                 runtime.set_handoff_reader_paused(false);
             }
+        }
+        #[cfg(feature = "web")]
+        if let Some(wire) = &self.client_wire {
+            wire.reopen_commands();
         }
         self.handoff_in_progress = false;
         let _ = std::fs::remove_file(socket_path);
@@ -3014,13 +3028,30 @@ impl HeadlessServer {
         )
     }
 
+    fn refuse_shutdown_request(msg: api::ApiRequestMessage) -> bool {
+        // During shutdown, respond with server_unavailable.
+        let response = serde_json::to_string(&api::schema::ErrorResponse {
+            id: msg.request.id,
+            error: api::schema::ErrorBody {
+                data: None,
+                code: "server_unavailable".into(),
+                message: "server is shutting down".into(),
+            },
+        })
+        .unwrap_or_else(|_| {
+            r#"{"id":"","error":{"code":"server_unavailable","message":"server is shutting down"}}"#
+                .to_string()
+        });
+        let _ = msg.respond_to.send(response);
+        false
+    }
     /// Drains API requests with shutdown awareness.
     ///
     /// During shutdown, remaining requests get a `server_unavailable` error.
-    fn drain_api_requests_with_shutdown_check(&mut self) -> bool {
+    async fn drain_api_requests_with_shutdown_check(&mut self) -> bool {
         let mut changed = false;
         while let Ok(msg) = self.app.api_rx.try_recv() {
-            changed |= self.handle_api_request_with_shutdown_check(msg);
+            changed |= self.handle_api_request_with_shutdown_check(msg).await;
         }
         changed
     }
@@ -3031,26 +3062,15 @@ impl HeadlessServer {
     /// request to connected clients. API methods like `pane.report_agent`
     /// trigger internal events that may set toast state or would normally
     /// play sounds — in headless mode we forward these to clients instead.
-    fn handle_api_request_with_shutdown_check(&mut self, msg: api::ApiRequestMessage) -> bool {
+    async fn handle_api_request_with_shutdown_check(
+        &mut self,
+        msg: api::ApiRequestMessage,
+    ) -> bool {
         if self.app.respond_scope_probe(&msg) {
             return false;
         }
         if self.shutting_down {
-            // During shutdown, respond with server_unavailable.
-            let response = serde_json::to_string(&api::schema::ErrorResponse {
-                id: msg.request.id,
-                error: api::schema::ErrorBody {
-                    data: None,
-                    code: "server_unavailable".into(),
-                    message: "server is shutting down".into(),
-                },
-            })
-            .unwrap_or_else(|_| {
-                r#"{"id":"","error":{"code":"server_unavailable","message":"server is shutting down"}}"#
-                    .to_string()
-            });
-            let _ = msg.respond_to.send(response);
-            return false;
+            return Self::refuse_shutdown_request(msg);
         }
 
         if matches!(
@@ -3081,7 +3101,7 @@ impl HeadlessServer {
 
         if let api::schema::Method::ServerLiveHandoff(params) = &msg.request.method {
             self.handoff_skipped_undrained.clear();
-            let outcome = self.perform_live_handoff(params.clone());
+            let outcome = self.perform_live_handoff(params.clone()).await;
             let dropped_before_failure = std::mem::take(&mut self.handoff_skipped_undrained);
             let response = match outcome {
                 Ok(skipped_undrained) if skipped_undrained.is_empty() => {
@@ -4225,7 +4245,11 @@ impl HeadlessServer {
         }
 
         // Drain remaining API requests with server_unavailable.
-        self.drain_api_requests_with_shutdown_check();
+        while let Ok(msg) = self.app.api_rx.try_recv() {
+            if !self.app.respond_scope_probe(&msg) {
+                Self::refuse_shutdown_request(msg);
+            }
+        }
 
         // Close all client connections. Staged handoff files stay on disk
         // (#286): surviving a restart is most of what makes them durable.
@@ -4394,7 +4418,7 @@ pub fn run_server(args: &[String], handoff_socket: Option<PathBuf>) -> io::Resul
         };
 
         #[cfg(feature = "web")]
-        server.prepare_client_wire(None, None).await?;
+        server.prepare_client_wire(None, None, false).await?;
         crate::logging::server_started(&api::socket_path(), &client_socket_path());
         print_ready_message(&api::socket_path(), &client_socket_path());
 
@@ -4525,7 +4549,7 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
         )?;
         #[cfg(feature = "web")]
         if let Err(err) = server
-            .prepare_client_wire(wire_listener, local_ws_owner)
+            .prepare_client_wire(wire_listener, local_ws_owner, true)
             .await
         {
             crate::server::handoff::report_import_refusal(&mut received.stream, &err.to_string())?;
@@ -4552,6 +4576,10 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
         import_deadline.disarm()?;
         crate::server::handoff::report_ready(&mut received.stream)?;
         crate::server::handoff::wait_committed(&mut received.stream)?;
+        #[cfg(feature = "web")]
+        if let Some(wire) = &server.client_wire {
+            wire.acquire_commands().await?;
+        }
         server
             .app
             .resume_mesh_store(received.manifest.store_generation);
@@ -5158,17 +5186,19 @@ mod tests {
             assert!(error
                 .0
                 .contains(&(case.id.clone(), ErrorCode::StructuredWorkerCleanupFailed)));
-            let result = server.perform_live_handoff(crate::api::schema::ServerLiveHandoffParams {
-                import_exe: Some(
-                    root.path()
-                        .join("missing-importer")
-                        .to_string_lossy()
-                        .into_owned(),
-                ),
-                expected_protocol: None,
-                expected_version: None,
-                skip_undrained: false,
-            });
+            let result = server
+                .perform_live_handoff(crate::api::schema::ServerLiveHandoffParams {
+                    import_exe: Some(
+                        root.path()
+                            .join("missing-importer")
+                            .to_string_lossy()
+                            .into_owned(),
+                    ),
+                    expected_protocol: None,
+                    expected_version: None,
+                    skip_undrained: false,
+                })
+                .await;
             match result {
                 Err(HandoffError::Failed(error)) => assert_eq!(
                     error.kind(),
@@ -5389,7 +5419,7 @@ mod tests {
             scope: None,
             request: serde_json::from_value(serde_json::json!({"id":"held","method":"pane.write_input","params":{"pane_id":public,"text":"never","raw":true,"write_timeout_ms":200}})).unwrap(),
             respond_to, peer_pid:Some(std::process::id()), peer_birth:crate::platform::process_start_time(std::process::id()), peer_uid:Some(crate::platform::peer::effective_uid()),
-        });
+        }).await;
         assert!(matches!(
             response.try_recv(),
             Err(std::sync::mpsc::TryRecvError::Empty)
@@ -5434,7 +5464,7 @@ mod tests {
             scope: None,
             request: serde_json::from_value(serde_json::json!({"id":"held","method":"pane.write_input","params":{"pane_id":public,"text":"never","raw":true}})).unwrap(),
             respond_to, peer_pid:Some(std::process::id()), peer_birth:crate::platform::process_start_time(std::process::id()), peer_uid:Some(crate::platform::peer::effective_uid()),
-        });
+        }).await;
         assert!(matches!(
             response.try_recv(),
             Err(std::sync::mpsc::TryRecvError::Empty)
@@ -5667,6 +5697,10 @@ mod tests {
     }
 
     fn relay_operator_headless(method: &str) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         let (_guard, _scrub) = crate::config::test_config_env_guard();
         let root = crate::test_support::TempDir::socket();
         let config = root.path().join("config.toml");
@@ -5698,7 +5732,7 @@ mod tests {
                     _ => serde_json::json!({}),
                 };
                 let (respond_to, response) = std::sync::mpsc::channel();
-                server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+                runtime.block_on(server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
                     scope: None,
                     request: serde_json::from_value(
                         serde_json::json!({"id":"relay-headless","method":method,"params":params}),
@@ -5708,7 +5742,7 @@ mod tests {
                     peer_pid: Some(std::process::id()),
                     peer_birth: crate::platform::process_start_time(std::process::id()),
                     peer_uid: Some(7),
-                });
+                }));
                 let result: serde_json::Value =
                     serde_json::from_str(&response.recv_timeout(Duration::from_secs(1)).unwrap())
                         .unwrap();
@@ -5766,8 +5800,8 @@ mod tests {
         relay_operator_headless("agent.fork");
     }
 
-    #[test]
-    fn headless_uid_boundary_precedes_live_handoff_fast_path() {
+    #[tokio::test]
+    async fn headless_uid_boundary_precedes_live_handoff_fast_path() {
         let mut server = test_headless_server();
         server.app.runtime_config.uid_policy = crate::structured::identity::UidPolicy {
             operator: 7,
@@ -5776,22 +5810,26 @@ mod tests {
         let root =
             crate::structured::launch::SessionConfigDir::create(&std::env::temp_dir()).unwrap();
         let (respond_to, response) = std::sync::mpsc::channel();
-        let changed = server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
-            scope: None,
-            request: api::schema::Request {
-                id: "uid-handoff".into(),
-                method: api::schema::Method::ServerLiveHandoff(
-                    api::schema::ServerLiveHandoffParams {
-                        import_exe: Some(root.path().join("absent-importer").display().to_string()),
-                        ..Default::default()
-                    },
-                ),
-            },
-            peer_pid: Some(std::process::id()),
-            peer_birth: crate::platform::process_start_time(std::process::id()),
-            peer_uid: Some(42),
-            respond_to,
-        });
+        let changed = server
+            .handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+                scope: None,
+                request: api::schema::Request {
+                    id: "uid-handoff".into(),
+                    method: api::schema::Method::ServerLiveHandoff(
+                        api::schema::ServerLiveHandoffParams {
+                            import_exe: Some(
+                                root.path().join("absent-importer").display().to_string(),
+                            ),
+                            ..Default::default()
+                        },
+                    ),
+                },
+                peer_pid: Some(std::process::id()),
+                peer_birth: crate::platform::process_start_time(std::process::id()),
+                peer_uid: Some(42),
+                respond_to,
+            })
+            .await;
         let response: serde_json::Value =
             serde_json::from_str(&response.recv_timeout(Duration::from_secs(1)).unwrap()).unwrap();
         assert!(!changed);
@@ -5800,8 +5838,8 @@ mod tests {
         assert!(!server.app.state.should_quit);
     }
 
-    #[test]
-    fn headless_api_request_drains_all_pending_internal_events_before_reading_state() {
+    #[tokio::test]
+    async fn headless_api_request_drains_all_pending_internal_events_before_reading_state() {
         let mut server = test_headless_server();
         for i in 0..=crate::app::APP_EVENT_DRAIN_LIMIT {
             server
@@ -5826,7 +5864,7 @@ mod tests {
                 peer_pid: Some(std::process::id()),
                 peer_birth: crate::platform::process_start_time(std::process::id()),
                 peer_uid: Some(crate::platform::peer::effective_uid()),
-            })
+            }).await
         );
         let response = response_rx
             .recv_timeout(Duration::from_millis(100))
@@ -8561,19 +8599,21 @@ next_tab = ""
 
         let (respond_to, response_rx) = std::sync::mpsc::channel();
         assert!(
-            server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
-                scope: None,
-                request: api::schema::Request {
-                    id: "focus_b".into(),
-                    method: api::schema::Method::WorkspaceFocus(api::schema::WorkspaceTarget {
-                        workspace_id: ws_b_public_id,
-                    },),
-                },
-                respond_to,
-                peer_pid: Some(std::process::id()),
-                peer_birth: crate::platform::process_start_time(std::process::id()),
-                peer_uid: Some(crate::platform::peer::effective_uid()),
-            })
+            server
+                .handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+                    scope: None,
+                    request: api::schema::Request {
+                        id: "focus_b".into(),
+                        method: api::schema::Method::WorkspaceFocus(api::schema::WorkspaceTarget {
+                            workspace_id: ws_b_public_id,
+                        },),
+                    },
+                    respond_to,
+                    peer_pid: Some(std::process::id()),
+                    peer_birth: crate::platform::process_start_time(std::process::id()),
+                    peer_uid: Some(crate::platform::peer::effective_uid()),
+                })
+                .await
         );
         let _ = response_rx
             .recv_timeout(Duration::from_millis(100))
@@ -10145,8 +10185,8 @@ next_tab = ""
         );
     }
 
-    #[test]
-    fn stale_api_agent_report_does_not_forward_done_sound() {
+    #[tokio::test]
+    async fn stale_api_agent_report_does_not_forward_done_sound() {
         let mut server = test_headless_server();
         let background = crate::workspace::Workspace::test_new("background");
         let pane_id = background.tabs[0].root_pane;
@@ -10193,27 +10233,31 @@ next_tab = ""
         server.sync_foreground_client_state();
 
         let (respond_to, response_rx) = std::sync::mpsc::channel();
-        let changed = server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
-            scope: None,
-            request: api::schema::Request {
-                id: "stale".into(),
-                method: api::schema::Method::PaneReportAgent(api::schema::PaneReportAgentParams {
-                    pane_id: public_pane_id,
-                    source: "flock:pi".into(),
-                    agent: "pi".into(),
-                    state: api::schema::PaneAgentState::Idle,
-                    message: None,
-                    custom_status: None,
-                    seq: Some(19),
-                    agent_session_id: None,
-                    agent_session_path: None,
-                }),
-            },
-            respond_to,
-            peer_pid: Some(std::process::id()),
-            peer_birth: crate::platform::process_start_time(std::process::id()),
-            peer_uid: Some(crate::platform::peer::effective_uid()),
-        });
+        let changed = server
+            .handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+                scope: None,
+                request: api::schema::Request {
+                    id: "stale".into(),
+                    method: api::schema::Method::PaneReportAgent(
+                        api::schema::PaneReportAgentParams {
+                            pane_id: public_pane_id,
+                            source: "flock:pi".into(),
+                            agent: "pi".into(),
+                            state: api::schema::PaneAgentState::Idle,
+                            message: None,
+                            custom_status: None,
+                            seq: Some(19),
+                            agent_session_id: None,
+                            agent_session_path: None,
+                        },
+                    ),
+                },
+                respond_to,
+                peer_pid: Some(std::process::id()),
+                peer_birth: crate::platform::process_start_time(std::process::id()),
+                peer_uid: Some(crate::platform::peer::effective_uid()),
+            })
+            .await;
 
         assert!(changed);
         assert!(response_rx.recv_timeout(Duration::from_millis(100)).is_ok());

@@ -573,6 +573,7 @@ mod tests {
     fn server_identity1076_unpinned_enrollment_cannot_supply_a_name_binding() {
         for state in ["pending", "refused", "retrying", "pinned"] {
             let status = crate::mesh::hello::Enrollment {
+                negotiated: None,
                 peer: "node-b.example".into(),
                 source: crate::mesh::store::PinSource::Configured,
                 pin_origin: Default::default(),

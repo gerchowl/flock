@@ -213,6 +213,7 @@ impl Run {
     async fn restart(&mut self) {
         let old = self.case.generation;
         let launch = Launch {
+            profile_identity: None,
             opening_turn: None,
             agent_id: self.case.id.clone(),
             generation: old,
@@ -797,6 +798,7 @@ async fn worker_queue_restart_refuses_to_discard_undrained_completions() {
     })
     .await;
     let launch = Launch {
+        profile_identity: None,
         opening_turn: None,
         agent_id: r.case.id.clone(),
         generation: r.case.generation,
@@ -972,6 +974,7 @@ async fn failed_spawn_settles_opening_and_resume_never_delivers_it() {
     let threshold = default_policy(&case);
     case.fixture.file("claude", &binary, 0o700);
     let launch = Launch {
+        profile_identity: None,
         opening_turn: None,
         agent_id: case.id.clone(),
         generation: case.generation,

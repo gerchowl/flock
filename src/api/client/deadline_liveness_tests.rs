@@ -68,13 +68,7 @@ fn missing_socket_status_is_not_running_and_preserves_transport_exit() {
 
 async fn cli_not_running(stale: bool) {
     let (root, path) = socket_fixture(stale);
-    let binary = std::env::current_exe()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("flk");
+    let binary = crate::test_support::flk_binary();
     for status in [false, true] {
         let mut command = tokio::process::Command::new(&binary);
         command

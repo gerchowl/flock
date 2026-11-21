@@ -14,7 +14,8 @@ impl<'a> VerifiedToken<'a> {
     fn new(subject: &'a str, operate: bool) -> Self {
         Self { subject, operate }
     }
-    pub(super) fn decision_subject(&self) -> Option<&str> {
+    /// Current decision authority sealed by token admission, never session metadata.
+    pub(crate) fn decision_subject(&self) -> Option<&str> {
         (self.operate && !self.subject.is_empty()).then_some(self.subject)
     }
 }
@@ -26,3 +27,7 @@ pub(crate) fn fixture(subject: &str, operate: bool) -> VerifiedToken<'_> {
 }
 
 pub(crate) mod tokens;
+
+// Dormant destination authority API, consumed by M2 admission, never local tokens.
+#[allow(dead_code)]
+pub(crate) mod gateway;

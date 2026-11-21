@@ -8,6 +8,8 @@ fn register(app: &mut App, id: &str, name: &str, session: &str) {
     app.state
         .structured_agents
         .register(crate::structured::registry::Record {
+            harness_established: false,
+            profile_identity: None,
             runtime: crate::structured::registry::StructuredRuntime::Structured,
             agent_id: id.into(),
             name: Some(name.into()),

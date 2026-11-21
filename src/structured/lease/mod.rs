@@ -5,7 +5,7 @@
 mod scoped;
 use super::supervision::ProcessIdentity;
 use crate::platform;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use scoped::Generation;
 pub(crate) use scoped::LeaseCredential;
 use std::collections::{BTreeMap, BTreeSet};
@@ -46,7 +46,7 @@ struct Entry {
 }
 /// Server-owned lease table shared with its runtime workers.
 #[derive(Clone, Default)]
-pub struct SessionLeases(Arc<Mutex<BTreeMap<String, Entry>>>, Arc<Mutex<Vec<Entry>>>);
+pub struct SessionLeases(Arc<RwLock<BTreeMap<String, Entry>>>, Arc<Mutex<Vec<Entry>>>);
 /// Attribution from trusted process evidence, never a caller-supplied id.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Caller {
@@ -82,8 +82,31 @@ impl SessionLeases {
         let (ready, seen) = std::sync::mpsc::channel();
         let (release, wait) = std::sync::mpsc::channel();
         let holder = std::thread::spawn(move || {
-            let _live = leases.0.lock();
+            let _live = leases.0.write();
             let _published = leases.1.lock();
+            ready.send(()).unwrap();
+            let _ = wait.recv_timeout(Duration::from_secs(10));
+        });
+        seen.recv_timeout(Duration::from_secs(10)).unwrap();
+        (release, holder)
+    }
+
+    fn try_read_entries(
+        &self,
+    ) -> Option<parking_lot::RwLockReadGuard<'_, BTreeMap<String, Entry>>> {
+        self.0.try_read()
+    }
+
+    /// Hold one read-only census while a real socket request authenticates.
+    #[cfg(test)]
+    pub(crate) fn test_hold_reader(
+        &self,
+    ) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+        let leases = self.clone();
+        let (ready, seen) = std::sync::mpsc::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _read = leases.try_read_entries().expect("owned reader fixture");
             ready.send(()).unwrap();
             let _ = wait.recv_timeout(Duration::from_secs(10));
         });
@@ -93,7 +116,7 @@ impl SessionLeases {
 
     /// Inspect a single record non-blockingly, without exposing PIDs or credentials.
     pub(crate) fn state(&self, agent: &str, session: &str) -> LeaseState {
-        let Some(entries) = self.0.try_lock() else {
+        let Some(entries) = self.try_read_entries() else {
             return LeaseState::Uncertain;
         };
         match entries.get(session).filter(|entry| entry.agent == agent) {
@@ -111,7 +134,7 @@ impl SessionLeases {
     fn update<T>(&self, change: impl FnOnce(&mut BTreeMap<String, Entry>) -> T) -> io::Result<T> {
         let mut entries = self
             .0
-            .try_lock_for(LOCK_LIMIT)
+            .try_write_for(LOCK_LIMIT)
             .ok_or_else(|| io::Error::other("lease registry busy"))?;
         let mut published = self
             .1
@@ -125,7 +148,7 @@ impl SessionLeases {
         // ADR-0036 §1a: short contention waits; longer registry contention uses
         // the last published snapshot, which already contains its uncertain root.
         // Independent callers can still prove unrelated ancestry at the deadline.
-        if let Some(entries) = self.0.try_lock_for(LOCK_LIMIT) {
+        if let Some(entries) = self.0.try_read_for(LOCK_LIMIT) {
             Some(entries.values().cloned().collect())
         } else {
             self.1
@@ -177,7 +200,7 @@ impl SessionLeases {
     pub(crate) fn is_reserved(&self, session: &str) -> io::Result<bool> {
         let entries = self
             .0
-            .try_lock_for(LOCK_LIMIT)
+            .try_read_for(LOCK_LIMIT)
             .ok_or_else(|| io::Error::other("lease registry busy"))?;
         Ok(entries.contains_key(session))
     }
@@ -192,7 +215,7 @@ impl SessionLeases {
                     .collect(),
             );
         }
-        let entries = self.0.try_lock()?;
+        let entries = self.try_read_entries()?;
         Some(
             entries
                 .values()

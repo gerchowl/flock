@@ -6,7 +6,7 @@
 import { describe, expect, test } from "bun:test";
 
 import type { ServerFrame } from "../src/gen/ServerFrame";
-import { WIRE_PROTOCOL } from "../src/wire/connection";
+import { RESUME_PROBE_MS, WIRE_PROTOCOL } from "../src/wire/connection";
 import { decodeServerFrame } from "../src/wire/decode";
 import { backoffDelay, endpointUrl } from "../src/wire/env";
 import { createWireSender } from "../src/workbench/sender";
@@ -70,7 +70,8 @@ describe("frames and versions", () => {
     expect(decodeServerFrame('{"t":"ping","nonce":"n"}')).toEqual({ ok: true, frame: { t: "ping", nonce: "n" } });
     expect(decodeServerFrame('{"t":"ping","nonce":"n","extra":1}').ok).toBe(true);
     expect(decodeServerFrame("{")).toEqual({ ok: false, reason: "a frame that is not JSON" });
-    expect(decodeServerFrame('{"t":"pong","nonce":"n"}')).toEqual({ ok: false, reason: 'an unknown frame type "pong"' });
+    expect(decodeServerFrame('{"t":"pong","nonce":"n"}')).toEqual({ ok: true, frame: { t: "pong", nonce: "n" } });
+    expect(decodeServerFrame('{"t":"future"}')).toEqual({ ok: false, reason: 'an unknown frame type "future"' });
     expect(decodeServerFrame('{"t":"synced","sub_id":"s"}')).toEqual({ ok: false, reason: "synced without seq" });
     expect(decodeServerFrame('{"t":"synced","sub_id":"s","seq":"1"}')).toEqual({ ok: false, reason: "synced.seq is not a number" });
   });
@@ -178,4 +179,54 @@ describe("ReadOnly: a client newer than the server (ADR-0038 §3)", () => {
     expect(h.net.closes.at(-1)?.code).toBe(1000);
     expect(h.connection.state).toBe("Connecting");
   });
+});
+
+
+describe("resume probes", () => {
+  test("a missed probe uses backoff and resumes subscriptions from their applied cursor", () => {
+    const h = new Harness();
+    live(h, {}, { ...WELCOME, capabilities: ["read", "resume_probe"] } as ServerFrame);
+    const sub = h.connection.subscribe("agent/resume", { event: () => undefined, synced: () => undefined, gap: () => undefined, snapshot: () => undefined, reset: () => undefined, refused: () => undefined });
+    const old = h.net.current();
+    old.deliver({ t: "ev", sub_id: sub.id, stream: "agent/resume", seq: 7, ts_ms: 0, ev: { type: "fixture" } });
+    old.deliver({ t: "synced", sub_id: sub.id, seq: 7 });
+    h.connection.resume();
+    h.clock.advanceTo(RESUME_PROBE_MS - 1);
+    h.connection.resume();
+    h.clock.advanceTo(RESUME_PROBE_MS);
+    expect(h.connection.state).toBe("Reconnecting");
+    expect(h.net.attempts).toHaveLength(1);
+    h.clock.advanceTo(RESUME_PROBE_MS + 250);
+    const current = h.net.current();
+    current.open();
+    current.deliver(WELCOME);
+    expect(sentFrames(h).at(-1)).toEqual({ t: "sub", sub_id: sub.id, stream: "agent/resume", after: 7 });
+    old.deliver({ t: "ev", sub_id: sub.id, stream: "agent/resume", seq: 8, ts_ms: 0, ev: { type: "old" } });
+    expect(h.connection.streams().get(sub.id)?.cursor).toBe(7);
+  });
+
+  test("resume replaces an almost-expired heartbeat window with the probe's deadline", () => {
+    const h = new Harness();
+    live(h, {}, { ...WELCOME, capabilities: ["read", "resume_probe"] } as ServerFrame);
+    h.clock.advanceTo(44_999);
+    h.connection.resume();
+    h.clock.advanceTo(45_001);
+    expect(h.connection.state).toBe("Live");
+    h.clock.advanceTo(44_999 + RESUME_PROBE_MS);
+    expect(h.connection.state).toBe("Reconnecting");
+  });
+});
+
+
+test("lifecycle sender uses the wire outbox and preserves target identity", () => {
+  const h = new Harness();
+  live(h);
+  const sender = createWireSender(h.connection, () => 0);
+  const restart = sender.restart!("fixture-agent");
+  const stop = sender.stop!("fixture-agent");
+  expect(sentFrames(h).filter(frame => typeof frame === "object" && frame !== null && "t" in frame && frame.t === "cmd")).toEqual([
+    { t: "cmd", cmd_id: restart, verb: "agent.restart", args: { target: "fixture-agent", reason: "Operator requested restart", when: "after_turn" }, resume_only: false },
+    { t: "cmd", cmd_id: stop, verb: "agent.stop", args: { target: "fixture-agent" }, resume_only: false },
+  ]);
+  expect(h.connection.commands().map(entry => entry.cmd_id)).toEqual([restart, stop]);
 });

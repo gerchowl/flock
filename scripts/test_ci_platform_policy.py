@@ -84,7 +84,7 @@ class PlatformPolicy(unittest.TestCase):
             for platform, gate_name in [('macos', 'check-macos'), ('ubuntu', 'check-ubuntu')]:
                 gate = self.ci['jobs'][gate_name]
                 self.assertEqual(gate['needs'], ['changes', platform, 'desktop-' + platform]
-                                 + (['script-tests'] if platform == 'ubuntu' else []))
+                                 + (['script-tests', 'gui-e2e-fleet'] if platform == 'ubuntu' else []))
                 self.assertEqual(gate['if'], 'always()')
                 self.assertFalse(gate.get('continue-on-error', False))
                 step = next(step for step in gate['steps'] if step['name'] == 'Require every job of the leg')
@@ -195,3 +195,22 @@ class PlatformPolicy(unittest.TestCase):
             outcome = subprocess.run(['/bin/sh', '-c', step['run']], capture_output=True, text=True,
                                      env={**os.environ, 'SCRIPT_TESTS': result}, timeout=10)
             self.assertEqual(outcome.returncode, code, result)
+
+
+class GuiFleetGate(unittest.TestCase):
+    def test_browser_job_is_required_even_when_rust_legs_are_skipped(self):
+        ci = workflow('ci.yml')
+        job = ci['jobs']['gui-e2e-fleet']
+        self.assertEqual(job['runs-on'], 'ubuntu-latest')
+        self.assertEqual(job['timeout-minutes'], 25)
+        self.assertNotIn('if', job)
+        browser = next(step for step in job['steps'] if step['name'] == 'Install Chromium')
+        self.assertEqual(browser['timeout-minutes'], 5)
+        gate = ci['jobs']['check-ubuntu']
+        step = next(step for step in gate['steps'] if step['name'] == 'Require the GUI fleet')
+        self.assertEqual(step['if'], 'always()')
+        self.assertEqual(step['env']['RESULT'], '${{ needs.gui-e2e-fleet.result }}')
+        for result in ['success', 'failure', 'cancelled', 'skipped', '']:
+            outcome = subprocess.run(['/bin/sh', '-c', step['run']], capture_output=True,
+                                     env={**os.environ, 'RESULT': result}, timeout=10)
+            self.assertEqual(outcome.returncode, 0 if result == 'success' else 1)

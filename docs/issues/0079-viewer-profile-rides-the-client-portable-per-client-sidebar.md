@@ -18,7 +18,7 @@ No. Viewer state (sidebar width/split, collapse keys, panel scopes, server filte
 
 ## Proposal — the client owns the viewer profile
 
-1. **ViewerProfile rides Hello** (the #52 theme precedent): { sidebar split/width, panel scopes, collapsed project keys, collapse_all, server filter, state-mark choice }. Server applies it to THAT client's view. Portable by construction: collapse keys are origin-shared project keys (#27/#62) — "collapsed gerchowl/dompt" means the same everywhere; host-keyed filter likewise.
+1. **ViewerProfile rides Hello** (the #52 theme precedent): { sidebar split/width, panel scopes, collapsed project keys, collapse_all, server filter, state-mark choice }. Server applies it to THAT client's view. Portable by construction: collapse keys are origin-shared project keys (#27/#62) — "collapsed gerchowl/private-project" means the same everywhere; host-keyed filter likewise.
 2. **Live updates**: a small ClientMessage::ViewerStateChanged on toggle/drag, so mid-session changes propagate to the active server (and with #75's slots, to warm slots — switch anywhere, same view).
 3. **Per-client view state server-side**: move the viewer fields off global AppState into per-client session view state (multi-client independence falls out). Render path already renders per client geometry; this extends the principle.
 4. Persistence: the client persists the profile locally (~/.local/state/herdr/viewer.toml or similar) — the same profile attaches everywhere; per-server snapshots stop carrying scopes/collapse (migration: read old snapshot fields as the seed once).

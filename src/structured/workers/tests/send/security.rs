@@ -137,6 +137,7 @@ async fn send_security_socket_relay_cannot_be_operator() {
         .enroll(
             pid,
             crate::mesh::hello::Enrollment {
+                negotiated: None,
                 peer: "relay.example".into(),
                 source: crate::mesh::store::PinSource::Inbound,
                 pin_origin: Default::default(),

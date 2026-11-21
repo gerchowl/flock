@@ -431,13 +431,16 @@ mod tests {
 
     #[test]
     fn one_alias_per_query_and_repo_is_split() {
-        let doc = build_query(&[q("gerchowl/flock", "main"), q("gerchowl/g-fleet", "dev")]);
+        let doc = build_query(&[
+            q("gerchowl/flock", "main"),
+            q("gerchowl/fleet-config", "dev"),
+        ]);
         assert!(
             doc.contains("a0: repository(owner: \"gerchowl\", name: \"flock\")"),
             "{doc}"
         );
         assert!(
-            doc.contains("a1: repository(owner: \"gerchowl\", name: \"g-fleet\")"),
+            doc.contains("a1: repository(owner: \"gerchowl\", name: \"fleet-config\")"),
             "{doc}"
         );
         assert!(doc.contains("headRefName: \"main\""), "{doc}");

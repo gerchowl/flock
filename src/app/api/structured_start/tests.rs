@@ -115,13 +115,15 @@ impl AdmissionFixture {
         // argument slots instead of predicting entropy in the launch fixture.
         let script = fs::read_to_string(root.join("claude")).unwrap().replace(
             "assert sys.argv[1:] == json.loads((root / \"argv.json\").read_text()), \"argv drift\"",
-            "assert sys.argv[1:4] == ['-p', '--input-format', 'stream-json']\nassert '--restricted' in sys.argv and '--strict-mcp-config' in sys.argv\nimport uuid\nuuid.UUID(sys.argv[sys.argv.index('--session-id') + 1])");
+            "assert sys.argv[1:4] == ['-p', '--input-format', 'stream-json']\nassert '--restricted' in sys.argv and '--strict-mcp-config' in sys.argv\nimport uuid\nuuid.UUID(sys.argv[sys.argv.index('--resume' if '--resume' in sys.argv else '--session-id') + 1])");
         // Publish complete observed config atomically before readiness events.
         let script = script.replace(
             r#"(root / "observed-mcp.json").write_text(json.dumps(registration))"#,
             "(root / \"observed-mcp.pending\").write_text(json.dumps(registration))\nos.replace(root / \"observed-mcp.pending\", root / \"observed-mcp.json\")");
         fixture.file("claude", script.as_bytes(), 0o700);
-        let config: crate::config::Config = toml::from_str(&format!("[sessions]\nstall_ms = {stall_ms}\nblob_min_bytes = 64\n[structured]\nrun_as = 'operator'\nprofile = 'fixture'\ntoken_file = {:?}\n",root.join("token").to_str().unwrap())).unwrap();
+        // These in-process clients have no separate requester environment.
+        // External selector admission is exercised by the delegate_claude binary.
+        let config: crate::config::Config = toml::from_str(&format!("[spawn.env]\nclaude = []\n[sessions]\nstall_ms = {stall_ms}\nblob_min_bytes = 64\n[structured]\nrun_as = 'operator'\nprofile = 'fixture'\ntoken_file = {:?}\n",root.join("token").to_str().unwrap())).unwrap();
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let hub = crate::api::EventHub::default();
         let policy = crate::structured::identity::UidPolicy {
@@ -1594,3 +1596,266 @@ async fn hold_native_ack(
 }
 
 mod native_permissions;
+
+async fn persisted_session_restart_case(pin_case: &str) {
+    let _guard = crate::config::test_config_env_guard();
+    let mut fixture = AdmissionFixture::new("init-restricted", 120_000);
+    fixture.app.no_session = false;
+    let root = fixture.fixture.root.path().to_owned();
+    let original = fs::read_to_string(root.join("claude")).unwrap();
+    let script = format!(
+        "{}\n{}",
+        original.lines().next().unwrap(),
+        r#"
+import json, os, pathlib, sys
+root = pathlib.Path(__file__).parent
+if sys.argv[1:] == ['--version']:
+    print('2.1.296 (Claude Code)', flush=True)
+    sys.exit(0)
+flag = '--resume' if '--resume' in sys.argv else '--session-id'
+session = sys.argv[sys.argv.index(flag) + 1]
+(root / 'observed-launch.pending').write_text(json.dumps(sys.argv[1:]))
+os.replace(root / 'observed-launch.pending', root / 'observed-launch.json')
+init = json.loads((root / 'restricted-init.json').read_text())
+init['session_id'] = session
+print(json.dumps(init), flush=True)
+sys.stdin.read()
+"#
+    );
+    fixture.fixture.file("claude", script.as_bytes(), 0o700);
+    let (id, generation) = fixture.start().await;
+    let notify = fixture.app.render_notify.clone();
+    crate::structured::workers::tests::wait(&notify, || {
+        fixture.app.service_structured_workers(Instant::now());
+        assert!(
+            fixture
+                .app
+                .structured_workers
+                .report(&id, generation)
+                .is_none(),
+            "fresh producer exited"
+        );
+        root.join("observed-launch.json").is_file()
+            && fixture
+                .app
+                .state
+                .structured_agents
+                .get(&id)
+                .is_some_and(|(record, _, _)| record.harness_established)
+    })
+    .await;
+    let session = fixture
+        .app
+        .state
+        .structured_agents
+        .get(&id)
+        .unwrap()
+        .0
+        .session_id
+        .clone();
+    let first: Vec<String> =
+        serde_json::from_slice(&fs::read(root.join("observed-launch.json")).unwrap()).unwrap();
+    assert!(first
+        .windows(2)
+        .any(|pair| pair == ["--session-id", &session]));
+    assert!(!first.iter().any(|arg| arg == "--resume"));
+    let stopped = fixture
+        .request(Method::AgentStop(crate::api::schema::AgentTarget {
+            target: id.clone(),
+        }))
+        .await;
+    assert!(stopped.get("error").is_none(), "{stopped}");
+    fixture
+        .app
+        .structured_workers
+        .shutdown(&mut fixture.app.state.structured_agents)
+        .unwrap();
+    fixture.app.sync_session_save_schedule();
+    fixture.app.save_session_now();
+    let saved = crate::persist::load().expect("synced session snapshot");
+    assert_eq!(
+        serde_json::to_value(&saved.structured_agents).unwrap()[0]["harness_established"],
+        true
+    );
+    let mut records = serde_json::to_value(&saved.structured_agents).unwrap();
+    assert_eq!(records[0]["profile_identity"]["profile"], "fixture");
+    assert!(records[0]["profile_identity"]["binding"].is_null());
+    if pin_case == "legacy" {
+        records[0]
+            .as_object_mut()
+            .unwrap()
+            .remove("profile_identity");
+    }
+    fixture.app.state.structured_agents = serde_json::from_value(records).unwrap();
+    if pin_case != "same" {
+        fixture.app.state.config.structured.profile = "switched-fixture".into();
+    }
+    fs::remove_file(root.join("observed-launch.json")).unwrap();
+    let params: AgentStartParams = serde_json::from_value(
+        json!({"name":"fixture-launch", "runtime":"structured", "argv":["claude"]}),
+    )
+    .unwrap();
+    let restarted = fixture.request(Method::AgentStart(params)).await;
+    if pin_case == "switched" {
+        assert_eq!(
+            restarted["error"]["code"], "structured_profile_mismatch",
+            "{restarted}"
+        );
+        assert!(!root.join("observed-launch.json").exists());
+        assert!(!crate::session::data_dir()
+            .join("structured/claude/switched-fixture")
+            .exists());
+        return;
+    }
+    assert_eq!(
+        restarted["result"]["agent"]["session_id"], session,
+        "{restarted}"
+    );
+    let generation = fixture.app.state.structured_agents.get(&id).unwrap().2;
+    crate::structured::workers::tests::wait(&notify, || {
+        fixture.app.service_structured_workers(Instant::now());
+        assert!(
+            fixture
+                .app
+                .structured_workers
+                .report(&id, generation)
+                .is_none(),
+            "resumed producer exited"
+        );
+        root.join("observed-launch.json").is_file()
+    })
+    .await;
+    let resumed: Vec<String> =
+        serde_json::from_slice(&fs::read(root.join("observed-launch.json")).unwrap()).unwrap();
+    assert!(
+        resumed
+            .windows(2)
+            .any(|pair| pair == ["--resume", &session]),
+        "{resumed:?}"
+    );
+    assert!(!resumed.iter().any(|arg| arg == "--session-id"));
+}
+
+async fn unestablished_retry_is_fresh(legacy: bool) {
+    let _guard = crate::config::test_config_env_guard();
+    let mut fixture = AdmissionFixture::new("init-restricted", 120_000);
+    let root = fixture.fixture.root.path().to_owned();
+    let original = fs::read_to_string(root.join("claude")).unwrap();
+    let script = format!(
+        "{}\n{}",
+        original.lines().next().unwrap(),
+        r#"
+import json, os, pathlib, sys
+root = pathlib.Path(__file__).parent
+if sys.argv[1:] == ['--version']:
+    print('2.1.296 (Claude Code)', flush=True)
+    sys.exit(0)
+(root / 'retry-argv.pending').write_text(json.dumps(sys.argv[1:]))
+os.replace(root / 'retry-argv.pending', root / 'retry-argv.json')
+print(json.dumps({'type':'fixture_retry_ready'}), flush=True)
+sys.stdin.read()
+"#
+    );
+    fixture.fixture.file("claude", script.as_bytes(), 0o700);
+    let token = fs::read(root.join("token")).unwrap();
+    fs::remove_file(root.join("token")).unwrap();
+    let params: AgentStartParams = serde_json::from_value(json!({"name":"fixture-launch", "runtime":"structured", "cwd":root.join("project"), "model":"fixture-worker-model", "argv":["claude"]})).unwrap();
+    let started = fixture.request(Method::AgentStart(params)).await;
+    let id = started["result"]["agent"]["agent_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let session = started["result"]["agent"]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let generation = fixture.app.state.structured_agents.get(&id).unwrap().2;
+    let notify = fixture.app.render_notify.clone();
+    crate::structured::workers::tests::wait(&notify, || {
+        fixture.app.service_structured_workers(Instant::now());
+        fixture
+            .app
+            .structured_workers
+            .report(&id, generation)
+            .is_some()
+    })
+    .await;
+    assert!(
+        !root.join("retry-argv.json").exists(),
+        "failed preparation spawned the model"
+    );
+    fixture
+        .app
+        .structured_workers
+        .shutdown(&mut fixture.app.state.structured_agents)
+        .unwrap();
+    let mut saved = serde_json::to_value(&fixture.app.state.structured_agents).unwrap();
+    assert!(!saved[0]["harness_established"].as_bool().unwrap_or(false));
+    if legacy {
+        saved[0]
+            .as_object_mut()
+            .unwrap()
+            .remove("harness_established");
+    }
+    fixture.app.state.structured_agents = serde_json::from_value(saved).unwrap();
+    fixture.fixture.file("token", &token, 0o600);
+    let params: AgentStartParams = serde_json::from_value(
+        json!({"name":"fixture-launch", "runtime":"structured", "argv":["claude"]}),
+    )
+    .unwrap();
+    let retried = fixture.request(Method::AgentStart(params)).await;
+    assert_eq!(
+        retried["result"]["agent"]["session_id"], session,
+        "{retried}"
+    );
+    let generation = fixture.app.state.structured_agents.get(&id).unwrap().2;
+    crate::structured::workers::tests::wait(&notify, || {
+        fixture.app.service_structured_workers(Instant::now());
+        assert!(
+            fixture
+                .app
+                .structured_workers
+                .report(&id, generation)
+                .is_none(),
+            "retry producer exited"
+        );
+        root.join("retry-argv.json").is_file()
+    })
+    .await;
+    let argv: Vec<String> =
+        serde_json::from_slice(&fs::read(root.join("retry-argv.json")).unwrap()).unwrap();
+    assert!(
+        argv.windows(2)
+            .any(|pair| pair == ["--session-id", &session]),
+        "{argv:?}"
+    );
+    assert!(!argv.iter().any(|arg| arg == "--resume"));
+}
+
+#[tokio::test]
+async fn preparation_failure_retry_launches_fresh() {
+    unestablished_retry_is_fresh(false).await;
+}
+
+#[tokio::test]
+async fn legacy_record_without_establishment_launches_fresh() {
+    unestablished_retry_is_fresh(true).await;
+}
+
+#[cfg(feature = "web")]
+mod wire_lifecycle;
+
+#[tokio::test]
+async fn persisted_session_restart_launches_with_resume() {
+    persisted_session_restart_case("same").await;
+}
+
+#[tokio::test]
+async fn profile_switch_between_establishment_and_restart_refused() {
+    persisted_session_restart_case("switched").await;
+}
+
+#[tokio::test]
+async fn legacy_established_record_without_profile_pin_continues() {
+    persisted_session_restart_case("legacy").await;
+}

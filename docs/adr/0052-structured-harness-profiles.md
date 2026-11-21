@@ -1,15 +1,16 @@
 # ADR 0052 — Structured harness profiles separate operator authority, immutable assets and session storage
 
-- Status: Proposed
+- Status: Accepted (2026-11-11)
 - Date: 2026-11-08
 - Issues: [#3066](https://github.com/gerchowl/flock/issues/3066)
 - Decision owner: operator
-- Implemented: none. This record proposes the provisioning contract and ordered
-  implementation slices. It changes no runtime behavior.
-- Amends on acceptance: ADR-0036 §1 isolation and hot reload, and ADR-0032 §3
+- Implemented: slice 1, disabled admission guard; slice 2a, inactive binding
+  storage/status; slice 2b-1, operator-only binding review/commit/revocation APIs. Production execution remains
+  unavailable until slice 17.
+- Amends: ADR-0036 §1 isolation and hot reload, and ADR-0032 §3
   structured-session context replenishment. Composes with ADR-0049 requests,
   operator bindings and the shared authority resolver. Existing accepted ADRs
-  remain unchanged by this proposal.
+  compose with this decision.
 
 ## Evidence and scope
 
@@ -162,6 +163,18 @@ Use separate storage roots with separate lifetimes:
 - Generated launch files belong to a process/lease generation and survive until
   supervision has reaped all relevant descendants. They include typed settings
   and the lease-bound MCP configuration; they are not bundle content.
+
+Slice 3 prepares these roots under the server state directory at
+`profile-storage/sessions/<session-id>/`, with native `config/` and a private
+`record.json` containing session, target and binding ID/revision. Preparation
+checks current binding authority and the exact requested pin without launching.
+Published roots, including completed sessions, are retained. Retention and cleanup
+policy await #3140. Failed allocation rolls back only staging created by that call.
+Startup moves unpublished `.alloc-<session-id>` staging into the adjacent
+`profile-storage/quarantine/`, logs a typed diagnostic and reports staging entry names in
+operator-only `profile.status.session_storage`. Unknown or invalid session records
+remain untouched and inactive; they never prevent other records from loading.
+Preparation is an internal seam for the following slices, not a public launch API.
 
 Persist adoption/binding/import records with temp-file fsync, rename and
 parent-directory fsync. In lists of persisted records, skip, log and retain raw
@@ -406,7 +419,7 @@ contain that exposure.
 
 ### 5. Hook inventory and disposition
 
-Inventory taken 2026-11-08 from the owner's claude-config checkout at
+Inventory taken 2026-11-08 from the owner's agent configuration checkout at
 `0f8d7d499c5c9b29b093957a8dd0814989fe28dc` (README and `hooks/`), the
 fleet-generated shared settings, and the local effective settings' hook entries.
 Only event/function identities are recorded here; deployment paths and identities
@@ -512,9 +525,16 @@ native rollout importer. No Codex support is implied by the Claude slices.
 
 ### 9. Operator command and recovery contract
 
-These are proposed CLI/API contracts, not commands available today. One operator
-controls the authority; ordinary relay or harness principals cannot invoke these
-mutations. Authenticated operator transport remains required on remote nodes.
+These are target CLI/API contracts. Slice 1 exposes `profile.enable`, which
+refuses execution while the build is incomplete. Slice 2b-1 adds
+`profile.plan {action: bind}`, `profile.bind` and binding-only `profile.revoke`
+preparation APIs. Slice 2b-2 adds their CLI commands plus `profile status`, and
+establishment/continuation identity pins. Lists use comma-separated IDs; budget
+and preset flags and other transactions below remain unavailable. Current legacy
+launches pin `structured.profile` with no operator binding; resolved binding pins
+carry the binding ID and revision when a later production launch path supplies them. One operator controls the authority; ordinary relay or harness
+principals cannot invoke these mutations. Authenticated operator transport remains
+required on remote nodes.
 
 | Operation | CLI | API transaction |
 | --- | --- | --- |
@@ -585,6 +605,51 @@ safety prerequisites. It can execute actual adopted assets in its isolated probe
 domain while production remains disabled, and can never publish a production
 session or transfer mailbox ownership. Its separate admission test proves this.
 
+Slice 1 holds the switch in server memory only; slice 2 persists it with the binding records.
+
+Slice 2 is split into inactive 2a (store, data-only resolution and read-only
+`profile.status`) and 2b (reviewed binding/revocation transactions). Slice 2b is
+further split: 2b-1 supplies transaction storage and authenticated socket APIs;
+2b-2 supplies CLI commands and #3111 session pins. Review plans are server-private
+and expire after five suspend-inclusive monotonic minutes; restart discards
+uncommitted plans.
+A bind plan ID is also its durable operation ID. Receipts are stored atomically
+with binding mutations in the same document, keyed by operation ID, operation
+kind, operator UID and expected digest. A committed repeat returns the original
+receipt even after restart, expiry or subsequent revocation, without changing
+current authority. Repeating binding revocation with the same binding/reason and
+operator returns its original terminal receipt. Unknown receipt entries are
+logged and preserved raw; ambiguous/unusable matching IDs refuse. Revision
+allocation, CAS, floor publication and the mutation receipt remain inside both
+store locks. Preparation never reads credential references or executes assets. Store 2a uses
+`profile-bindings.json` beside server session state, mode 0600, with schema 1,
+`policy_revision`, default-false `execution_switch`, `bindings` and retained raw
+`unknown` entries. One global policy revision orders all binding changes and
+revocations; each binding records its last change revision. Reload refuses a
+revision lower than one already observed, and saving refuses to replace a higher
+disk revision. A separate private `profile-bindings.floor.json` durably records
+the highest revision before a store write is acknowledged, using the same fsync,
+rename and directory-fsync discipline. First upgrade initializes a missing floor
+from an existing document. A document below the floor is retained unchanged;
+profiles refuse with `policy_revision_regressed {store, floor}`, operator status
+reports the floor and fault, and other server operations continue. Unreadable
+floor/policy state refuses profiles with `policy_revision_unavailable`.
+One store-owned in-process mutex and an exclusive advisory lock on the stable
+`profile-bindings.lock` serialize the complete read/check/floor/write/acknowledgment
+transaction, including load-time floor initialization. Revision allocation in 2b
+must run inside that same section. Contention refuses without waiting or making
+partial observations. The floor is updated to `max(existing, proposed)` under
+both locks. Store, floor and lock opens do not follow final-component symlinks;
+only regular files owned by the server user can supply policy or lock ownership.
+Temporary files are created exclusively beside their destination. Non-operator status projections omit binding and account metadata.
+Binding records contain `binding_id`, explicit `target` (`repo_id`, `node_ids`,
+`agent_ids`), `account_alias`, `credential_ref`, `credential_generation`,
+`bundle_digests`, `grants`, `revision` and nullable `revoked` evidence (reason,
+principal, operation ID and revision). Resolution neither dereferences credentials
+nor executes anything. Session binding pins and continuation refusal (#3111) move
+to 2b to keep 2a within the production-line cap. Budgets, permits, containment and
+activation remain in their numbered later slices.
+
 Existing trusted single-account launch behavior stays on its existing path;
 profile operations never fall back to it on denial. Slice 17 is the only initial
 production activation path: its readiness predicate requires all slices 1–16,
@@ -628,7 +693,7 @@ consumer; slice 18 adds orchestration, not a late exception to pin enforcement.
 | 24. Codex native importer | 19–20 and 23. Separate rollout/sidecar discovery and import adapter. | Partial/ambiguous import or a live writer refuses; recovery proves one owner and preserves the native thread. |
 | 25. Dogfood | 14–22, with 23–24 only for Codex consumers. Isolated recovery drill then operator-authorized staged canary. | Demonstrate real-bundle qualification before enablement, replenishment, immutable workflow pins, revocation/partition bounds and rollback at cap before fleet expansion. |
 
-This ADR's PR remains docs only. These caps are planning constraints, not measured
+The original ADR PR was docs only. These caps are planning constraints, not measured
 implementation sizes: each implementation brief must enumerate touched functions
 and a production-line estimate, subdividing oversized rows into inactive dependent
 PRs before work begins. Qualification is the sole pre-activation execution mode

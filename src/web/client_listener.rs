@@ -243,6 +243,15 @@ impl Listener {
     pub(crate) fn service_commands(&mut self, app: &mut crate::app::App) {
         self.core.service_commands(app);
     }
+    pub(crate) async fn freeze_commands(&self) -> io::Result<()> {
+        self.core.freeze_commands().await
+    }
+    pub(crate) fn reopen_commands(&self) {
+        drop(self.core.reopen_commands());
+    }
+    pub(crate) async fn acquire_commands(&self) -> io::Result<()> {
+        self.core.acquire_commands().await
+    }
     /// Start only inside the owning server loop, after handoff commit if importing.
     pub(crate) fn activate(&mut self) {
         self.local.activate();

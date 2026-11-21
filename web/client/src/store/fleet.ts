@@ -158,13 +158,13 @@ function createFleetStore(source: FleetSource, monotonic: () => number): FleetSt
           for (const each of tables) each.setProgress({ phase: "loading" });
         });
         },
-      failed: (message) => {
+      failed: (message, recoverable = false) => {
         batch(() => {
-          clear();
+          if (!recoverable) clear();
           for (const each of tables) each.setProgress({ phase: "failed", message });
         });
-        // The subscription is over for good: the next reader opens a fresh one.
-        if (current === record) current = null;
+        // Retryable refusals retain one shared record through same-socket recovery.
+        if (!recoverable && current === record) current = null;
         },
     });
     current = record;

@@ -626,13 +626,7 @@ fn browser_open_does_not_widen_an_existing_operator_named_token() {
 }
 
 pub(super) fn helper_binary() -> std::path::PathBuf {
-    std::env::current_exe()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join(format!("flk{}", std::env::consts::EXE_SUFFIX))
+    crate::test_support::flk_binary()
 }
 #[test]
 fn revocation_intent_blocks_new_admissions_across_handles_without_starvation() {
@@ -928,6 +922,8 @@ fn pending_revoke_refuses_only_the_new_subscription_and_preserves_siblings() {
         );
         registry
             .register(crate::structured::registry::Record {
+                harness_established: false,
+                profile_identity: None,
                 runtime: crate::structured::registry::StructuredRuntime::Structured,
                 agent_id: "fixture-agent".into(),
                 name: None,

@@ -441,6 +441,17 @@ mod tests {
                 serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
             assert_eq!(queued["state"], "queued");
         }
+        crate::test_support::attest_pane_caller(&mut api.0.borrow_mut(), pane);
+        let listed = route(
+            "tools/call",
+            json!({"name":"flock_msg_list", "arguments":{}}),
+            &api,
+            &ChannelOptions::off(),
+        )
+        .unwrap();
+        let listed: Value =
+            serde_json::from_str(listed["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(listed["messages"].as_array().unwrap().len(), 7);
         let read = api
             .call(Method::MsgRead(crate::api::schema::MsgReadParams {
                 pane: Some(pane_id.clone()),
@@ -1005,6 +1016,40 @@ mod tests {
             Some(&json!("not_exposed_via_mcp"))
         );
         assert!(flock.calls.borrow().is_empty(), "refusal short-circuits");
+    }
+
+    #[test]
+    fn message_tools_preserve_unresolved_caller_diagnosis_and_remedy() {
+        let message = "the candidate pane has no process-birth evidence; ask the operator to migrate (#3066) or run flk msg read --pane <id>";
+        for (tool, arguments) in [
+            ("flock_msg_read", json!({})),
+            ("flock_msg_list", json!({})),
+            (
+                "flock_msg_send",
+                json!({"to": "p_1", "body": "fixture", "intent": "fyi"}),
+            ),
+            (
+                "flock_msg_reply",
+                json!({"correlation_id": "fixture", "body": "fixture"}),
+            ),
+        ] {
+            let flock = MockApi::ok(json!({"error": {
+                "code": "caller_pane_unresolved", "message": message,
+            }}));
+            let err = route(
+                "tools/call",
+                json!({"name": tool, "arguments": arguments}),
+                &flock,
+                &ChannelOptions::off(),
+            )
+            .unwrap_err();
+            assert_eq!(err.code, -32000);
+            assert_eq!(err.message, message);
+            assert_eq!(
+                err.data,
+                Some(json!({"refusal": "caller_pane_unresolved", "retry": "never", "exit": 1}))
+            );
+        }
     }
 
     #[test]

@@ -139,6 +139,13 @@ bootstrap, live updates/removal and recovery on the client.
 `tests/fixtures/structured-wire/fleet-server.jsonl` separately drives the real
 server owner and endpoint, including absent-row completion.
 
+An agent history cut that reaches its producer's end waits at the registry
+owner for a replacement producer. Once that producer is installed, `lagged`
+closes the old subscription ID; a fresh-ID subscription continues from the
+applied cursor on the same connection. A fleet `session_busy` refusal preserves
+the authenticated connection, so rebinding that reader keeps an existing
+transcript receiving events after restart.
+
 ### Fleet-lite store recovery
 
 An empty, unmarked lock with neither data record opens at zero. This includes an
@@ -178,9 +185,14 @@ replay, under those cut limits. The latest coherent owner-turn materialization
 may replace an unprocessed one;
 use the agent journal for every intermediate event.
 
-An unavailable permission-book observation leaves stored rows intact and fails
-its readers instead of publishing an empty attention list. This includes a
-preparing worker or one with unconfirmed cleanup: an absent Runtime book is
+An unavailable permission-book observation leaves stored rows intact and refuses
+only its fleet subscription with retryable `subfail session_busy`, through the
+normal data writer after already queued acknowledgements. The socket and sibling
+subscriptions stay connected. Retry with a fresh subscription ID after 250, 500
+and 1000 ms, as for other `session_busy` subscription refusals, instead of
+publishing an empty attention list. Fleet readers retain their shared
+subscription and last coherent rows through this retry cycle, show refusal
+while unavailable, and recover from the next snapshot without reconnecting. This includes a preparing worker or one with unconfirmed cleanup: an absent Runtime book is
 empty only when no worker exists or its producer is joined and its authority
 released. A later coherent
 observation can serve fresh readers. Storage failure stops the fleet owner,
@@ -211,7 +223,9 @@ rows and checkpoints, but are dropped when a fresh projection changes the row.
 
 `agent.decide` takes `AgentDecide` arguments: `agent`, `request_id`, required `request_seq`, `decision`
 (`allow_once`, `allow_always` or `deny`), and optional `message`. Only a
-token-authenticated client principal can submit this command. The optional message
+token-authenticated client principal can submit this command. Fresh admission,
+cached replay and joined outcomes require both current `answer` and `operate`
+scopes, checked through the same authorization function. The optional message
 is normalized from CRLF to LF and trimmed, then limited to 2048 UTF-8 bytes
 (`MAX_PERMISSION_DECISION_MESSAGE_BYTES`). The `prompt_control_bytes` rules
 permit newlines and tabs and refuse other controls. Invalid messages return
@@ -263,6 +277,23 @@ have no preceding open. Other reasons include `ended`, `cancelled`, `result`,
 `interrupted`, `permission_request_too_large`, and `session_ended` (a prior
 runtime left an unmatched open). Existing closed JSON is preserved apart from `request_seq`.
 
+For journal-admitted permission decisions, the command ACK must be written and flushed
+before its caused permission closed event or transport audit is published. The same
+ordering applies to caused fleet/lifecycle projections, including the fleet rows clients
+render. This holds on every connection, including observers and subscriptions opened
+while the command is pending. Durable Finish precedes the ACK. Joined waiters retain the
+publication hold until each ACK flushes or its originating socket is lost; socket loss
+releases that waiter without rolling back durable effects. Initial replay cuts and
+ordinary projections cannot bypass an active hold. Later records on the fenced stream
+preserve sequence order, while independent producers continue.
+
+This guarantee excludes history records that constitute the command outcome or
+downstream transport output: accepted input and queue admission cuts for `agent.send`,
+and lifecycle launch/terminal transport history. These records may precede the ACK.
+Correlate command outcomes using `cmd_id`; do not infer a universal history fence.
+Universal producer fencing is a separate owner decision tracked in
+[#3198](https://github.com/gerchowl/flock/issues/3198).
+
 The `permission-decision` fixture shows open, `agent.decide` acknowledgement,
 then closed. The ack acknowledges admission; remove the card when the durable
 closed event arrives. Future or incompatible record shapes use the existing
@@ -277,6 +308,155 @@ use their durable stream position for the recovery close; an old close without
 a handle matches by ID. Unknown records remain untouched, and invalid permission
 headers are logged and preserved rather than failing the entire recovery scan.
 
+
+## Agent lifecycle commands
+
+JSON wire version 2 accepts `agent.start`, `agent.restart`, and `agent.stop`.
+Their arguments reuse the socket API's `AgentStartParams`, `AgentRestartParams`,
+and `AgentTarget`. All three require `operate`; a send-only token receives
+`not_authorized` before argument or target lookup. The generated
+`AgentLifecycleCommand` TypeScript type lists the verbs and argument types.
+
+Lifecycle arguments may additionally carry `node_id`. Omit it for this server,
+or supply this server's pinned NodeId. Another node receives
+`unsupported_for_agent` before any local dispatch. A target agent ID known
+through the remote fleet directory receives the same refusal, even without
+`node_id`. Remote lifecycle forwarding
+remains gated by ADR-0043.
+
+An authenticated replay of the same principal, command ID, verb and arguments
+returns the first lifecycle ack within the journal's 24-hour retention window.
+Reusing a retained ID with different arguments or verb refuses `invalid_params`. Revocation and scope checks precede replay.
+An uncertain retry with `resume_only: true` returns the first durable
+acknowledgement. An absent, expired, lost or recovered pending claim refuses
+`session_unconfirmed` and never launches again. Claims are retained for 24 hours;
+unexpired claims are never evicted.
+
+Core owns the command-journal lease and acquires it at handoff ownership commit,
+never during importer preparation. Lease acquisition waits at most one second,
+including any earlier writer drain. Once the lease is held, startup, post-commit
+acquisition and rollback await replay without a total-duration deadline. Replay work
+is bounded by the captured file length and the journal byte and entry caps.
+Readiness requires completed replay; a slow machine can replay a near-full
+journal without repeatedly failing startup. Lease timeout or open failure returns
+typed `session_busy` before reporting ready. Rollback retries failed acquisition
+every 250 ms and remains fenced until replay finishes.
+
+Replay has a separate ten-second stall window (`REPLAY_STALL`): completing lease
+setup, consuming a nonempty read chunk or applying a record resets the window.
+A long replay that keeps progressing can exceed ten seconds overall. A read,
+torn-tail repair or sync that stops making progress for ten seconds returns
+typed `session_busy` and logs `status=stalled` with the last byte counts.
+Admission stays closed, and the existing worker retains its exclusive lease
+until it actually stops. Its late completion cannot reopen admission; background
+recovery then retries after 250 ms. No second local replay starts while that
+worker is still pending. Startup/importer completion fail closed; rollback's
+running transport keeps issuing typed, audited refusals until recovery succeeds.
+
+If the replay worker never returns, this refusal is indefinite: its owning
+`flk` server process keeps the exclusive journal lease, and background recovery
+cannot retry until that worker stops. Commands on an already running transport
+receive `error.code: "session_busy"` with the exact message
+`error.message: "command refused: session_busy"`. Startup or importer completion
+instead fails with the typed `session_busy` acquisition error before readiness.
+To distinguish a journal replay stall from other busy conditions, look for the
+server JSON log with these exact fields: `"message":"command journal replay"`,
+`"event":"client.journal.replay"` and `"status":"stalled"`. Its `replayed_bytes`
+and `total_bytes` fields show the last observed byte counts. The entry records
+the caller's stall timeout; the worker can remain alive with its lease held.
+
+Recover a permanent stall by restarting the **owning server process**. If its
+API responds, use `flk server stop`; otherwise stop that process using its
+service supervisor or normal process-management tools. Wait for actual process
+exit, which releases the journal lease even if the replay worker never returned.
+Then start `flk server` again, or restart it through the same supervisor, using
+the same data directory.
+A live handoff cannot recover a lease still held by that permanently stalled
+process. These are operator recovery steps; an ordinary command retry does not
+restart the server.
+
+Restarting preserves the durable journal; do not delete or recreate
+`wire/commands.jsonl` to clear the stall. Synced claims and completed outcomes
+remain on disk and are replayed after restart. Reconnect and reauthorize, then
+retry an uncertain command within the 24-hour window using the same principal,
+command ID, verb and arguments with `resume_only: true`. A completed outcome
+returns its original acknowledgement. A recovered pending claim returns
+`session_unconfirmed` without executing again: inspect the subject's state to
+resolve that uncertainty instead of sending a new command ID to force execution.
+
+Watch the server logs for `command journal replay`: `status=replaying` reports
+`replayed_bytes=N` / `total_bytes=M` at the start and roughly every tenth of the
+file; `status=ready` follows successful replay. Startup and importer readiness
+wait during replay. An already running rollback transport refuses commands with
+typed, audited `session_busy` until replay completes, without dispatching them.
+
+The exporter closes wire admission before requesting a drain. Freeze and shutdown
+proceed after their one-second journal budget, logging pending write counts;
+abandoned I/O retains its exclusive lease until the worker actually stops.
+The separate five-second credential-revocation and transport-drain waits do not
+read the journal; journal writes and compaction drain under their own caller
+budget. Even a stalled replay cannot extend that shutdown caller budget.
+Rollback remains fenced while it reacquires and replays. A late drain cannot
+close a newer recovered owner. Live commands claim their principal/command key
+durably before dispatch, then recheck current authorization under the token fence. Outcomes sync before
+acknowledgement; identical in-flight requests join and each waiter is
+reauthorized with its own credential. Connection closure follows that credential's
+current revocation status. Completed outcomes replay after restart or
+handoff. Conflicting payloads refuse `invalid_params`; journal capacity or writer
+queue pressure returns audited `session_busy` before effects. Ownership phase
+changes fence earlier claim completions from dispatch.
+
+`agent.start` permits fresh launches through the existing server-side launch
+gates, including `structured_needs_agent_user`. It cannot resume a structured
+record: that receives `operator_only`.
+
+An operator app-session token with `operate` may stop a structured agent or
+restart a stopped structured agent on its home node. Restart resumes the same
+agent and session ID through the socket structured-resume funnel, including
+run-as, recovery and spawn admission. An active worker refuses replacement with
+`session_busy`; uncertain recovery state refuses `structured_recovery_required`.
+`continue_with` is unsupported for structured
+restart; `when` must be `after_turn` and `reason` must be nonempty plain text
+of at most 1,024 bytes. Stop requests asynchronous cleanup; inspect `agent.list`
+or `agent.get` for confirmed `offline` state. Owner-side stop/restart decisions,
+including refusals and replays, log the requested `target`, resolved `agent_id`
+and `session_id` when known, authenticated `principal`, per-mint `app:<nonce>`
+credential identity, and outcome. Unresolved identities use empty ID fields.
+Authenticated ingress and owner refusals, including journal capacity and writer
+queue pressure, use the bounded `wire_refused` audit with the requesting
+credential's identity.
+
+The GUI's agent view and command palette offer **Stop agent** with a confirmation
+and **Restart agent** when the agent is offline. Restart resumes the existing
+session; stop it first if it is still running. A stop acknowledgement says cleanup
+was requested; the view follows the server's state until it reports offline.
+These actions require the operator app on the home node. Browser file credentials
+receive a plain-language refusal with the server code available under **Details**.
+
+File credentials retain `operator_only` for structured stop and
+`runtime_unsupported` for structured restart, even with `operate`. Tokens
+without `operate` receive `not_authorized`. Agent callers and mesh relays gain
+no resume authority. The socket API still refuses PTY `agent.stop` with
+`runtime_unsupported`; the wire preserves that behavior.
+[ADR-0036 §1a](https://github.com/gerchowl/flock/blob/dev/docs/adr/0036-structured-agent-sessions.md#1a-identity-and-the-operator-boundary-for-structured-agents)
+defines the app-session authority boundary. ADR-0052 slice 17 will add profile
+admission at the shared socket/wire entry for profile-bound execution.
+
+## New agent picker
+
+In the live GUI, **New agent** opens a sheet from the toolbar or command
+palette. Enter a name, choose a node and an absolute working directory, then
+select **Start agent**. Reported project paths are offered as choices, with the
+first selected by default; you can also type another path. The home node is
+selected by default. Runtime is **Structured** and harness is **Claude Code**, the currently supported adapter.
+An empty or relative working directory keeps **Start agent** disabled. The
+server checks that the directory exists on the chosen node.
+
+The picker sends `agent.start` through the existing command outbox and shows
+the server’s acknowledgment. An unresolved start stays disabled to prevent a
+second launch. A non-home selection shows a plain-language refusal with the
+server code available under **Details**. Server admission and operator authority
+gates still apply.
 
 ## Unsupported command verbs
 
@@ -296,3 +476,61 @@ The next supported command or subscription can use the same socket. Repeating
 an unknown verb on the same server does not make it supported; use a compatible
 server/version before retrying. This command-level refusal does not change the
 existing protocol-close rules for malformed frames or invalid session traffic.
+
+### Refusal audit events
+
+Every authenticated wire request refusal produces a best-effort `wire_refused`
+event through the server event hub and socket event APIs. This includes command
+ingress, owner admission (scope, revocation and capacity), argument validation,
+dispatch, replay/resume refusals, cached failed outcomes and failed input
+receipts. The owner records command failures before sending the reply, including
+when the reply's reader has disconnected. Full or closed enqueue lanes are
+recorded at enqueue. Existing responses, uncertainty and retry classes stay
+unchanged; an audited error does not prove an uncertain input had no effect.
+
+Subscription auditing covers identity/length/capacity rejection, reused IDs,
+read authorization, unknown or invalid streams, cursor/replay failures and
+storage unavailability. Authenticated JSON/framing/binary protocol refusals and
+ignored invalid or excess JSON probes are also recorded. Idempotent unsubscribe,
+normal disconnect and idle liveness expiry are not refused requests.
+
+The event data has `type: "wire_refused"`, verified `principal`, public
+`token_id` (file-token name or per-mint app-session label), normalized `verb`,
+parsed `target` (first 256 Unicode characters), typed `reason`, and
+`suppressed: 0`. Targets come from `args.target`, `args.agent` or the subscription
+`stream`. Reasons use registered command error codes or the closed subscription
+refusal codes. Malformed frames use `invalid_params`; transport/framing read
+errors use `internal_error`. Known command verbs keep
+their names; unknown commands all normalize to `unknown`. Control categories
+are `sub`, `unsub`, `ping`, `pong`, and `protocol` (when no request verb can be
+parsed). Bearer secrets, command bodies, nonces and raw unknown verbs are never
+recorded.
+
+One server-wide monotonic 60-second window permits eight individual events per
+`(principal, verb, reason)`, with at most 64 resident keys and 128 individual
+events globally. No key is evicted or given a new budget within that window.
+Excess refusals for a resident key accumulate into one summary with the same
+principal, verb and reason, null target/token ID, and the exact `suppressed`
+count. Once either the key capacity or global event budget prevents admission,
+refusals join an aggregate overflow count. At window closure there is at most
+one aggregate summary, with null principal/token ID/verb/target/reason and the
+exact total suppressed by overflow. Per-key counts apply only while resident
+and within the global budget. Shared operator principals share budgets across
+tokens; summaries do not claim attribution to one of those tokens.
+
+Summaries use the same event kind and are outside the individual-event budget:
+at most 65 summaries and 128 individual events per window. The owner tick or
+next refusal closes an expired window, including idle keys. Graceful shutdown
+drains connections and flushes the current partial window's exact suppression
+counts; repeated shutdown does not repeat summaries. A crash or abrupt owner
+drop can lose pending counts. Restart and handoff start fresh budgets; there is
+no global lifetime or cross-server rate guarantee.
+
+The limiter decides and constructs events under its mutex, then releases that
+mutex before `EventHub::push`. Journal I/O can still block a publishing caller,
+but never holds the limiter lock across I/O or prevents concurrent refusal
+budget decisions. Publication is best-effort, rather than a required-audit
+mutation fence: failure can degrade to memory-only events and never changes a
+request's outcome. Existing required mutation audits retain their own fences.
+Pre-authentication failures remain unaudited: they lack a verified principal
+and must not provide an unauthenticated journal-amplification path.

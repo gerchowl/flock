@@ -118,5 +118,5 @@ class RunGuardrailTests(unittest.TestCase):
                 self.assertEqual(entry[:2], ["sh", "scripts/run_guardrail.sh"])
                 self.assertTrue(entry[2].startswith("guardrails-") or entry[2] in {"cargo", "gitleaks", "python3"})
                 wrapped.append(hook["id"])
-        self.assertTrue({"gitleaks", "rustfmt", "clippy", "cargo-deny"}.issubset(wrapped))
-        self.assertEqual(len(wrapped), 21)
+        self.assertTrue({"gitleaks", "rustfmt", "clippy", "cargo-deny", "journal-io"}.issubset(wrapped))
+        self.assertEqual(len(wrapped), 22)

@@ -4,13 +4,7 @@ use crate::structured::launch::SessionConfigDir;
 use std::fs::{self, OpenOptions};
 use std::os::unix::fs::PermissionsExt;
 fn executable() -> std::path::PathBuf {
-    std::env::current_exe()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join(format!("flk{}", std::env::consts::EXE_SUFFIX))
+    crate::test_support::flk_binary()
 }
 fn fixture() -> (SessionConfigDir, std::path::PathBuf, LockFile) {
     let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();

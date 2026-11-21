@@ -246,8 +246,8 @@ fn spawn_flock_auto_executable(
         })
         .unwrap();
 
-    let binary = support::sandboxes::prepare_launch(executable, runtime_dir).unwrap();
-    let mut cmd = CommandBuilder::new(binary);
+    support::sandboxes::prepare_launch(executable, runtime_dir).unwrap();
+    let mut cmd = CommandBuilder::new(executable);
     // No subcommand, no --no-session → auto-detect launch
     for (key, value) in support::environment::isolated_env(config_home, runtime_dir) {
         cmd.env(key, value);
@@ -380,8 +380,25 @@ fn auto_detect_symlink_daemon_has_canonical_identity_after_alias_removal() {
         .expect("auto-detect never reached client attach")
         .expect("auto-detect exited before attach");
     reader.join().unwrap();
+    let client_identity =
+        support::process_table::process_info(flock.child.process_id().unwrap()).unwrap();
+    assert_eq!(
+        client_identity.argv.first().map(String::as_str),
+        alias.to_str(),
+        "client must execute through the launch alias"
+    );
     let pids = support::flock_server_pids_for_runtime_dir(&runtime).unwrap();
     assert_eq!(pids.len(), 1, "one isolated daemon must own the runtime");
+    support::sandboxes::record_runtime_candidates(
+        &base.join("config"),
+        &runtime,
+        flock.child.process_id(),
+        pids.iter().copied(),
+    );
+    let record: support::sandboxes::ServerRecord =
+        serde_json::from_slice(&fs::read(base.join(format!(".server-{}.json", pids[0]))).unwrap())
+            .unwrap();
+    assert_eq!(record.binary, canonical, "durable executable identity");
     let identity = support::process_table::process_info(pids[0]).unwrap();
     assert_eq!(
         identity.exe_path.as_deref(),

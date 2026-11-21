@@ -1249,6 +1249,7 @@ fn failed_decision_audit_never_enqueues_a_control_response() {
         )
         .unwrap();
     let control = Control {
+        cause: None,
         bytes: encode(&response.response).unwrap(),
         answer: response,
     };
@@ -1580,6 +1581,7 @@ fn a_cancelled_reservation_cannot_deliver_a_stale_control_response() {
         .input
         .decisions
         .try_send(Command::Decide(Control {
+            cause: None,
             answer: stale,
             bytes,
         }))
@@ -3573,4 +3575,110 @@ fn queue_stdin_admission_waits_for_permission_book_release() {
         "book contention must not refuse queued input: {result:?}"
     );
     accepted(&transport);
+}
+
+#[test]
+fn cancelled_transport_keeps_durable_history_readable_through_terminal_audits() {
+    use crate::structured::history::Item;
+    let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+    let (transport, mut output, _input) = start(&root);
+    permission(&mut output, "history-stop-request");
+    receive(&transport);
+    receive(&transport);
+    transport.cancel();
+    assert_eq!(
+        reader_done(&transport).unwrap_err().kind(),
+        io::ErrorKind::Interrupted
+    );
+    let mut cut = transport.history.subscribe(None).unwrap();
+    let mut records = Vec::new();
+    for _ in 0..32 {
+        match cut
+            .page()
+            .expect("cancelled delivery preserves readable history")
+        {
+            Item::Record(record) => {
+                records.push(serde_json::from_str::<Value>(&record.raw).unwrap())
+            }
+            Item::Synced(_) | Item::Progress => (),
+            Item::End => {
+                assert!(records
+                    .iter()
+                    .any(|record| record["type"] == "flk_permission_request"
+                        && record["state"] == "closed"));
+                return;
+            }
+            item => panic!("unexpected completed history page: {item:?}"),
+        }
+    }
+    panic!("completed history did not end within its bounded record count");
+}
+
+#[test]
+fn causal_audit_failure_keeps_terminal_cleanup_behind_the_receipt() {
+    use crate::structured::publication::causal::Cause;
+    let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+    let path = root.path().join("read-only");
+    fs::write(&path, b"").unwrap();
+    let mut file = File::open(path).unwrap();
+    let mut book = Book::new("fixture-agent".into());
+    book.observe(
+        "request-example",
+        serde_json::from_value(serde_json::json!({
+            "subtype":"can_use_tool", "tool_name":"Bash", "tool_use_id":"tool-example", "input":{}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let answer = book
+        .prepare(
+            &owner(),
+            &decide("request-example", permissions::Decision::Deny, 1),
+        )
+        .unwrap();
+    let (cause, lease) = Cause::hold();
+    let control = Control {
+        cause: Some(cause),
+        bytes: encode(&answer.response).unwrap(),
+        answer,
+    };
+    let (input, inputs) = mpsc::sync_channel(4);
+    let (entered, ready) = mpsc::channel();
+    let (finished, done) = mpsc::channel();
+    let task = thread::spawn(move || {
+        let plane = ControlPlane {
+            accepted: mpsc::sync_channel(1).1,
+            book: Arc::new(parking_lot::Mutex::new(book)),
+            input,
+            decisions: mpsc::sync_channel(4).1,
+        };
+        let (tx, _notifications) = mpsc::sync_channel(4);
+        let blobs = crate::structured::blobs::BlobStore::open(root.path()).unwrap();
+        let history = crate::structured::history::History::default();
+        let flag = AtomicBool::new(false);
+        let mut seq = 0;
+        let mut recorder = control::Recorder::new(
+            &mut file,
+            &mut seq,
+            "2.1.296",
+            &tx,
+            &flag,
+            &flag,
+            &flag,
+            &plane,
+            (&blobs, location(&root).storage.blob_min_bytes, &history),
+        );
+        assert!(recorder.command(Command::Decide(control)).is_err());
+        entered.send(()).unwrap();
+        finished.send(recorder.finish().is_err()).unwrap();
+    });
+    ready.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(matches!(
+        done.recv_timeout(Duration::from_millis(20)),
+        Err(mpsc::RecvTimeoutError::Timeout)
+    ));
+    assert!(matches!(inputs.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    drop(lease);
+    assert!(done.recv_timeout(Duration::from_secs(5)).unwrap());
+    task.join().unwrap();
 }

@@ -104,7 +104,7 @@ async fn native_mint_hello_and_generated_command_cross_owner_path() {
     let token = f.mint().await;
     let mut socket = f.open().await;
     assert_eq!(
-        socket.hello(WIRE_JSON_VERSION, &token.0).await["capabilities"],
+        granted_scopes(&socket.hello(WIRE_JSON_VERSION, &token.0).await),
         json!(["read", "send", "answer", "operate"])
     );
     socket.send(json!({"t":"cmd","cmd_id":"native-refusal","resume_only":false,"verb":"agent.send","args":{"target":"absent","text":"hello","submit":false}})).await;
@@ -840,6 +840,8 @@ async fn waiting_hellos_do_not_starve_established_subscriptions() {
             .state
             .structured_agents
             .register(crate::structured::registry::Record {
+                harness_established: false,
+                profile_identity: None,
                 runtime: crate::structured::registry::StructuredRuntime::Structured,
                 agent_id: "fixture-event".into(),
                 name: None,
@@ -959,6 +961,8 @@ async fn waiting_retirements_do_not_starve_established_subscriptions() {
         .state
         .structured_agents
         .register(crate::structured::registry::Record {
+            harness_established: false,
+            profile_identity: None,
             runtime: crate::structured::registry::StructuredRuntime::Structured,
             agent_id: "fixture-retire-event".into(),
             name: None,

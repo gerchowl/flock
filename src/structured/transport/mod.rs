@@ -48,6 +48,7 @@ struct Accepted {
 
 type Permissions = Arc<parking_lot::Mutex<Book>>;
 struct Control {
+    cause: Option<super::publication::causal::Cause>,
     answer: permissions::Answer,
     bytes: Vec<u8>,
 }
@@ -332,7 +333,11 @@ impl Transport {
                 let result = pump(
                     stdout, location, &version, output_tx, &b, &u, &c, &plane, &source,
                 );
-                source.finish(result.is_err());
+                // Cancelled delivery leaves fsynced history readable. Storage and
+                // terminal-audit failures still fail the publication authority.
+                source.finish(result.as_ref().is_err_and(|error| {
+                    !error.get_ref().is_some_and(|cause| cause.is::<Cancelled>())
+                }));
                 plane.book.lock().end();
                 if result.is_err() {
                     c.store(true, Ordering::Release);
@@ -513,6 +518,16 @@ impl InputHandle {
         principal: &Principal<'_>,
         args: &AgentDecide,
     ) -> Result<(), ErrorCode> {
+        self.agent_decide_caused(principal, args, None)
+    }
+    // Wire decisions carry an ACK receipt; ordinary callers retain their order.
+    #[allow(dead_code)]
+    pub(crate) fn agent_decide_caused(
+        &self,
+        principal: &Principal<'_>,
+        args: &AgentDecide,
+        cause: Option<super::publication::causal::Cause>,
+    ) -> Result<(), ErrorCode> {
         principal.decision_subject()?;
         if self.cancel.load(Ordering::Acquire) || self.close.load(Ordering::Acquire) {
             return Err(ErrorCode::AgentNotFound);
@@ -530,7 +545,11 @@ impl InputHandle {
         let request_seq = answer.request_seq;
         if self
             .decisions
-            .try_send(Command::Decide(Control { answer, bytes }))
+            .try_send(Command::Decide(Control {
+                answer,
+                bytes,
+                cause,
+            }))
             .is_err()
         {
             book.aborted(&id, request_seq);
@@ -701,8 +720,17 @@ impl Write for InputBuffer<'_> {
     }
 }
 
+#[derive(Debug)]
+struct Cancelled;
+impl std::fmt::Display for Cancelled {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("transport cancelled")
+    }
+}
+impl std::error::Error for Cancelled {}
+
 fn cancelled() -> io::Error {
-    io::Error::new(io::ErrorKind::Interrupted, "transport cancelled")
+    io::Error::new(io::ErrorKind::Interrupted, Cancelled)
 }
 
 fn write_inputs(
@@ -1003,6 +1031,38 @@ fn persist(
     permission_request_seq: Option<u64>,
     storage: (&super::blobs::BlobStore, usize, &super::history::History),
 ) -> io::Result<Received> {
+    persist_caused(
+        file,
+        seq,
+        line,
+        count,
+        version,
+        busy,
+        uncertain,
+        synthetic,
+        grant_request_id,
+        permission_request_seq,
+        (storage.0, storage.1, storage.2, None),
+    )
+}
+fn persist_caused(
+    file: &mut File,
+    seq: &mut u64,
+    line: &[u8],
+    count: u64,
+    version: &str,
+    busy: &AtomicBool,
+    uncertain: &AtomicBool,
+    synthetic: bool,
+    grant_request_id: Option<&str>,
+    permission_request_seq: Option<u64>,
+    storage: (
+        &super::blobs::BlobStore,
+        usize,
+        &super::history::History,
+        Option<(&super::publication::causal::Cause, &AtomicBool)>,
+    ),
+) -> io::Result<Received> {
     let origin = if synthetic || count > MAX_LINE_BYTES as u64 || std::str::from_utf8(line).is_err()
     {
         RecordOrigin::Flk
@@ -1078,6 +1138,10 @@ fn persist(
         file.write_all(&encoded)?;
         file.sync_data()?;
         let stored = Arc::new(record);
+        // The fsynced tail is private until release; head/end advance together.
+        if let Some((cause, cancel)) = storage.3 {
+            cause.wait(cancel)?;
+        }
         storage.2.publish(stored.clone(), encoded.len())?;
         record = StreamRecord {
             raw: live_raw,

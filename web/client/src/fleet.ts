@@ -56,8 +56,8 @@ export type FleetObserver = {
   change(change: FleetChange): void;
   /** The stream restarts: every kind is emptied until the next snapshot. */
   reset(): void;
-  /** The source ended visibly; no call follows. */
-  failed(message: string): void;
+  /** A visible failure. A recoverable refusal retains this subscription for retry. */
+  failed(message: string, recoverable?: boolean): void;
 };
 
 /** A source of fleet entities. `subscribe` delivers asynchronously; the returned function unsubscribes. */

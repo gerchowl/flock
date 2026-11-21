@@ -8,7 +8,7 @@
 ## Context
 
 The built binary was `flock`, which **collides with util-linux `flock(1)`** (file
-locking) on Linux hosts. Downstream (g-fleet) already worked around this by
+locking) on Linux hosts. Downstream (the fleet configuration repo) already worked around this by
 shipping the fork under the collision-free name **`flk`** (as a symlink) and
 treating `flk` as the canonical fleet-wide command — but the fork still *emitted*
 the literal string `flock` in three remote-peer command literals and throughout
@@ -87,7 +87,7 @@ that hosts rename to `flk` on install), and internal Rust identifiers
   probe expects).
 - The federated servers-pane health poll now runs `flk peers summary --json`
   on each peer; util-linux `flock(1)` is never shadowed anywhere.
-- Downstream g-fleet can drop its `flk`-symlink package (`flkPkg`), its
+- The downstream fleet configuration repo can drop its `flk`-symlink package (`flkPkg`), its
   flock-only `summary_command` peer-mesh override, and the Macs' "install
   `flock` too" line. `flk` becomes the only command name on every host;
   `flock` survives purely as the repo/product/brand + config namespace.
@@ -97,7 +97,7 @@ that hosts rename to `flk` on install), and internal Rust identifiers
 
 ## Follow-ups
 
-- Once landed and the `latest` channel bumps, remove g-fleet's shim
+- Once landed and the `latest` channel bumps, remove the fleet configuration repo's shim
   package + peer-mesh override.
 - Nothing in this ADR touches the twelve-factor config layers (ADR-0002) or
   the logging redesign; the remote.* observability events emitted through the

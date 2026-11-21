@@ -97,30 +97,31 @@ impl Case {
         core.service_commands(&mut self.app);
     }
     async fn frame(&mut self, socket: &mut Socket) -> Received {
+        within(self.frame_without_deadline(socket)).await
+    }
+    // Capacity tests rely on nextest's hang ceiling, not a latency assertion.
+    async fn frame_without_deadline(&mut self, socket: &mut Socket) -> Received {
         let owner = self.server.wake.clone();
         let worker = self.notify.clone();
-        within(async {
-            loop {
-                let changed = owner.notified();
-                let produced = worker.notified();
-                tokio::pin!(changed, produced);
-                changed.as_mut().enable();
-                produced.as_mut().enable();
-                self.service();
-                assert!(
-                    self.app
-                        .structured_workers
-                        .report(&self.worker.id, self.worker.generation)
-                        .is_none(),
-                    "harness exited before frame"
-                );
-                tokio::select! { biased;
-                    frame = socket.receive() => return frame,
-                    _ = &mut changed => (), _ = &mut produced => (),
-                }
+        loop {
+            let changed = owner.notified();
+            let produced = worker.notified();
+            tokio::pin!(changed, produced);
+            changed.as_mut().enable();
+            produced.as_mut().enable();
+            self.service();
+            assert!(
+                self.app
+                    .structured_workers
+                    .report(&self.worker.id, self.worker.generation)
+                    .is_none(),
+                "harness exited before frame"
+            );
+            tokio::select! { biased;
+                frame = socket.receive_frames() => return frame,
+                _ = &mut changed => (), _ = &mut produced => (),
             }
-        })
-        .await
+        }
     }
     async fn ack(&mut self, socket: &mut Socket) -> Value {
         match self.frame(socket).await {
@@ -395,8 +396,8 @@ fn same_principal_command_id_is_fenced_across_sockets() {
         second.send(json!({"t":"cmd","cmd_id":"same-id","verb":"agent.decide","args":other,"resume_only":false})).await;
         refusal(
             case.ack(&mut second).await,
-            "session_unconfirmed",
-            crate::cli::exit::UNCONFIRMED,
+            "invalid_params",
+            crate::api::error_code::ErrorCode::InvalidParams.exit(),
         );
         assert_eq!(
             case.handles()
@@ -653,6 +654,16 @@ fn revoked_principal_closes_other_socket_even_when_ack_flush_fails() {
                     resume_only: false,
                     read_only: false,
                 },
+                *case
+                    .server
+                    .core
+                    .shared
+                    .clients
+                    .lock()
+                    .unwrap()
+                    .keys()
+                    .next()
+                    .unwrap(),
             ));
             let wake = case.server.wake.clone();
             let delivered = within(async {
@@ -758,6 +769,7 @@ fn previous_runtime_permission_handle_is_refused_after_restart() {
         fs::remove_file(&path).unwrap();
         let listener = tokio::net::UnixListener::bind(path).unwrap();
         let launch = crate::structured::workers::Launch {
+            profile_identity: None,
             opening_turn: None,
             agent_id: case.worker.id.clone(),
             generation: case.worker.generation,
@@ -809,3 +821,590 @@ fn previous_runtime_permission_handle_is_refused_after_restart() {
 mod trace_permission;
 
 mod trace_clean;
+
+#[test]
+fn ingress_refusal_is_attributable() {
+    runtime(async {
+        let mut case = Case::new(315901).await;
+        case.service();
+        let mut socket = case.open().await;
+        let ack = case
+            .command(
+                &mut socket,
+                "unsupported.verb",
+                json!({"target":"fixture-agent"}),
+            )
+            .await;
+        assert_eq!(ack["error"]["code"], "server_version_gap");
+        let events = case.app.event_hub.events_after(0).unwrap();
+        let events: Vec<Value> = events
+            .into_iter()
+            .map(|(_, e)| serde_json::to_value(e).unwrap())
+            .filter(|e| e["event"] == "wire_refused")
+            .collect();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0]["data"]["principal"],
+            "0123456789abcdef0123456789abcdef"
+        );
+        assert_eq!(events[0]["data"]["token_id"], "one");
+        assert_eq!(events[0]["data"]["verb"], "unknown");
+        assert_eq!(events[0]["data"]["target"], "fixture-agent");
+        assert_eq!(events[0]["data"]["reason"], "server_version_gap");
+        case.stop().await;
+    });
+}
+
+#[test]
+fn execute_queue_full_refusal_is_attributable() {
+    runtime(async {
+        let mut case = Case::new(315902).await;
+        case.service();
+        let mut producers = Vec::new();
+        for token in ["a", "d"] {
+            for connection in 0..4 {
+                let mut socket = Socket::open(&case.server).await;
+                socket.hello(1, &token.repeat(64)).await;
+                for n in 0..4 {
+                    enqueue_without_owner(
+                        &case.server,
+                        &mut socket,
+                        format!("{connection}-{n}"),
+                        &case.worker.id,
+                    )
+                    .await;
+                }
+                producers.push(socket);
+            }
+        }
+        let session = case
+            .server
+            .core
+            .shared
+            .clients
+            .lock()
+            .unwrap()
+            .values()
+            .find(|c| c.session.info.name == "one")
+            .unwrap()
+            .session
+            .clone();
+        let (data, mut delivered) = mpsc::channel(1);
+        let execute = wire_commands::execute(
+            case.server.core.shared.clone(),
+            session,
+            data,
+            wire_commands::Command {
+                id: "overflow".into(),
+                verb: "agent.decide".into(),
+                args: json!({"agent":"fixture-agent"}),
+                resume_only: false,
+                read_only: false,
+            },
+            *case
+                .server
+                .core
+                .shared
+                .clients
+                .lock()
+                .unwrap()
+                .keys()
+                .next()
+                .unwrap(),
+        );
+        tokio::pin!(execute);
+        let delivery = within(async {
+            tokio::select! {
+                delivery = delivered.recv() => delivery.unwrap(),
+                result = &mut execute => panic!("execute ended before ack: {result:?}"),
+            }
+        })
+        .await;
+        assert!(
+            matches!(delivery.frame, ServerFrame::Ack { error: Some(ref e), .. } if e.code == "session_busy")
+        );
+        delivery.delivered.unwrap().send(true).unwrap();
+        assert_eq!(within(execute).await, Ok(()));
+        let events: Vec<Value> = case
+            .app
+            .event_hub
+            .events_after(0)
+            .unwrap()
+            .into_iter()
+            .map(|(_, e)| serde_json::to_value(e).unwrap())
+            .filter(|e| e["event"] == "wire_refused")
+            .collect();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["data"]["token_id"], "one");
+        assert_eq!(
+            events[0]["data"]["principal"],
+            "0123456789abcdef0123456789abcdef"
+        );
+        assert_eq!(events[0]["data"]["verb"], "agent.decide");
+        assert_eq!(events[0]["data"]["target"], "fixture-agent");
+        assert_eq!(events[0]["data"]["reason"], "session_busy");
+        drop(producers);
+        case.stop().await;
+    });
+}
+
+#[test]
+fn ingress_flood_is_summarized_by_owner_tick_without_another_request() {
+    runtime(async {
+        let mut case = Case::new(315903).await;
+        case.service();
+        let mut socket = case.open().await;
+        for n in 0..20 {
+            assert_eq!(
+                case.command(&mut socket, &format!("unknown-{n}"), json!({}))
+                    .await["error"]["code"],
+                "server_version_gap"
+            );
+        }
+        case.server.clock.advance(60_000);
+        case.service();
+        case.service();
+        let events: Vec<Value> = case
+            .app
+            .event_hub
+            .events_after(0)
+            .unwrap()
+            .into_iter()
+            .map(|(_, e)| serde_json::to_value(e).unwrap())
+            .filter(|e| e["event"] == "wire_refused")
+            .collect();
+        assert_eq!(events.len(), 9);
+        assert_eq!(events.last().unwrap()["data"]["suppressed"], 12);
+        assert_eq!(events.last().unwrap()["data"]["verb"], "unknown");
+        case.stop().await;
+    });
+}
+
+#[test]
+fn review_shutdown_flushes_suppressed() {
+    runtime(async {
+        let mut case = Case::new(315903).await;
+        case.service();
+        let mut socket = case.open().await;
+        for n in 0..20 {
+            assert_eq!(
+                case.command(&mut socket, &format!("unknown-{n}"), json!({}))
+                    .await["error"]["code"],
+                "server_version_gap"
+            );
+        }
+        case.server.core.shutdown().await.unwrap();
+        let events: Vec<Value> = case
+            .app
+            .event_hub
+            .events_after(0)
+            .unwrap()
+            .into_iter()
+            .map(|(_, e)| serde_json::to_value(e).unwrap())
+            .filter(|e| e["event"] == "wire_refused")
+            .collect();
+        assert_eq!(events.len(), 9);
+        assert_eq!(events.last().unwrap()["data"]["suppressed"], 12);
+        assert_eq!(events.last().unwrap()["data"]["verb"], "unknown");
+        case.stop().await;
+    });
+}
+
+#[test]
+fn review_scope_refusal_is_audited() {
+    runtime(async {
+        let mut case = Case::new(315904).await;
+        case.service();
+        let mut socket = case.open().await;
+        case.scopes(json!(["read"]));
+        let ack = case
+            .command(
+                &mut socket,
+                "agent.decide",
+                json!({"agent":"fixture-agent"}),
+            )
+            .await;
+        assert_eq!(ack["error"]["code"], "scope");
+        let events = case.app.event_hub.events_after(0).unwrap();
+        assert!(
+            events.into_iter().any(|(_, e)| {
+                let v = serde_json::to_value(e).unwrap();
+                v["event"] == "wire_refused" && v["data"]["reason"] == "scope"
+            }),
+            "authenticated scope refusal produced no audit event"
+        );
+        case.stop().await;
+    });
+}
+
+fn refusal_events(case: &Case) -> Vec<Value> {
+    case.app
+        .event_hub
+        .events_after(0)
+        .unwrap()
+        .into_iter()
+        .map(|(_, event)| serde_json::to_value(event).unwrap())
+        .filter(|event| event["event"] == "wire_refused")
+        .map(|event| event["data"].clone())
+        .collect()
+}
+
+#[test]
+fn owner_parse_resume_and_cached_refusals_are_each_audited() {
+    runtime(async {
+        let mut case = Case::new(315905).await;
+        case.service();
+        let mut socket = case.open().await;
+        let args = json!({"target":"fixture-agent"});
+        let parsed = case
+            .command(&mut socket, "agent.decide", args.clone())
+            .await;
+        assert_eq!(parsed["error"]["code"], "invalid_params");
+        socket.send(json!({"t":"cmd","cmd_id":"resume","verb":"agent.send","args":args,"resume_only":true})).await;
+        assert_eq!(
+            case.ack(&mut socket).await["error"]["code"],
+            "session_unconfirmed"
+        );
+        for _ in 0..2 {
+            socket.send(json!({"t":"cmd","cmd_id":"cached","verb":"agent.stop","args":{"target":"fixture-agent"},"resume_only":false})).await;
+            assert_eq!(case.ack(&mut socket).await["ok"], false);
+        }
+        let events = refusal_events(&case);
+        assert_eq!(events.len(), 4);
+        assert_eq!(events[0]["reason"], "invalid_params");
+        assert_eq!(events[1]["reason"], "session_unconfirmed");
+        assert_eq!(events[2]["reason"], events[3]["reason"]);
+        assert_eq!(events[2]["verb"], "agent.stop");
+        for event in events {
+            assert_eq!(event["token_id"], "one");
+            assert_eq!(event["target"], "fixture-agent");
+        }
+        case.stop().await;
+    });
+}
+
+#[test]
+fn subscription_refusals_preserve_identity_target_and_typed_reason() {
+    runtime(async {
+        let mut case = Case::new(315906).await;
+        case.service();
+        let mut socket = case.open().await;
+        for (id, reason) in [("missing", "unknown_stream"), ("missing", "sub_id_reused")] {
+            socket
+                .send(json!({"t":"sub","sub_id":id,"stream":"unsupported-stream","after":null}))
+                .await;
+            let Received::Text(frame) = case.frame(&mut socket).await else {
+                panic!("subscription ended without refusal")
+            };
+            assert_eq!(frame["t"], "subfail");
+            assert_eq!(frame["code"], reason);
+        }
+        case.scopes(json!(["send"]));
+        socket
+            .send(json!({"t":"sub","sub_id":"scope","stream":"fleet","after":null}))
+            .await;
+        let Received::Text(frame) = case.frame(&mut socket).await else {
+            panic!("scope refusal missing")
+        };
+        assert_eq!(frame["code"], "scope");
+        let events = refusal_events(&case);
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0]["reason"], "unknown_stream");
+        assert_eq!(events[1]["reason"], "sub_id_reused");
+        assert_eq!(events[2]["reason"], "scope");
+        assert_eq!(events[2]["target"], "fleet");
+        for event in events {
+            assert_eq!(event["verb"], "sub");
+            assert_eq!(event["token_id"], "one");
+        }
+        case.stop().await;
+    });
+}
+
+#[test]
+fn authenticated_malformed_frames_are_audited_with_parsed_context() {
+    runtime(async {
+        let mut case = Case::new(315907).await;
+        case.service();
+        let mut socket = case.open().await;
+        socket
+            .send(json!({"t":"cmd","verb":"agent.send","args":{"target":"fixture-agent"}}))
+            .await;
+        assert!(matches!(
+            socket.receive().await,
+            Received::Close(POLICY_VIOLATION_CLOSE)
+        ));
+        let events = refusal_events(&case);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["reason"], "invalid_params");
+        assert_eq!(events[0]["verb"], "agent.send");
+        assert_eq!(events[0]["target"], "fixture-agent");
+        let mut binary = case.open().await;
+        binary.raw(b"untrusted content", 0x82).await;
+        assert!(matches!(
+            binary.receive().await,
+            Received::Close(POLICY_VIOLATION_CLOSE)
+        ));
+        let events = refusal_events(&case);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1]["verb"], "protocol");
+        assert!(events[1]["target"].is_null());
+        case.stop().await;
+    });
+}
+
+#[test]
+fn subscription_resource_refusal_and_invalid_probes_are_audited() {
+    runtime(async {
+        let mut case = Case::new(315908).await;
+        case.service();
+        let mut socket = case.open().await;
+        socket.send(json!({"t":"ping","nonce":""})).await;
+        socket.send(json!({"t":"pong","nonce":"unmatched"})).await;
+        socket
+            .send(json!({"t":"sub","sub_id":"x".repeat(129),"stream":"fleet","after":null}))
+            .await;
+        assert!(matches!(
+            socket.receive().await,
+            Received::Close(GOING_AWAY_CLOSE)
+        ));
+        let events = refusal_events(&case);
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0]["verb"], "ping");
+        assert_eq!(events[1]["verb"], "pong");
+        assert_eq!(events[2]["verb"], "sub");
+        for event in events {
+            assert_eq!(event["reason"], "invalid_params");
+        }
+        case.stop().await;
+    });
+}
+
+mod ownership;
+
+mod durable;
+
+#[test]
+fn ended_history_cut_recovers_after_restart_without_losing_the_socket() {
+    runtime(async {
+        let mut case = Case::new(183193).await;
+        let mut socket = case.open().await;
+        socket
+            .send(json!({"t":"sub","sub_id":"restart-fleet","stream":"fleet"}))
+            .await;
+        within(async {
+            loop {
+                let Received::Text(frame) = case.frame(&mut socket).await else {
+                    panic!("fleet socket ended");
+                };
+                assert_eq!(frame["sub_id"], "restart-fleet");
+                if frame["t"] == "synced" {
+                    break;
+                }
+                assert!(matches!(frame["t"].as_str(), Some("gap" | "ev")));
+            }
+        })
+        .await;
+        socket.send(json!({"t":"sub","sub_id":"before-restart","stream":format!("agent/{}",case.worker.id)})).await;
+        let mut cursor = 0;
+        loop {
+            let Received::Text(frame) = case.frame(&mut socket).await else {
+                panic!("history socket ended");
+            };
+            if frame["sub_id"] == "restart-fleet" {
+                assert_eq!(frame["t"], "ev");
+                continue;
+            }
+            assert_eq!(frame["sub_id"], "before-restart");
+            if let Some(seq) = frame["seq"].as_u64() {
+                cursor = seq;
+            }
+            if frame["t"] == "synced" {
+                break;
+            }
+            assert_eq!(frame["t"], "ev");
+        }
+        case.worker
+            .finish(
+                &mut case.app.state.structured_agents,
+                &mut case.app.structured_workers,
+                &case.notify,
+                Instant::now(),
+                None,
+            )
+            .await;
+        let fixture = case.worker.fixture.clone();
+        let path = fixture.root.path().join("queue.sock");
+        fs::remove_file(&path).unwrap();
+        let listener = tokio::net::UnixListener::bind(path).unwrap();
+        let launch = crate::structured::workers::Launch {
+            profile_identity: None,
+            opening_turn: None,
+            agent_id: case.worker.id.clone(),
+            generation: case.worker.generation,
+            leases: case.worker.leases.clone(),
+            state: fixture.root.path().to_owned(),
+            storage: Default::default(),
+            mcp: fixture.mcp(),
+            stall_after: Duration::from_secs(60),
+            queue_rewrite_bytes: crate::config::Config::default()
+                .sessions
+                .queue_rewrite_bytes,
+            lineage: None,
+            admission: None,
+        };
+        let factory = case.worker.factory("queue", vec![]);
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let (release, proceed) = std::sync::mpsc::channel();
+        case.worker.generation = case
+            .app
+            .structured_workers
+            .start(
+                &mut case.app.state.structured_agents,
+                launch,
+                move |record| {
+                    let _ = entered.send(());
+                    proceed
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("restart preparation was not released");
+                    factory(record)
+                },
+            )
+            .unwrap();
+        within(started).await.unwrap();
+        within(async {
+            loop {
+                let Received::Text(frame) = case.frame(&mut socket).await else {
+                    panic!("fleet busy closed the socket");
+                };
+                if frame["t"] == "subfail" {
+                    assert_eq!(frame["sub_id"], "restart-fleet");
+                    assert_eq!(frame["code"], "session_busy");
+                    break;
+                }
+                assert_eq!(frame["t"], "ev");
+                match frame["sub_id"].as_str() {
+                    Some("before-restart") => cursor = frame["seq"].as_u64().unwrap(),
+                    Some("restart-fleet") => (),
+                    _ => panic!("unexpected restart frame: {frame:?}"),
+                }
+            }
+        })
+        .await;
+        socket
+            .send(json!({"t":"ping","nonce":"scoped-busy-kept-socket"}))
+            .await;
+        within(async {
+            loop {
+                let Received::Text(frame) = case.frame(&mut socket).await else {
+                    panic!("scoped refusal lost the socket");
+                };
+                if frame["t"] == "pong" {
+                    assert_eq!(frame["nonce"], "scoped-busy-kept-socket");
+                    break;
+                }
+                assert_eq!(frame["t"], "ev");
+                assert_eq!(frame["sub_id"], "before-restart");
+                cursor = frame["seq"].as_u64().unwrap();
+            }
+        })
+        .await;
+        release.send(()).unwrap();
+        case.driver = within(listener.accept()).await.unwrap().0;
+        case.worker
+            .ready(
+                &mut case.app.state.structured_agents,
+                &mut case.app.structured_workers,
+                &case.notify,
+                Instant::now(),
+            )
+            .await;
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let Received::Text(frame) = case.frame(&mut socket).await else {
+                    panic!("restart closed the socket");
+                };
+                if frame["t"] == "ev" {
+                    assert_eq!(frame["sub_id"], "before-restart");
+                    cursor = frame["seq"].as_u64().unwrap();
+                    continue;
+                }
+                assert_eq!(frame["t"], "lagged");
+                assert_eq!(frame["sub_id"], "before-restart");
+                break;
+            }
+        })
+        .await
+        .expect(
+            "scoped fleet refusal kept the socket alive, but replacement history never recovered",
+        );
+        socket.send(json!({"t":"sub","sub_id":"after-restart","stream":format!("agent/{}",case.worker.id),"after":cursor})).await;
+        loop {
+            let Received::Text(frame) = case.frame(&mut socket).await else {
+                panic!("history socket ended");
+            };
+            if let Some(seq) = frame["seq"].as_u64() {
+                cursor = seq;
+            }
+            if frame["t"] == "synced" {
+                break;
+            }
+            assert_eq!(frame["t"], "ev");
+        }
+        let event = crate::structured::workers::tests::event("assistant");
+        let expected = event["message"]["content"][0]["text"].clone();
+        within(
+            case.driver
+                .write_all(format!("{}\n", json!({"op":"event","event":event})).as_bytes()),
+        )
+        .await
+        .unwrap();
+        within(async {
+            loop {
+                let Received::Text(frame) = case.frame(&mut socket).await else {
+                    panic!("missing replacement producer event");
+                };
+                assert_eq!(frame["t"], "ev");
+                assert_eq!(frame["sub_id"], "after-restart");
+                let seq = frame["seq"].as_u64().unwrap();
+                assert!(seq > cursor);
+                cursor = seq;
+                match frame["ev"]["type"].as_str() {
+                    Some("system") => assert!(matches!(
+                        frame["ev"]["subtype"].as_str(),
+                        Some("hook_started" | "init")
+                    )),
+                    Some("assistant") => {
+                        assert_eq!(frame["ev"]["message"]["content"][0]["text"], expected);
+                        break;
+                    }
+                    _ => panic!("unexpected replacement producer event: {frame:?}"),
+                }
+            }
+        })
+        .await;
+        let args = case.prompt().await;
+        let mut opened = 0;
+        while opened != 2 {
+            let Received::Text(frame) = case.frame(&mut socket).await else {
+                panic!("restart prompt lost socket");
+            };
+            assert_eq!(frame["t"], "ev");
+            if frame["ev"]["type"] == "flk_permission_request" && frame["ev"]["state"] == "open" {
+                opened += 1;
+            }
+        }
+        socket.send(json!({"t":"cmd","cmd_id":"restart-reply","verb":"agent.decide","args":args,"resume_only":false})).await;
+        let ack = case.ack(&mut socket).await;
+        assert_eq!(ack["cmd_id"], "restart-reply");
+        assert_eq!(ack["ok"], true);
+        let Received::Text(closed) = case.frame(&mut socket).await else {
+            panic!("restart reply lost socket");
+        };
+        assert_eq!(closed["ev"]["state"], "closed");
+        case.stop().await;
+    });
+}
+
+mod causal;

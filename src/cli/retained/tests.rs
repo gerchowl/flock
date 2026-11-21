@@ -142,6 +142,7 @@ async fn doctor_socket_round_trip(relayed: bool) {
             .enroll(
                 pid,
                 crate::mesh::hello::Enrollment {
+                    negotiated: None,
                     peer: "relay.example".into(),
                     source: crate::mesh::store::PinSource::Inbound,
                     pin_origin: Default::default(),

@@ -77,6 +77,8 @@ pub enum LaunchError {
     UnsupportedHarness,
     /// No live reservation matches the profile being registered.
     McpLeaseRequired,
+    /// The saved conversation identity is not a UUID; no argv is prepared.
+    InvalidSessionId,
     /// The opening turn was refused before runtime publication or harness spawn.
     QueueAdmission {
         /// Registered refusal from the journal owner.
@@ -95,6 +97,7 @@ impl LaunchError {
             Self::NeedsAgentUser => ErrorCode::StructuredNeedsAgentUser,
             Self::UnsupportedHarness => ErrorCode::StructuredHarnessVersionUnsupported,
             Self::McpLeaseRequired => ErrorCode::StructuredMcpLeaseRequired,
+            Self::InvalidSessionId => ErrorCode::InvalidParams,
             Self::QueueAdmission { code, .. } => *code,
             Self::Io(_) => ErrorCode::AgentStartFailed,
         }
@@ -104,6 +107,7 @@ impl LaunchError {
 impl fmt::Display for LaunchError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidSessionId => f.write_str("structured session id is not a UUID"),
             Self::NeedsAgentUser => f.write_str(
                 "structured_needs_agent_user: flk-agent launch requires O19a (#1208)",
             ),
@@ -406,6 +410,17 @@ impl Drop for SessionConfigDir {
     }
 }
 
+/// Explicit harness identity operation selected by the session owner.
+/// The caller chooses from retained session state, before preparing the launch.
+/// Filesystem contents and transient process observations never choose this mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchMode {
+    /// Create a new conversation with `--session-id` and its allocated UUID.
+    Fresh,
+    /// Continue the retained harness conversation with `--resume` and its saved id.
+    Continuation,
+}
+
 /// Prepared argv, typed settings and owned secrets, with no spawn side effects.
 /// Dropping an unarmed profile removes its session files; arm before spawning.
 #[derive(Debug)]
@@ -426,10 +441,22 @@ impl LaunchProfile {
         config: &StructuredConfig,
         state_dir: &Path,
         session_id: &str,
+        mode: LaunchMode,
         binary: VerifiedBinary,
         read_env: impl FnMut(&str) -> Option<OsString>,
     ) -> Result<Self, LaunchError> {
         config.run_as.admit()?;
+        if session_id.len() != 36
+            || !session_id.bytes().enumerate().all(|(index, byte)| {
+                if matches!(index, 8 | 13 | 18 | 23) {
+                    byte == b'-'
+                } else {
+                    byte.is_ascii_hexdigit()
+                }
+            })
+        {
+            return Err(LaunchError::InvalidSessionId);
+        }
         let token = Token::read(
             config
                 .token_file
@@ -468,7 +495,11 @@ impl LaunchProfile {
             settings_path.into_os_string(),
             "--mcp-config".into(),
             mcp_path.into_os_string(),
-            "--session-id".into(),
+            match mode {
+                LaunchMode::Fresh => "--session-id",
+                LaunchMode::Continuation => "--resume",
+            }
+            .into(),
             session_id.into(),
         ]);
         let environment = EnvironmentAllowlist::capture(read_env, token);

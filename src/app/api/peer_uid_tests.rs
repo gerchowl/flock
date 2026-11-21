@@ -334,6 +334,7 @@ impl App {
                 .enroll(
                     pid,
                     crate::mesh::hello::Enrollment {
+                        negotiated: None,
                         peer: "relay.example".into(),
                         source: crate::mesh::store::PinSource::Inbound,
                         pin_origin: Default::default(),
@@ -353,6 +354,8 @@ fn relay_request(method: &str) -> Request {
         "id": "relay-boundary", "method": method,
         "params": if matches!(method, "agent.stop" | "agent.fork") {
             serde_json::json!({"target": "fixture-agent"})
+        } else if matches!(method, "msg.operator_list" | "msg.operator_read") {
+            serde_json::json!({"pane": "fixture-pane"})
         } else { serde_json::json!({}) }
     }))
     .unwrap()
@@ -384,6 +387,12 @@ async fn relay_refusal(method: &str) {
         assert!(app.state.workspaces.is_empty());
     }
     assert!(violations.is_empty(), "{violations:#?}");
+}
+#[tokio::test]
+async fn relay_operator_inbox_methods() {
+    for method in ["msg.operator_list", "msg.operator_read"] {
+        relay_refusal(method).await;
+    }
 }
 #[tokio::test]
 async fn relay_operator_server_stop() {

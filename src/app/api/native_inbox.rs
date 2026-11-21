@@ -4,6 +4,42 @@ use crate::{
     app::App,
 };
 impl App {
+    /// Explain unresolved pane evidence without changing the authority decision.
+    pub(super) fn message_authority_error(
+        &self,
+        id: String,
+        code: crate::api::error_code::ErrorCode,
+        fallback: &str,
+    ) -> String {
+        use crate::api::error_code::ErrorCode;
+        if matches!(code, ErrorCode::NotAuthorized | ErrorCode::MsgNotAllowed)
+            && self.lease_caller() == crate::structured::lease::Caller::Uncertain
+            && self.caller_pane_candidate().is_some()
+            && self.caller_pane().is_none()
+        {
+            return self.unresolved_message_caller(id);
+        }
+        super::responses::encode_error(id, code.as_str(), fallback)
+    }
+
+    /// One identity diagnosis and recovery contract for unresolved message callers.
+    pub(super) fn unresolved_message_caller(&self, id: String) -> String {
+        super::responses::encode_error(
+            id,
+            crate::api::error_code::ErrorCode::CallerPaneUnresolved.as_str(),
+            format!(
+                "the calling pane could not be resolved from the caller's attested \
+                 identity: {}. Ask the operator to migrate this agent to a structured \
+                 agent, resuming its harness session (#3066). Until migration, the \
+                 operator can consume the inbox from their own interactive shell with \
+                 `flk msg operator-read --pane <id>` (also `flk msg read --pane <id>`), \
+                 or peek with `flk msg operator-list --pane <id>`. Reading the inbox \
+                 or selecting a pane explicitly does not restore agent authority",
+                self.caller_pane_refusal_reason(),
+            ),
+        )
+    }
+
     /// Share native inbox ownership with wake checks without reading message bodies.
     pub(super) fn native_inbox_owner(
         &self,
@@ -54,7 +90,7 @@ impl App {
         target: Option<&str>,
         consume: bool,
     ) -> Option<String> {
-        use super::responses::{encode_error, encode_success};
+        use super::responses::encode_success;
         use crate::api::{
             error_code::ErrorCode,
             schema::{InboxMessage, QueuedMessageInfo, ResponseResult},
@@ -129,9 +165,9 @@ impl App {
         match result {
             Ok(None) => None,
             Ok(Some(result)) => Some(encode_success(id.into(), result)),
-            Err(code) => Some(encode_error(
+            Err(code) => Some(self.message_authority_error(
                 id.into(),
-                code.as_str(),
+                code,
                 "native inbox authority refused or unavailable",
             )),
         }
@@ -200,6 +236,36 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn message_authority_diagnostics_preserve_other_refusals() {
+        use crate::api::error_code::ErrorCode;
+        use crate::app::delegation::handler_tests::{app_on, shutdown};
+        let mut app = app_on(crate::api::EventHub::default());
+        for code in [ErrorCode::NotAuthorized, ErrorCode::MsgNotAllowed] {
+            let reply: serde_json::Value = serde_json::from_str(&app.message_authority_error(
+                "req".into(),
+                code,
+                "original reason",
+            ))
+            .unwrap();
+            assert_eq!(reply["error"]["code"], code.as_str());
+            assert_eq!(reply["error"]["message"], "original reason");
+        }
+        let pane = app.state.workspaces[0].focused_pane_id().unwrap();
+        crate::test_support::adopt_unproven_pane_caller(&mut app, pane, false);
+        for code in [ErrorCode::InboxNotOwner, ErrorCode::MailStoreUnavailable] {
+            let reply: serde_json::Value = serde_json::from_str(&app.message_authority_error(
+                "req".into(),
+                code,
+                "original reason",
+            ))
+            .unwrap();
+            assert_eq!(reply["error"]["code"], code.as_str());
+            assert_eq!(reply["error"]["message"], "original reason");
+        }
+        shutdown(app);
+    }
+
     #[tokio::test]
     async fn native_inbox_sweep_emits_each_expiry_once() {
         let (_env, _scrub) = crate::config::test_config_env_guard();

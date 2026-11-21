@@ -32,6 +32,8 @@ impl Case {
         let mut registry = Registry::default();
         let generation = registry
             .register(Record {
+                harness_established: false,
+                profile_identity: None,
                 runtime: StructuredRuntime::Structured,
                 agent_id: "fixture-agent".into(),
                 session_id: "history".into(),
@@ -385,6 +387,8 @@ fn selected_agent_gap_fixture_runs_against_cold_persisted_jsonl_and_owner_instal
         case.workers = Workers::new(case.server.wake.clone());
         case.registry
             .register(Record {
+                harness_established: false,
+                profile_identity: None,
                 runtime: StructuredRuntime::Structured,
                 agent_id: "fixture".into(),
                 session_id: "history".into(),
@@ -525,6 +529,7 @@ fn unsubscribe_api_fences_an_already_queued_jsonl_event_before_the_writer_starts
             frame: data_frame("sibling"),
             active: None,
             delivered: Some(done),
+            causal: None,
         })
         .unwrap();
         priority
@@ -532,7 +537,8 @@ fn unsubscribe_api_fences_an_already_queued_jsonl_event_before_the_writer_starts
                 output::encode(ServerFrame::Ping {
                     nonce: "priority".into(),
                 })
-                .unwrap(),
+                .unwrap()
+                .into(),
             )
             .unwrap();
         let (sink, release, _started, mut flushed, _dropped) = gated_sink();
@@ -604,6 +610,8 @@ fn invalid_stored_subject_is_distinct_from_unknown_stream() {
         let mut case = Case::new(vec![]).await;
         case.registry
             .register(Record {
+                harness_established: false,
+                profile_identity: None,
                 runtime: StructuredRuntime::Structured,
                 agent_id: "reserved".into(),
                 session_id: "queue".into(),

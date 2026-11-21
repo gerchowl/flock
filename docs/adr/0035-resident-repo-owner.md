@@ -98,7 +98,7 @@ session. Its pieces (read-only inventory of
 | `GOAL.md` | Frozen goal, merge policy ("Merge into `dev` only after reviewer approval and green CI", line 44), "no applies, no handoffs", cap of 3–4 agents, amendments by the owner | hand-written file |
 | `STATUS.md` | Mutable state, in flight, landing queue, next action, owner decisions in force | rewritten by the architect |
 | `tasks.json`, `triage.json`, `agents.json` | Gated checklist, triage skips, the delegate registry | hand-kept JSON |
-| `architect` skill | Plan in waves, write briefs, dispatch delegates under a cap, review with a fresh reviewer, land serially, compact at landing boundaries, file friction (`~/.claude-profiles/priv/skills/architect/SKILL.md` §0–§9) | prompt |
+| `architect` skill | Plan in waves, write briefs, dispatch delegates under a cap, review with a fresh reviewer, land serially, compact at landing boundaries, file friction (`~/.config/<profile>/skills/architect/SKILL.md` §0–§9) | prompt |
 
 Two failures of that build are on record. A `[fleet]` digest got glued onto
 the operator's half-typed message (#1162). And everything dies with the
@@ -938,6 +938,20 @@ rewritten by the owner, including its own caps and gates. **Recommended:**
   files an operator notification (ADR-0016), posts to any channel binding
   that subscribes (ADR-0028 §8), and is listed in the next standup.
 
+**Audit persistence for implemented owner writes (#3156).** `owner.bind`,
+`owner.unbind` and state-changing `owner.policy.adopt` append and sync their
+audit event and sync the journal directory before applying the live change.
+Missing persistence or a durably rolled-back append/sync failure returns
+`audit_unavailable`
+(retry `after_human`, exit 1), with no live owner or policy change. Repair
+storage and restart before retrying. If rollback fails, `audit_indeterminate`
+(retry `after_inspecting`, exit 14) reports that the mutation may or may not
+replay after restart. It changes no live state and blocks all further
+required audits with the same code until restart; the reopened journal is
+authoritative. An already adopted policy is a no-op.
+The [socket API](../next/website/src/content/docs/socket-api.mdx) specifies
+the wire behavior; these verbs reuse the required-audit path from #3152.
+
 **Rejected.**
 
 - *A CODEOWNERS file plus a ruleset path rule on `.flk.toml`, with flk
@@ -1033,7 +1047,7 @@ and ADR-0034 itself says nothing may rely on it for safety (§1a, §7).
 
    **Cost, honestly.**
    - **Per host:** one more Unix user, declared in the host's nix-darwin or
-     NixOS config (g-fleet, operator-applied, never by an agent), a sudoers
+     NixOS config (the fleet configuration repo, operator-applied, never by an agent), a sudoers
      rule for one binary, and its group membership.
    - **Worktrees and git objects:** the agent user cannot write the
      operator's checkout or its `.git`. Each repo therefore gets an agent-side
@@ -1043,8 +1057,7 @@ and ADR-0034 itself says nothing may rely on it for safety (§1a, §7).
      per host, and flk's worktree bookkeeping must know two roots.
    - **Harness logins:** Claude Code and Codex logins live in the agent
      user's own keychain and config. Each profile must be logged in once as
-     `flk-agent` (and again whenever a login expires, as on 2026-10-12,
-     g-fleet#452).
+     `flk-agent` (and again whenever a login expires, as on 2026-10-12).
    - **flk changes:** spawn-as-user, uid attestation, token minting, two
      worktree roots. These are slices O19a and O19b below.
    - **Migration:** existing delegates keep running as the operator until
@@ -1213,7 +1226,7 @@ author and reviewer is the same identity. **Recommended:**
   expired harness login reads `needs_human{login}` or `blocked{auth}`
   (ADR-0028 §1; `HumanReason::Login`, `src/api/agent_state.rs:85`). One
   happened on 2026-10-12, when a locked keychain logged a Claude profile out
-  (g-fleet#452, STATUS.md "Environment"). An episode that fails to start for
+  (STATUS.md "Environment"). An episode that fails to start for
   that reason is not retried in a loop. The owner is marked
   `blocked{auth}`, the operator is told with the exact `! <login>` command,
   and the standup lists it (§7a). A profile ladder is operator configuration
@@ -1311,7 +1324,7 @@ is the first owned repo, in shadow mode, before anything is switched off.
   shadow was rejected: it would put an owner that can start delegates and
   write to GitHub live before any of its other judgement had been compared.
   (Owner question 23.)
-- **Rollout.** As always: release, then a g-fleet "Roll out flock vX" issue.
+- **Rollout.** As always: release, then a fleet configuration repo "Roll out flock vX" issue.
   No owner applies anything to a host.
 
 **Alternatives rejected.**
@@ -1334,7 +1347,7 @@ is the first owned repo, in shadow mode, before anything is switched off.
   | achieved | `pr.merged`, `issue.closed{completed}`, `release.published` in the window (O3a, O3b, #1020); reaped edges (`DelegateReaped`, ADR-0027 §5); intake records that reached `done` (§3) |
   | planned | the goal record's open subtasks and wave structure (ADR-0030 §1); intake records in `accepted`, `planned` and `assigned` (§3, §1a); queued start intents (ADR-0027 §6) |
   | pending | PRs awaiting review or landing (`delegate.list` joined with the poller's PR state, ADR-0027 §2, and `ReviewRecorded` at head, §6.4); unadopted policy changes (§6.2); open ADR-0023 decisions and gate requests for the operator (§6); open `owner.request`s both ways (§4); open watches (§5) |
-  | blockers | **logins**: an owner or delegate in `needs_human{login}` or `blocked{auth}`, or an episode that failed to start because a harness is logged out (§6.5; the 2026-10-12 case is g-fleet#452), with the exact command for the operator; **limits**: `limit_reached` with its reset time; delegates or owner in `needs_human` or other `blocked` (ADR-0028 §1); red default branch (`branch.ci_completed`); expired wait deadlines; blocked-on cycles (§4); wake budget exhausted, incidents and layer-one points the repo lacks (§6) |
+  | blockers | **logins**: an owner or delegate in `needs_human{login}` or `blocked{auth}`, or an episode that failed to start because a harness is logged out (§6.5; the 2026-10-12 case was a login failure), with the exact command for the operator; **limits**: `limit_reached` with its reset time; delegates or owner in `needs_human` or other `blocked` (ADR-0028 §1); red default branch (`branch.ci_completed`); expired wait deadlines; blocked-on cycles (§4); wake budget exhausted, incidents and layer-one points the repo lacks (§6) |
   | experiences | AX review records in the window, with their metrics and the issues they filed or commented on (`AxReviewRecorded`, ADR-0033 §5); friction issues filed by the owner or its delegates (O4 `OwnerActed` with action `file`) |
   | wishes | open lift proposals awaiting approval (§7b), and the top Q8 answer ("which single change would have saved the most turns", ADR-0033 §2) of the last AX review |
 
@@ -1452,7 +1465,7 @@ rather than hiding them.
   | a `just` recipe or script in the repo | a multi-step check sequence repeated by builders | an issue in the repo, through the owner's intake (§3); if approved, a delegate builds it |
   | a line in the repo's `AGENTS.md` / `CLAUDE.md`, or the repo traps file of ADR-0032 owner decision 3 (`docs/agents/traps.md`, compiled into layer 2) | the six pasted rules in Context: nextest, `nix develop` commits, the comment-prose gates, `FLOCK_SOCKET_PATH`, the size cap | as above; once merged, layer 2 carries them and briefs stop repeating them (ADR-0032 §5) |
   | a product fix | the paste-chip Enter (`supervisor.py:88-92`) is a symptom of #1162 / #950, not a rule to teach | a comment with the new evidence on the existing issue (ADR-0033 §6 search-first) |
-  | a rule or skill in the general Claude config (claude-config) | a harness-level habit seen across repos | an issue in `gerchowl/claude-config`, never a change to it |
+  | a rule or skill in the general Claude config (the agent configuration repo) | a harness-level habit seen across repos | an issue in the agent configuration repo, never a change to it |
   | a `--help`, docs or MCP tool description change | Q10 "I polled `flk agent get`" with Q11 "`flk agent wait --help` never mentions `flk events wait`" | an issue in the repo that owns the text (`gerchowl/flock` for flk), through its owner if it has one (§4) |
   | an error message that names the right verb | a refusal that tells the agent what not to do but not what to do | the same; ADR-0034 §1a's command-gate deny reasons already work this way (`merges go through flk land`), and their wording is ADR-0035's policy (§6.3) |
   | a pointer at the moment of need | Q11 "a hint when I ran raw `gh pr checks` in a loop" | a gate row or a mid-turn notice under ADR-0034 §1a / §1b, set as policy in the binding (§6.2); never a new hook |
@@ -1510,7 +1523,7 @@ rather than hiding them.
 - *Auto-apply lifts in the owner's own repo.* A lift changes what every
   later agent reads (layer 2) or runs (a recipe). That is a change like any
   other, so it goes through intake and review.
-- *Edit claude-config or other repos directly.* The owner excluded it, and
+- *Edit the agent configuration repo or other repos directly.* The owner excluded it, and
   it would break §4's rule that an owner's authority ends at its own repo.
 
 **Cost.** The miner is new code that must keep up with three transcript
@@ -1621,9 +1634,9 @@ the fields treats the typed block as plain text.
 | O14 | Segment architects (§1a): `SegmentAssigned`, disjoint `scope_paths` (`scope_overlap`), `assigned { segment }` intake routing, depth owner → segment → builder at `delegate start`, subtree cap with segment sub-caps, wave reports as `GoalStatusSet` lines | ~350 | O5a, O6, O11a, G1 #1034, ADR-0034 Q1, Q4 and Q9 (segment questions route to the owner, the owner escalates), O21; **after #1167's dry run** | #1167 (flk primitives part) | new kinds and verb, gated | Overlapping scopes are refused; an issue in segment A's paths routes to A; a parked segment architect parks the owner; a third-level working `delegate start` is refused |
 | O15 | Daily standup (§7a): `flk owner standup [--since]` fold, bounded markdown and JSON, `Standup` cron action (daily by default) delivering to the notification log, a channel binding and a file; login and limit blockers with the operator command; `owner.standup` kind; `unattributed: n` | ~350 | O3a, O5a, O6, O18; ADR-0033 AX4b; E8 #1037 for channels | `WriteDigest` (extends); STATUS.md progress reports | new action and kind | A fixture day yields all six headings with no model call; a logged-out delegate appears under blockers with its login command; nothing is typed into any pane |
 | O16 | Transcript miner (§7b stage 1): `flk ax mine`, run by a server cron action, ported from `scripts/research/toolchain_survey.py`, edge-scoped, six pattern kinds, templating and redaction, token attribution from `usage`, JSON under `state_dir()/ax/` as an MCP resource | ~400 | ADR-0027 edges (shipped), AX4a | the survey script (productised) | client-side read; new MCP resource | Fixture transcripts yield the expected fingerprints; no output text, `$HOME` path or hostname appears; sessions outside the owner's edges are not read |
-| O17 | Lift reviews (§7b stage 2): trigger kind `lift` fired by unprocessed `ax/1` Q10 `tools_missed` / Q11 `discovery_gaps` answers (primary) or a miner fingerprint over threshold; `docs/ax/rubric-lifts.md` (`ax-lifts/1`); compiled-reviewer path; target routing (help/docs, skill or CLAUDE.md line, error-message or gate-reason wording, flk issue); dry run first; `[ax] lift_reviews_per_day`; cooldown; `LiftLanded` and `LiftOutcome` from `flk ax report` trends after `lift_check_reviews` | ~380 | O16, AX1 #1091 (rubric with Q9–Q11), AX4b #1095 (trends), AX6a, AX7, AX9, O6, O8a | — | config; new kinds `LiftLanded`, `LiftOutcome` | A recorded review naming a missed `flk events wait` yields one lift candidate targeting `flk agent wait --help`, with the miner's substitute count attached; nothing is filed in dry run; after a landed lift and ten later reviews with no further mention, the outcome is `moved`; a claude-config lift is only ever an issue candidate |
+| O17 | Lift reviews (§7b stage 2): trigger kind `lift` fired by unprocessed `ax/1` Q10 `tools_missed` / Q11 `discovery_gaps` answers (primary) or a miner fingerprint over threshold; `docs/ax/rubric-lifts.md` (`ax-lifts/1`); compiled-reviewer path; target routing (help/docs, skill or CLAUDE.md line, error-message or gate-reason wording, flk issue); dry run first; `[ax] lift_reviews_per_day`; cooldown; `LiftLanded` and `LiftOutcome` from `flk ax report` trends after `lift_check_reviews` | ~380 | O16, AX1 #1091 (rubric with Q9–Q11), AX4b #1095 (trends), AX6a, AX7, AX9, O6, O8a | — | config; new kinds `LiftLanded`, `LiftOutcome` | A recorded review naming a missed `flk events wait` yields one lift candidate targeting `flk agent wait --help`, with the miner's substitute count attached; nothing is filed in dry run; after a landed lift and ten later reviews with no further mention, the outcome is `moved`; an agent configuration repo lift is only ever an issue candidate |
 | O18 | Recorded review (§6.4): `ReviewRecorded`, `flk review record` / MCP `flock_review_record`, validity (reviewer edge `review:<pr>`, not the builder, head SHA matches the poller), `--by operator`; `flk land` (#694) requires an approve at the current head | ~300 | O3a, ADR-0027 edges, #694 | `VERDICT:` comments (replaced as the record) | new kind and verb, gated | A review recorded by the builder is refused; an approve at an old SHA does not let `flk land` proceed; a new push resets the gate |
-| O19a | **Agent Unix user** (§6.3 point 1, #1177): `flk agent-exec` launcher run as `flk-agent` through a one-binary sudoers rule (systemd `User=` on NixOS); socket group access; uid attestation (`getpeereid` / `SO_PEERCRED`), so a `flk-agent` caller is never the operator; agent-side clone per repo and worktrees from it with a shared read group; `flk owner bind` self-test; host user and sudoers declared in g-fleet (an issue there, operator-applied) | ~380 | O1, O11a, a g-fleet host change | ADR-0014 operator attestation (amends, §11) | server-internal; a host without the user reports "cooperative only" | The self-test fails unless `flk-agent` is **not in group `staff`** (the operator's home is `drwxr-x---` with group `staff`, and `~/.config` is 755) and a **scan finds no credential file readable by `flk-agent`** under the operator's home (`~/.config/gh`, `~/.ssh`, `~/.netrc`, `~/.git-credentials`, the Claude and Codex profile dirs, `~/Library/Keychains`). **From an agent pane:** reading the operator's `~/.config/gh/hosts.yml` fails with permission denied; `security find-internet-password -s github.com <operator home>/Library/Keychains/login.keychain-db` fails (naming the path, because a bare lookup as `flk-agent` searches only its own keychains); reading the `flk-agent` App key in the operator's flk state dir fails; `gh auth status` shows no operator login; a `setsid` child calling `flk owner limits set` exits 13; the agent's worktree commits and pushes through its own clone |
+| O19a | **Agent Unix user** (§6.3 point 1, #1177): `flk agent-exec` launcher run as `flk-agent` through a one-binary sudoers rule (systemd `User=` on NixOS); socket group access; uid attestation (`getpeereid` / `SO_PEERCRED`), so a `flk-agent` caller is never the operator; agent-side clone per repo and worktrees from it with a shared read group; `flk owner bind` self-test; host user and sudoers declared in the fleet configuration repo (an issue there, operator-applied) | ~380 | O1, O11a, a fleet configuration repo host change | ADR-0014 operator attestation (amends, §11) | server-internal; a host without the user reports "cooperative only" | The self-test fails unless `flk-agent` is **not in group `staff`** (the operator's home is `drwxr-x---` with group `staff`, and `~/.config` is 755) and a **scan finds no credential file readable by `flk-agent`** under the operator's home (`~/.config/gh`, `~/.ssh`, `~/.netrc`, `~/.git-credentials`, the Claude and Codex profile dirs, `~/Library/Keychains`). **From an agent pane:** reading the operator's `~/.config/gh/hosts.yml` fails with permission denied; `security find-internet-password -s github.com <operator home>/Library/Keychains/login.keychain-db` fails (naming the path, because a bare lookup as `flk-agent` searches only its own keychains); reading the `flk-agent` App key in the operator's flk state dir fails; `gh auth status` shows no operator login; a `setsid` child calling `flk owner limits set` exits 13; the agent's worktree commits and pushes through its own clone |
 | O19b | **Agent GitHub identity:** `flk-agent` App installation tokens minted by the operator's server (key never readable by `flk-agent`), git credential helper and `GH_TOKEN` in agent processes, refresh before expiry, per-repo `actions` write only when the binding grants it | ~300 | O19a | — | server and process env | From an agent pane, `gh api user` shows `flk-agent[bot]`; `gh api -X PUT …/branches/dev/protection` is refused by GitHub (403); `gh workflow run promote.yml` is refused; the token rotates before expiry |
 | O19c | Gate (§6.3 points 2, 3, 5): `flk-gate` App posting `flk/land-gate` from `ReviewRecorded` plus the binding's gate; setup docs for the `dev` required check and the `release` environment; incident detection for a merge without a gate success, with automatic pause | ~300 | O18, O19a, O19b, O11b, O3a | — | server and GitHub config | In a sandbox repo with the required check: a merge without a recorded approve is refused by GitHub; with one it passes; an admin merge raises an incident and pauses the owner |
 | O20 | Command-gate rows (§6.3 layer two): the default `owner`, `segment` and `delegate` rows (ADR-0034 §1a roles), seeded into the binding's `deny_commands`, with reasons naming the flk verb; served to ADR-0034 §1a's in-memory lookup | ~120 | ADR-0034 Q3 (the gate), O11a | — (policy over ADR-0034 §1a) | server config only | In an owner pane and a segment pane `gh pr merge 1` is refused with the `flk land` reason; a delegate's or segment's `gh pr comment` passes and an owner's is refused naming `flk owner comment`; changing a row needs `flk owner limits set` |
@@ -1866,7 +1879,7 @@ alternative it was weighed against.
     App identity (no admin, no workflow dispatch unless granted), and the
     operator's own token sits behind a user-presence keychain prompt as
     defence in depth.
-    - **Cost:** a host user per machine in g-fleet, a one-binary sudoers
+    - **Cost:** a host user per machine in the fleet configuration repo, a one-binary sudoers
       rule, an agent-side clone per repo with a shared read group, harness
       logins repeated as that user, flk spawn-as-user and uid attestation
       (O19a, O19b), and a migration in which running delegates finish as

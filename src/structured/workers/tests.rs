@@ -56,6 +56,8 @@ impl Case {
         let session = format!("00000000-0000-4000-8000-{n:012}");
         let generation = registry
             .register(Record {
+                harness_established: false,
+                profile_identity: None,
                 runtime: StructuredRuntime::Structured,
                 agent_id: id.clone(),
                 name: Some(format!("worker-{n}")),
@@ -67,6 +69,7 @@ impl Case {
             .unwrap();
         let leases = SessionLeases::default();
         let launch = Launch {
+            profile_identity: None,
             opening_turn: None,
             agent_id: id.clone(),
             generation,
@@ -291,7 +294,11 @@ impl Case {
 }
 
 pub(crate) async fn wait(notify: &Arc<Notify>, mut condition: impl FnMut() -> bool) {
-    tokio::time::timeout(LIMIT, async {
+    #[cfg(feature = "web")]
+    use crate::test_support::deadline::timeout;
+    #[cfg(not(feature = "web"))]
+    use tokio::time::timeout;
+    timeout(LIMIT, async {
         loop {
             if condition() {
                 return;
@@ -1266,6 +1273,7 @@ async fn operator_resume_preserves_original_lease_lineage() {
     let (case, mut launch, _) = Case::prepare(&mut registry, 1734, "state-reducer", vec![]);
     launch.lineage = Some(("original-parent".into(), 2));
     let template = Launch {
+        profile_identity: None,
         opening_turn: None,
         queue_rewrite_bytes: crate::config::Config::default()
             .sessions
@@ -1340,3 +1348,36 @@ mod send;
 
 #[path = "tests/live.rs"]
 mod live_feed;
+
+#[test]
+fn pinned_continuation_refuses_missing_or_changed_identity_before_reservation() {
+    use crate::structured::registry::{BindingIdentity, ProfileIdentity};
+    let identity = ProfileIdentity {
+        profile: "fixture".into(),
+        binding: Some(BindingIdentity {
+            binding_id: "binding-fixture".into(),
+            revision: 7,
+        }),
+    };
+    let mut revised = identity.clone();
+    revised.binding.as_mut().unwrap().revision = 8;
+    for actual in [None, Some(revised)] {
+        let (mut registry, mut workers, _, _) = owner();
+        let (case, mut launch, _) = Case::prepare(&mut registry, 3111, "state-reducer", vec![]);
+        let mut raw = serde_json::to_value(&registry).unwrap();
+        raw[0]["harness_established"] = json!(true);
+        raw[0]["profile_identity"] = json!(identity);
+        registry = serde_json::from_value(raw).unwrap();
+        launch.profile_identity = actual;
+        let generation = registry.get(&case.id).unwrap().2;
+        assert_eq!(
+            workers.start(&mut registry, launch, |_| panic!(
+                "refused continuation prepared a launch"
+            )),
+            Err(ErrorCode::StructuredProfileMismatch)
+        );
+        assert!(workers.pending.is_empty());
+        assert!(workers.entries.is_empty());
+        assert_eq!(registry.get(&case.id).unwrap().2, generation);
+    }
+}
