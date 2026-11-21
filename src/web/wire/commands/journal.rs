@@ -96,6 +96,37 @@ pub(super) enum Operation {
 }
 pub(super) type Response = oneshot::Receiver<Result<Admission, ErrorCode>>;
 type Job = (Operation, oneshot::Sender<Result<Admission, ErrorCode>>);
+pub(super) type ReplayProgress = watch::Sender<(u64, u64)>;
+fn replay_progress(progress: &Option<ReplayProgress>, bytes: u64, total: u64) {
+    if let Some(progress) = progress {
+        progress.send_modify(|(consumed, bound)| {
+            *consumed = (*consumed).max(bytes);
+            *bound = total;
+        });
+    }
+}
+struct ReplayReader<R> {
+    source: R,
+    progress: Option<ReplayProgress>,
+    consumed: u64,
+    total: u64,
+    #[cfg(test)]
+    step: Option<tests::ReplayStep>,
+}
+impl<R: Read> Read for ReplayReader<R> {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        let count = self.source.read(bytes)?;
+        if count > 0 {
+            self.consumed += count as u64;
+            replay_progress(&self.progress, self.consumed, self.total);
+            #[cfg(test)]
+            if let Some(step) = &mut self.step {
+                step(self.consumed)?;
+            }
+        }
+        Ok(count)
+    }
+}
 enum Message {
     Job(Job),
     Compacted(io::Result<compact::Snapshot>),
@@ -111,17 +142,20 @@ impl Writer {
     /// A held lease returns typed busy, never a permanently failed usable writer.
     #[cfg(test)]
     pub(super) async fn open(data: PathBuf, wake: Arc<Notify>) -> Result<Self, ErrorCode> {
-        Self::open_signalled(data, wake, None).await
+        Self::open_signalled(data, wake, None, None).await
     }
     /// Notify the owner after lease setup, before starting the work-bounded replay.
     pub(super) async fn open_signalled(
         data: PathBuf,
         wake: Arc<Notify>,
         acquired: Option<oneshot::Sender<()>>,
+        progress: Option<ReplayProgress>,
     ) -> Result<Self, ErrorCode> {
         Self::spawn(
             move || {
                 let mut journal = Journal::lease(&data)?;
+                journal.replay_progress = progress;
+                journal.replay_advanced(0);
                 if let Some(acquired) = acquired {
                     let _ = acquired.send(());
                 }
@@ -250,12 +284,15 @@ struct Journal {
     blocked: bool,
     principal_limit: usize,
     global_limit: usize,
+    replay_progress: Option<ReplayProgress>,
     #[cfg(test)]
     fault: Option<Fault>,
     #[cfg(test)]
     before_sync: Option<Box<dyn FnMut() + Send>>,
     #[cfg(test)]
     compaction_hook: Option<fn(&str)>,
+    #[cfg(test)]
+    replay_step: Option<tests::ReplayStep>,
 }
 impl Journal {
     #[cfg(test)]
@@ -292,12 +329,15 @@ impl Journal {
             blocked: false,
             principal_limit: PRINCIPAL_LIMIT,
             global_limit: GLOBAL_LIMIT,
+            replay_progress: None,
             #[cfg(test)]
             fault: None,
             #[cfg(test)]
             before_sync: None,
             #[cfg(test)]
             compaction_hook: None,
+            #[cfg(test)]
+            replay_step: tests::take_replay_steps(data),
         })
     }
     #[cfg(test)]
@@ -305,7 +345,7 @@ impl Journal {
         use std::io::{Seek, SeekFrom};
         let mut file = io::BufWriter::new(self.file.try_clone()?);
         for n in 0..GLOBAL_LIMIT - 1 {
-            let record = Record {
+            let mut record = Record {
                 version: 1,
                 namespace: "local".into(),
                 principal: format!("p{}", n / PRINCIPAL_LIMIT),
@@ -316,6 +356,15 @@ impl Journal {
             };
             serde_json::to_writer(&mut file, &record)?;
             file.write_all(b"\n")?;
+            if n == 0 {
+                // Cross several reads before the complete outcome can apply.
+                record.outcome = Some(serde_json::to_value(ack(
+                    "id0".into(),
+                    Ok(Value::String("x".repeat(60 * 1024))),
+                ))?);
+                serde_json::to_writer(&mut file, &record)?;
+                file.write_all(b"\n")?;
+            }
         }
         file.flush()?;
         file.get_ref().sync_all()?;
@@ -323,12 +372,25 @@ impl Journal {
         self.file.try_clone()?.seek(SeekFrom::Start(0))?;
         self.bytes = self.file.metadata()?.len();
         self.index = Index::default();
-        self.replay()
+        self.replay()?;
+        assert!(!self.blocked, "capacity fixture contains an opaque record");
+        assert_eq!(self.index.records.len(), GLOBAL_LIMIT - 1);
+        Ok(())
+    }
+    fn replay_advanced(&self, bytes: u64) {
+        replay_progress(&self.replay_progress, bytes, self.bytes);
     }
     fn replay(&mut self) -> io::Result<()> {
         // Read only the captured, byte-capped prefix even if the file grows.
         let total = self.bytes;
-        let mut reader = io::BufReader::new(self.file.try_clone()?.take(total));
+        let mut reader = io::BufReader::new(ReplayReader {
+            source: self.file.try_clone()?.take(total),
+            progress: self.replay_progress.clone(),
+            consumed: 0,
+            total,
+            #[cfg(test)]
+            step: self.replay_step.take(),
+        });
         let mut good = 0;
         let mut next_report = 0;
         loop {
@@ -345,6 +407,7 @@ impl Journal {
             {
                 break;
             }
+            self.replay_advanced(good + line.len() as u64);
             if line.len() > ENTRY_BYTES {
                 self.blocked = true;
                 good += line.len() as u64;
@@ -360,6 +423,7 @@ impl Journal {
                         break;
                     }
                     good += line.len() as u64;
+                    self.replay_advanced(good);
                 }
                 continue;
             }
@@ -381,6 +445,9 @@ impl Journal {
             good += line.len() as u64;
             let valid =
                 Record::decode(&line).is_some_and(|r| self.index.fold(r, self.global_limit));
+            if valid {
+                self.replay_advanced(good);
+            }
             if !valid {
                 self.blocked = true;
                 tracing::warn!("opaque command journal entry skipped and preserved");

@@ -335,12 +335,23 @@ unexpired claims are never evicted.
 Core owns the command-journal lease and acquires it at handoff ownership commit,
 never during importer preparation. Lease acquisition waits at most one second,
 including any earlier writer drain. Once the lease is held, startup, post-commit
-acquisition and rollback await replay without a wall-clock deadline. Replay work
+acquisition and rollback await replay without a total-duration deadline. Replay work
 is bounded by the captured file length and the journal byte and entry caps.
 Readiness requires completed replay; a slow machine can replay a near-full
 journal without repeatedly failing startup. Lease timeout or open failure returns
 typed `session_busy` before reporting ready. Rollback retries failed acquisition
 every 250 ms and remains fenced until replay finishes.
+
+Replay has a separate ten-second stall window (`REPLAY_STALL`): completing lease
+setup, consuming a nonempty read chunk or applying a record resets the window.
+A long replay that keeps progressing can exceed ten seconds overall. A read,
+torn-tail repair or sync that stops making progress for ten seconds returns
+typed `session_busy` and logs `status=stalled` with the last byte counts.
+Admission stays closed, and the existing worker retains its exclusive lease
+until it actually stops. Its late completion cannot reopen admission; background
+recovery then retries after 250 ms. No second local replay starts while that
+worker is still pending. Startup/importer completion fail closed; rollback's
+running transport keeps issuing typed, audited refusals until recovery succeeds.
 
 Watch the server logs for `command journal replay`: `status=replaying` reports
 `replayed_bytes=N` / `total_bytes=M` at the start and roughly every tenth of the

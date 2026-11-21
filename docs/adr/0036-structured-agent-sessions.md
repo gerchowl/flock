@@ -2042,15 +2042,29 @@ rollback. Completed outcomes replay across restart and ownership transfer.
 
 Lease acquisition has a one-second budget (`JOURNAL_WAIT`), including any earlier
 writer drain. Startup, post-commit importer acquisition and rollback then await
-replay without a wall-clock deadline. Replay work is bounded by the captured
+replay without a total-duration deadline. Replay work is bounded by the captured
 journal byte length, checked against `LOG_BYTES`, and the global index cap;
-machine speed cannot turn a valid near-cap journal into a startup refusal.
+machine speed cannot turn a progressing near-cap replay into a startup refusal.
+`REPLAY_STALL` is ten seconds without replay progress, measured by the async
+owner's monotonic clock. Completing lease setup starts a fresh window; every
+nonempty read chunk and every applied record resets it. This includes chunks
+skipped from oversized entries. Torn-tail archival and file/directory sync must
+also finish within a window without further progress. Ten seconds allows a
+single storage operation more room than lease acquisition while bounding a
+silent worker; it is independent of the number of retained claims.
+On stall, acquisition returns typed `session_busy` and logs `status=stalled`
+with the last byte counts. Admission stays closed. The owner retains its pending
+worker and lease until that worker actually stops, rejects its late completion,
+then retries after 250 ms; it never starts another local replay in parallel with
+the stalled worker or reports readiness from a partial index. Startup and
+importer completion fail closed; rollback's running transport continues issuing
+typed, audited refusals until a subsequent replay succeeds.
 Readiness requires both the lease and completed replay. Lease timeout and open
 failure return typed `session_busy`. Acquisition is a prerequisite like token
 store and listener setup. Rollback recovery remains fenced and retries failed
 acquisition every 250 ms (`ACQUIRE_RETRY`). Importer preparation never opens the
 journal. The import watchdog covers preparation and is disarmed before ownership
-commit; post-commit replay is bounded by journal work, not that watchdog.
+commit; post-commit replay has the work cap and progress-stall window above.
 
 Server logs report `command journal replay` with `status=replaying`,
 `replayed_bytes=N` and `total_bytes=M` at the start and approximately each tenth

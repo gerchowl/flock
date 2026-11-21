@@ -204,10 +204,38 @@ fn open_hooks() -> &'static parking_lot::Mutex<std::collections::HashMap<PathBuf
     > = std::sync::OnceLock::new();
     HOOKS.get_or_init(Default::default)
 }
+type ReplayEvents = tokio::sync::mpsc::UnboundedSender<(u64, u64)>;
+fn replay_events() -> &'static parking_lot::Mutex<std::collections::HashMap<PathBuf, ReplayEvents>>
+{
+    static EVENTS: std::sync::OnceLock<
+        parking_lot::Mutex<std::collections::HashMap<PathBuf, ReplayEvents>>,
+    > = std::sync::OnceLock::new();
+    EVENTS.get_or_init(Default::default)
+}
+pub(super) fn replay_observed(data: &std::path::Path, progress: (u64, u64)) {
+    if let Some(events) = replay_events().lock().get(data) {
+        let _ = events.send(progress);
+    }
+}
 pub(super) fn take_open_barrier(data: &std::path::Path) -> Option<OpenBarrier> {
     open_hooks().lock().remove(data)
 }
 impl Ownership {
+    pub(in crate::web::wire) fn test_watch_replay(
+        data: PathBuf,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<(u64, u64)> {
+        let (send, events) = tokio::sync::mpsc::unbounded_channel();
+        replay_events().lock().insert(data, send);
+        events
+    }
+    pub(in crate::web::wire) fn test_step_replay(
+        data: PathBuf,
+    ) -> (
+        tokio::sync::mpsc::UnboundedReceiver<u64>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        Writer::test_step_replay(data)
+    }
     pub(in crate::web::wire) fn test_stall_replay(
         data: PathBuf,
     ) -> (oneshot::Receiver<()>, std::sync::mpsc::Sender<()>) {

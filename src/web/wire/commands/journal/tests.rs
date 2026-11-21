@@ -605,6 +605,15 @@ fn replay_reports_byte_progress_without_record_contents() {
 }
 
 type ReplayBarrier = (oneshot::Sender<()>, mpsc::Receiver<()>);
+pub(super) type ReplayStep = Box<dyn FnMut(u64) -> io::Result<()> + Send>;
+fn replay_steps() -> &'static parking_lot::Mutex<HashMap<PathBuf, ReplayStep>> {
+    static STEPS: std::sync::OnceLock<parking_lot::Mutex<HashMap<PathBuf, ReplayStep>>> =
+        std::sync::OnceLock::new();
+    STEPS.get_or_init(Default::default)
+}
+pub(super) fn take_replay_steps(data: &Path) -> Option<ReplayStep> {
+    replay_steps().lock().remove(data)
+}
 fn replay_hooks() -> &'static parking_lot::Mutex<HashMap<PathBuf, ReplayBarrier>> {
     static HOOKS: std::sync::OnceLock<parking_lot::Mutex<HashMap<PathBuf, ReplayBarrier>>> =
         std::sync::OnceLock::new();
@@ -621,6 +630,26 @@ pub(super) fn replay_barrier(data: &Path) -> io::Result<()> {
     Ok(())
 }
 impl Writer {
+    pub(in crate::web::wire) fn test_step_replay(
+        data: PathBuf,
+    ) -> (tokio::sync::mpsc::UnboundedReceiver<u64>, mpsc::Sender<()>) {
+        let (entered, steps) = tokio::sync::mpsc::unbounded_channel();
+        let (release, wait) = mpsc::channel();
+        let mut remaining = 3;
+        replay_steps().lock().insert(
+            data,
+            Box::new(move |bytes| {
+                if remaining > 0 {
+                    entered.send(bytes).map_err(io::Error::other)?;
+                    wait.recv_timeout(std::time::Duration::from_secs(30))
+                        .map_err(io::Error::other)?;
+                    remaining -= 1;
+                }
+                Ok(())
+            }),
+        );
+        (steps, release)
+    }
     pub(in crate::web::wire) fn test_stall_replay(
         data: PathBuf,
     ) -> (oneshot::Receiver<()>, mpsc::Sender<()>) {
