@@ -66,17 +66,30 @@ fn check_probes(context: &str, cases: &[(&str, Option<&str>)]) {
     }
 }
 
+// Keep sealed declarations/impls verbatim. Storage submodules need product
+// dependencies, so retain only their namespaces in these standalone probes.
+fn token_context(auth: &str) -> String {
+    let tree = syn::parse_file(auth).expect("parse actual auth module");
+    let mut context = auth.to_owned();
+    let modules = tree.items.into_iter().filter_map(|item| match item {
+        syn::Item::Mod(module) if module.content.is_none() => Some(module.ident),
+        _ => None,
+    });
+    for module in modules {
+        let declaration = format!("mod {module};");
+        assert_eq!(
+            auth.matches(&declaration).count(),
+            1,
+            "auth submodule boundary"
+        );
+        context = context.replace(&declaration, &format!("mod {module} {{}}"));
+    }
+    format!("mod auth {{\n{context}\n}}")
+}
+
 #[test]
 fn permission_token_compile_fail() {
-    let auth = include_str!("../src/structured/permissions/auth.rs");
-    // Keep every declaration/impl, excluding only the dependency-heavy token store.
-    let store = "\npub(crate) mod tokens;";
-    assert_eq!(
-        auth.matches(store).count(),
-        1,
-        "token store module boundary"
-    );
-    let context = format!("mod auth {{\n{}\n}}", auth.replace(store, ""));
+    let context = token_context(include_str!("../src/structured/permissions/auth.rs"));
     check_probes(
         &context,
         &[
@@ -134,11 +147,9 @@ fn permission_local_operator_compile_fail() {
 /// Browser scopes, including operate, never mint the local operator witness.
 #[test]
 fn websocket_token_cannot_become_local_operator() {
-    let auth = include_str!("../src/structured/permissions/auth.rs");
-    let boundary = "\npub(crate) mod tokens;";
-    assert_eq!(auth.matches(boundary).count(), 1);
+    let auth = token_context(include_str!("../src/structured/permissions/auth.rs"));
     let operator = local_operator_context();
-    let context = format!("mod auth {{ {} }} {operator}", auth.replace(boundary, ""));
+    let context = format!("{auth} {operator}");
     check_probes(&context, &[
         ("fn keep(token: auth::VerifiedToken<'static>) -> auth::VerifiedToken<'static> { token }", None),
         ("fn elevate(token: auth::VerifiedToken<'static>) -> app::LocalOperator<'static> { token.into() }", Some("E0277")),
