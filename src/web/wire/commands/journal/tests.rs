@@ -1,7 +1,7 @@
 use super::std;
 use super::*;
 use serde_json::json;
-use std::{fs, time::Duration};
+use std::time::Duration;
 fn root() -> crate::structured::launch::SessionConfigDir {
     crate::structured::launch::SessionConfigDir::create(&std::env::temp_dir()).unwrap()
 }
@@ -66,7 +66,7 @@ fn replay_rebuilds_index_counts_and_first_outcome() {
         Admission::Pending(100)
     ));
     assert_eq!(
-        fs::read_to_string(root.path().join("wire/commands.jsonl"))
+        filesystem::fs::read_to_string(root.path().join("wire/commands.jsonl"))
             .unwrap()
             .lines()
             .count(),
@@ -98,7 +98,7 @@ fn claim_and_finish_write_one_record_independent_of_retained_size() {
         let mut journal = Journal::open(root.path()).unwrap();
         let before = journal.bytes;
         let written = journal.file.written;
-        let original = fs::read(root.path().join("wire/commands.jsonl")).unwrap();
+        let original = filesystem::fs::read(root.path().join("wire/commands.jsonl")).unwrap();
         claim(&mut journal, "one");
         let middle = journal.file.written;
         let claim_bytes = serde_json::to_vec(&journal.index.records[&key("one")])
@@ -114,7 +114,7 @@ fn claim_and_finish_write_one_record_independent_of_retained_size() {
             .len() as u64
             + 1;
         assert_eq!(*deltas.last().unwrap(), (claim_bytes, outcome_bytes));
-        let bytes = fs::read(root.path().join("wire/commands.jsonl")).unwrap();
+        let bytes = filesystem::fs::read(root.path().join("wire/commands.jsonl")).unwrap();
         assert_eq!(&bytes[..before as usize], &original);
         assert!(deltas.last().unwrap().0 < ENTRY_BYTES as u64);
         assert!(deltas.last().unwrap().1 < ENTRY_BYTES as u64);
@@ -131,14 +131,14 @@ fn principal_global_and_byte_caps_refuse_without_eviction() {
         Some(ErrorCode::SessionBusy)
     );
     journal.claim("local", "q", &command("three"), 101).unwrap();
-    let before = fs::read(root.path().join("wire/commands.jsonl")).unwrap();
+    let before = filesystem::fs::read(root.path().join("wire/commands.jsonl")).unwrap();
     assert_eq!(
         journal.claim("local", "r", &command("four"), 102).err(),
         Some(ErrorCode::SessionBusy)
     );
     assert_eq!(
         before,
-        fs::read(root.path().join("wire/commands.jsonl")).unwrap()
+        filesystem::fs::read(root.path().join("wire/commands.jsonl")).unwrap()
     );
     assert!(matches!(
         journal.claim("local", "p", &command("one"), 103).unwrap(),
@@ -203,7 +203,7 @@ fn absent_expired_and_lost_claims_fail_closed() {
         journal.finish(&key("one"), 101, Ok(json!({}))).err(),
         Some(ErrorCode::SessionUnconfirmed)
     );
-    fs::remove_file(root.path().join("wire/commands.jsonl")).unwrap();
+    filesystem::fs::remove_file(root.path().join("wire/commands.jsonl")).unwrap();
     assert!(matches!(
         journal.apply(operation("one")),
         Err(ErrorCode::SessionUnconfirmed)
@@ -225,9 +225,10 @@ fn torn_tail_is_archived_before_truncation_and_append_remains_readable() {
     drop(journal);
     let mut journal = Journal::open(root.path()).unwrap();
     assert_eq!(journal.bytes, before);
-    let archived: Value =
-        serde_json::from_slice(&fs::read(root.path().join("wire/commands.torn.jsonl")).unwrap())
-            .unwrap();
+    let archived: Value = serde_json::from_slice(
+        &filesystem::fs::read(root.path().join("wire/commands.torn.jsonl")).unwrap(),
+    )
+    .unwrap();
     assert_eq!(archived["raw"], json!(b"{\"outcome\":".to_vec()));
     claim(&mut journal, "two");
     drop(journal);
@@ -257,7 +258,7 @@ fn complete_corruption_and_oversized_rows_preserve_raw_and_other_results() {
         serde_json::to_writer(&mut journal.file, &record).unwrap();
         journal.file.write_all(b"\n").unwrap();
         drop(journal);
-        let before = fs::read(root.path().join("wire/commands.jsonl")).unwrap();
+        let before = filesystem::fs::read(root.path().join("wire/commands.jsonl")).unwrap();
         let mut journal = Journal::open(root.path()).unwrap();
         assert!(journal.blocked);
         assert_eq!(journal.index.records.len(), 2);
@@ -270,7 +271,7 @@ fn complete_corruption_and_oversized_rows_preserve_raw_and_other_results() {
         );
         assert_eq!(
             before,
-            fs::read(root.path().join("wire/commands.jsonl")).unwrap()
+            filesystem::fs::read(root.path().join("wire/commands.jsonl")).unwrap()
         );
     }
 }
@@ -283,11 +284,11 @@ fn archive_full_preserves_the_active_tail() {
     let archive = private(&root.path().join("wire/commands.torn.jsonl")).unwrap();
     archive.set_len((ENTRY_BYTES * 32) as u64).unwrap();
     drop(archive);
-    let before = fs::read(root.path().join("wire/commands.jsonl")).unwrap();
+    let before = filesystem::fs::read(root.path().join("wire/commands.jsonl")).unwrap();
     assert!(Journal::open(root.path()).is_err());
     assert_eq!(
         before,
-        fs::read(root.path().join("wire/commands.jsonl")).unwrap()
+        filesystem::fs::read(root.path().join("wire/commands.jsonl")).unwrap()
     );
 }
 #[test]
@@ -295,7 +296,7 @@ fn append_and_sync_failures_roll_back_before_publishing_index() {
     for fault in [Fault::Partial, Fault::Sync] {
         let (root, mut journal) = setup();
         claim(&mut journal, "one");
-        let before = fs::read(root.path().join("wire/commands.jsonl")).unwrap();
+        let before = filesystem::fs::read(root.path().join("wire/commands.jsonl")).unwrap();
         journal.fault = Some(fault);
         assert_eq!(
             journal.claim("local", "p", &command("two"), 100).err(),
@@ -305,7 +306,7 @@ fn append_and_sync_failures_roll_back_before_publishing_index() {
         assert_eq!(journal.index.counts[&("local".into(), "p".into())], 1);
         assert_eq!(
             before,
-            fs::read(root.path().join("wire/commands.jsonl")).unwrap()
+            filesystem::fs::read(root.path().join("wire/commands.jsonl")).unwrap()
         );
         assert!(journal.blocked);
         drop(journal);
@@ -507,7 +508,7 @@ fn public_writer_opens_and_wakes_only_after_durable_completion() {
             response.await.unwrap().unwrap(),
             Admission::Claimed(100)
         ));
-        let text = fs::read_to_string(root.path().join("wire/commands.jsonl")).unwrap();
+        let text = filesystem::fs::read_to_string(root.path().join("wire/commands.jsonl")).unwrap();
         assert_eq!(
             serde_json::from_str::<Value>(text.trim()).unwrap()["cmd_id"],
             "one"

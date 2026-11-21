@@ -16,6 +16,15 @@ the same directory observer. Rename updates existing handles' destinations;
 replacing a `Stream` cannot reset the observer. A separate boundary test checks
 reopened handles, copying and writes after replacement.
 
+The source gate `just journal-io-check` also prevents bypassing the boundary with
+fully qualified paths or aliases. It scans every Rust file under `journal*` and
+`ownership.rs`, excluding only the canonical `journal/filesystem.rs` boundary.
+Native filesystem imports, `OpenOptions`, file constructors, direct platform I/O,
+boundary rebinding, module path overrides and Rust `include!` are rejected.
+Journal code uses explicit `filesystem` interfaces; comments and literals are
+ignored. The gate runs in lint, pre-commit/pre-push hooks, Nix gate checks, and
+maintenance tests, including mutation fixtures and a real-tree assertion.
+
 Each foreground claim and finish must write exactly its single serialized
 record, below 2 KiB for this fixture. After normalizing the decimal widths of the
 timestamp and payload digest, write sizes must agree across journal sizes.

@@ -101,7 +101,7 @@ impl Journal {
             .spawn(move || {
                 let initial = (|| -> io::Result<Snapshot> {
                     let path = root.join("commands.compact");
-                    match std::fs::remove_file(&path) {
+                    match filesystem::remove_file(&path) {
                         Ok(()) => (),
                         Err(e) if e.kind() == io::ErrorKind::NotFound => (),
                         Err(e) => return Err(e),
@@ -196,7 +196,7 @@ impl Journal {
             snapshot.file.sync_all()?;
             #[cfg(test)]
             snapshot.checkpoint("synced");
-            std::fs::rename(
+            filesystem::rename(
                 self.root.join("commands.compact"),
                 self.root.join("commands.jsonl"),
             )?;
@@ -210,7 +210,7 @@ impl Journal {
             self.file = file;
             self.bytes = snapshot.bytes;
             std::mem::swap(&mut self.index, &mut snapshot.index);
-            File::open(&self.root)?.sync_all()?;
+            filesystem::sync_directory(&self.root)?;
             #[cfg(test)]
             snapshot.checkpoint("directory_synced");
             Ok(())

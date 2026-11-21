@@ -83,7 +83,7 @@ fn expiry_threshold_drops_only_expired_records_and_releases_exact_capacity() {
     );
     assert_eq!(
         journal.bytes,
-        fs::metadata(root.path().join("wire/commands.jsonl"))
+        filesystem::fs::metadata(root.path().join("wire/commands.jsonl"))
             .unwrap()
             .len()
     );
@@ -188,7 +188,7 @@ fn opaque_rows_fence_compaction_and_remain_byte_exact() {
         journal.file.sync_all().unwrap();
         drop(journal);
         let mut journal = Journal::open(root.path()).unwrap();
-        let before = fs::read(root.path().join("wire/commands.jsonl")).unwrap();
+        let before = filesystem::fs::read(root.path().join("wire/commands.jsonl")).unwrap();
         let rx = start(&mut journal, NOW);
         assert!(journal.compaction.is_none());
         assert!(matches!(
@@ -196,7 +196,7 @@ fn opaque_rows_fence_compaction_and_remain_byte_exact() {
             Err(mpsc::TryRecvError::Disconnected)
         ));
         assert_eq!(
-            fs::read(root.path().join("wire/commands.jsonl")).unwrap(),
+            filesystem::fs::read(root.path().join("wire/commands.jsonl")).unwrap(),
             before
         );
         assert_eq!(journal.index.counts[&("local".into(), "p".into())], 1);
@@ -214,11 +214,11 @@ fn failed_append_during_snapshot_cannot_publish_over_uncertain_tail() {
     let snapshot = receive(&rx);
     journal.fault = Some(Fault::Rollback);
     assert!(journal.claim("local", "p", &command("torn"), NOW).is_err());
-    let before = fs::read(root.path().join("wire/commands.jsonl")).unwrap();
+    let before = filesystem::fs::read(root.path().join("wire/commands.jsonl")).unwrap();
     journal.compacted(snapshot);
     assert!(journal.blocked);
     assert_eq!(
-        fs::read(root.path().join("wire/commands.jsonl")).unwrap(),
+        filesystem::fs::read(root.path().join("wire/commands.jsonl")).unwrap(),
         before
     );
     assert!(journal.index.records.contains_key(&key("expired")));
@@ -341,7 +341,7 @@ fn crash_at_each_compaction_step_leaves_a_complete_replayable_old_or_new_log() {
         let first = journal
             .finish(&key("keep"), 1001, Ok(json!({"first":true})))
             .unwrap();
-        let before = fs::read(root.path().join("wire/commands.jsonl")).unwrap();
+        let before = filesystem::fs::read(root.path().join("wire/commands.jsonl")).unwrap();
         drop(journal);
         let mut child = std::process::Command::new(std::env::current_exe().unwrap());
         child
@@ -369,7 +369,7 @@ fn crash_at_each_compaction_step_leaves_a_complete_replayable_old_or_new_log() {
             std::thread::yield_now();
         };
         assert_eq!(status.code(), Some(crate::cli::exit::SUCCESS), "{step}");
-        let after = fs::read(root.path().join("wire/commands.jsonl")).unwrap();
+        let after = filesystem::fs::read(root.path().join("wire/commands.jsonl")).unwrap();
         if matches!(
             step,
             "created" | "row_written" | "prefix_copied" | "catchup_copied" | "synced"
@@ -482,12 +482,12 @@ fn lost_primary_during_copy_is_fenced_without_resurrecting_the_journal() {
     let snapshot = receive(&rx);
     let primary = root.path().join("wire/commands.jsonl");
     let backup = root.path().join("wire/commands.saved");
-    let before = fs::read(&primary).unwrap();
-    fs::rename(&primary, &backup).unwrap();
+    let before = filesystem::fs::read(&primary).unwrap();
+    filesystem::fs::rename(&primary, &backup).unwrap();
     journal.compacted(snapshot);
     assert!(journal.blocked);
     assert!(!primary.exists());
-    assert_eq!(fs::read(&backup).unwrap(), before);
+    assert_eq!(filesystem::fs::read(&backup).unwrap(), before);
     assert!(journal.index.records.contains_key(&key("one")));
 }
 
@@ -499,12 +499,12 @@ fn opaque_row_discovered_by_copier_preserves_the_log_and_fences_writes() {
     journal.file.write_all(opaque).unwrap();
     journal.file.sync_all().unwrap();
     journal.bytes += opaque.len() as u64;
-    let before = fs::read(root.path().join("wire/commands.jsonl")).unwrap();
+    let before = filesystem::fs::read(root.path().join("wire/commands.jsonl")).unwrap();
     let rx = start(&mut journal, NOW);
     finish_compaction(&mut journal, &rx);
     assert!(journal.blocked);
     assert_eq!(
-        fs::read(root.path().join("wire/commands.jsonl")).unwrap(),
+        filesystem::fs::read(root.path().join("wire/commands.jsonl")).unwrap(),
         before
     );
     assert!(journal.index.records.contains_key(&key("one")));

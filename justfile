@@ -51,11 +51,15 @@ log-budget seconds='60':
     guardrails-log-budget
 
 # Run fast local lint checks
-lint: changelog-check ts-check client-lint
+lint: changelog-check journal-io-check ts-check client-lint
     cargo fmt --check
     cargo clippy --all-targets --locked -- -D warnings
     cargo clippy --all-targets --locked --features ts -- -D warnings
     cargo clippy --locked --bin flk --features web -- -D warnings
+
+# Keep all journal I/O observable, including fully qualified filesystem paths.
+journal-io-check:
+    python3 scripts/journal_io_gate.py
 
 # Validate fragments with the same rules used to prepare a release.
 changelog-check:

@@ -2,18 +2,15 @@
 //! Opening and shutdown are asynchronous lease barriers. Compaction copies a fixed
 //! prefix off-thread, catches up appends, then publishes a bounded tail atomically.
 use super::{ack, Command, ErrorCode, ServerFrame};
-#[cfg(not(test))]
-use crate::platform::{file_lock::LockFile, structured as files};
-#[cfg(test)]
 pub(in crate::web::wire) mod filesystem;
 #[cfg(test)]
-use filesystem::{files, std, LockFile};
+use filesystem::std;
+use filesystem::{files, File, LockFile};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
-    fs::File,
     io::{self, BufRead, Read, Write},
     path::{Path, PathBuf},
     sync::{
@@ -215,7 +212,7 @@ fn private(path: &Path) -> io::Result<File> {
     match files::create_private_file(path) {
         Ok(file) => {
             file.sync_all()?;
-            File::open(path.parent().ok_or(io::ErrorKind::InvalidInput)?)?.sync_all()?;
+            filesystem::sync_directory(path.parent().ok_or(io::ErrorKind::InvalidInput)?)?;
         }
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => (),
         Err(e) => return Err(e),
@@ -244,7 +241,7 @@ impl Journal {
     fn open(data: &Path) -> io::Result<Self> {
         let root = data.canonicalize()?.join("wire");
         match files::create_private_dir(&root) {
-            Ok(()) => File::open(data)?.sync_all()?,
+            Ok(()) => filesystem::sync_directory(data)?,
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => files::check_private_dir(&root)?,
             Err(e) => return Err(e),
         }
