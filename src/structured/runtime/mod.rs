@@ -160,6 +160,17 @@ impl Runtime {
     ) -> Result<(), crate::api::error_code::ErrorCode> {
         self.transport.agent_decide(principal, args)
     }
+    /// Producer fence for journal dispatch; ordinary decisions retain their order.
+    #[allow(dead_code)] // #1380 P2 connects journal Finish to this opt-in seam.
+    pub(crate) fn agent_decide_caused(
+        &self,
+        principal: &super::permissions::Principal<'_>,
+        args: &super::permissions::AgentDecide,
+        cause: super::publication::causal::Cause,
+    ) -> Result<(), crate::api::error_code::ErrorCode> {
+        self.transport
+            .agent_decide_caused(principal, args, Some(cause))
+    }
     /// Audit a host cancellation/result/interrupt without sending a tool decision.
     /// The caller must carry an authenticated operate-token capability.
     pub fn close_permissions(

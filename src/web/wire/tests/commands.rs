@@ -1364,3 +1364,5 @@ fn ended_history_cut_recovers_after_restart_without_losing_the_socket() {
         case.stop().await;
     });
 }
+
+mod causal;

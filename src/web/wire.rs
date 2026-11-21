@@ -1,6 +1,6 @@
 //! Server-owned, opt-in structured transport; no PTY or model dispatch.
 mod commands;
-mod fleet;
+pub(crate) mod fleet;
 mod output;
 mod refusals;
 mod subscriptions;
@@ -55,6 +55,8 @@ const GOING_AWAY_CLOSE: u16 = 1001;
 const POLICY_VIOLATION_CLOSE: u16 = 1008;
 /// Socket identity remains owned until teardown; later dispatch uses this verified session.
 struct Client {
+    #[allow(dead_code)] // P2 adds registration; this field already owns socket teardown.
+    causal: crate::structured::publication::causal::Origin,
     session: Session,
     read_only: bool,
     data: mpsc::Sender<output::Delivery>,
@@ -247,6 +249,23 @@ impl Core {
         );
         let projection = self.fleet_nodes.observe(app, self.shared.clock.now());
         self.shared.fleet.observe(
+            &app.state.structured_agents,
+            &app.structured_workers,
+            root,
+            app.node_id.as_deref(),
+            Some(projection),
+        );
+    }
+    /// Capture the command's projection before the next ordinary observation.
+    #[allow(dead_code)] // P1 tests the producer seam independently of journal admission.
+    pub(crate) fn service_app_caused(
+        &mut self,
+        app: &mut crate::app::App,
+        root: &std::path::Path,
+        publication: fleet::Publication,
+    ) {
+        let projection = self.fleet_nodes.observe(app, self.shared.clock.now());
+        publication.observe(
             &app.state.structured_agents,
             &app.structured_workers,
             root,
@@ -605,6 +624,7 @@ async fn connection(
                         clients.insert(
                             id,
                             Client {
+                                causal: Default::default(),
                                 session: session.clone(),
                                 read_only,
                                 data,

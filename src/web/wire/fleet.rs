@@ -6,6 +6,7 @@ use super::{
 };
 use crate::structured::{
     fleet_lite::{Delta, Provider, Store, StructuredAgent},
+    publication::causal::projection::{Projection, Reader, Reservation},
     registry::{Record, Registry},
     workers::Workers,
 };
@@ -69,6 +70,23 @@ impl Provider for Local {
     }
 }
 type Observation = (PathBuf, Result<Local, crate::api::error_code::ErrorCode>);
+/// Reserve bounded producer capacity before mutating lifecycle state (P2).
+#[allow(dead_code)] // Journal dispatch connects this seam in #1380 P2.
+pub(crate) struct Publication(Reservation<Arc<Observation>>);
+impl Publication {
+    #[allow(dead_code)] // Called after lifecycle dispatch by P2, never by admission in P1.
+    pub(super) fn observe(
+        self,
+        registry: &Registry,
+        workers: &Workers,
+        root: &Path,
+        home: Option<&str>,
+        nodes: Option<nodes::Projection>,
+    ) {
+        self.0
+            .send(observation(registry, workers, root, home, nodes));
+    }
+}
 type Request = (Option<u64>, oneshot::Sender<io::Result<Cut>>);
 // Shared ring: sixteen frames, each within the existing 64 KiB writer limit.
 const LIVE: usize = 16;
@@ -89,23 +107,39 @@ fn refusal(error: io::Error) -> Option<SubfailCode> {
 }
 #[derive(Clone)]
 pub(super) struct Client {
-    updates: watch::Sender<Option<Arc<Observation>>>,
+    #[cfg(test)]
+    schedule: Arc<tests::Schedule>,
+    updates: Arc<Projection<Arc<Observation>>>,
     requests: mpsc::Sender<Request>,
     wake: Arc<Notify>,
     done: watch::Receiver<bool>,
 }
 impl Client {
     pub(super) fn new(wake: Arc<Notify>, stop: watch::Receiver<bool>) -> Self {
-        let (updates, observations) = watch::channel(None);
+        let (updates, observations) = Projection::channel();
         let (requests, rx) = mpsc::channel(32);
         let (done, closed) = watch::channel(false);
+        #[cfg(test)]
+        let schedule = Arc::new(tests::Schedule::default());
+        #[cfg(test)]
+        let scheduling = schedule.clone();
         tokio::spawn(async move {
-            if let Err(error) = run(observations, rx, stop).await {
+            if let Err(error) = run(
+                observations,
+                rx,
+                stop,
+                #[cfg(test)]
+                scheduling,
+            )
+            .await
+            {
                 crate::logging::structured_fleet_stopped(&error);
             }
             done.send_replace(true);
         });
         Self {
+            #[cfg(test)]
+            schedule,
             updates,
             requests,
             wake,
@@ -121,39 +155,16 @@ impl Client {
         home: Option<&str>,
         nodes: Option<nodes::Projection>,
     ) {
-        let agents = registry
-            .records()
-            .into_iter()
-            .map(|record| {
-                let (_, view, generation) = registry
-                    .get(&record.agent_id)
-                    .ok_or(crate::api::error_code::ErrorCode::AgentNotFound)?;
-                let waiting = match workers.runtime(&record.agent_id, generation) {
-                    Some(runtime) => runtime
-                        .waiting_on_human()?
-                        .into_iter()
-                        .map(|(id, _)| id)
-                        .collect(),
-                    // Only a quiescent producer proves that an absent book is empty.
-                    None if workers.history_recovery_allowed(&record.agent_id) => Vec::new(),
-                    None => return Err(crate::api::error_code::ErrorCode::SessionBusy),
-                };
-                Ok(Agent(record, view.update.state.clone(), waiting))
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .map(|agents| Local {
-                agents,
-                home: home.map(str::to_owned),
-                nodes,
-            });
-        let observation = Arc::new((root.join("fleet.json"), agents));
-        self.updates.send_if_modified(|old| {
-            if old.as_ref() == Some(&observation) {
-                return false;
-            }
-            *old = Some(observation);
-            true
-        });
+        self.updates
+            .observe(observation(registry, workers, root, home, nodes));
+    }
+    /// Reserve before effects: a full causal lane refuses admission, never drops it.
+    #[allow(dead_code)] // Journal admission connects this in #1380 P2.
+    pub(crate) fn reserve(
+        &self,
+        cause: crate::structured::publication::causal::Cause,
+    ) -> io::Result<Publication> {
+        self.updates.reserve(cause).map(Publication)
     }
     pub(super) async fn subscribe(&self, after: Option<u64>) -> io::Result<Cut> {
         let (tx, rx) = oneshot::channel();
@@ -167,6 +178,41 @@ impl Client {
         let _ = self.done.clone().wait_for(|done| *done).await;
     }
 }
+fn observation(
+    registry: &Registry,
+    workers: &Workers,
+    root: &Path,
+    home: Option<&str>,
+    nodes: Option<nodes::Projection>,
+) -> Arc<Observation> {
+    let agents = registry
+        .records()
+        .into_iter()
+        .map(|record| {
+            let (_, view, generation) = registry
+                .get(&record.agent_id)
+                .ok_or(crate::api::error_code::ErrorCode::AgentNotFound)?;
+            let waiting = match workers.runtime(&record.agent_id, generation) {
+                Some(runtime) => runtime
+                    .waiting_on_human()?
+                    .into_iter()
+                    .map(|(id, _)| id)
+                    .collect(),
+                // Only a quiescent producer proves that an absent book is empty.
+                None if workers.history_recovery_allowed(&record.agent_id) => Vec::new(),
+                None => return Err(crate::api::error_code::ErrorCode::SessionBusy),
+            };
+            Ok(Agent(record, view.update.state.clone(), waiting))
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(|agents| Local {
+            agents,
+            home: home.map(str::to_owned),
+            nodes,
+        });
+    Arc::new((root.join("fleet.json"), agents))
+}
+
 fn event(delta: Delta, ts_ms: u64, head: u64) -> io::Result<Arc<ServerFrame>> {
     let mut frame = ServerFrame::Ev {
         // Reserve the largest JSON-escaped ID before admitting a frame to shared storage.
@@ -204,30 +250,44 @@ fn checkpoint(
     Ok((end, frames))
 }
 async fn run(
-    mut updates: watch::Receiver<Option<Arc<Observation>>>,
+    mut updates: Reader<Arc<Observation>>,
     mut requests: mpsc::Receiver<Request>,
     mut stop: watch::Receiver<bool>,
+    #[cfg(test)] schedule: Arc<tests::Schedule>,
 ) -> io::Result<()> {
     let mut store: Option<Store> = None;
     let (frames, _) = broadcast::channel(LIVE);
     let head = Arc::new(AtomicU64::new(0));
+    let mut current: Option<Arc<Observation>> = None;
     loop {
-        let request = tokio::select! { biased;
+        let mut request = tokio::select! { biased;
             _ = stop.changed() => return Ok(()),
             request = requests.recv() => match request { Some(request) => Some(request), None => return Ok(()) },
-            changed = updates.changed() => { if changed.is_err() { return Ok(()); } None },
+            _ = updates.changed() => None,
         };
+        #[cfg(test)]
+        schedule.selected().await;
         if request.as_ref().is_some_and(|(_, reply)| reply.is_closed()) {
+            request = None;
+        }
+        let mut publication = updates.take();
+        if publication.is_none() && request.is_none() {
             continue;
         }
-        while updates.borrow().is_none() {
-            tokio::select! { biased; _ = stop.changed() => return Ok(()), result = updates.changed() => { if result.is_err() { return Ok(()); } } }
+        while publication.is_none() && current.is_none() {
+            tokio::select! { biased;
+                _ = stop.changed() => return Ok(()),
+                _ = updates.changed() => publication = updates.take(),
+            }
         }
-        let observation = updates
-            .borrow_and_update()
-            .clone()
+        let (observation, cause) = publication
+            .or_else(|| current.clone().map(|observation| (observation, None)))
             .ok_or(io::ErrorKind::BrokenPipe)?;
+        current = Some(observation.clone());
         if let Err(code) = &observation.1 {
+            if let Some(cause) = cause {
+                cause.released().await;
+            }
             tracing::warn!(code = code.as_str(), "fleet provider unavailable");
             let _ = frames.send(Err(*code));
             if let Some((_, reply)) = request {
@@ -282,7 +342,15 @@ async fn run(
         })
         .await
         .map_err(io::Error::other)??;
+        // Persisted projections remain private, including snapshot requests.
+        if let Some(cause) = cause {
+            #[cfg(test)]
+            schedule.boundary();
+            cause.released().await;
+        }
         head.store(next.high_water(), Ordering::Release);
+        #[cfg(test)]
+        schedule.boundary();
         store = Some(next);
         for delta in deltas {
             let _ = frames.send(Ok(delta));
