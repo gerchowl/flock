@@ -10,22 +10,22 @@ included Rust code and symlinks are refused. Only enumerated existing internal g
 Comments and literals are ignored. There is no escape marker.
 
 Known limits: this is a text scanner, not a Rust parser or type checker. It does
-not infer receiver types, expand arbitrary macros, or model trait dispatch and
-generic instantiation. The independent method-name layer defends receiver-typed
-calls even when path resolution cannot identify their origin. References to
-associated capability functions are refused too, preventing an indirect call
-through a function value. Exceptions pin the file, lexical module/impl/function
-path, receiver tokens and method, trusting reviewed bindings rather than proving
-Rust type identity. Arguments and closure bodies remain independently scanned;
-receiver literals are retained in anchors. Duplicate calls matching the
-same anchor share its permission, but another item cannot consume a deleted pin.
-In-tree macro token trees cannot synthesize method/path positions from
-metavariables without an explicit, reasoned exception. Conservatively, any `.` or
-`::` inside or adjacent to a repetition (including its separator and quantifier)
-requires that exception, even for otherwise harmless repeated static paths.
-Alias collection covers the whole file and its lexical/inline-module scopes before
-uses are checked. Unsupported source and namespace injection constructs fail closed
-as documented above.
+not infer receiver types or expand macros. Every capability identifier token,
+including declarations, bare references, macro arguments and macro bodies, needs
+a reviewed file/item/receiver anchor. Boundary and fixture code also need anchors.
+Arguments and closure bodies remain independently scanned; receiver literals are
+retained. Declaration anchors are distinct from expression anchors. Duplicate
+uses with the same anchor share its permission; another item cannot reuse it.
+Receiver bindings remain a review responsibility, not proof of Rust type identity.
+Every in-tree macro_rules! definition requires an explicit reasoned allowlist
+entry reviewed for capability synthesis. No definitions currently need permission.
+Expansion-time identifier construction from fragments (for example a paste-style
+procedural macro) is not modeled: the outside import/path/macro allowlist refuses
+such crates and their macros outside the counted filesystem boundary unless
+explicitly reviewed. There is no shape-based
+metavariable or repetition analysis. Alias collection covers the whole file and
+its lexical/inline-module scopes before uses are checked. Unsupported source and
+namespace injection constructs fail closed as documented above.
 """
 from __future__ import annotations
 
@@ -184,10 +184,9 @@ EXISTING_GLOBS = {
     COMMANDS / 'ownership/tests.rs': 'ownership fixtures inspect private lifecycle state',
 }
 # Keys are (definition source path, macro name), with a review reason as value.
-# No crate-defined macros currently need to cross into the journal.
+# Also required for every in-tree definition, reviewed for capability synthesis.
+# The current journal tree defines no macros, so no entries are needed.
 CRATE_MACRO_ALLOWLIST = {}
-# Same key shape, for reviewed in-tree macros synthesizing method/path positions.
-MACRO_POSITION_ALLOWLIST = {}
 
 # Independent of path/alias resolution: these std and Tokio names can perform
 # filesystem or process operations on a value whose type the scanner cannot infer.
@@ -244,14 +243,13 @@ def item_paths(names, pairs):
                 if names[end] in {'(', '['}:
                     end = pairs.get(end, len(names))
                 end += 1
-            if end < len(names) and names[end] == '{':
-                if name == 'impl':
-                    identity = ' '.join(names[i:end])
-                elif name == 'macro_rules':
-                    identity = 'macro ' + ''.join(names[i + 2:end])
-                else:
-                    identity = name + ' ' + ('block' if anonymous_const else names[named])
-            at.extend([path] * (end - i))
+            if name == 'impl':
+                identity = ' '.join(names[i:end])
+            elif name == 'macro_rules':
+                identity = 'macro ' + ''.join(names[i + 2:end])
+            else:
+                identity = name + ' ' + ('block' if anonymous_const else names[named])
+            at.extend([path + (identity,)] * (end - i))
             i = end
             if i >= len(names):
                 break
@@ -268,18 +266,8 @@ def item_paths(names, pairs):
 
 
 def call_receiver(names, index, pairs):
-    """Token identity of a method/associated call's receiver, excluding arguments."""
+    """Receiver token span for a method or associated capability identifier."""
     if names[max(0, index - 1):index] not in (['.'], ['::']):
-        return None
-    opening = index + 1
-    if names[opening:opening + 2] == ['::', '<']:
-        opening += 2
-        depth = 1
-        while opening < len(names) and depth:
-            depth += (names[opening] == '<') - (
-                names[opening] == '>' and names[opening - 1] != '-')
-            opening += 1
-    if names[opening:opening + 1] != ['(']:
         return None
 
     def receiver(end):
@@ -287,131 +275,243 @@ def call_receiver(names, index, pairs):
             return 0
         if names[end] == '?':
             return receiver(end - 1)
-        start = pairs.get(end, end)
+        start = pairs.get(end, end) if names[end] in {')', ']', '}'} else end
         if start and names[end] in {')', ']'} and (
                 IDENT.fullmatch(names[start - 1]) or names[start - 1] in {')', ']'}):
             start = receiver(start - 1)
-        if start >= 2 and names[start - 1] in {'.', '::'}:
-            start = receiver(start - 2)
+        if start and names[start - 1] in {'.', '::'}:
+            if start >= 2 and (IDENT.fullmatch(names[start - 2])
+                               or names[start - 2].isdecimal()
+                               or names[start - 2] in {')', ']', '}', '?'}):
+                start = receiver(start - 2)
+            elif names[start - 1] == '::':
+                start -= 1
         return start
 
     return receiver(index - 2), index - 1
 
 
-def method_findings(text, code, path):
-    if path == BOUNDARY or test_source(path):
-        return []
+def capability_anchor(text, code, names, pairs, items, index, *, imported=False):
+    receiver = call_receiver(names, index, pairs)
+    if receiver is not None:
+        start, end = receiver
+        receiver = ''.join(token for token, _ in tokens(
+            text[code[start][1]:code[end][1]], literals=True))
+    else:
+        receiver = '<definition>' if names[max(0, index - 1):index] == ['fn'] else '<bare>'
+    return items[index], '<import>' if imported else receiver, names[index]
+
+
+def capability_findings(text, code, path):
     names = [name for name, _ in code]
     pairs = delimiter_pairs(names)
     items = item_paths(names, pairs)
-    findings = []
+    findings, import_end = [], 0
     for i, (name, offset) in enumerate(code):
-        if name not in CAPABILITY_METHODS:
-            continue
-        receiver = call_receiver(names, i, pairs)
-        if (receiver is None and names[max(0, i - 1):i] != ['::']
-                and names[i + 1:i + 3] != ['::', '<']):
-            continue
-        if receiver is not None:
-            start, end = receiver
-            receiver = ''.join(token for token, _ in tokens(
-                text[code[start][1]:code[end][1]], literals=True))
-        if receiver is None or (path, items[i], receiver, name) not in CALL_EXCEPTIONS:
-            findings.append((text.count('\n', 0, offset) + 1,
-                             f'filesystem/process capability requires an anchored exception: {name}'))
+        if name == 'use':
+            try:
+                _, import_end = import_paths(names, i + 1)
+            except (ValueError, IndexError):
+                import_end = i
+        if name in CAPABILITY_METHODS:
+            item, receiver, method = capability_anchor(
+                text, code, names, pairs, items, i, imported=i < import_end)
+            if (path, item, receiver, method) not in CALL_EXCEPTIONS:
+                findings.append((text.count('\n', 0, offset) + 1,
+                                 f'capability identifier requires an anchored exception: {name}'))
     return findings
 
 
-# Keys pin (file, lexical item path, receiver expression tokens, method).
-# Arguments and closure bodies are scanned independently, not frozen. All current
-# receivers are counted adapters, in-memory locks or worker factories: none grants
-# access based on an argument's value, so no argument-specific pins are needed.
-# Receiver types/bindings remain a review responsibility, not a scanner proof.
+# Group only identical method sets within one file/item. Each receiver/method
+# pair still expands to an independent exact anchor, never an allowance count.
+# Every token was reviewed, including counted boundary adapters and fixtures.
+# Definition/import permissions never authorize expression tokens.
 CALL_EXCEPTIONS = {
-    (COMMANDS / 'journal.rs', ('impl < R : Read > Read for ReplayReader < R >', 'fn read'),
-     'self.source', 'read'): 'existing replay stream delegates to the counted File',
-    (COMMANDS / 'journal.rs', ('impl Writer', 'fn open_signalled'),
-     'Self', 'spawn'): 'existing journal Writer factory; closure uses the counted boundary',
-    (COMMANDS / 'journal.rs', ('impl Writer', 'fn spawn'),
-     'std::thread::Builder::new().name("wire-journal".into())', 'spawn'): 'existing journal worker thread, not a child process; body scanned independently',
-    (COMMANDS / 'journal.rs', ('impl Writer', 'fn spawn'),
-     'admission', 'lock'): 'existing in-memory ownership/admission mutex, not a filesystem lock',
-    (COMMANDS / 'journal.rs', ('impl Writer', 'fn submit'),
-     'self.admission', 'lock'): 'existing in-memory ownership/admission mutex, not a filesystem lock',
-    (COMMANDS / 'journal.rs', ('impl Writer', 'fn shutdown'),
-     'self.admission', 'lock'): 'existing in-memory ownership/admission mutex, not a filesystem lock',
-    (COMMANDS / 'journal.rs', ('fn private',),
-     'file', 'sync_all'): 'existing counted File/Stream or its buffered writer; boundary retains I/O observation',
-    (COMMANDS / 'journal.rs', ('impl Journal', 'fn lease'),
-     'lease', 'try_lock'): 'existing counted LockFile wrapper',
-    (COMMANDS / 'journal.rs', ('impl Journal', 'fn lease'),
-     'file', 'metadata'): 'existing counted File/Stream or its buffered writer; boundary retains I/O observation',
-    (COMMANDS / 'journal.rs', ('impl Journal', 'fn seed_capacity_test'),
-     'self.file', 'try_clone'): 'existing counted File/Stream or its buffered writer; boundary retains I/O observation',
-    (COMMANDS / 'journal.rs', ('impl Journal', 'fn seed_capacity_test'),
-     'file', 'write_all'): 'existing counted File/Stream or its buffered writer; boundary retains I/O observation',
-    (COMMANDS / 'journal.rs', ('impl Journal', 'fn seed_capacity_test'),
-     'file', 'flush'): 'existing counted File/Stream or its buffered writer; boundary retains I/O observation',
-    (COMMANDS / 'journal.rs', ('impl Journal', 'fn seed_capacity_test'),
-     'file.get_ref()', 'sync_all'): 'existing counted File/Stream or its buffered writer; boundary retains I/O observation',
-    (COMMANDS / 'journal.rs', ('impl Journal', 'fn seed_capacity_test'),
-     'self.file.try_clone()?', 'seek'): 'existing counted File/Stream or its buffered writer; boundary retains I/O observation',
-    (COMMANDS / 'journal.rs', ('impl Journal', 'fn seed_capacity_test'),
-     'self.file', 'metadata'): 'existing counted File/Stream or its buffered writer; boundary retains I/O observation',
-    (COMMANDS / 'journal.rs', ('impl Journal', 'fn replay'),
-     'self.file', 'try_clone'): 'existing counted File/Stream or its buffered writer; boundary retains I/O observation',
-    (COMMANDS / 'journal.rs', ('impl Journal', 'fn replay'),
-     'file', 'metadata'): 'existing counted File/Stream or its buffered writer; boundary retains I/O observation',
-    (COMMANDS / 'journal.rs', ('impl Journal', 'fn replay'),
-     'file', 'write_all'): 'existing counted File/Stream or its buffered writer; boundary retains I/O observation',
-    (COMMANDS / 'journal.rs', ('impl Journal', 'fn replay'),
-     'file', 'sync_all'): 'existing counted File/Stream or its buffered writer; boundary retains I/O observation',
-    (COMMANDS / 'journal.rs', ('impl Journal', 'fn replay'),
-     'self.file', 'set_len'): 'existing counted File/Stream or its buffered writer; boundary retains I/O observation',
-    (COMMANDS / 'journal.rs', ('impl Journal', 'fn replay'),
-     'self.file', 'sync_all'): 'existing counted File/Stream or its buffered writer; boundary retains I/O observation',
-    (COMMANDS / 'journal.rs', ('impl Journal', 'fn append'),
-     'self.file', 'write_all'): 'existing counted File/Stream or its buffered writer; boundary retains I/O observation',
-    (COMMANDS / 'journal.rs', ('impl Journal', 'fn append'),
-     'self.file', 'sync_data'): 'existing counted File/Stream or its buffered writer; boundary retains I/O observation',
-    (COMMANDS / 'journal.rs', ('impl Journal', 'fn append'),
-     'self.file', 'set_len'): 'existing counted File/Stream or its buffered writer; boundary retains I/O observation',
-    (COMMANDS / 'journal.rs', ('impl Journal', 'fn append'),
-     'self.file', 'sync_all'): 'existing counted File/Stream or its buffered writer; boundary retains I/O observation',
-    (COMMANDS / 'journal/compact.rs', ('impl Snapshot', 'fn copy_to'),
-     'self.file', 'write_all'): 'existing counted File/Stream or its buffered writer; boundary retains I/O observation',
-    (COMMANDS / 'journal/compact.rs', ('impl Journal', 'fn start_compaction'),
-     'self.file', 'try_clone'): 'existing counted File/Stream or its buffered writer; boundary retains I/O observation',
-    (COMMANDS / 'journal/compact.rs', ('impl Journal', 'fn start_compaction'),
-     'std::thread::Builder::new().name("wire-compact".into())', 'spawn'): 'existing journal worker thread, not a child process; body scanned independently',
-    (COMMANDS / 'journal/compact.rs', ('impl Journal', 'fn start_compaction'),
-     'filesystem', 'remove_file'): 'existing counted filesystem boundary adapter',
-    (COMMANDS / 'journal/compact.rs', ('impl Journal', 'fn compacted'),
-     'snapshot.file', 'sync_all'): 'existing counted File/Stream or its buffered writer; boundary retains I/O observation',
-    (COMMANDS / 'journal/compact.rs', ('impl Journal', 'fn compacted'),
-     'filesystem', 'rename'): 'existing counted filesystem boundary adapter',
-    (COMMANDS / 'journal/compact.rs', ('impl Journal', 'fn compacted'),
-     'snapshot.file', 'try_clone'): 'existing counted File/Stream or its buffered writer; boundary retains I/O observation',
-    (COMMANDS / 'ownership.rs', ('impl Ownership', 'fn submit'),
-     'self.0.writer', 'try_lock'): 'existing in-memory ownership/admission mutex, not a filesystem lock',
-    (COMMANDS / 'ownership.rs', ('impl Ownership', 'fn abandoned'),
-     'self.0.pending', 'lock'): 'existing in-memory ownership/admission mutex, not a filesystem lock',
-    (COMMANDS / 'ownership.rs', ('impl Ownership', 'fn recover'),
-     'tokio', 'spawn'): 'existing ownership future task, not a child process; body scanned independently',
-    (COMMANDS / 'ownership.rs', ('impl Ownership', 'fn acquire_at'),
-     'self.0.writer', 'lock'): 'existing in-memory ownership/admission mutex, not a filesystem lock',
-    (COMMANDS / 'ownership.rs', ('impl Ownership', 'fn acquire_at'),
-     'self.0.open_barrier', 'lock'): 'existing in-memory ownership/admission mutex, not a filesystem lock',
-    (COMMANDS / 'ownership.rs', ('impl Ownership', 'fn acquire_at'),
-     'self.0.pending', 'lock'): 'existing in-memory ownership/admission mutex, not a filesystem lock',
-    (COMMANDS / 'ownership.rs', ('impl Ownership', 'fn freeze'),
-     'tokio', 'spawn'): 'existing ownership future task, not a child process; body scanned independently',
-    (COMMANDS / 'ownership.rs', ('impl Ownership', 'fn freeze'),
-     'owner.0.writer', 'lock'): 'existing in-memory ownership/admission mutex, not a filesystem lock',
-    (COMMANDS / 'ownership.rs', ('impl Ownership', 'fn reopen'),
-     'tokio', 'spawn'): 'existing ownership future task, not a child process; body scanned independently',
+    (COMMANDS / path, item, receiver, method): reason
+    for path, item, receivers, methods, reason in [
+        ('journal/compact.rs', ('impl Read for Positioned', 'fn read'), ('<definition>',), 'read', 'existing journal method declaration, not an expression permission'),
+        ('journal/compact.rs', ('impl Snapshot', 'fn copy_to'), ('self.file',), 'write_all', 'existing counted File/Stream or its buffered writer; boundary retains I/O observation'),
+        ('journal/compact.rs', ('impl Journal', 'fn start_compaction'), ('self.file',), 'try_clone', 'existing counted File/Stream or its buffered writer; boundary retains I/O observation'),
+        ('journal/compact.rs', ('impl Journal', 'fn start_compaction'), ('std::thread::Builder::new().name("wire-compact".into())',), 'spawn', 'existing journal worker thread, not a child process; body scanned independently'),
+        ('journal/compact.rs', ('impl Journal', 'fn start_compaction'), ('filesystem',), 'remove_file', 'existing counted filesystem boundary adapter'),
+        ('journal/compact.rs', ('impl Journal', 'fn compacted'), ('snapshot.file',), 'sync_all try_clone', 'existing counted File/Stream or its buffered writer; boundary retains I/O observation'),
+        ('journal/compact.rs', ('impl Journal', 'fn compacted'), ('filesystem',), 'rename', 'existing counted filesystem boundary adapter'),
+        ('journal/filesystem.rs', (), ('<import>',), 'remove_file rename', 'reviewed counted filesystem boundary and its adapter fixtures'),
+        ('journal/filesystem.rs', ('fn canonical_path',), ('path',), 'canonicalize', 'reviewed counted filesystem boundary and its adapter fixtures'),
+        ('journal/filesystem.rs', ('fn sync_directory',), ('File',), 'open', 'reviewed counted filesystem boundary and its adapter fixtures'),
+        ('journal/filesystem.rs', ('fn sync_directory',), ('File::open(path)?',), 'sync_all', 'reviewed counted filesystem boundary and its adapter fixtures'),
+        ('journal/filesystem.rs', ('mod counted', 'impl Observation', 'fn start'), ('registry()',), 'lock', 'reviewed counted filesystem boundary and its adapter fixtures'),
+        ('journal/filesystem.rs', ('mod counted', 'impl Observation', 'fn sample'), ('self.0.counts',), 'lock', 'reviewed counted filesystem boundary and its adapter fixtures'),
+        ('journal/filesystem.rs', ('mod counted', 'fn observe'), ('registry()', 'observer.counts'), 'lock', 'reviewed counted filesystem boundary and its adapter fixtures'),
+        ('journal/filesystem.rs', ('mod counted', 'impl File', 'fn wrap'), ('registry()',), 'lock', 'reviewed counted filesystem boundary and its adapter fixtures'),
+        ('journal/filesystem.rs', ('mod counted', 'impl File', 'fn open'), ('<definition>', '::std::fs::File'), 'open', 'reviewed counted filesystem boundary and its adapter fixtures'),
+        ('journal/filesystem.rs', ('mod counted', 'impl File', 'fn create'), ('<definition>', '::std::fs::File'), 'create', 'reviewed counted filesystem boundary and its adapter fixtures'),
+        ('journal/filesystem.rs', ('mod counted', 'impl File', 'fn try_clone'), ('<definition>', 'self.raw'), 'try_clone', 'reviewed counted filesystem boundary and its adapter fixtures'),
+        ('journal/filesystem.rs', ('mod counted', 'impl File', 'fn metadata'), ('<definition>', 'self.raw'), 'metadata', 'reviewed counted filesystem boundary and its adapter fixtures'),
+        ('journal/filesystem.rs', ('mod counted', 'impl File', 'fn set_len'), ('<definition>', 'self.raw'), 'set_len', 'reviewed counted filesystem boundary and its adapter fixtures'),
+        ('journal/filesystem.rs', ('mod counted', 'impl File', 'fn sync_all'), ('<definition>', 'self.raw'), 'sync_all', 'reviewed counted filesystem boundary and its adapter fixtures'),
+        ('journal/filesystem.rs', ('mod counted', 'impl File', 'fn sync_data'), ('<definition>', 'self.raw'), 'sync_data', 'reviewed counted filesystem boundary and its adapter fixtures'),
+        ('journal/filesystem.rs', ('mod counted', 'impl Read for File', 'fn read'), ('<definition>', 'self.raw'), 'read', 'reviewed counted filesystem boundary and its adapter fixtures'),
+        ('journal/filesystem.rs', ('mod counted', 'impl Seek for File', 'fn seek'), ('<definition>', 'self.raw'), 'seek', 'reviewed counted filesystem boundary and its adapter fixtures'),
+        ('journal/filesystem.rs', ('mod counted', 'impl Write for File', 'fn write'), ('<definition>', 'self.raw'), 'write', 'reviewed counted filesystem boundary and its adapter fixtures'),
+        ('journal/filesystem.rs', ('mod counted', 'impl Write for File', 'fn write'), ('self.path',), 'lock', 'reviewed counted filesystem boundary and its adapter fixtures'),
+        ('journal/filesystem.rs', ('mod counted', 'impl Write for File', 'fn flush'), ('<definition>', 'self.raw'), 'flush', 'reviewed counted filesystem boundary and its adapter fixtures'),
+        ('journal/filesystem.rs', ('mod counted', 'impl OpenOptions', 'fn write'), ('<definition>', 'self.0'), 'write', 'reviewed counted filesystem boundary and its adapter fixtures'),
+        ('journal/filesystem.rs', ('mod counted', 'impl OpenOptions', 'fn read'), ('<definition>', 'self.0'), 'read', 'reviewed counted filesystem boundary and its adapter fixtures'),
+        ('journal/filesystem.rs', ('mod counted', 'impl OpenOptions', 'fn create_new'), ('<definition>', 'self.0'), 'create_new', 'reviewed counted filesystem boundary and its adapter fixtures'),
+        ('journal/filesystem.rs', ('mod counted', 'impl OpenOptions', 'fn create'), ('<definition>', 'self.0'), 'create', 'reviewed counted filesystem boundary and its adapter fixtures'),
+        ('journal/filesystem.rs', ('mod counted', 'impl OpenOptions', 'fn open'), ('<definition>', 'self.0'), 'open', 'reviewed counted filesystem boundary and its adapter fixtures'),
+        ('journal/filesystem.rs', ('mod counted', 'fn write'), ('<definition>',), 'write', 'reviewed counted filesystem boundary and its adapter fixtures'),
+        ('journal/filesystem.rs', ('mod counted', 'fn write'), ('File',), 'create', 'reviewed counted filesystem boundary and its adapter fixtures'),
+        ('journal/filesystem.rs', ('mod counted', 'fn write'), ('File::create(path)?',), 'write_all', 'reviewed counted filesystem boundary and its adapter fixtures'),
+        ('journal/filesystem.rs', ('mod counted', 'fn copy'), ('<definition>', 'io'), 'copy', 'reviewed counted filesystem boundary and its adapter fixtures'),
+        ('journal/filesystem.rs', ('mod counted', 'fn copy'), ('File',), 'create open', 'reviewed counted filesystem boundary and its adapter fixtures'),
+        ('journal/filesystem.rs', ('mod counted', 'fn copy'), ('<bare>', 'source'), 'metadata', 'reviewed counted filesystem boundary and its adapter fixtures'),
+        ('journal/filesystem.rs', ('mod counted', 'fn copy'), ('metadata',), 'is_file', 'reviewed counted filesystem boundary and its adapter fixtures'),
+        ('journal/filesystem.rs', ('mod counted', 'fn copy'), ('destination.raw',), 'set_permissions', 'reviewed counted filesystem boundary and its adapter fixtures'),
+        ('journal/filesystem.rs', ('mod counted', 'fn rename'), ('<definition>', '::std::fs'), 'rename', 'reviewed counted filesystem boundary and its adapter fixtures'),
+        ('journal/filesystem.rs', ('mod counted', 'fn rename'), ('registry()', 'path'), 'lock', 'reviewed counted filesystem boundary and its adapter fixtures'),
+        ('journal/filesystem.rs', ('mod counted', 'mod std', 'mod fs'), ('<import>',), 'copy rename write', 'reviewed counted filesystem boundary and its adapter fixtures'),
+        ('journal/filesystem.rs', ('mod counted', 'impl LockFile', 'fn try_lock'), ('<definition>', 'self.0'), 'try_lock', 'reviewed counted filesystem boundary and its adapter fixtures'),
+        ('journal/filesystem.rs', ('mod counted', 'fn counts_new_handles_clones_copies_and_replacement'), ('crate::structured::launch::SessionConfigDir', 'std::fs::File', 'std::fs::OpenOptions::new().read(true).write(true).append(true)'), 'create', 'reviewed counted filesystem boundary and its adapter fixtures'),
+        ('journal/filesystem.rs', ('mod counted', 'fn counts_new_handles_clones_copies_and_replacement'), ('original', 'extra', 'replacement'), 'write_all', 'reviewed counted filesystem boundary and its adapter fixtures'),
+        ('journal/filesystem.rs', ('mod counted', 'fn counts_new_handles_clones_copies_and_replacement'), ('std::fs',), 'copy write', 'reviewed counted filesystem boundary and its adapter fixtures'),
+        ('journal/filesystem.rs', ('mod counted', 'fn counts_new_handles_clones_copies_and_replacement'), ('std::fs::OpenOptions::new()',), 'read', 'reviewed counted filesystem boundary and its adapter fixtures'),
+        ('journal/filesystem.rs', ('mod counted', 'fn counts_new_handles_clones_copies_and_replacement'), ('std::fs::OpenOptions::new().read(true)',), 'write', 'reviewed counted filesystem boundary and its adapter fixtures'),
+        ('journal/filesystem.rs', ('mod counted', 'fn counts_new_handles_clones_copies_and_replacement'), ('std::fs::OpenOptions::new().read(true).write(true).append(true).create(true).truncate(false)',), 'create_new', 'reviewed counted filesystem boundary and its adapter fixtures'),
+        ('journal/filesystem.rs', ('mod counted', 'fn counts_new_handles_clones_copies_and_replacement'), ('std::fs::OpenOptions::new().read(true).write(true).append(true).create(true).truncate(false).create_new(false)', 'OpenOptions::new().append(true)'), 'open', 'reviewed counted filesystem boundary and its adapter fixtures'),
+        ('journal/filesystem.rs', ('mod counted', 'fn counts_new_handles_clones_copies_and_replacement'), ('OpenOptions::new().append(true).open(&compact).unwrap()',), 'try_clone', 'reviewed counted filesystem boundary and its adapter fixtures'),
+        ('journal/filesystem.rs', ('mod counted', 'fn counts_new_handles_clones_copies_and_replacement'), ('<bare>',), 'rename', 'reviewed counted filesystem boundary and its adapter fixtures'),
+        ('journal/tests/capacity.rs', ('fn near_global_cap_hot_operations_write_only_one_record',), ('Journal',), 'open', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests/capacity.rs', ('fn near_global_cap_hot_operations_write_only_one_record',), ('journal.file',), 'try_clone', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests/capacity.rs', ('fn near_global_cap_hot_operations_write_only_one_record',), ('file',), 'flush write_all', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests/compaction.rs', ('fn expiry_threshold_drops_only_expired_records_and_releases_exact_capacity',), ('filesystem::fs',), 'metadata', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests/compaction.rs', ('fn expiry_threshold_drops_only_expired_records_and_releases_exact_capacity',), ('Journal',), 'open', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests/compaction.rs', ('fn pause_prefix',), ('PAUSE.get().unwrap()',), 'lock', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests/compaction.rs', ('fn concurrent_appends_and_multiple_catchup_rounds_keep_exact_index_and_first_outcomes',), ('<bare>',), 'wait', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests/compaction.rs', ('fn concurrent_appends_and_multiple_catchup_rounds_keep_exact_index_and_first_outcomes',), ('PAUSE.get_or_init(||Mutex::new(None))',), 'lock', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests/compaction.rs', ('fn concurrent_appends_and_multiple_catchup_rounds_keep_exact_index_and_first_outcomes',), ('Journal',), 'open', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests/compaction.rs', ('fn opaque_rows_fence_compaction_and_remain_byte_exact',), ('journal.file',), 'sync_all write_all', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests/compaction.rs', ('fn opaque_rows_fence_compaction_and_remain_byte_exact',), ('Journal',), 'open', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests/compaction.rs', ('fn opaque_rows_fence_compaction_and_remain_byte_exact',), ('filesystem::fs',), 'read', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests/compaction.rs', ('fn failed_append_during_snapshot_cannot_publish_over_uncertain_tail',), ('filesystem::fs',), 'read', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests/compaction.rs', ('fn shutdown_drains_cancelled_jobs_closes_every_clone_and_releases_lease_before_reopen',), ('<bare>',), 'wait', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests/compaction.rs', ('fn shutdown_drains_cancelled_jobs_closes_every_clone_and_releases_lease_before_reopen',), ('Writer',), 'open spawn', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests/compaction.rs', ('fn shutdown_drains_cancelled_jobs_closes_every_clone_and_releases_lease_before_reopen',), ('Journal',), 'open', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests/compaction.rs', ('fn compaction_crash_child',), ('Journal',), 'open', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests/compaction.rs', ('fn crash_at_each_compaction_step_leaves_a_complete_replayable_old_or_new_log',), ('filesystem::fs',), 'read', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests/compaction.rs', ('fn crash_at_each_compaction_step_leaves_a_complete_replayable_old_or_new_log',), ('<bare>',), 'status', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests/compaction.rs', ('fn crash_at_each_compaction_step_leaves_a_complete_replayable_old_or_new_log',), ('child',), 'kill try_wait wait', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests/compaction.rs', ('fn crash_at_each_compaction_step_leaves_a_complete_replayable_old_or_new_log',), ('Journal',), 'open', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests/compaction.rs', ('fn published',), ('PUBLISHED.get().unwrap()',), 'lock', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests/compaction.rs', ('fn writer_claim_clock_drives_threshold_compaction_and_shutdown_drains_it',), ('PUBLISHED.get_or_init(||Mutex::new(None))',), 'lock', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests/compaction.rs', ('fn writer_claim_clock_drives_threshold_compaction_and_shutdown_drains_it',), ('Writer',), 'spawn', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests/compaction.rs', ('fn writer_claim_clock_drives_threshold_compaction_and_shutdown_drains_it',), ('Journal',), 'open', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests/compaction.rs', ('fn replacement_descriptor_supports_later_sweeps_appends_and_future_timestamps',), ('Journal',), 'open', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests/compaction.rs', ('fn lost_primary_during_copy_is_fenced_without_resurrecting_the_journal',), ('filesystem::fs',), 'read rename', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests/compaction.rs', ('fn lost_primary_during_copy_is_fenced_without_resurrecting_the_journal',), ('primary',), 'exists', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests/compaction.rs', ('fn opaque_row_discovered_by_copier_preserves_the_log_and_fences_writes',), ('journal.file',), 'sync_all write_all', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests/compaction.rs', ('fn opaque_row_discovered_by_copier_preserves_the_log_and_fences_writes',), ('filesystem::fs',), 'read', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests/compaction.rs', ('fn expiry_reclaims_full_capacity_without_log_growth_after_sweep_or_reopen',), ('Journal',), 'open', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests/compaction.rs', ('fn writer_capacity_refusal_triggers_expiry_sweep_and_retry_succeeds',), ('PUBLISHED.get_or_init(||Mutex::new(None))',), 'lock', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests/compaction.rs', ('fn writer_capacity_refusal_triggers_expiry_sweep_and_retry_succeeds',), ('Writer',), 'spawn', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests/compaction.rs', ('fn writer_capacity_refusal_triggers_expiry_sweep_and_retry_succeeds',), ('Journal',), 'open', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests.rs', ('fn root',), ('crate::structured::launch::SessionConfigDir',), 'create', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests.rs', ('fn setup',), ('Journal',), 'open', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests.rs', ('fn replay_rebuilds_index_counts_and_first_outcome',), ('Journal',), 'open', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests.rs', ('fn replay_rebuilds_index_counts_and_first_outcome',), ('filesystem::fs',), 'read_to_string', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests.rs', ('fn claim_and_finish_write_one_record_independent_of_retained_size',), ('Journal',), 'open', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests.rs', ('fn claim_and_finish_write_one_record_independent_of_retained_size',), ('journal.file',), 'sync_all write_all', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests.rs', ('fn claim_and_finish_write_one_record_independent_of_retained_size',), ('filesystem::fs',), 'read', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests.rs', ('fn principal_global_and_byte_caps_refuse_without_eviction',), ('filesystem::fs',), 'read', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests.rs', ('fn absent_expired_and_lost_claims_fail_closed',), ('filesystem::fs',), 'remove_file', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests.rs', ('fn absent_expired_and_lost_claims_fail_closed',), ('Journal',), 'open', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests.rs', ('fn torn_tail_is_archived_before_truncation_and_append_remains_readable',), ('journal.file',), 'sync_all write_all', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests.rs', ('fn torn_tail_is_archived_before_truncation_and_append_remains_readable',), ('Journal',), 'open', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests.rs', ('fn torn_tail_is_archived_before_truncation_and_append_remains_readable',), ('filesystem::fs',), 'read', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests.rs', ('fn complete_corruption_and_oversized_rows_preserve_raw_and_other_results',), ('journal.file',), 'write_all', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests.rs', ('fn complete_corruption_and_oversized_rows_preserve_raw_and_other_results',), ('filesystem::fs',), 'read', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests.rs', ('fn complete_corruption_and_oversized_rows_preserve_raw_and_other_results',), ('Journal',), 'open', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests.rs', ('fn archive_full_preserves_the_active_tail',), ('journal.file',), 'write_all', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests.rs', ('fn archive_full_preserves_the_active_tail',), ('archive',), 'set_len', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests.rs', ('fn archive_full_preserves_the_active_tail',), ('filesystem::fs',), 'read', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests.rs', ('fn archive_full_preserves_the_active_tail',), ('Journal',), 'open', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests.rs', ('fn append_and_sync_failures_roll_back_before_publishing_index',), ('filesystem::fs',), 'read', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests.rs', ('fn append_and_sync_failures_roll_back_before_publishing_index',), ('Journal',), 'open', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests.rs', ('fn failed_outcome_keeps_pending_and_failed_rollback_requires_recovery',), ('Journal',), 'open', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests.rs', ('fn exclusive_writer_lease_prevents_stale_parallel_indexes',), ('Journal',), 'open', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests.rs', ('fn submit',), ('std::thread',), 'spawn', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests.rs', ('fn worker_never_blocks_submit_on_sync_and_queue_remains_bounded',), ('<bare>',), 'wait', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests.rs', ('fn worker_never_blocks_submit_on_sync_and_queue_remains_bounded',), ('Writer', 'tokio'), 'spawn', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests.rs', ('fn worker_never_blocks_submit_on_sync_and_queue_remains_bounded',), ('Journal',), 'open', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests.rs', ('fn crash_after_synced_outcome_before_index_publication_replays_the_ack',), ('Journal',), 'open', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests.rs', ('fn public_writer_opens_and_wakes_only_after_durable_completion',), ('Writer', 'Journal'), 'open', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests.rs', ('fn public_writer_opens_and_wakes_only_after_durable_completion',), ('filesystem::fs',), 'read_to_string', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests.rs', ('fn public_writer_opens_and_wakes_only_after_durable_completion',), ('std::thread',), 'spawn', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests.rs', ('impl Write for Stream', 'fn write'), ('<definition>', 'self.file'), 'write', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests.rs', ('impl Write for Stream', 'fn flush'), ('<definition>', 'self.file'), 'flush', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests.rs', ('impl Writer', 'fn test_open'), ('Self',), 'spawn', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests.rs', ('impl Writer', 'fn test_open'), ('Journal',), 'open', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests.rs', ('fn replay_reports_byte_progress_without_record_contents',), ('Journal',), 'open', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests.rs', ('fn take_replay_steps',), ('replay_steps()',), 'lock', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests.rs', ('fn replay_barrier',), ('replay_hooks()',), 'lock', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests.rs', ('impl Writer', 'fn test_step_replay'), ('<bare>',), 'wait', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests.rs', ('impl Writer', 'fn test_step_replay'), ('replay_steps()',), 'lock', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests.rs', ('impl Writer', 'fn test_stall_replay'), ('<bare>',), 'wait', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests.rs', ('impl Writer', 'fn test_stall_replay'), ('replay_hooks()',), 'lock', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal.rs', ('impl < R : Read > Read for ReplayReader < R >', 'fn read'), ('<definition>',), 'read', 'existing journal method declaration, not an expression permission'),
+        ('journal.rs', ('impl < R : Read > Read for ReplayReader < R >', 'fn read'), ('self.source',), 'read', 'existing replay stream delegates to the counted File'),
+        ('journal.rs', ('impl Writer', 'fn open'), ('<definition>',), 'open', 'existing journal method declaration, not an expression permission'),
+        ('journal.rs', ('impl Writer', 'fn open_signalled'), ('Self',), 'spawn', 'existing journal Writer factory; closure uses the counted boundary'),
+        ('journal.rs', ('impl Writer', 'fn spawn'), ('<definition>',), 'spawn', 'existing journal method declaration, not an expression permission'),
+        ('journal.rs', ('impl Writer', 'fn spawn'), ('<bare>',), 'open', 'existing Writer factory closure binding and invocation; body uses counted adapters'),
+        ('journal.rs', ('impl Writer', 'fn spawn'), ('std::thread::Builder::new().name("wire-journal".into())',), 'spawn', 'existing journal worker thread, not a child process; body scanned independently'),
+        ('journal.rs', ('impl Writer', 'fn spawn'), ('admission',), 'lock', 'existing in-memory ownership/admission mutex, not a filesystem lock'),
+        ('journal.rs', ('impl Writer', 'fn submit'), ('self.admission',), 'lock', 'existing in-memory ownership/admission mutex, not a filesystem lock'),
+        ('journal.rs', ('impl Writer', 'fn shutdown'), ('self.admission',), 'lock', 'existing in-memory ownership/admission mutex, not a filesystem lock'),
+        ('journal.rs', ('fn private',), ('file',), 'sync_all', 'existing counted File/Stream or its buffered writer; boundary retains I/O observation'),
+        ('journal.rs', ('impl Journal', 'fn open'), ('<definition>',), 'open', 'existing journal method declaration, not an expression permission'),
+        ('journal.rs', ('impl Journal', 'fn lease'), ('lease',), 'try_lock', 'existing counted LockFile wrapper'),
+        ('journal.rs', ('impl Journal', 'fn lease'), ('file',), 'metadata', 'existing counted File/Stream or its buffered writer; boundary retains I/O observation'),
+        ('journal.rs', ('impl Journal', 'fn seed_capacity_test'), ('self.file',), 'metadata try_clone', 'existing counted File/Stream or its buffered writer; boundary retains I/O observation'),
+        ('journal.rs', ('impl Journal', 'fn seed_capacity_test'), ('file',), 'flush write_all', 'existing counted File/Stream or its buffered writer; boundary retains I/O observation'),
+        ('journal.rs', ('impl Journal', 'fn seed_capacity_test'), ('file.get_ref()',), 'sync_all', 'existing counted File/Stream or its buffered writer; boundary retains I/O observation'),
+        ('journal.rs', ('impl Journal', 'fn seed_capacity_test'), ('self.file.try_clone()?',), 'seek', 'existing counted File/Stream or its buffered writer; boundary retains I/O observation'),
+        ('journal.rs', ('impl Journal', 'fn replay'), ('self.file',), 'set_len sync_all try_clone', 'existing counted File/Stream or its buffered writer; boundary retains I/O observation'),
+        ('journal.rs', ('impl Journal', 'fn replay'), ('file',), 'metadata sync_all write_all', 'existing counted File/Stream or its buffered writer; boundary retains I/O observation'),
+        ('journal.rs', ('impl Journal', 'fn append'), ('self.file',), 'set_len sync_all sync_data write_all', 'existing counted File/Stream or its buffered writer; boundary retains I/O observation'),
+        ('ownership/tests.rs', ('fn fixture',), ('crate::structured::launch::SessionConfigDir',), 'create', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('ownership/tests.rs', ('fn install',), ('owner.0.pending', 'owner.0.writer'), 'lock', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('ownership/tests.rs', ('fn apply',), ('owner.0.writer',), 'lock', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('ownership/tests.rs', ('fn commit_prepares_without_lease_then_replays_after_exporter_freeze',), ('importer.0.writer',), 'lock', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('ownership/tests.rs', ('fn commit_prepares_without_lease_then_replays_after_exporter_freeze',), ('Writer',), 'open', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('ownership/tests.rs', ('fn rollback_replays_before_opening_and_shutdown_cannot_be_undone_by_recovery',), ('owner.0.writer',), 'lock', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('ownership/tests.rs', ('fn shutdown_drains_accepted_write_and_releases_lease_with_handles_alive',), ('<bare>',), 'wait', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('ownership/tests.rs', ('fn shutdown_drains_accepted_write_and_releases_lease_with_handles_alive',), ('tokio',), 'spawn', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('ownership/tests.rs', ('fn shutdown_waits_for_inflight_replay_and_fences_its_late_completion',), ('<bare>',), 'wait', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('ownership/tests.rs', ('fn shutdown_waits_for_inflight_replay_and_fences_its_late_completion',), ('owner.0.open_barrier',), 'lock', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('ownership/tests.rs', ('fn shutdown_during_leased_replay_is_bounded_and_fences_late_completion',), ('tokio',), 'spawn', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('ownership/tests.rs', ('fn shutdown_during_leased_replay_is_bounded_and_fences_late_completion',), ('Writer',), 'open', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('ownership/tests.rs', ('fn replay_observed',), ('replay_events()',), 'lock', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('ownership/tests.rs', ('fn take_open_barrier',), ('open_hooks()',), 'lock', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('ownership/tests.rs', ('impl Ownership', 'fn test_watch_replay'), ('replay_events()',), 'lock', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('ownership/tests.rs', ('impl Ownership', 'fn test_stall_next_open'), ('<bare>',), 'wait', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('ownership/tests.rs', ('impl Ownership', 'fn test_stall_next_open'), ('open_hooks()',), 'lock', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('ownership/tests.rs', ('fn stalled_drain',), ('<bare>',), 'wait', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('ownership/tests.rs', ('fn stalled_drain',), ('tokio',), 'spawn', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('ownership/tests.rs', ('fn stalled_drain',), ('owner.0.pending',), 'lock', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('ownership/tests.rs', ('fn stalled_drain',), ('Writer',), 'open', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('ownership.rs', ('impl Ownership', 'fn submit'), ('self.0.writer',), 'try_lock', 'existing in-memory ownership/admission mutex, not a filesystem lock'),
+        ('ownership.rs', ('impl Ownership', 'fn abandoned'), ('self.0.pending',), 'lock', 'existing in-memory ownership/admission mutex, not a filesystem lock'),
+        ('ownership.rs', ('impl Ownership', 'fn recover'), ('tokio',), 'spawn', 'existing ownership future task, not a child process; body scanned independently'),
+        ('ownership.rs', ('impl Ownership', 'fn acquire_at'), ('self.0.writer', 'self.0.open_barrier', 'self.0.pending'), 'lock', 'existing in-memory ownership/admission mutex, not a filesystem lock'),
+        ('ownership.rs', ('impl Ownership', 'fn freeze'), ('tokio',), 'spawn', 'existing ownership future task, not a child process; body scanned independently'),
+        ('ownership.rs', ('impl Ownership', 'fn freeze'), ('owner.0.writer',), 'lock', 'existing in-memory ownership/admission mutex, not a filesystem lock'),
+        ('ownership.rs', ('impl Ownership', 'fn reopen'), ('tokio',), 'spawn', 'existing ownership future task, not a child process; body scanned independently'),
+    ]
+    for receiver in receivers
+    for method in methods.split()
 }
-
 
 def test_source(path: Path) -> bool:
     relative = path.relative_to(COMMANDS)
@@ -720,57 +820,16 @@ def boundary_path(names: list[str], index: int) -> bool:
                 and all(part == "super" for part in parts[:-1])))
 
 
-def macro_position_findings(code, path):
-    """Refuse uninspectable method/path substitutions in local macro bodies."""
-    names = [name for name, _ in code]
-    pairs = delimiter_pairs(names)
-    findings = []
-    for i in range(len(names) - 3):
-        if names[i:i + 2] != ['macro_rules', '!']:
-            continue
-        if (path, names[i + 2]) in MACRO_POSITION_ALLOWLIST:
-            continue
-        opening = i + 3
-        end = pairs.get(opening, opening)
-        for j in range(opening + 1, end):
-            if names[j] != '$':
-                continue
-            if names[j + 1:j + 2] == ['(']:
-                # A repetition is a substitution spanning its token tree,
-                # optional separator and quantifier, not just the opening $.
-                tail = pairs.get(j + 1, j + 1) + 1
-                if names[tail:tail + 1] not in (['*'], ['+'], ['?']):
-                    tail += 1
-                if names[tail:tail + 1] in (['*'], ['+'], ['?']):
-                    tail += 1
-                if any(token in {'.', '::'} for token in names[j - 1:tail + 1]):
-                    findings.append((code[j][1],
-                                     'macro repetition in method/path position requires review'))
-                continue
-            method = names[j - 1] == '.'
-            qualified = (names[j - 1] == '::'
-                         or names[j + 2:j + 3] == ['::'])
-            if qualified and names[j + 1] == 'crate' and names[j - 1] != '::':
-                # Static crate-relative paths are visible, but must not hide a
-                # capability behind macro hygiene or a generated receiver.
-                k = j + 3
-                qualified = False
-                while k < end and IDENT.fullmatch(names[k]):
-                    qualified |= names[k] in CAPABILITY_METHODS
-                    if names[k + 1:k + 2] != ['::']:
-                        break
-                    k += 2
-            if method or qualified:
-                findings.append((code[j][1],
-                                 'macro-generated method/path position requires review'))
-    return findings
-
-
 def check_text(text: str, path: Path, crate_macros=None, macro_uses=()) -> list[tuple[int, str]]:
-    if path == BOUNDARY:
-        return []
     code = tokens(text)
     names = [name for name, _ in code]
+    findings = capability_findings(text, code, path)
+    for i, (name, offset) in enumerate(code[:-2]):
+        if names[i:i + 2] == ['macro_rules', '!'] and not CRATE_MACRO_ALLOWLIST.get((path, names[i + 2]), '').strip():
+            findings.append((text.count('\n', 0, offset) + 1,
+                             'in-tree macro definition requires capability-synthesis review'))
+    if path == BOUNDARY:
+        return findings
     local = macro_definitions(code)
     if crate_macros is None:
         crate_macros = {name: {path} for name in local}
@@ -778,10 +837,8 @@ def check_text(text: str, path: Path, crate_macros=None, macro_uses=()) -> list[
               if all(source == COMMANDS / 'journal.rs'
                      or source.is_relative_to(COMMANDS / 'journal')
                      or (source, name) in CRATE_MACRO_ALLOWLIST for source in sources)}
-    findings = [(text.count("\n", 0, offset) + 1, reason)
-                for offset, reason in (import_findings(code, path, local)
-                                       + macro_position_findings(code, path))]
-    findings.extend(method_findings(text, code, path))
+    findings.extend((text.count("\n", 0, offset) + 1, reason)
+                    for offset, reason in import_findings(code, path, local))
     attribute_depth = 0
     for i, (name, offset) in enumerate(code):
         if name == "[" and (attribute_depth or names[max(0, i - 1):i] == ["#"]

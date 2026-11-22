@@ -73,7 +73,7 @@ let lifetime: &'static str = "File::open";
             boundary = root / gate.BOUNDARY
             boundary.write_text('::std::fs::write(path, bytes)?;')
             findings = gate.check_tree(root)
-            self.assertEqual(len({finding.split(":")[0] for finding in findings}), 5)
+            self.assertEqual(len({finding.split(":")[0] for finding in findings}), 6)
             self.assertTrue(any('ownership.rs:' in finding for finding in findings))
             self.assertTrue(any('nested/filesystem.rs:' in finding for finding in findings))
 
@@ -211,8 +211,6 @@ mod nested {
         source = """
 use crate::structured::launch::SessionConfigDir as Directory;
 use crate::process::TracedCommand as Runner;
-Directory::create(path);
-Runner::new("program").status();
 std::process::exit(0);
 """
         for relative in ['journal/tests.rs', 'journal/tests/compaction.rs', 'ownership/tests.rs']:
@@ -262,8 +260,10 @@ std::process::exit(0);
 
     def test_in_tree_macros_are_checked_and_cannot_shadow_reviewed_names(self):
         path = gate.COMMANDS / 'journal.rs'
-        self.assertEqual(gate.check_text(
-            'macro_rules! safe { () => { 1 } } safe!();', path), [])
+        with patch.dict(gate.CRATE_MACRO_ALLOWLIST,
+                        {(path, 'safe'): 'constant expansion cannot synthesize capability identifiers'}):
+            self.assertEqual(gate.check_text(
+                'macro_rules! safe { () => { 1 } } safe!();', path), [])
         self.assertTrue(gate.check_text(
             'macro_rules! hidden { () => { std::fs::write(path, bytes) } } hidden!();', path))
         self.assertTrue(gate.check_text(
@@ -381,6 +381,29 @@ set_permissions spawn output status""".split()
                               + right + '; probe!(path, read_dir);')
                 self.assertTrue(gate.check_text(definition, gate.COMMANDS / 'journal.rs'))
 
+    def test_macro_tt_substitution_cannot_hide_capability_tokens(self):
+        source = ('macro_rules! r { ($($t:tt),*) => { $($t)* } } '
+                  'fn probe(path: &Path) { r!(Path, ::, read_dir)(path); }')
+        self.assertTrue(gate.check_text(source, gate.COMMANDS / 'journal.rs'))
+
+    def test_split_macro_path_and_method_substitutions_are_rejected(self):
+        for source in [
+            'macro_rules! r { ($a:ident, $s:tt, $b:ident) => { $a $s $b } } '
+            'r!(Path, ::, read_dir)(path);',
+            'macro_rules! r { ($p:ident, $s:tt, $m:ident) => { $p $s $m() } } '
+            'r!(path, ., read_dir);',
+        ]:
+            with self.subTest(source=source):
+                self.assertTrue(gate.check_text(source, gate.COMMANDS / 'journal.rs'))
+
+    def test_unlisted_macro_definition_is_rejected(self):
+        self.assertTrue(gate.check_text(
+            'macro_rules! unlisted { () => { 1 } }', gate.COMMANDS / 'journal.rs'))
+
+    def test_macro_arguments_cannot_carry_unanchored_capability_tokens(self):
+        self.assertTrue(gate.check_text(
+            'format!("{}", read_dir);', gate.COMMANDS / 'journal.rs'))
+
     def test_macro_path_repetition_is_rejected(self):
         source = ('macro_rules! review_path { ($($p:ident),*) => { $($p)::* } } '
                   'review_path!(Path, read_dir)(path);')
@@ -391,59 +414,67 @@ set_permissions spawn output status""".split()
                   'review_method!(make_path, read_dir);')
         self.assertTrue(gate.check_text(source, gate.COMMANDS / 'journal.rs'))
 
-    def test_repetition_positions_fail_closed_and_allowlist_is_exact(self):
+    def test_macro_definition_allowlist_is_exact_and_independent_of_token_ban(self):
         path = gate.COMMANDS / 'journal.rs'
-        for body in ['$($p)::*', '$($p)::+', '$($p()).*', '$(.$m())*',
-                     '$($p),*::operation()', '$($p),*.operation()',
-                     'object.$($p)*()', 'module::$($p)*()',
-                     '$($p::operation()),*', '$($($p)::*),*',
-                     '$($p::operation())?', '$(fixed::operation($p)),*']:
-            with self.subTest(body=body):
-                source = 'macro_rules! probe { ($($p:ident),*) => { ' + body + ' } }'
-                code = gate.tokens(source)
-                self.assertTrue(gate.macro_position_findings(code, path))
-                self.assertTrue(gate.check_text(source, path))
-                with patch.dict(gate.MACRO_POSITION_ALLOWLIST,
-                                {(path, 'probe'): 'reviewed repetition fixture'}):
-                    self.assertEqual(gate.macro_position_findings(code, path), [])
-                    self.assertTrue(gate.macro_position_findings(
-                        code, gate.COMMANDS / 'journal/compact.rs'))
-        for body in ['$($p),*', '$($($p),*);*', '[$($p)*]',
-                     '$($p),* + 1', '$($p),* ":: ."',
-                     '$($p),* /* :: . */']:
-            with self.subTest(body=body):
-                self.assertEqual(gate.macro_position_findings(gate.tokens(
-                    'macro_rules! safe { ($($p:ident),*) => { ' + body + ' } }'), path), [])
+        safe = 'macro_rules! safe { ($($p:expr),*) => { [$($p),*] } } safe!(1, 2);'
+        self.assertTrue(gate.check_text(safe, path))
+        with patch.dict(gate.CRATE_MACRO_ALLOWLIST,
+                        {(path, 'safe'): 'array construction cannot synthesize capability identifiers'}):
+            self.assertEqual(gate.check_text(safe, path), [])
+            self.assertTrue(gate.check_text(safe.replace('safe', 'other'), path))
+            self.assertTrue(gate.check_text(safe, gate.COMMANDS / 'journal/compact.rs'))
+            self.assertTrue(gate.check_text(safe.replace('safe!(1, 2)', 'safe!(read_dir)'), path))
+            self.assertTrue(gate.check_text(safe.replace('[$($p),*]', 'read_dir'), path))
+        for reason in ['', '   ']:
+            with patch.dict(gate.CRATE_MACRO_ALLOWLIST, {(path, 'safe'): reason}):
+                self.assertTrue(gate.check_text(safe, path))
 
-    def test_macro_path_positions_require_explicit_review(self):
+    def test_macro_substitution_shape_cannot_bypass_capability_tokens(self):
         path = gate.COMMANDS / 'journal.rs'
-        for body in ['$p::helper()', '$crate::helper::read_dir(path)',
-                     'path.$method::<u8>()', '$crate::helper::metadata',
-                     '$crate::$method(path)', '$crate::helper::$method(path)',
-                     'helper::$method(path)']:
+        for body, invocation in [
+            ('$($p)*', 'probe!(Path, ::, read_dir)(path)'),
+            ('$a $s $b', 'probe!(Path, ::, read_dir)(path)'),
+            ('$p $s $m()', 'probe!(path, ., read_dir)'),
+            ('$($p)::*', 'probe!(Path, read_dir)(path)'),
+            ('$($p()).*', 'probe!(make_path, read_dir)'),
+            ('$(.$m())*', 'probe!(read_dir)'),
+            ('$($($p)*)*', 'probe!(Path, ::, read_dir)(path)'),
+        ]:
             with self.subTest(body=body):
-                source = 'macro_rules! probe { ($p:ident) => { ' + body + ' } }'
-                code = gate.tokens(source)
-                self.assertTrue(gate.macro_position_findings(code, path))
+                source = 'macro_rules! probe { ($($p:tt)*) => { ' + body + ' } } ' + invocation + ';'
+                # A hypothetical definition approval cannot waive the token rule.
+                with patch.dict(gate.CRATE_MACRO_ALLOWLIST,
+                                {(path, 'probe'): 'fixture to isolate token checks from definition checks'}):
+                    self.assertTrue(gate.capability_findings(source, gate.tokens(source), path))
+                    self.assertTrue(gate.check_text(source, path))
+
+    def test_unlisted_macros_fail_in_every_protected_file(self):
+        for path in gate.protected_files(gate.ROOT):
+            relative = path.relative_to(gate.ROOT)
+            with self.subTest(path=relative):
+                self.assertTrue(gate.check_text('macro_rules! added { () => { 1 } }', relative))
+
+    def test_identifier_construction_crates_require_import_review(self):
+        for source in ['use paste::paste; paste! { [<rea d_dir>](path); }',
+                       'paste::paste! { [<rea d_dir>](path); }',
+                       'use crate::other::paste; paste! { [<rea d_dir>](path); }']:
+            with self.subTest(source=source):
+                path = gate.COMMANDS / 'journal.rs'
+                self.assertEqual(gate.capability_findings(source, gate.tokens(source), path), [])
                 self.assertTrue(gate.check_text(source, path))
-        for body in ['$value', '$crate::web::wire::commands::ack(id, result)',
-                     '($($value),*)', '".$method() $p::read_dir()"']:
-            with self.subTest(body=body):
-                self.assertEqual(gate.macro_position_findings(gate.tokens(
-                    'macro_rules! safe { ($value:expr) => { ' + body + ' } }'), path), [])
-        with patch.dict(gate.MACRO_POSITION_ALLOWLIST,
-                        {(path, 'probe'): 'fixture for explicit macro review'}):
-            self.assertEqual(gate.macro_position_findings(gate.tokens(
-                'macro_rules! probe { () => { path.$method() } }'), path), [])
-            self.assertEqual(gate.check_text(
-                'macro_rules! probe { ($method:ident) => { path.$method() } }', path), [])
-        # Generated functions cannot inherit a real function's exception.
+
+    def test_generated_and_nested_items_cannot_borrow_declaration_pins(self):
+        path = gate.COMMANDS / 'journal.rs'
         for wrapper in ['macro_rules! probe { () => { %s } }',
                         'const NESTED: () = { %s };', 'const _: () = const { %s };',
                         'static mut NESTED: () = { %s };']:
             with self.subTest(wrapper=wrapper):
                 self.assertTrue(gate.check_text(
                     wrapper % 'fn private() { file.sync_all(); }', path))
+        self.assertTrue(gate.check_text(
+            'impl Writer { fn open() { format!("{}", open); } }', path))
+        self.assertTrue(gate.check_text(
+            'impl Writer { fn spawn() { format!("{}", spawn); } }', path))
 
     def test_non_risky_arguments_and_closure_edits_pass(self):
         path = gate.COMMANDS / 'journal.rs'
@@ -468,15 +499,21 @@ set_permissions spawn output status""".split()
         self.assertEqual(paths, [('impl < T > Trait for Thing < T >', 'fn read'),
                                  ('mod nested', 'impl Other', 'fn read')])
 
-    def test_method_layer_skips_only_boundary_and_path_enforced_test_files(self):
-        for relative in ['journal/filesystem.rs', 'journal/tests.rs', 'journal/tests/compaction.rs']:
-            with self.subTest(relative=relative):
-                self.assertEqual(gate.check_text('object.read_dir();', gate.COMMANDS / relative), [])
-        self.assertTrue(gate.check_text(
-            '#[cfg(test)] fn probe() { object.read_dir(); }', gate.COMMANDS / 'journal.rs'))
+    def test_capability_tokens_need_anchors_in_every_protected_file(self):
+        for path in gate.protected_files(gate.ROOT):
+            relative = path.relative_to(gate.ROOT)
+            for name in gate.CAPABILITY_METHODS:
+                with self.subTest(path=relative, capability=name):
+                    self.assertTrue(gate.check_text('format!("{}", ' + name + ');', relative))
         self.assertEqual(gate.check_text(
-            '// object.read_dir();\nlet text = "object.read_dir()"; fn read_dir() {}',
+            '// object.read_dir();\nlet text = "object.read_dir()";',
             gate.COMMANDS / 'journal.rs'), [])
+        self.assertTrue(gate.check_text('fn read_dir() {}', gate.COMMANDS / 'journal.rs'))
+        boundary = (gate.ROOT / gate.BOUNDARY).read_text()
+        changed = boundary.replace('::std::fs::File::open(path.as_ref())',
+                                   '::std::fs::Other::open(path.as_ref())')
+        self.assertNotEqual(boundary, changed)
+        self.assertTrue(gate.check_text(changed, gate.BOUNDARY))
 
     def test_repository_uses_counted_boundary(self):
         self.assertEqual(gate.check_tree(gate.ROOT), [])
