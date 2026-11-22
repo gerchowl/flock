@@ -308,81 +308,72 @@ fn fault_proxy_exercises_real_client_never_opened_and_late_id_frames() {
 
 #[test]
 fn live_overflow_closes_both_cuts_and_a_fresh_id_replays_from_applied_cursor() {
-    for force_delivery in [false, true] {
-        runtime(async {
-            let mut case = Case::new(vec![]).await;
-            let mut socket = case.open().await;
-            let ids = ["first", "second"];
-            for id in ids {
-                case.sub(&mut socket, id, None).await;
-                assert_eq!(case.frame(&mut socket).await["t"], "synced");
-            }
-            let before_burst = if force_delivery {
-                case.stored.append(record(1));
-                // Wait for a real live frame without consuming it. The old strict
-                // lagged-first assertion must fail under this interleaving.
-                assert_eq!(within(socket.0.peek(&mut [0])).await.unwrap(), 1);
-                1
-            } else {
-                0
-            };
-            // Async tasks cannot run during this burst, but a spawn_blocking page
-            // already in flight can remove one record. Exceed the window even then.
-            let head = before_burst + crate::structured::history::LIVE_RECORDS as u64 + 2;
-            for seq in before_burst + 1..=head {
-                case.stored.append(record(seq));
-            }
-            let mut applied = [0; 2];
-            let mut closed = [false; 2];
-            // ADR-0036 §5a: lag terminates on the next page, after any page
-            // already read. No frame may follow lagged for that subscription.
-            for _ in 0..2 * (before_burst + 2) {
-                let frame = case.frame(&mut socket).await;
-                let index = ids
-                    .iter()
-                    .position(|id| frame["sub_id"] == *id)
-                    .expect("only the original cuts are open");
-                assert!(!closed[index], "frame after lagged: {frame}");
-                match frame["t"].as_str().unwrap() {
-                    "ev" => {
-                        applied[index] += 1;
-                        assert_eq!(frame["seq"], applied[index]);
-                        assert!(applied[index] <= before_burst + 1);
-                    }
-                    "lagged" => {
-                        assert_eq!(frame["skipped_to"], head);
-                        closed[index] = true;
-                    }
-                    other => panic!("unexpected overflow frame: {other}"),
-                }
-                if closed == [true; 2] {
-                    break;
-                }
-            }
-            assert_eq!(closed, [true; 2], "both cuts must terminate");
-            if force_delivery {
-                assert!(applied.iter().any(|cursor| *cursor > 0));
-            }
-            let cursor = *applied.iter().max().unwrap();
-            case.sub(&mut socket, "fresh", Some(cursor)).await;
-            for seq in cursor + 1..=head {
-                let frame = case.frame(&mut socket).await;
-                assert_eq!(frame["sub_id"], "fresh");
-                assert_eq!(frame["t"], "ev");
-                assert_eq!(frame["seq"], seq);
-            }
-            assert_eq!(
-                case.frame(&mut socket).await,
-                json!({"t":"synced","sub_id":"fresh","seq":head})
-            );
-            case.stored.append(record(head + 1));
-            let frame = case.frame(&mut socket).await;
-            assert_eq!(frame["sub_id"], "fresh");
-            assert_eq!(frame["t"], "ev");
-            assert_eq!(frame["seq"], head + 1);
-            case.server.finish().await;
-        });
+    runtime(live_overflow(false));
+}
+
+#[test]
+fn live_overflow_with_pre_overflow_events_replays_from_applied_cursor() {
+    runtime(live_overflow(true));
+}
+
+async fn live_overflow(deliver_first: bool) {
+    use super::super::subscriptions::IO;
+    let mut case = Case::new(vec![]).await;
+    let mut socket = case.open().await;
+    let ids = ["first", "second"];
+    for id in ids {
+        case.sub(&mut socket, id, None).await;
+        assert_eq!(case.frame(&mut socket).await["t"], "synced");
     }
+    let cursor = u64::from(deliver_first);
+    if deliver_first {
+        case.stored.append(record(1));
+        let mut delivered = Vec::new();
+        for _ in ids {
+            let frame = case.frame(&mut socket).await;
+            assert_eq!(frame["t"], "ev");
+            assert_eq!(frame["seq"], 1);
+            delivered.push(frame["sub_id"].as_str().unwrap().to_owned());
+        }
+        delivered.sort();
+        assert_eq!(delivered, ids);
+    }
+    // Take every page permit, waiting for any spawn_blocking page to finish.
+    // Neither cut can read another page until after the overflow is published.
+    let slots = within(IO.acquire_many(32)).await.unwrap();
+    let head = cursor + crate::structured::history::LIVE_RECORDS as u64 + 1;
+    for seq in cursor + 1..=head {
+        case.stored.append(record(seq));
+    }
+    drop(slots);
+    // ADR-0036 §5a permits the already delivered events above. With paging
+    // held throughout the burst, each cut's next frame must now be lagged.
+    let mut closed = Vec::new();
+    for _ in ids {
+        let frame = case.frame(&mut socket).await;
+        assert_eq!(frame["t"], "lagged");
+        assert_eq!(frame["skipped_to"], head);
+        closed.push(frame["sub_id"].as_str().unwrap().to_owned());
+    }
+    closed.sort();
+    assert_eq!(closed, ids);
+    case.sub(&mut socket, "fresh", Some(cursor)).await;
+    for seq in cursor + 1..=head {
+        let frame = case.frame(&mut socket).await;
+        assert_eq!(frame["sub_id"], "fresh", "frame after lagged: {frame}");
+        assert_eq!(frame["t"], "ev");
+        assert_eq!(frame["seq"], seq);
+    }
+    assert_eq!(
+        case.frame(&mut socket).await,
+        json!({"t":"synced","sub_id":"fresh","seq":head})
+    );
+    case.stored.append(record(head + 1));
+    let frame = case.frame(&mut socket).await;
+    assert_eq!(frame["sub_id"], "fresh");
+    assert_eq!(frame["t"], "ev");
+    assert_eq!(frame["seq"], head + 1);
+    case.server.finish().await;
 }
 
 #[test]
