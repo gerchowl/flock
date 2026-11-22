@@ -3,6 +3,7 @@
 //! prefix off-thread, catches up appends, then publishes a bounded tail atomically.
 use super::{ack, Command, ErrorCode, ServerFrame};
 pub(in crate::web::wire) mod filesystem;
+use crate::web::wire::commands::journal::grants::{Claim, Consumption, Totals};
 #[cfg(test)]
 use filesystem::std;
 use filesystem::{files, File, LockFile};
@@ -20,6 +21,9 @@ use std::{
 };
 use tokio::sync::{oneshot, watch, Notify};
 mod compact;
+// Dormant until verified M2 admission supplies these facts.
+#[allow(dead_code)]
+pub(super) mod grants;
 const PRINCIPAL_LIMIT: usize =
     super::super::CREDENTIAL_CONNECTIONS * super::super::COMMANDS_PER_SOCKET * 2880;
 const GLOBAL_LIMIT: usize =
@@ -33,6 +37,7 @@ struct Index {
     records: HashMap<Key, Record>,
     counts: HashMap<(String, String), usize>,
     oldest_ms: Option<u64>,
+    consumed: Totals,
 }
 #[cfg(not(test))]
 type Stream = File;
@@ -48,10 +53,12 @@ struct Record {
     digest: [u8; 32],
     admitted_ms: u64,
     outcome: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    consumption: Option<Consumption>,
 }
 impl Record {
     fn decode(line: &[u8]) -> Option<Self> {
-        serde_json::from_slice::<Self>(line).ok().filter(|r| r.version == 1 && r.outcome.as_ref().is_none_or(|v| {
+        serde_json::from_slice::<Self>(line).ok().filter(|r| (r.version == 1 && r.consumption.is_none() || r.version == 2 && r.consumption.as_ref().is_some_and(|c| c.ordinal > 0 && c.issuance.len() == 32)) && r.outcome.as_ref().is_none_or(|v| {
             matches!(serde_json::from_value::<ServerFrame>(v.clone()), Ok(ServerFrame::Ack {cmd_id, ..}) if cmd_id == r.cmd_id)
         }))
     }
@@ -71,11 +78,23 @@ pub(super) fn digest(command: &Command) -> Result<[u8; 32], ErrorCode> {
     .into())
 }
 pub(super) enum Admission {
+    // Dormant M2 receipt; ordinary command admission cannot produce this variant.
+    #[allow(dead_code)]
+    Granted {
+        consumption: Consumption,
+        state: Box<Admission>,
+    },
+    // Dormant M2 refusal receipt, before any durable claim or use.
+    #[allow(dead_code)]
+    Refused(crate::structured::permissions::auth::gateway::lifecycle::Refusal),
     Claimed(u64),
     Replayed(ServerFrame),
     Pending(u64),
 }
 pub(super) enum Operation {
+    // Dormant M2 admission entry point, deliberately unused by remote dispatch.
+    #[allow(dead_code)]
+    Grant(Box<Claim>),
     #[cfg(test)]
     SeedCapacity,
 
@@ -191,6 +210,7 @@ impl Writer {
                             Message::Job((operation, reply)) => {
                                 let now = match &operation {
                                     Operation::Claim { now, .. } => Some(*now),
+                                    Operation::Grant(c) => Some(c.now),
                                     _ => None,
                                 };
                                 let result = journal.apply(operation);
@@ -292,6 +312,8 @@ struct Journal {
     #[cfg(test)]
     before_sync: Option<Box<dyn FnMut() + Send>>,
     #[cfg(test)]
+    claim_checkpoint: Option<Box<dyn FnMut(bool) + Send>>,
+    #[cfg(test)]
     compaction_hook: Option<fn(&str)>,
     #[cfg(test)]
     replay_step: Option<tests::ReplayStep>,
@@ -337,6 +359,8 @@ impl Journal {
             #[cfg(test)]
             before_sync: None,
             #[cfg(test)]
+            claim_checkpoint: None,
+            #[cfg(test)]
             compaction_hook: None,
             #[cfg(test)]
             replay_step: tests::take_replay_steps(data),
@@ -355,6 +379,7 @@ impl Journal {
                 digest: [0; 32],
                 admitted_ms: crate::app::notifications::now_ms(),
                 outcome: None,
+                consumption: None,
             };
             serde_json::to_writer(&mut file, &record)?;
             file.write_all(b"\n")?;
@@ -508,6 +533,7 @@ impl Journal {
         files::rollout_identity(&self.file, &self.root.join("commands.jsonl"))
             .map_err(|_| ErrorCode::SessionUnconfirmed)?;
         match operation {
+            Operation::Grant(c) => self.grant(*c),
             #[cfg(test)]
             Operation::SeedCapacity => {
                 self.seed_capacity_test()
@@ -549,6 +575,16 @@ impl Journal {
         command: &Command,
         now: u64,
     ) -> Result<Admission, ErrorCode> {
+        self.claim_with(namespace, principal, command, now, None)
+    }
+    fn claim_with(
+        &mut self,
+        namespace: &str,
+        principal: &str,
+        command: &Command,
+        now: u64,
+        consumption: Option<Consumption>,
+    ) -> Result<Admission, ErrorCode> {
         let key = (
             namespace.to_owned(),
             principal.to_owned(),
@@ -563,7 +599,7 @@ impl Journal {
                     ErrorCode::SessionBusy
                 });
             }
-            if digest != record.digest {
+            if digest != record.digest || consumption != record.consumption {
                 return Err(ErrorCode::InvalidParams);
             }
             return match &record.outcome {
@@ -588,15 +624,24 @@ impl Journal {
             return Err(ErrorCode::SessionBusy);
         }
         let record = Record {
-            version: 1,
+            version: if consumption.is_some() { 2 } else { 1 },
             namespace: key.0,
             principal: key.1,
             cmd_id: key.2,
             digest,
             admitted_ms: now,
             outcome: None,
+            consumption,
         };
+        #[cfg(test)]
+        if let Some(hook) = &mut self.claim_checkpoint {
+            hook(false);
+        }
         self.append(&record)?;
+        #[cfg(test)]
+        if let Some(hook) = &mut self.claim_checkpoint {
+            hook(true);
+        }
         self.index.fold(record, self.global_limit);
         Ok(Admission::Claimed(now))
     }
@@ -637,7 +682,8 @@ impl Index {
     fn fold(&mut self, record: Record, global_limit: usize) -> bool {
         let key = record.key();
         if let Some(first) = self.records.get_mut(&key) {
-            if first.digest != record.digest
+            if first.consumption != record.consumption
+                || first.digest != record.digest
                 || first.admitted_ms != record.admitted_ms
                 || first.outcome.is_some()
                 || record.outcome.is_none()
@@ -648,6 +694,13 @@ impl Index {
         } else {
             if record.outcome.is_some() || self.records.len() == global_limit {
                 return false;
+            }
+            if let Some(c) = &record.consumption {
+                let used = self.consumed.get(&c.issuance).copied().unwrap_or(0);
+                if used.checked_add(1) != Some(c.ordinal) {
+                    return false;
+                }
+                self.consumed.insert(c.issuance.clone(), c.ordinal);
             }
             *self
                 .counts
