@@ -123,11 +123,46 @@ def owned_cache(env, audit):
                 signal.signal(sig, handler)
 
 
-def quarantine(rows):
+def quarantine(rows, *, gc_contaminated=False, aggregate_eligible=True):
     """GC is store-wide, so contamination of one concurrent member taints all."""
-    contaminated = any(row.get("nix_auto_gc_messages", 0)
-                       or row.get("nix_gc_lock_messages", 0) for row in rows)
+    contaminated = gc_contaminated or any(
+        row.get("gc_contaminated", False) or row.get("nix_auto_gc_messages", 0)
+        or row.get("nix_gc_lock_messages", 0) for row in rows)
+    eligible = aggregate_eligible and not contaminated and all(
+        row.get("aggregate_eligible", True) and row["exit"] == 0 for row in rows)
     for row in rows:
         row["gc_contaminated"] = contaminated
-        row["aggregate_eligible"] = not contaminated and row["exit"] == 0
+        row["aggregate_eligible"] = eligible
     return not contaminated
+
+
+def restore_quarantine(data):
+    """Replay persisted batch decisions without reviving excluded observations."""
+    samples = {row["scenario"]: row for row in data["rows"]}
+    if len(samples) != len(data["rows"]):
+        raise RuntimeError("duplicate sample identity in stored measurements")
+    batches, covered = [], set()
+    for group in data["groups"]:
+        label = group["scenario"]
+        identities = group.get("sample_ids")
+        if identities is None:
+            # Legacy groups used the label itself or a numeric member suffix.
+            # Later retries sharing the label prefix have explicit identities.
+            identities = [name for name in samples if name == label
+                          or (name.startswith(label + "-") and name[len(label) + 1:].isdigit())]
+        if not identities or len(set(identities)) != len(identities):
+            raise RuntimeError("stored batch has missing or duplicate membership")
+        if any(name not in samples or name in covered for name in identities):
+            raise RuntimeError("stored sample has missing or ambiguous batch ownership")
+        covered.update(identities)
+        batches.append((group, [samples[name] for name in identities]))
+    if covered != set(samples):
+        raise RuntimeError("cannot restore quarantine without batch membership")
+    for group, members in batches:
+        clean = quarantine(members, gc_contaminated=group.get("gc_contaminated", False),
+                           aggregate_eligible=group.get("aggregate_eligible", True))
+        eligible = all(row["aggregate_eligible"] for row in members)
+        if "gc_contaminated" in group or not clean:
+            group["gc_contaminated"] = not clean
+        if "aggregate_eligible" in group or not eligible:
+            group["aggregate_eligible"] = eligible

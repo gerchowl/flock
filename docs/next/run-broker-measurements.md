@@ -146,7 +146,12 @@ contaminated or unavailable in this dataset.
 Daemon auto-GC is an uncontrolled host setting. The harness does not override
 `min-free` or `max-free`. It detects the captured auto-GC and GC-lock messages
 for every measured command, including Cargo. A signal in any concurrent member
-quarantines the entire batch. Rows and groups record `gc_contaminated` and
+quarantines the entire batch. Reloading results preserves each persisted batch
+decision and applies new evidence to all of its members; it never reclassifies
+a clean-looking member independently. Explicit sample IDs identify newer
+batches; legacy membership uses the exact label or numeric member suffixes so
+a historical batch cannot absorb a later retry with the same prefix. Missing
+or ambiguous membership fails before classification is mutated. Rows and groups record `gc_contaminated` and
 `aggregate_eligible`; excluded observations remain visible. Nix batches retry
 up to three total attempts, with unique log names; only a signal-free successful
 attempt enters aggregates. Exhaustion records an unavailable cell rather than
@@ -507,7 +512,7 @@ BUILD_BACKEND_TEST_ROOT="$SCRATCH/m3081-fix1-tests" \
   nix develop --command python3 -m unittest scripts.test_build_backend_control -v
 ```
 
-All eight tests passed with exit 0: three GC-policy regressions and five real
+At the first review fix, all eight tests passed with exit 0: three GC-policy regressions and five real
 private-daemon cases (normal exit, exception, SIGINT, SIGTERM, and refusal to
 adopt an occupied endpoint). The exception and signal probes intentionally exit
 1, 130 and 143; the test driver verifies those exits, child termination, owned
@@ -525,11 +530,54 @@ the original task target after measurement, so its retained contents include
 additional checking artifacts beyond the timed size snapshots.
 
 
-The review fix increases runtime controller code from 317 to 503 nonblank,
+The first review fix increases runtime controller code from 317 to 503 nonblank,
 noncomment lines, excluding docstrings and tests (361 raw lines before; 572 raw
 runtime lines across the harness and lifetime helper afterward). Rust production
 code changes remain zero. This is the review-fix round; the increase is reported
 for the architect's split decision rather than bypassing the experiment fixes.
+
+### Second review fix: preserve batch exclusions
+
+The rerun regression covers a contaminated batch with a member whose own log
+looks clean, persisted group-only exclusions, newly detected GC, and exclusions
+unrelated to GC. Each is serialized/reloaded and rerun twice, with both explicit
+and legacy membership. The test fails by assertion against `ebb4c5b07` and passes
+with the fix. The reviewer's unchanged reproduction also changed from exit 1 to
+exit 0. Legacy/retry separation and fail-before-mutation checks cover restoration
+of stored batches.
+
+The updated devShell test command above passed all 11 tests with exit 0,
+including the five real-daemon probes. `nix develop --command just lint` also
+passed with exit 0. Runtime code increases from 503 to 528 nonblank, noncomment
+lines excluding docstrings/tests in this review fix; Rust production changes
+remain zero. The existing retained probe root was reused.
+
+No measurements or classification values in the committed JSON change. Applying
+batch restoration to a deep copy yields an identical object, and the JSON file
+is byte-identical to `ebb4c5b07`. All summary cells, 68 resource rows, 42 cache
+rows, 13 copy rows, 22 Nix diagnostic rows and group rows still match the JSON.
+The dataset's controller hashes retain their original measurement provenance;
+this classification repair does not rewrite them or append measurement samples.
+The JSON SHA-256 remains
+`241d60828f6844dc740e7328ed54f3e963cd87c7eba8b6136e4b911d6d8a7159`.
+The unchanged-data check is reproducible without running builds:
+
+```sh
+python3 - <<'PY'
+import copy, json, sys
+from pathlib import Path
+sys.path.insert(0, "scripts")
+from build_backend_control import restore_quarantine
+path = Path("docs/next/run-broker-measurements.json")
+original = path.read_bytes()
+data = json.loads(original)
+restored = copy.deepcopy(data)
+restore_quarantine(restored)
+assert restored == data
+assert path.read_bytes() == original
+print("batch restoration leaves the committed dataset unchanged")
+PY
+```
 
 All scratch roots remain under the operator-supplied `$SCRATCH`. No scratch
 root was deleted; the admission owner handles reclamation. The JSON `scratch`

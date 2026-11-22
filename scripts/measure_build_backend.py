@@ -22,7 +22,7 @@ import subprocess
 import tarfile
 import time
 
-from build_backend_control import RunInterrupted, owned_cache, quarantine
+from build_backend_control import RunInterrupted, owned_cache, quarantine, restore_quarantine
 
 
 def output(argv, **kwargs):
@@ -349,19 +349,14 @@ class Measurement:
         self.checkpoint()
 
     def rerun_nix(self):
+        restore_quarantine(self.data)
         for row in self.data["rows"]:
-            quarantine([row])
             if row["scenario"].startswith("nix-"):
                 row["aggregate_eligible"] = False
                 row["exclusion_reason"] = "superseded by GC-controlled Nix rerun"
         for group in self.data["groups"]:
             if group["scenario"].startswith("nix-"):
                 group["aggregate_eligible"] = False
-                members = [row for row in self.data["rows"]
-                           if row["scenario"] in group.get("sample_ids", [])
-                           or ("sample_ids" not in group
-                               and row["scenario"].startswith(group["scenario"] + "-"))]
-                group["gc_contaminated"] = any(r["gc_contaminated"] for r in members)
                 group["exclusion_reason"] = "superseded by GC-controlled Nix rerun"
         self.data["nix_rerun_source_sha"] = output(["git", "rev-parse", "HEAD"], cwd=self.repo)
         self.nix_runs()

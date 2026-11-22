@@ -10,8 +10,9 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
-from scripts.build_backend_control import quarantine
+from scripts.build_backend_control import quarantine, restore_quarantine
 
 
 class QuarantineTests(unittest.TestCase):
@@ -55,6 +56,60 @@ class QuarantineTests(unittest.TestCase):
         self.assertEqual(len(rows), 3)
         self.assertFalse(any(r["aggregate_eligible"] for r in rows))
         self.assertIn("nix-fresh-eval", data["unavailable"])
+
+    def test_rerun_preserves_batch_exclusion_for_clean_looking_member(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from scripts.measure_build_backend import Measurement
+        for explicit_ids in (False, True):
+            for state in ("persisted", "group_only", "new_signal", "excluded"):
+                with self.subTest(explicit_ids=explicit_ids, state=state):
+                    rows = [{"scenario": f"concurrent-1-{i}", "exit": 0} for i in range(2)]
+                    if state in ("persisted", "new_signal"):
+                        rows[0]["nix_auto_gc_messages"] = 1
+                    if state == "persisted":
+                        quarantine(rows)
+                    group = {"scenario": "concurrent-1",
+                             "gc_contaminated": state in ("persisted", "group_only"),
+                             "aggregate_eligible": state == "new_signal"}
+                    if explicit_ids:
+                        group["sample_ids"] = [row["scenario"] for row in rows]
+                    data = json.loads(json.dumps({"rows": rows, "groups": [group]}))
+                    controller = Measurement.__new__(Measurement)
+                    controller.data = data
+                    controller.repo = Path(".")
+                    controller.nix_runs = lambda: None
+                    with mock.patch("scripts.measure_build_backend.output", return_value="source"), \
+                            mock.patch("builtins.print"):
+                        controller.rerun_nix()
+                        controller.rerun_nix()
+                    self.assertTrue(all(row["gc_contaminated"] == (state != "excluded")
+                                        for row in data["rows"]))
+                    self.assertFalse(any(row["aggregate_eligible"] for row in data["rows"]))
+
+    def test_legacy_batch_does_not_capture_explicit_retry_members(self):
+        old, retry = "nix-fresh-eval-1", "nix-fresh-eval-fix1-r1-a1-1"
+        data = {"rows": [
+                    {"scenario": old, "exit": 0, "gc_contaminated": True,
+                     "aggregate_eligible": False},
+                    {"scenario": retry, "exit": 0, "gc_contaminated": False,
+                     "aggregate_eligible": True}],
+                "groups": [
+                    {"scenario": "nix-fresh-eval", "gc_contaminated": True,
+                     "aggregate_eligible": False},
+                    {"scenario": "nix-fresh-eval", "sample_ids": [retry],
+                     "gc_contaminated": False, "aggregate_eligible": True}]}
+        before = json.dumps(data)
+        restore_quarantine(data)
+        self.assertEqual(data, json.loads(before))
+
+    def test_missing_batch_membership_fails_before_mutating_classification(self):
+        data = {"rows": [{"scenario": "known", "exit": 0},
+                         {"scenario": "unassigned", "exit": 0}],
+                "groups": [{"scenario": "known", "gc_contaminated": True}]}
+        before = json.dumps(data)
+        with self.assertRaisesRegex(RuntimeError, "batch membership"):
+            restore_quarantine(data)
+        self.assertEqual(data, json.loads(before))
 
 
 PROBE = r'''
