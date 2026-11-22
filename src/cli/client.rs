@@ -72,6 +72,7 @@ fn parse(args: &[String]) -> Option<(Method, bool)> {
                 }
             };
             Method::ClientGrantAdd(crate::api::gateway_grants::Grant {
+                lifecycle: None,
                 name: (*name).into(),
                 home_node_id: (*home).into(),
                 principals: set(principals),
