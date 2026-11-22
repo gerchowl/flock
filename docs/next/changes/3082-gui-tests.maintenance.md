@@ -1,1 +1,0 @@
-- Merge the GUI bundle build and feature-gate integration tests into one test binary, preserving all three cases and both feature-variant checks while reducing duplicate build artifacts.
