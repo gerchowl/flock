@@ -1,4 +1,4 @@
-//! Non-consuming Q9 preflight; P3 owns durable use accounting and clock latching.
+//! Q9 preflight shared with atomic J1 accounting; P3c owns durable clock latching.
 use super::*;
 
 /// Authenticated provenance supplied by P1, never inferred from principal text.
@@ -16,6 +16,7 @@ pub(crate) struct Evaluation<'a> {
     pub clock: Option<ClockPair>,
     pub consumed: &'a BTreeMap<String, u64>,
 }
+/// Closed reasons for refusing a lifecycle preflight or fenced admission.
 #[derive(Debug, PartialEq)]
 pub(crate) enum Refusal {
     Revoked,
@@ -97,76 +98,109 @@ impl Store {
         membership: impl FnOnce(Target<'_>) -> Option<String>,
     ) -> Result<Decision, E> {
         let (_lease, value) = self.snapshot()?;
-        let listing = Self::listing(&value);
-        if listing.generation != generation {
-            return Ok(Decision::Refused(Refusal::Revoked));
+        Ok(evaluate_listing(
+            context,
+            generation,
+            &Self::listing(&value),
+            None,
+            membership,
+        ))
+    }
+    /// Hold the A1 lease through the caller's single durable J1 commit.
+    pub(crate) fn with_listing<R>(
+        &self,
+        action: impl FnOnce(&Listing) -> Result<R, E>,
+    ) -> Result<R, E> {
+        let (_lease, value) = self.snapshot()?;
+        action(&Self::listing(&value))
+    }
+}
+/// Caller must hold the A1 lease until admission is durably committed.
+pub(crate) fn evaluate_listing(
+    context: &Evaluation<'_>,
+    generation: u64,
+    listing: &Listing,
+    selected: Option<&str>,
+    membership: impl FnOnce(Target<'_>) -> Option<String>,
+) -> Decision {
+    if listing.generation != generation {
+        return Decision::Refused(Refusal::Revoked);
+    }
+    let r = context.request;
+    if context.source == PrincipalKind::File {
+        return Decision::Refused(Refusal::Principal);
+    }
+    let Some(scope) = required_scope(r.verb) else {
+        return Decision::Refused(Refusal::Verb);
+    };
+    if !r.scopes.contains(&scope) {
+        return Decision::Refused(Refusal::Scope);
+    }
+    if (r.verb == "agent.start") != matches!(r.target, Target::Start(_)) {
+        return Decision::Refused(Refusal::Target);
+    }
+    let Some(workspace) = membership(r.target) else {
+        return Decision::Refused(Refusal::Target);
+    };
+    let mut grants: Vec<_> = listing
+        .entries
+        .values()
+        .flatten()
+        .filter_map(|g| {
+            g.lifecycle
+                .as_ref()
+                .and_then(|p| p.issuance.as_ref().map(|i| (g, p, i)))
+        })
+        .filter(|(_, _, issuance)| selected.is_none_or(|id| id == issuance.id))
+        .collect();
+    grants.sort_by(|a, b| a.2.id.cmp(&b.2.id));
+    let mut reason = Refusal::NoGrant;
+    for (g, p, i) in grants {
+        if g.home_node_id != r.home {
+            continue;
         }
-        let r = context.request;
-        if context.source == PrincipalKind::File {
-            return Ok(Decision::Refused(Refusal::Principal));
-        }
-        let Some(scope) = required_scope(r.verb) else {
-            return Ok(Decision::Refused(Refusal::Verb));
-        };
-        if !r.scopes.contains(&scope) {
-            return Ok(Decision::Refused(Refusal::Scope));
-        }
-        if (r.verb == "agent.start") != matches!(r.target, Target::Start(_)) {
-            return Ok(Decision::Refused(Refusal::Target));
-        }
-        let Some(workspace) = membership(r.target) else {
-            return Ok(Decision::Refused(Refusal::Target));
-        };
-        let mut grants: Vec<_> = listing
-            .entries
-            .values()
-            .flatten()
-            .filter_map(|g| {
-                g.lifecycle
-                    .as_ref()
-                    .and_then(|p| p.issuance.as_ref().map(|i| (g, p, i)))
-            })
-            .collect();
-        grants.sort_by(|a, b| a.2.id.cmp(&b.2.id));
-        let mut reason = Refusal::NoGrant;
-        for (g, p, i) in grants {
-            if g.home_node_id != r.home {
+        reason = if !g.principals.contains(r.principal)
+            || !match &p.subject {
+                Subject::User => context.source == PrincipalKind::User,
+                Subject::Agent => context.source == PrincipalKind::Agent,
+                Subject::Role { kind, .. } => matches!(
+                    (kind, context.source),
+                    (SubjectKind::User, PrincipalKind::User)
+                        | (SubjectKind::Agent, PrincipalKind::Agent)
+                ),
+            } {
+            Refusal::Principal
+        } else if p.destination_node_id != context.destination {
+            Refusal::Destination
+        } else if !g.verbs.contains(r.verb) {
+            Refusal::Verb
+        } else if !g.scopes.contains(&scope) {
+            Refusal::Scope
+        } else if !matches_target(g, r.target, &workspace) {
+            Refusal::Target
+        } else if !unexpired(p, context.clock.as_ref()) {
+            Refusal::Expired
+        } else {
+            let used = context.consumed.get(&i.id).copied().unwrap_or(0);
+            let remaining = p.max_uses.map(|max| max.saturating_sub(used));
+            if remaining == Some(0) {
+                reason = Refusal::Exhausted;
                 continue;
             }
-            reason = if !g.principals.contains(r.principal)
-                || !match &p.subject {
-                    Subject::User => context.source == PrincipalKind::User,
-                    Subject::Agent => context.source == PrincipalKind::Agent,
-                    Subject::Role { kind, .. } => matches!(
-                        (kind, context.source),
-                        (SubjectKind::User, PrincipalKind::User)
-                            | (SubjectKind::Agent, PrincipalKind::Agent)
-                    ),
-                } {
-                Refusal::Principal
-            } else if p.destination_node_id != context.destination {
-                Refusal::Destination
-            } else if !g.verbs.contains(r.verb) {
-                Refusal::Verb
-            } else if !g.scopes.contains(&scope) {
-                Refusal::Scope
-            } else if !matches_target(g, r.target, &workspace) {
-                Refusal::Target
-            } else if !unexpired(p, context.clock.as_ref()) {
-                Refusal::Expired
-            } else {
-                let used = context.consumed.get(&i.id).copied().unwrap_or(0);
-                let remaining = p.max_uses.map(|max| max.saturating_sub(used));
-                if remaining == Some(0) {
-                    reason = Refusal::Exhausted;
-                    continue;
-                }
-                return Ok(Decision::Allowed {
-                    issuance_id: i.id.clone(),
-                    remaining,
-                });
+            return Decision::Allowed {
+                issuance_id: i.id.clone(),
+                remaining,
             };
-        }
-        Ok(Decision::Refused(reason))
+        };
+    }
+    Decision::Refused(reason)
+}
+
+/// Canonical destination target for a lifecycle preflight or transaction.
+pub(crate) fn target<'a>(verb: &str, id: &'a str) -> Target<'a> {
+    if verb == "agent.start" {
+        Target::Start(id)
+    } else {
+        Target::Agent(id)
     }
 }

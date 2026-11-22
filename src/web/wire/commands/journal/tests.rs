@@ -89,6 +89,7 @@ fn claim_and_finish_write_one_record_independent_of_retained_size() {
                 digest: [0; 32],
                 admitted_ms: 100,
                 outcome: None,
+                consumption: None,
             };
             serde_json::to_writer(&mut journal.file, &record).unwrap();
             journal.file.write_all(b"\n").unwrap();
@@ -254,6 +255,7 @@ fn complete_corruption_and_oversized_rows_preserve_raw_and_other_results() {
             digest: [0; 32],
             admitted_ms: 100,
             outcome: None,
+            consumption: None,
         };
         serde_json::to_writer(&mut journal.file, &record).unwrap();
         journal.file.write_all(b"\n").unwrap();
@@ -661,3 +663,5 @@ impl Writer {
         (started, release)
     }
 }
+
+mod grants;

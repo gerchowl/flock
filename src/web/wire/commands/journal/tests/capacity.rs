@@ -14,6 +14,7 @@ fn near_global_cap_hot_operations_write_only_one_record() {
             digest: [0; 32],
             admitted_ms: 100,
             outcome: None,
+            consumption: None,
         };
         serde_json::to_writer(&mut file, &record).unwrap();
         file.write_all(b"\n").unwrap();
