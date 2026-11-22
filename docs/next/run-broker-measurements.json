@@ -1,0 +1,4276 @@
+{
+  "source_sha": "fad0aafc91de25a790db46b4b5b857cde000baf5",
+  "host": {
+    "os": "26.6.2",
+    "cores": 14,
+    "ram_bytes": 68719476736,
+    "filesystem": "APFS"
+  },
+  "versions": {
+    "rustc": "rustc 1.95.0 (59807616e 2026-04-14) (built from a source tarball)",
+    "cargo": "cargo 1.95.0 (f2d3ce0bd 2026-03-21)",
+    "nix": "nix (Lix, like Nix) 2.95.2",
+    "sccache": "sccache 0.18.0"
+  },
+  "nextest": "cargo-nextest 0.9.146",
+  "rows": [
+    {
+      "scenario": "cold",
+      "exit": 0,
+      "wall_s": 140.77299658302218,
+      "max_rss_bytes": 9329737728,
+      "peak_footprint_bytes": 201557632,
+      "sampled_process_group_peak_rss_bytes": 14772240384,
+      "load_start": 4.13,
+      "load_end": 5.15,
+      "cargo_lock_messages": 0,
+      "command": [
+        "cargo",
+        "nextest",
+        "archive",
+        "--locked",
+        "--features",
+        "web,ts",
+        "--timings",
+        "--archive-file",
+        "$SCRATCH/m3081-results/cold.tar.zst"
+      ],
+      "target_allocated_kib": 2259804,
+      "archive_bytes": 179373747,
+      "cargo_lock_kinds": {},
+      "nix_sqlite_busy_messages": 0,
+      "nix_auto_gc_messages": 0,
+      "nix_gc_lock_messages": 0
+    },
+    {
+      "scenario": "same-1",
+      "exit": 0,
+      "wall_s": 1.2334193328861147,
+      "max_rss_bytes": 204079104,
+      "peak_footprint_bytes": 192448064,
+      "sampled_process_group_peak_rss_bytes": 202244096,
+      "load_start": 5.15,
+      "load_end": 5.06,
+      "cargo_lock_messages": 0,
+      "command": [
+        "cargo",
+        "nextest",
+        "archive",
+        "--locked",
+        "--features",
+        "web,ts",
+        "--timings",
+        "--archive-file",
+        "$SCRATCH/m3081-results/same-1.tar.zst"
+      ],
+      "target_allocated_kib": 2227400,
+      "archive_bytes": 179373747,
+      "cargo_lock_kinds": {},
+      "nix_sqlite_busy_messages": 0,
+      "nix_auto_gc_messages": 0,
+      "nix_gc_lock_messages": 0
+    },
+    {
+      "scenario": "different-1",
+      "exit": 0,
+      "wall_s": 112.43411924992688,
+      "max_rss_bytes": 9346449408,
+      "peak_footprint_bytes": 212141760,
+      "sampled_process_group_peak_rss_bytes": 10077224960,
+      "load_start": 5.06,
+      "load_end": 4.78,
+      "cargo_lock_messages": 0,
+      "command": [
+        "cargo",
+        "nextest",
+        "archive",
+        "--locked",
+        "--features",
+        "web,ts",
+        "--timings",
+        "--archive-file",
+        "$SCRATCH/m3081-results/different-1.tar.zst"
+      ],
+      "target_allocated_kib": 2327968,
+      "archive_bytes": 179395308,
+      "cargo_lock_kinds": {},
+      "nix_sqlite_busy_messages": 0,
+      "nix_auto_gc_messages": 0,
+      "nix_gc_lock_messages": 0
+    },
+    {
+      "scenario": "touch-1",
+      "exit": 0,
+      "wall_s": 80.03753658407368,
+      "max_rss_bytes": 9508896768,
+      "peak_footprint_bytes": 205817472,
+      "sampled_process_group_peak_rss_bytes": 10244833280,
+      "load_start": 4.78,
+      "load_end": 4.62,
+      "cargo_lock_messages": 0,
+      "command": [
+        "cargo",
+        "nextest",
+        "archive",
+        "--locked",
+        "--features",
+        "web,ts",
+        "--timings",
+        "--archive-file",
+        "$SCRATCH/m3081-results/touch-1.tar.zst"
+      ],
+      "target_allocated_kib": 2260580,
+      "archive_bytes": 179373794,
+      "cargo_lock_kinds": {},
+      "nix_sqlite_busy_messages": 0,
+      "nix_auto_gc_messages": 0,
+      "nix_gc_lock_messages": 0
+    },
+    {
+      "scenario": "fresh-1",
+      "exit": 0,
+      "wall_s": 106.32112012500875,
+      "max_rss_bytes": 9432317952,
+      "peak_footprint_bytes": 206063360,
+      "sampled_process_group_peak_rss_bytes": 9867280384,
+      "load_start": 4.62,
+      "load_end": 5.96,
+      "cargo_lock_messages": 0,
+      "command": [
+        "cargo",
+        "nextest",
+        "archive",
+        "--locked",
+        "--features",
+        "web,ts",
+        "--timings",
+        "--archive-file",
+        "$SCRATCH/m3081-results/fresh-1.tar.zst"
+      ],
+      "target_allocated_kib": 2327828,
+      "archive_bytes": 179367058,
+      "cargo_lock_kinds": {},
+      "nix_sqlite_busy_messages": 0,
+      "nix_auto_gc_messages": 0,
+      "nix_gc_lock_messages": 0
+    },
+    {
+      "scenario": "same-2",
+      "exit": 0,
+      "wall_s": 1.1731636670883745,
+      "max_rss_bytes": 204488704,
+      "peak_footprint_bytes": 192841280,
+      "sampled_process_group_peak_rss_bytes": 201998336,
+      "load_start": 5.81,
+      "load_end": 5.81,
+      "cargo_lock_messages": 0,
+      "command": [
+        "cargo",
+        "nextest",
+        "archive",
+        "--locked",
+        "--features",
+        "web,ts",
+        "--timings",
+        "--archive-file",
+        "$SCRATCH/m3081-results/same-2.tar.zst"
+      ],
+      "target_allocated_kib": 2227400,
+      "archive_bytes": 179373747,
+      "cargo_lock_kinds": {},
+      "nix_sqlite_busy_messages": 0,
+      "nix_auto_gc_messages": 0,
+      "nix_gc_lock_messages": 0
+    },
+    {
+      "scenario": "different-2",
+      "exit": 0,
+      "wall_s": 133.62772208289243,
+      "max_rss_bytes": 9373384704,
+      "peak_footprint_bytes": 200476288,
+      "sampled_process_group_peak_rss_bytes": 9509634048,
+      "load_start": 5.81,
+      "load_end": 5.73,
+      "cargo_lock_messages": 0,
+      "command": [
+        "cargo",
+        "nextest",
+        "archive",
+        "--locked",
+        "--features",
+        "web,ts",
+        "--timings",
+        "--archive-file",
+        "$SCRATCH/m3081-results/different-2.tar.zst"
+      ],
+      "target_allocated_kib": 2327976,
+      "archive_bytes": 179395364,
+      "cargo_lock_kinds": {},
+      "nix_sqlite_busy_messages": 0,
+      "nix_auto_gc_messages": 0,
+      "nix_gc_lock_messages": 0
+    },
+    {
+      "scenario": "touch-2",
+      "exit": 0,
+      "wall_s": 90.6784607921727,
+      "max_rss_bytes": 9525493760,
+      "peak_footprint_bytes": 211437248,
+      "sampled_process_group_peak_rss_bytes": 9690038272,
+      "load_start": 5.73,
+      "load_end": 6.74,
+      "cargo_lock_messages": 0,
+      "command": [
+        "cargo",
+        "nextest",
+        "archive",
+        "--locked",
+        "--features",
+        "web,ts",
+        "--timings",
+        "--archive-file",
+        "$SCRATCH/m3081-results/touch-2.tar.zst"
+      ],
+      "target_allocated_kib": 2260580,
+      "archive_bytes": 179373574,
+      "cargo_lock_kinds": {},
+      "nix_sqlite_busy_messages": 0,
+      "nix_auto_gc_messages": 0,
+      "nix_gc_lock_messages": 0
+    },
+    {
+      "scenario": "fresh-2",
+      "exit": 0,
+      "wall_s": 137.20294250012375,
+      "max_rss_bytes": 9442951168,
+      "peak_footprint_bytes": 204048064,
+      "sampled_process_group_peak_rss_bytes": 10162503680,
+      "load_start": 6.74,
+      "load_end": 7.01,
+      "cargo_lock_messages": 0,
+      "command": [
+        "cargo",
+        "nextest",
+        "archive",
+        "--locked",
+        "--features",
+        "web,ts",
+        "--timings",
+        "--archive-file",
+        "$SCRATCH/m3081-results/fresh-2.tar.zst"
+      ],
+      "target_allocated_kib": 2327828,
+      "archive_bytes": 179366967,
+      "cargo_lock_kinds": {},
+      "nix_sqlite_busy_messages": 0,
+      "nix_auto_gc_messages": 0,
+      "nix_gc_lock_messages": 0
+    },
+    {
+      "scenario": "edit-1-01",
+      "exit": 0,
+      "wall_s": 88.02853933302686,
+      "max_rss_bytes": 9503227904,
+      "peak_footprint_bytes": 209766080,
+      "sampled_process_group_peak_rss_bytes": 10148954112,
+      "load_start": 7.01,
+      "load_end": 6.59,
+      "cargo_lock_messages": 0,
+      "command": [
+        "cargo",
+        "nextest",
+        "archive",
+        "--locked",
+        "--features",
+        "web,ts",
+        "--timings",
+        "--archive-file",
+        "$SCRATCH/m3081-results/edit-1-01.tar.zst"
+      ],
+      "target_allocated_kib": 2260772,
+      "archive_bytes": 179373195,
+      "cargo_lock_kinds": {},
+      "nix_sqlite_busy_messages": 0,
+      "nix_auto_gc_messages": 0,
+      "nix_gc_lock_messages": 0
+    },
+    {
+      "scenario": "edit-1-02",
+      "exit": 0,
+      "wall_s": 87.56896366691217,
+      "max_rss_bytes": 9454125056,
+      "peak_footprint_bytes": 205506176,
+      "sampled_process_group_peak_rss_bytes": 9564815360,
+      "load_start": 6.59,
+      "load_end": 6.98,
+      "cargo_lock_messages": 0,
+      "command": [
+        "cargo",
+        "nextest",
+        "archive",
+        "--locked",
+        "--features",
+        "web,ts",
+        "--timings",
+        "--archive-file",
+        "$SCRATCH/m3081-results/edit-1-02.tar.zst"
+      ],
+      "target_allocated_kib": 2260964,
+      "archive_bytes": 179373198,
+      "cargo_lock_kinds": {},
+      "nix_sqlite_busy_messages": 0,
+      "nix_auto_gc_messages": 0,
+      "nix_gc_lock_messages": 0
+    },
+    {
+      "scenario": "edit-1-03",
+      "exit": 0,
+      "wall_s": 81.3990278749261,
+      "max_rss_bytes": 9416736768,
+      "peak_footprint_bytes": 209782464,
+      "sampled_process_group_peak_rss_bytes": 10278207488,
+      "load_start": 6.98,
+      "load_end": 5.06,
+      "cargo_lock_messages": 0,
+      "command": [
+        "cargo",
+        "nextest",
+        "archive",
+        "--locked",
+        "--features",
+        "web,ts",
+        "--timings",
+        "--archive-file",
+        "$SCRATCH/m3081-results/edit-1-03.tar.zst"
+      ],
+      "target_allocated_kib": 2261156,
+      "archive_bytes": 179372887,
+      "cargo_lock_kinds": {},
+      "nix_sqlite_busy_messages": 0,
+      "nix_auto_gc_messages": 0,
+      "nix_gc_lock_messages": 0
+    },
+    {
+      "scenario": "edit-1-04",
+      "exit": 0,
+      "wall_s": 79.56240054219961,
+      "max_rss_bytes": 9399812096,
+      "peak_footprint_bytes": 205981376,
+      "sampled_process_group_peak_rss_bytes": 10205396992,
+      "load_start": 5.06,
+      "load_end": 6.34,
+      "cargo_lock_messages": 0,
+      "command": [
+        "cargo",
+        "nextest",
+        "archive",
+        "--locked",
+        "--features",
+        "web,ts",
+        "--timings",
+        "--archive-file",
+        "$SCRATCH/m3081-results/edit-1-04.tar.zst"
+      ],
+      "target_allocated_kib": 2261348,
+      "archive_bytes": 179372900,
+      "cargo_lock_kinds": {},
+      "nix_sqlite_busy_messages": 0,
+      "nix_auto_gc_messages": 0,
+      "nix_gc_lock_messages": 0
+    },
+    {
+      "scenario": "edit-1-05",
+      "exit": 0,
+      "wall_s": 87.1861766660586,
+      "max_rss_bytes": 9419898880,
+      "peak_footprint_bytes": 203933312,
+      "sampled_process_group_peak_rss_bytes": 9645342720,
+      "load_start": 6.34,
+      "load_end": 5.71,
+      "cargo_lock_messages": 0,
+      "command": [
+        "cargo",
+        "nextest",
+        "archive",
+        "--locked",
+        "--features",
+        "web,ts",
+        "--timings",
+        "--archive-file",
+        "$SCRATCH/m3081-results/edit-1-05.tar.zst"
+      ],
+      "target_allocated_kib": 2261540,
+      "archive_bytes": 179373206,
+      "cargo_lock_kinds": {},
+      "nix_sqlite_busy_messages": 0,
+      "nix_auto_gc_messages": 0,
+      "nix_gc_lock_messages": 0
+    },
+    {
+      "scenario": "edit-1-06",
+      "exit": 0,
+      "wall_s": 87.55002262513153,
+      "max_rss_bytes": 9408348160,
+      "peak_footprint_bytes": 206292608,
+      "sampled_process_group_peak_rss_bytes": 9669378048,
+      "load_start": 5.71,
+      "load_end": 6.71,
+      "cargo_lock_messages": 0,
+      "command": [
+        "cargo",
+        "nextest",
+        "archive",
+        "--locked",
+        "--features",
+        "web,ts",
+        "--timings",
+        "--archive-file",
+        "$SCRATCH/m3081-results/edit-1-06.tar.zst"
+      ],
+      "target_allocated_kib": 2261732,
+      "archive_bytes": 179373166,
+      "cargo_lock_kinds": {},
+      "nix_sqlite_busy_messages": 0,
+      "nix_auto_gc_messages": 0,
+      "nix_gc_lock_messages": 0
+    },
+    {
+      "scenario": "edit-1-07",
+      "exit": 0,
+      "wall_s": 96.41939791711047,
+      "max_rss_bytes": 9363079168,
+      "peak_footprint_bytes": 213255872,
+      "sampled_process_group_peak_rss_bytes": 10211803136,
+      "load_start": 6.71,
+      "load_end": 8.55,
+      "cargo_lock_messages": 0,
+      "command": [
+        "cargo",
+        "nextest",
+        "archive",
+        "--locked",
+        "--features",
+        "web,ts",
+        "--timings",
+        "--archive-file",
+        "$SCRATCH/m3081-results/edit-1-07.tar.zst"
+      ],
+      "target_allocated_kib": 2261924,
+      "archive_bytes": 179373085,
+      "cargo_lock_kinds": {},
+      "nix_sqlite_busy_messages": 0,
+      "nix_auto_gc_messages": 0,
+      "nix_gc_lock_messages": 0
+    },
+    {
+      "scenario": "edit-1-08",
+      "exit": 0,
+      "wall_s": 101.01042237482034,
+      "max_rss_bytes": 9324658688,
+      "peak_footprint_bytes": 213436096,
+      "sampled_process_group_peak_rss_bytes": 9522642944,
+      "load_start": 8.55,
+      "load_end": 7.43,
+      "cargo_lock_messages": 0,
+      "command": [
+        "cargo",
+        "nextest",
+        "archive",
+        "--locked",
+        "--features",
+        "web,ts",
+        "--timings",
+        "--archive-file",
+        "$SCRATCH/m3081-results/edit-1-08.tar.zst"
+      ],
+      "target_allocated_kib": 2262116,
+      "archive_bytes": 179372966,
+      "cargo_lock_kinds": {},
+      "nix_sqlite_busy_messages": 0,
+      "nix_auto_gc_messages": 0,
+      "nix_gc_lock_messages": 0
+    },
+    {
+      "scenario": "edit-1-09",
+      "exit": 0,
+      "wall_s": 88.23189450008795,
+      "max_rss_bytes": 9391112192,
+      "peak_footprint_bytes": 214058688,
+      "sampled_process_group_peak_rss_bytes": 10143645696,
+      "load_start": 7.43,
+      "load_end": 6.42,
+      "cargo_lock_messages": 0,
+      "command": [
+        "cargo",
+        "nextest",
+        "archive",
+        "--locked",
+        "--features",
+        "web,ts",
+        "--timings",
+        "--archive-file",
+        "$SCRATCH/m3081-results/edit-1-09.tar.zst"
+      ],
+      "target_allocated_kib": 2262308,
+      "archive_bytes": 179372989,
+      "cargo_lock_kinds": {},
+      "nix_sqlite_busy_messages": 0,
+      "nix_auto_gc_messages": 0,
+      "nix_gc_lock_messages": 0
+    },
+    {
+      "scenario": "edit-1-10",
+      "exit": 0,
+      "wall_s": 86.3064365000464,
+      "max_rss_bytes": 9431875584,
+      "peak_footprint_bytes": 205948672,
+      "sampled_process_group_peak_rss_bytes": 9875111936,
+      "load_start": 6.42,
+      "load_end": 6.68,
+      "cargo_lock_messages": 0,
+      "command": [
+        "cargo",
+        "nextest",
+        "archive",
+        "--locked",
+        "--features",
+        "web,ts",
+        "--timings",
+        "--archive-file",
+        "$SCRATCH/m3081-results/edit-1-10.tar.zst"
+      ],
+      "target_allocated_kib": 2262500,
+      "archive_bytes": 179372894,
+      "cargo_lock_kinds": {},
+      "nix_sqlite_busy_messages": 0,
+      "nix_auto_gc_messages": 0,
+      "nix_gc_lock_messages": 0
+    },
+    {
+      "scenario": "edit-2-01",
+      "exit": 0,
+      "wall_s": 93.22706429101527,
+      "max_rss_bytes": 9363783680,
+      "peak_footprint_bytes": 213419712,
+      "sampled_process_group_peak_rss_bytes": 9656336384,
+      "load_start": 6.68,
+      "load_end": 6.21,
+      "cargo_lock_messages": 0,
+      "command": [
+        "cargo",
+        "nextest",
+        "archive",
+        "--locked",
+        "--features",
+        "web,ts",
+        "--timings",
+        "--archive-file",
+        "$SCRATCH/m3081-results/edit-2-01.tar.zst"
+      ],
+      "target_allocated_kib": 2262692,
+      "archive_bytes": 179373143,
+      "cargo_lock_kinds": {},
+      "nix_sqlite_busy_messages": 0,
+      "nix_auto_gc_messages": 0,
+      "nix_gc_lock_messages": 0
+    },
+    {
+      "scenario": "edit-2-02",
+      "exit": 0,
+      "wall_s": 89.44860645802692,
+      "max_rss_bytes": 9462153216,
+      "peak_footprint_bytes": 212469440,
+      "sampled_process_group_peak_rss_bytes": 9650454528,
+      "load_start": 6.21,
+      "load_end": 7.42,
+      "cargo_lock_messages": 0,
+      "command": [
+        "cargo",
+        "nextest",
+        "archive",
+        "--locked",
+        "--features",
+        "web,ts",
+        "--timings",
+        "--archive-file",
+        "$SCRATCH/m3081-results/edit-2-02.tar.zst"
+      ],
+      "target_allocated_kib": 2262884,
+      "archive_bytes": 179373030,
+      "cargo_lock_kinds": {},
+      "nix_sqlite_busy_messages": 0,
+      "nix_auto_gc_messages": 0,
+      "nix_gc_lock_messages": 0
+    },
+    {
+      "scenario": "edit-2-03",
+      "exit": 0,
+      "wall_s": 87.01957429200411,
+      "max_rss_bytes": 9528033280,
+      "peak_footprint_bytes": 213288704,
+      "sampled_process_group_peak_rss_bytes": 9998991360,
+      "load_start": 7.42,
+      "load_end": 6.28,
+      "cargo_lock_messages": 0,
+      "command": [
+        "cargo",
+        "nextest",
+        "archive",
+        "--locked",
+        "--features",
+        "web,ts",
+        "--timings",
+        "--archive-file",
+        "$SCRATCH/m3081-results/edit-2-03.tar.zst"
+      ],
+      "target_allocated_kib": 2263076,
+      "archive_bytes": 179373183,
+      "cargo_lock_kinds": {},
+      "nix_sqlite_busy_messages": 0,
+      "nix_auto_gc_messages": 0,
+      "nix_gc_lock_messages": 0
+    },
+    {
+      "scenario": "edit-2-04",
+      "exit": 0,
+      "wall_s": 82.79400904197246,
+      "max_rss_bytes": 9431384064,
+      "peak_footprint_bytes": 213354240,
+      "sampled_process_group_peak_rss_bytes": 9577103360,
+      "load_start": 6.28,
+      "load_end": 5.21,
+      "cargo_lock_messages": 0,
+      "command": [
+        "cargo",
+        "nextest",
+        "archive",
+        "--locked",
+        "--features",
+        "web,ts",
+        "--timings",
+        "--archive-file",
+        "$SCRATCH/m3081-results/edit-2-04.tar.zst"
+      ],
+      "target_allocated_kib": 2263268,
+      "archive_bytes": 179373193,
+      "cargo_lock_kinds": {},
+      "nix_sqlite_busy_messages": 0,
+      "nix_auto_gc_messages": 0,
+      "nix_gc_lock_messages": 0
+    },
+    {
+      "scenario": "edit-2-05",
+      "exit": 0,
+      "wall_s": 78.32671970804222,
+      "max_rss_bytes": 9393487872,
+      "peak_footprint_bytes": 211142336,
+      "sampled_process_group_peak_rss_bytes": 9724903424,
+      "load_start": 5.21,
+      "load_end": 4.38,
+      "cargo_lock_messages": 0,
+      "command": [
+        "cargo",
+        "nextest",
+        "archive",
+        "--locked",
+        "--features",
+        "web,ts",
+        "--timings",
+        "--archive-file",
+        "$SCRATCH/m3081-results/edit-2-05.tar.zst"
+      ],
+      "target_allocated_kib": 2263460,
+      "archive_bytes": 179372983,
+      "cargo_lock_kinds": {},
+      "nix_sqlite_busy_messages": 0,
+      "nix_auto_gc_messages": 0,
+      "nix_gc_lock_messages": 0
+    },
+    {
+      "scenario": "edit-2-06",
+      "exit": 0,
+      "wall_s": 88.0952095000539,
+      "max_rss_bytes": 9477046272,
+      "peak_footprint_bytes": 213239552,
+      "sampled_process_group_peak_rss_bytes": 10530390016,
+      "load_start": 4.38,
+      "load_end": 6.04,
+      "cargo_lock_messages": 0,
+      "command": [
+        "cargo",
+        "nextest",
+        "archive",
+        "--locked",
+        "--features",
+        "web,ts",
+        "--timings",
+        "--archive-file",
+        "$SCRATCH/m3081-results/edit-2-06.tar.zst"
+      ],
+      "target_allocated_kib": 2263652,
+      "archive_bytes": 179373216,
+      "cargo_lock_kinds": {},
+      "nix_sqlite_busy_messages": 0,
+      "nix_auto_gc_messages": 0,
+      "nix_gc_lock_messages": 0
+    },
+    {
+      "scenario": "edit-2-07",
+      "exit": 0,
+      "wall_s": 86.02432079194114,
+      "max_rss_bytes": 9446817792,
+      "peak_footprint_bytes": 211535552,
+      "sampled_process_group_peak_rss_bytes": 10113024000,
+      "load_start": 6.04,
+      "load_end": 5.76,
+      "cargo_lock_messages": 0,
+      "command": [
+        "cargo",
+        "nextest",
+        "archive",
+        "--locked",
+        "--features",
+        "web,ts",
+        "--timings",
+        "--archive-file",
+        "$SCRATCH/m3081-results/edit-2-07.tar.zst"
+      ],
+      "target_allocated_kib": 2263844,
+      "archive_bytes": 179372933,
+      "cargo_lock_kinds": {},
+      "nix_sqlite_busy_messages": 0,
+      "nix_auto_gc_messages": 0,
+      "nix_gc_lock_messages": 0
+    },
+    {
+      "scenario": "edit-2-08",
+      "exit": 0,
+      "wall_s": 87.29596695792861,
+      "max_rss_bytes": 9451569152,
+      "peak_footprint_bytes": 212584128,
+      "sampled_process_group_peak_rss_bytes": 9691054080,
+      "load_start": 5.76,
+      "load_end": 5.75,
+      "cargo_lock_messages": 0,
+      "command": [
+        "cargo",
+        "nextest",
+        "archive",
+        "--locked",
+        "--features",
+        "web,ts",
+        "--timings",
+        "--archive-file",
+        "$SCRATCH/m3081-results/edit-2-08.tar.zst"
+      ],
+      "target_allocated_kib": 2264036,
+      "archive_bytes": 179372818,
+      "cargo_lock_kinds": {},
+      "nix_sqlite_busy_messages": 0,
+      "nix_auto_gc_messages": 0,
+      "nix_gc_lock_messages": 0
+    },
+    {
+      "scenario": "edit-2-09",
+      "exit": 0,
+      "wall_s": 87.93873525015078,
+      "max_rss_bytes": 9262104576,
+      "peak_footprint_bytes": 211109568,
+      "sampled_process_group_peak_rss_bytes": 9748774912,
+      "load_start": 5.75,
+      "load_end": 6.31,
+      "cargo_lock_messages": 0,
+      "command": [
+        "cargo",
+        "nextest",
+        "archive",
+        "--locked",
+        "--features",
+        "web,ts",
+        "--timings",
+        "--archive-file",
+        "$SCRATCH/m3081-results/edit-2-09.tar.zst"
+      ],
+      "target_allocated_kib": 2264228,
+      "archive_bytes": 179372880,
+      "cargo_lock_kinds": {},
+      "nix_sqlite_busy_messages": 0,
+      "nix_auto_gc_messages": 0,
+      "nix_gc_lock_messages": 0
+    },
+    {
+      "scenario": "edit-2-10",
+      "exit": 0,
+      "wall_s": 88.13603045907803,
+      "max_rss_bytes": 9419948032,
+      "peak_footprint_bytes": 213305024,
+      "sampled_process_group_peak_rss_bytes": 9526788096,
+      "load_start": 6.31,
+      "load_end": 6.37,
+      "cargo_lock_messages": 0,
+      "command": [
+        "cargo",
+        "nextest",
+        "archive",
+        "--locked",
+        "--features",
+        "web,ts",
+        "--timings",
+        "--archive-file",
+        "$SCRATCH/m3081-results/edit-2-10.tar.zst"
+      ],
+      "target_allocated_kib": 2264420,
+      "archive_bytes": 179373204,
+      "cargo_lock_kinds": {},
+      "nix_sqlite_busy_messages": 0,
+      "nix_auto_gc_messages": 0,
+      "nix_gc_lock_messages": 0
+    },
+    {
+      "scenario": "serial-1",
+      "exit": 0,
+      "wall_s": 124.82792549999431,
+      "max_rss_bytes": 9493577728,
+      "peak_footprint_bytes": 213632768,
+      "sampled_process_group_peak_rss_bytes": 9629351936,
+      "load_start": 6.42,
+      "load_end": 7.03,
+      "cargo_lock_messages": 0,
+      "command": [
+        "cargo",
+        "nextest",
+        "archive",
+        "--locked",
+        "--features",
+        "web,ts",
+        "--timings",
+        "--archive-file",
+        "$SCRATCH/m3081-results/serial-1.tar.zst"
+      ],
+      "target_allocated_kib": 2332120,
+      "archive_bytes": 179391177,
+      "cargo_lock_kinds": {},
+      "nix_sqlite_busy_messages": 0,
+      "nix_auto_gc_messages": 0,
+      "nix_gc_lock_messages": 0
+    },
+    {
+      "scenario": "concurrent-1-0",
+      "exit": 0,
+      "wall_s": 94.95712808286771,
+      "max_rss_bytes": 9442312192,
+      "peak_footprint_bytes": 200902272,
+      "sampled_process_group_peak_rss_bytes": 9602039808,
+      "load_start": 7.03,
+      "load_end": 8.63,
+      "cargo_lock_messages": 4,
+      "command": [
+        "cargo",
+        "nextest",
+        "archive",
+        "--locked",
+        "--features",
+        "web,ts",
+        "--timings",
+        "--archive-file",
+        "$SCRATCH/m3081-results/concurrent-1-0.tar.zst"
+      ],
+      "target_allocated_kib": 2332300,
+      "archive_bytes": 179391317,
+      "cargo_lock_kinds": {
+        "package cache": 4
+      },
+      "nix_sqlite_busy_messages": 0,
+      "nix_auto_gc_messages": 0,
+      "nix_gc_lock_messages": 0
+    },
+    {
+      "scenario": "concurrent-1-1",
+      "exit": 0,
+      "wall_s": 121.49906862503849,
+      "max_rss_bytes": 9320005632,
+      "peak_footprint_bytes": 207341312,
+      "sampled_process_group_peak_rss_bytes": 12437422080,
+      "load_start": 7.03,
+      "load_end": 7.98,
+      "cargo_lock_messages": 5,
+      "command": [
+        "cargo",
+        "nextest",
+        "archive",
+        "--locked",
+        "--features",
+        "web,ts",
+        "--timings",
+        "--archive-file",
+        "$SCRATCH/m3081-results/concurrent-1-1.tar.zst"
+      ],
+      "target_allocated_kib": 2332120,
+      "archive_bytes": 179390735,
+      "cargo_lock_kinds": {
+        "package cache": 5
+      },
+      "nix_sqlite_busy_messages": 0,
+      "nix_auto_gc_messages": 0,
+      "nix_gc_lock_messages": 0
+    },
+    {
+      "scenario": "serial-2",
+      "exit": 0,
+      "wall_s": 88.98931391700171,
+      "max_rss_bytes": 9340518400,
+      "peak_footprint_bytes": 210060992,
+      "sampled_process_group_peak_rss_bytes": 10393583616,
+      "load_start": 7.98,
+      "load_end": 7.5,
+      "cargo_lock_messages": 0,
+      "command": [
+        "cargo",
+        "nextest",
+        "archive",
+        "--locked",
+        "--features",
+        "web,ts",
+        "--timings",
+        "--archive-file",
+        "$SCRATCH/m3081-results/serial-2.tar.zst"
+      ],
+      "target_allocated_kib": 2332492,
+      "archive_bytes": 179391222,
+      "cargo_lock_kinds": {},
+      "nix_sqlite_busy_messages": 0,
+      "nix_auto_gc_messages": 0,
+      "nix_gc_lock_messages": 0
+    },
+    {
+      "scenario": "concurrent-2-0",
+      "exit": 0,
+      "wall_s": 91.54208141588606,
+      "max_rss_bytes": 9452322816,
+      "peak_footprint_bytes": 204965504,
+      "sampled_process_group_peak_rss_bytes": 9863856128,
+      "load_start": 7.5,
+      "load_end": 8.94,
+      "cargo_lock_messages": 4,
+      "command": [
+        "cargo",
+        "nextest",
+        "archive",
+        "--locked",
+        "--features",
+        "web,ts",
+        "--timings",
+        "--archive-file",
+        "$SCRATCH/m3081-results/concurrent-2-0.tar.zst"
+      ],
+      "target_allocated_kib": 2332684,
+      "archive_bytes": 179391252,
+      "cargo_lock_kinds": {
+        "package cache": 4
+      },
+      "nix_sqlite_busy_messages": 0,
+      "nix_auto_gc_messages": 0,
+      "nix_gc_lock_messages": 0
+    },
+    {
+      "scenario": "concurrent-2-1",
+      "exit": 0,
+      "wall_s": 92.16336925001815,
+      "max_rss_bytes": 9343336448,
+      "peak_footprint_bytes": 206538432,
+      "sampled_process_group_peak_rss_bytes": 10194567168,
+      "load_start": 7.5,
+      "load_end": 8.94,
+      "cargo_lock_messages": 5,
+      "command": [
+        "cargo",
+        "nextest",
+        "archive",
+        "--locked",
+        "--features",
+        "web,ts",
+        "--timings",
+        "--archive-file",
+        "$SCRATCH/m3081-results/concurrent-2-1.tar.zst"
+      ],
+      "target_allocated_kib": 2332300,
+      "archive_bytes": 179390856,
+      "cargo_lock_kinds": {
+        "package cache": 5
+      },
+      "nix_sqlite_busy_messages": 0,
+      "nix_auto_gc_messages": 0,
+      "nix_gc_lock_messages": 0
+    },
+    {
+      "scenario": "full-debug-cold",
+      "exit": 0,
+      "wall_s": 179.85314920800738,
+      "max_rss_bytes": 10586685440,
+      "peak_footprint_bytes": 207423104,
+      "sampled_process_group_peak_rss_bytes": 10727194624,
+      "load_start": 8.94,
+      "load_end": 6.4,
+      "cargo_lock_messages": 0,
+      "command": [
+        "cargo",
+        "nextest",
+        "archive",
+        "--locked",
+        "--features",
+        "web,ts",
+        "--timings",
+        "--archive-file",
+        "$SCRATCH/m3081-results/full-debug-cold.tar.zst",
+        "--config",
+        "profile.dev.package.\"*\".debug=true"
+      ],
+      "target_allocated_kib": 3391332,
+      "archive_bytes": 200856567,
+      "cargo_lock_kinds": {},
+      "nix_sqlite_busy_messages": 0,
+      "nix_auto_gc_messages": 0,
+      "nix_gc_lock_messages": 0
+    },
+    {
+      "scenario": "full-debug-touch-1",
+      "exit": 0,
+      "wall_s": 101.64211616595276,
+      "max_rss_bytes": 10364321792,
+      "peak_footprint_bytes": 208979712,
+      "sampled_process_group_peak_rss_bytes": 10616324096,
+      "load_start": 6.4,
+      "load_end": 6.47,
+      "cargo_lock_messages": 0,
+      "command": [
+        "cargo",
+        "nextest",
+        "archive",
+        "--locked",
+        "--features",
+        "web,ts",
+        "--timings",
+        "--archive-file",
+        "$SCRATCH/m3081-results/full-debug-touch-1.tar.zst",
+        "--config",
+        "profile.dev.package.\"*\".debug=true"
+      ],
+      "target_allocated_kib": 3391744,
+      "archive_bytes": 200856414,
+      "cargo_lock_kinds": {},
+      "nix_sqlite_busy_messages": 0,
+      "nix_auto_gc_messages": 0,
+      "nix_gc_lock_messages": 0
+    },
+    {
+      "scenario": "full-debug-touch-2",
+      "exit": 0,
+      "wall_s": 101.91550612496212,
+      "max_rss_bytes": 10519232512,
+      "peak_footprint_bytes": 208422592,
+      "sampled_process_group_peak_rss_bytes": 10649387008,
+      "load_start": 6.47,
+      "load_end": 7.0,
+      "cargo_lock_messages": 0,
+      "command": [
+        "cargo",
+        "nextest",
+        "archive",
+        "--locked",
+        "--features",
+        "web,ts",
+        "--timings",
+        "--archive-file",
+        "$SCRATCH/m3081-results/full-debug-touch-2.tar.zst",
+        "--config",
+        "profile.dev.package.\"*\".debug=true"
+      ],
+      "target_allocated_kib": 3391936,
+      "archive_bytes": 200856627,
+      "cargo_lock_kinds": {},
+      "nix_sqlite_busy_messages": 0,
+      "nix_auto_gc_messages": 0,
+      "nix_gc_lock_messages": 0
+    },
+    {
+      "scenario": "nix-fresh-eval-1",
+      "exit": 0,
+      "wall_s": 28.985199375078082,
+      "max_rss_bytes": 1572864,
+      "peak_footprint_bytes": 1098496,
+      "sampled_process_group_peak_rss_bytes": 488964096,
+      "load_start": 7.0,
+      "load_end": 6.99,
+      "cargo_lock_messages": 0,
+      "command": [
+        "nix",
+        "--option",
+        "eval-cache",
+        "false",
+        "develop",
+        "--command",
+        "true"
+      ],
+      "cargo_lock_kinds": {},
+      "nix_sqlite_busy_messages": 0,
+      "nix_auto_gc_messages": 1,
+      "nix_gc_lock_messages": 1
+    },
+    {
+      "scenario": "nix-warm-1",
+      "exit": 0,
+      "wall_s": 2.2548170830123127,
+      "max_rss_bytes": 1572864,
+      "peak_footprint_bytes": 1098496,
+      "sampled_process_group_peak_rss_bytes": 497303552,
+      "load_start": 6.99,
+      "load_end": 6.99,
+      "cargo_lock_messages": 0,
+      "command": [
+        "nix",
+        "develop",
+        "--command",
+        "true"
+      ],
+      "cargo_lock_kinds": {},
+      "nix_sqlite_busy_messages": 0,
+      "nix_auto_gc_messages": 0,
+      "nix_gc_lock_messages": 0
+    },
+    {
+      "scenario": "nix-warm-2",
+      "exit": 0,
+      "wall_s": 1.9457612079568207,
+      "max_rss_bytes": 1572864,
+      "peak_footprint_bytes": 1098496,
+      "sampled_process_group_peak_rss_bytes": 375439360,
+      "load_start": 6.99,
+      "load_end": 6.83,
+      "cargo_lock_messages": 0,
+      "command": [
+        "nix",
+        "develop",
+        "--command",
+        "true"
+      ],
+      "cargo_lock_kinds": {},
+      "nix_sqlite_busy_messages": 0,
+      "nix_auto_gc_messages": 0,
+      "nix_gc_lock_messages": 0
+    },
+    {
+      "scenario": "nix-four-a-1",
+      "exit": 0,
+      "wall_s": 2.8731904169544578,
+      "max_rss_bytes": 1572864,
+      "peak_footprint_bytes": 1098496,
+      "sampled_process_group_peak_rss_bytes": 446119936,
+      "load_start": 6.83,
+      "load_end": 6.83,
+      "cargo_lock_messages": 0,
+      "command": [
+        "nix",
+        "develop",
+        "--command",
+        "true"
+      ],
+      "cargo_lock_kinds": {},
+      "nix_sqlite_busy_messages": 2,
+      "nix_auto_gc_messages": 0,
+      "nix_gc_lock_messages": 0
+    },
+    {
+      "scenario": "nix-four-a-2",
+      "exit": 0,
+      "wall_s": 2.8241243751253933,
+      "max_rss_bytes": 1572864,
+      "peak_footprint_bytes": 1098496,
+      "sampled_process_group_peak_rss_bytes": 448364544,
+      "load_start": 6.83,
+      "load_end": 6.83,
+      "cargo_lock_messages": 0,
+      "command": [
+        "nix",
+        "develop",
+        "--command",
+        "true"
+      ],
+      "cargo_lock_kinds": {},
+      "nix_sqlite_busy_messages": 2,
+      "nix_auto_gc_messages": 0,
+      "nix_gc_lock_messages": 0
+    },
+    {
+      "scenario": "nix-four-a-3",
+      "exit": 0,
+      "wall_s": 2.5724853749852628,
+      "max_rss_bytes": 1572864,
+      "peak_footprint_bytes": 1098496,
+      "sampled_process_group_peak_rss_bytes": 480755712,
+      "load_start": 6.83,
+      "load_end": 6.83,
+      "cargo_lock_messages": 0,
+      "command": [
+        "nix",
+        "develop",
+        "--command",
+        "true"
+      ],
+      "cargo_lock_kinds": {},
+      "nix_sqlite_busy_messages": 0,
+      "nix_auto_gc_messages": 0,
+      "nix_gc_lock_messages": 0
+    },
+    {
+      "scenario": "nix-four-a-4",
+      "exit": 0,
+      "wall_s": 2.870520167052746,
+      "max_rss_bytes": 1572864,
+      "peak_footprint_bytes": 1098496,
+      "sampled_process_group_peak_rss_bytes": 445759488,
+      "load_start": 6.83,
+      "load_end": 6.83,
+      "cargo_lock_messages": 0,
+      "command": [
+        "nix",
+        "develop",
+        "--command",
+        "true"
+      ],
+      "cargo_lock_kinds": {},
+      "nix_sqlite_busy_messages": 2,
+      "nix_auto_gc_messages": 0,
+      "nix_gc_lock_messages": 0
+    },
+    {
+      "scenario": "nix-four-b-1",
+      "exit": 0,
+      "wall_s": 2.616071250056848,
+      "max_rss_bytes": 1572864,
+      "peak_footprint_bytes": 1098496,
+      "sampled_process_group_peak_rss_bytes": 460996608,
+      "load_start": 6.83,
+      "load_end": 6.68,
+      "cargo_lock_messages": 0,
+      "command": [
+        "nix",
+        "develop",
+        "--command",
+        "true"
+      ],
+      "cargo_lock_kinds": {},
+      "nix_sqlite_busy_messages": 1,
+      "nix_auto_gc_messages": 0,
+      "nix_gc_lock_messages": 0
+    },
+    {
+      "scenario": "nix-four-b-2",
+      "exit": 0,
+      "wall_s": 2.6429689589422196,
+      "max_rss_bytes": 1572864,
+      "peak_footprint_bytes": 1114944,
+      "sampled_process_group_peak_rss_bytes": 461029376,
+      "load_start": 6.83,
+      "load_end": 6.68,
+      "cargo_lock_messages": 0,
+      "command": [
+        "nix",
+        "develop",
+        "--command",
+        "true"
+      ],
+      "cargo_lock_kinds": {},
+      "nix_sqlite_busy_messages": 2,
+      "nix_auto_gc_messages": 0,
+      "nix_gc_lock_messages": 0
+    },
+    {
+      "scenario": "nix-four-b-3",
+      "exit": 0,
+      "wall_s": 2.6241303340066224,
+      "max_rss_bytes": 1572864,
+      "peak_footprint_bytes": 1098496,
+      "sampled_process_group_peak_rss_bytes": 460816384,
+      "load_start": 6.83,
+      "load_end": 6.68,
+      "cargo_lock_messages": 0,
+      "command": [
+        "nix",
+        "develop",
+        "--command",
+        "true"
+      ],
+      "cargo_lock_kinds": {},
+      "nix_sqlite_busy_messages": 1,
+      "nix_auto_gc_messages": 0,
+      "nix_gc_lock_messages": 0
+    },
+    {
+      "scenario": "nix-four-b-4",
+      "exit": 0,
+      "wall_s": 2.6227696251589805,
+      "max_rss_bytes": 1572864,
+      "peak_footprint_bytes": 1098496,
+      "sampled_process_group_peak_rss_bytes": 460931072,
+      "load_start": 6.83,
+      "load_end": 6.68,
+      "cargo_lock_messages": 0,
+      "command": [
+        "nix",
+        "develop",
+        "--command",
+        "true"
+      ],
+      "cargo_lock_kinds": {},
+      "nix_sqlite_busy_messages": 2,
+      "nix_auto_gc_messages": 0,
+      "nix_gc_lock_messages": 0
+    },
+    {
+      "scenario": "empty-checkout-1",
+      "exit": 0,
+      "wall_s": 157.74008995783515,
+      "max_rss_bytes": 9459220480,
+      "peak_footprint_bytes": 210994880,
+      "sampled_process_group_peak_rss_bytes": 9706930176,
+      "load_start": 4.46,
+      "load_end": 7.14,
+      "cargo_lock_messages": 0,
+      "cargo_lock_kinds": {},
+      "command": [
+        "cargo",
+        "nextest",
+        "archive",
+        "--locked",
+        "--features",
+        "web,ts",
+        "--timings",
+        "--archive-file",
+        "$SCRATCH/m3081-results/empty-checkout-1.tar.zst"
+      ],
+      "nix_sqlite_busy_messages": 0,
+      "nix_auto_gc_messages": 0,
+      "nix_gc_lock_messages": 0,
+      "target_allocated_kib": 2259008,
+      "archive_bytes": 179404152
+    },
+    {
+      "scenario": "empty-checkout-2",
+      "exit": 0,
+      "wall_s": 180.4613300000783,
+      "max_rss_bytes": 9387245568,
+      "peak_footprint_bytes": 211371712,
+      "sampled_process_group_peak_rss_bytes": 9512927232,
+      "load_start": 7.14,
+      "load_end": 6.53,
+      "cargo_lock_messages": 0,
+      "cargo_lock_kinds": {},
+      "command": [
+        "cargo",
+        "nextest",
+        "archive",
+        "--locked",
+        "--features",
+        "web,ts",
+        "--timings",
+        "--archive-file",
+        "$SCRATCH/m3081-results/empty-checkout-2.tar.zst"
+      ],
+      "nix_sqlite_busy_messages": 0,
+      "nix_auto_gc_messages": 0,
+      "nix_gc_lock_messages": 0,
+      "target_allocated_kib": 2257988,
+      "archive_bytes": 179404129
+    },
+    {
+      "scenario": "steady-serial-1",
+      "exit": 0,
+      "wall_s": 88.18669450003654,
+      "max_rss_bytes": 9348513792,
+      "peak_footprint_bytes": 210273984,
+      "sampled_process_group_peak_rss_bytes": 9519513600,
+      "load_start": 6.53,
+      "load_end": 6.5,
+      "cargo_lock_messages": 0,
+      "cargo_lock_kinds": {},
+      "command": [
+        "cargo",
+        "nextest",
+        "archive",
+        "--locked",
+        "--features",
+        "web,ts",
+        "--timings",
+        "--archive-file",
+        "$SCRATCH/m3081-results/steady-serial-1.tar.zst"
+      ],
+      "nix_sqlite_busy_messages": 0,
+      "nix_auto_gc_messages": 0,
+      "nix_gc_lock_messages": 0,
+      "target_allocated_kib": 2332876,
+      "archive_bytes": 179391143
+    },
+    {
+      "scenario": "steady-concurrent-1-0",
+      "exit": 0,
+      "wall_s": 93.464834083803,
+      "max_rss_bytes": 9439379456,
+      "peak_footprint_bytes": 211175104,
+      "sampled_process_group_peak_rss_bytes": 10104307712,
+      "load_start": 6.5,
+      "load_end": 8.37,
+      "cargo_lock_messages": 4,
+      "cargo_lock_kinds": {
+        "package cache": 4
+      },
+      "command": [
+        "cargo",
+        "nextest",
+        "archive",
+        "--locked",
+        "--features",
+        "web,ts",
+        "--timings",
+        "--archive-file",
+        "$SCRATCH/m3081-results/steady-concurrent-1-0.tar.zst"
+      ],
+      "nix_sqlite_busy_messages": 0,
+      "nix_auto_gc_messages": 0,
+      "nix_gc_lock_messages": 0,
+      "target_allocated_kib": 2333068,
+      "archive_bytes": 179391314
+    },
+    {
+      "scenario": "steady-concurrent-1-1",
+      "exit": 0,
+      "wall_s": 93.59495833306573,
+      "max_rss_bytes": 9407905792,
+      "peak_footprint_bytes": 201557632,
+      "sampled_process_group_peak_rss_bytes": 9603661824,
+      "load_start": 6.5,
+      "load_end": 8.37,
+      "cargo_lock_messages": 5,
+      "cargo_lock_kinds": {
+        "package cache": 5
+      },
+      "command": [
+        "cargo",
+        "nextest",
+        "archive",
+        "--locked",
+        "--features",
+        "web,ts",
+        "--timings",
+        "--archive-file",
+        "$SCRATCH/m3081-results/steady-concurrent-1-1.tar.zst"
+      ],
+      "nix_sqlite_busy_messages": 0,
+      "nix_auto_gc_messages": 0,
+      "nix_gc_lock_messages": 0,
+      "target_allocated_kib": 2332492,
+      "archive_bytes": 179390942
+    },
+    {
+      "scenario": "steady-serial-2",
+      "exit": 0,
+      "wall_s": 87.47994500002824,
+      "max_rss_bytes": 9501999104,
+      "peak_footprint_bytes": 214222528,
+      "sampled_process_group_peak_rss_bytes": 9623535616,
+      "load_start": 8.37,
+      "load_end": 7.08,
+      "cargo_lock_messages": 0,
+      "cargo_lock_kinds": {},
+      "command": [
+        "cargo",
+        "nextest",
+        "archive",
+        "--locked",
+        "--features",
+        "web,ts",
+        "--timings",
+        "--archive-file",
+        "$SCRATCH/m3081-results/steady-serial-2.tar.zst"
+      ],
+      "nix_sqlite_busy_messages": 0,
+      "nix_auto_gc_messages": 0,
+      "nix_gc_lock_messages": 0,
+      "target_allocated_kib": 2333260,
+      "archive_bytes": 179391318
+    },
+    {
+      "scenario": "steady-concurrent-2-0",
+      "exit": 0,
+      "wall_s": 91.31479475018568,
+      "max_rss_bytes": 9402826752,
+      "peak_footprint_bytes": 208209600,
+      "sampled_process_group_peak_rss_bytes": 9609445376,
+      "load_start": 7.08,
+      "load_end": 9.99,
+      "cargo_lock_messages": 4,
+      "cargo_lock_kinds": {
+        "package cache": 4
+      },
+      "command": [
+        "cargo",
+        "nextest",
+        "archive",
+        "--locked",
+        "--features",
+        "web,ts",
+        "--timings",
+        "--archive-file",
+        "$SCRATCH/m3081-results/steady-concurrent-2-0.tar.zst"
+      ],
+      "nix_sqlite_busy_messages": 0,
+      "nix_auto_gc_messages": 0,
+      "nix_gc_lock_messages": 0,
+      "target_allocated_kib": 2333452,
+      "archive_bytes": 179391283
+    },
+    {
+      "scenario": "steady-concurrent-2-1",
+      "exit": 0,
+      "wall_s": 91.7482771249488,
+      "max_rss_bytes": 9363013632,
+      "peak_footprint_bytes": 209618624,
+      "sampled_process_group_peak_rss_bytes": 10253172736,
+      "load_start": 7.08,
+      "load_end": 9.99,
+      "cargo_lock_messages": 5,
+      "cargo_lock_kinds": {
+        "package cache": 5
+      },
+      "command": [
+        "cargo",
+        "nextest",
+        "archive",
+        "--locked",
+        "--features",
+        "web,ts",
+        "--timings",
+        "--archive-file",
+        "$SCRATCH/m3081-results/steady-concurrent-2-1.tar.zst"
+      ],
+      "nix_sqlite_busy_messages": 0,
+      "nix_auto_gc_messages": 0,
+      "nix_gc_lock_messages": 0,
+      "target_allocated_kib": 2332684,
+      "archive_bytes": 179390795
+    }
+  ],
+  "groups": [
+    {
+      "scenario": "cold",
+      "wall_s": 140.79101979197003,
+      "sccache_delta": {
+        "compile_requests": 371,
+        "requests_unsupported_compiler": 0,
+        "requests_not_compile": 3,
+        "requests_not_cacheable": 136,
+        "requests_executed": 232,
+        "cache_errors": {
+          "counts": {},
+          "adv_counts": {}
+        },
+        "cache_hits": {
+          "counts": {},
+          "adv_counts": {}
+        },
+        "cache_misses": {
+          "counts": {
+            "C/C++": 2,
+            "Rust": 225
+          },
+          "adv_counts": {
+            "rust": 225,
+            "c [clang]": 2
+          }
+        },
+        "cache_timeouts": 0,
+        "cache_read_errors": 0,
+        "non_cacheable_compilations": 0,
+        "forced_recaches": 0,
+        "cache_write_errors": 0,
+        "cache_writes": 227,
+        "cache_write_duration": {
+          "secs": 0,
+          "nanos": 118860956
+        },
+        "cache_read_hit_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "compilations": 227,
+        "compiler_write_duration": {
+          "secs": 45,
+          "nanos": 504848754
+        },
+        "compile_fails": 5,
+        "not_cached": {
+          "-": 3,
+          "crate-type": 125,
+          "missing input": 5,
+          "-o": 3
+        },
+        "dist_compiles": {},
+        "dist_errors": 0,
+        "multi_level": null
+      }
+    },
+    {
+      "scenario": "same-1",
+      "wall_s": 1.2503193749580532,
+      "sccache_delta": {
+        "compile_requests": 1,
+        "requests_unsupported_compiler": 0,
+        "requests_not_compile": 0,
+        "requests_not_cacheable": 1,
+        "requests_executed": 0,
+        "cache_errors": {
+          "counts": {},
+          "adv_counts": {}
+        },
+        "cache_hits": {
+          "counts": {},
+          "adv_counts": {}
+        },
+        "cache_misses": {
+          "counts": {
+            "Rust": 0,
+            "C/C++": 0
+          },
+          "adv_counts": {
+            "c [clang]": 0,
+            "rust": 0
+          }
+        },
+        "cache_timeouts": 0,
+        "cache_read_errors": 0,
+        "non_cacheable_compilations": 0,
+        "forced_recaches": 0,
+        "cache_write_errors": 0,
+        "cache_writes": 0,
+        "cache_write_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "cache_read_hit_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "compilations": 0,
+        "compiler_write_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "compile_fails": 0,
+        "not_cached": {
+          "crate-type": 0,
+          "-o": 0,
+          "-": 1,
+          "missing input": 0
+        },
+        "dist_compiles": {},
+        "dist_errors": 0,
+        "multi_level": null
+      }
+    },
+    {
+      "scenario": "different-1",
+      "wall_s": 112.45077779213898,
+      "sccache_delta": {
+        "compile_requests": 78,
+        "requests_unsupported_compiler": 0,
+        "requests_not_compile": 0,
+        "requests_not_cacheable": 77,
+        "requests_executed": 1,
+        "cache_errors": {
+          "counts": {},
+          "adv_counts": {}
+        },
+        "cache_hits": {
+          "counts": {
+            "C/C++": 1
+          },
+          "adv_counts": {
+            "c [clang]": 1
+          }
+        },
+        "cache_misses": {
+          "counts": {
+            "C/C++": 0,
+            "Rust": 0
+          },
+          "adv_counts": {
+            "c [clang]": 0,
+            "rust": 0
+          }
+        },
+        "cache_timeouts": 0,
+        "cache_read_errors": 0,
+        "non_cacheable_compilations": 0,
+        "forced_recaches": 0,
+        "cache_write_errors": 0,
+        "cache_writes": 0,
+        "cache_write_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "cache_read_hit_duration": {
+          "secs": 0,
+          "nanos": 458834
+        },
+        "compilations": 0,
+        "compiler_write_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "compile_fails": 0,
+        "not_cached": {
+          "-o": 0,
+          "-": 1,
+          "missing input": 0,
+          "crate-type": 76
+        },
+        "dist_compiles": {},
+        "dist_errors": 0,
+        "multi_level": null
+      }
+    },
+    {
+      "scenario": "touch-1",
+      "wall_s": 80.05490699992515,
+      "sccache_delta": {
+        "compile_requests": 3,
+        "requests_unsupported_compiler": 0,
+        "requests_not_compile": 0,
+        "requests_not_cacheable": 3,
+        "requests_executed": 0,
+        "cache_errors": {
+          "counts": {},
+          "adv_counts": {}
+        },
+        "cache_hits": {
+          "counts": {
+            "C/C++": 0
+          },
+          "adv_counts": {
+            "c [clang]": 0
+          }
+        },
+        "cache_misses": {
+          "counts": {
+            "Rust": 0,
+            "C/C++": 0
+          },
+          "adv_counts": {
+            "rust": 0,
+            "c [clang]": 0
+          }
+        },
+        "cache_timeouts": 0,
+        "cache_read_errors": 0,
+        "non_cacheable_compilations": 0,
+        "forced_recaches": 0,
+        "cache_write_errors": 0,
+        "cache_writes": 0,
+        "cache_write_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "cache_read_hit_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "compilations": 0,
+        "compiler_write_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "compile_fails": 0,
+        "not_cached": {
+          "crate-type": 3,
+          "-o": 0,
+          "missing input": 0,
+          "-": 0
+        },
+        "dist_compiles": {},
+        "dist_errors": 0,
+        "multi_level": null
+      }
+    },
+    {
+      "scenario": "fresh-1",
+      "wall_s": 106.33649083320051,
+      "sccache_delta": {
+        "compile_requests": 78,
+        "requests_unsupported_compiler": 0,
+        "requests_not_compile": 0,
+        "requests_not_cacheable": 77,
+        "requests_executed": 1,
+        "cache_errors": {
+          "counts": {},
+          "adv_counts": {}
+        },
+        "cache_hits": {
+          "counts": {
+            "C/C++": 1
+          },
+          "adv_counts": {
+            "c [clang]": 1
+          }
+        },
+        "cache_misses": {
+          "counts": {
+            "Rust": 0,
+            "C/C++": 0
+          },
+          "adv_counts": {
+            "rust": 0,
+            "c [clang]": 0
+          }
+        },
+        "cache_timeouts": 0,
+        "cache_read_errors": 0,
+        "non_cacheable_compilations": 0,
+        "forced_recaches": 0,
+        "cache_write_errors": 0,
+        "cache_writes": 0,
+        "cache_write_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "cache_read_hit_duration": {
+          "secs": 0,
+          "nanos": 150042
+        },
+        "compilations": 0,
+        "compiler_write_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "compile_fails": 0,
+        "not_cached": {
+          "-o": 0,
+          "-": 1,
+          "missing input": 0,
+          "crate-type": 76
+        },
+        "dist_compiles": {},
+        "dist_errors": 0,
+        "multi_level": null
+      }
+    },
+    {
+      "scenario": "same-2",
+      "wall_s": 1.188164958031848,
+      "sccache_delta": {
+        "compile_requests": 1,
+        "requests_unsupported_compiler": 0,
+        "requests_not_compile": 0,
+        "requests_not_cacheable": 1,
+        "requests_executed": 0,
+        "cache_errors": {
+          "counts": {},
+          "adv_counts": {}
+        },
+        "cache_hits": {
+          "counts": {
+            "C/C++": 0
+          },
+          "adv_counts": {
+            "c [clang]": 0
+          }
+        },
+        "cache_misses": {
+          "counts": {
+            "C/C++": 0,
+            "Rust": 0
+          },
+          "adv_counts": {
+            "rust": 0,
+            "c [clang]": 0
+          }
+        },
+        "cache_timeouts": 0,
+        "cache_read_errors": 0,
+        "non_cacheable_compilations": 0,
+        "forced_recaches": 0,
+        "cache_write_errors": 0,
+        "cache_writes": 0,
+        "cache_write_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "cache_read_hit_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "compilations": 0,
+        "compiler_write_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "compile_fails": 0,
+        "not_cached": {
+          "-": 1,
+          "-o": 0,
+          "crate-type": 0,
+          "missing input": 0
+        },
+        "dist_compiles": {},
+        "dist_errors": 0,
+        "multi_level": null
+      }
+    },
+    {
+      "scenario": "different-2",
+      "wall_s": 133.6457813330926,
+      "sccache_delta": {
+        "compile_requests": 78,
+        "requests_unsupported_compiler": 0,
+        "requests_not_compile": 0,
+        "requests_not_cacheable": 77,
+        "requests_executed": 1,
+        "cache_errors": {
+          "counts": {},
+          "adv_counts": {}
+        },
+        "cache_hits": {
+          "counts": {
+            "C/C++": 1
+          },
+          "adv_counts": {
+            "c [clang]": 1
+          }
+        },
+        "cache_misses": {
+          "counts": {
+            "C/C++": 0,
+            "Rust": 0
+          },
+          "adv_counts": {
+            "rust": 0,
+            "c [clang]": 0
+          }
+        },
+        "cache_timeouts": 0,
+        "cache_read_errors": 0,
+        "non_cacheable_compilations": 0,
+        "forced_recaches": 0,
+        "cache_write_errors": 0,
+        "cache_writes": 0,
+        "cache_write_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "cache_read_hit_duration": {
+          "secs": 0,
+          "nanos": 872167
+        },
+        "compilations": 0,
+        "compiler_write_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "compile_fails": 0,
+        "not_cached": {
+          "-": 1,
+          "crate-type": 76,
+          "missing input": 0,
+          "-o": 0
+        },
+        "dist_compiles": {},
+        "dist_errors": 0,
+        "multi_level": null
+      }
+    },
+    {
+      "scenario": "touch-2",
+      "wall_s": 90.69463279191405,
+      "sccache_delta": {
+        "compile_requests": 3,
+        "requests_unsupported_compiler": 0,
+        "requests_not_compile": 0,
+        "requests_not_cacheable": 3,
+        "requests_executed": 0,
+        "cache_errors": {
+          "counts": {},
+          "adv_counts": {}
+        },
+        "cache_hits": {
+          "counts": {
+            "C/C++": 0
+          },
+          "adv_counts": {
+            "c [clang]": 0
+          }
+        },
+        "cache_misses": {
+          "counts": {
+            "Rust": 0,
+            "C/C++": 0
+          },
+          "adv_counts": {
+            "rust": 0,
+            "c [clang]": 0
+          }
+        },
+        "cache_timeouts": 0,
+        "cache_read_errors": 0,
+        "non_cacheable_compilations": 0,
+        "forced_recaches": 0,
+        "cache_write_errors": 0,
+        "cache_writes": 0,
+        "cache_write_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "cache_read_hit_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "compilations": 0,
+        "compiler_write_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "compile_fails": 0,
+        "not_cached": {
+          "-": 0,
+          "-o": 0,
+          "missing input": 0,
+          "crate-type": 3
+        },
+        "dist_compiles": {},
+        "dist_errors": 0,
+        "multi_level": null
+      }
+    },
+    {
+      "scenario": "fresh-2",
+      "wall_s": 137.2211251668632,
+      "sccache_delta": {
+        "compile_requests": 78,
+        "requests_unsupported_compiler": 0,
+        "requests_not_compile": 0,
+        "requests_not_cacheable": 77,
+        "requests_executed": 1,
+        "cache_errors": {
+          "counts": {},
+          "adv_counts": {}
+        },
+        "cache_hits": {
+          "counts": {
+            "C/C++": 1
+          },
+          "adv_counts": {
+            "c [clang]": 1
+          }
+        },
+        "cache_misses": {
+          "counts": {
+            "Rust": 0,
+            "C/C++": 0
+          },
+          "adv_counts": {
+            "rust": 0,
+            "c [clang]": 0
+          }
+        },
+        "cache_timeouts": 0,
+        "cache_read_errors": 0,
+        "non_cacheable_compilations": 0,
+        "forced_recaches": 0,
+        "cache_write_errors": 0,
+        "cache_writes": 0,
+        "cache_write_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "cache_read_hit_duration": {
+          "secs": 0,
+          "nanos": 136375
+        },
+        "compilations": 0,
+        "compiler_write_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "compile_fails": 0,
+        "not_cached": {
+          "-o": 0,
+          "crate-type": 76,
+          "missing input": 0,
+          "-": 1
+        },
+        "dist_compiles": {},
+        "dist_errors": 0,
+        "multi_level": null
+      }
+    },
+    {
+      "scenario": "edit-1-01",
+      "wall_s": 88.0454055829905,
+      "sccache_delta": {
+        "compile_requests": 3,
+        "requests_unsupported_compiler": 0,
+        "requests_not_compile": 0,
+        "requests_not_cacheable": 3,
+        "requests_executed": 0,
+        "cache_errors": {
+          "counts": {},
+          "adv_counts": {}
+        },
+        "cache_hits": {
+          "counts": {
+            "C/C++": 0
+          },
+          "adv_counts": {
+            "c [clang]": 0
+          }
+        },
+        "cache_misses": {
+          "counts": {
+            "C/C++": 0,
+            "Rust": 0
+          },
+          "adv_counts": {
+            "rust": 0,
+            "c [clang]": 0
+          }
+        },
+        "cache_timeouts": 0,
+        "cache_read_errors": 0,
+        "non_cacheable_compilations": 0,
+        "forced_recaches": 0,
+        "cache_write_errors": 0,
+        "cache_writes": 0,
+        "cache_write_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "cache_read_hit_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "compilations": 0,
+        "compiler_write_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "compile_fails": 0,
+        "not_cached": {
+          "-": 0,
+          "crate-type": 3,
+          "-o": 0,
+          "missing input": 0
+        },
+        "dist_compiles": {},
+        "dist_errors": 0,
+        "multi_level": null
+      }
+    },
+    {
+      "scenario": "edit-1-02",
+      "wall_s": 87.58677608403377,
+      "sccache_delta": {
+        "compile_requests": 3,
+        "requests_unsupported_compiler": 0,
+        "requests_not_compile": 0,
+        "requests_not_cacheable": 3,
+        "requests_executed": 0,
+        "cache_errors": {
+          "counts": {},
+          "adv_counts": {}
+        },
+        "cache_hits": {
+          "counts": {
+            "C/C++": 0
+          },
+          "adv_counts": {
+            "c [clang]": 0
+          }
+        },
+        "cache_misses": {
+          "counts": {
+            "C/C++": 0,
+            "Rust": 0
+          },
+          "adv_counts": {
+            "c [clang]": 0,
+            "rust": 0
+          }
+        },
+        "cache_timeouts": 0,
+        "cache_read_errors": 0,
+        "non_cacheable_compilations": 0,
+        "forced_recaches": 0,
+        "cache_write_errors": 0,
+        "cache_writes": 0,
+        "cache_write_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "cache_read_hit_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "compilations": 0,
+        "compiler_write_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "compile_fails": 0,
+        "not_cached": {
+          "missing input": 0,
+          "-": 0,
+          "crate-type": 3,
+          "-o": 0
+        },
+        "dist_compiles": {},
+        "dist_errors": 0,
+        "multi_level": null
+      }
+    },
+    {
+      "scenario": "edit-1-03",
+      "wall_s": 81.41759533295408,
+      "sccache_delta": {
+        "compile_requests": 3,
+        "requests_unsupported_compiler": 0,
+        "requests_not_compile": 0,
+        "requests_not_cacheable": 3,
+        "requests_executed": 0,
+        "cache_errors": {
+          "counts": {},
+          "adv_counts": {}
+        },
+        "cache_hits": {
+          "counts": {
+            "C/C++": 0
+          },
+          "adv_counts": {
+            "c [clang]": 0
+          }
+        },
+        "cache_misses": {
+          "counts": {
+            "Rust": 0,
+            "C/C++": 0
+          },
+          "adv_counts": {
+            "c [clang]": 0,
+            "rust": 0
+          }
+        },
+        "cache_timeouts": 0,
+        "cache_read_errors": 0,
+        "non_cacheable_compilations": 0,
+        "forced_recaches": 0,
+        "cache_write_errors": 0,
+        "cache_writes": 0,
+        "cache_write_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "cache_read_hit_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "compilations": 0,
+        "compiler_write_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "compile_fails": 0,
+        "not_cached": {
+          "missing input": 0,
+          "-": 0,
+          "-o": 0,
+          "crate-type": 3
+        },
+        "dist_compiles": {},
+        "dist_errors": 0,
+        "multi_level": null
+      }
+    },
+    {
+      "scenario": "edit-1-04",
+      "wall_s": 79.58112874999642,
+      "sccache_delta": {
+        "compile_requests": 3,
+        "requests_unsupported_compiler": 0,
+        "requests_not_compile": 0,
+        "requests_not_cacheable": 3,
+        "requests_executed": 0,
+        "cache_errors": {
+          "counts": {},
+          "adv_counts": {}
+        },
+        "cache_hits": {
+          "counts": {
+            "C/C++": 0
+          },
+          "adv_counts": {
+            "c [clang]": 0
+          }
+        },
+        "cache_misses": {
+          "counts": {
+            "Rust": 0,
+            "C/C++": 0
+          },
+          "adv_counts": {
+            "rust": 0,
+            "c [clang]": 0
+          }
+        },
+        "cache_timeouts": 0,
+        "cache_read_errors": 0,
+        "non_cacheable_compilations": 0,
+        "forced_recaches": 0,
+        "cache_write_errors": 0,
+        "cache_writes": 0,
+        "cache_write_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "cache_read_hit_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "compilations": 0,
+        "compiler_write_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "compile_fails": 0,
+        "not_cached": {
+          "missing input": 0,
+          "-": 0,
+          "crate-type": 3,
+          "-o": 0
+        },
+        "dist_compiles": {},
+        "dist_errors": 0,
+        "multi_level": null
+      }
+    },
+    {
+      "scenario": "edit-1-05",
+      "wall_s": 87.20350508391857,
+      "sccache_delta": {
+        "compile_requests": 3,
+        "requests_unsupported_compiler": 0,
+        "requests_not_compile": 0,
+        "requests_not_cacheable": 3,
+        "requests_executed": 0,
+        "cache_errors": {
+          "counts": {},
+          "adv_counts": {}
+        },
+        "cache_hits": {
+          "counts": {
+            "C/C++": 0
+          },
+          "adv_counts": {
+            "c [clang]": 0
+          }
+        },
+        "cache_misses": {
+          "counts": {
+            "C/C++": 0,
+            "Rust": 0
+          },
+          "adv_counts": {
+            "c [clang]": 0,
+            "rust": 0
+          }
+        },
+        "cache_timeouts": 0,
+        "cache_read_errors": 0,
+        "non_cacheable_compilations": 0,
+        "forced_recaches": 0,
+        "cache_write_errors": 0,
+        "cache_writes": 0,
+        "cache_write_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "cache_read_hit_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "compilations": 0,
+        "compiler_write_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "compile_fails": 0,
+        "not_cached": {
+          "-": 0,
+          "-o": 0,
+          "crate-type": 3,
+          "missing input": 0
+        },
+        "dist_compiles": {},
+        "dist_errors": 0,
+        "multi_level": null
+      }
+    },
+    {
+      "scenario": "edit-1-06",
+      "wall_s": 87.5699347499758,
+      "sccache_delta": {
+        "compile_requests": 3,
+        "requests_unsupported_compiler": 0,
+        "requests_not_compile": 0,
+        "requests_not_cacheable": 3,
+        "requests_executed": 0,
+        "cache_errors": {
+          "counts": {},
+          "adv_counts": {}
+        },
+        "cache_hits": {
+          "counts": {
+            "C/C++": 0
+          },
+          "adv_counts": {
+            "c [clang]": 0
+          }
+        },
+        "cache_misses": {
+          "counts": {
+            "C/C++": 0,
+            "Rust": 0
+          },
+          "adv_counts": {
+            "c [clang]": 0,
+            "rust": 0
+          }
+        },
+        "cache_timeouts": 0,
+        "cache_read_errors": 0,
+        "non_cacheable_compilations": 0,
+        "forced_recaches": 0,
+        "cache_write_errors": 0,
+        "cache_writes": 0,
+        "cache_write_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "cache_read_hit_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "compilations": 0,
+        "compiler_write_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "compile_fails": 0,
+        "not_cached": {
+          "-o": 0,
+          "missing input": 0,
+          "-": 0,
+          "crate-type": 3
+        },
+        "dist_compiles": {},
+        "dist_errors": 0,
+        "multi_level": null
+      }
+    },
+    {
+      "scenario": "edit-1-07",
+      "wall_s": 96.4392906660214,
+      "sccache_delta": {
+        "compile_requests": 3,
+        "requests_unsupported_compiler": 0,
+        "requests_not_compile": 0,
+        "requests_not_cacheable": 3,
+        "requests_executed": 0,
+        "cache_errors": {
+          "counts": {},
+          "adv_counts": {}
+        },
+        "cache_hits": {
+          "counts": {
+            "C/C++": 0
+          },
+          "adv_counts": {
+            "c [clang]": 0
+          }
+        },
+        "cache_misses": {
+          "counts": {
+            "C/C++": 0,
+            "Rust": 0
+          },
+          "adv_counts": {
+            "c [clang]": 0,
+            "rust": 0
+          }
+        },
+        "cache_timeouts": 0,
+        "cache_read_errors": 0,
+        "non_cacheable_compilations": 0,
+        "forced_recaches": 0,
+        "cache_write_errors": 0,
+        "cache_writes": 0,
+        "cache_write_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "cache_read_hit_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "compilations": 0,
+        "compiler_write_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "compile_fails": 0,
+        "not_cached": {
+          "crate-type": 3,
+          "-o": 0,
+          "missing input": 0,
+          "-": 0
+        },
+        "dist_compiles": {},
+        "dist_errors": 0,
+        "multi_level": null
+      }
+    },
+    {
+      "scenario": "edit-1-08",
+      "wall_s": 101.04418862517923,
+      "sccache_delta": {
+        "compile_requests": 3,
+        "requests_unsupported_compiler": 0,
+        "requests_not_compile": 0,
+        "requests_not_cacheable": 3,
+        "requests_executed": 0,
+        "cache_errors": {
+          "counts": {},
+          "adv_counts": {}
+        },
+        "cache_hits": {
+          "counts": {
+            "C/C++": 0
+          },
+          "adv_counts": {
+            "c [clang]": 0
+          }
+        },
+        "cache_misses": {
+          "counts": {
+            "Rust": 0,
+            "C/C++": 0
+          },
+          "adv_counts": {
+            "rust": 0,
+            "c [clang]": 0
+          }
+        },
+        "cache_timeouts": 0,
+        "cache_read_errors": 0,
+        "non_cacheable_compilations": 0,
+        "forced_recaches": 0,
+        "cache_write_errors": 0,
+        "cache_writes": 0,
+        "cache_write_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "cache_read_hit_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "compilations": 0,
+        "compiler_write_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "compile_fails": 0,
+        "not_cached": {
+          "crate-type": 3,
+          "missing input": 0,
+          "-": 0,
+          "-o": 0
+        },
+        "dist_compiles": {},
+        "dist_errors": 0,
+        "multi_level": null
+      }
+    },
+    {
+      "scenario": "edit-1-09",
+      "wall_s": 88.24896129104309,
+      "sccache_delta": {
+        "compile_requests": 3,
+        "requests_unsupported_compiler": 0,
+        "requests_not_compile": 0,
+        "requests_not_cacheable": 3,
+        "requests_executed": 0,
+        "cache_errors": {
+          "counts": {},
+          "adv_counts": {}
+        },
+        "cache_hits": {
+          "counts": {
+            "C/C++": 0
+          },
+          "adv_counts": {
+            "c [clang]": 0
+          }
+        },
+        "cache_misses": {
+          "counts": {
+            "Rust": 0,
+            "C/C++": 0
+          },
+          "adv_counts": {
+            "c [clang]": 0,
+            "rust": 0
+          }
+        },
+        "cache_timeouts": 0,
+        "cache_read_errors": 0,
+        "non_cacheable_compilations": 0,
+        "forced_recaches": 0,
+        "cache_write_errors": 0,
+        "cache_writes": 0,
+        "cache_write_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "cache_read_hit_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "compilations": 0,
+        "compiler_write_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "compile_fails": 0,
+        "not_cached": {
+          "-o": 0,
+          "crate-type": 3,
+          "missing input": 0,
+          "-": 0
+        },
+        "dist_compiles": {},
+        "dist_errors": 0,
+        "multi_level": null
+      }
+    },
+    {
+      "scenario": "edit-1-10",
+      "wall_s": 86.3258587080054,
+      "sccache_delta": {
+        "compile_requests": 3,
+        "requests_unsupported_compiler": 0,
+        "requests_not_compile": 0,
+        "requests_not_cacheable": 3,
+        "requests_executed": 0,
+        "cache_errors": {
+          "counts": {},
+          "adv_counts": {}
+        },
+        "cache_hits": {
+          "counts": {
+            "C/C++": 0
+          },
+          "adv_counts": {
+            "c [clang]": 0
+          }
+        },
+        "cache_misses": {
+          "counts": {
+            "C/C++": 0,
+            "Rust": 0
+          },
+          "adv_counts": {
+            "c [clang]": 0,
+            "rust": 0
+          }
+        },
+        "cache_timeouts": 0,
+        "cache_read_errors": 0,
+        "non_cacheable_compilations": 0,
+        "forced_recaches": 0,
+        "cache_write_errors": 0,
+        "cache_writes": 0,
+        "cache_write_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "cache_read_hit_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "compilations": 0,
+        "compiler_write_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "compile_fails": 0,
+        "not_cached": {
+          "crate-type": 3,
+          "-": 0,
+          "missing input": 0,
+          "-o": 0
+        },
+        "dist_compiles": {},
+        "dist_errors": 0,
+        "multi_level": null
+      }
+    },
+    {
+      "scenario": "edit-2-01",
+      "wall_s": 93.24464645888656,
+      "sccache_delta": {
+        "compile_requests": 3,
+        "requests_unsupported_compiler": 0,
+        "requests_not_compile": 0,
+        "requests_not_cacheable": 3,
+        "requests_executed": 0,
+        "cache_errors": {
+          "counts": {},
+          "adv_counts": {}
+        },
+        "cache_hits": {
+          "counts": {
+            "C/C++": 0
+          },
+          "adv_counts": {
+            "c [clang]": 0
+          }
+        },
+        "cache_misses": {
+          "counts": {
+            "C/C++": 0,
+            "Rust": 0
+          },
+          "adv_counts": {
+            "c [clang]": 0,
+            "rust": 0
+          }
+        },
+        "cache_timeouts": 0,
+        "cache_read_errors": 0,
+        "non_cacheable_compilations": 0,
+        "forced_recaches": 0,
+        "cache_write_errors": 0,
+        "cache_writes": 0,
+        "cache_write_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "cache_read_hit_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "compilations": 0,
+        "compiler_write_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "compile_fails": 0,
+        "not_cached": {
+          "missing input": 0,
+          "-": 0,
+          "-o": 0,
+          "crate-type": 3
+        },
+        "dist_compiles": {},
+        "dist_errors": 0,
+        "multi_level": null
+      }
+    },
+    {
+      "scenario": "edit-2-02",
+      "wall_s": 89.4678334579803,
+      "sccache_delta": {
+        "compile_requests": 3,
+        "requests_unsupported_compiler": 0,
+        "requests_not_compile": 0,
+        "requests_not_cacheable": 3,
+        "requests_executed": 0,
+        "cache_errors": {
+          "counts": {},
+          "adv_counts": {}
+        },
+        "cache_hits": {
+          "counts": {
+            "C/C++": 0
+          },
+          "adv_counts": {
+            "c [clang]": 0
+          }
+        },
+        "cache_misses": {
+          "counts": {
+            "C/C++": 0,
+            "Rust": 0
+          },
+          "adv_counts": {
+            "rust": 0,
+            "c [clang]": 0
+          }
+        },
+        "cache_timeouts": 0,
+        "cache_read_errors": 0,
+        "non_cacheable_compilations": 0,
+        "forced_recaches": 0,
+        "cache_write_errors": 0,
+        "cache_writes": 0,
+        "cache_write_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "cache_read_hit_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "compilations": 0,
+        "compiler_write_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "compile_fails": 0,
+        "not_cached": {
+          "-": 0,
+          "missing input": 0,
+          "crate-type": 3,
+          "-o": 0
+        },
+        "dist_compiles": {},
+        "dist_errors": 0,
+        "multi_level": null
+      }
+    },
+    {
+      "scenario": "edit-2-03",
+      "wall_s": 87.03608174994588,
+      "sccache_delta": {
+        "compile_requests": 3,
+        "requests_unsupported_compiler": 0,
+        "requests_not_compile": 0,
+        "requests_not_cacheable": 3,
+        "requests_executed": 0,
+        "cache_errors": {
+          "counts": {},
+          "adv_counts": {}
+        },
+        "cache_hits": {
+          "counts": {
+            "C/C++": 0
+          },
+          "adv_counts": {
+            "c [clang]": 0
+          }
+        },
+        "cache_misses": {
+          "counts": {
+            "C/C++": 0,
+            "Rust": 0
+          },
+          "adv_counts": {
+            "rust": 0,
+            "c [clang]": 0
+          }
+        },
+        "cache_timeouts": 0,
+        "cache_read_errors": 0,
+        "non_cacheable_compilations": 0,
+        "forced_recaches": 0,
+        "cache_write_errors": 0,
+        "cache_writes": 0,
+        "cache_write_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "cache_read_hit_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "compilations": 0,
+        "compiler_write_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "compile_fails": 0,
+        "not_cached": {
+          "missing input": 0,
+          "crate-type": 3,
+          "-o": 0,
+          "-": 0
+        },
+        "dist_compiles": {},
+        "dist_errors": 0,
+        "multi_level": null
+      }
+    },
+    {
+      "scenario": "edit-2-04",
+      "wall_s": 82.81360508291982,
+      "sccache_delta": {
+        "compile_requests": 3,
+        "requests_unsupported_compiler": 0,
+        "requests_not_compile": 0,
+        "requests_not_cacheable": 3,
+        "requests_executed": 0,
+        "cache_errors": {
+          "counts": {},
+          "adv_counts": {}
+        },
+        "cache_hits": {
+          "counts": {
+            "C/C++": 0
+          },
+          "adv_counts": {
+            "c [clang]": 0
+          }
+        },
+        "cache_misses": {
+          "counts": {
+            "C/C++": 0,
+            "Rust": 0
+          },
+          "adv_counts": {
+            "rust": 0,
+            "c [clang]": 0
+          }
+        },
+        "cache_timeouts": 0,
+        "cache_read_errors": 0,
+        "non_cacheable_compilations": 0,
+        "forced_recaches": 0,
+        "cache_write_errors": 0,
+        "cache_writes": 0,
+        "cache_write_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "cache_read_hit_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "compilations": 0,
+        "compiler_write_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "compile_fails": 0,
+        "not_cached": {
+          "-": 0,
+          "-o": 0,
+          "crate-type": 3,
+          "missing input": 0
+        },
+        "dist_compiles": {},
+        "dist_errors": 0,
+        "multi_level": null
+      }
+    },
+    {
+      "scenario": "edit-2-05",
+      "wall_s": 78.3441560419742,
+      "sccache_delta": {
+        "compile_requests": 3,
+        "requests_unsupported_compiler": 0,
+        "requests_not_compile": 0,
+        "requests_not_cacheable": 3,
+        "requests_executed": 0,
+        "cache_errors": {
+          "counts": {},
+          "adv_counts": {}
+        },
+        "cache_hits": {
+          "counts": {
+            "C/C++": 0
+          },
+          "adv_counts": {
+            "c [clang]": 0
+          }
+        },
+        "cache_misses": {
+          "counts": {
+            "Rust": 0,
+            "C/C++": 0
+          },
+          "adv_counts": {
+            "rust": 0,
+            "c [clang]": 0
+          }
+        },
+        "cache_timeouts": 0,
+        "cache_read_errors": 0,
+        "non_cacheable_compilations": 0,
+        "forced_recaches": 0,
+        "cache_write_errors": 0,
+        "cache_writes": 0,
+        "cache_write_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "cache_read_hit_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "compilations": 0,
+        "compiler_write_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "compile_fails": 0,
+        "not_cached": {
+          "crate-type": 3,
+          "missing input": 0,
+          "-o": 0,
+          "-": 0
+        },
+        "dist_compiles": {},
+        "dist_errors": 0,
+        "multi_level": null
+      }
+    },
+    {
+      "scenario": "edit-2-06",
+      "wall_s": 88.11054033390246,
+      "sccache_delta": {
+        "compile_requests": 3,
+        "requests_unsupported_compiler": 0,
+        "requests_not_compile": 0,
+        "requests_not_cacheable": 3,
+        "requests_executed": 0,
+        "cache_errors": {
+          "counts": {},
+          "adv_counts": {}
+        },
+        "cache_hits": {
+          "counts": {
+            "C/C++": 0
+          },
+          "adv_counts": {
+            "c [clang]": 0
+          }
+        },
+        "cache_misses": {
+          "counts": {
+            "Rust": 0,
+            "C/C++": 0
+          },
+          "adv_counts": {
+            "rust": 0,
+            "c [clang]": 0
+          }
+        },
+        "cache_timeouts": 0,
+        "cache_read_errors": 0,
+        "non_cacheable_compilations": 0,
+        "forced_recaches": 0,
+        "cache_write_errors": 0,
+        "cache_writes": 0,
+        "cache_write_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "cache_read_hit_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "compilations": 0,
+        "compiler_write_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "compile_fails": 0,
+        "not_cached": {
+          "-o": 0,
+          "missing input": 0,
+          "-": 0,
+          "crate-type": 3
+        },
+        "dist_compiles": {},
+        "dist_errors": 0,
+        "multi_level": null
+      }
+    },
+    {
+      "scenario": "edit-2-07",
+      "wall_s": 86.0396967921406,
+      "sccache_delta": {
+        "compile_requests": 3,
+        "requests_unsupported_compiler": 0,
+        "requests_not_compile": 0,
+        "requests_not_cacheable": 3,
+        "requests_executed": 0,
+        "cache_errors": {
+          "counts": {},
+          "adv_counts": {}
+        },
+        "cache_hits": {
+          "counts": {
+            "C/C++": 0
+          },
+          "adv_counts": {
+            "c [clang]": 0
+          }
+        },
+        "cache_misses": {
+          "counts": {
+            "Rust": 0,
+            "C/C++": 0
+          },
+          "adv_counts": {
+            "c [clang]": 0,
+            "rust": 0
+          }
+        },
+        "cache_timeouts": 0,
+        "cache_read_errors": 0,
+        "non_cacheable_compilations": 0,
+        "forced_recaches": 0,
+        "cache_write_errors": 0,
+        "cache_writes": 0,
+        "cache_write_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "cache_read_hit_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "compilations": 0,
+        "compiler_write_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "compile_fails": 0,
+        "not_cached": {
+          "missing input": 0,
+          "crate-type": 3,
+          "-": 0,
+          "-o": 0
+        },
+        "dist_compiles": {},
+        "dist_errors": 0,
+        "multi_level": null
+      }
+    },
+    {
+      "scenario": "edit-2-08",
+      "wall_s": 87.31224495801143,
+      "sccache_delta": {
+        "compile_requests": 3,
+        "requests_unsupported_compiler": 0,
+        "requests_not_compile": 0,
+        "requests_not_cacheable": 3,
+        "requests_executed": 0,
+        "cache_errors": {
+          "counts": {},
+          "adv_counts": {}
+        },
+        "cache_hits": {
+          "counts": {
+            "C/C++": 0
+          },
+          "adv_counts": {
+            "c [clang]": 0
+          }
+        },
+        "cache_misses": {
+          "counts": {
+            "C/C++": 0,
+            "Rust": 0
+          },
+          "adv_counts": {
+            "rust": 0,
+            "c [clang]": 0
+          }
+        },
+        "cache_timeouts": 0,
+        "cache_read_errors": 0,
+        "non_cacheable_compilations": 0,
+        "forced_recaches": 0,
+        "cache_write_errors": 0,
+        "cache_writes": 0,
+        "cache_write_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "cache_read_hit_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "compilations": 0,
+        "compiler_write_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "compile_fails": 0,
+        "not_cached": {
+          "-o": 0,
+          "missing input": 0,
+          "-": 0,
+          "crate-type": 3
+        },
+        "dist_compiles": {},
+        "dist_errors": 0,
+        "multi_level": null
+      }
+    },
+    {
+      "scenario": "edit-2-09",
+      "wall_s": 87.9561932911165,
+      "sccache_delta": {
+        "compile_requests": 3,
+        "requests_unsupported_compiler": 0,
+        "requests_not_compile": 0,
+        "requests_not_cacheable": 3,
+        "requests_executed": 0,
+        "cache_errors": {
+          "counts": {},
+          "adv_counts": {}
+        },
+        "cache_hits": {
+          "counts": {
+            "C/C++": 0
+          },
+          "adv_counts": {
+            "c [clang]": 0
+          }
+        },
+        "cache_misses": {
+          "counts": {
+            "C/C++": 0,
+            "Rust": 0
+          },
+          "adv_counts": {
+            "c [clang]": 0,
+            "rust": 0
+          }
+        },
+        "cache_timeouts": 0,
+        "cache_read_errors": 0,
+        "non_cacheable_compilations": 0,
+        "forced_recaches": 0,
+        "cache_write_errors": 0,
+        "cache_writes": 0,
+        "cache_write_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "cache_read_hit_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "compilations": 0,
+        "compiler_write_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "compile_fails": 0,
+        "not_cached": {
+          "crate-type": 3,
+          "-o": 0,
+          "-": 0,
+          "missing input": 0
+        },
+        "dist_compiles": {},
+        "dist_errors": 0,
+        "multi_level": null
+      }
+    },
+    {
+      "scenario": "edit-2-10",
+      "wall_s": 88.15350474999286,
+      "sccache_delta": {
+        "compile_requests": 3,
+        "requests_unsupported_compiler": 0,
+        "requests_not_compile": 0,
+        "requests_not_cacheable": 3,
+        "requests_executed": 0,
+        "cache_errors": {
+          "counts": {},
+          "adv_counts": {}
+        },
+        "cache_hits": {
+          "counts": {
+            "C/C++": 0
+          },
+          "adv_counts": {
+            "c [clang]": 0
+          }
+        },
+        "cache_misses": {
+          "counts": {
+            "Rust": 0,
+            "C/C++": 0
+          },
+          "adv_counts": {
+            "rust": 0,
+            "c [clang]": 0
+          }
+        },
+        "cache_timeouts": 0,
+        "cache_read_errors": 0,
+        "non_cacheable_compilations": 0,
+        "forced_recaches": 0,
+        "cache_write_errors": 0,
+        "cache_writes": 0,
+        "cache_write_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "cache_read_hit_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "compilations": 0,
+        "compiler_write_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "compile_fails": 0,
+        "not_cached": {
+          "missing input": 0,
+          "crate-type": 3,
+          "-o": 0,
+          "-": 0
+        },
+        "dist_compiles": {},
+        "dist_errors": 0,
+        "multi_level": null
+      }
+    },
+    {
+      "scenario": "serial-1",
+      "wall_s": 124.84538658289239,
+      "sccache_delta": {
+        "compile_requests": 77,
+        "requests_unsupported_compiler": 0,
+        "requests_not_compile": 0,
+        "requests_not_cacheable": 76,
+        "requests_executed": 1,
+        "cache_errors": {
+          "counts": {},
+          "adv_counts": {}
+        },
+        "cache_hits": {
+          "counts": {
+            "C/C++": 1
+          },
+          "adv_counts": {
+            "c [clang]": 1
+          }
+        },
+        "cache_misses": {
+          "counts": {
+            "C/C++": 0,
+            "Rust": 0
+          },
+          "adv_counts": {
+            "rust": 0,
+            "c [clang]": 0
+          }
+        },
+        "cache_timeouts": 0,
+        "cache_read_errors": 0,
+        "non_cacheable_compilations": 0,
+        "forced_recaches": 0,
+        "cache_write_errors": 0,
+        "cache_writes": 0,
+        "cache_write_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "cache_read_hit_duration": {
+          "secs": 0,
+          "nanos": 183542
+        },
+        "compilations": 0,
+        "compiler_write_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "compile_fails": 0,
+        "not_cached": {
+          "-o": 0,
+          "missing input": 0,
+          "crate-type": 76,
+          "-": 0
+        },
+        "dist_compiles": {},
+        "dist_errors": 0,
+        "multi_level": null
+      }
+    },
+    {
+      "scenario": "concurrent-1",
+      "wall_s": 121.51948945783079,
+      "sccache_delta": {
+        "compile_requests": 80,
+        "requests_unsupported_compiler": 0,
+        "requests_not_compile": 0,
+        "requests_not_cacheable": 79,
+        "requests_executed": 1,
+        "cache_errors": {
+          "counts": {},
+          "adv_counts": {}
+        },
+        "cache_hits": {
+          "counts": {
+            "C/C++": 1
+          },
+          "adv_counts": {
+            "c [clang]": 1
+          }
+        },
+        "cache_misses": {
+          "counts": {
+            "C/C++": 0,
+            "Rust": 0
+          },
+          "adv_counts": {
+            "c [clang]": 0,
+            "rust": 0
+          }
+        },
+        "cache_timeouts": 0,
+        "cache_read_errors": 0,
+        "non_cacheable_compilations": 0,
+        "forced_recaches": 0,
+        "cache_write_errors": 0,
+        "cache_writes": 0,
+        "cache_write_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "cache_read_hit_duration": {
+          "secs": 0,
+          "nanos": 158375
+        },
+        "compilations": 0,
+        "compiler_write_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "compile_fails": 0,
+        "not_cached": {
+          "-o": 0,
+          "-": 0,
+          "missing input": 0,
+          "crate-type": 79
+        },
+        "dist_compiles": {},
+        "dist_errors": 0,
+        "multi_level": null
+      }
+    },
+    {
+      "scenario": "serial-2",
+      "wall_s": 89.00712475017644,
+      "sccache_delta": {
+        "compile_requests": 3,
+        "requests_unsupported_compiler": 0,
+        "requests_not_compile": 0,
+        "requests_not_cacheable": 3,
+        "requests_executed": 0,
+        "cache_errors": {
+          "counts": {},
+          "adv_counts": {}
+        },
+        "cache_hits": {
+          "counts": {
+            "C/C++": 0
+          },
+          "adv_counts": {
+            "c [clang]": 0
+          }
+        },
+        "cache_misses": {
+          "counts": {
+            "Rust": 0,
+            "C/C++": 0
+          },
+          "adv_counts": {
+            "rust": 0,
+            "c [clang]": 0
+          }
+        },
+        "cache_timeouts": 0,
+        "cache_read_errors": 0,
+        "non_cacheable_compilations": 0,
+        "forced_recaches": 0,
+        "cache_write_errors": 0,
+        "cache_writes": 0,
+        "cache_write_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "cache_read_hit_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "compilations": 0,
+        "compiler_write_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "compile_fails": 0,
+        "not_cached": {
+          "missing input": 0,
+          "crate-type": 3,
+          "-": 0,
+          "-o": 0
+        },
+        "dist_compiles": {},
+        "dist_errors": 0,
+        "multi_level": null
+      }
+    },
+    {
+      "scenario": "concurrent-2",
+      "wall_s": 92.18485324992798,
+      "sccache_delta": {
+        "compile_requests": 6,
+        "requests_unsupported_compiler": 0,
+        "requests_not_compile": 0,
+        "requests_not_cacheable": 6,
+        "requests_executed": 0,
+        "cache_errors": {
+          "counts": {},
+          "adv_counts": {}
+        },
+        "cache_hits": {
+          "counts": {
+            "C/C++": 0
+          },
+          "adv_counts": {
+            "c [clang]": 0
+          }
+        },
+        "cache_misses": {
+          "counts": {
+            "Rust": 0,
+            "C/C++": 0
+          },
+          "adv_counts": {
+            "c [clang]": 0,
+            "rust": 0
+          }
+        },
+        "cache_timeouts": 0,
+        "cache_read_errors": 0,
+        "non_cacheable_compilations": 0,
+        "forced_recaches": 0,
+        "cache_write_errors": 0,
+        "cache_writes": 0,
+        "cache_write_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "cache_read_hit_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "compilations": 0,
+        "compiler_write_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "compile_fails": 0,
+        "not_cached": {
+          "-": 0,
+          "crate-type": 6,
+          "missing input": 0,
+          "-o": 0
+        },
+        "dist_compiles": {},
+        "dist_errors": 0,
+        "multi_level": null
+      }
+    },
+    {
+      "scenario": "full-debug-cold",
+      "wall_s": 179.8700804580003,
+      "sccache_delta": {
+        "compile_requests": 371,
+        "requests_unsupported_compiler": 0,
+        "requests_not_compile": 3,
+        "requests_not_cacheable": 136,
+        "requests_executed": 232,
+        "cache_errors": {
+          "counts": {},
+          "adv_counts": {}
+        },
+        "cache_hits": {
+          "counts": {
+            "C/C++": 1
+          },
+          "adv_counts": {
+            "c [clang]": 1
+          }
+        },
+        "cache_misses": {
+          "counts": {
+            "C/C++": 1,
+            "Rust": 225
+          },
+          "adv_counts": {
+            "rust": 225,
+            "c [clang]": 1
+          }
+        },
+        "cache_timeouts": 0,
+        "cache_read_errors": 0,
+        "non_cacheable_compilations": 0,
+        "forced_recaches": 0,
+        "cache_write_errors": 0,
+        "cache_writes": 226,
+        "cache_write_duration": {
+          "secs": 0,
+          "nanos": 130599364
+        },
+        "cache_read_hit_duration": {
+          "secs": 0,
+          "nanos": 468292
+        },
+        "compilations": 226,
+        "compiler_write_duration": {
+          "secs": 55,
+          "nanos": -191610923
+        },
+        "compile_fails": 5,
+        "not_cached": {
+          "crate-type": 125,
+          "-": 3,
+          "-o": 3,
+          "missing input": 5
+        },
+        "dist_compiles": {},
+        "dist_errors": 0,
+        "multi_level": null
+      }
+    },
+    {
+      "scenario": "full-debug-touch-1",
+      "wall_s": 101.6631691660732,
+      "sccache_delta": {
+        "compile_requests": 4,
+        "requests_unsupported_compiler": 0,
+        "requests_not_compile": 0,
+        "requests_not_cacheable": 4,
+        "requests_executed": 0,
+        "cache_errors": {
+          "counts": {},
+          "adv_counts": {}
+        },
+        "cache_hits": {
+          "counts": {
+            "C/C++": 0
+          },
+          "adv_counts": {
+            "c [clang]": 0
+          }
+        },
+        "cache_misses": {
+          "counts": {
+            "C/C++": 0,
+            "Rust": 0
+          },
+          "adv_counts": {
+            "rust": 0,
+            "c [clang]": 0
+          }
+        },
+        "cache_timeouts": 0,
+        "cache_read_errors": 0,
+        "non_cacheable_compilations": 0,
+        "forced_recaches": 0,
+        "cache_write_errors": 0,
+        "cache_writes": 0,
+        "cache_write_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "cache_read_hit_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "compilations": 0,
+        "compiler_write_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "compile_fails": 0,
+        "not_cached": {
+          "missing input": 0,
+          "-o": 0,
+          "-": 1,
+          "crate-type": 3
+        },
+        "dist_compiles": {},
+        "dist_errors": 0,
+        "multi_level": null
+      }
+    },
+    {
+      "scenario": "full-debug-touch-2",
+      "wall_s": 101.9329504580237,
+      "sccache_delta": {
+        "compile_requests": 3,
+        "requests_unsupported_compiler": 0,
+        "requests_not_compile": 0,
+        "requests_not_cacheable": 3,
+        "requests_executed": 0,
+        "cache_errors": {
+          "counts": {},
+          "adv_counts": {}
+        },
+        "cache_hits": {
+          "counts": {
+            "C/C++": 0
+          },
+          "adv_counts": {
+            "c [clang]": 0
+          }
+        },
+        "cache_misses": {
+          "counts": {
+            "Rust": 0,
+            "C/C++": 0
+          },
+          "adv_counts": {
+            "rust": 0,
+            "c [clang]": 0
+          }
+        },
+        "cache_timeouts": 0,
+        "cache_read_errors": 0,
+        "non_cacheable_compilations": 0,
+        "forced_recaches": 0,
+        "cache_write_errors": 0,
+        "cache_writes": 0,
+        "cache_write_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "cache_read_hit_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "compilations": 0,
+        "compiler_write_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "compile_fails": 0,
+        "not_cached": {
+          "-": 0,
+          "missing input": 0,
+          "crate-type": 3,
+          "-o": 0
+        },
+        "dist_compiles": {},
+        "dist_errors": 0,
+        "multi_level": null
+      }
+    },
+    {
+      "scenario": "nix-fresh-eval",
+      "wall_s": 28.999975374899805
+    },
+    {
+      "scenario": "nix-warm",
+      "wall_s": 4.232855541165918
+    },
+    {
+      "scenario": "nix-four-a",
+      "wall_s": 2.8971227079164237
+    },
+    {
+      "scenario": "nix-four-b",
+      "wall_s": 2.6626704579684883
+    },
+    {
+      "scenario": "empty-checkout-1",
+      "wall_s": 157.76404983294196,
+      "sccache_delta": {
+        "compile_requests": 371,
+        "requests_unsupported_compiler": 0,
+        "requests_not_compile": 3,
+        "requests_not_cacheable": 136,
+        "requests_executed": 232,
+        "cache_errors": {
+          "counts": {},
+          "adv_counts": {}
+        },
+        "cache_hits": {
+          "counts": {
+            "C/C++": 2
+          },
+          "adv_counts": {
+            "c [clang]": 2
+          }
+        },
+        "cache_misses": {
+          "counts": {
+            "Rust": 225,
+            "C/C++": 0
+          },
+          "adv_counts": {
+            "rust": 225,
+            "c [clang]": 0
+          }
+        },
+        "cache_timeouts": 0,
+        "cache_read_errors": 0,
+        "non_cacheable_compilations": 0,
+        "forced_recaches": 0,
+        "cache_write_errors": 0,
+        "cache_writes": 225,
+        "cache_write_duration": {
+          "secs": 0,
+          "nanos": 105035298
+        },
+        "cache_read_hit_duration": {
+          "secs": 0,
+          "nanos": 653000
+        },
+        "compilations": 225,
+        "compiler_write_duration": {
+          "secs": 47,
+          "nanos": 363500206
+        },
+        "compile_fails": 5,
+        "not_cached": {
+          "-": 3,
+          "-o": 3,
+          "missing input": 5,
+          "crate-type": 125
+        },
+        "dist_compiles": {},
+        "dist_errors": 0,
+        "multi_level": null
+      }
+    },
+    {
+      "scenario": "empty-checkout-2",
+      "wall_s": 180.4799777502194,
+      "sccache_delta": {
+        "compile_requests": 371,
+        "requests_unsupported_compiler": 0,
+        "requests_not_compile": 3,
+        "requests_not_cacheable": 136,
+        "requests_executed": 232,
+        "cache_errors": {
+          "counts": {},
+          "adv_counts": {}
+        },
+        "cache_hits": {
+          "counts": {
+            "C/C++": 2
+          },
+          "adv_counts": {
+            "c [clang]": 2
+          }
+        },
+        "cache_misses": {
+          "counts": {
+            "C/C++": 0,
+            "Rust": 225
+          },
+          "adv_counts": {
+            "rust": 225,
+            "c [clang]": 0
+          }
+        },
+        "cache_timeouts": 0,
+        "cache_read_errors": 0,
+        "non_cacheable_compilations": 0,
+        "forced_recaches": 0,
+        "cache_write_errors": 0,
+        "cache_writes": 225,
+        "cache_write_duration": {
+          "secs": 0,
+          "nanos": 181266828
+        },
+        "cache_read_hit_duration": {
+          "secs": 0,
+          "nanos": 831583
+        },
+        "compilations": 225,
+        "compiler_write_duration": {
+          "secs": 48,
+          "nanos": -455923500
+        },
+        "compile_fails": 5,
+        "not_cached": {
+          "-": 3,
+          "-o": 3,
+          "crate-type": 125,
+          "missing input": 5
+        },
+        "dist_compiles": {},
+        "dist_errors": 0,
+        "multi_level": null
+      }
+    },
+    {
+      "scenario": "steady-serial-1",
+      "wall_s": 88.20345112495124,
+      "sccache_delta": {
+        "compile_requests": 3,
+        "requests_unsupported_compiler": 0,
+        "requests_not_compile": 0,
+        "requests_not_cacheable": 3,
+        "requests_executed": 0,
+        "cache_errors": {
+          "counts": {},
+          "adv_counts": {}
+        },
+        "cache_hits": {
+          "counts": {
+            "C/C++": 0
+          },
+          "adv_counts": {
+            "c [clang]": 0
+          }
+        },
+        "cache_misses": {
+          "counts": {
+            "Rust": 0,
+            "C/C++": 0
+          },
+          "adv_counts": {
+            "rust": 0,
+            "c [clang]": 0
+          }
+        },
+        "cache_timeouts": 0,
+        "cache_read_errors": 0,
+        "non_cacheable_compilations": 0,
+        "forced_recaches": 0,
+        "cache_write_errors": 0,
+        "cache_writes": 0,
+        "cache_write_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "cache_read_hit_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "compilations": 0,
+        "compiler_write_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "compile_fails": 0,
+        "not_cached": {
+          "crate-type": 3,
+          "missing input": 0,
+          "-o": 0,
+          "-": 0
+        },
+        "dist_compiles": {},
+        "dist_errors": 0,
+        "multi_level": null
+      }
+    },
+    {
+      "scenario": "steady-concurrent-1",
+      "wall_s": 93.6161957080476,
+      "sccache_delta": {
+        "compile_requests": 6,
+        "requests_unsupported_compiler": 0,
+        "requests_not_compile": 0,
+        "requests_not_cacheable": 6,
+        "requests_executed": 0,
+        "cache_errors": {
+          "counts": {},
+          "adv_counts": {}
+        },
+        "cache_hits": {
+          "counts": {
+            "C/C++": 0
+          },
+          "adv_counts": {
+            "c [clang]": 0
+          }
+        },
+        "cache_misses": {
+          "counts": {
+            "C/C++": 0,
+            "Rust": 0
+          },
+          "adv_counts": {
+            "c [clang]": 0,
+            "rust": 0
+          }
+        },
+        "cache_timeouts": 0,
+        "cache_read_errors": 0,
+        "non_cacheable_compilations": 0,
+        "forced_recaches": 0,
+        "cache_write_errors": 0,
+        "cache_writes": 0,
+        "cache_write_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "cache_read_hit_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "compilations": 0,
+        "compiler_write_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "compile_fails": 0,
+        "not_cached": {
+          "-": 0,
+          "crate-type": 6,
+          "missing input": 0,
+          "-o": 0
+        },
+        "dist_compiles": {},
+        "dist_errors": 0,
+        "multi_level": null
+      }
+    },
+    {
+      "scenario": "steady-serial-2",
+      "wall_s": 87.49672225001268,
+      "sccache_delta": {
+        "compile_requests": 3,
+        "requests_unsupported_compiler": 0,
+        "requests_not_compile": 0,
+        "requests_not_cacheable": 3,
+        "requests_executed": 0,
+        "cache_errors": {
+          "counts": {},
+          "adv_counts": {}
+        },
+        "cache_hits": {
+          "counts": {
+            "C/C++": 0
+          },
+          "adv_counts": {
+            "c [clang]": 0
+          }
+        },
+        "cache_misses": {
+          "counts": {
+            "C/C++": 0,
+            "Rust": 0
+          },
+          "adv_counts": {
+            "c [clang]": 0,
+            "rust": 0
+          }
+        },
+        "cache_timeouts": 0,
+        "cache_read_errors": 0,
+        "non_cacheable_compilations": 0,
+        "forced_recaches": 0,
+        "cache_write_errors": 0,
+        "cache_writes": 0,
+        "cache_write_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "cache_read_hit_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "compilations": 0,
+        "compiler_write_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "compile_fails": 0,
+        "not_cached": {
+          "missing input": 0,
+          "-o": 0,
+          "-": 0,
+          "crate-type": 3
+        },
+        "dist_compiles": {},
+        "dist_errors": 0,
+        "multi_level": null
+      }
+    },
+    {
+      "scenario": "steady-concurrent-2",
+      "wall_s": 91.7677302500233,
+      "sccache_delta": {
+        "compile_requests": 6,
+        "requests_unsupported_compiler": 0,
+        "requests_not_compile": 0,
+        "requests_not_cacheable": 6,
+        "requests_executed": 0,
+        "cache_errors": {
+          "counts": {},
+          "adv_counts": {}
+        },
+        "cache_hits": {
+          "counts": {
+            "C/C++": 0
+          },
+          "adv_counts": {
+            "c [clang]": 0
+          }
+        },
+        "cache_misses": {
+          "counts": {
+            "C/C++": 0,
+            "Rust": 0
+          },
+          "adv_counts": {
+            "c [clang]": 0,
+            "rust": 0
+          }
+        },
+        "cache_timeouts": 0,
+        "cache_read_errors": 0,
+        "non_cacheable_compilations": 0,
+        "forced_recaches": 0,
+        "cache_write_errors": 0,
+        "cache_writes": 0,
+        "cache_write_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "cache_read_hit_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "compilations": 0,
+        "compiler_write_duration": {
+          "secs": 0,
+          "nanos": 0
+        },
+        "compile_fails": 0,
+        "not_cached": {
+          "missing input": 0,
+          "-": 0,
+          "crate-type": 6,
+          "-o": 0
+        },
+        "dist_compiles": {},
+        "dist_errors": 0,
+        "multi_level": null
+      }
+    }
+  ],
+  "skipped": {
+    "four_builds": "host rules allow at most two concurrent builds",
+    "k3s": "cluster access excluded from this round",
+    "tart": "VM access excluded from this round",
+    "test_execution": "archive builds tests without executing them"
+  },
+  "scratch": [
+    "m3081",
+    "m3081-attempt1",
+    "m3081-attempt1-results",
+    "m3081-attempt1-sccache",
+    "m3081-attempt1-source",
+    "m3081-attempt2",
+    "m3081-attempt2-fresh-1",
+    "m3081-attempt2-fresh-source-1",
+    "m3081-attempt2-relocated-1",
+    "m3081-attempt2-relocated-source-1",
+    "m3081-attempt2-results",
+    "m3081-attempt2-retired-1",
+    "m3081-attempt2-sccache",
+    "m3081-attempt2-seed",
+    "m3081-attempt2-source",
+    "m3081-empty-checkout-1",
+    "m3081-empty-checkout-2",
+    "m3081-empty-source-1",
+    "m3081-empty-source-2",
+    "m3081-fresh-1",
+    "m3081-fresh-2",
+    "m3081-fresh-source-1",
+    "m3081-fresh-source-2",
+    "m3081-full-debug",
+    "m3081-parallel-0",
+    "m3081-parallel-1",
+    "m3081-parallel-source-0",
+    "m3081-parallel-source-1",
+    "m3081-relocated-1",
+    "m3081-relocated-2",
+    "m3081-relocated-source-1",
+    "m3081-relocated-source-2",
+    "m3081-results",
+    "m3081-retired-1",
+    "m3081-retired-2",
+    "m3081-sccache",
+    "m3081-seed",
+    "m3081-source"
+  ],
+  "copies": [
+    {
+      "destination": "m3081-seed",
+      "wall_s": 0.3923657089471817
+    },
+    {
+      "destination": "m3081",
+      "wall_s": 0.3981469999998808
+    },
+    {
+      "destination": "m3081-relocated-source-1",
+      "wall_s": 0.3817999588791281
+    },
+    {
+      "destination": "m3081-relocated-1",
+      "wall_s": 0.3925476248841733
+    },
+    {
+      "destination": "m3081-fresh-1",
+      "wall_s": 0.40535629098303616
+    },
+    {
+      "destination": "m3081",
+      "wall_s": 0.3871414999011904
+    },
+    {
+      "destination": "m3081-relocated-source-2",
+      "wall_s": 0.3999907081015408
+    },
+    {
+      "destination": "m3081-relocated-2",
+      "wall_s": 0.4056786249857396
+    },
+    {
+      "destination": "m3081-fresh-2",
+      "wall_s": 0.4552163330372423
+    },
+    {
+      "destination": "m3081-parallel-source-0",
+      "wall_s": 0.5197924580425024
+    },
+    {
+      "destination": "m3081-parallel-0",
+      "wall_s": 0.46934412489645183
+    },
+    {
+      "destination": "m3081-parallel-source-1",
+      "wall_s": 0.5061342502012849
+    },
+    {
+      "destination": "m3081-parallel-1",
+      "wall_s": 0.48312404099851847
+    }
+  ]
+}
