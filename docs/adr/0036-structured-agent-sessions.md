@@ -429,9 +429,10 @@ no implicit re-delegation, consumption atomically with J1's durable claim,
 generation-fenced revocation, audit and crash uncertainty. Its paragraph 6
 lists the exact §1a/§5/§5a and ADR-0043 §4/§9 sentences/restrictions to supersede
 on acceptance; accepted historical text is preserved here. Profile admission,
-resource policy and remaining local verb checks still apply. M1 lacks agent
-provenance and A1/J1 lack atomic grant-use accounting today; no runtime gate is
-lifted by this proposal. M2 excludes GUI grant management, and “once” remains
+resource policy and remaining local verb checks still apply. P1 adds dormant M1
+agent provenance from the operator-owned, read-only-by-default profile ceiling
+(Q13, 2026-11-22); A1/J1 still lack atomic grant-use accounting. No runtime gate
+is lifted by this proposal. M2 excludes GUI grant management, and “once” remains
 an explicit owner confirmation in paragraph 8 and the PR body.
 
 `caller_is_local_operator()` (`src/app/api/mesh.rs:182`) treats a local

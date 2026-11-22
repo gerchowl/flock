@@ -85,6 +85,28 @@ impl ProfileAdmission {
         gate
     }
 
+    /// Resolve the recorded profile against current durable operator policy.
+    /// Legacy launches have no binding and retain the read-only default.
+    pub(crate) fn mesh_scopes(
+        &mut self,
+        profile: Option<&crate::structured::registry::ProfileIdentity>,
+    ) -> Result<std::collections::BTreeSet<crate::api::client_tokens::Scope>, &'static str> {
+        let Some(pin) = profile.and_then(|p| p.binding.as_ref()) else {
+            return Ok(bindings::read_only_mesh_scopes());
+        };
+        if self.path.is_none() {
+            return Err("not_authorized");
+        }
+        let value = self
+            .edit(|disk, _| {
+                disk.mesh_scopes(pin)
+                    .map(|s| serde_json::json!(s))
+                    .ok_or(ErrorCode::NotAuthorized)
+            })
+            .map_err(|_| "not_authorized")?;
+        serde_json::from_value(value).map_err(|_| "not_authorized")
+    }
+
     /// Return binding metadata only to the authenticated local operator.
     pub(crate) fn status(&self, operator: bool) -> serde_json::Value {
         let mut status = self.store.status(operator);

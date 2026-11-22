@@ -66,6 +66,7 @@ fn invalid_future_and_conflicting_entries_are_preserved_without_authority() {
     assert!(store.resolve("repo-a", "node-a", "agent-a").is_none());
     store.save(&path).unwrap();
     let saved: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    survivor["mesh_scopes"] = json!(["read"]);
     assert_eq!(saved["bindings"], json!([survivor]));
     assert!(store
         .resolve("repo-a", "node-a", "agent-survivor")
@@ -481,5 +482,35 @@ fn external_lock_holder_refuses_initialization_and_save_without_interleaving() {
     );
     assert_eq!(fs::read(&path).unwrap(), raw);
     candidate.save(&path).unwrap();
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn old_profiles_default_read_only_and_invalid_ceiling_is_retained_without_authority() {
+    let (root, path) = fixture();
+    let mut old = binding();
+    old["binding_id"] = json!("old-binding");
+    let mut invalid = binding();
+    invalid["binding_id"] = json!("invalid-ceiling");
+    invalid["mesh_scopes"] = json!(["future-scope"]);
+    let mut store = BindingStore::default();
+    store.decode(envelope(json!([old, invalid.clone()])));
+    let pin = crate::structured::registry::BindingIdentity {
+        binding_id: "old-binding".into(),
+        revision: 7,
+    };
+    assert_eq!(
+        store.mesh_scopes(&pin),
+        Some([crate::api::client_tokens::Scope::Read].into())
+    );
+    assert!(store
+        .mesh_scopes(&crate::structured::registry::BindingIdentity {
+            binding_id: "invalid-ceiling".into(),
+            revision: 7
+        })
+        .is_none());
+    store.save(&path).unwrap();
+    let saved: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert!(saved["unknown"].as_array().unwrap().contains(&invalid));
     fs::remove_dir_all(root).unwrap();
 }

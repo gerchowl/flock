@@ -32,6 +32,9 @@ pub struct BindingSpec {
     pub credential_generation: u64,
     /// Exact content identities, without adoption or verification.
     pub bundle_digests: Vec<String>,
+    /// Operator-owned mesh ceiling; older requests remain read-only.
+    #[serde(default = "super::read_only_mesh_scopes")]
+    pub mesh_scopes: BTreeSet<crate::api::client_tokens::Scope>,
     /// Operator-issued selection grant identifiers.
     pub grants: Vec<String>,
 }

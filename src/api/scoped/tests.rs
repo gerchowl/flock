@@ -14,12 +14,13 @@ use std::{
 };
 
 pub(crate) fn live_scope() -> (SessionLeases, Lease, Scope, Credentials) {
+    live_scope_for_agent("fixture-agent")
+}
+pub(crate) fn live_scope_for_agent(agent: &str) -> (SessionLeases, Lease, Scope, Credentials) {
     let (socket, _other) = UnixStream::pair().unwrap();
     let peer = crate::platform::peer::credentials(&socket);
     let leases = SessionLeases::default();
-    let mut lease = leases
-        .reserve("fixture-agent", "fixture-session", None)
-        .unwrap();
+    let mut lease = leases.reserve(agent, "fixture-session", None).unwrap();
     lease.bind_test_peer(peer.pid.unwrap());
     let mut scope = Scope(Arc::new(ScopeData {
         credential: Some(lease.credential()),

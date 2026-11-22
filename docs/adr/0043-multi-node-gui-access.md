@@ -598,11 +598,17 @@ historical contract until this amendment is accepted and implemented.
    reuse the enrolled home's signed M1 `Body` (`src/mesh/command.rs`), verified
    by `Frame::verify` and `src/mesh/sign.rs`; it binds home, principal, scopes,
    destination, target, verb and argument digest. A1 accepts principal strings,
-   not identity proofs. M1's `TokenSource` currently has only App/File: it does
-   **not** yet encode agent provenance or connect scoped MCP to mesh commands.
-   Before agent forwarding, extend that signed provenance and wire the verified
-   agent identity and its policy-derived scope ceiling at the home; an agent
-   cannot assert its own scopes or masquerade as App. No credential crosses the
+   not identity proofs. P1 extends M1's `TokenSource` with Agent and adds dormant
+   admission adapters for app sessions and scoped MCP identities. Before agent
+   forwarding, M3 must invoke these adapters inside authenticated admission and
+   use the verified agent identity and policy-derived scope ceiling; an agent
+   cannot assert its own scopes or masquerade as App. **Q13 owner ruling,
+   2026-11-22 (PROPOSED amendment):** the local operator sets `mesh_scopes` on
+   the ADR-0052 profile binding, defaulting to `read` only. Effective authority
+   intersects this authenticated profile ceiling with the destination grant and
+   verb policy. Remote lifecycle requires `operate` in both ceiling and grant.
+   Forks and resumes retain the profile ceiling; destination grants are never
+   inherited. No credential crosses the
    mesh. File tokens remain refused for start/stop/restart/resume, even with an
    `operate` grant: a portable bearer proves neither process-bound human nor
    live lease-bound agent identity. Existing scoped lease credentials are not

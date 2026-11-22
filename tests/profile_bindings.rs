@@ -105,7 +105,9 @@ fn socket_status_restores_operator_bindings_and_true_switch_without_activation()
                 .get("error")
                 .is_none());
         } else {
-            assert_eq!(reply["result"]["bindings"], raw["bindings"]);
+            let mut projected = raw["bindings"].clone();
+            projected[0]["mesh_scopes"] = json!(["read"]);
+            assert_eq!(reply["result"]["bindings"], projected);
         }
         let reply = json_api::request(&socket, r#"{"id":"enable","method":"profile.enable","params":{"plan":"fixture-plan","expect":"fixture-digest"}}"#, Duration::from_secs(5)).unwrap();
         let reply: Value = serde_json::from_str(&reply).unwrap();
