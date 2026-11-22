@@ -411,6 +411,29 @@ refusal:
 
 Part of #3096.
 
+#### Amendment 2026-11-22 — Q9 grant-authorized lifecycle across nodes (#1380)
+
+**Status: PROPOSED.** The owner's 2026-11-22 direction includes the human user
+and agents explicitly allowed to act, including “once”.
+[ADR-0043 §4, Q9 amendment](0043-multi-node-gui-access.md#amendment-2026-11-22--q9-lifecycle-grants-for-users-and-agents-1380)
+paragraphs 1–8 specify the proposed replacement for the home-node app-session
+restriction above. Home-node app sessions become one principal kind among
+explicitly granted, home-attested user and agent principals. Start, stop and
+restart/resume require `operate` plus the destination grant for that verb and
+target; send/answer keep their own scopes. File tokens remain refused as
+start/stop/restart/resume authority. Existing agent self-stop is preserved.
+
+The linked amendment defines attestation from app-session admission or scoped
+MCP live-lease admission, roles, operator-only grant issuance, once/count/expiry,
+no implicit re-delegation, consumption atomically with J1's durable claim,
+generation-fenced revocation, audit and crash uncertainty. Its paragraph 6
+lists the exact §1a/§5/§5a and ADR-0043 §4/§9 sentences/restrictions to supersede
+on acceptance; accepted historical text is preserved here. Profile admission,
+resource policy and remaining local verb checks still apply. M1 lacks agent
+provenance and A1/J1 lack atomic grant-use accounting today; no runtime gate is
+lifted by this proposal. M2 excludes GUI grant management, and “once” remains
+an explicit owner confirmation in paragraph 8 and the PR body.
+
 `caller_is_local_operator()` (`src/app/api/mesh.rs:182`) treats a local
 caller with no flk pane in its process ancestry as the operator. A
 structured agent has no pane, so its tool calls (`flk msg send`, `flk

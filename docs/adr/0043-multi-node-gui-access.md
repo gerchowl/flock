@@ -573,6 +573,180 @@ until #1380 and its rollout gates land. Remote blob and artifact carriage
 remains ADR-0038 G11; #2293 tracks its integration, never a direct browser
 bypass.
 
+### Amendment 2026-11-22 — Q9 lifecycle grants for users and agents (#1380)
+
+**Status: PROPOSED.** Records the owner's 2026-11-22 direction on #1380's
+2026-11-20 plan, “the user + agents that were allowed to do it” and “as in
+once”. This is a design amendment to §4/§9 and
+[ADR-0036 §1a](0036-structured-agent-sessions.md#1a-identity-and-the-operator-boundary-for-structured-agents),
+not an implementation or activation claim. Accepted text above remains the
+historical contract until this amendment is accepted and implemented.
+[ADR-0026's #1380 amendment](0026-mesh-fleet-transport.md#amendment-1380-mesh-hello-version-negotiation)
+(#3168) still governs negotiation; VERSION stays 5 and M4 owns activation.
+
+1. **Principals and attestation.** Both the human user authenticated through an
+   app session and authenticated agent principals may hold lifecycle grants.
+   The destination keys identity by `(home_node_id, principal)`, never the last
+   relay, caller-supplied agent name or lineage alone. Human attestation starts
+   with the fresh LocalOperator/process-bound app-session admission in
+   `src/structured/permissions/auth/tokens/app_sessions.rs`. Agent attestation
+   starts with the existing scoped MCP admission in `src/api/scoped.rs`,
+   `src/api/server.rs` and `src/structured/lease/scoped.rs`: the home derives
+   `Caller::Agent` from a server-issued lease-generation credential, captured
+   kernel peer credentials and ancestry to the live lease root. Failed or
+   revoked authentication never falls back to operator identity. Across nodes,
+   reuse the enrolled home's signed M1 `Body` (`src/mesh/command.rs`), verified
+   by `Frame::verify` and `src/mesh/sign.rs`; it binds home, principal, scopes,
+   destination, target, verb and argument digest. A1 accepts principal strings,
+   not identity proofs. M1's `TokenSource` currently has only App/File: it does
+   **not** yet encode agent provenance or connect scoped MCP to mesh commands.
+   Before agent forwarding, extend that signed provenance and wire the verified
+   agent identity and its policy-derived scope ceiling at the home; an agent
+   cannot assert its own scopes or masquerade as App. No credential crosses the
+   mesh. File tokens remain refused for start/stop/restart/resume, even with an
+   `operate` grant: a portable bearer proves neither process-bound human nor
+   live lease-bound agent identity. Existing scoped lease credentials are not
+   client token files. Send and answer keep their existing scope rules.
+
+2. **Grant shape, roles and issuance.** Extend A1's destination-local named grant
+   (`src/api/gateway_grants.rs`) with an immutable issuance identity, issuer,
+   subject binding (explicit human/agent principal or operator-assigned role),
+   validity and use limit. Preserve enrolled home, explicit verb/scopes sets and
+   the union of `agent:`, `workspace:` and `*` selectors. The containing
+   destination's pinned NodeId is the node target; a grant on one node never
+   authorizes another. Node-wide authority requires explicit `*`; start targets
+   a workspace, with membership resolved by the destination. Minimum role set:
+   **operator** may manage grants on its own destination, but an operator from
+   another home still needs a destination grant; **owner-of-agent** binds an
+   authenticated owner to explicit agent targets, with no automatic lifecycle
+   authority from parentage or creation; **delegate** receives only enumerated
+   verbs/targets. Roles expand into explicit grants at the destination, with
+   role membership changes fenced like revocation. They never bypass scope or
+   verb checks. Start/stop/restart/resume require `operate`; send requires `send`,
+   answer requires `answer`, and neither implies permission `agent.decide`.
+   Validity is standing, once (`max_uses = 1`), or count-limited (positive
+   `max_uses`), optionally intersected with an absolute expiry. Expired or
+   exhausted authority refuses; uncertain time after recovery fails closed.
+   Only the destination's local operator issues/revokes grants in this design,
+   through A1's sealed LocalOperator management path. Holding a grant never
+   confers re-delegation. No delegation permission is implicit; any future
+   delegation requires a separately accepted explicit issuance capability and
+   may not widen verbs, targets, validity or remaining uses. A revoked issuance
+   ID is never reused, even if its display name is reused. A1 today has only
+   principal sets and standing grants; roles, expiry, issuance IDs and counters
+   are proposed extensions, not landed fields.
+
+3. **Once, retries and crashes.** Consumption belongs to the destination,
+   atomically with the durable J1 claim, before dispatch. Reuse J1's namespace
+   for the signed home and key `(home_node_id, principal, cmd_id)`, binding the
+   exact destination, target, verb and payload digest. Under the grant lease,
+   first look for that key: same digest returns the existing pending/result
+   state without consuming again; a different target/payload refuses. A retry
+   must still pass current identity, revocation and result-disclosure checks,
+   but exhaustion caused by its own claim is not a second-use refusal.
+   Select one matching issuance deterministically (issuance ID order); consume
+   only that grant, recording its ID and use ordinal in the claim. Two homes
+   or different command IDs competing for one use serialize at the destination.
+   J1 (`src/web/wire/commands/journal.rs`, #3179/#3180/#3183/#3185) already
+   syncs claims before returning `Claimed`; it does not yet transact with A1's
+   separate grants file. M2 must make the durable J1 claim the authoritative
+   consumption record, rebuilding use counts from it under the generation
+   lease, rather than decrementing a separate file before/after the append.
+   A failed append admits nothing; uncertain durability fails closed. Before
+   releasing admission after restart, recover claims and counts. A crash after
+   consume/claim and before dispatch leaves the use spent and outcome uncertain:
+   never automatically redispatch or refund it. `resume_only` returns the
+   recorded result or explicit uncertainty, never executes an absent claim.
+   Journal compaction must retain consumption totals/tombstones for each live
+   issuance beyond the command replay window; loss of that state fails closed.
+
+4. **Revocation ordering.** Reuse A1's generation capture, recheck and locked
+   `Store::admit` lease (`src/structured/permissions/auth/gateway.rs`). Admission
+   linearizes at durable consume/claim under that lease: check the captured
+   generation, current grant/role membership, expiry, uses, destination-owned
+   target membership, enrollment and existing verb policy before committing.
+   Revocation increments/persists generation under the same lease. A revocation
+   that commits first fences every in-flight old-generation request before
+   consumption, dispatch or cached-result disclosure; no preflight decision
+   survives it. A claim committed first is already admitted and can complete:
+   later revocation does not undo an effect or promise cancellation. Recheck
+   current authority before disclosing a cached result, without charging another
+   use. This preserves §4's distinction: home token/lease revocation prevents
+   new home attestations, but cannot recall an already signed in-transit
+   command; immediate destination fencing requires destination revocation.
+
+5. **Audit.** Every admitted and refused lifecycle command records signed home,
+   verified principal, selected grant issuance ID, verb, canonical target,
+   `cmd_id`, generation and outcome. Refusals before authentication label claimed
+   identity as unverified; when no grant can be selected, grant ID is null with
+   the typed refusal reason. Never attribute a forged home/principal as verified.
+   Reuse `wire.lifecycle.admission` in `src/web/wire/commands.rs` for admission
+   and refusals, extending its fields for gateway context and send/answer, and
+   existing durable event surfaces (ADR-0005/ADR-0036 §5a). Extend the versioned
+   J1 claim/outcome with grant consumption metadata for admitted commands and
+   replayable results; today J1 has no grant ID. A refused attempt emits audit
+   metadata without creating a dispatchable claim or spending a use. Replays
+   record replay/pending/refused outcomes, not another effect. Preserve unknown
+   records per ADR-0028 §3a; no second audit log format or secret payload logging.
+
+6. **Exact supersession inventory.** On acceptance, the following historical
+   sentences/restrictions change only for grant-authorized lifecycle admission:
+   ADR-0036 §1a's “Resuming an existing structured record is operator-only”,
+   “stop remains available only to the operator and the structured agent itself”,
+   “Mesh relays cannot carry structured start/spawn”, and the token-scope
+   restriction ending “resume authority” become the principal/grant checks of
+   paragraphs 1–4. In its 2026-11-19 amendment, replace the home-node-only
+   app-session Decision and operator-identity equivalence with “Home-node app
+   sessions are one principal kind among granted principals; authenticated users
+   and agents may start, stop and restart/resume on explicitly granted targets.”
+   Replace the Unchanged bullets denying mesh/lineage authority, remote targets,
+   agent resume and all delegation: transport/lineage alone still confer none,
+   but an attested agent's explicit grant may authorize the operation. Replace
+   the follow-up instruction “refuse everything but Source::App operate” with
+   admission of granted attested user/agent principals. Retain file-token
+   refusal, self-stop, credential audit and ADR-0052 profile checks. ADR-0036
+   §5's sentence beginning “That reach is why” becomes a reference to this
+   process-bound human/lease-bound agent distinction; `read`/`send`/`answer`
+   still confer no start/stop/restart authority. Its §5a journal/recovery rules
+   gain the atomic consumption and retention requirements of paragraph 3.
+   ADR-0043 §4's effective-authority sentence includes the authenticated agent
+   scope ceiling as well as home token scopes. Its A1 status sentences beginning
+   “Remote structured start/stop/restart/resume” and “this slice does not extend”
+   are replaced by the proposed Q9 grant rule, with implementation still gated.
+   Its journal-before-dispatch sentence includes atomic consumption. Its §9
+   A1 acceptance retains the lifecycle refusal until this design is implemented;
+   M1 gains authenticated agent provenance; M2's dependency and acceptance gain
+   paragraphs 3–4's atomicity/recovery and revocation oracles. Older operator-only
+   references in ADR-0044/ADR-0049/ADR-0052 must be reconciled before activation;
+   this proposal does not silently override their remaining policy checks.
+
+7. **M2 and GUI consequences.** Destination order is verify authenticated origin
+   and signed binding → atomically check the remaining 30-second budget →
+   evaluate current grant, scope and verb policy, including single-use selection
+   → durable J1 write with atomic consumption → dispatch through existing verb
+   handlers → admission/result receipt. Evaluation/consumption and J1 write are
+   one admission transaction under paragraph 4's fence, not two durable commits;
+   recheck budget immediately before claim. Keep M1's monotonic residence and
+   ADR-0026 next-hop version gates; no offline mail custody. M2 acceptance must
+   exercise user and agent admission, file-token refusal, once/count/expiry,
+   duplicate retries and changed targets, simultaneous final-use requests,
+   revocation races, lost ack and crashes around claim/dispatch/result, recovery
+   and compaction without restored uses. Agent attestation and the A1/J1
+   extensions are prerequisites, not satisfied by lifting today's refusal.
+   GUI grant display/creation is **out of scope for M2**. Proposed follow-up
+   issue for the report only: “GUI lifecycle grant management: show subject,
+   verbs, targets, remaining uses, expiry and revocation; create explicit once
+   or standing grants.” Do not create it in this docs task.
+
+8. **Owner confirmation for the PR.** Our reading of “as in once” is a
+   single-use authorization grant alongside standing and time-bounded grants,
+   not “approve once, then allow indefinitely”. The existing A1 standing model
+   does not settle that phrase. Put this open confirmation in the PR body:
+   “Does ‘as in once’ mean a grant consumed by one distinct admitted command,
+   with retries of the same cmd_id free of another use, alongside standing
+   grants?” This proposal uses that reading pending acceptance; no runtime
+   policy changes here.
+
 ## 5. Federated fleet materialization
 
 The NODE STATUS contract above is the immediate #2721/G4 boundary, including
