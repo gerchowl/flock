@@ -5,7 +5,7 @@ use crate::{
 };
 use std::{cell::Cell, os::unix::net::UnixStream};
 
-fn operator() -> App {
+pub(super) fn operator() -> App {
     let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = App::new(
         &crate::config::Config::default(),
@@ -25,8 +25,9 @@ fn operator() -> App {
     app.current_api_peer_uid = Some(peer.uid);
     app
 }
-fn grant(targets: &[&str]) -> Grant {
+pub(super) fn grant(targets: &[&str]) -> Grant {
     Grant {
+        lifecycle: None,
         name: "tablet".into(),
         home_node_id: "a".repeat(64),
         principals: ["client-1".into()].into(),
@@ -45,7 +46,7 @@ fn grant(targets: &[&str]) -> Grant {
         targets: targets.iter().map(|s| (*s).into()).collect(),
     }
 }
-fn request<'a>(g: &'a Grant, scopes: &'a BTreeSet<Scope>) -> Request<'a> {
+pub(super) fn request<'a>(g: &'a Grant, scopes: &'a BTreeSet<Scope>) -> Request<'a> {
     Request {
         home: &g.home_node_id,
         principal: "client-1",
@@ -54,14 +55,27 @@ fn request<'a>(g: &'a Grant, scopes: &'a BTreeSet<Scope>) -> Request<'a> {
         target: Target::Agent("agent_atlas_1"),
     }
 }
-fn fixture() -> (SessionConfigDir, Store, App) {
+pub(super) fn fixture() -> (SessionConfigDir, Store, App) {
     let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
     let store = Store::open(root.path()).unwrap();
     (root, store, operator())
 }
-fn add(store: &Store, app: &mut App, g: Grant) -> u64 {
+pub(super) fn add(store: &Store, app: &mut App, g: Grant) -> u64 {
     store
-        .manage(&app.client_token_authority().unwrap(), Some(Change::Add(g)))
+        .manage_issued(
+            &app.client_token_authority().unwrap(),
+            Some(Change::Add(g)),
+            || {
+                Ok((
+                    "b".repeat(64),
+                    Some(ClockPair {
+                        domain: "fixture-domain".into(),
+                        wall_ms: 10000,
+                        elapsed_ms: 20000,
+                    }),
+                ))
+            },
+        )
         .unwrap()
         .generation
 }
@@ -380,5 +394,43 @@ async fn every_management_verb_refuses_nonoperator_dispatch_context() {
             .unwrap();
             assert_eq!(response["error"]["code"], "operator_only", "{response}");
         }
+    }
+}
+
+#[test]
+fn lifecycle_schema_and_nonconsuming_decisions() {
+    use crate::api::gateway_grants::{Lifecycle, Subject};
+    let (_root, store, mut app) = fixture();
+    let mut g = grant(&["*"]);
+    g.lifecycle = Some(
+        Lifecycle {
+            subject: Subject::User,
+            destination_node_id: "b".repeat(64),
+            max_uses: Some(1),
+            lifetime_ms: None,
+            issuance: None,
+        }
+        .into(),
+    );
+    let generation = add(&store, &mut app, g.clone());
+    let mut r = request(&g, &g.scopes);
+    r.verb = "agent.stop";
+    let context = Evaluation {
+        request: &r,
+        source: PrincipalKind::User,
+        destination: &"b".repeat(64),
+        clock: None,
+        consumed: &BTreeMap::new(),
+    };
+    for _ in 0..2 {
+        assert!(matches!(
+            store
+                .evaluate(&context, generation, |_| Some("w1".into()))
+                .unwrap(),
+            Decision::Allowed {
+                remaining: Some(1),
+                ..
+            }
+        ));
     }
 }

@@ -4,7 +4,7 @@ use super::tokens::Scope;
 use crate::{
     api::{
         error_code::ErrorCode as E,
-        gateway_grants::{Grant, Listing},
+        gateway_grants::{ClockPair, Grant, Issuance, Lifecycle, Listing, Subject, SubjectKind},
     },
     app::LocalOperator,
     platform::{client_tokens::Namespace, file_lock::LockFile},
@@ -12,7 +12,7 @@ use crate::{
 };
 use serde_json::{json, Value};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs::TryLockError,
     io::{Read, Write},
     path::Path,
@@ -65,6 +65,46 @@ fn valid(g: &Grant) -> bool {
             .all(|p| !p.is_empty() && p.len() <= 256 && !p.chars().any(char::is_control))
         && g.verbs.iter().all(|v| required_scope(v).is_some())
         && g.targets.iter().all(|s| selector(s))
+        && g.lifecycle.as_ref().is_none_or(|p| {
+            p.destination_node_id.len() == 64
+                && p.destination_node_id
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                && p.max_uses != Some(0)
+                && p.lifetime_ms != Some(0)
+                && (!matches!(
+                    p.subject,
+                    Subject::Role {
+                        role: crate::api::gateway_grants::Role::OwnerOfAgent,
+                        ..
+                    }
+                ) || g.targets.iter().all(|s| s.starts_with("agent:")))
+        })
+}
+fn sealed(p: &Lifecycle) -> bool {
+    let Some(i) = &p.issuance else {
+        return false;
+    };
+    if i.id.len() != 32
+        || !i.id.bytes().all(|b| b.is_ascii_hexdigit())
+        || i.issuer != format!("{}:local_operator", p.destination_node_id)
+    {
+        return false;
+    }
+    match (
+        p.lifetime_ms,
+        &i.issued,
+        i.expires_at_ms,
+        i.elapsed_deadline_ms,
+    ) {
+        (None, None, None, None) => true,
+        (Some(l), Some(c), Some(w), Some(m)) => {
+            !c.domain.is_empty()
+                && c.wall_ms.checked_add(l) == Some(w)
+                && c.elapsed_ms.checked_add(l) == Some(m)
+        }
+        _ => false,
+    }
 }
 /// Closed mapping: unknown verbs cannot acquire authority through a grant.
 pub(crate) fn required_scope(verb: &str) -> Option<Scope> {
@@ -145,7 +185,9 @@ impl Store {
             .map(|(key, raw)| {
                 let grant = serde_json::from_value::<Grant>(raw.clone())
                     .ok()
-                    .filter(|g| g.name == *key && valid(g));
+                    .filter(|g| {
+                        g.name == *key && valid(g) && g.lifecycle.as_ref().is_none_or(|p| sealed(p))
+                    });
                 if grant.is_none() {
                     tracing::warn!("gateway grant entry skipped: invalid or newer format");
                 }
@@ -160,15 +202,63 @@ impl Store {
     /// LocalOperator is sealed by the same socket admission as client tokens.
     pub(crate) fn manage(
         &self,
+        authority: &LocalOperator<'_>,
+        change: Option<Change>,
+    ) -> Result<Listing, E> {
+        self.manage_issued(authority, change, || {
+            let destination = crate::mesh::identity::NodeIdentity::existing()
+                .map_err(storage)?
+                .node_id();
+            Ok((destination, lifecycle::clock_pair()))
+        })
+    }
+    fn manage_issued(
+        &self,
         _: &LocalOperator<'_>,
         change: Option<Change>,
+        environment: impl FnOnce() -> Result<(String, Option<ClockPair>), E>,
     ) -> Result<Listing, E> {
         let (_lease, mut value) = self.snapshot()?;
         if let Some(change) = change {
             match change {
-                Change::Add(grant) => {
+                Change::Add(mut grant) => {
                     if !valid(&grant) || value["entries"].get(&grant.name).is_some() {
                         return Err(E::InvalidParams);
+                    }
+                    if let Some(p) = &mut grant.lifecycle {
+                        if p.issuance.is_some() {
+                            return Err(E::InvalidParams);
+                        }
+                        let (destination, clock) = environment()?;
+                        if p.destination_node_id != destination {
+                            return Err(E::InvalidParams);
+                        }
+                        let mut bytes = [0; 16];
+                        getrandom::fill(&mut bytes).map_err(storage)?;
+                        let mut issuance = Issuance {
+                            id: format!("{:032x}", u128::from_ne_bytes(bytes)),
+                            issuer: format!("{destination}:local_operator"),
+                            issued: None,
+                            expires_at_ms: None,
+                            elapsed_deadline_ms: None,
+                        };
+                        if let Some(lifetime) = p.lifetime_ms {
+                            let clock = clock.ok_or(E::InternalError)?;
+                            issuance.expires_at_ms = Some(
+                                clock
+                                    .wall_ms
+                                    .checked_add(lifetime)
+                                    .ok_or(E::InvalidParams)?,
+                            );
+                            issuance.elapsed_deadline_ms = Some(
+                                clock
+                                    .elapsed_ms
+                                    .checked_add(lifetime)
+                                    .ok_or(E::InvalidParams)?,
+                            );
+                            issuance.issued = Some(clock);
+                        }
+                        p.issuance = Some(issuance);
                     }
                     value["entries"][&grant.name] =
                         serde_json::to_value(&grant).map_err(storage)?;
@@ -234,7 +324,8 @@ impl Store {
         }
         let workspace = membership(request.target).ok_or(E::NotAuthorized)?;
         let allowed = listing.entries.values().flatten().any(|g| {
-            g.home_node_id == request.home
+            g.lifecycle.is_none()
+                && g.home_node_id == request.home
                 && g.principals.contains(request.principal)
                 && g.scopes.contains(&scope)
                 && g.verbs.contains(request.verb)
@@ -253,3 +344,10 @@ impl Store {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod lifecycle_tests;
+
+pub(crate) mod lifecycle;
+#[cfg(test)]
+use lifecycle::{Decision, Evaluation, PrincipalKind, Refusal};
