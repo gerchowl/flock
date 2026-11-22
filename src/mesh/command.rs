@@ -15,12 +15,17 @@ use crate::{api::client_tokens::Scope, platform::suspend_clock, terminal::AgentI
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeSet, time::Duration};
 
+mod provenance;
+pub(crate) use provenance::Provenance;
+
 pub(crate) const BUDGET_MS: u64 = 30_000;
 
+/// Authenticated principal class: App is a process-bound user, Agent a live lease.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum TokenSource {
     App,
+    Agent,
     File,
 }
 
@@ -31,7 +36,7 @@ pub(crate) enum Target {
     Workspace(String),
 }
 
-/// Home-attested facts, supplied only after token authentication by M3.
+/// Home-attested facts, supplied only after authenticated admission.
 /// Digests commit to arguments without transporting raw secrets or credentials.
 /// Source records provenance; it does not grant remote lifecycle authority.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -97,6 +102,20 @@ impl Body {
         {
             return Err("invalid_envelope");
         }
+        if self.token_source == TokenSource::Agent && !AgentId::is_well_formed(&self.principal) {
+            return Err("invalid_envelope");
+        }
+        if self.token_source == TokenSource::File
+            && matches!(
+                self.verb.as_str(),
+                "agent.start" | "agent.stop" | "agent.restart" | "agent.resume"
+            )
+        {
+            return Err("not_authorized");
+        }
+        if !self.scopes.contains(&self.requested_scope) {
+            return Err("not_authorized");
+        }
         Ok(())
     }
 }
@@ -104,11 +123,13 @@ impl Body {
 impl Frame {
     /// Refuse before minting an envelope when either endpoint cannot use VERSION 6.
     pub(crate) fn originate(
-        body: Body,
+        mut body: Body,
         identity: &NodeIdentity,
         next_version: u32,
+        provenance: &Provenance<'_>,
     ) -> Result<Self, &'static str> {
         enabled(next_version)?;
+        provenance.bind(&mut body)?;
         body.validate()?;
         if body.home_node_id != identity.node_id() {
             return Err("origin_mismatch");
@@ -266,4 +287,4 @@ impl Hop {
 
 // VERSION 6 is reachable only through debug-only negotiation overrides in M1.
 #[cfg(all(test, debug_assertions))]
-mod tests;
+pub(crate) mod tests;

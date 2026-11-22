@@ -55,7 +55,14 @@ commands are `profile plan bind`, `profile bind`, `profile revoke` and `profile 
 - `profile.plan` accepts `{ "action": "bind", "binding_id": "optional-existing-id",
   "target": { "repo_id": "repo", "node_ids": ["node"], "agent_ids": ["agent"] },
   "account_alias": "alias", "credential_ref": "opaque-reference",
-  "credential_generation": 1, "bundle_digests": ["digest"], "grants": [] }`.
+  "credential_generation": 1, "bundle_digests": ["digest"], "grants": [],
+  "mesh_scopes": ["read"] }`.
+  `mesh_scopes` is the operator-owned ceiling for authenticated mesh commands:
+  `read`, `send`, `answer`, `operate`. Omitting it defaults to `["read"]`, including
+  on older stored bindings; an empty set denies all scopes. Lifecycle needs
+  `operate` plus a separate destination grant. Forks/resumes retain the profile
+  ceiling and do not inherit destination grants. Mesh VERSION remains 5 and
+  remote lifecycle remains refused.
   Omit `binding_id` to allocate a fresh identity. The response contains `plan`,
   `expect` (the review SHA-256) and `review`, including the predecessor policy
   revision, previous binding, exact proposed binding and expiration timestamp.

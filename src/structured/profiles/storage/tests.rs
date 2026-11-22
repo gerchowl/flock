@@ -29,6 +29,7 @@ impl Fixture {
             credential_generation: 1,
             bundle_digests: vec!["fixture-digest".into()],
             grants: vec![],
+            mesh_scopes: [crate::api::client_tokens::Scope::Read].into(),
         };
         let plan = gate.plan_bind(7, PlanRequest::Bind(spec)).unwrap();
         gate.bind(

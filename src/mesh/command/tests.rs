@@ -38,7 +38,13 @@ fn body() -> Body {
     }
 }
 fn frame() -> Frame {
-    Frame::originate(body(), &NodeIdentity::fixture([7; 32]), 6).unwrap()
+    Frame::originate(
+        body(),
+        &NodeIdentity::fixture([7; 32]),
+        6,
+        &Provenance::fixture(&body()),
+    )
+    .unwrap()
 }
 
 #[test]
@@ -60,9 +66,14 @@ fn signed_round_trip_preserves_home_after_multiple_hops() {
     let mut file = body();
     file.token_source = TokenSource::File;
     assert_eq!(
-        Frame::originate(file.clone(), &NodeIdentity::fixture([7; 32]), 6)
-            .unwrap()
-            .verify(),
+        Frame::originate(
+            file.clone(),
+            &NodeIdentity::fixture([7; 32]),
+            6,
+            &Provenance::fixture(&file)
+        )
+        .unwrap()
+        .verify(),
         Ok(file)
     );
 }
@@ -100,7 +111,12 @@ fn home_target_payload_and_budget_substitution_fail_signature_verification() {
     changed.envelope.target_agent.push('x');
     assert_eq!(changed.verify(), Err("invalid_signature"));
     assert_eq!(
-        Frame::originate(body(), &NodeIdentity::fixture([9; 32]), 6),
+        Frame::originate(
+            body(),
+            &NodeIdentity::fixture([9; 32]),
+            6,
+            &Provenance::fixture(&body())
+        ),
         Err("origin_mismatch")
     );
 }
@@ -153,7 +169,12 @@ fn serialized_frames_and_refusals_carry_no_credentials_or_raw_arguments() {
 fn version_five_refuses_before_emission_and_downgrade_never_holds_commands() {
     let (_lock, _scrub) = six();
     assert_eq!(
-        Frame::originate(body(), &NodeIdentity::fixture([7; 32]), 5),
+        Frame::originate(
+            body(),
+            &NodeIdentity::fixture([7; 32]),
+            5,
+            &Provenance::fixture(&body())
+        ),
         Err("unsupported_for_agent")
     );
     let mut hop = Hop::receive(frame(), Some(Duration::ZERO)).unwrap();
@@ -178,7 +199,12 @@ fn version_five_refuses_before_emission_and_downgrade_never_holds_commands() {
     std::env::remove_var("FLOCK_TEST_MESH_MIN");
     assert_eq!(hello::window(), (5, 5));
     assert_eq!(
-        Frame::originate(body(), &NodeIdentity::fixture([7; 32]), 6),
+        Frame::originate(
+            body(),
+            &NodeIdentity::fixture([7; 32]),
+            6,
+            &Provenance::fixture(&body())
+        ),
         Err("unsupported_for_agent")
     );
     assert_eq!(hop.frame.verify(), Err("unsupported_for_agent"));
@@ -228,20 +254,25 @@ fn workspace_start_is_explicit_and_budget_policy_is_fixed() {
     start.requested_scope = Scope::Operate;
     let identity = NodeIdentity::fixture([7; 32]);
     assert_eq!(
-        Frame::originate(start.clone(), &identity, 6)
+        Frame::originate(start.clone(), &identity, 6, &Provenance::fixture(&start))
             .unwrap()
             .verify(),
         Ok(start.clone())
     );
     start.target = Target::Agent("agent_hopper_command".into());
     assert_eq!(
-        Frame::originate(start, &identity, 6),
+        Frame::originate(start.clone(), &identity, 6, &Provenance::fixture(&start)),
         Err("invalid_envelope")
     );
     let mut invalid = body();
     invalid.budget_ms += 1;
     assert_eq!(
-        Frame::originate(invalid, &identity, 6),
+        Frame::originate(
+            invalid.clone(),
+            &identity,
+            6,
+            &Provenance::fixture(&invalid)
+        ),
         Err("invalid_envelope")
     );
 }
@@ -300,4 +331,287 @@ fn hub_preparation_returns_a_signed_refusal_instead_of_a_deferred_command() {
     mismatched.envelope.target_agent = "agent_kiln_command".into();
     sign::seal(&mut mismatched.envelope, &NodeIdentity::fixture([7; 32]));
     assert_eq!(mismatched.verify(), Err("invalid_envelope"));
+}
+
+/// Exercise the signed envelope from a real token-store admission callback.
+pub(crate) fn authenticated_token_round_trip(
+    token: &crate::structured::permissions::auth::VerifiedToken<'_>,
+    principal: &str,
+    app: bool,
+) {
+    let (_lock, _scrub) = six();
+    let proof = Provenance::from_token(token);
+    let (_, _, scopes) = token.command_facts();
+    let mut payload = body();
+    payload.principal = principal.into();
+    payload.scopes = scopes.clone();
+    payload.token_source = if app {
+        TokenSource::App
+    } else {
+        TokenSource::File
+    };
+    let identity = NodeIdentity::fixture([7; 32]);
+    let signed = Frame::originate(payload.clone(), &identity, 6, &proof).unwrap();
+    assert_eq!(signed.verify(), Ok(payload.clone()));
+    for change in [
+        |b: &mut Body| b.principal.push('x'),
+        |b: &mut Body| {
+            b.scopes.clear();
+        },
+        |b: &mut Body| b.token_source = TokenSource::Agent,
+    ] {
+        let mut altered = signed.clone();
+        let mut b = payload.clone();
+        change(&mut b);
+        altered.envelope.body = serde_json::to_vec(&b).unwrap();
+        assert_eq!(altered.verify(), Err("invalid_signature"));
+        assert_eq!(
+            Frame::originate(b, &identity, 6, &proof),
+            Err("not_authorized")
+        );
+    }
+    if !app {
+        let mut promoted = payload.clone();
+        promoted.token_source = TokenSource::App;
+        assert_eq!(
+            Frame::originate(promoted, &identity, 6, &proof),
+            Err("not_authorized")
+        );
+    }
+    for verb in ["agent.start", "agent.stop", "agent.restart", "agent.resume"] {
+        let mut lifecycle = payload.clone();
+        lifecycle.verb = verb.into();
+        lifecycle.requested_scope = Scope::Operate;
+        if verb == "agent.start" {
+            lifecycle.target = Target::Workspace("w1".into());
+        }
+        if app {
+            assert!(Frame::originate(lifecycle, &identity, 6, &proof).is_ok());
+        } else {
+            assert_eq!(
+                Frame::originate(lifecycle.clone(), &identity, 6, &proof),
+                Err("not_authorized")
+            );
+            let mut forged = signed.clone();
+            forged.envelope.body = serde_json::to_vec(&lifecycle).unwrap();
+            forged.envelope.intent = verb.into();
+            if verb == "agent.start" {
+                forged.envelope.target_agent.clear();
+            }
+            sign::seal(&mut forged.envelope, &identity);
+            assert_eq!(forged.verify(), Err("not_authorized"));
+        }
+    }
+    std::env::remove_var("FLOCK_TEST_MESH_VERSION");
+    std::env::remove_var("FLOCK_TEST_MESH_MIN");
+    assert_eq!(hello::window(), (5, 5));
+    assert_eq!(
+        Frame::originate(payload, &identity, 6, &proof),
+        Err("unsupported_for_agent")
+    );
+    assert_eq!(signed.verify(), Err("unsupported_for_agent"));
+}
+
+#[test]
+fn scoped_admission_binds_profile_ceiling_identity_and_revocation() {
+    use crate::structured::{
+        profiles::ProfileAdmission,
+        registry::{BindingIdentity, ProfileIdentity, Record, Registry, StructuredRuntime},
+    };
+    let (_lock, _scrub) = six();
+    let root = crate::test_support::TempDir::socket();
+    let path = root.path().join("profile-bindings.json");
+    let mut profiles = ProfileAdmission::load(&path);
+    let (_leases, lease, scope, _) = crate::api::scoped::tests::live_scope();
+    let crate::structured::lease::Caller::Agent { agent, .. } = scope.caller() else {
+        panic!("not authenticated")
+    };
+    let mut record = Record {
+        runtime: StructuredRuntime::Structured,
+        agent_id: agent.clone(),
+        name: None,
+        harness: "claude".into(),
+        session_id: "fixture-session".into(),
+        harness_established: true,
+        profile_identity: None,
+        cwd: root.path().into(),
+        model: None,
+    };
+    let mut registry = Registry::default();
+    registry.register(record.clone()).unwrap();
+    let proof = Provenance::from_scoped(&scope, &mut profiles, &registry).unwrap();
+    let mut payload = body();
+    payload.principal = agent.clone();
+    payload.token_source = TokenSource::Agent;
+    payload.scopes = [Scope::Read].into();
+    payload.requested_scope = Scope::Read;
+    payload.verb = "agent.read".into();
+    let identity = NodeIdentity::fixture([7; 32]);
+    assert_eq!(
+        Frame::originate(payload.clone(), &identity, 6, &proof)
+            .unwrap()
+            .verify(),
+        Ok(payload.clone())
+    );
+    let mut widened = payload.clone();
+    widened.scopes.insert(Scope::Operate);
+    assert_eq!(
+        Frame::originate(widened, &identity, 6, &proof),
+        Err("not_authorized")
+    );
+    let mut impersonated = payload.clone();
+    impersonated.principal = "agent_kiln_other".into();
+    assert_eq!(
+        Frame::originate(impersonated, &identity, 6, &proof),
+        Err("not_authorized")
+    );
+    let read_plan = profiles.plan_bind(7, serde_json::from_value(serde_json::json!({
+        "action":"bind", "binding_id":"fixture-binding",
+        "target":{"repo_id":"fixture-repo", "node_ids":["node.example"], "agent_ids":[agent]},
+        "account_alias":"fixture-account", "credential_ref":"unopened-reference",
+        "credential_generation":1, "bundle_digests":["fixture-digest"], "grants":["profile-select-only"]
+    })).unwrap()).unwrap();
+    profiles
+        .bind(
+            7,
+            read_plan["plan"].as_str().unwrap(),
+            read_plan["expect"].as_str().unwrap(),
+        )
+        .unwrap();
+    record.profile_identity = Some(ProfileIdentity {
+        profile: "fixture".into(),
+        binding: Some(BindingIdentity {
+            binding_id: "fixture-binding".into(),
+            revision: 1,
+        }),
+    });
+    registry = Registry::default();
+    registry.register(record.clone()).unwrap();
+    let readonly = Provenance::from_scoped(&scope, &mut profiles, &registry).unwrap();
+    assert!(Frame::originate(payload.clone(), &identity, 6, &readonly).is_ok());
+    let mut elevated = payload.clone();
+    elevated.scopes.insert(Scope::Operate);
+    assert_eq!(
+        Frame::originate(elevated, &identity, 6, &readonly),
+        Err("not_authorized")
+    );
+    let plan = profiles.plan_bind(7, serde_json::from_value(serde_json::json!({"action":"bind", "binding_id":"fixture-binding", "target":{"repo_id":"fixture-repo", "node_ids":["node.example"], "agent_ids":[agent]}, "account_alias":"fixture-account", "credential_ref":"unopened-reference", "credential_generation":1, "bundle_digests":["fixture-digest"], "grants":["profile-select-only"], "mesh_scopes":["read", "operate"]})).unwrap()).unwrap();
+    profiles
+        .bind(
+            7,
+            plan["plan"].as_str().unwrap(),
+            plan["expect"].as_str().unwrap(),
+        )
+        .unwrap();
+    assert!(Provenance::from_scoped(&scope, &mut profiles, &registry).is_err());
+    record.profile_identity = Some(ProfileIdentity {
+        profile: "fixture".into(),
+        binding: Some(BindingIdentity {
+            binding_id: "fixture-binding".into(),
+            revision: 2,
+        }),
+    });
+    registry = Registry::default();
+    registry.register(record.clone()).unwrap();
+    let proof = Provenance::from_scoped(&scope, &mut profiles, &registry).unwrap();
+    payload.scopes.insert(Scope::Operate);
+    payload.verb = "agent.stop".into();
+    payload.requested_scope = Scope::Operate;
+    let signed = Frame::originate(payload.clone(), &identity, 6, &proof).unwrap();
+    assert_eq!(signed.verify(), Ok(payload.clone()));
+    for change in [
+        |b: &mut Body| b.principal = "agent_kiln_other".into(),
+        |b: &mut Body| {
+            b.scopes.insert(Scope::Answer);
+        },
+        |b: &mut Body| b.token_source = TokenSource::App,
+    ] {
+        let mut tampered = signed.clone();
+        let mut b = payload.clone();
+        change(&mut b);
+        tampered.envelope.body = serde_json::to_vec(&b).unwrap();
+        assert_eq!(tampered.verify(), Err("invalid_signature"));
+    }
+    // Resume checks the original profile pin rather than accepting a new ceiling.
+    assert!(record
+        .admit_profile(record.profile_identity.as_ref())
+        .is_ok());
+    let mut changed = record.profile_identity.clone().unwrap();
+    changed.binding.as_mut().unwrap().revision += 1;
+    assert!(record.admit_profile(Some(&changed)).is_err());
+    assert_eq!(
+        profiles
+            .mesh_scopes(record.profile_identity.as_ref())
+            .unwrap(),
+        payload.scopes
+    );
+    let (_, _child_lease, child_scope, _) =
+        crate::api::scoped::tests::live_scope_for_agent("agent_kiln_child");
+    let mut child = record.clone();
+    child.agent_id = "agent_kiln_child".into();
+    child.session_id = "child-session".into();
+    registry.register(child).unwrap();
+    let child_proof = Provenance::from_scoped(&child_scope, &mut profiles, &registry).unwrap();
+    payload.principal = "agent_kiln_child".into();
+    assert_eq!(
+        Frame::originate(payload.clone(), &identity, 6, &proof),
+        Err("not_authorized")
+    );
+    assert_eq!(
+        Frame::originate(payload.clone(), &identity, 6, &child_proof)
+            .unwrap()
+            .verify(),
+        Ok(payload)
+    );
+    // Neither the parent nor the fork imports profile-selection grants into A1.
+    let grants = crate::structured::permissions::auth::gateway::Store::open(root.path()).unwrap();
+    use crate::structured::permissions::auth::gateway::{
+        lifecycle::{Decision, Evaluation, PrincipalKind, Refusal},
+        Request, Target as GrantTarget,
+    };
+    let scopes = [Scope::Read, Scope::Operate].into();
+    let consumed = std::collections::BTreeMap::new();
+    for principal in [agent.as_str(), "agent_kiln_child"] {
+        let request = Request {
+            home: &identity.node_id(),
+            principal,
+            scopes: &scopes,
+            verb: "agent.stop",
+            target: GrantTarget::Agent("agent_hopper_command"),
+        };
+        let context = Evaluation {
+            request: &request,
+            source: PrincipalKind::Agent,
+            destination: &NodeIdentity::fixture([8; 32]).node_id(),
+            clock: None,
+            consumed: &consumed,
+        };
+        assert_eq!(
+            grants.evaluate(&context, 0, |_| Some("w1".into())).unwrap(),
+            Decision::Refused(Refusal::NoGrant)
+        );
+    }
+    let authenticated_body = signed.verify().unwrap();
+    drop(lease);
+    assert_eq!(
+        Frame::originate(authenticated_body, &identity, 6, &proof),
+        Err("not_authorized")
+    );
+    profiles
+        .revoke(
+            7,
+            crate::structured::profiles::bindings::transactions::RevokeRequest {
+                binding: "fixture-binding".into(),
+                reason: "fixture revocation".into(),
+            },
+        )
+        .unwrap();
+    assert!(Provenance::from_scoped(&child_scope, &mut profiles, &registry).is_err());
+    assert!(Provenance::from_scoped(&scope, &mut profiles, &registry).is_err());
+    assert!(Provenance::from_scoped(
+        &crate::api::scoped::tests::unknown_credential(&scope),
+        &mut profiles,
+        &registry
+    )
+    .is_err());
 }

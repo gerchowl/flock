@@ -415,9 +415,10 @@ impl TokenStore {
         if !r.scopes.contains(&required) {
             return Err(TokenError::Scope);
         }
-        Ok(dispatch(VerifiedToken::new(
+        Ok(dispatch(VerifiedToken::authenticated(
             &r.principal,
-            r.scopes.contains(&Scope::Operate),
+            r.scopes.clone(),
+            false,
         )))
     }
 }

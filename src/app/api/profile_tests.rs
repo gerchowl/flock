@@ -240,8 +240,10 @@ fn commit_plan(app: &mut App, plan: &Value) -> Value {
 
 #[tokio::test]
 async fn profile_mutations_refuse_relays_and_agents_before_any_effect() {
+    let mut widened = proposed("binding-a");
+    widened["mesh_scopes"] = json!(["read", "operate"]);
     for params in [
-        ("profile.plan", proposed("binding-a")),
+        ("profile.plan", widened),
         (
             "profile.bind",
             json!({"plan":"fixture-plan","expect":"fixture-digest"}),

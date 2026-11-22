@@ -427,3 +427,38 @@ fn operator_identity_survives_a_store_restart_without_reusing_credentials() {
     assert_ne!(second.token, first.token);
     assert_ne!(second.info.name, first.info.name);
 }
+
+#[test]
+#[cfg(debug_assertions)]
+fn authenticated_app_and_file_provenance_round_trip_without_lifecycle_file_authority() {
+    let (_root, files, store, _clock, mut app) = fixture();
+    let authority = app.client_token_authority().unwrap();
+    let issued = store.issue(&authority).unwrap();
+    let session = store.authenticate(&issued.token).unwrap();
+    store
+        .admit(&session, Scope::Operate, |token| {
+            crate::mesh::command::tests::authenticated_token_round_trip(
+                &token,
+                &issued.info.principal,
+                true,
+            );
+        })
+        .unwrap();
+    let issued = files
+        .issue(
+            &authority,
+            "file-proof",
+            crate::api::client_tokens::operator_scopes(),
+        )
+        .unwrap();
+    let session = files.authenticate(&issued.token).unwrap();
+    files
+        .admit(&session, Scope::Operate, |token| {
+            crate::mesh::command::tests::authenticated_token_round_trip(
+                &token,
+                &issued.info.principal,
+                false,
+            );
+        })
+        .unwrap();
+}

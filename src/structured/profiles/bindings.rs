@@ -56,10 +56,17 @@ pub(crate) struct BindingView {
     pub bundle_digests: Vec<String>,
     /// Operator-issued profile-selection grant identifiers.
     pub grants: Vec<String>,
+    /// Operator-owned authenticated mesh ceiling, independent of selection grants.
+    #[serde(default = "read_only_mesh_scopes")]
+    pub mesh_scopes: BTreeSet<crate::api::client_tokens::Scope>,
     /// Global policy revision at the last change.
     pub revision: u64,
     /// Terminal revocation, retained across restarts.
     pub revoked: Option<Revocation>,
+}
+
+pub(crate) fn read_only_mesh_scopes() -> BTreeSet<crate::api::client_tokens::Scope> {
+    [crate::api::client_tokens::Scope::Read].into()
 }
 
 fn explicit(s: &str) -> bool {
@@ -303,6 +310,22 @@ impl BindingStore {
         root["bindings"] = json!(self.bindings);
         root["unknown"] = json!(self.unknown);
         root
+    }
+
+    /// Resolve a recorded binding pin without exporting profile-selection grants.
+    pub(super) fn mesh_scopes(
+        &self,
+        pin: &crate::structured::registry::BindingIdentity,
+    ) -> Option<BTreeSet<crate::api::client_tokens::Scope>> {
+        if self.refusal().is_some() {
+            return None;
+        }
+        self.bindings
+            .iter()
+            .find(|b| {
+                b.binding_id == pin.binding_id && b.revision == pin.revision && b.revoked.is_none()
+            })
+            .map(|b| b.mesh_scopes.clone())
     }
 
     /// Resolve explicit target identities using in-memory data alone.

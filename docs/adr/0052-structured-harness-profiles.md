@@ -89,6 +89,26 @@ Preserve authenticated origin through every relay hop: pending and enrolled
 relays never become the local operator, including through local dispatch or
 forwarded profile APIs (the GHSA-6795-cfg2-rhhw confusion class).
 
+#### Amendment 2026-11-22 — Q13 authenticated mesh scope ceiling (#1380)
+
+**Status: PROPOSED.** The owner chooses a per-profile scope ceiling for
+home-attested agent commands. The operator binding gains `mesh_scopes`, an
+explicit set of `read`, `send`, `answer` and `operate` scopes. Omitted fields on
+older bindings default to `["read"]`; an empty set grants no scopes. Only the
+local operator may set or change this field, through the existing reviewed
+`profile.plan` / `profile.bind` transaction. Repository configuration, model
+arguments and scoped MCP callers cannot widen it.
+
+The home authenticates the scoped lease before resolving the agent's recorded
+profile binding and exact revision. Missing legacy bindings yield read-only
+ceilings; revoked, changed or unavailable bound profiles refuse attestation.
+The signed M1 body binds principal kind, identity and this resolved ceiling.
+Forks and resumes retain the same profile ceiling; neither copying the profile
+nor lineage copies destination lifecycle grants. Each principal needs its own
+matching destination grant, and lifecycle requires `operate` in the ceiling as
+well as the grant. Profile-selection grants are separate from destination grants.
+VERSION remains 5 and remote lifecycle remains refused until M4 activation.
+
 ### 2. Adoption and storage
 
 Bundle adoption verifies a canonical manifest and every file's content hash,

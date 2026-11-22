@@ -307,7 +307,11 @@ impl Store {
         if !current.info.scopes.contains(&required) {
             return Err(TokenError::Scope);
         }
-        Ok(dispatch(VerifiedToken::new(&current.info.principal, true)))
+        Ok(dispatch(VerifiedToken::authenticated(
+            &current.info.principal,
+            current.info.scopes.clone(),
+            true,
+        )))
     }
     fn remove(entries: &mut Entries, digest: &[u8; 32]) -> Result<(), TokenError> {
         let entry = entries.remove(digest).ok_or(TokenError::Revoked)?;
