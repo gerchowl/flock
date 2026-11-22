@@ -1155,7 +1155,7 @@ does not fall back to legacy launch. Production readiness remains false.
 Binding preparation is available without enabling execution:
 
 ```bash
-flk profile plan bind --repo <repo-id> --nodes <node-ids> --agents <agent-ids> --account <alias> --bundle <digests> --credential-ref <ref> --generation <n> [--grants <grant-ids>] [--binding <existing-id>] --format json
+flk profile plan bind --repo <repo-id> --nodes <node-ids> --agents <agent-ids> --account <alias> --bundle <digests> --credential-ref <ref> --generation <n> [--grants <grant-ids>] [--mesh-scopes <scopes>] [--binding <existing-id>] --format json
 flk profile bind --plan <id> --expect <digest> --format json
 flk profile status --format json
 flk profile revoke --binding <id> --reason <text> --format json
@@ -1168,7 +1168,12 @@ retention and cleanup policy await a separate decision. This storage preparation
 does not enable execution or change legacy profile storage.
 
 Lists use comma-separated identifiers. Omit `--binding` to allocate a new identity;
-omit `--grants` for an empty grant list. Budget and preset flags, adoption, rotation,
+omit `--grants` for an empty grant list. `--mesh-scopes read,operate` sets the
+operator-owned authenticated mesh ceiling. It defaults to `read`; `none` denies
+all mesh scopes. Allowed names are `read`, `send`, `answer` and `operate`.
+Lifecycle also needs a separate destination grant. Forks/resumes keep the profile
+ceiling and inherit no destination grants. Remote lifecycle remains refused at
+mesh VERSION 5. Budget and preset flags, adoption, rotation,
 and fleet recovery are not available in this slice. Credential references are
 identifiers only. A plan is an immutable five-minute review; `bind` must carry its
 returned `plan` and `expect`. Commit refuses altered, expired or stale reviews.

@@ -11,7 +11,7 @@ use crate::structured::profiles::bindings::{
 pub(super) const ENABLE_USAGE: &str = "flk profile enable --plan <id> --expect <digest> (unavailable until production readiness is complete)";
 
 /// Group usage for data-only preparation and the inactive enable transaction.
-const USAGE: &str = "flk profile plan bind --repo <id> --nodes <ids> --agents <ids> --account <alias> --bundle <digests> --credential-ref <ref> --generation <n> [--grants <ids>] [--binding <id>] | bind|enable --plan <id> --expect <digest> | revoke --binding <id> --reason <text> | status [--format json]";
+const USAGE: &str = "flk profile plan bind --repo <id> --nodes <ids> --agents <ids> --account <alias> --bundle <digests> --credential-ref <ref> --generation <n> [--grants <ids>] [--mesh-scopes <scopes>] [--binding <id>] | bind|enable --plan <id> --expect <digest> | revoke --binding <id> --reason <text> | status [--format json]";
 
 fn parse(args: &[String]) -> Option<Method> {
     let (verb, tail) = args.split_first()?;
@@ -69,6 +69,14 @@ fn parse(args: &[String]) -> Option<Method> {
                 .ok()
                 .filter(|n| *n > 0)?,
             bundle_digests: list(flags.remove("--bundle")?)?,
+            mesh_scopes: match flags.remove("--mesh-scopes") {
+                None => crate::structured::profiles::bindings::read_only_mesh_scopes(),
+                Some("none") => Default::default(),
+                Some(value) => list(value)?
+                    .into_iter()
+                    .map(|s| serde_json::from_value(serde_json::Value::String(s)).ok())
+                    .collect::<Option<_>>()?,
+            },
             grants: match flags.remove("--grants") {
                 Some(value) => list(value)?,
                 None => Vec::new(),
@@ -202,6 +210,55 @@ mod binding_tests {
             let index = invalid.iter().position(|v| v == flag).unwrap();
             invalid[index + 1] = bad.into();
             assert!(parse(&invalid).is_none());
+        }
+    }
+}
+
+#[cfg(test)]
+mod mesh_scope_tests {
+    use super::*;
+
+    #[test]
+    fn mesh_scope_cli_defaults_read_only_and_refuses_unknown_authority() {
+        let base: Vec<String> = [
+            "plan",
+            "bind",
+            "--repo",
+            "fixture-repo",
+            "--nodes",
+            "node.example",
+            "--agents",
+            "agent_hopper_fixture",
+            "--account",
+            "fixture-account",
+            "--bundle",
+            "fixture-digest",
+            "--credential-ref",
+            "unopened-ref",
+            "--generation",
+            "1",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        for (input, expected) in [
+            (None, serde_json::json!(["read"])),
+            (Some("read,operate"), serde_json::json!(["read", "operate"])),
+            (Some("none"), serde_json::json!([])),
+        ] {
+            let mut args = base.clone();
+            if let Some(scopes) = input {
+                args.extend(["--mesh-scopes".into(), scopes.into()]);
+            }
+            let Method::ProfilePlan(PlanRequest::Bind(spec)) = parse(&args).unwrap() else {
+                panic!("bind expected")
+            };
+            assert_eq!(serde_json::to_value(spec).unwrap()["mesh_scopes"], expected);
+        }
+        for value in ["admin", "read,,operate", "none,operate", "read,Operate"] {
+            let mut args = base.clone();
+            args.extend(["--mesh-scopes".into(), value.into()]);
+            assert!(parse(&args).is_none());
         }
     }
 }

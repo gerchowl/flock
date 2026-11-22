@@ -17,7 +17,25 @@ use std::time::Duration;
 use zeroize::Zeroize;
 
 use crate::api::client_tokens::operator_scopes;
-pub(crate) use crate::api::client_tokens::{Bearer, Issued, Listed, Scope, TokenInfo};
+mod scope;
+pub(crate) use crate::api::client_tokens::{Bearer, Issued, Listed, TokenInfo};
+pub use scope::Scope;
+
+/// Mesh facts sealed by the same revocation-fenced admission as permissions.
+/// Distinct from the dependency-free permission capability, never deserialized.
+pub(crate) struct CommandToken<'a> {
+    principal: &'a str,
+    scopes: &'a BTreeSet<Scope>,
+    app: bool,
+}
+impl<'a> CommandToken<'a> {
+    fn permission(self) -> VerifiedToken<'a> {
+        VerifiedToken::new(self.principal, self.scopes.contains(&Scope::Operate))
+    }
+    pub(crate) fn command_facts(&self) -> (&str, bool, &BTreeSet<Scope>) {
+        (self.principal, self.app, self.scopes)
+    }
+}
 /// Admission failures contain no bearer or file contents.
 #[derive(Debug)]
 pub(crate) enum TokenError {
@@ -399,6 +417,15 @@ impl TokenStore {
         required: Scope,
         dispatch: impl for<'a> FnOnce(VerifiedToken<'a>) -> T,
     ) -> Result<T, TokenError> {
+        self.admit_command(session, required, |facts| dispatch(facts.permission()))
+    }
+    /// Authenticate mesh facts under the same current-record and scope fence.
+    pub(crate) fn admit_command<T>(
+        &self,
+        session: &Session,
+        required: Scope,
+        dispatch: impl for<'a> FnOnce(CommandToken<'a>) -> T,
+    ) -> Result<T, TokenError> {
         let _guard = self.lock_with(LockFile::try_lock_shared)?;
         let r = self.load(&session.info.name).map_err(|e| match e {
             TokenError::Io(e) if e.kind() == io::ErrorKind::NotFound => TokenError::Revoked,
@@ -415,10 +442,11 @@ impl TokenStore {
         if !r.scopes.contains(&required) {
             return Err(TokenError::Scope);
         }
-        Ok(dispatch(VerifiedToken::new(
-            &r.principal,
-            r.scopes.contains(&Scope::Operate),
-        )))
+        Ok(dispatch(CommandToken {
+            principal: &r.principal,
+            scopes: &r.scopes,
+            app: false,
+        }))
     }
 }
 

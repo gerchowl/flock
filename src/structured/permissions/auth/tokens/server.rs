@@ -221,9 +221,18 @@ impl Store {
         required: Scope,
         dispatch: impl for<'a> FnOnce(VerifiedToken<'a>) -> T,
     ) -> Result<T, TokenError> {
+        self.admit_command(session, required, |facts| dispatch(facts.permission()))
+    }
+    /// Preserve the authenticated source and current scopes through mesh origination.
+    pub(crate) fn admit_command<T>(
+        &self,
+        session: &Session,
+        required: Scope,
+        dispatch: impl for<'a> FnOnce(CommandToken<'a>) -> T,
+    ) -> Result<T, TokenError> {
         match &session.source {
-            Source::App(s) => self.apps.admit(s, required, dispatch),
-            Source::File(s) => self.files.admit(s, required, dispatch),
+            Source::App(s) => self.apps.admit_command(s, required, dispatch),
+            Source::File(s) => self.files.admit_command(s, required, dispatch),
         }
     }
     /// Gate a contended retirement before its deadline-bounded IPC read.

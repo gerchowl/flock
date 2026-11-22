@@ -114,3 +114,27 @@ fn unknown_receipts_survive_and_conflicting_receipts_refuse() {
     );
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn mesh_ceiling_defaults_read_only_and_operator_review_persists_operate() {
+    let (mut gate, root) = fixture();
+    let plan = gate.plan_bind(7, request("binding-read")).unwrap();
+    assert_eq!(plan["review"]["binding"]["mesh_scopes"], json!(["read"]));
+    bind(&mut gate, &plan, 7).unwrap();
+    let mut raw = serde_json::to_value(request("binding-operate")).unwrap();
+    raw["mesh_scopes"] = json!(["read", "operate"]);
+    let plan = gate
+        .plan_bind(7, serde_json::from_value(raw).unwrap())
+        .unwrap();
+    bind(&mut gate, &plan, 7).unwrap();
+    let loaded = ProfileAdmission::load(&root.join("profile-bindings.json"));
+    let status = loaded.status(true);
+    let binding = status["bindings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["binding_id"] == "binding-operate")
+        .unwrap();
+    assert_eq!(binding["mesh_scopes"], json!(["read", "operate"]));
+    fs::remove_dir_all(root).unwrap();
+}
