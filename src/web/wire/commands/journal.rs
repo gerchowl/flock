@@ -285,15 +285,20 @@ fn unavailable(error: &io::Error) {
     crate::logging::client_wire_unavailable("command_journal", Some(error.kind()));
 }
 fn private(path: &Path) -> io::Result<File> {
-    match files::create_private_file(path) {
+    private_created(path).map(|(file, _)| file)
+}
+/// Open a private stream, also reporting whether this call created it.
+fn private_created(path: &Path) -> io::Result<(File, bool)> {
+    let created = match files::create_private_file(path) {
         Ok(file) => {
             file.sync_all()?;
             filesystem::sync_directory(path.parent().ok_or(io::ErrorKind::InvalidInput)?)?;
+            true
         }
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => (),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => false,
         Err(e) => return Err(e),
-    }
-    files::open_append_file(path)
+    };
+    Ok((files::open_append_file(path)?, created))
 }
 struct Journal {
     file: Stream,
@@ -333,9 +338,16 @@ impl Journal {
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => files::check_private_dir(&root)?,
             Err(e) => return Err(e),
         }
-        let lease = LockFile::new(private(&root.join("commands.lock"))?);
+        let (journal_lease_file, first_open) = private_created(&root.join("commands.lock"))?;
+        let lease = LockFile::new(journal_lease_file);
         lease.try_lock().map_err(io::Error::other)?;
-        let file = private(&root.join("commands.jsonl"))?;
+        // An established journal must never recreate lost consumption as zero uses.
+        let path = root.join("commands.jsonl");
+        let file = if first_open {
+            private(&path)?
+        } else {
+            files::open_append_file(&path)?
+        };
         #[cfg(test)]
         let file = Stream::from(file);
         let bytes = file.metadata()?.len();
@@ -592,7 +604,9 @@ impl Journal {
         );
         let digest = digest(command)?;
         if let Some(record) = self.index.records.get(&key) {
-            if now.saturating_sub(record.admitted_ms) >= super::super::IDEMPOTENCY_WINDOW_MS {
+            if record.consumption.is_none()
+                && now.saturating_sub(record.admitted_ms) >= super::super::IDEMPOTENCY_WINDOW_MS
+            {
                 return Err(if command.resume_only {
                     ErrorCode::SessionUnconfirmed
                 } else {
@@ -706,10 +720,12 @@ impl Index {
                 .counts
                 .entry((key.0.clone(), key.1.clone()))
                 .or_default() += 1;
-            self.oldest_ms = Some(
-                self.oldest_ms
-                    .map_or(record.admitted_ms, |oldest| oldest.min(record.admitted_ms)),
-            );
+            if record.consumption.is_none() {
+                self.oldest_ms = Some(
+                    self.oldest_ms
+                        .map_or(record.admitted_ms, |oldest| oldest.min(record.admitted_ms)),
+                );
+            }
             self.records.insert(key, record);
         }
         true

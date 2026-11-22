@@ -46,8 +46,9 @@ impl Snapshot {
             self.offset += line.len() as u64;
             let record = Record::decode(&line)
                 .ok_or_else(|| io::Error::other("opaque compaction record"))?;
-            if self.now.saturating_sub(record.admitted_ms)
-                < super::super::super::IDEMPOTENCY_WINDOW_MS
+            if record.consumption.is_some()
+                || self.now.saturating_sub(record.admitted_ms)
+                    < super::super::super::IDEMPOTENCY_WINDOW_MS
             {
                 if !self.index.fold(record, self.limit) {
                     return Err(io::Error::other("invalid compaction record"));
@@ -72,9 +73,7 @@ impl Journal {
         let expired = self.index.oldest_ms.is_some_and(|oldest| {
             now.saturating_sub(oldest) >= super::super::super::IDEMPOTENCY_WINDOW_MS
         });
-        // P3b must retain consumption beyond the replay window before sweeping it.
         if self.blocked
-            || !self.index.consumed.is_empty()
             || self.compaction.is_some()
             || (self.bytes < self.next_compaction && !expired)
         {
@@ -173,7 +172,7 @@ impl Journal {
             }
         };
         // A failed append may have left a torn tail. Keep the authoritative log intact.
-        if self.blocked || !self.index.consumed.is_empty() {
+        if self.blocked {
             let _ = control.send(Continue::Retire(snapshot.index));
             return;
         }

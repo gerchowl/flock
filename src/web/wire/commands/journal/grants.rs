@@ -126,5 +126,14 @@ impl Journal {
     }
 }
 /// Rebuilt only from committed claims, never a second durable grants-file update.
-/// P3b will retain these authoritative totals through bounded compaction.
+/// Compaction retains every grant claim and its first outcome, independent of the
+/// ordinary 24-hour replay window. This also preserves command bindings forever:
+/// pending recovery is uncertainty, never permission to redispatch or refund.
+/// No issuance is collected, including revoked/expired issuances, until a future
+/// collection rule can prove that its authority cannot recur. Retention is bounded
+/// by the shared J1 global/per-principal entry caps and active-file byte cap, with
+/// at most two bounded rows per key and one total per retained issuance. Capacity
+/// refuses new admission rather than evicting consumption or restoring uses.
+/// Outcomes still require current A1 authority before disclosure. P3c's clock
+/// evidence belongs at the existing environment seam under that same lease.
 pub(in crate::web::wire) type Totals = BTreeMap<String, u64>;

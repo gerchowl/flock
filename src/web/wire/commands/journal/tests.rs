@@ -210,11 +210,7 @@ fn absent_expired_and_lost_claims_fail_closed() {
         Err(ErrorCode::SessionUnconfirmed)
     ));
     drop(journal);
-    let mut journal = Journal::open(root.path()).unwrap();
-    assert_eq!(
-        journal.claim("local", "p", &cmd, 101).err(),
-        Some(ErrorCode::SessionUnconfirmed)
-    );
+    assert!(Journal::open(root.path()).is_err());
 }
 #[test]
 fn torn_tail_is_archived_before_truncation_and_append_remains_readable() {

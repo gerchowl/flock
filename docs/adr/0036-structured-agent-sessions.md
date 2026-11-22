@@ -2168,6 +2168,23 @@ bounded to 32 record byte caps; recovery refuses without truncation when full.
 A recovered pending claim remains uncertain and a completed claim returns
 its first acknowledgement through the live wire after fresh authorization.
 
+**Dormant Q9 grant retention (#1380, P3b).** Grant-bearing claims and their
+first outcomes are retained regardless of the ordinary 24-hour replay window.
+Compaction copies these records in order, rebuilding authoritative issuance
+totals, command bindings and outcomes before publication. It also retains
+revoked and expired issuances: collection needs a separate proof that authority
+cannot recur. These records occupy the existing global and per-principal entry
+caps and active-file byte cap, with at most two bounded rows per key and one
+total per issuance. At capacity, new admission refuses rather than evicting
+consumption. Retained retries still require current A1 authorization; pending
+claims are uncertainty and never redispatched or refunded. Only ordinary claims
+contribute expiry-triggered sweep deadlines, avoiding repeated futile sweeps of
+permanently retained grants. A surviving writer lease file with a missing log
+fails acquisition instead of creating an empty authority history. This also
+fails closed after interrupted first initialization between those files.
+P3c supplies durable clock evidence through the existing leased environment
+seam. Remote lifecycle remains refused and mesh VERSION remains 5.
+
 Automatic resend is allowed for the listed §5 verbs only through this durable
 idempotency path, not based on an assumed harmless verb. Permission/question
 answers retain stable question/request IDs; apply answer validity, principal

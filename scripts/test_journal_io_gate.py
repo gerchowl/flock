@@ -45,7 +45,7 @@ use filesystem::{File, files, LockFile};
 use self::filesystem;
 use filesystem::fs;
 filesystem::sync_directory(root)?;
-fn private() { files::open_append_file(path)?; }
+fn private_created() { files::open_append_file(path)?; }
 impl<R: Read> Read for ReplayReader<R> {
     fn read(&mut self) { self.source.read(bytes)?; }
 }
@@ -577,7 +577,7 @@ set_permissions spawn output status""".split()
                         'static mut NESTED: () = { %s };']:
             with self.subTest(wrapper=wrapper):
                 self.assertTrue(gate.check_text(
-                    wrapper % 'fn private() { file.sync_all(); }', path))
+                    wrapper % 'fn private_created() { file.sync_all(); }', path))
         self.assertTrue(gate.check_text(
             'impl Writer { fn open() { format!("{}", open); } }', path))
         self.assertTrue(gate.check_text(
