@@ -14,7 +14,13 @@ not infer receiver types or expand macros. Every capability identifier token,
 including declarations, bare references, macro arguments and macro bodies, needs
 a reviewed file/item/receiver anchor. Boundary and fixture code also need anchors.
 Arguments and closure bodies remain independently scanned; receiver literals are
-retained. Declaration anchors are distinct from expression anchors. Duplicate
+retained. Imports pin the complete use leaf, absolute root and binding, including
+explicit `as` clauses. Type and function/value aliases require complete declaration
+permissions, including initializer literals because the callable target carries
+risk. Approved and discovered alias names join the token ban throughout
+the tree, conservatively across scopes and cfgs. Function references, bindings,
+calls and namespace uses have separate anchors. No implicit `as _` exemption is
+granted. Declaration anchors are distinct from expression anchors. Duplicate
 uses with the same anchor share its permission; another item cannot reuse it.
 Receiver bindings remain a review responsibility, not proof of Rust type identity.
 Every in-tree macro_rules! definition requires an explicit reasoned allowlist
@@ -22,8 +28,10 @@ entry reviewed for capability synthesis. No definitions currently need permissio
 Expansion-time identifier construction from fragments (for example a paste-style
 procedural macro) is not modeled: the outside import/path/macro allowlist refuses
 such crates and their macros outside the counted filesystem boundary unless
-explicitly reviewed. There is no shape-based
-metavariable or repetition analysis. Alias collection covers the whole file and
+explicitly reviewed. Binding discovery follows syntax and reviewed paths, not
+arbitrary function effects. Generic, Self-dependent and type-qualified aliases
+require explicit binding review. There is no shape-based metavariable or repetition
+analysis. Alias collection covers the whole file and
 its lexical/inline-module scopes before uses are checked. Unsupported source and
 namespace injection constructs fail closed as documented above.
 """
@@ -291,52 +299,263 @@ def call_receiver(names, index, pairs):
     return receiver(index - 2), index - 1
 
 
-def capability_anchor(text, code, names, pairs, items, index, *, imported=False):
+# Binding permissions pin complete declarations; aliases need separate use anchors.
+IMPORT_EXCEPTIONS = {
+    (COMMANDS / 'journal/filesystem.rs', (), ('crate', 'platform', 'structured'), 'files', True): 'existing counted boundary/stream interface; complete source leaf and binding reviewed',
+    (COMMANDS / 'journal/filesystem.rs', (), ('::', 'std', 'fs', 'remove_file'), 'remove_file', False): 'existing counted boundary/stream interface; complete source leaf and binding reviewed',
+    (COMMANDS / 'journal/filesystem.rs', (), ('::', 'std', 'fs', 'rename'), 'rename', False): 'existing counted boundary/stream interface; complete source leaf and binding reviewed',
+    (COMMANDS / 'journal/filesystem.rs', (), ('counted', 'std', 'fs', 'remove_file'), 'remove_file', False): 'existing counted boundary/stream interface; complete source leaf and binding reviewed',
+    (COMMANDS / 'journal/filesystem.rs', (), ('counted', 'std', 'fs', 'rename'), 'rename', False): 'existing counted boundary/stream interface; complete source leaf and binding reviewed',
+    (COMMANDS / 'journal/filesystem.rs', (), ('counted', 'files'), 'files', False): 'existing counted boundary/stream interface; complete source leaf and binding reviewed',
+    (COMMANDS / 'journal/filesystem.rs', ('mod counted', 'mod std', 'mod fs'), ('super', 'super', 'copy'), 'copy', False): 'existing counted boundary/stream interface; complete source leaf and binding reviewed',
+    (COMMANDS / 'journal/filesystem.rs', ('mod counted', 'mod std', 'mod fs'), ('super', 'super', 'rename'), 'rename', False): 'existing counted boundary/stream interface; complete source leaf and binding reviewed',
+    (COMMANDS / 'journal/filesystem.rs', ('mod counted', 'mod std', 'mod fs'), ('super', 'super', 'write'), 'write', False): 'existing counted boundary/stream interface; complete source leaf and binding reviewed',
+    (COMMANDS / 'journal.rs', (), ('filesystem', 'files'), 'files', False): 'existing counted boundary/stream interface; complete source leaf and binding reviewed',
+    (COMMANDS / 'journal.rs', (), ('tests', 'Stream'), 'Stream', False): 'existing counted boundary/stream interface; complete source leaf and binding reviewed',
+    (COMMANDS / 'journal/filesystem.rs', (), ('crate', 'platform', 'file_lock', 'LockFile'), 'LockFile', False): 'existing counted boundary dependency/re-export; complete source leaf and binding reviewed',
+    (COMMANDS / 'journal/filesystem.rs', (), ('::', 'std', 'fs', 'File'), 'File', False): 'existing counted boundary dependency/re-export; complete source leaf and binding reviewed',
+    (COMMANDS / 'journal/filesystem.rs', (), ('counted', 'std', 'fs', 'self'), 'fs', False): 'existing counted boundary dependency/re-export; complete source leaf and binding reviewed',
+    (COMMANDS / 'journal/filesystem.rs', (), ('counted', 'Observation'), 'Observation', False): 'existing counted boundary dependency/re-export; complete source leaf and binding reviewed',
+    (COMMANDS / 'journal/filesystem.rs', (), ('counted', 'std'), 'std', False): 'existing counted boundary dependency/re-export; complete source leaf and binding reviewed',
+    (COMMANDS / 'journal/filesystem.rs', (), ('counted', 'File'), 'File', False): 'existing counted boundary dependency/re-export; complete source leaf and binding reviewed',
+    (COMMANDS / 'journal/filesystem.rs', (), ('counted', 'LockFile'), 'LockFile', False): 'existing counted boundary dependency/re-export; complete source leaf and binding reviewed',
+    (COMMANDS / 'journal/filesystem.rs', ('mod counted',), ('::', 'std', 'collections', 'HashMap'), 'HashMap', False): 'existing counted boundary dependency/re-export; complete source leaf and binding reviewed',
+    (COMMANDS / 'journal/filesystem.rs', ('mod counted',), ('::', 'std', 'io', 'self'), 'io', False): 'existing counted boundary dependency/re-export; complete source leaf and binding reviewed',
+    (COMMANDS / 'journal/filesystem.rs', ('mod counted',), ('::', 'std', 'io', 'Read'), 'Read', False): 'existing counted boundary dependency/re-export; complete source leaf and binding reviewed',
+    (COMMANDS / 'journal/filesystem.rs', ('mod counted',), ('::', 'std', 'io', 'Seek'), 'Seek', False): 'existing counted boundary dependency/re-export; complete source leaf and binding reviewed',
+    (COMMANDS / 'journal/filesystem.rs', ('mod counted',), ('::', 'std', 'io', 'Write'), 'Write', False): 'existing counted boundary dependency/re-export; complete source leaf and binding reviewed',
+    (COMMANDS / 'journal/filesystem.rs', ('mod counted',), ('::', 'std', 'path', 'Path'), 'Path', False): 'existing counted boundary dependency/re-export; complete source leaf and binding reviewed',
+    (COMMANDS / 'journal/filesystem.rs', ('mod counted',), ('::', 'std', 'path', 'PathBuf'), 'PathBuf', False): 'existing counted boundary dependency/re-export; complete source leaf and binding reviewed',
+    (COMMANDS / 'journal/filesystem.rs', ('mod counted',), ('::', 'std', 'sync', 'Arc'), 'Arc', False): 'existing counted boundary dependency/re-export; complete source leaf and binding reviewed',
+    (COMMANDS / 'journal/filesystem.rs', ('mod counted',), ('::', 'std', 'sync', 'Mutex'), 'Mutex', False): 'existing counted boundary dependency/re-export; complete source leaf and binding reviewed',
+    (COMMANDS / 'journal/filesystem.rs', ('mod counted',), ('::', 'std', 'sync', 'OnceLock'), 'OnceLock', False): 'existing counted boundary dependency/re-export; complete source leaf and binding reviewed',
+    (COMMANDS / 'journal/filesystem.rs', ('mod counted',), ('::', 'std', 'sync', 'Weak'), 'Weak', False): 'existing counted boundary dependency/re-export; complete source leaf and binding reviewed',
+    (COMMANDS / 'journal/filesystem.rs', ('mod counted', 'mod std'), ('::', 'std', '*'), '*', False): 'existing counted boundary dependency/re-export; complete source leaf and binding reviewed',
+    (COMMANDS / 'journal/filesystem.rs', ('mod counted', 'mod std', 'mod fs'), ('super', 'super', 'File'), 'File', False): 'existing counted boundary dependency/re-export; complete source leaf and binding reviewed',
+    (COMMANDS / 'journal/filesystem.rs', ('mod counted', 'mod std', 'mod fs'), ('super', 'super', 'OpenOptions'), 'OpenOptions', False): 'existing counted boundary dependency/re-export; complete source leaf and binding reviewed',
+    (COMMANDS / 'journal/filesystem.rs', ('mod counted', 'mod std', 'mod fs'), ('::', 'std', 'fs', '*'), '*', False): 'existing counted boundary dependency/re-export; complete source leaf and binding reviewed',
+    (COMMANDS / 'journal/filesystem.rs', ('mod counted', 'mod files'), ('super', '*'), '*', False): 'existing counted boundary dependency/re-export; complete source leaf and binding reviewed',
+    (COMMANDS / 'journal/filesystem.rs', ('mod counted', 'mod files'), ('crate', 'platform', 'structured', 'check_private_dir'), 'check_private_dir', False): 'existing counted boundary dependency/re-export; complete source leaf and binding reviewed',
+    (COMMANDS / 'journal/filesystem.rs', ('mod counted', 'mod files'), ('crate', 'platform', 'structured', 'create_private_dir'), 'create_private_dir', False): 'existing counted boundary dependency/re-export; complete source leaf and binding reviewed',
+}
+ALIAS_EXCEPTIONS = {
+    (COMMANDS / 'journal/tests.rs', ('impl std :: ops :: Deref for Stream',), 'type', ('type', 'Target', '=', 'File', ';'), 'Target'): 'existing stream type alias to the counted File; target and binding pinned together',
+    (COMMANDS / 'journal.rs', (), 'type', ('type', 'Stream', '=', 'File', ';'), 'Stream'): 'existing stream type alias to the counted File; target and binding pinned together',
+}
+# Constructor/native namespaces also matter when hidden behind a new binding.
+CAPABILITY_BINDINGS = CAPABILITY_METHODS | {
+    'File', 'OpenOptions', 'LockFile', 'fs', 'filesystem', 'files', 'platform', 'libc',
+}
+
+
+def operation_tail(names, index):
+    """Token after a capability name and any explicit generic arguments."""
+    cursor = index + 1
+    if names[cursor:cursor + 2] == ['::', '<']:
+        cursor += 2
+        depth = 1
+        while cursor < len(names) and depth:
+            depth += (names[cursor] == '<') - (
+                names[cursor] == '>' and names[cursor - 1] != '-')
+            cursor += 1
+    return cursor
+
+
+def capability_reference(names, index):
+    tail = operation_tail(names, index)
+    return (names[max(0, index - 1):index] != ['.']
+            and names[tail:tail + 1] not in (['('], ['::'], ['.'], ['{'], [':']))
+
+
+def binding_inventory(code):
+    """Collect complete use leaves and value/type binding declarations."""
+    names = [name for name, _ in code]
+    pairs = delimiter_pairs(names)
+    imports, bindings, imported = [], [], set()
+    for i, name in enumerate(names):
+        if i in imported:
+            continue
+        if name == 'use':
+            try:
+                entries, end = import_paths(names, i + 1, preserve_roots=True)
+            except (ValueError, IndexError):
+                imports.append((i, None, None, False))
+                continue
+            imported.update(range(i, end))
+            for parts, index, binding in entries:
+                renamed = names[index + 1:index + 2] == ['as']
+                if not renamed and parts[-1] == 'self':
+                    binding = parts[-2]
+                imports.append((index, tuple(parts), binding, renamed))
+        elif name in {'type', 'const', 'static', 'let'}:
+            cursor = i + 1
+            while cursor < len(names) and names[cursor] not in {'=', ';', '{', '}'}:
+                cursor = pairs.get(cursor, cursor) + 1 if names[cursor] in {'(', '['} else cursor + 1
+            if names[cursor:cursor + 1] != ['=']:
+                continue
+            end = cursor + 1
+            while end < len(names) and names[end] not in {';', '}'}:
+                end = pairs.get(end, end) + 1 if names[end] in {'(', '[', '{'} else end + 1
+            if names[end:end + 1] != [';']:
+                continue
+            pattern = names[i + 1:cursor]
+            if ':' in pattern:
+                pattern = pattern[:pattern.index(':')]
+            bound = ([part for j, part in enumerate(pattern) if IDENT.fullmatch(part)
+                      and part not in {'mut', 'ref', '_'}
+                      and pattern[j + 1:j + 2] not in (['('], ['::'], ['{'])] if name == 'let'
+                     else [names[i + 1 + (names[i + 1:i + 2] == ['mut'])]])
+            bindings.append((i, cursor + 1, end, name, tuple(bound)))
+    return imports, bindings, imported
+
+
+def capability_path(parts, aliases, *, unknown=True):
+    parts = [part for part in parts if part not in {'::', 'self'}]
+    if not parts:
+        return False
+    if parts[:2] == ['filesystem', 'std'] or (
+            tuple(parts[:len(JOURNAL)]) == JOURNAL and 'std' in parts[len(JOURNAL):]):
+        parts = parts[parts.index('std'):]
+    if any(part in CAPABILITY_BINDINGS | aliases for part in parts):
+        return True
+    if parts[0] in {'io', 'mpsc', 'oneshot', 'watch'}:
+        prefix = ['std', 'io'] if parts[0] == 'io' else (
+            ['std', 'sync', 'mpsc'] if parts[0] == 'mpsc' else ['tokio', 'sync', parts[0]])
+        parts = prefix + parts[1:]
+    path = '::'.join(parts)
+    if any(path == prefix or path.startswith(prefix + '::') for prefix in ALLOWLIST):
+        return False
+    return (path not in TYPE_ONLY_ALLOWLIST and len(parts) > 1
+            and (unknown or parts[0] in {'std', 'core', 'alloc', 'crate'}))
+
+
+def alias_context(sources, extra=()):
+    """Conservatively propagate capability bindings across the protected tree.
+
+    A global name set deliberately over-approximates Rust scopes and cfgs. New
+    spellings never become invisible through a re-export or another alias.
+    """
+    contexts = {}
+    aliases = (set(extra) | {key[-1] for key in ALIAS_EXCEPTIONS}
+               | {key[-2] for key in IMPORT_EXCEPTIONS if key[-1] and key[-2] != '_'})
+    for path, text in sources.items():
+        code = tokens(text)
+        contexts[path] = (code, binding_inventory(code))
+    changed = True
+    while changed:
+        before = set(aliases)
+        for source, (code, (imports, bindings, _)) in contexts.items():
+            names = [name for name, _ in code]
+            index = AliasIndex(names, module_path(source))
+
+            def risky_path(parts, at, *, unknown=True):
+                resolved = (list(parts[1:]) if parts[:1] == ('::',) else
+                            index.resolve(list(parts), index.at[at]))
+                return capability_path(resolved, aliases, unknown=unknown)
+            for at, parts, binding, renamed in imports:
+                if parts is None:
+                    continue
+                if renamed and risky_path(parts, at) and binding != '_':
+                    aliases.add(binding)
+            for opening, start, end, kind, bound in bindings:
+                risky = False
+                for at in range(start, end):
+                    if not IDENT.fullmatch(names[at]):
+                        continue
+                    if names[at - 1] == '::' and at >= 2 and IDENT.fullmatch(names[at - 2]):
+                        continue
+                    cursor, parts = at + 1, [names[at]]
+                    if names[at - 1] == '::':
+                        parts.insert(0, '::')
+                    while names[cursor:cursor + 1] == ['::'] and cursor + 1 < end and IDENT.fullmatch(names[cursor + 1]):
+                        parts.append(names[cursor + 1])
+                        cursor += 2
+                    if kind == 'type' or capability_reference(names, cursor - 1):
+                        risky |= risky_path(tuple(parts), at, unknown=kind == 'type')
+                opaque_type = kind == 'type' and (
+                    '<' in names[opening:start] or 'Self' in names[start:end]
+                    or any(names[i:i + 2] == ['>', '::'] for i in range(start, end)))
+                if risky or opaque_type or (kind in {'const', 'static', 'let'} and 'fn' in names[opening:start]):
+                    aliases.update(set(bound) - CAPABILITY_METHODS)
+        changed = aliases != before
+    return aliases, contexts
+
+
+def capability_anchor(text, code, names, pairs, items, index, *, declared=False):
     receiver = call_receiver(names, index, pairs)
     if receiver is not None:
         start, end = receiver
         receiver = ''.join(token for token, _ in tokens(
             text[code[start][1]:code[end][1]], literals=True))
+        if capability_reference(names, index):
+            receiver = '<reference> ' + receiver
+    elif names[max(0, index - 1):index] in (['fn'], ['mod'], ['struct'], ['enum'], ['trait']):
+        receiver = '<definition>'
+    elif declared or names[index + 1:index + 2] == [':']:
+        receiver = '<binding>'
     else:
-        receiver = '<definition>' if names[max(0, index - 1):index] == ['fn'] else '<bare>'
-    return items[index], '<import>' if imported else receiver, names[index]
+        tail = operation_tail(names, index)
+        receiver = ('<namespace>' if names[tail:tail + 1] == ['::'] else
+                    '<call>' if names[tail:tail + 1] == ['('] else '<reference>')
+    return items[index], receiver, names[index]
 
 
-def capability_findings(text, code, path):
+def binding_fingerprint(text, code, start, end):
+    return tuple(token for token, _ in tokens(
+        text[code[start][1]:code[end][1] + 1], literals=True))
+
+
+def capability_findings(text, code, path, alias_names=()):
+    aliases, contexts = alias_context({path: text}, alias_names)
+    _, (imports, bindings, imported) = contexts[path]
     names = [name for name, _ in code]
     pairs = delimiter_pairs(names)
     items = item_paths(names, pairs)
-    findings, import_end = [], 0
+    capabilities = CAPABILITY_METHODS | aliases
+    findings, covered, declared = [], set(imported), set()
+    for index, parts, binding, renamed in imports:
+        if parts is None:
+            findings.append((text.count('\n', 0, code[index][1]) + 1, 'unsupported capability use tree'))
+        elif path == BOUNDARY or any(name in capabilities for name in (*parts, binding)):
+            key = (path, items[index], parts, binding, renamed)
+            if not IMPORT_EXCEPTIONS.get(key, '').strip():
+                findings.append((text.count('\n', 0, code[index][1]) + 1,
+                                 'capability import requires a complete leaf/binding exception'))
+    for start, rhs, end, kind, bound in bindings:
+        declared.update(i for i in range(start + 1, rhs - 1) if names[i] in bound)
+        for binding in set(bound) & aliases:
+            key = (path, items[start], kind, binding_fingerprint(text, code, start, end), binding)
+            if ALIAS_EXCEPTIONS.get(key, '').strip():
+                covered.update(i for i in range(start, end + 1)
+                               if i < rhs or names[i] not in bound)
+            else:
+                findings.append((text.count('\n', 0, code[start][1]) + 1,
+                                 'capability binding requires an exact declaration exception'))
     for i, (name, offset) in enumerate(code):
-        if name == 'use':
-            try:
-                _, import_end = import_paths(names, i + 1)
-            except (ValueError, IndexError):
-                import_end = i
-        if name in CAPABILITY_METHODS:
+        if name in capabilities and i not in covered:
             item, receiver, method = capability_anchor(
-                text, code, names, pairs, items, i, imported=i < import_end)
+                text, code, names, pairs, items, i, declared=i in declared)
             if (path, item, receiver, method) not in CALL_EXCEPTIONS:
                 findings.append((text.count('\n', 0, offset) + 1,
                                  f'capability identifier requires an anchored exception: {name}'))
     return findings
 
 
-# Group only identical method sets within one file/item. Each receiver/method
-# pair still expands to an independent exact anchor, never an allowance count.
-# Every token was reviewed, including counted boundary adapters and fixtures.
-# Definition/import permissions never authorize expression tokens.
+# Group identical method sets within one file/item; expand exact independent anchors.
+# Binding, reference, call and namespace roles have separate permissions.
 CALL_EXCEPTIONS = {
     (COMMANDS / path, item, receiver, method): reason
     for path, item, receivers, methods, reason in [
         ('journal/compact.rs', ('impl Read for Positioned', 'fn read'), ('<definition>',), 'read', 'existing journal method declaration, not an expression permission'),
+        ('journal/compact.rs', ('impl Read for Positioned', 'fn read'), ('<namespace>',), 'files', 'existing use of reviewed counted stream/namespace alias; this use site reviewed separately'),
         ('journal/compact.rs', ('impl Snapshot', 'fn copy_to'), ('self.file',), 'write_all', 'existing counted File/Stream or its buffered writer; boundary retains I/O observation'),
+        ('journal/compact.rs', ('impl Journal', 'fn start_compaction'), ('<namespace>',), 'files', 'existing use of reviewed counted stream/namespace alias; this use site reviewed separately'),
         ('journal/compact.rs', ('impl Journal', 'fn start_compaction'), ('self.file',), 'try_clone', 'existing counted File/Stream or its buffered writer; boundary retains I/O observation'),
         ('journal/compact.rs', ('impl Journal', 'fn start_compaction'), ('std::thread::Builder::new().name("wire-compact".into())',), 'spawn', 'existing journal worker thread, not a child process; body scanned independently'),
         ('journal/compact.rs', ('impl Journal', 'fn start_compaction'), ('filesystem',), 'remove_file', 'existing counted filesystem boundary adapter'),
+        ('journal/compact.rs', ('impl Journal', 'fn compacted'), ('<namespace>',), 'Stream files', 'existing use of reviewed counted stream/namespace alias; this use site reviewed separately'),
         ('journal/compact.rs', ('impl Journal', 'fn compacted'), ('snapshot.file',), 'sync_all try_clone', 'existing counted File/Stream or its buffered writer; boundary retains I/O observation'),
         ('journal/compact.rs', ('impl Journal', 'fn compacted'), ('filesystem',), 'rename', 'existing counted filesystem boundary adapter'),
-        ('journal/filesystem.rs', (), ('<import>',), 'remove_file rename', 'reviewed counted filesystem boundary and its adapter fixtures'),
         ('journal/filesystem.rs', ('fn canonical_path',), ('path',), 'canonicalize', 'reviewed counted filesystem boundary and its adapter fixtures'),
         ('journal/filesystem.rs', ('fn sync_directory',), ('File',), 'open', 'reviewed counted filesystem boundary and its adapter fixtures'),
         ('journal/filesystem.rs', ('fn sync_directory',), ('File::open(path)?',), 'sync_all', 'reviewed counted filesystem boundary and its adapter fixtures'),
@@ -366,12 +585,12 @@ CALL_EXCEPTIONS = {
         ('journal/filesystem.rs', ('mod counted', 'fn write'), ('File::create(path)?',), 'write_all', 'reviewed counted filesystem boundary and its adapter fixtures'),
         ('journal/filesystem.rs', ('mod counted', 'fn copy'), ('<definition>', 'io'), 'copy', 'reviewed counted filesystem boundary and its adapter fixtures'),
         ('journal/filesystem.rs', ('mod counted', 'fn copy'), ('File',), 'create open', 'reviewed counted filesystem boundary and its adapter fixtures'),
-        ('journal/filesystem.rs', ('mod counted', 'fn copy'), ('<bare>', 'source'), 'metadata', 'reviewed counted filesystem boundary and its adapter fixtures'),
+        ('journal/filesystem.rs', ('mod counted', 'fn copy'), ('<binding>', 'source', '<reference>'), 'metadata', 'reviewed counted filesystem boundary and its adapter fixtures'),
         ('journal/filesystem.rs', ('mod counted', 'fn copy'), ('metadata',), 'is_file', 'reviewed counted filesystem boundary and its adapter fixtures'),
         ('journal/filesystem.rs', ('mod counted', 'fn copy'), ('destination.raw',), 'set_permissions', 'reviewed counted filesystem boundary and its adapter fixtures'),
         ('journal/filesystem.rs', ('mod counted', 'fn rename'), ('<definition>', '::std::fs'), 'rename', 'reviewed counted filesystem boundary and its adapter fixtures'),
         ('journal/filesystem.rs', ('mod counted', 'fn rename'), ('registry()', 'path'), 'lock', 'reviewed counted filesystem boundary and its adapter fixtures'),
-        ('journal/filesystem.rs', ('mod counted', 'mod std', 'mod fs'), ('<import>',), 'copy rename write', 'reviewed counted filesystem boundary and its adapter fixtures'),
+        ('journal/filesystem.rs', ('mod counted', 'mod files'), ('<definition>',), 'files', 'existing use of reviewed counted stream/namespace alias; this use site reviewed separately'),
         ('journal/filesystem.rs', ('mod counted', 'impl LockFile', 'fn try_lock'), ('<definition>', 'self.0'), 'try_lock', 'reviewed counted filesystem boundary and its adapter fixtures'),
         ('journal/filesystem.rs', ('mod counted', 'fn counts_new_handles_clones_copies_and_replacement'), ('crate::structured::launch::SessionConfigDir', 'std::fs::File', 'std::fs::OpenOptions::new().read(true).write(true).append(true)'), 'create', 'reviewed counted filesystem boundary and its adapter fixtures'),
         ('journal/filesystem.rs', ('mod counted', 'fn counts_new_handles_clones_copies_and_replacement'), ('original', 'extra', 'replacement'), 'write_all', 'reviewed counted filesystem boundary and its adapter fixtures'),
@@ -381,26 +600,26 @@ CALL_EXCEPTIONS = {
         ('journal/filesystem.rs', ('mod counted', 'fn counts_new_handles_clones_copies_and_replacement'), ('std::fs::OpenOptions::new().read(true).write(true).append(true).create(true).truncate(false)',), 'create_new', 'reviewed counted filesystem boundary and its adapter fixtures'),
         ('journal/filesystem.rs', ('mod counted', 'fn counts_new_handles_clones_copies_and_replacement'), ('std::fs::OpenOptions::new().read(true).write(true).append(true).create(true).truncate(false).create_new(false)', 'OpenOptions::new().append(true)'), 'open', 'reviewed counted filesystem boundary and its adapter fixtures'),
         ('journal/filesystem.rs', ('mod counted', 'fn counts_new_handles_clones_copies_and_replacement'), ('OpenOptions::new().append(true).open(&compact).unwrap()',), 'try_clone', 'reviewed counted filesystem boundary and its adapter fixtures'),
-        ('journal/filesystem.rs', ('mod counted', 'fn counts_new_handles_clones_copies_and_replacement'), ('<bare>',), 'rename', 'reviewed counted filesystem boundary and its adapter fixtures'),
+        ('journal/filesystem.rs', ('mod counted', 'fn counts_new_handles_clones_copies_and_replacement'), ('<call>',), 'rename', 'reviewed counted filesystem boundary and its adapter fixtures'),
         ('journal/tests/capacity.rs', ('fn near_global_cap_hot_operations_write_only_one_record',), ('Journal',), 'open', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
         ('journal/tests/capacity.rs', ('fn near_global_cap_hot_operations_write_only_one_record',), ('journal.file',), 'try_clone', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
         ('journal/tests/capacity.rs', ('fn near_global_cap_hot_operations_write_only_one_record',), ('file',), 'flush write_all', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
         ('journal/tests/compaction.rs', ('fn expiry_threshold_drops_only_expired_records_and_releases_exact_capacity',), ('filesystem::fs',), 'metadata', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
         ('journal/tests/compaction.rs', ('fn expiry_threshold_drops_only_expired_records_and_releases_exact_capacity',), ('Journal',), 'open', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
         ('journal/tests/compaction.rs', ('fn pause_prefix',), ('PAUSE.get().unwrap()',), 'lock', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
-        ('journal/tests/compaction.rs', ('fn concurrent_appends_and_multiple_catchup_rounds_keep_exact_index_and_first_outcomes',), ('<bare>',), 'wait', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests/compaction.rs', ('fn concurrent_appends_and_multiple_catchup_rounds_keep_exact_index_and_first_outcomes',), ('<binding>', '<reference>'), 'wait', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
         ('journal/tests/compaction.rs', ('fn concurrent_appends_and_multiple_catchup_rounds_keep_exact_index_and_first_outcomes',), ('PAUSE.get_or_init(||Mutex::new(None))',), 'lock', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
         ('journal/tests/compaction.rs', ('fn concurrent_appends_and_multiple_catchup_rounds_keep_exact_index_and_first_outcomes',), ('Journal',), 'open', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
         ('journal/tests/compaction.rs', ('fn opaque_rows_fence_compaction_and_remain_byte_exact',), ('journal.file',), 'sync_all write_all', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
         ('journal/tests/compaction.rs', ('fn opaque_rows_fence_compaction_and_remain_byte_exact',), ('Journal',), 'open', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
         ('journal/tests/compaction.rs', ('fn opaque_rows_fence_compaction_and_remain_byte_exact',), ('filesystem::fs',), 'read', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
         ('journal/tests/compaction.rs', ('fn failed_append_during_snapshot_cannot_publish_over_uncertain_tail',), ('filesystem::fs',), 'read', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
-        ('journal/tests/compaction.rs', ('fn shutdown_drains_cancelled_jobs_closes_every_clone_and_releases_lease_before_reopen',), ('<bare>',), 'wait', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests/compaction.rs', ('fn shutdown_drains_cancelled_jobs_closes_every_clone_and_releases_lease_before_reopen',), ('<binding>', '<reference>'), 'wait', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
         ('journal/tests/compaction.rs', ('fn shutdown_drains_cancelled_jobs_closes_every_clone_and_releases_lease_before_reopen',), ('Writer',), 'open spawn', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
         ('journal/tests/compaction.rs', ('fn shutdown_drains_cancelled_jobs_closes_every_clone_and_releases_lease_before_reopen',), ('Journal',), 'open', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
         ('journal/tests/compaction.rs', ('fn compaction_crash_child',), ('Journal',), 'open', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
         ('journal/tests/compaction.rs', ('fn crash_at_each_compaction_step_leaves_a_complete_replayable_old_or_new_log',), ('filesystem::fs',), 'read', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
-        ('journal/tests/compaction.rs', ('fn crash_at_each_compaction_step_leaves_a_complete_replayable_old_or_new_log',), ('<bare>',), 'status', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests/compaction.rs', ('fn crash_at_each_compaction_step_leaves_a_complete_replayable_old_or_new_log',), ('<binding>', '<reference>'), 'status', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
         ('journal/tests/compaction.rs', ('fn crash_at_each_compaction_step_leaves_a_complete_replayable_old_or_new_log',), ('child',), 'kill try_wait wait', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
         ('journal/tests/compaction.rs', ('fn crash_at_each_compaction_step_leaves_a_complete_replayable_old_or_new_log',), ('Journal',), 'open', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
         ('journal/tests/compaction.rs', ('fn published',), ('PUBLISHED.get().unwrap()',), 'lock', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
@@ -441,13 +660,17 @@ CALL_EXCEPTIONS = {
         ('journal/tests.rs', ('fn failed_outcome_keeps_pending_and_failed_rollback_requires_recovery',), ('Journal',), 'open', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
         ('journal/tests.rs', ('fn exclusive_writer_lease_prevents_stale_parallel_indexes',), ('Journal',), 'open', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
         ('journal/tests.rs', ('fn submit',), ('std::thread',), 'spawn', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
-        ('journal/tests.rs', ('fn worker_never_blocks_submit_on_sync_and_queue_remains_bounded',), ('<bare>',), 'wait', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests.rs', ('fn worker_never_blocks_submit_on_sync_and_queue_remains_bounded',), ('<binding>', '<reference>'), 'wait', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
         ('journal/tests.rs', ('fn worker_never_blocks_submit_on_sync_and_queue_remains_bounded',), ('Writer', 'tokio'), 'spawn', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
         ('journal/tests.rs', ('fn worker_never_blocks_submit_on_sync_and_queue_remains_bounded',), ('Journal',), 'open', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
         ('journal/tests.rs', ('fn crash_after_synced_outcome_before_index_publication_replays_the_ack',), ('Journal',), 'open', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
         ('journal/tests.rs', ('fn public_writer_opens_and_wakes_only_after_durable_completion',), ('Writer', 'Journal'), 'open', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
         ('journal/tests.rs', ('fn public_writer_opens_and_wakes_only_after_durable_completion',), ('filesystem::fs',), 'read_to_string', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
         ('journal/tests.rs', ('fn public_writer_opens_and_wakes_only_after_durable_completion',), ('std::thread',), 'spawn', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests.rs', ('struct Stream',), ('<definition>',), 'Stream', 'existing use of reviewed counted stream/namespace alias; this use site reviewed separately'),
+        ('journal/tests.rs', ('impl From < File > for Stream',), ('<reference>',), 'Stream', 'existing use of reviewed counted stream/namespace alias; this use site reviewed separately'),
+        ('journal/tests.rs', ('impl std :: ops :: Deref for Stream',), ('<reference>',), 'Stream', 'existing use of reviewed counted stream/namespace alias; this use site reviewed separately'),
+        ('journal/tests.rs', ('impl Write for Stream',), ('<reference>',), 'Stream', 'existing use of reviewed counted stream/namespace alias; this use site reviewed separately'),
         ('journal/tests.rs', ('impl Write for Stream', 'fn write'), ('<definition>', 'self.file'), 'write', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
         ('journal/tests.rs', ('impl Write for Stream', 'fn flush'), ('<definition>', 'self.file'), 'flush', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
         ('journal/tests.rs', ('impl Writer', 'fn test_open'), ('Self',), 'spawn', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
@@ -455,22 +678,25 @@ CALL_EXCEPTIONS = {
         ('journal/tests.rs', ('fn replay_reports_byte_progress_without_record_contents',), ('Journal',), 'open', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
         ('journal/tests.rs', ('fn take_replay_steps',), ('replay_steps()',), 'lock', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
         ('journal/tests.rs', ('fn replay_barrier',), ('replay_hooks()',), 'lock', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
-        ('journal/tests.rs', ('impl Writer', 'fn test_step_replay'), ('<bare>',), 'wait', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests.rs', ('impl Writer', 'fn test_step_replay'), ('<binding>', '<reference>'), 'wait', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
         ('journal/tests.rs', ('impl Writer', 'fn test_step_replay'), ('replay_steps()',), 'lock', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
-        ('journal/tests.rs', ('impl Writer', 'fn test_stall_replay'), ('<bare>',), 'wait', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('journal/tests.rs', ('impl Writer', 'fn test_stall_replay'), ('<binding>', '<reference>'), 'wait', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
         ('journal/tests.rs', ('impl Writer', 'fn test_stall_replay'), ('replay_hooks()',), 'lock', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
         ('journal.rs', ('impl < R : Read > Read for ReplayReader < R >', 'fn read'), ('<definition>',), 'read', 'existing journal method declaration, not an expression permission'),
         ('journal.rs', ('impl < R : Read > Read for ReplayReader < R >', 'fn read'), ('self.source',), 'read', 'existing replay stream delegates to the counted File'),
         ('journal.rs', ('impl Writer', 'fn open'), ('<definition>',), 'open', 'existing journal method declaration, not an expression permission'),
         ('journal.rs', ('impl Writer', 'fn open_signalled'), ('Self',), 'spawn', 'existing journal Writer factory; closure uses the counted boundary'),
         ('journal.rs', ('impl Writer', 'fn spawn'), ('<definition>',), 'spawn', 'existing journal method declaration, not an expression permission'),
-        ('journal.rs', ('impl Writer', 'fn spawn'), ('<bare>',), 'open', 'existing Writer factory closure binding and invocation; body uses counted adapters'),
+        ('journal.rs', ('impl Writer', 'fn spawn'), ('<binding>', '<call>'), 'open', 'existing Writer factory closure binding and invocation; body uses counted adapters'),
         ('journal.rs', ('impl Writer', 'fn spawn'), ('std::thread::Builder::new().name("wire-journal".into())',), 'spawn', 'existing journal worker thread, not a child process; body scanned independently'),
         ('journal.rs', ('impl Writer', 'fn spawn'), ('admission',), 'lock', 'existing in-memory ownership/admission mutex, not a filesystem lock'),
         ('journal.rs', ('impl Writer', 'fn submit'), ('self.admission',), 'lock', 'existing in-memory ownership/admission mutex, not a filesystem lock'),
         ('journal.rs', ('impl Writer', 'fn shutdown'), ('self.admission',), 'lock', 'existing in-memory ownership/admission mutex, not a filesystem lock'),
+        ('journal.rs', ('fn private',), ('<namespace>',), 'files', 'existing use of reviewed counted stream/namespace alias; this use site reviewed separately'),
         ('journal.rs', ('fn private',), ('file',), 'sync_all', 'existing counted File/Stream or its buffered writer; boundary retains I/O observation'),
+        ('journal.rs', ('struct Journal',), ('<reference>',), 'Stream', 'existing use of reviewed counted stream/namespace alias; this use site reviewed separately'),
         ('journal.rs', ('impl Journal', 'fn open'), ('<definition>',), 'open', 'existing journal method declaration, not an expression permission'),
+        ('journal.rs', ('impl Journal', 'fn lease'), ('<namespace>',), 'Stream files', 'existing use of reviewed counted stream/namespace alias; this use site reviewed separately'),
         ('journal.rs', ('impl Journal', 'fn lease'), ('lease',), 'try_lock', 'existing counted LockFile wrapper'),
         ('journal.rs', ('impl Journal', 'fn lease'), ('file',), 'metadata', 'existing counted File/Stream or its buffered writer; boundary retains I/O observation'),
         ('journal.rs', ('impl Journal', 'fn seed_capacity_test'), ('self.file',), 'metadata try_clone', 'existing counted File/Stream or its buffered writer; boundary retains I/O observation'),
@@ -480,24 +706,25 @@ CALL_EXCEPTIONS = {
         ('journal.rs', ('impl Journal', 'fn replay'), ('self.file',), 'set_len sync_all try_clone', 'existing counted File/Stream or its buffered writer; boundary retains I/O observation'),
         ('journal.rs', ('impl Journal', 'fn replay'), ('file',), 'metadata sync_all write_all', 'existing counted File/Stream or its buffered writer; boundary retains I/O observation'),
         ('journal.rs', ('impl Journal', 'fn append'), ('self.file',), 'set_len sync_all sync_data write_all', 'existing counted File/Stream or its buffered writer; boundary retains I/O observation'),
+        ('journal.rs', ('impl Journal', 'fn apply'), ('<namespace>',), 'files', 'existing use of reviewed counted stream/namespace alias; this use site reviewed separately'),
         ('ownership/tests.rs', ('fn fixture',), ('crate::structured::launch::SessionConfigDir',), 'create', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
         ('ownership/tests.rs', ('fn install',), ('owner.0.pending', 'owner.0.writer'), 'lock', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
         ('ownership/tests.rs', ('fn apply',), ('owner.0.writer',), 'lock', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
         ('ownership/tests.rs', ('fn commit_prepares_without_lease_then_replays_after_exporter_freeze',), ('importer.0.writer',), 'lock', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
         ('ownership/tests.rs', ('fn commit_prepares_without_lease_then_replays_after_exporter_freeze',), ('Writer',), 'open', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
         ('ownership/tests.rs', ('fn rollback_replays_before_opening_and_shutdown_cannot_be_undone_by_recovery',), ('owner.0.writer',), 'lock', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
-        ('ownership/tests.rs', ('fn shutdown_drains_accepted_write_and_releases_lease_with_handles_alive',), ('<bare>',), 'wait', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('ownership/tests.rs', ('fn shutdown_drains_accepted_write_and_releases_lease_with_handles_alive',), ('<binding>', '<reference>'), 'wait', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
         ('ownership/tests.rs', ('fn shutdown_drains_accepted_write_and_releases_lease_with_handles_alive',), ('tokio',), 'spawn', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
-        ('ownership/tests.rs', ('fn shutdown_waits_for_inflight_replay_and_fences_its_late_completion',), ('<bare>',), 'wait', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('ownership/tests.rs', ('fn shutdown_waits_for_inflight_replay_and_fences_its_late_completion',), ('<binding>', '<reference>'), 'wait', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
         ('ownership/tests.rs', ('fn shutdown_waits_for_inflight_replay_and_fences_its_late_completion',), ('owner.0.open_barrier',), 'lock', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
         ('ownership/tests.rs', ('fn shutdown_during_leased_replay_is_bounded_and_fences_late_completion',), ('tokio',), 'spawn', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
         ('ownership/tests.rs', ('fn shutdown_during_leased_replay_is_bounded_and_fences_late_completion',), ('Writer',), 'open', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
         ('ownership/tests.rs', ('fn replay_observed',), ('replay_events()',), 'lock', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
         ('ownership/tests.rs', ('fn take_open_barrier',), ('open_hooks()',), 'lock', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
         ('ownership/tests.rs', ('impl Ownership', 'fn test_watch_replay'), ('replay_events()',), 'lock', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
-        ('ownership/tests.rs', ('impl Ownership', 'fn test_stall_next_open'), ('<bare>',), 'wait', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('ownership/tests.rs', ('impl Ownership', 'fn test_stall_next_open'), ('<binding>', '<reference>'), 'wait', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
         ('ownership/tests.rs', ('impl Ownership', 'fn test_stall_next_open'), ('open_hooks()',), 'lock', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
-        ('ownership/tests.rs', ('fn stalled_drain',), ('<bare>',), 'wait', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
+        ('ownership/tests.rs', ('fn stalled_drain',), ('<binding>', '<reference>'), 'wait', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
         ('ownership/tests.rs', ('fn stalled_drain',), ('tokio',), 'spawn', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
         ('ownership/tests.rs', ('fn stalled_drain',), ('owner.0.pending',), 'lock', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
         ('ownership/tests.rs', ('fn stalled_drain',), ('Writer',), 'open', 'reviewed isolated fixtures, counted streams, synchronization and subprocess assertions'),
@@ -538,14 +765,16 @@ def module_path(path: Path) -> tuple[str, ...]:
     return ('crate',) + (parts[:-1] if parts[-1] == 'mod' else parts)
 
 
-def import_paths(names: list[str], start: int):
+def import_paths(names: list[str], start: int, *, preserve_roots=False):
     """Expand use trees, retaining source indices for diagnostics and aliases."""
     entries = []
 
     def tree(i, prefix):
+        parts = list(prefix)
         if names[i:i + 1] == ['::']:
             i += 1
-        parts = list(prefix)
+            if preserve_roots:
+                parts = ['::']
         while i < len(names):
             name = names[i]
             if name == '{':
@@ -820,10 +1049,10 @@ def boundary_path(names: list[str], index: int) -> bool:
                 and all(part == "super" for part in parts[:-1])))
 
 
-def check_text(text: str, path: Path, crate_macros=None, macro_uses=()) -> list[tuple[int, str]]:
+def check_text(text: str, path: Path, crate_macros=None, macro_uses=(), alias_names=()) -> list[tuple[int, str]]:
     code = tokens(text)
     names = [name for name, _ in code]
-    findings = capability_findings(text, code, path)
+    findings = capability_findings(text, code, path, alias_names)
     for i, (name, offset) in enumerate(code[:-2]):
         if names[i:i + 2] == ['macro_rules', '!'] and not CRATE_MACRO_ALLOWLIST.get((path, names[i + 2]), '').strip():
             findings.append((text.count('\n', 0, offset) + 1,
@@ -934,12 +1163,15 @@ def crate_macro_sources(root):
 def check_tree(root: Path) -> list[str]:
     findings = []
     crate_macros, macro_uses = crate_macro_sources(root)
-    for path in protected_files(root):
+    paths = protected_files(root)
+    sources = {path.relative_to(root): path.read_text() for path in paths if not path.is_symlink()}
+    aliases, _ = alias_context(sources)
+    for path in paths:
         relative = path.relative_to(root)
         if path.is_symlink():
             findings.append(f"{relative}:1: symlinks escape the journal source scan")
             continue
-        for line, reason in check_text(path.read_text(), relative, crate_macros, macro_uses):
+        for line, reason in check_text(sources[relative], relative, crate_macros, macro_uses, aliases):
             findings.append(f"{relative}:{line}: {reason}")
     return findings
 

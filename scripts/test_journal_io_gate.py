@@ -45,7 +45,7 @@ use filesystem::{File, files, LockFile};
 use self::filesystem;
 use filesystem::fs;
 filesystem::sync_directory(root)?;
-files::open_append_file(path)?;
+fn private() { files::open_append_file(path)?; }
 impl<R: Read> Read for ReplayReader<R> {
     fn read(&mut self) { self.source.read(bytes)?; }
 }
@@ -209,8 +209,8 @@ mod nested {
 
     def test_test_capabilities_require_test_file_paths(self):
         source = """
-use crate::structured::launch::SessionConfigDir as Directory;
-use crate::process::TracedCommand as Runner;
+use crate::structured::launch::SessionConfigDir;
+use crate::process::TracedCommand;
 std::process::exit(0);
 """
         for relative in ['journal/tests.rs', 'journal/tests/compaction.rs', 'ownership/tests.rs']:
@@ -380,6 +380,113 @@ set_permissions spawn output status""".split()
                               + ' ($p:expr, $method:ident) => { $p.$method() } '
                               + right + '; probe!(path, read_dir);')
                 self.assertTrue(gate.check_text(definition, gate.COMMANDS / 'journal.rs'))
+
+    def test_boundary_reexport_cannot_rename_capability(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            commands = root / gate.COMMANDS
+            (commands / 'journal').mkdir(parents=True)
+            (commands / 'ownership.rs').write_text('')
+            boundary = (gate.ROOT / gate.BOUNDARY).read_text()
+            (root / gate.BOUNDARY).write_text(boundary.replace('remove_file,', 'remove_file as erase,'))
+            (commands / 'journal.rs').write_text('fn probe() { filesystem::erase(path); }')
+            self.assertTrue(gate.check_tree(root))
+
+    def test_capability_import_alias_is_rejected(self):
+        self.assertTrue(gate.check_text('use std::fs::read_dir as rd;', gate.COMMANDS / 'journal.rs'))
+
+    def test_approved_alias_still_requires_anchored_use(self):
+        path = gate.BOUNDARY
+        source = (gate.ROOT / path).read_text().replace('remove_file,', 'remove_file as erase,')
+        approved = {(path, (), ('::', 'std', 'fs', 'remove_file'), 'erase', True): 'fixture to test alias-use isolation',
+                    (path, (), ('counted', 'std', 'fs', 'remove_file'), 'erase', True): 'fixture to test alias-use isolation'}
+        with patch.object(gate, 'IMPORT_EXCEPTIONS',
+                          getattr(gate, 'IMPORT_EXCEPTIONS', {}) | approved, create=True):
+            self.assertEqual(gate.check_text(source, path), [])
+            self.assertTrue(gate.check_text(source + '\nfn probe() { erase(path); }', path))
+
+    def test_approved_alias_call_does_not_grant_another_use_or_reference(self):
+        path = gate.COMMANDS / 'journal.rs'
+        alias = (gate.BOUNDARY, (), ('::', 'std', 'fs', 'remove_file'), 'erase', True)
+        call = (path, ('fn reviewed',), 'filesystem', 'erase')
+        with patch.dict(gate.IMPORT_EXCEPTIONS, {alias: 'fixture for an approved renamed leaf'}):
+            with patch.dict(gate.CALL_EXCEPTIONS, {call: 'fixture for exactly one alias use item'}):
+                self.assertEqual(gate.check_text('fn reviewed() { filesystem::erase(path); }', path), [])
+                self.assertTrue(gate.check_text('fn elsewhere() { filesystem::erase(path); }', path))
+                self.assertTrue(gate.check_text(
+                    'fn reviewed() { let other = filesystem::erase; other(path); }', path))
+
+    def test_let_reference_cannot_reuse_a_call_anchor(self):
+        for declaration in ['let erase = filesystem::remove_file;',
+                            'let erase = (filesystem::remove_file);',
+                            'let (erase,) = (filesystem::remove_file,);',
+                            'let erase: fn(_) -> _ = filesystem::remove_file;']:
+            source = 'impl Journal { fn start_compaction() { ' + declaration + ' erase(path); } }'
+            with self.subTest(declaration=declaration):
+                self.assertTrue(gate.check_text(source, gate.COMMANDS / 'journal/compact.rs'))
+
+    def test_complete_import_leaf_pins_source_binding_and_root(self):
+        path = gate.BOUNDARY
+        original = (gate.ROOT / path).read_text()
+        for before, after in [('remove_file,', 'remove_file as _,') ,
+                              ('remove_file,', 'remove_file as r#erase,'),
+                              ('remove_file,', 'remove_file as remove_file,'),
+                              ('use ::std::fs::', 'use std::fs::'),
+                              ('use ::std::fs::', 'use other::fs::')]:
+            with self.subTest(after=after):
+                source = original.replace(before, after)
+                self.assertNotEqual(original, source)
+                self.assertTrue(gate.check_text(source, path))
+
+    def test_type_and_function_aliases_require_binding_and_use_permissions(self):
+        path = gate.BOUNDARY
+        declarations = [('type Native = File;', (), 'type', 'Native'),
+                        ('const ERASE: fn() = safe;', ('const ERASE',), 'const', 'ERASE'),
+                        ('static ERASE: fn() = safe;', ('static ERASE',), 'static', 'ERASE'),
+                        ('let erase: fn() = safe;', (), 'let', 'erase')]
+        for source, item, kind, binding in declarations:
+            with self.subTest(source=source):
+                self.assertTrue(gate.check_text(source, path))
+                key = (path, item, kind, tuple(name for name, _ in gate.tokens(source)), binding)
+                with patch.dict(gate.ALIAS_EXCEPTIONS, {key: 'fixture to isolate binding and use review'}):
+                    self.assertEqual(gate.check_text(source, path), [])
+                    use = binding + ('::from_raw_fd(fd)' if kind == 'type' else '()')
+                    self.assertTrue(gate.check_text(source + ' fn probe() { ' + use + '; }', path))
+        for source in ['type Native = ::std::os::fd::OwnedFd;',
+                       'use ::std::os::fd::OwnedFd; type Native = OwnedFd;',
+                       'type Next = Native; type Native = File;',
+                       'type Native<T> = T;',
+                       'type Native = <Hidden as Trait>::Associated;',
+                       'type Native = Self;',
+                       'const ERASE: fn() = std::fs::remove_file;',
+                       'fn probe() { let erase = std::fs::remove_file::<_>; }']:
+            with self.subTest(source=source):
+                self.assertTrue(gate.check_text(source, path))
+
+    def test_alias_binding_permissions_retain_literal_contents(self):
+        path = gate.BOUNDARY
+        source = 'const OP: fn() = loader("reviewed");'
+        key = (path, ('const OP',), 'const', tuple(n for n, _ in gate.tokens(source, literals=True)), 'OP')
+        with patch.dict(gate.ALIAS_EXCEPTIONS, {key: 'fixture for literal-bearing function binding'}):
+            self.assertEqual(gate.check_text(source, path), [])
+            self.assertTrue(gate.check_text(source.replace('reviewed', 'changed'), path))
+
+    def test_alias_reexport_chains_and_uses_before_definitions_are_checked(self):
+        path = gate.BOUNDARY
+        source = 'pub(crate) use std::fs::remove_file as erase; pub(crate) use self::erase as wipe;'
+        approved = {(path, (), ('std', 'fs', 'remove_file'), 'erase', True): 'fixture for first alias',
+                    (path, (), ('self', 'erase'), 'wipe', True): 'fixture for chained alias'}
+        with patch.dict(gate.IMPORT_EXCEPTIONS, approved):
+            self.assertEqual(gate.check_text(source, path), [])
+            self.assertTrue(gate.check_text('fn probe() { wipe(path); } ' + source, path))
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                commands = root / gate.COMMANDS
+                (commands / 'journal').mkdir(parents=True)
+                (root / path).write_text(source)
+                (commands / 'ownership.rs').write_text('')
+                (commands / 'journal.rs').write_text('fn probe() { filesystem::wipe(path); }')
+                self.assertTrue(gate.check_tree(root))
 
     def test_macro_tt_substitution_cannot_hide_capability_tokens(self):
         source = ('macro_rules! r { ($($t:tt),*) => { $($t)* } } '
