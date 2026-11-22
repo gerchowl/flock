@@ -308,34 +308,81 @@ fn fault_proxy_exercises_real_client_never_opened_and_late_id_frames() {
 
 #[test]
 fn live_overflow_closes_both_cuts_and_a_fresh_id_replays_from_applied_cursor() {
-    runtime(async {
-        let mut case = Case::new(vec![]).await;
-        let mut socket = case.open().await;
-        for id in ["first", "second"] {
-            case.sub(&mut socket, id, None).await;
-            assert_eq!(case.frame(&mut socket).await["t"], "synced");
-        }
-        // Same executor, no await: publication necessarily precedes the next page.
-        for seq in 1..=crate::structured::history::LIVE_RECORDS as u64 + 1 {
-            case.stored.append(record(seq));
-        }
-        let mut ids = Vec::new();
-        for _ in 0..2 {
+    for force_delivery in [false, true] {
+        runtime(async {
+            let mut case = Case::new(vec![]).await;
+            let mut socket = case.open().await;
+            let ids = ["first", "second"];
+            for id in ids {
+                case.sub(&mut socket, id, None).await;
+                assert_eq!(case.frame(&mut socket).await["t"], "synced");
+            }
+            let before_burst = if force_delivery {
+                case.stored.append(record(1));
+                // Wait for a real live frame without consuming it. The old strict
+                // lagged-first assertion must fail under this interleaving.
+                assert_eq!(within(socket.0.peek(&mut [0])).await.unwrap(), 1);
+                1
+            } else {
+                0
+            };
+            // Async tasks cannot run during this burst, but a spawn_blocking page
+            // already in flight can remove one record. Exceed the window even then.
+            let head = before_burst + crate::structured::history::LIVE_RECORDS as u64 + 2;
+            for seq in before_burst + 1..=head {
+                case.stored.append(record(seq));
+            }
+            let mut applied = [0; 2];
+            let mut closed = [false; 2];
+            // ADR-0036 §5a: lag terminates on the next page, after any page
+            // already read. No frame may follow lagged for that subscription.
+            for _ in 0..2 * (before_burst + 2) {
+                let frame = case.frame(&mut socket).await;
+                let index = ids
+                    .iter()
+                    .position(|id| frame["sub_id"] == *id)
+                    .expect("only the original cuts are open");
+                assert!(!closed[index], "frame after lagged: {frame}");
+                match frame["t"].as_str().unwrap() {
+                    "ev" => {
+                        applied[index] += 1;
+                        assert_eq!(frame["seq"], applied[index]);
+                        assert!(applied[index] <= before_burst + 1);
+                    }
+                    "lagged" => {
+                        assert_eq!(frame["skipped_to"], head);
+                        closed[index] = true;
+                    }
+                    other => panic!("unexpected overflow frame: {other}"),
+                }
+                if closed == [true; 2] {
+                    break;
+                }
+            }
+            assert_eq!(closed, [true; 2], "both cuts must terminate");
+            if force_delivery {
+                assert!(applied.iter().any(|cursor| *cursor > 0));
+            }
+            let cursor = *applied.iter().max().unwrap();
+            case.sub(&mut socket, "fresh", Some(cursor)).await;
+            for seq in cursor + 1..=head {
+                let frame = case.frame(&mut socket).await;
+                assert_eq!(frame["sub_id"], "fresh");
+                assert_eq!(frame["t"], "ev");
+                assert_eq!(frame["seq"], seq);
+            }
+            assert_eq!(
+                case.frame(&mut socket).await,
+                json!({"t":"synced","sub_id":"fresh","seq":head})
+            );
+            case.stored.append(record(head + 1));
             let frame = case.frame(&mut socket).await;
-            assert_eq!(frame["t"], "lagged");
-            ids.push(frame["sub_id"].as_str().unwrap().to_owned());
-        }
-        ids.sort();
-        assert_eq!(ids, ["first", "second"]);
-        case.sub(&mut socket, "fresh", Some(0)).await;
-        for seq in 1..=crate::structured::history::LIVE_RECORDS as u64 + 1 {
-            let frame = case.frame(&mut socket).await;
+            assert_eq!(frame["sub_id"], "fresh");
             assert_eq!(frame["t"], "ev");
-            assert_eq!(frame["seq"], seq);
-        }
-        assert_eq!(case.frame(&mut socket).await["t"], "synced");
-        case.server.finish().await;
-    });
+            assert_eq!(frame["seq"], head + 1);
+            case.server.finish().await;
+        });
+    }
 }
 
 #[test]
