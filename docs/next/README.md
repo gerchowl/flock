@@ -157,7 +157,7 @@ not a gui window, not a web dashboard, not electron. flock runs inside whatever 
 - **tabs** — first-class in the socket api and cli
 - **copy-friendly** — drag-select pane text, double-click tokens, or use keyboard copy mode with `prefix+[`, `h/j/k/l`, `{`/`}`, `v`, and `y`
 - **notifications** — sounds and toasts for background events; tab-aware suppression
-- **18 built-in themes** — catppuccin, terminal, tokyo night, gruvbox, one, solarized, kanagawa, rosé pine, vesper, and light variants for the main palettes
+- **20 built-in themes** — dalton (the colorblind-friendly default), catppuccin, terminal, tokyo night, gruvbox, one, solarized, kanagawa, rosé pine, vesper, and light variants for the main palettes
 - **session persistence** — pane processes survive client detach; sessions restore panes after full restart, with opt-in recent screen history
 
 ## agents can use flock too
