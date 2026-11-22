@@ -351,3 +351,60 @@ mod lifecycle_tests;
 pub(crate) mod lifecycle;
 #[cfg(test)]
 use lifecycle::{Decision, Evaluation, PrincipalKind, Refusal};
+
+#[cfg(test)]
+pub(crate) fn claim_fixture() -> (
+    crate::structured::launch::SessionConfigDir,
+    Store,
+    u64,
+    String,
+) {
+    claim_fixture_limit(Some(1))
+}
+
+#[cfg(test)]
+pub(crate) fn claim_fixture_limit(
+    max_uses: Option<u64>,
+) -> (
+    crate::structured::launch::SessionConfigDir,
+    Store,
+    u64,
+    String,
+) {
+    let (root, store, mut app) = tests::fixture();
+    let mut grant = tests::grant(&["*"]);
+    grant.lifecycle = Some(
+        Lifecycle {
+            subject: Subject::User,
+            destination_node_id: "b".repeat(64),
+            max_uses,
+            lifetime_ms: None,
+            issuance: None,
+        }
+        .into(),
+    );
+    let generation = tests::add(&store, &mut app, grant);
+    let listing = store
+        .manage(&app.client_token_authority().unwrap(), None)
+        .unwrap();
+    let id = listing.entries["tablet"]
+        .as_ref()
+        .unwrap()
+        .lifecycle
+        .as_ref()
+        .unwrap()
+        .issuance
+        .as_ref()
+        .unwrap()
+        .id
+        .clone();
+    (root, store, generation, id)
+}
+
+#[cfg(test)]
+pub(crate) fn claim_revoke(store: &Store) -> Result<Listing, E> {
+    store.manage(
+        &tests::operator().client_token_authority().unwrap(),
+        Some(Change::Revoke("tablet".into())),
+    )
+}

@@ -105,6 +105,11 @@ def tokens(text: str, *, literals=False) -> list[tuple[str, int]]:
 # Each entry is a reviewed item or an explicitly safe standard/library namespace.
 # Descendants cover associated items (or the explicitly named safe namespace).
 ALLOWLIST = {
+    'std::collections::BTreeMap': 'recovered issuance consumption totals',
+    'std::collections::BTreeSet': 'verified request scopes',
+    'crate::api::gateway_grants::ClockPair': 'destination clock evidence value',
+    'crate::structured::permissions::auth::gateway': 'A1 lease and pure grant evaluation; no journal file handles escape',
+    'crate::structured::permissions::auth::tokens::Scope': 'verified request scope values',
     'std::collections::HashMap': 'journal indexes',
     'std::sync': 'in-memory synchronization and channels',
     'std::task::Poll': 'test readiness assertions',
@@ -169,6 +174,8 @@ ALLOWLIST.update({
 })
 # These capabilities are restricted by source path, never a caller-supplied cfg.
 TEST_ONLY_ALLOWLIST = {
+    'std::panic::catch_unwind': 'injected crash after durable append',
+    'std::panic::AssertUnwindSafe': 'isolated crash fixture is discarded after unwinding',
     'std::ops::Deref': 'test stream wrapper',
     'std::env::temp_dir': 'isolated test fixture location',
     'std::env::current_exe': 'journal subprocess test executable',
@@ -546,6 +553,19 @@ def capability_findings(text, code, path, alias_names=()):
 CALL_EXCEPTIONS = {
     (COMMANDS / path, item, receiver, method): reason
     for path, item, receivers, methods, reason in [
+        ('journal/tests/grants.rs', ('fn final_lifecycle_use_is_not_admitted_twice',), ('Writer',), 'spawn', 'existing journal worker with a bounded sync barrier, never a child process'),
+        ('journal/tests/grants.rs', ('fn crash_before_append_spends_nothing_on_restart',), ('Journal',), 'open', 'isolated A1 fixtures and counted journal replay for transactional recovery assertions'),
+        ('journal/tests/grants.rs', ('fn claim_holds_generation_lease_through_sync',), ('Journal', 'Store'), 'open', 'isolated A1 fixtures and counted journal replay for transactional recovery assertions'),
+        ('journal/tests/grants.rs', ('fn count_ordinals_and_standing_claims_survive_outcomes_and_restart',), ('Journal',), 'open', 'isolated A1 fixtures and counted journal replay for transactional recovery assertions'),
+        ('journal/tests/grants.rs', ('fn in_flight_compaction_cannot_publish_over_consumption',), ('Journal',), 'open', 'isolated A1 fixtures and counted journal replay for transactional recovery assertions'),
+        ('journal/tests/grants.rs', ('fn request',), ('Store',), 'open', 'open the isolated A1 grant namespace, never a journal handle'),
+        ('journal/tests/grants.rs', ('fn final_lifecycle_use_is_not_admitted_twice',), ('Journal',), 'open', 'replay isolated claims through the existing counted journal opener'),
+        ('journal/tests/grants.rs', ('fn final_lifecycle_use_is_not_admitted_twice',), ('std::thread',), 'spawn', 'one joined request producer with a bounded start wait'),
+        ('journal/tests/grants.rs', ('fn retry_is_free_but_payload_target_and_destination_are_bound',), ('Journal',), 'open', 'replay isolated claims through the existing counted journal opener'),
+        ('journal/tests/grants.rs', ('fn failed_append_and_precommit_drop_spend_nothing',), ('Journal',), 'open', 'replay isolated claims through the existing counted journal opener'),
+        ('journal/tests/grants.rs', ('fn crash_after_commit_before_publication_recovers_spent_pending_claim',), ('Journal',), 'open', 'replay isolated claims through the existing counted journal opener'),
+        ('journal/tests/grants.rs', ('fn revoke_first_fences_claim_and_retry_without_spending',), ('Journal',), 'open', 'replay isolated claims through the existing counted journal opener'),
+        ('journal/tests/grants.rs', ('fn compaction_waits_for_p3b_retention',), ('Journal',), 'open', 'replay isolated claims through the existing counted journal opener'),
         ('journal/compact.rs', ('impl Read for Positioned', 'fn read'), ('<definition>',), 'read', 'existing journal method declaration, not an expression permission'),
         ('journal/compact.rs', ('impl Read for Positioned', 'fn read'), ('<namespace>',), 'files', 'existing use of reviewed counted stream/namespace alias; this use site reviewed separately'),
         ('journal/compact.rs', ('impl Snapshot', 'fn copy_to'), ('self.file',), 'write_all', 'existing counted File/Stream or its buffered writer; boundary retains I/O observation'),

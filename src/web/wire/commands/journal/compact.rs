@@ -72,7 +72,9 @@ impl Journal {
         let expired = self.index.oldest_ms.is_some_and(|oldest| {
             now.saturating_sub(oldest) >= super::super::super::IDEMPOTENCY_WINDOW_MS
         });
+        // P3b must retain consumption beyond the replay window before sweeping it.
         if self.blocked
+            || !self.index.consumed.is_empty()
             || self.compaction.is_some()
             || (self.bytes < self.next_compaction && !expired)
         {
@@ -118,6 +120,7 @@ impl Journal {
                             records: HashMap::with_capacity(limit),
                             counts: HashMap::with_capacity(limit),
                             oldest_ms: None,
+                            consumed: super::grants::Totals::new(),
                         },
                         offset: 0,
                         bytes: 0,
@@ -170,7 +173,7 @@ impl Journal {
             }
         };
         // A failed append may have left a torn tail. Keep the authoritative log intact.
-        if self.blocked {
+        if self.blocked || !self.index.consumed.is_empty() {
             let _ = control.send(Continue::Retire(snapshot.index));
             return;
         }
