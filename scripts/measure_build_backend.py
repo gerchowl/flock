@@ -10,6 +10,7 @@ only metrics, relative scratch names, tool versions and the measured source SHA.
 import argparse
 from collections import Counter
 import concurrent.futures
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -20,6 +21,8 @@ import signal
 import subprocess
 import tarfile
 import time
+
+from build_backend_control import RunInterrupted, owned_cache, quarantine
 
 
 def output(argv, **kwargs):
@@ -58,25 +61,30 @@ class Measurement:
         self.root = self.target.parent
         self.prefix = self.target.name
         self.logs = self.path("results")
-        if not args.append_controls and (self.target.exists() or self.logs.exists()):
+        if not (args.append_controls or args.rerun_nix) and (self.target.exists() or self.logs.exists()):
             raise RuntimeError("use a fresh exclusively owned target prefix")
         self.disk()
-        self.logs.mkdir(parents=True, exist_ok=args.append_controls)
+        self.logs.mkdir(parents=True, exist_ok=args.append_controls or args.rerun_nix)
         self.env = {key: value for key, value in os.environ.items()
                     if not key.startswith("FLOCK_") and not key.startswith("CARGO_PROFILE_")}
         self.env.update(CARGO_BUILD_JOBS="2", CARGO_INCREMENTAL="0",
                         NEXTEST_TEST_THREADS="2", SCCACHE_DIR=str(self.path("sccache")),
                         SCCACHE_SERVER_UDS=str(self.path("sccache") / "server.sock"),
                         SCCACHE_IGNORE_SERVER_IO_ERROR="1")
+        temporary = self.path("sccache") / "tmp"
+        temporary.mkdir(parents=True, exist_ok=True)
+        self.env["TMPDIR"] = str(temporary)
+        os.environ["TMPDIR"] = str(temporary)
+        self.session = None
         self.env.pop("SCCACHE_SERVER_PORT", None)
         self.env.pop("RUSTFLAGS", None)
         self.env.pop("CARGO_ENCODED_RUSTFLAGS", None)
         self.env["RUSTC_WRAPPER"] = shutil.which("sccache") or ""
         if not self.env["RUSTC_WRAPPER"]:
             raise RuntimeError("sccache is required")
-        if args.append_controls:
+        if args.append_controls or args.rerun_nix:
             self.data = json.loads((self.logs / "results.json").read_text())
-            if self.data["source_sha"] != output(["git", "rev-parse", "HEAD"], cwd=self.repo):
+            if not args.rerun_nix and self.data["source_sha"] != output(["git", "rev-parse", "HEAD"], cwd=self.repo):
                 raise RuntimeError("source changed since the initial measurement")
             return
         self.data = {
@@ -103,13 +111,19 @@ class Measurement:
 
     def admit(self):
         self.disk()
+        if self.session and self.session.cancelled:
+            raise RunInterrupted(self.session.cancelled)
         deadline = time.monotonic() + 300 * 60
         while not self.args.slot.is_file() or load() >= 10:
             if time.monotonic() >= deadline:
                 raise RuntimeError("no slot within 300 minutes")
             print("Waiting for admission: slot required, load < 10", flush=True)
             # The host admission protocol explicitly requires 60 second polls.
-            time.sleep(60)
+            if self.session:
+                if self.session.cancel_event.wait(60):
+                    raise RunInterrupted(self.session.cancelled)
+            else:
+                time.sleep(60)
             self.disk()
 
     def checkpoint(self):
@@ -155,9 +169,8 @@ class Measurement:
         start = time.monotonic()
         peak_group_rss = 0
         with logfile.open("w") as stream:
-            child = subprocess.Popen(["/usr/bin/time", "-l", *argv], cwd=cwd,
-                                     env=env, stdout=stream, stderr=stream,
-                                     start_new_session=True)
+            child = self.session.spawn(["/usr/bin/time", "-l", *argv], cwd=cwd,
+                                     env=env, stdout=stream, stderr=stream)
             while True:
                 try:
                     code = child.wait(timeout=1)
@@ -177,6 +190,7 @@ class Measurement:
         rss = re.search(r"(\d+)\s+maximum resident set size", text)
         footprint = re.search(r"(\d+)\s+peak memory footprint", text)
         row = {"scenario": name, "exit": code, "wall_s": elapsed,
+               "lifecycle_run": len(self.data["lifecycle_runs"]), "tmpdir_owned": True,
                "max_rss_bytes": int(rss[1]) if rss else None,
                "peak_footprint_bytes": int(footprint[1]) if footprint else None,
                "sampled_process_group_peak_rss_bytes": peak_group_rss,
@@ -211,14 +225,19 @@ class Measurement:
                 argv, env = self.archive(name, source, target, full_debug)
                 futures.append(pool.submit(self.measure, name, argv, source, env))
             rows = [future.result() for future in futures]
+        clean = quarantine(rows)
         self.data["groups"].append({"scenario": label, "wall_s": time.monotonic() - start,
-                                    "sccache_delta": delta(before, self.stats())})
+                                    "sccache_delta": delta(before, self.stats()),
+                                    "gc_contaminated": not clean,
+                                    "aggregate_eligible": clean and all(r["exit"] == 0 for r in rows)})
         for row, (_, _, target) in zip(rows, jobs):
             row["target_allocated_kib"] = int(output(["du", "-sk", str(target)]).split()[0])
             artifact = self.logs / f"{row['scenario']}.tar.zst"
             row["archive_bytes"] = artifact.stat().st_size if artifact.exists() else None
         self.data["rows"].extend(rows)
         self.checkpoint()
+        if not clean:
+            raise RuntimeError("GC contaminated archive; restart from its original target state")
         if any(row["exit"] for row in rows):
             raise RuntimeError(f"{label}: archive failed; inspect private logs")
 
@@ -227,12 +246,11 @@ class Measurement:
         module = source / "src/main.rs"
         source_times = (module.stat().st_atime_ns, module.stat().st_mtime_ns)
         self.admit()
-        subprocess.run(["sccache", "--start-server"], env=self.env, check=True,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        self.admit()
         with (self.logs / "fetch.log").open("w") as stream:
-            subprocess.run(["cargo", "fetch", "--locked"], cwd=source, env=self.env,
-                           stdout=stream, stderr=stream, check=True, timeout=1800)
+            fetch = self.session.spawn(["cargo", "fetch", "--locked"], cwd=source,
+                                       stdout=stream, stderr=stream)
+            if fetch.wait(timeout=1800):
+                raise RuntimeError("cargo fetch failed")
         self.env["CARGO_NET_OFFLINE"] = "true"
         self.record_archives("cold", [("cold", source, self.target)])
         seed = self.path("seed")
@@ -288,25 +306,66 @@ class Measurement:
             module.touch()
             self.record_archives(f"full-debug-touch-{repeat}",
                                  [(f"full-debug-touch-{repeat}", source, full)], True)
+        self.nix_runs()
+        print("results.json complete", flush=True)
+
+    def nix_runs(self):
+        self.data["gc_policy"] = {
+            "attempt_limit": self.args.gc_attempts,
+            "evidence": "captured auto-GC and GC-lock messages; entire batch quarantined",
+            "limit": "daemon GC lock unreadable; unrelated silent GC not observable"}
+        run_id = len(self.data["lifecycle_runs"])
         for label, count in (("nix-fresh-eval", 1), ("nix-warm", 2),
                              ("nix-four-a", 4), ("nix-four-b", 4)):
-            self.admit()
+            self.data.get("unavailable", {}).pop(label, None)
             argv = ["nix"]
             if label == "nix-fresh-eval":
                 argv += ["--option", "eval-cache", "false"]
             argv += ["develop", "--command", "true"]
-            start = time.monotonic()
-            with concurrent.futures.ThreadPoolExecutor(max_workers=4 if count == 4 else 1) as pool:
-                futures = [pool.submit(self.measure, f"{label}-{i+1}", argv, self.repo,
-                                       self.env | {"CARGO_TARGET_DIR": str(self.target)})
-                           for i in range(count)]
-                rows = [future.result() for future in futures]
-            self.data["rows"].extend(rows)
-            self.data["groups"].append({"scenario": label, "wall_s": time.monotonic() - start})
-            self.checkpoint()
-            if any(row["exit"] for row in rows):
-                raise RuntimeError(f"{label}: nix failed")
-        print("results.json complete", flush=True)
+            for attempt in range(1, self.args.gc_attempts + 1):
+                self.admit()
+                start = time.monotonic()
+                with concurrent.futures.ThreadPoolExecutor(max_workers=4 if count == 4 else 1) as pool:
+                    futures = [pool.submit(self.measure,
+                                           f"{label}-fix1-r{run_id}-a{attempt}-{i+1}", argv, self.repo,
+                                           self.env | {"CARGO_TARGET_DIR": str(self.target)})
+                               for i in range(count)]
+                    rows = [future.result() for future in futures]
+                clean = quarantine(rows)
+                group = {"scenario": label, "attempt": attempt,
+                         "wall_s": time.monotonic() - start, "gc_contaminated": not clean,
+                         "sample_ids": [row["scenario"] for row in rows],
+                         "aggregate_eligible": clean and all(r["exit"] == 0 for r in rows)}
+                self.data["rows"].extend(rows)
+                self.data["groups"].append(group)
+                self.checkpoint()
+                if any(row["exit"] for row in rows):
+                    raise RuntimeError(f"{label}: nix failed")
+                if clean:
+                    break
+            if not clean:
+                self.data.setdefault("unavailable", {})[label] = (
+                    f"GC signals in all {self.args.gc_attempts} attempts; no clean aggregate")
+        self.checkpoint()
+
+    def rerun_nix(self):
+        for row in self.data["rows"]:
+            quarantine([row])
+            if row["scenario"].startswith("nix-"):
+                row["aggregate_eligible"] = False
+                row["exclusion_reason"] = "superseded by GC-controlled Nix rerun"
+        for group in self.data["groups"]:
+            if group["scenario"].startswith("nix-"):
+                group["aggregate_eligible"] = False
+                members = [row for row in self.data["rows"]
+                           if row["scenario"] in group.get("sample_ids", [])
+                           or ("sample_ids" not in group
+                               and row["scenario"].startswith(group["scenario"] + "-"))]
+                group["gc_contaminated"] = any(r["gc_contaminated"] for r in members)
+                group["exclusion_reason"] = "superseded by GC-controlled Nix rerun"
+        self.data["nix_rerun_source_sha"] = output(["git", "rev-parse", "HEAD"], cwd=self.repo)
+        self.nix_runs()
+        print("GC-controlled Nix rerun complete", flush=True)
 
     def controls(self):
         """Separate cache reuse and steady-path concurrency from relocation."""
@@ -342,19 +401,38 @@ def main():
     parser.add_argument("--slot", type=Path, required=True)
     parser.add_argument("--append-controls", action="store_true",
                         help="after the main run, append warm-cache and steady-path controls")
+    parser.add_argument("--rerun-nix", action="store_true",
+                        help="append GC-controlled Nix samples to an existing result file")
+    parser.add_argument("--gc-attempts", type=int, choices=range(1, 4), default=3)
     args = parser.parse_args()
+    if args.rerun_nix and args.append_controls:
+        parser.error("choose one append mode")
     if platform.system() != "Darwin":
         parser.error("this harness requires macOS /usr/bin/time -l and APFS clone copies")
     measurement = Measurement(args)
+    measurement.data.pop("failure", None)
+    audit = {"owned_tmpdir": True, "mode": "rerun-nix" if args.rerun_nix else "archives",
+             "controller_sha256": {name: hashlib.sha256((measurement.repo / "scripts" / name).read_bytes()).hexdigest()
+                                   for name in ("measure_build_backend.py", "build_backend_control.py")}}
+    measurement.data.setdefault("lifecycle_runs", []).append(audit)
+    code = 0
     try:
-        if args.append_controls:
-            measurement.controls()
-        else:
-            measurement.run()
-    except (RuntimeError, subprocess.CalledProcessError) as error:
+        measurement.admit()
+        with owned_cache(measurement.env, audit) as session:
+            measurement.session = session
+            if args.rerun_nix:
+                measurement.rerun_nix()
+            elif args.append_controls:
+                measurement.controls()
+            else:
+                measurement.run()
+    except (RuntimeError, subprocess.SubprocessError, RunInterrupted) as error:
         measurement.data["failure"] = str(error)
+        audit["failure"] = str(error)
+        code = 128 + error.signum if isinstance(error, RunInterrupted) else 1
+    finally:
         measurement.checkpoint()
-        raise SystemExit(str(error)) from None
+    raise SystemExit(code)
 
 
 if __name__ == "__main__":

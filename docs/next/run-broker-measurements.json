@@ -40,7 +40,9 @@
       "cargo_lock_kinds": {},
       "nix_sqlite_busy_messages": 0,
       "nix_auto_gc_messages": 0,
-      "nix_gc_lock_messages": 0
+      "nix_gc_lock_messages": 0,
+      "gc_contaminated": false,
+      "aggregate_eligible": true
     },
     {
       "scenario": "same-1",
@@ -68,7 +70,9 @@
       "cargo_lock_kinds": {},
       "nix_sqlite_busy_messages": 0,
       "nix_auto_gc_messages": 0,
-      "nix_gc_lock_messages": 0
+      "nix_gc_lock_messages": 0,
+      "gc_contaminated": false,
+      "aggregate_eligible": true
     },
     {
       "scenario": "different-1",
@@ -96,7 +100,9 @@
       "cargo_lock_kinds": {},
       "nix_sqlite_busy_messages": 0,
       "nix_auto_gc_messages": 0,
-      "nix_gc_lock_messages": 0
+      "nix_gc_lock_messages": 0,
+      "gc_contaminated": false,
+      "aggregate_eligible": true
     },
     {
       "scenario": "touch-1",
@@ -124,7 +130,9 @@
       "cargo_lock_kinds": {},
       "nix_sqlite_busy_messages": 0,
       "nix_auto_gc_messages": 0,
-      "nix_gc_lock_messages": 0
+      "nix_gc_lock_messages": 0,
+      "gc_contaminated": false,
+      "aggregate_eligible": true
     },
     {
       "scenario": "fresh-1",
@@ -152,7 +160,9 @@
       "cargo_lock_kinds": {},
       "nix_sqlite_busy_messages": 0,
       "nix_auto_gc_messages": 0,
-      "nix_gc_lock_messages": 0
+      "nix_gc_lock_messages": 0,
+      "gc_contaminated": false,
+      "aggregate_eligible": true
     },
     {
       "scenario": "same-2",
@@ -180,7 +190,9 @@
       "cargo_lock_kinds": {},
       "nix_sqlite_busy_messages": 0,
       "nix_auto_gc_messages": 0,
-      "nix_gc_lock_messages": 0
+      "nix_gc_lock_messages": 0,
+      "gc_contaminated": false,
+      "aggregate_eligible": true
     },
     {
       "scenario": "different-2",
@@ -208,7 +220,9 @@
       "cargo_lock_kinds": {},
       "nix_sqlite_busy_messages": 0,
       "nix_auto_gc_messages": 0,
-      "nix_gc_lock_messages": 0
+      "nix_gc_lock_messages": 0,
+      "gc_contaminated": false,
+      "aggregate_eligible": true
     },
     {
       "scenario": "touch-2",
@@ -236,7 +250,9 @@
       "cargo_lock_kinds": {},
       "nix_sqlite_busy_messages": 0,
       "nix_auto_gc_messages": 0,
-      "nix_gc_lock_messages": 0
+      "nix_gc_lock_messages": 0,
+      "gc_contaminated": false,
+      "aggregate_eligible": true
     },
     {
       "scenario": "fresh-2",
@@ -264,7 +280,9 @@
       "cargo_lock_kinds": {},
       "nix_sqlite_busy_messages": 0,
       "nix_auto_gc_messages": 0,
-      "nix_gc_lock_messages": 0
+      "nix_gc_lock_messages": 0,
+      "gc_contaminated": false,
+      "aggregate_eligible": true
     },
     {
       "scenario": "edit-1-01",
@@ -292,7 +310,9 @@
       "cargo_lock_kinds": {},
       "nix_sqlite_busy_messages": 0,
       "nix_auto_gc_messages": 0,
-      "nix_gc_lock_messages": 0
+      "nix_gc_lock_messages": 0,
+      "gc_contaminated": false,
+      "aggregate_eligible": true
     },
     {
       "scenario": "edit-1-02",
@@ -320,7 +340,9 @@
       "cargo_lock_kinds": {},
       "nix_sqlite_busy_messages": 0,
       "nix_auto_gc_messages": 0,
-      "nix_gc_lock_messages": 0
+      "nix_gc_lock_messages": 0,
+      "gc_contaminated": false,
+      "aggregate_eligible": true
     },
     {
       "scenario": "edit-1-03",
@@ -348,7 +370,9 @@
       "cargo_lock_kinds": {},
       "nix_sqlite_busy_messages": 0,
       "nix_auto_gc_messages": 0,
-      "nix_gc_lock_messages": 0
+      "nix_gc_lock_messages": 0,
+      "gc_contaminated": false,
+      "aggregate_eligible": true
     },
     {
       "scenario": "edit-1-04",
@@ -376,7 +400,9 @@
       "cargo_lock_kinds": {},
       "nix_sqlite_busy_messages": 0,
       "nix_auto_gc_messages": 0,
-      "nix_gc_lock_messages": 0
+      "nix_gc_lock_messages": 0,
+      "gc_contaminated": false,
+      "aggregate_eligible": true
     },
     {
       "scenario": "edit-1-05",
@@ -404,7 +430,9 @@
       "cargo_lock_kinds": {},
       "nix_sqlite_busy_messages": 0,
       "nix_auto_gc_messages": 0,
-      "nix_gc_lock_messages": 0
+      "nix_gc_lock_messages": 0,
+      "gc_contaminated": false,
+      "aggregate_eligible": true
     },
     {
       "scenario": "edit-1-06",
@@ -432,7 +460,9 @@
       "cargo_lock_kinds": {},
       "nix_sqlite_busy_messages": 0,
       "nix_auto_gc_messages": 0,
-      "nix_gc_lock_messages": 0
+      "nix_gc_lock_messages": 0,
+      "gc_contaminated": false,
+      "aggregate_eligible": true
     },
     {
       "scenario": "edit-1-07",
@@ -460,7 +490,9 @@
       "cargo_lock_kinds": {},
       "nix_sqlite_busy_messages": 0,
       "nix_auto_gc_messages": 0,
-      "nix_gc_lock_messages": 0
+      "nix_gc_lock_messages": 0,
+      "gc_contaminated": false,
+      "aggregate_eligible": true
     },
     {
       "scenario": "edit-1-08",
@@ -488,7 +520,9 @@
       "cargo_lock_kinds": {},
       "nix_sqlite_busy_messages": 0,
       "nix_auto_gc_messages": 0,
-      "nix_gc_lock_messages": 0
+      "nix_gc_lock_messages": 0,
+      "gc_contaminated": false,
+      "aggregate_eligible": true
     },
     {
       "scenario": "edit-1-09",
@@ -516,7 +550,9 @@
       "cargo_lock_kinds": {},
       "nix_sqlite_busy_messages": 0,
       "nix_auto_gc_messages": 0,
-      "nix_gc_lock_messages": 0
+      "nix_gc_lock_messages": 0,
+      "gc_contaminated": false,
+      "aggregate_eligible": true
     },
     {
       "scenario": "edit-1-10",
@@ -544,7 +580,9 @@
       "cargo_lock_kinds": {},
       "nix_sqlite_busy_messages": 0,
       "nix_auto_gc_messages": 0,
-      "nix_gc_lock_messages": 0
+      "nix_gc_lock_messages": 0,
+      "gc_contaminated": false,
+      "aggregate_eligible": true
     },
     {
       "scenario": "edit-2-01",
@@ -572,7 +610,9 @@
       "cargo_lock_kinds": {},
       "nix_sqlite_busy_messages": 0,
       "nix_auto_gc_messages": 0,
-      "nix_gc_lock_messages": 0
+      "nix_gc_lock_messages": 0,
+      "gc_contaminated": false,
+      "aggregate_eligible": true
     },
     {
       "scenario": "edit-2-02",
@@ -600,7 +640,9 @@
       "cargo_lock_kinds": {},
       "nix_sqlite_busy_messages": 0,
       "nix_auto_gc_messages": 0,
-      "nix_gc_lock_messages": 0
+      "nix_gc_lock_messages": 0,
+      "gc_contaminated": false,
+      "aggregate_eligible": true
     },
     {
       "scenario": "edit-2-03",
@@ -628,7 +670,9 @@
       "cargo_lock_kinds": {},
       "nix_sqlite_busy_messages": 0,
       "nix_auto_gc_messages": 0,
-      "nix_gc_lock_messages": 0
+      "nix_gc_lock_messages": 0,
+      "gc_contaminated": false,
+      "aggregate_eligible": true
     },
     {
       "scenario": "edit-2-04",
@@ -656,7 +700,9 @@
       "cargo_lock_kinds": {},
       "nix_sqlite_busy_messages": 0,
       "nix_auto_gc_messages": 0,
-      "nix_gc_lock_messages": 0
+      "nix_gc_lock_messages": 0,
+      "gc_contaminated": false,
+      "aggregate_eligible": true
     },
     {
       "scenario": "edit-2-05",
@@ -684,7 +730,9 @@
       "cargo_lock_kinds": {},
       "nix_sqlite_busy_messages": 0,
       "nix_auto_gc_messages": 0,
-      "nix_gc_lock_messages": 0
+      "nix_gc_lock_messages": 0,
+      "gc_contaminated": false,
+      "aggregate_eligible": true
     },
     {
       "scenario": "edit-2-06",
@@ -712,7 +760,9 @@
       "cargo_lock_kinds": {},
       "nix_sqlite_busy_messages": 0,
       "nix_auto_gc_messages": 0,
-      "nix_gc_lock_messages": 0
+      "nix_gc_lock_messages": 0,
+      "gc_contaminated": false,
+      "aggregate_eligible": true
     },
     {
       "scenario": "edit-2-07",
@@ -740,7 +790,9 @@
       "cargo_lock_kinds": {},
       "nix_sqlite_busy_messages": 0,
       "nix_auto_gc_messages": 0,
-      "nix_gc_lock_messages": 0
+      "nix_gc_lock_messages": 0,
+      "gc_contaminated": false,
+      "aggregate_eligible": true
     },
     {
       "scenario": "edit-2-08",
@@ -768,7 +820,9 @@
       "cargo_lock_kinds": {},
       "nix_sqlite_busy_messages": 0,
       "nix_auto_gc_messages": 0,
-      "nix_gc_lock_messages": 0
+      "nix_gc_lock_messages": 0,
+      "gc_contaminated": false,
+      "aggregate_eligible": true
     },
     {
       "scenario": "edit-2-09",
@@ -796,7 +850,9 @@
       "cargo_lock_kinds": {},
       "nix_sqlite_busy_messages": 0,
       "nix_auto_gc_messages": 0,
-      "nix_gc_lock_messages": 0
+      "nix_gc_lock_messages": 0,
+      "gc_contaminated": false,
+      "aggregate_eligible": true
     },
     {
       "scenario": "edit-2-10",
@@ -824,7 +880,9 @@
       "cargo_lock_kinds": {},
       "nix_sqlite_busy_messages": 0,
       "nix_auto_gc_messages": 0,
-      "nix_gc_lock_messages": 0
+      "nix_gc_lock_messages": 0,
+      "gc_contaminated": false,
+      "aggregate_eligible": true
     },
     {
       "scenario": "serial-1",
@@ -852,7 +910,9 @@
       "cargo_lock_kinds": {},
       "nix_sqlite_busy_messages": 0,
       "nix_auto_gc_messages": 0,
-      "nix_gc_lock_messages": 0
+      "nix_gc_lock_messages": 0,
+      "gc_contaminated": false,
+      "aggregate_eligible": true
     },
     {
       "scenario": "concurrent-1-0",
@@ -882,7 +942,9 @@
       },
       "nix_sqlite_busy_messages": 0,
       "nix_auto_gc_messages": 0,
-      "nix_gc_lock_messages": 0
+      "nix_gc_lock_messages": 0,
+      "gc_contaminated": false,
+      "aggregate_eligible": true
     },
     {
       "scenario": "concurrent-1-1",
@@ -912,7 +974,9 @@
       },
       "nix_sqlite_busy_messages": 0,
       "nix_auto_gc_messages": 0,
-      "nix_gc_lock_messages": 0
+      "nix_gc_lock_messages": 0,
+      "gc_contaminated": false,
+      "aggregate_eligible": true
     },
     {
       "scenario": "serial-2",
@@ -940,7 +1004,9 @@
       "cargo_lock_kinds": {},
       "nix_sqlite_busy_messages": 0,
       "nix_auto_gc_messages": 0,
-      "nix_gc_lock_messages": 0
+      "nix_gc_lock_messages": 0,
+      "gc_contaminated": false,
+      "aggregate_eligible": true
     },
     {
       "scenario": "concurrent-2-0",
@@ -970,7 +1036,9 @@
       },
       "nix_sqlite_busy_messages": 0,
       "nix_auto_gc_messages": 0,
-      "nix_gc_lock_messages": 0
+      "nix_gc_lock_messages": 0,
+      "gc_contaminated": false,
+      "aggregate_eligible": true
     },
     {
       "scenario": "concurrent-2-1",
@@ -1000,7 +1068,9 @@
       },
       "nix_sqlite_busy_messages": 0,
       "nix_auto_gc_messages": 0,
-      "nix_gc_lock_messages": 0
+      "nix_gc_lock_messages": 0,
+      "gc_contaminated": false,
+      "aggregate_eligible": true
     },
     {
       "scenario": "full-debug-cold",
@@ -1030,7 +1100,9 @@
       "cargo_lock_kinds": {},
       "nix_sqlite_busy_messages": 0,
       "nix_auto_gc_messages": 0,
-      "nix_gc_lock_messages": 0
+      "nix_gc_lock_messages": 0,
+      "gc_contaminated": false,
+      "aggregate_eligible": true
     },
     {
       "scenario": "full-debug-touch-1",
@@ -1060,7 +1132,9 @@
       "cargo_lock_kinds": {},
       "nix_sqlite_busy_messages": 0,
       "nix_auto_gc_messages": 0,
-      "nix_gc_lock_messages": 0
+      "nix_gc_lock_messages": 0,
+      "gc_contaminated": false,
+      "aggregate_eligible": true
     },
     {
       "scenario": "full-debug-touch-2",
@@ -1090,7 +1164,9 @@
       "cargo_lock_kinds": {},
       "nix_sqlite_busy_messages": 0,
       "nix_auto_gc_messages": 0,
-      "nix_gc_lock_messages": 0
+      "nix_gc_lock_messages": 0,
+      "gc_contaminated": false,
+      "aggregate_eligible": true
     },
     {
       "scenario": "nix-fresh-eval-1",
@@ -1114,7 +1190,10 @@
       "cargo_lock_kinds": {},
       "nix_sqlite_busy_messages": 0,
       "nix_auto_gc_messages": 1,
-      "nix_gc_lock_messages": 1
+      "nix_gc_lock_messages": 1,
+      "gc_contaminated": true,
+      "aggregate_eligible": false,
+      "exclusion_reason": "superseded by GC-controlled Nix rerun"
     },
     {
       "scenario": "nix-warm-1",
@@ -1135,7 +1214,10 @@
       "cargo_lock_kinds": {},
       "nix_sqlite_busy_messages": 0,
       "nix_auto_gc_messages": 0,
-      "nix_gc_lock_messages": 0
+      "nix_gc_lock_messages": 0,
+      "gc_contaminated": false,
+      "aggregate_eligible": false,
+      "exclusion_reason": "superseded by GC-controlled Nix rerun"
     },
     {
       "scenario": "nix-warm-2",
@@ -1156,7 +1238,10 @@
       "cargo_lock_kinds": {},
       "nix_sqlite_busy_messages": 0,
       "nix_auto_gc_messages": 0,
-      "nix_gc_lock_messages": 0
+      "nix_gc_lock_messages": 0,
+      "gc_contaminated": false,
+      "aggregate_eligible": false,
+      "exclusion_reason": "superseded by GC-controlled Nix rerun"
     },
     {
       "scenario": "nix-four-a-1",
@@ -1177,7 +1262,10 @@
       "cargo_lock_kinds": {},
       "nix_sqlite_busy_messages": 2,
       "nix_auto_gc_messages": 0,
-      "nix_gc_lock_messages": 0
+      "nix_gc_lock_messages": 0,
+      "gc_contaminated": false,
+      "aggregate_eligible": false,
+      "exclusion_reason": "superseded by GC-controlled Nix rerun"
     },
     {
       "scenario": "nix-four-a-2",
@@ -1198,7 +1286,10 @@
       "cargo_lock_kinds": {},
       "nix_sqlite_busy_messages": 2,
       "nix_auto_gc_messages": 0,
-      "nix_gc_lock_messages": 0
+      "nix_gc_lock_messages": 0,
+      "gc_contaminated": false,
+      "aggregate_eligible": false,
+      "exclusion_reason": "superseded by GC-controlled Nix rerun"
     },
     {
       "scenario": "nix-four-a-3",
@@ -1219,7 +1310,10 @@
       "cargo_lock_kinds": {},
       "nix_sqlite_busy_messages": 0,
       "nix_auto_gc_messages": 0,
-      "nix_gc_lock_messages": 0
+      "nix_gc_lock_messages": 0,
+      "gc_contaminated": false,
+      "aggregate_eligible": false,
+      "exclusion_reason": "superseded by GC-controlled Nix rerun"
     },
     {
       "scenario": "nix-four-a-4",
@@ -1240,7 +1334,10 @@
       "cargo_lock_kinds": {},
       "nix_sqlite_busy_messages": 2,
       "nix_auto_gc_messages": 0,
-      "nix_gc_lock_messages": 0
+      "nix_gc_lock_messages": 0,
+      "gc_contaminated": false,
+      "aggregate_eligible": false,
+      "exclusion_reason": "superseded by GC-controlled Nix rerun"
     },
     {
       "scenario": "nix-four-b-1",
@@ -1261,7 +1358,10 @@
       "cargo_lock_kinds": {},
       "nix_sqlite_busy_messages": 1,
       "nix_auto_gc_messages": 0,
-      "nix_gc_lock_messages": 0
+      "nix_gc_lock_messages": 0,
+      "gc_contaminated": false,
+      "aggregate_eligible": false,
+      "exclusion_reason": "superseded by GC-controlled Nix rerun"
     },
     {
       "scenario": "nix-four-b-2",
@@ -1282,7 +1382,10 @@
       "cargo_lock_kinds": {},
       "nix_sqlite_busy_messages": 2,
       "nix_auto_gc_messages": 0,
-      "nix_gc_lock_messages": 0
+      "nix_gc_lock_messages": 0,
+      "gc_contaminated": false,
+      "aggregate_eligible": false,
+      "exclusion_reason": "superseded by GC-controlled Nix rerun"
     },
     {
       "scenario": "nix-four-b-3",
@@ -1303,7 +1406,10 @@
       "cargo_lock_kinds": {},
       "nix_sqlite_busy_messages": 1,
       "nix_auto_gc_messages": 0,
-      "nix_gc_lock_messages": 0
+      "nix_gc_lock_messages": 0,
+      "gc_contaminated": false,
+      "aggregate_eligible": false,
+      "exclusion_reason": "superseded by GC-controlled Nix rerun"
     },
     {
       "scenario": "nix-four-b-4",
@@ -1324,7 +1430,10 @@
       "cargo_lock_kinds": {},
       "nix_sqlite_busy_messages": 2,
       "nix_auto_gc_messages": 0,
-      "nix_gc_lock_messages": 0
+      "nix_gc_lock_messages": 0,
+      "gc_contaminated": false,
+      "aggregate_eligible": false,
+      "exclusion_reason": "superseded by GC-controlled Nix rerun"
     },
     {
       "scenario": "empty-checkout-1",
@@ -1352,7 +1461,9 @@
       "nix_auto_gc_messages": 0,
       "nix_gc_lock_messages": 0,
       "target_allocated_kib": 2259008,
-      "archive_bytes": 179404152
+      "archive_bytes": 179404152,
+      "gc_contaminated": false,
+      "aggregate_eligible": true
     },
     {
       "scenario": "empty-checkout-2",
@@ -1380,7 +1491,9 @@
       "nix_auto_gc_messages": 0,
       "nix_gc_lock_messages": 0,
       "target_allocated_kib": 2257988,
-      "archive_bytes": 179404129
+      "archive_bytes": 179404129,
+      "gc_contaminated": false,
+      "aggregate_eligible": true
     },
     {
       "scenario": "steady-serial-1",
@@ -1408,7 +1521,9 @@
       "nix_auto_gc_messages": 0,
       "nix_gc_lock_messages": 0,
       "target_allocated_kib": 2332876,
-      "archive_bytes": 179391143
+      "archive_bytes": 179391143,
+      "gc_contaminated": false,
+      "aggregate_eligible": true
     },
     {
       "scenario": "steady-concurrent-1-0",
@@ -1438,7 +1553,9 @@
       "nix_auto_gc_messages": 0,
       "nix_gc_lock_messages": 0,
       "target_allocated_kib": 2333068,
-      "archive_bytes": 179391314
+      "archive_bytes": 179391314,
+      "gc_contaminated": false,
+      "aggregate_eligible": true
     },
     {
       "scenario": "steady-concurrent-1-1",
@@ -1468,7 +1585,9 @@
       "nix_auto_gc_messages": 0,
       "nix_gc_lock_messages": 0,
       "target_allocated_kib": 2332492,
-      "archive_bytes": 179390942
+      "archive_bytes": 179390942,
+      "gc_contaminated": false,
+      "aggregate_eligible": true
     },
     {
       "scenario": "steady-serial-2",
@@ -1496,7 +1615,9 @@
       "nix_auto_gc_messages": 0,
       "nix_gc_lock_messages": 0,
       "target_allocated_kib": 2333260,
-      "archive_bytes": 179391318
+      "archive_bytes": 179391318,
+      "gc_contaminated": false,
+      "aggregate_eligible": true
     },
     {
       "scenario": "steady-concurrent-2-0",
@@ -1526,7 +1647,9 @@
       "nix_auto_gc_messages": 0,
       "nix_gc_lock_messages": 0,
       "target_allocated_kib": 2333452,
-      "archive_bytes": 179391283
+      "archive_bytes": 179391283,
+      "gc_contaminated": false,
+      "aggregate_eligible": true
     },
     {
       "scenario": "steady-concurrent-2-1",
@@ -1556,7 +1679,287 @@
       "nix_auto_gc_messages": 0,
       "nix_gc_lock_messages": 0,
       "target_allocated_kib": 2332684,
-      "archive_bytes": 179390795
+      "archive_bytes": 179390795,
+      "gc_contaminated": false,
+      "aggregate_eligible": true
+    },
+    {
+      "scenario": "nix-fresh-eval-fix1-r1-a1-1",
+      "exit": 0,
+      "wall_s": 2.594590999884531,
+      "lifecycle_run": 1,
+      "tmpdir_owned": true,
+      "max_rss_bytes": 1572864,
+      "peak_footprint_bytes": 1098496,
+      "sampled_process_group_peak_rss_bytes": 447234048,
+      "load_start": 4.0,
+      "load_end": 4.0,
+      "cargo_lock_messages": 0,
+      "cargo_lock_kinds": {},
+      "command": [
+        "nix",
+        "--option",
+        "eval-cache",
+        "false",
+        "develop",
+        "--command",
+        "true"
+      ],
+      "nix_sqlite_busy_messages": 0,
+      "nix_auto_gc_messages": 0,
+      "nix_gc_lock_messages": 0,
+      "gc_contaminated": false,
+      "aggregate_eligible": true
+    },
+    {
+      "scenario": "nix-warm-fix1-r1-a1-1",
+      "exit": 0,
+      "wall_s": 2.5889971661381423,
+      "lifecycle_run": 1,
+      "tmpdir_owned": true,
+      "max_rss_bytes": 1572864,
+      "peak_footprint_bytes": 1098496,
+      "sampled_process_group_peak_rss_bytes": 448020480,
+      "load_start": 4.0,
+      "load_end": 4.16,
+      "cargo_lock_messages": 0,
+      "cargo_lock_kinds": {},
+      "command": [
+        "nix",
+        "develop",
+        "--command",
+        "true"
+      ],
+      "nix_sqlite_busy_messages": 0,
+      "nix_auto_gc_messages": 0,
+      "nix_gc_lock_messages": 0,
+      "gc_contaminated": false,
+      "aggregate_eligible": true
+    },
+    {
+      "scenario": "nix-warm-fix1-r1-a1-2",
+      "exit": 0,
+      "wall_s": 2.5869330000132322,
+      "lifecycle_run": 1,
+      "tmpdir_owned": true,
+      "max_rss_bytes": 1572864,
+      "peak_footprint_bytes": 1098496,
+      "sampled_process_group_peak_rss_bytes": 449380352,
+      "load_start": 4.16,
+      "load_end": 4.16,
+      "cargo_lock_messages": 0,
+      "cargo_lock_kinds": {},
+      "command": [
+        "nix",
+        "develop",
+        "--command",
+        "true"
+      ],
+      "nix_sqlite_busy_messages": 0,
+      "nix_auto_gc_messages": 0,
+      "nix_gc_lock_messages": 0,
+      "gc_contaminated": false,
+      "aggregate_eligible": true
+    },
+    {
+      "scenario": "nix-four-a-fix1-r1-a1-1",
+      "exit": 0,
+      "wall_s": 3.777459834003821,
+      "lifecycle_run": 1,
+      "tmpdir_owned": true,
+      "max_rss_bytes": 1572864,
+      "peak_footprint_bytes": 1098496,
+      "sampled_process_group_peak_rss_bytes": 450920448,
+      "load_start": 4.16,
+      "load_end": 4.62,
+      "cargo_lock_messages": 0,
+      "cargo_lock_kinds": {},
+      "command": [
+        "nix",
+        "develop",
+        "--command",
+        "true"
+      ],
+      "nix_sqlite_busy_messages": 2,
+      "nix_auto_gc_messages": 0,
+      "nix_gc_lock_messages": 0,
+      "gc_contaminated": false,
+      "aggregate_eligible": true
+    },
+    {
+      "scenario": "nix-four-a-fix1-r1-a1-2",
+      "exit": 0,
+      "wall_s": 3.7657955831382424,
+      "lifecycle_run": 1,
+      "tmpdir_owned": true,
+      "max_rss_bytes": 1572864,
+      "peak_footprint_bytes": 1098496,
+      "sampled_process_group_peak_rss_bytes": 451395584,
+      "load_start": 4.16,
+      "load_end": 4.62,
+      "cargo_lock_messages": 0,
+      "cargo_lock_kinds": {},
+      "command": [
+        "nix",
+        "develop",
+        "--command",
+        "true"
+      ],
+      "nix_sqlite_busy_messages": 2,
+      "nix_auto_gc_messages": 0,
+      "nix_gc_lock_messages": 0,
+      "gc_contaminated": false,
+      "aggregate_eligible": true
+    },
+    {
+      "scenario": "nix-four-a-fix1-r1-a1-3",
+      "exit": 0,
+      "wall_s": 3.783646124880761,
+      "lifecycle_run": 1,
+      "tmpdir_owned": true,
+      "max_rss_bytes": 1572864,
+      "peak_footprint_bytes": 1098496,
+      "sampled_process_group_peak_rss_bytes": 451543040,
+      "load_start": 4.16,
+      "load_end": 4.62,
+      "cargo_lock_messages": 0,
+      "cargo_lock_kinds": {},
+      "command": [
+        "nix",
+        "develop",
+        "--command",
+        "true"
+      ],
+      "nix_sqlite_busy_messages": 1,
+      "nix_auto_gc_messages": 0,
+      "nix_gc_lock_messages": 0,
+      "gc_contaminated": false,
+      "aggregate_eligible": true
+    },
+    {
+      "scenario": "nix-four-a-fix1-r1-a1-4",
+      "exit": 0,
+      "wall_s": 3.8020132908131927,
+      "lifecycle_run": 1,
+      "tmpdir_owned": true,
+      "max_rss_bytes": 1572864,
+      "peak_footprint_bytes": 1098496,
+      "sampled_process_group_peak_rss_bytes": 452542464,
+      "load_start": 4.16,
+      "load_end": 4.62,
+      "cargo_lock_messages": 0,
+      "cargo_lock_kinds": {},
+      "command": [
+        "nix",
+        "develop",
+        "--command",
+        "true"
+      ],
+      "nix_sqlite_busy_messages": 1,
+      "nix_auto_gc_messages": 0,
+      "nix_gc_lock_messages": 0,
+      "gc_contaminated": false,
+      "aggregate_eligible": true
+    },
+    {
+      "scenario": "nix-four-b-fix1-r1-a1-1",
+      "exit": 0,
+      "wall_s": 4.071257291827351,
+      "lifecycle_run": 1,
+      "tmpdir_owned": true,
+      "max_rss_bytes": 1572864,
+      "peak_footprint_bytes": 1098496,
+      "sampled_process_group_peak_rss_bytes": 411942912,
+      "load_start": 4.62,
+      "load_end": 5.69,
+      "cargo_lock_messages": 0,
+      "cargo_lock_kinds": {},
+      "command": [
+        "nix",
+        "develop",
+        "--command",
+        "true"
+      ],
+      "nix_sqlite_busy_messages": 1,
+      "nix_auto_gc_messages": 0,
+      "nix_gc_lock_messages": 0,
+      "gc_contaminated": false,
+      "aggregate_eligible": true
+    },
+    {
+      "scenario": "nix-four-b-fix1-r1-a1-2",
+      "exit": 0,
+      "wall_s": 4.254580040927976,
+      "lifecycle_run": 1,
+      "tmpdir_owned": true,
+      "max_rss_bytes": 1572864,
+      "peak_footprint_bytes": 1098496,
+      "sampled_process_group_peak_rss_bytes": 498122752,
+      "load_start": 4.62,
+      "load_end": 5.69,
+      "cargo_lock_messages": 0,
+      "cargo_lock_kinds": {},
+      "command": [
+        "nix",
+        "develop",
+        "--command",
+        "true"
+      ],
+      "nix_sqlite_busy_messages": 1,
+      "nix_auto_gc_messages": 0,
+      "nix_gc_lock_messages": 0,
+      "gc_contaminated": false,
+      "aggregate_eligible": true
+    },
+    {
+      "scenario": "nix-four-b-fix1-r1-a1-3",
+      "exit": 0,
+      "wall_s": 4.062727333046496,
+      "lifecycle_run": 1,
+      "tmpdir_owned": true,
+      "max_rss_bytes": 1572864,
+      "peak_footprint_bytes": 1098496,
+      "sampled_process_group_peak_rss_bytes": 412155904,
+      "load_start": 4.62,
+      "load_end": 5.69,
+      "cargo_lock_messages": 0,
+      "cargo_lock_kinds": {},
+      "command": [
+        "nix",
+        "develop",
+        "--command",
+        "true"
+      ],
+      "nix_sqlite_busy_messages": 2,
+      "nix_auto_gc_messages": 0,
+      "nix_gc_lock_messages": 0,
+      "gc_contaminated": false,
+      "aggregate_eligible": true
+    },
+    {
+      "scenario": "nix-four-b-fix1-r1-a1-4",
+      "exit": 0,
+      "wall_s": 4.119036291027442,
+      "lifecycle_run": 1,
+      "tmpdir_owned": true,
+      "max_rss_bytes": 1572864,
+      "peak_footprint_bytes": 1098496,
+      "sampled_process_group_peak_rss_bytes": 408092672,
+      "load_start": 4.62,
+      "load_end": 5.69,
+      "cargo_lock_messages": 0,
+      "cargo_lock_kinds": {},
+      "command": [
+        "nix",
+        "develop",
+        "--command",
+        "true"
+      ],
+      "nix_sqlite_busy_messages": 2,
+      "nix_auto_gc_messages": 0,
+      "nix_gc_lock_messages": 0,
+      "gc_contaminated": false,
+      "aggregate_eligible": true
     }
   ],
   "groups": [
@@ -3786,19 +4189,31 @@
     },
     {
       "scenario": "nix-fresh-eval",
-      "wall_s": 28.999975374899805
+      "wall_s": 28.999975374899805,
+      "aggregate_eligible": false,
+      "gc_contaminated": true,
+      "exclusion_reason": "superseded by GC-controlled Nix rerun"
     },
     {
       "scenario": "nix-warm",
-      "wall_s": 4.232855541165918
+      "wall_s": 4.232855541165918,
+      "aggregate_eligible": false,
+      "gc_contaminated": false,
+      "exclusion_reason": "superseded by GC-controlled Nix rerun"
     },
     {
       "scenario": "nix-four-a",
-      "wall_s": 2.8971227079164237
+      "wall_s": 2.8971227079164237,
+      "aggregate_eligible": false,
+      "gc_contaminated": false,
+      "exclusion_reason": "superseded by GC-controlled Nix rerun"
     },
     {
       "scenario": "nix-four-b",
-      "wall_s": 2.6626704579684883
+      "wall_s": 2.6626704579684883,
+      "aggregate_eligible": false,
+      "gc_contaminated": false,
+      "exclusion_reason": "superseded by GC-controlled Nix rerun"
     },
     {
       "scenario": "empty-checkout-1",
@@ -4171,6 +4586,53 @@
         "dist_errors": 0,
         "multi_level": null
       }
+    },
+    {
+      "scenario": "nix-fresh-eval",
+      "attempt": 1,
+      "wall_s": 2.612501750001684,
+      "gc_contaminated": false,
+      "sample_ids": [
+        "nix-fresh-eval-fix1-r1-a1-1"
+      ],
+      "aggregate_eligible": true
+    },
+    {
+      "scenario": "nix-warm",
+      "attempt": 1,
+      "wall_s": 5.211362000089139,
+      "gc_contaminated": false,
+      "sample_ids": [
+        "nix-warm-fix1-r1-a1-1",
+        "nix-warm-fix1-r1-a1-2"
+      ],
+      "aggregate_eligible": true
+    },
+    {
+      "scenario": "nix-four-a",
+      "attempt": 1,
+      "wall_s": 3.8271102919243276,
+      "gc_contaminated": false,
+      "sample_ids": [
+        "nix-four-a-fix1-r1-a1-1",
+        "nix-four-a-fix1-r1-a1-2",
+        "nix-four-a-fix1-r1-a1-3",
+        "nix-four-a-fix1-r1-a1-4"
+      ],
+      "aggregate_eligible": true
+    },
+    {
+      "scenario": "nix-four-b",
+      "attempt": 1,
+      "wall_s": 4.274362374795601,
+      "gc_contaminated": false,
+      "sample_ids": [
+        "nix-four-b-fix1-r1-a1-1",
+        "nix-four-b-fix1-r1-a1-2",
+        "nix-four-b-fix1-r1-a1-3",
+        "nix-four-b-fix1-r1-a1-4"
+      ],
+      "aggregate_eligible": true
     }
   ],
   "skipped": {
@@ -4199,6 +4661,7 @@
     "m3081-empty-checkout-2",
     "m3081-empty-source-1",
     "m3081-empty-source-2",
+    "m3081-fix1-tests",
     "m3081-fresh-1",
     "m3081-fresh-2",
     "m3081-fresh-source-1",
@@ -4272,5 +4735,24 @@
       "destination": "m3081-parallel-1",
       "wall_s": 0.48312404099851847
     }
-  ]
+  ],
+  "lifecycle_runs": [
+    {
+      "owned_tmpdir": true,
+      "mode": "rerun-nix",
+      "controller_sha256": {
+        "measure_build_backend.py": "7f8daa5d80e9b92933deb6d29e0fd853b5229d3b14ca21826aeb0600c111bea8",
+        "build_backend_control.py": "f05d3685ff714c98f9e82e3187fb663f8af76d48386479b9398e35e3bdf80fb7"
+      },
+      "started": true,
+      "stop_exit": 0,
+      "endpoint_gone": true
+    }
+  ],
+  "nix_rerun_source_sha": "17bc1f9b456129f6b9193ceafdf677ec10206c68",
+  "gc_policy": {
+    "attempt_limit": 3,
+    "evidence": "captured auto-GC and GC-lock messages; entire batch quarantined",
+    "limit": "daemon GC lock unreadable; unrelated silent GC not observable"
+  }
 }
