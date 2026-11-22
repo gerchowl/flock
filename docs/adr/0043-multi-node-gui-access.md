@@ -626,7 +626,47 @@ historical contract until this amendment is accepted and implemented.
    answer requires `answer`, and neither implies permission `agent.decide`.
    Validity is standing, once (`max_uses = 1`), or count-limited (positive
    `max_uses`), optionally intersected with an absolute expiry. Expired or
-   exhausted authority refuses; uncertain time after recovery fails closed.
+   exhausted authority refuses. **Expiry clock and skew:** only the admitting
+   destination evaluates expiry, at the atomic consume/J1-claim step, never
+   using the home's or issuer client's clock. For time-bounded issuance the
+   local operator supplies a positive lifetime `L`; the destination captures
+   paired UTC wall time `W0` and suspend-inclusive elapsed time `M0`, records
+   absolute `expires_at = W0 + L` and a nonrenewable elapsed deadline `M0 + L`,
+   and returns that absolute expiry for display. Do not derive `L` from a
+   timestamp computed by another node. Home/client skew therefore contributes
+   zero extension. An initially ahead/behind destination shifts the displayed
+   UTC expiry but cannot extend `L` in destination elapsed time; there is no
+   assumed bound on its offset from external UTC. This is a destination-issued
+   lifetime contract, not a promise of globally synchronized UTC cutoffs.
+   At admission require both `wall_now + 1 second < expires_at` and
+   `elapsed_now < M0 + L`, using checked arithmetic. Equality, overflow or
+   unavailable clock evidence refuses. The one-second conservative wall margin
+   bounds tolerated wall/elapsed drift to the refusal side; no positive grace
+   extends the elapsed lifetime. An ahead wall clock can expire authority early;
+   a behind wall clock cannot extend the elapsed deadline.
+
+   **Clock discontinuity:** before every time-bounded admission compare paired
+   wall/elapsed readings against both the issuance pair and the last durable
+   admission pair in the same boot clock domain (an operator acknowledgement
+   replaces comparison pairs, preserving the original expiry/deadline). Any
+   backwards wall or elapsed reading, or absolute difference between wall and
+   elapsed progress greater than one second latches a destination-wide refusal of
+   time-bounded grants. Comparing against issuance as well as the last record
+   prevents small repeated corrections from accumulating extra validity.
+   Forward/backward NTP steps, manual changes and VM resume must pass this
+   check before consumption; missing evidence also latches refusal. Reuse
+   `src/platform/suspend_clock.rs` (`CLOCK_BOOTTIME` / `mach_continuous_time`),
+   aligned with ADR-0036's “App-session tokens and shell origins” lifetime
+   amendment (#2489, owner decision 18): suspended time counts and wall changes
+   never extend lifetime. Persist the admission clock evidence with the J1
+   claim under the same fence and retain it through compaction. Only an explicit
+   local-operator acknowledgement after validating the destination clock clears
+   the latch and establishes a new comparison pair; it never resets a grant's
+   expiry or elapsed deadline, refunds a use or revives expired authority.
+   Recovery without comparable boot/elapsed evidence refuses existing
+   time-bounded grants; acknowledgement alone cannot restore them, and the
+   operator must issue a new grant. These wall-clock pairing/latch fields are
+   proposed additions, not existing app-session clock behavior.
    Only the destination's local operator issues/revokes grants in this design,
    through A1's sealed LocalOperator management path. Holding a grant never
    confers re-delegation. No delegation permission is implicit; any future
@@ -726,13 +766,23 @@ historical contract until this amendment is accepted and implemented.
    → durable J1 write with atomic consumption → dispatch through existing verb
    handlers → admission/result receipt. Evaluation/consumption and J1 write are
    one admission transaction under paragraph 4's fence, not two durable commits;
-   recheck budget immediately before claim. Keep M1's monotonic residence and
-   ADR-0026 next-hop version gates; no offline mail custody. M2 acceptance must
+   recheck budget and destination expiry immediately before consume/claim.
+   Keep M1's monotonic residence and ADR-0026 next-hop version gates; no offline
+   mail custody. M2 acceptance must
    exercise user and agent admission, file-token refusal, once/count/expiry,
    duplicate retries and changed targets, simultaneous final-use requests,
    revocation races, lost ack and crashes around claim/dispatch/result, recovery
-   and compaction without restored uses. Agent attestation and the A1/J1
-   extensions are prerequisites, not satisfied by lifting today's refusal.
+   and compaction without restored uses. Inject destination clocks ahead and
+   behind the home/client and verify neither extends the issued elapsed lifetime;
+   forward jumps may refuse early. Step the wall clock backwards during operation
+   and verify the refusal latch before any further consume/claim, including
+   cumulative drift beyond the one-second bound. Suspend/resume the VM across
+   expiry and verify refusal using suspend-inclusive elapsed time. Let a once
+   grant expire between budget preflight and atomic consumption: refuse without
+   spending its use or writing a dispatchable claim. Test operator acknowledgement
+   and restart with lost clock evidence without restoring expired authority.
+   Agent attestation and the A1/J1 extensions are prerequisites, not satisfied
+   by lifting today's refusal.
    GUI grant display/creation is **out of scope for M2**. Proposed follow-up
    issue for the report only: “GUI lifecycle grant management: show subject,
    verbs, targets, remaining uses, expiry and revocation; create explicit once
