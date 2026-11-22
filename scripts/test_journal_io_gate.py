@@ -381,6 +381,40 @@ set_permissions spawn output status""".split()
                               + right + '; probe!(path, read_dir);')
                 self.assertTrue(gate.check_text(definition, gate.COMMANDS / 'journal.rs'))
 
+    def test_macro_path_repetition_is_rejected(self):
+        source = ('macro_rules! review_path { ($($p:ident),*) => { $($p)::* } } '
+                  'review_path!(Path, read_dir)(path);')
+        self.assertTrue(gate.check_text(source, gate.COMMANDS / 'journal.rs'))
+
+    def test_macro_method_repetition_is_rejected(self):
+        source = ('macro_rules! review_method { ($($m:ident),*) => { $($m()).* } } '
+                  'review_method!(make_path, read_dir);')
+        self.assertTrue(gate.check_text(source, gate.COMMANDS / 'journal.rs'))
+
+    def test_repetition_positions_fail_closed_and_allowlist_is_exact(self):
+        path = gate.COMMANDS / 'journal.rs'
+        for body in ['$($p)::*', '$($p)::+', '$($p()).*', '$(.$m())*',
+                     '$($p),*::operation()', '$($p),*.operation()',
+                     'object.$($p)*()', 'module::$($p)*()',
+                     '$($p::operation()),*', '$($($p)::*),*',
+                     '$($p::operation())?', '$(fixed::operation($p)),*']:
+            with self.subTest(body=body):
+                source = 'macro_rules! probe { ($($p:ident),*) => { ' + body + ' } }'
+                code = gate.tokens(source)
+                self.assertTrue(gate.macro_position_findings(code, path))
+                self.assertTrue(gate.check_text(source, path))
+                with patch.dict(gate.MACRO_POSITION_ALLOWLIST,
+                                {(path, 'probe'): 'reviewed repetition fixture'}):
+                    self.assertEqual(gate.macro_position_findings(code, path), [])
+                    self.assertTrue(gate.macro_position_findings(
+                        code, gate.COMMANDS / 'journal/compact.rs'))
+        for body in ['$($p),*', '$($($p),*);*', '[$($p)*]',
+                     '$($p),* + 1', '$($p),* ":: ."',
+                     '$($p),* /* :: . */']:
+            with self.subTest(body=body):
+                self.assertEqual(gate.macro_position_findings(gate.tokens(
+                    'macro_rules! safe { ($($p:ident),*) => { ' + body + ' } }'), path), [])
+
     def test_macro_path_positions_require_explicit_review(self):
         path = gate.COMMANDS / 'journal.rs'
         for body in ['$p::helper()', '$crate::helper::read_dir(path)',

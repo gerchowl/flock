@@ -20,9 +20,12 @@ Rust type identity. Arguments and closure bodies remain independently scanned;
 receiver literals are retained in anchors. Duplicate calls matching the
 same anchor share its permission, but another item cannot consume a deleted pin.
 In-tree macro token trees cannot synthesize method/path positions from
-metavariables without an explicit, reasoned exception. Alias collection covers
-the whole file and its lexical/inline-module scopes before uses are checked. Unsupported source and
-namespace injection constructs fail closed as documented above.
+metavariables without an explicit, reasoned exception. Conservatively, any `.` or
+`::` inside or adjacent to a repetition (including its separator and quantifier)
+requires that exception, even for otherwise harmless repeated static paths.
+Alias collection covers the whole file and its lexical/inline-module scopes before
+uses are checked. Unsupported source and namespace injection constructs fail closed
+as documented above.
 """
 from __future__ import annotations
 
@@ -731,6 +734,18 @@ def macro_position_findings(code, path):
         end = pairs.get(opening, opening)
         for j in range(opening + 1, end):
             if names[j] != '$':
+                continue
+            if names[j + 1:j + 2] == ['(']:
+                # A repetition is a substitution spanning its token tree,
+                # optional separator and quantifier, not just the opening $.
+                tail = pairs.get(j + 1, j + 1) + 1
+                if names[tail:tail + 1] not in (['*'], ['+'], ['?']):
+                    tail += 1
+                if names[tail:tail + 1] in (['*'], ['+'], ['?']):
+                    tail += 1
+                if any(token in {'.', '::'} for token in names[j - 1:tail + 1]):
+                    findings.append((code[j][1],
+                                     'macro repetition in method/path position requires review'))
                 continue
             method = names[j - 1] == '.'
             qualified = (names[j - 1] == '::'
