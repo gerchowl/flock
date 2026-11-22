@@ -1,5 +1,28 @@
 # Test build profiles
 
+## Integration binary grouping
+
+The [grouping inventory](../docs/next/testing-integration-binaries.md) covers every
+integration binary from the #3082 baseline. Only `gui_bundle_build` and
+`gui_feature_gate` are merged, into `gui_build`. A previous `(binary, test)`
+selection maps to `(gui_build, binary::test)`; test bodies remain unchanged.
+`just gui-check` exercises both feature variants with the new binary name.
+
+The GUI group imports only the environment and bounded-command helpers.
+It never mutates the parent environment or cwd, installs signal handlers, binds
+listeners or uses constructors. Its environment helper's `OnceLock` owns one
+PID-scoped fallback sandbox and its exit cleanup; the bundle tests use distinct
+fixture labels. Nextest continues to run each test in a separate process.
+
+Other proposed groups are candidates, not a process-safety certification.
+Most import `support/mod.rs`, whose cleanup initialization installs panic,
+signal and exit hooks and owns registries and a watchdog. Audit those paths
+before merging another group. Keep module-local copies of support and their
+tests unless a separate change explicitly accounts for the test-count change.
+Preserve per-module nextest settings and prove the CI shard partition again.
+
+## Fixture executable identity
+
 The cleanup sweep compares canonical executable paths against
 `env!("CARGO_BIN_EXE_flk")`, exactly as the fixtures launch the CLI. It accepts
 that build and symlinks to it, including release/custom target layouts, and

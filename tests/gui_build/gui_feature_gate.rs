@@ -2,16 +2,16 @@
 
 // Reuse the shared isolation/timeout helpers without importing unrelated harnesses.
 #[allow(dead_code)]
-#[path = "support/environment.rs"]
+#[path = "../support/environment.rs"]
 mod environment;
 // The collector exposes shared limits as well as the bounded output operation.
 #[allow(dead_code)]
-#[path = "support/command.rs"]
+#[path = "../support/command.rs"]
 mod command;
 
 #[test]
 fn gui_bundle_is_contained_by_the_web_feature_gate() {
-    let entry = syn::parse_file(include_str!("../src/main.rs")).unwrap();
+    let entry = syn::parse_file(include_str!("../../src/main.rs")).unwrap();
     let web = entry
         .items
         .iter()
@@ -27,7 +27,7 @@ fn gui_bundle_is_contained_by_the_web_feature_gate() {
         }),
         "the entire web module must be feature gated"
     );
-    let module = syn::parse_file(include_str!("../src/web/mod.rs")).unwrap();
+    let module = syn::parse_file(include_str!("../../src/web/mod.rs")).unwrap();
     assert!(
         module.items.iter().any(|item| matches!(item,
         syn::Item::Mod(module) if module.ident == "gui")),

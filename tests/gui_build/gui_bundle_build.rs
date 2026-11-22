@@ -1,6 +1,6 @@
 //! Exercise the actual build-script bundle generator without a frontend build.
 
-#[path = "../src/web/bundle_build.rs"]
+#[path = "../../src/web/bundle_build.rs"]
 mod bundle_build;
 
 use std::{fs, io, path::Path, time::SystemTime};
