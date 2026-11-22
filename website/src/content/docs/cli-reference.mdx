@@ -53,6 +53,17 @@ execution with `invalid_params` and usage exit 2, rather than panicking. This ea
 parse error prints on stderr before output-format selection. Native socket paths
 used by the internal handoff importer retain their original OS bytes.
 
+Attach has its own five-second Welcome deadline starting immediately after
+Hello. The complete frame header and payload share that budget, so trickled
+bytes cannot extend it. Expiry restores the terminal before reporting
+`server did not answer attach within 5s (server busy?)` and exits **124**.
+JSON-capable attach commands report `attach_timeout`, `retry: yes`, and
+`data: {"phase": "welcome", "timeout_ms": 5000}`. A timeout does not start an
+automatic attach retry or replay terminal input; the existing bounded retry
+window after an explicit live-handoff refusal remains available. You can retry
+attach with a fresh connection. EOF, malformed frames and version refusals
+retain their existing diagnostics.
+
 ## Exit codes
 
 `flk --help` lists every exit code, what it means and whether retrying is safe, from one registry (`src/cli/exit.rs`). Four cases moved in #1025, and for one release each prints `note: exit code is now N (was M); see CHANGELOG` on stderr when it returns its new code. stdout, `--json` output included, is unchanged.
@@ -184,9 +195,18 @@ supersedes the older edge. Resetting an inbound pin clears all edges enrolled
 under that identity. Transient connection failures show `retrying` with the
 reason; `refused` identifies a handshake or compatibility refusal.
 
-Held SSH edges authenticate both node keys using fresh challenges and require
-identical mesh protocol versions. Mismatches name both versions and say
-`upgrade flk on <peer>`; upgrade the fleet together. First contact pins the
+Held SSH edges authenticate both node keys using fresh challenges and negotiate
+from their signed mesh protocol support ranges. `peers status` and `status`
+show `mesh N` for an established edge, and JSON rows include `negotiated`.
+Disjoint ranges show both ranges and name the older side with
+`upgrade flk on <peer>` or `upgrade flk on this node`; custody stays stored
+while the edge takes the long refusal backoff.
+
+This build remains at VERSION 5 and can be rolled out one node at a time
+alongside earlier VERSION 5 builds. Upgrade every node to this negotiation
+build and check that all edges are established before deploying a future
+VERSION 6 build. A remaining pre-negotiation peer cannot accept VERSION 6;
+its refusal names that peer and asks for an upgrade. First contact pins the
 identity.
 Enrollment uses trust on first use (TOFU): possession of a node key proves the
 key holder, not that its claimed name belongs to the intended machine. Inbound
@@ -541,6 +561,12 @@ Pane-only operations on structured records, including attach, readiness and
 settled waits, return `runtime_unsupported` (retry `never`, exit 2). Use the
 structured state for observation instead. PTY records keep their existing fields.
 Start a structured session with `flk agent start NAME --runtime structured --model MODEL --cwd /absolute/checkout -- claude`.
+After stopping it, the operator can run `flk agent start NAME --runtime structured -- claude`
+to continue the retained conversation. New records launch the harness with
+`--session-id`; a relaunch uses `--resume` only after the harness reported a matching
+`system/init` and that establishment evidence was saved with the record. Failed
+attempts before init and older records without this field use `--session-id`.
+Saved conversation ids must be UUIDs; invalid ids are refused before launch.
 
 An attached local TUI can choose **Allow once** or **Deny** on a native permission
 card. The server authenticates the attaching process and uses a private app-session
@@ -608,6 +634,8 @@ flk msg send <target> <text...> [--repo NAME] [--intent fyi|needs-reply|blocking
 flk msg reply <correlation_id> <text...> [--intent fyi|needs-reply|blocking] [-- <text starting with dashes>]
 flk msg list [--pane TARGET]
 flk msg read [--pane TARGET]
+flk msg operator-list --pane TARGET
+flk msg operator-read --pane TARGET
 flk msg status <correlation_id>
 flk msg mute <seconds> [--pane TARGET] [--reason TEXT]
 flk checks list
@@ -670,15 +698,59 @@ attested connection or MCP lease. `--pane self`, the stable native id, or an
 unambiguous native name may name that same inbox; another target is refused as
 `inbox_not_owner` (retry `never`, exit 13), and ambiguous names are refused as
 `agent_target_ambiguous`. Invalid and revoked leases both return `not_authorized`.
-The operator's global `msg list` is unchanged. Reads return only live entries from
+For a legacy pane whose inbox authority is unresolved, the local operator can
+run `flk msg operator-list --pane TARGET` to peek (120-character previews), or
+`flk msg operator-read --pane TARGET` to consume the full messages, from a shell
+outside Flock panes. These are interim recovery commands until migration to a
+structured agent ([#3066](https://github.com/gerchowl/flock/issues/3066)); reading
+does not restore the agent's authority. Both commands refuse structured agents,
+legacy pane callers, mesh relays and unattested callers with `operator_only`
+(exit 13). Successful accesses record a durable `operator_inbox_access` event
+with the pane, operation, caller PID/UID and message count, without message bodies.
+Existing `msg read --pane TARGET` and `msg list --pane TARGET` require the same
+operator check when TARGET is another pane; an attested caller may still read
+its own inbox.
+
+Claude's Stop hook resolves its inbox from process attestation, including after a
+fork or resume with a stale `FLOCK_PANE_ID`. Its CLI fallback is `flk msg read`
+without an explicit pane. The `msg.wake` socket method with an explicit `pane`
+uses the same ownership check as a read: another pane requires local operator authority.
+An authority refusal produces one nonblocking recovery notice per server, pane
+claim and harness session; the hook does not keep blocking on unread mail or a
+recap while that refusal persists. A successful wake check resets the notice.
+Resuming a harness in a legacy pane without process-birth evidence does not
+restore that evidence; the migration and operator recovery paths above still
+apply. Forked PTY agents use their own pane identity and inbox, while a resumed
+agent uses the attested pane in which it runs; a harness session ID or environment
+claim cannot transfer another agent's inbox authority (ADR-0008 and ADR-0036 §1a).
+
+Without `--pane`, `msg list` is scoped to the caller's attested inbox. An unresolved caller receives `caller_pane_unresolved`. Listing all panes or another pane's inbox requires the local operator. Global operator lists record `operator_inbox_access` with `pane: null` and the total message count. Reads return only live entries from
 a mixed expired/live batch, once; each expired entry emits one durable
 `dropped_undeliverable` event. Reading the projection does not submit another turn.
+
+Message read, list, wake, send and reply from a legacy pane whose caller identity
+cannot be attested return `caller_pane_unresolved` (CLI exit **1**, retry `never`).
+The diagnostic names the missing evidence, including a missing process birth after
+a pre-3.3 handoff. MCP returns JSON-RPC **-32000**, with
+`data.refusal: "caller_pane_unresolved"`, `data.exit: 1` and `data.retry: "never"`.
+Selecting `--pane` does not restore authority. Ask the operator to migrate the
+agent to a structured agent while resuming its harness session ([#3066](https://github.com/gerchowl/flock/issues/3066)).
+Until migration, the operator can read the inbox from their own interactive shell
+with `flk msg read --pane <id>`. The Stop hook gives one nonblocking notice naming
+these remedies and suppresses further inbox demands until authority recovers.
+Legacy panes stay fail-closed; automatic re-attestation is not performed.
+
+The same refusal applies to `msg mute` when `--pane` is omitted and the caller's
+pane cannot be attested. A refused mute neither sets nor clears the mute, and
+queued messages are not deferred.
 
 The stop-hook mail nudge names `flock_msg_read` and, if the MCP tool is unavailable, `flk msg read --pane <pane_id>` with the stopping pane’s ID filled in. Both read and consume the same inbox.
 
 `msg status` and `msg list` include `attempts`: local wake submission evidence with an attempt id, pane, correlation ids, timestamps, retry flag and reason. Attempts progress through `queued`, `typed` and `submit_sent` to `accepted`, `observed_accepted`, `unconfirmed` or `abandoned`. A genuine inbox read during verification (or after an unconfirmed wake) records `read`; a read before Enter cancels the pending submission. An accepted wake does not mean the inbox was read: a message still in an inbox on this server stays `queued` until a genuine read, whether it took the mesh path or the older local one. Explicit guarded-submit responses carry the same evidence. Mesh attempt queries read the custody store; older local attempts use an in-memory registry restored from the retained audit window. Both restore during boot and live handoff. The registry targets 4,096 entries, matching mailbox history: completed attempts are evicted oldest-first. Pending attempts are never evicted. An unconfirmed attempt stays protected while any of its correlated messages is queued in any local mailbox; once none remain queued (including after expiry or dropping), it becomes eligible for oldest-first eviction on the next submission. Unconfirmed explicit submissions with no correlated mail are also eligible. No additional attempt TTL is used. New submissions are refused with `delivery_attempt_capacity` only if all slots are still protected. Restoring older logs with more protected entries preserves them and refuses new submissions until capacity is available. Mesh attempt recovery is independent of audit retention; older local attempt recovery is limited to the retained log window. Interrupted attempts become `unconfirmed` with reason `server_restarted`, and their keys are never replayed. Older pre-mesh `relayed` records still mean transport handoff, not a read receipt. Unconfirmed and abandoned attempts also appear in the digest. The optional System One advisory is deferred to Clef (#714).
 
 Mesh `msg.status` reports `queued` (origin custody awaiting transport, or waiting unread in an inbox on this server, with `detail` saying which), `custody` (transferred custody), `delivered` (durable import into another node's inbox, still unread), `read`, `held` (answer awaiting return), `collected` (answer transferred to its origin), `undeliverable` (a forwarding hub could not deliver it), `expired`, or `outcome_retention_elapsed`. Refusals, undeliverable messages and collection failures include `detail`. `reply` contains the best imported answer independently of the original message state. Queries do not commit store changes. Read receipts return over authenticated collection, including the hub's collection exchange with a spoke.
+
+Legacy `relayed` status details treat destinations reached through a hub as unverified: the route identifies the hub, not the destination owner. Claimed names are escaped and badged; a hidden alias without owner identity appears as `[unverified] unknown destination`. Direct delivery can show a trusted alias when exact local route bindings match. Raw `to_host` metadata is unchanged.
 
 A status result includes a signed `reference`. Retain it and pass it as `reference` to socket/MCP status or reply-wait calls, or as `--reference JSON` to `flk msg status` and `flk wait reply`, to query an exact message after outcome cleanup. A correlation alone cannot distinguish an unknown message from one whose retention elapsed. Status by correlation only answers for messages this node sent; a correlation another node reused for its own mail never stands in. `msg status` exits 0 for known nonfailure states, 3 for expiry, an undeliverable message, removal, elapsed retention or collection failure, 13 when the receiver refused the message (4 before #1025), and 1 for API errors.
 
@@ -876,6 +948,7 @@ flk delegate send <name> --brief FILE [--await] [--timeout MS] [--settle MS] [--
 flk delegate wait <name> [--after CURSOR] [--timeout MS] [--settle MS] [--silence DURATION] [--max-chars N] [--json]
 flk delegate result <name> [--max-chars N] [--json]
 flk delegate status <name> [--json]
+flk delegate rebind <name> --agent <id> [--json]
 flk delegate reap <name> [--force] [--json]
 flk delegate list [--mine | --architect <id> | --all] [--branch <b>] [--json]
 ```
@@ -954,6 +1027,15 @@ If the pane disappears before the readiness subscription is established, `delega
 
 A Codex that is still starting can swallow the typed brief: the composer stays empty and no turn begins. When a Codex submit cannot be confirmed, `start` watches for the same evidence `not_started` uses — an empty idle composer, no turn and no queued or startup marker, held for 30 s plus `--settle` — and only then types the brief once more. A brief that appears anywhere on screen, or a turn that starts late, is never typed again. opencode keeps its rule that a dropped brief is reported, not retyped.
 
+Claude delegates retain the `CLAUDE_CONFIG_DIR` resolved at spawn and associate it
+with the session when its identity is reported. A harness hook's recorded directory
+takes precedence over the launch snapshot in either arrival order; the snapshot
+only fills an absent record. `delegate result`, `--await` and
+`agent fork` can then locate that session's transcript without a profile-installed
+hook having written a separate config-directory record. A recorded directory is
+exclusive: a missing transcript never falls back to another profile. Sessions
+without a config-directory record continue to use the default Claude directory.
+
 `--await` stays and reports the round's outcome. Settling is not finishing: an agent goes quiet between tool calls, so the await settles and then waits a further grace for a reply recorded at or after this round's submit. On the same terminal, a round is only reported when the agent entered `working` after that round's cursor **and** a reply exists from after the submit — a fix round is not reported from the quiet that preceded it, and not from the previous round's reply. A settle is never reported as `no_result` while the store records a turn begun at or after the submit that has not ended (`turn_open_at_ms` on `agent.result`, Claude only): the screen can read idle inside a running turn, so the await settles again from the same cursor and asks the store again, and the round ends only on a reply, a turn the transcript records as over, or the usual blocked, gone, stalled and timeout outcomes (#1257). A turn the transcript closes without a `turn_duration` entry — a resumed session's `No response requested.`, an interrupt, a local command — counts as over (the rules are under `agent.result` in the socket API), so such a round ends as usual, typically `no_sentinel` or `no_result` (exit 5), and the caller re-waits or re-sends. Against an older server, which never reports an open turn, the grace behaves as before. Codex delegates are not covered: a Codex reply ending on `VERDICT:` reported as `no_result` is [#1268](https://github.com/gerchowl/flock/issues/1268). `--timeout` bounds the await only and starts after the submit (for `wait`, at command entry); `--settle` defaults to 5000; `--max-chars` pages the reply.
 
 Exit codes: **0** a finished reply ending on `DONE:` / `VERDICT:` · **3** a `BLOCKED:` reply · **4** the agent's pane closed, hibernated or its execution ended · **5** a finished reply with no sentinel, or none inside the grace · **6** the agent sitting on a prompt (`blocked`) for the settle window · **7** a stalled round · **11** `not_started` (8 before #1025; continuously idle with an empty composer for the startup window and no new turn since the submit cursor) · **12** `session_unbound`: a live delegate could not be rebound from exact session evidence · **75** `server_unavailable`: the server stopped answering inside the reply grace for 5 minutes, which says nothing about the agent · **78** server protocol mismatch · **124** the timeout · **2** a usage error, or a name that is not a delegate · **10** the composer refused the brief before typing (`delegate send` restores the registry; `start` only when it rolled back) · **1** any other failure. With `--json`, exits 0, 3, 4, 5, 6, 7, 11, 12, 75 and 124 print the same object (a usage error, exit 2, and failures other than readiness expiry or retained-block registry errors, exit 1, print nothing on stdout, only the error on stderr), and its `turn_cursor` is the cursor that await started from — so a timed-out caller resumes with `--after <turn_cursor>` and gets the same round. Without `--json`, stdout is the reply's text and stderr is one summary line.
@@ -974,13 +1056,25 @@ If the agent exits before it takes the brief (a harness that dies at launch, say
 
 `pane read --source detection` reads exactly the unscrolled screen used by agent detection, excluding scrollback; `--lines` does not expand that screen. It supports text and ANSI formats. Socket clients can ask `pane.read` for `source: "detection_unfaint"` to get the same screen plus `unfaint`, the same rows with faint cells blanked, from one read; that is how `delegate wait` tells an agent's own dimmed suggestion from a typed draft.
 
-Delegates retain the session ID reported by the harness at launch and follow their stable agent identity across terminal changes. Recovery requires an exact session ID in the Codex rollout or Claude session store. When recovery is needed, a missing ID, an unreadable store, a conflicting identity, or duplicate matching session files returns `session_unbound` (exit **12**) from `delegate wait`, `result`, and `send`. The error names the agent and current terminal and provides `flk pane read <pane>` for diagnostics. Pane captures are never returned as results. Recovery currently supports Codex and Claude; other harnesses return `session_unbound` after a terminal change. Recovery requires a recorded stable agent ID. Legacy records without that ID return `session_unbound`; a matching name or working directory never establishes identity. Records with a stable agent ID but no captured session ID can recover only when that agent reports an authoritative session. Recovery targets the recorded delegate and requires its attested supervisor or the operator. Inspect before retrying, and resume the existing agent or repair its session integration rather than starting a duplicate.
+Delegates retain the session ID reported by the harness at launch and follow their stable agent identity across terminal changes. Recovery requires an exact session ID in the Codex rollout or Claude session store. When recovery is needed, a missing ID, an unreadable store, a conflicting identity, or duplicate matching session files returns `session_unbound` (exit **12**) from `delegate wait`, `result`, and `send`. The error names the agent and current terminal and provides `flk pane read <pane>` for diagnostics. Pane captures are never returned as results. Recovery currently supports Codex and Claude; other harnesses return `session_unbound` after a terminal change. Recovery requires a recorded stable agent ID. For pre-v2 records, the CLI backfills that ID only when the saved harness and native session ID have exactly one live match. Terminal equality, names, and working directories never establish identity. Session-less records remain `session_unbound` (exit **12**, JSON `reason: "saved_session_missing"`); unmatched or duplicate session claims report `saved_session_not_found` or `saved_session_ambiguous`. A structured-only match reports `saved_session_runtime_unsupported`; incomplete live identity fields report `live_binding_incomplete`. Failed inventory reads do not modify the record. Successful backfill persists atomically, preserves unknown fields and the recorded round, and is idempotent across CLI restarts. Records with a stable agent ID but no captured session ID can recover only when that agent reports an authoritative session. Recovery targets the recorded delegate and requires its attested supervisor or the operator. Inspect before retrying, and resume the existing agent or repair its session integration rather than starting a duplicate.
+
+The backfill `reason` values are registered typed codes; the enclosing error remains `session_unbound` (exit **12**):
+
+| Registered reason | Retry class | Meaning |
+| --- | --- | --- |
+| `saved_session_missing` | `after_inspecting` | No usable saved native harness session ID |
+| `saved_session_not_found` | `after_inspecting` | No exact live harness/session match |
+| `saved_session_ambiguous` | `after_inspecting` | Multiple exact session claims |
+| `saved_session_runtime_unsupported` | `after_inspecting` | Only a pane-free runtime matches this PTY delegate |
+| `live_binding_incomplete` | `after_inspecting` | Live record lacks an agent, terminal, or pane identity |
+
+An operator can explicitly repair a local delegate record with `flk delegate rebind <name> --agent <id>`. Run it from an operator shell outside agent panes. The server requires the exact live PTY agent ID and refuses agent, relayed, or unattested callers with `operator_only` (exit **13**). It writes a durable `delegate_rebind_authorized` event with the delegate name, previous ID, and selected ID before returning authorization; this event records approval, and does not claim that the client write completed. If the audit journal is missing or its append/sync fails, the server returns registered error `delegate_audit_unavailable` (exit **1**, retry class `after_human`) without authorizing or changing the client record. A failed writer is closed to protect a potentially torn tail, while the journal path remains available for reading intact prior history; repair audit storage and restart the server before retrying. The CLI then atomically saves the selected agent, terminal, pane, harness session, and observation cursor, preserving the round and submission time. This is explicit replacement of launch evidence: inspect the chosen agent before rebinding. Rebind and automatic backfill grant no new server authority and do not create or restore architect edges, so `delegate list` remains a projection of existing server edges (#3147).
 
 The session ID captured for a delegate is immutable launch evidence. Re-identification preserves it; a different observed or returned session produces `session_unbound` (exit **12**) without replacing the saved ID. The server also requires that delegate's own persisted session record from its native hook or restore path. A supervisor may select the delegate and assert its expected session, but cannot choose another session to bind. A missing server-side record, or a request for the supervisor's session, is refused.
 
 Guarded recovery requires server protocol **33**: a protocol-32 server ignores the new recovery guard field, so a protocol-33 CLI refuses the mutation with `server_version_gap` (exit **78**) before sending it. TUI attachments require an exact protocol match, so a protocol-32 TUI cannot attach to a protocol-33 server. The JSON API keeps string error codes compatible: the wire error is `session_unbound`, and exit **12** is the updated client's mapping. A protocol-32 `flk` JSON client that receives this unknown code preserves the string and uses its generic exit **1** mapping; update the caller to use exit 12. Ordinary native hook reports retain their existing protocol-skew exemption and do not request recovery.
 
-After a verified rebind, wait keeps the recorded round and checks result freshness against its original submission. If recovery happens during reply grace, wait restarts settling on the current terminal before accepting a reply; a cached finished reply does not settle a working replacement. Terminal cursor counters are local to an execution, so they are not translated across terminals. `send` can confirm an Enter from a new turn in the bound session store: the prompt must match exactly and appear after the transcript boundary recorded immediately before the first Enter; Codex also requires a new `task_started` event. Evidence of a turn before Enter aborts submission, and Enter retries keep the first Enter’s boundary. This evidence uses the existing submit deadline. A session guard refusal before typing returns `session_unbound` (exit **12**) and restores the unsubmitted round. Claude session IDs must be unique across the recorded profile and default store, including stale or reused IDs. Unreadable profile records, store directories, project directories or candidate metadata abort recovery and name the failing path. Only a missing path or a proven non-directory project entry can be ignored; an unreadable unrelated project is refused because it may conceal a matching ID. Recovery checks session metadata within the first 64 KiB; confirmation checks at most the first 1 MiB appended after capture. Evidence outside those windows does not authorize recovery or confirm submission. Missing evidence never turns a pane capture into a reply or proves acceptance.
+After a verified rebind, wait keeps the recorded round and checks result freshness against its original submission. If recovery happens during reply grace, wait restarts settling on the current terminal before accepting a reply; a cached finished reply does not settle a working replacement. Terminal cursor counters are local to an execution, so they are not translated across terminals. `send` can confirm an Enter from a new turn in the bound session store: the prompt must match exactly and appear after the transcript boundary recorded immediately before the first Enter; Codex also requires a new `task_started` event. Evidence of a turn before Enter aborts submission, and Enter retries keep the first Enter’s boundary. This evidence uses the existing submit deadline. A session guard refusal before typing returns `session_unbound` (exit **12**) and restores the unsubmitted round. Claude session IDs must be unique within the recorded profile, or within the default store when no profile is recorded, including stale or reused IDs. Unreadable profile records, store directories, project directories or candidate metadata abort recovery and name the failing path. Only a missing path or a proven non-directory project entry can be ignored; an unreadable unrelated project is refused because it may conceal a matching ID. Recovery checks session metadata within the first 64 KiB; confirmation checks at most the first 1 MiB appended after capture. Evidence outside those windows does not authorize recovery or confirm submission. Missing evidence never turns a pane capture into a reply or proves acceptance.
 
 ### Delegate stall verdicts
 
@@ -1044,6 +1138,59 @@ Run `flk integration sync --dry-run` to review the plan, then `flk integration s
 Sync uses the selected `CLAUDE_CONFIG_DIR` and `CODEX_HOME` profiles (or their defaults) and the user OpenCode config; it does not search other homes or profiles. Only MCP entries named flock launching a store-pinned flk executable (including the legacy flock name) with `mcp serve` are migrated; bare PATH commands and explicit stable custom paths are preserved. Claude project-local registrations under `projects.*.mcpServers` are reported and updated individually. The chosen launch path is printed first; development executable fallbacks are refused, and a missing stable path fails MCP targets while allowing hook refreshes. Custom commands and unrelated entries are preserved, as are arguments, environment, permissions, comments and Codex hook trust. Symlinked or read-only configs are skipped with a fragment to merge through their Nix/Home Manager configuration owner.
 
 Sync reports client, installed binary and server drift but does not perform a server handoff or stop sessions. Use `flk server live-handoff` when needed. Running agents need `flk agent restart` or an MCP reconnect to load the new bridge and tool catalog.
+
+## Structured profile admission
+
+`flk profile enable --plan <id> --expect <digest>` sends the operator-only
+`profile.enable` request. This build always refuses with
+`structured_profiles_not_ready` (exit 1, retry `never`), including for the
+operator. Enable requests require server protocol **34** before sending a mutation.
+Reviewed enable plans and production activation arrive in ADR-0052
+slice 17. Agents and mesh relays receive `operator_only` (exit 13).
+
+The execution switch is persisted in server-owned `profile-bindings.json`, initially
+false, and cannot be set through `config.toml` or repository files. Profile refusal
+does not fall back to legacy launch. Production readiness remains false.
+
+Binding preparation is available without enabling execution:
+
+```bash
+flk profile plan bind --repo <repo-id> --nodes <node-ids> --agents <agent-ids> --account <alias> --bundle <digests> --credential-ref <ref> --generation <n> [--grants <grant-ids>] [--binding <existing-id>] --format json
+flk profile bind --plan <id> --expect <digest> --format json
+flk profile status --format json
+flk profile revoke --binding <id> --reason <text> --format json
+```
+
+Operator `profile status` includes `session_storage` with durable session/binding
+pins, retained unknown-record count, quarantined staging names and availability.
+Published native roots are retained. Startup quarantines crash-left staging;
+retention and cleanup policy await a separate decision. This storage preparation
+does not enable execution or change legacy profile storage.
+
+Lists use comma-separated identifiers. Omit `--binding` to allocate a new identity;
+omit `--grants` for an empty grant list. Budget and preset flags, adoption, rotation,
+and fleet recovery are not available in this slice. Credential references are
+identifiers only. A plan is an immutable five-minute review; `bind` must carry its
+returned `plan` and `expect`. Commit refuses altered, expired or stale reviews.
+Successful mutations return durable operation receipts; repeating the same bind
+or revocation returns its original receipt without allocating another revision.
+Revocation is terminal. The commands use the shared typed error and exit mapping;
+`--format json` includes the registered code, retry class and exit on failure.
+
+Structured starts use the managed directory selected by `structured.profile`.
+A caller's explicit `CLAUDE_CONFIG_DIR` naming a different directory is refused
+with `structured_profile_mismatch` before launch or credential access. Use the
+PTY runtime to carry that directory, or unset the selector to request the
+configured structured profile.
+
+Structured conversations pin their actual launch profile when a matching harness
+init establishes the session. A continuation after switching `structured.profile`
+is refused with `structured_profile_mismatch` (exit 1, retry `after_human`) before
+launch or credential access. Restore the recorded profile or explicitly start a
+new conversation. Records without a profile pin retain legacy continuation
+behavior. The pin also represents an optional resolved binding ID/revision;
+current trusted single-account launches have no operator binding, and binding
+execution remains unavailable.
 
 ## Structured session grants
 
@@ -1139,7 +1286,7 @@ Exposed tools:
 | `flock_delegate_list` | `delegate.list` | The delegates an architect started, the rows of `flk delegate list`. `architect` is `self` (default), `all` or an agent id; `branch` returns the owning edge. Read-only. |
 | `flock_msg_send` | `msg.send` | `to` accepts a bare pane id, terminal id, unique agent name or fleet agent id, or a tagged `pane`, `repo_pane` or `agent` object. Queued to the recipient's inbox, which it reads itself; it is nudged at its next turn boundary, so an already-idle recipient waits. Target `{"type":"agent","agent":"<agent_id>"}` to reach another host. `intent` is required: `fyi` (no wake), `needs_reply` (nudged at its next turn boundary), or `blocking` (also operator-visible; past a small per-sender budget it is delivered as `needs_reply`). |
 | `flock_msg_reply` | `msg.reply` | Uses the stored return binding; direct cross-host answers are held for origin collection. `intent` is optional here and defaults to `fyi`. A sender with no inbox gets the reply held for it (`state: "held"`). |
-| `flock_msg_list` | `msg.list` | Peek at the attested structured inbox, or the operator global list; includes local wake attempt evidence. |
+| `flock_msg_list` | `msg.list` | Peek at the attested caller inbox, or the audited operator global list; includes local wake attempt evidence. |
 | `flock_msg_status` | `msg.status` | Sender view by `correlation_id`: mailbox state and submission attempts, including unconfirmed or abandoned reasons. |
 | `flock_msg_read` | `msg.read` | Consume your attested pane or structured inbox once; no additional harness delivery. |
 | `flock_self_compact` | `pane.arm_self_compact` | Compact your OWN context and carry on, unattended: you supply the handoff prompt for your next self, the call arms and returns having typed nothing, and flock completes it at your next turn boundary. `abort: true` drops an arming instead. Optional `instructions` steers what the summary keeps (`/compact <instructions>`; `instructions: true` in the answer confirms they were stored). `state` is `armed` / `aborted` / `pending`; `pending` means refused because one was already armed. Claude Code only. |
@@ -1283,6 +1430,31 @@ explicitly permits secret output to a pipe or file. Otherwise it refuses before
 creating a token. Token names cannot begin with `-`; an operand named
 `--show-token` is not consent. Use `token rm --entry HEX_ID` to revoke an
 older unsafe record by the identifier reported by list.
+
+Destination gateway grants use the same local-operator boundary:
+
+```sh
+flk client grant add NAME --home NODE_ID --principals PRINCIPAL,... --verbs VERB,... --scopes read,send,answer,operate --targets SELECTOR,...
+flk client grant list
+flk client grant revoke NAME
+```
+
+`NODE_ID` must be an enrolled home's pinned node digest. Each named grant sets
+maximum authority for those home-issued principals, exact verbs and scopes.
+Names follow token naming rules; adding an existing name refuses (revoke first).
+Selectors are `agent:<AgentId>`, `workspace:<WorkspaceId>`, or explicit `*`.
+Quote `--targets '*'` to avoid shell expansion. Selectors combine as a union;
+`--targets ''` matches nothing. Workspace selectors use current destination
+membership at admission; names and paths are not selectors. Structured start
+matches only workspace selectors or `*`. List returns the durable generation
+and entries; an invalid/future entry has null authority and can be revoked by
+name. Stored grants survive restart in the private `gateway-grants` directory
+beside `client-tokens`. Revocation advances a generation that fences racing
+admission; it cannot undo an already admitted effect.
+
+These commands prepare destination policy only. Mesh commands remain disabled;
+remote lifecycle verbs are refused pending the owner ruling. A grant never
+widens token scopes, and remote `config.*` remains `unsupported`.
 
 `flk client open [--print]` creates or reuses the operator credential and opens
 a new browser tab or window at a configured loopback URL containing a single-use

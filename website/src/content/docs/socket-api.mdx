@@ -7,6 +7,92 @@ Flock exposes a local socket API for scripts and agents that need to inspect or 
 
 Most automation should start with the CLI wrappers. Use the raw socket API only when you need direct request/response control or long-lived event subscriptions.
 
+## Structured profile admission
+
+`profile.enable` requires client/server protocol 34. It takes `{ "plan": "<id>", "expect": "<digest>" }` and requires
+the local authenticated operator. Agents and pending or enrolled mesh relays
+receive `operator_only`. This incomplete build refuses even operator requests
+with `structured_profiles_not_ready`; no enable plan is consumed or execution
+started. ADR-0052 slice 17 adds the reviewed activation transaction.
+
+The server persists the execution switch (default false) with operator binding
+records in `profile-bindings.json`, beside its session state. Agent-editable
+configuration cannot set it. Unknown or invalid binding entries remain preserved
+and inactive; unsupported store formats are never overwritten. A separate private
+`profile-bindings.floor.json` retains the highest revision across restarts. A
+store restored below that floor is retained unchanged, with its bindings and
+switch withheld. Operator status reports `policy_revision` as the floor and
+`policy_error: {code: "policy_revision_regressed", store, floor}`; profile admission
+and enablement return `policy_revision_regressed`. Unreadable floor or policy state
+returns `policy_revision_unavailable`. Both faults have retry class `after_human`:
+operator recovery is required. Other server operations continue. A missing
+floor is initialized from an existing store on first upgrade. Policy load and
+save transactions hold both an in-process mutex and an exclusive advisory lock
+on the stable `profile-bindings.lock`; contention refuses without waiting.
+Symlinked, non-regular or foreign-owned store/floor/lock files produce
+`policy_revision_unavailable` during load. Temporary files are created exclusively,
+and the lock file is never replaced during policy updates.
+
+`profile.status` accepts `{}`. The authenticated local operator receives
+`policy_revision`, `execution_switch`, and binding records containing explicit
+targets, credential references, bundle digests, grants, and revocation metadata.
+References contain no resolved secret bytes. Agents and pending or enrolled mesh
+relays receive no binding, account, sibling identity, or usage fields. This API
+only projects data. Production execution remains unavailable.
+
+Operator status also includes `session_storage`: durable session/target and binding
+revision pins, `retained_unknown`, `quarantined` staging entry names, and
+`unavailable`. Native config lives under server-owned
+`profile-storage/sessions/<session-id>/config/`, separate from operator profiles.
+Published roots remain retained; startup quarantines unpublished allocation staging
+beside the roots. Unusable records remain untouched and inactive. Storage allocation
+is internal preparation only, with no new launch or credential access.
+
+The following preparation methods require the authenticated local operator.
+Relays and agents receive `operator_only` before mutation. The matching CLI
+commands are `profile plan bind`, `profile bind`, `profile revoke` and `profile status`.
+
+- `profile.plan` accepts `{ "action": "bind", "binding_id": "optional-existing-id",
+  "target": { "repo_id": "repo", "node_ids": ["node"], "agent_ids": ["agent"] },
+  "account_alias": "alias", "credential_ref": "opaque-reference",
+  "credential_generation": 1, "bundle_digests": ["digest"], "grants": [] }`.
+  Omit `binding_id` to allocate a fresh identity. The response contains `plan`,
+  `expect` (the review SHA-256) and `review`, including the predecessor policy
+  revision, previous binding, exact proposed binding and expiration timestamp.
+  Plans expire after five minutes using a suspend-inclusive monotonic deadline; uncommitted plans
+  are discarded on server restart. Wildcard/empty targets are refused.
+- `profile.bind` accepts `{ "plan": "id", "expect": "review-digest" }`. Commit
+  rechecks caller identity, immutable review bytes, expiry and current policy
+  revision while holding both store locks, then allocates the next revision.
+- `profile.revoke` accepts `{ "binding": "id", "reason": "operator reason" }`.
+  It commits a terminal tombstone without preview, increments the policy revision
+  and records the operator principal and operation ID. A revoked identity cannot
+  be rebound; corrected authority needs a fresh identity.
+
+Mutation responses contain `operation_id`, `action`, `principal`, `expect` and the
+committed `binding`. A bind operation uses its plan ID. Repeating a committed bind
+with the same ID/digest/caller returns its original receipt across restart and
+later changes, including revocation; that historical receipt does not change
+current authority. Repeating revocation for the same binding/reason/caller returns
+its original receipt. Receipts persist with the binding document and preserve
+unknown entries without treating them as authority.
+
+Typed preparation refusals include `profile_plan_invalid`, `profile_plan_expired`,
+`profile_revision_conflict`, `profile_binding_revoked`, and
+`profile_binding_not_found`. A stale review requires a fresh plan. Credential
+references remain identifiers only; these methods do not resolve secrets,
+activate profiles or launch processes. Every future profile execution path must pass shared admission
+before accessing secrets, starting processes or transferring mailbox ownership.
+
+Structured session records persist `profile_identity` only after matching harness
+init establishes a conversation. It contains the actual legacy `profile` selector
+and a nullable resolved `binding` (`binding_id`, `revision`). A changed profile,
+binding ID or binding revision refuses continuation with
+`structured_profile_mismatch` before launch, without legacy fallback. Missing pins
+remain legacy-compatible; unsupported pin formats are retained inactive like other
+unknown session records. Current single-account launches carry no binding and do
+not activate profile execution.
+
 ## Structured permission decision messages
 
 For the structured `agent.decide` contract, the optional `message` is normalized
@@ -82,9 +168,19 @@ checks remain required.
 ## Mesh edge enrollment
 
 `mesh.hello` is a held-relay handshake. A `begin` offer carries `mesh`,
-`name`, `node_id`, `public_key`, and a fresh `nonce`. The receiver returns a
+`name`, `node_id`, `public_key`, and a fresh `nonce`. `mesh` is the maximum
+supported version; optional `mesh_min` is the minimum. A single-version offer
+omits `mesh_min` and reads as `[mesh, mesh]`, preserving the old signed bytes.
+Both sides compute the highest common version from the two signed offers.
+The receiver returns a
 `challenge` with its own offer and a signature binding both offers and the
-acceptor direction. `finish` carries the dialer's signature over the same
+acceptor direction. The challenge also reports `negotiated`, an unsigned,
+redundant cross-check. A disagreeing report is refused; a missing report is
+accepted only for an offer with `mesh: 5` and no `mesh_min`. Disjoint or invalid
+ranges return `mesh_version_mismatch`; `data.mesh` remains the refusing node's
+maximum and `data.mesh_min` its minimum. An absent `data.mesh_min` on a
+VERSION 5 refusal identifies a pre-negotiation peer when 5 is in the dialer's
+window. `finish` carries the dialer's signature over the same
 transcript with the dialer direction. Both peers pin the proven key after
 successful verification. `check` verifies that the calling relay still holds
 an enrolled attachment, including after a server restart. Relay methods are
@@ -94,7 +190,9 @@ or, for Tailscale SSH, `tailscaled`. Anything else is refused with
 `relay_not_from_ssh`.
 
 `peers.enrollment` returns `peers` entries containing `peer`, `node_id`,
-`source` (`configured` or `inbound`), `state`, and `reason`. Its `routes` array
+`source` (`configured` or `inbound`), `state`, and `reason`. Established entries
+also contain `negotiated`, the current session version, which is recomputed
+at each hello and never persisted. Its `routes` array
 contains `{node, name, next_hop, hops}` for live shortest paths (at most eight
 hops). Names use locally pinned names when available; other names include an
 eight-character node ID suffix and `(advertised)`. `route_generation` is the
@@ -156,7 +254,15 @@ MCP/relay; the operator's shell is the trust boundary.
 
 `owner.policy.adopt { "repo": "<path>", "policy_version": "<blob id>" | null }` makes the current version apply. It answers the same result with `adopted_now` (`false` when that version was already adopted). It is refused with `operator_only` for an agent pane, a mesh relay or an unattested caller, with `owner_policy_changed` when `policy_version` is no longer the current one, and with `owner_policy_unreadable` when the current version is not valid TOML. `adopt` is state-changing for the protocol gate, so a newer CLI refuses it against an older server with exit 78. `operator_only` maps to exit 13 through the error-code registry, for the CLI and for MCP's `data.exit`.
 
+When adoption changes policy, the server appends its audit event, syncs the file and syncs the journal directory before applying the policy. Missing persistence or an append/sync failure with a durably completed rollback returns `audit_unavailable` (retry `after_human`, CLI exit 1), with no live policy change or success payload. Repair audit storage and restart the server before retrying. Rollback failure instead returns [`audit_indeterminate`](#required-audit-outcomes). An already adopted version remains a successful no-op. See [ADR-0035 §6.2](https://github.com/gerchowl/flock/blob/dev/docs/adr/0035-resident-repo-owner.md) for the authority boundary.
+
 An adoption is the durable event `owner_policy_adopted { repo, policy_version, reissued }`. The latest one per repo applies. Every server start and every log rotation writes each repo's adoption again with `reissued: true`. A server older than 2.0.0 cannot read a log holding it; 2.0.0 and later skip the kind if they do not know it.
+
+## Required audit outcomes
+
+`owner.bind`, `owner.unbind`, state-changing `owner.policy.adopt`, and `delegate.rebind` share the required-audit writer. It finishes rotation and syncs the journal directory before appending. No rotation occurs during the append. An append or file/directory-sync failure truncates the retained file to its original length, then syncs that file and directory. Only a successful durable rollback permits a definite refusal (`audit_unavailable` for owner mutations, `delegate_audit_unavailable` for rebind): that mutation cannot replay after restart.
+
+If rollback fails, `audit_indeterminate` has retry class `after_inspecting` and CLI/MCP exit 14, like `request_outcome_unknown`. No mutation is applied live and no success payload is returned, but the uncertain mutation may or may not take effect after restart. Every later required-audit mutation receives the same code without appending until restart. Repair storage, restart, and inspect the journal-derived owner/policy state and rebind audit history before deciding whether to retry. The reopened journal is authoritative. Rebind audit replay does not update the client's registry; a retained authorization event does not prove that the client completed its update. Best-effort event producers keep their existing behavior.
 
 ## Choose an integration layer
 
@@ -228,8 +334,8 @@ Raw socket method names use dot notation:
 | Tab | `tab.create`, `tab.list`, `tab.get`, `tab.focus`, `tab.rename`, `tab.close` |
 | Pane | `pane.split`, `pane.list`, `pane.get`, `pane.rename`, `pane.send_text`, `pane.send_keys`, `pane.send_input`, `pane.write_text`, `pane.write_keys`, `pane.write_input`, `pane.stash_show`, `pane.stash_restore`, `pane.read`, `pane.report_agent`, `pane.report_agent_session`, `pane.report_metadata`, `pane.clear_agent_authority`, `pane.release_agent`, `pane.close`, `pane.wait_for_output` |
 | Agent | `agent.list`, `agent.get`, `agent.read`, `agent.history`, `agent.result`, `agent.send`, `agent.rename`, `agent.focus`, `agent.start`, `agent.fork`, `agent.hibernate`, `agent.resume`, `agent.restart`, `agent.lineage` |
-| Delegate | `delegate.list` |
-| Message | `msg.send`, `msg.reply`, `msg.list`, `msg.read`, `msg.status`, `msg.wait_reply`, `msg.wake`, `msg.mute` |
+| Delegate | `delegate.list`, `delegate.rebind` |
+| Message | `msg.send`, `msg.reply`, `msg.list`, `msg.read`, `msg.operator_list`, `msg.operator_read`, `msg.status`, `msg.wait_reply`, `msg.wake`, `msg.mute` |
 | Hook | `hook.decide` |
 | Checks | `checks.list`, `checks.ack`, `checks.run` |
 | Events | `events.subscribe`, `events.wait` |
@@ -453,9 +559,31 @@ validation and deadline checks.
 Pre-upgrade unsigned rows retain their terminal reply route for the existing
 inbox window (up to 24 hours); they do not gain structured sender authority.
 
+`msg.operator_list {"pane":"TARGET"}` peeks at one legacy pane inbox using
+`msg_list` results; `msg.operator_read {"pane":"TARGET"}` consumes it using
+`msg_read` results. Both require `caller_is_local_operator`: a local operator
+outside pane ancestry, with no structured identity or inbound relay origin.
+Refused callers receive `operator_only`, before target lookup. Successful accesses
+emit a durable `operator_inbox_access` event containing `pane`, `operation`
+(`list` or `read`), `peer_pid`, `peer_uid`, and `message_count`, without bodies.
+`msg.list` without `pane` returns only the non-operator caller's attested inbox;
+unresolved callers receive `caller_pane_unresolved`. A global list requires the
+local operator and emits the same audit event with `pane: null`.
+The ordinary `msg.list` and `msg.read` methods also require this operator check
+when an explicit target names another pane. These operator methods are an interim
+recovery path until agent migration (#3066), and do not restore agent authority.
+
 For terminal recipients, `msg.send` queues a message for another pane's agent. Delivery is a pull: Flock never types into a session, and the recipient reads its own inbox with `msg.read`. What Flock pushes is the *wake* — at the recipient's next turn boundary its agent integration is told how many messages are waiting and which tool reads them, never what they say. `msg.wake` is the method that decides whether that wake may fire at all; it answers with a count and returns zero while the fleet is paused or the recipient has muted itself with `msg.mute`, in which case the messages stay queued and `msg.list`/`msg.read` are unaffected. A mute is not silent (ADR-0018): every `needs_reply` message that is waiting when `msg.mute` is called, or arrives while it holds, gets exactly one automatic reply to its sender — `in_reply_to` the message, intent `fyi` so it never asks for an answer back, and a body stating the deferral, the optional `reason` the mute was given (sanitised, cut to `[msg] mute_reason_max_chars`, default 200) and the UTC time the mute lifts. It travels the ordinary reply path, so a sender on another host hears it the same way. Renewing or extending a mute does not repeat it, nor does a restart; `fyi` messages get none, and `seconds: 0` (clear) sends nothing. `msg.mute` answers with `muted_until_ms` and `deferred`, the number of already-waiting senders it just answered — accepted durably, not delivered: a direct-edge deferral counts once it is held in the custody store for collection — and each deferral is recorded as a durable `message_deferred` event. A recipient that is already idle — and so has no turn boundary coming — is reached differently: for a message that is not `fyi`, flock types a fixed sentence naming the count and the tool into an idle Claude pane, under the gates described in [Waking idle agents](./configuration.mdx#waking-idle-agents). The destination is structured: `{"type":"pane","pane":"..."}` or `{"type":"repo_pane","repo":"...","pane":"..."}`. Messages carry a client-suppliable `correlation_id` (a client label, not the deduplication identity), a sender stamp inferred from the caller's process ancestry (routing and audit metadata only — never authorization), and survive server restarts via the custody store. They also carry an `intent`, stamped by the sender and delivered on the envelope so a recipient knows what is wanted before it reads the body. It defaults to `fyi` on the wire and is required on the `flock_msg_send` MCP tool. The wake reads it (ADR-0018): `msg.wake` reports zero, with `suppressed: "fyi_only"`, for an inbox holding only `fyi` messages, and once any `needs_reply` or `blocking` message is waiting it reports every queued message, notices included, so the read it prompts clears them. A reply whose `in_reply_to` names a `needs_reply` or `blocking` message wakes its recipient whatever its own stamp, except a mute's automatic deferral. A claimed `from_agent` must be shaped like an agent id, or the send is refused with `invalid_request`. A socket sender cannot assert a remote host. A nudge still names a count and a tool and nothing else. `blocking` additionally surfaces the recipient in the attention cycle under a mail label of its own (never the `blocked` state), files an operator notification when the recipient is muted, and is budgeted per sender by `[msg] blocking_per_hour` — past it the message is still queued, as `needs_reply`, and the result's `warnings` carry `blocking_budget_spent_sent_as_needs_reply` (or `blocking_disabled_sent_as_needs_reply` when the budget is 0). The budget is keyed on an agent the receiving server attested; every unattested sender, relayed ones included, shares one bucket. `msg.reply` routes an answer back to the original sender's pane by correlation id; `msg.list` shows undelivered messages. A message whose sender has no inbox at all (sent from an ssh shell or a script, outside any pane) can still be answered: the reply is **held** under the original's correlation id, recorded in the custody store, and `msg.reply` answers `state: "held"` with the warning `reply_held_for_waiter`. A muted recipient answers such a sender the same way, with a held deferral. `msg.status` carries the answer as `reply` (`correlation_id`, `kind` `reply`/`deferral`, `body`, sender stamp, `held`) once there is one, whether it was delivered to an inbox or held; `state` keeps describing the message's own delivery. `msg.wait_reply` waits for that answer, see [Waiting for state](#waiting-for-state). Rate limit: 20 messages/minute per sender pane; mailbox depth 32; undelivered messages expire after 24 hours. Errors include `msg_target_not_found`, `msg_target_ambiguous`, `self_message_forbidden`, `msg_rate_limited`, `mailbox_full`, and `message_not_found`. Mesh sends remain `queued` when transport is unavailable; replies can remain `held`. Permanent refusals report `refused` with a reason, and incompatible edges expose `peer_incompatible`.
 
 Message acceptance commits to the mesh custody store before returning a `message_key` containing `origin_node` and a server-minted ULID `message_id`. Correlation IDs remain caller-selected conversation labels: two accepted sends with the same correlation ID have distinct message keys.
+
+Mesh envelopes and the records that carry them (`Deliver`, `OutboundCollect`,
+and `OutboundAck`) require JSON object form. Sequence-form structs, including
+enclosing records and optional receipt envelopes, cause
+`mesh_protocol_violation`: the entire batch remains unacknowledged and the
+session resets. Explicit envelope `kind` tags must be strings; an absent tag
+means `message`, and enum-map aliases are refused. Optional `receipt: null`
+means no envelope. The collection result's string receipt token is unchanged.
 
 `mesh.deliver` takes a `Deliver` object with these fields:
 
@@ -478,10 +606,12 @@ inbox delivery.
 | `loop_detected` | Refuse this route attempt, retain upstream custody and wait for a route change. |
 | `hop_budget_exhausted` | Refuse further forwarding, retain upstream custody and seek another route. |
 | `invalid_signature` | Permanently refuse an envelope whose origin signature fails verification. |
-| `peer_incompatible` | Refuse a new send through a known incompatible peer with an upgrade instruction. The edge handshake diagnostic names both mesh versions, or that the peer runs a pre-mesh flk. |
+| `peer_incompatible` | Refuse a new send through a known incompatible peer with an upgrade instruction. The edge handshake diagnostic names both mesh support ranges, or that the peer runs a pre-mesh flk. |
+| `mesh_version_mismatch` | Refuse hello when support ranges do not overlap or the reported version fails its cross-check. Retry after upgrading the named side. |
+| `mesh_protocol_violation` | Refuse every envelope in a batch containing an unknown kind or a kind above the session version, acknowledge nothing, reset the edge, and take the long refusal backoff. The retry class is `after_handoff`. |
 
 Delivery refusals use `error.code: "mesh_delivery_refused"` with the specific
-reason above in `error.message`; `origin_mismatch` has its own error code.
+route or signature reason above in `error.message`; `origin_mismatch` has its own error code.
 New-send compatibility refusals use `error.code: "peer_incompatible"`. No
 legacy transport or downgrade is attempted. A peer still running a pre-mesh
 release such as v0.11.0 rejects `mesh.hello` as an unknown method; Flock
@@ -547,6 +677,8 @@ An explicit kill, or a permanent pane close/exit without a resumable session, re
 ```
 
 `checks.list` enumerates every enrolled script check plus the built-in checks (`blocked_alert`, `hibernation`, `issue_guard`), showing coarse state (`enabled` / `disabled` / `acked` / `errored`), the last outcome, and consecutive Fire count. `checks.ack <name>` silences a check — for a script check, that suppresses fires until the next debounce window elapses; for the built-in `blocked_alert`, it marks every currently-Blocked pane's episode as acked (a re-block starts a fresh episode that can fire again). `checks.run <name>` forces a script check due right now, out of cadence. Errors: `check_not_found`.
+
+`delegate.rebind` accepts `name`, the exact live PTY `agent_id`, and optional `previous_agent_id` (audit metadata). Only an authenticated local operator may call it; agents, relays, and unattested callers receive `operator_only`. It returns the selected `agent` record only after the durable `delegate_rebind_authorized` event is appended and synced. Missing audit persistence or an append/sync failure with a durably completed rollback returns `delegate_audit_unavailable` (retry `after_human`, CLI exit 1), without a binding payload or client record change. Rollback failure instead returns [`audit_indeterminate`](#required-audit-outcomes). A failed audit writer is closed, while intact prior journal history remains readable through lineage, digest history, and cold `events.read` calls, including rotated files. Best-effort event producers continue to log append failures, publish to the live ring, advance their normal sequence/cursor counters, and wake subscribers. New events published while the writer is unavailable exist only in memory and can be lost on ring eviction or restart; counter advancement alone does not prove persistence. Required audits remain refused until storage is repaired and the server restarts. This authorizes the CLI to update its local registry; the server does not write client files or create delegation edges, and the event does not assert completion of that write. No unique exact live agent ID yields `session_unbound`. Clients require protocol **34** before sending this mutation.
 
 `delegate.list` (`architect`: `self` by default, `all`, or an agent id; optional `branch` and `repo`) returns `delegates`, one row per open `agent_delegated` edge: `architect`, `delegate`, `name`, `via`, `state`, `label`, `harness`, `agent_status`, `status_age_secs`, `edge_age_secs`, `workspace_id`, `pane_id`, `worktree`, `branch`, `repo`, and `pr` (`number`, `state`) from the PR poller's cache. `state` is `live`, `hibernated, awaiting merge`, `gone`, `gone, worktree retained`, `orphaned`, or `closed, not merged`. It is answered from cached state only, with no git or `gh` call. `self` is resolved from the caller's process ancestry; a caller in no agent pane gets `no_caller_pane`.
 
@@ -1155,6 +1287,8 @@ A repo's resident owner (ADR-0035 §1) is a **binding**, not a session: server s
 - `owner.unbind` (`{"repo"}`) ends the binding and answers `owner_unbound` with the binding that ended.
 - `owner.list` answers `owner_list` with `bindings`, ordered by repo. `owner.show` (`{"repo"}`) answers `owner_show` with `binding`. Both are reads, and `owner.show` is the MCP tool `flock_owner_show`.
 
+`owner.bind` and `owner.unbind` append their audit event, sync the file and sync the journal directory before changing the live binding. Missing persistence or an append/sync failure with a durably completed rollback returns `audit_unavailable` (retry `after_human`, CLI exit 1), with no live binding change or success payload. Rollback failure instead returns [`audit_indeterminate`](#required-audit-outcomes). Required audit writes remain unavailable until storage is repaired and the server restarts.
+
 `owner.bind` and `owner.unbind` are operator verbs: an owner holds merge and teardown authority over its delegates, so no agent may appoint itself (the ADR-0014 boundary). They are refused with `operator_only` when the caller is agent-attested, which today means its process ancestry reaches an agent's pane or the request was relayed from a mesh peer, and also when the server could not read the caller's pid. This is **cooperative only** until agents run as their own Unix user and the server attests by uid (ADR-0035 §6.3 points 1 and 6, #1208, #1177): a child an agent detaches with `setsid` has no agent pane in its ancestry and passes as the operator. Both count as state-changing for the skew gate (#868). `owner.unbind` and `owner.show` answer `not_found` for a repo with no binding. Through `flk owner` (see the [CLI reference](/cli-reference/)), `operator_only` exits 13 and `not_found` exits 4. Repo slugs are case-insensitive, as on GitHub: the server records and looks them up in lowercase, so `Example/Widgets` and `example/widgets` are one binding.
 
 The binding is recorded as durable events: `owner_bound` (`binding`, `reissued`) and `owner_unbound` (`repo`). The server folds them once per start, in the same log read as delegation edges and goals, and emits every binding again as `owner_bound` with `reissued: true` on every start and after every log rotation, so an owner that stays quiet cannot rotate out. A server older than 2.0.0 quarantines a log that holds these kinds; servers from 2.0.0 skip them.
@@ -1448,6 +1582,15 @@ Duplicate native placements or invalid layout membership make `agent.get` and
 `agent.focus` refuse with `internal_error` without changing the layout.
 
 
+Structured socket resume continues to use `agent.start` with an existing agent
+identity and operator authority. The wire `agent.restart` command additionally
+allows an operator app-session token with `operate` to resume a stopped
+structured agent on its home node through the same launch funnel, preserving
+its session ID. Wire structured stop uses the same app-session authority.
+File tokens retain their existing refusals. See
+[wire lifecycle commands](./structured-wire-minimal.mdx#agent-lifecycle-commands)
+for admission, asynchronous stop completion and typed refusals.
+
 ### Queue item lifecycle facts
 
 `queue_item_state` is a durable, local event emitted after an existing queue
@@ -1540,3 +1683,43 @@ On Linux, the native shell must refuse local mint when `ptrace_scope=0`, explain
 that other processes could read its operator credential, and offer explicit
 remote pairing or administrator-enabled `ptrace_scope ≥ 1`. G9a owns that
 native check and fallback presentation; there is no silent fallback.
+
+Every authenticated structured-wire refusal (commands, subscriptions and protocol) emits
+best-effort `wire_refused` events through the event hub. See the
+[structured wire refusal audit contract](../structured-wire-minimal/#refusal-audit-events)
+for fields, exact suppression summaries, the shared 60-second per-key/global
+budgets, graceful shutdown flushing, and the limits at capacity, crash and
+journal failure. Refusal reporting does not replace required mutation audits.
+
+
+## Destination gateway grants
+
+`client.grant.add`, `client.grant.list`, and `client.grant.revoke` require the
+same kernel-attested local operator as client-token management. Agent panes,
+relays and non-operator callers receive `operator_only`. An enrolled home or a
+client bearer alone cannot manage grants.
+
+Add params are `{name, home_node_id, principals, verbs, scopes, targets}` with
+explicit string arrays for each set. `home_node_id` is the enrolled home's
+pinned digest. Names follow token naming rules; existing names refuse. List
+params are `{}`; revoke params are `{name}`. All three return
+`{type:"client_grant_list", listing:{generation, entries}}`, where `entries`
+maps names to grant records. Invalid/future entries have null authority, remain
+preserved on disk, and may be revoked by name. Revoke of an absent name and
+invalid adds return `invalid_params`; unavailable storage returns
+`internal_error`.
+
+Targets are the union of `agent:<AgentId>`, `workspace:<WorkspaceId>`, and `*`.
+An empty array denies all; `*` is explicit in list output. Workspace membership
+comes from current destination state at admission. Structured start can match
+only `workspace:` or `*`. Display names and filesystem paths are refused.
+Authority is the intersection of current home-token scopes, one matching grant,
+and existing local verb checks. Principals are namespaced by home NodeId.
+`agent.decide` requires `operate`; `send` and `answer` never promote to it.
+The durable generation and admission lock fence revocation against new claims.
+An admitted effect is not undone by a later revoke.
+
+This slice provides dormant evaluation and management; M2 has not connected it
+to mesh commands. Remote `config.*` evaluation returns `unsupported` before
+claim. Remote structured start/stop/restart/resume require `operate` and remain
+`unsupported_for_agent` pending the ADR-0036 §1a / Q9 owner ruling.

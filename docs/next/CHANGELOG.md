@@ -2,6 +2,100 @@
 
 ## Unreleased
 
+## [3.6.0] - 2026-11-22
+
+### Maintenance
+- Add growth- and expiry-triggered compaction and explicit open/shutdown lease barriers to the dormant wire command journal backend, allowing full journals to recover after claims expire without new appends. Live wire commands continue using the existing duplicate list pending the separate admission integration.
+- Manage the dormant command-journal lease through Core startup, handoff commit/rollback, and shutdown, with one-second caller budgets, fenced background retry/drain, pending-write diagnostics and audited fail-closed admission. Live commands retain the in-memory duplicate list.
+- Add a bounded producer-owned causal publication receipt for command ACK ordering across history and fleet streams; serialize ordinary snapshot capture with caused projection submission, ahead of journal admission integration (refs #1380).
+- Add a dormant append-only wire command journal backend and bounded background writer. Active wire commands retain their existing in-memory duplicate handling until the asynchronous integration and compaction follow-up.
+- Capture the canonical test-server executable before spawning and retain exact
+  argv identity checks for direct and detached launches. Add alias-launch
+  regression coverage, including orphan sweeping with a relative launch argv,
+  and document the signal fixtures’ Python CI prerequisite.
+- Bind test sandbox launch records to the executable file’s device, inode, size
+  and modification time, as well as its canonical path. Crash sweeps log and
+  retain sandboxes when that file is missing or replaced; restoring the original
+  file permits recovery. Older records without file identity remain unproven.
+- Make the long-turn self-compaction regression test deterministic with injected timestamps.
+- Accept ADR-0051 and measure usable first-frame progress during stalled event-log syncs with an isolated manual Linux baseline workflow.
+- Merge the GUI bundle build and feature-gate integration tests into one test binary, preserving all three cases and both feature-variant checks while reducing duplicate build artifacts.
+- Reduce development and test build storage by retaining flock line tables while omitting dependency debug information. Full debugger information remains available through Cargo profile overrides documented in CONTRIBUTING.md.
+- Share the devShell sccache artifact cache and daemon across isolated agent homes by resolving the OS account home. `SCCACHE_DIR` overrides the persistent cache and runtime location.
+- Keep helper-CLI tests compatible with Cargo's updated test-artifact layout when running extracted nextest archives.
+- Restrict test helper discovery to the artifact's own build profile and refuse missing companions or unrecognized layouts without selecting another executable.
+- Gate GUI changes with a real Chromium browser driving two isolated mesh nodes, with failure traces and server logs from the `gui-e2e-fleet` CI job.
+- Add a deterministic scripted model fixture and browser-free structured runtime lifecycle coverage for streamed replies, permission decisions, and session resume.
+- Make the delegate wait request-budget test observe completed event reads, keeping reply-grace polling out of its event-wait budget and failing on missing proxy evidence.
+- Replace private infrastructure references in historical documentation and test fixtures with generic descriptions and fictional names, preserving runtime behavior.
+- Extend the GUI fleet gate to cover durable structured-agent conversation, permission answers, independent history verification, and expected remote-start failure.
+- Replace the capacity wire test’s wall-clock latency gate with per-record I/O bounds across empty and near-full journals, including reopened handles and compaction replacement. Run all fixture harness waits on the injected clock and report timings separately with `just capacity-publication-probe` (ignored in CI).
+- Enforce the journal filesystem boundary statically so fully qualified native I/O cannot bypass the capacity test’s write observer.
+- Lint all Rust targets with CI's `web,ts` feature set, including the wire journal compaction tests.
+- Require reviewed outside imports and qualified paths in the command journal I/O gate, closing the sibling re-export bypass, and clarify when replay stall diagnostics are logged.
+- Check journal macro provenance across the crate, restrict filesystem and process fixture helpers to test files, and permit only the enumerated existing internal glob imports.
+- Independently gate filesystem/process-capable call names on values and associated functions, resolve aliases before checking uses, and keep root canonicalization inside the journal filesystem boundary.
+- Bind journal I/O exceptions to stable enclosing items, receiver roles and complete import bindings; reject unreviewed capability aliases and macro definitions while allowing ordinary call argument and closure edits.
+
+### Added
+- Wire commands now claim and complete through the durable journal, replaying the first acknowledgement across restart and handoff, joining in-flight duplicates with fresh authorization, and refusing capacity pressure before dispatch.
+- Permission-decision events and fleet projections wait for durable command completion and ACK flush on every connection; queue and lifecycle transport history remain exempt (see #3198).
+- Cached and joined command outcomes require the same current verb authority as fresh dispatch, including both answer and operate scopes for permission decisions.
+- Mesh peers negotiate a session protocol version from their signed support windows and show it in `flk peers` and `flk status`. VERSION remains 5, with rolling compatibility with pre-negotiation VERSION 5 peers. Upgrade every node to this negotiation build before deploying a future VERSION 6 build.
+- Incompatible ranges retain custody and report both ranges with an upgrade instruction. Unknown envelope kinds refuse the entire batch and reset the edge with a permanent protocol violation.
+- Mesh envelope-bearing records require JSON objects. Sequence-form envelopes or enclosing records and invalid kind tags refuse the batch and reset the session before any import or acknowledgement.
+- Add local-operator destination gateway grant management (`flk client grant add|list|revoke`) and a durable, revocation-fenced evaluator for future mesh command admission. Remote forwarding and remote lifecycle commands remain disabled.
+- Add the dormant mesh command envelope contract with home-signed identity, token source, target, argument digest and a 30-second admission budget. Trusted hops account for monotonic residence separately and refuse expired or unsupported commands. Mesh VERSION remains 5; gateway command admission and dispatch remain disabled.
+- Persist inactive operator binding records and the default-false structured-profile execution switch in private server state. Add data-only target resolution and a read-only `profile.status` projection that withholds binding and account metadata from agents and mesh relays. Production execution remains unavailable; reviewed binding mutations and session binding pins follow in slice 2b.
+- Retain a separate durable policy revision floor across server restarts. Reject restored older binding documents with a typed profile-only refusal and operator status detail, while ordinary server operations remain available.
+- Serialize profile policy transactions across threads and server processes. Refuse linked, non-regular or foreign-owned policy files and keep the revision floor monotonic under concurrent saves.
+- Add operator-only socket APIs to review binding plans, commit an exact digest with a policy revision compare-and-swap, and revoke bindings. Plans expire after five minutes; durable operation receipts make committed repeats idempotent across restart. Agents and mesh relays cannot invoke these preparation methods, and profile execution remains disabled. CLI commands and session profile pins follow separately.
+- Add operator CLI commands to review, bind, inspect and revoke inactive structured profile bindings. Production execution remains unavailable.
+- Persist established structured-session profile identity and refuse continuations under a changed profile or binding revision; older records without a pin retain legacy behavior.
+- Add inactive per-session native storage preparation with durable session and binding revision pins, private roots, and operator-visible recovery status. Retain completed roots and quarantine crash-left allocation staging without enabling profile execution.
+- Add an operator-only `flk profile enable --plan <id> --expect <digest>` request and shared structured-profile admission guard. Profile execution stays disabled, including for the operator, until the complete readiness requirements are implemented. Existing trusted single-account launches are unchanged.
+- Bump the client/server protocol to 34 so profile enable requests are refused before reaching older servers.
+- Add operate-scoped web wire agent lifecycle commands with bounded replay, local-node routing, and the existing structured-session authority and launch gates.
+- Start a structured Claude Code agent from the GUI’s New agent picker, choosing its name, node and working directory. The home node is selected by default; starts on other nodes show a plain-language refusal.
+- Added Restart agent and Stop agent to the GUI agent view and command palette. Stop asks for confirmation; Restart resumes an offline agent's existing session. Server refusals explain the next action in plain language, with technical details available separately.
+- Allow operate-scoped operator app-session tokens to stop and resume structured agents on their home node over the wire, preserving session IDs and existing admission checks.
+- Attribute owner-side structured stop/restart audits, including refusals and replays, to the resolved agent/session and authenticated principal as well as the per-mint credential.
+
+### Fixed
+- Keep the authenticated connection and queued command acknowledgements intact when a fleet permission book is temporarily unavailable; refuse only the fleet subscription with retryable `session_busy` and let existing fleet readers recover through the bounded same-connection retries.
+- Require command-journal lease acquisition and replay to finish before startup or a committed handoff reports ready; return the typed acquisition error within the existing one-second budget.
+- Resume an open agent history subscription from its applied cursor when a stopped session gets a replacement producer, keeping the same connection.
+- Disable messaging and show why an agent is unavailable when a saved selection is missing from the agent list or the selected agent leaves it.
+- Resolve Claude Stop-hook mail wakes from the caller's attested inbox after fork or resume, even with a stale pane environment. Refuse wakes for another pane's inbox without operator authority and report authority refusals once without blocking.
+- Probe GUI connections when a background tab resumes or a page returns from the back-forward cache, reconnecting silently dead sockets while preserving session cursors. Older servers use a bounded heartbeat fallback.
+- Bound the complete attach Welcome response to five seconds, including trickled frame headers and payloads. Expiry reports `attach_timeout` with exit 124 after restoring the terminal, without replaying input or starting automatic timeout retries.
+- Message read, list, wake, send and reply now report `caller_pane_unresolved` with the missing identity evidence for unattested legacy panes. The refusal and Stop hook notice point to structured-agent migration and an operator inbox read; authority remains fail-closed. `msg mute` without an explicit pane reports the same refusal and preserves mute state and queued mail.
+- Restore pre-v2 delegate records only from a unique exact saved harness session match; keep missing, conflicting, or ambiguous sessions unbound with typed reasons and offer audited, operator-only `flk delegate rebind`. Existing architect ownership edges remain unchanged.
+- Register delegate backfill reason codes and refuse rebind authorization when its audit journal cannot append and sync, leaving the client record unchanged.
+- Preserve access to intact event history after a required audit write fails, while retaining ordinary best-effort event publication and keeping further audit authorizations refused.
+- Add audited operator-only inbox reads and peeks with `flk msg operator-read --pane TARGET` and `flk msg operator-list --pane TARGET` as an interim path until agent migration (#3066). Require local operator authority when existing inbox commands select another pane, and name the supported recovery command in Stop-hook remedies.
+- Scope `msg list` without `--pane` to the caller's attested inbox; return `caller_pane_unresolved` when it cannot be resolved. Listing all panes or another pane's inbox requires the local operator, and global operator lists are audited.
+- Keep consume, peek and migration guidance consistent across unresolved message-caller diagnostics.
+- Preserve readable durable history after structured-agent stop so transcript subscriptions stay connected and the GUI can observe the offline state.
+- Retain the Claude config directory resolved at spawn in the reported session record, so delegate results, awaits and forks find transcripts without a profile-installed hook record. A harness hook record takes precedence over the launch snapshot in either arrival order. Recorded directories are authoritative, with no fallback to another profile. Refuse structured starts whose caller requests a different config directory instead of silently selecting another profile.
+- Allow simultaneous read-only lease checks so valid scoped messaging calls are not refused as unauthenticated by another census or authentication reader. Registry writers, revocation and kernel identity failures continue to refuse access.
+- Relaunch established structured agent conversations with `--resume` and their retained session id. Failed attempts before a matching init and older records without establishment evidence launch fresh; invalid saved UUIDs are refused before launch.
+- Keep `flk profile enable --help` specific to enablement instead of showing the full profile command list. Global JSON/text output flags remain supported.
+- Refuse owner binding, unbinding and policy adoption with `audit_unavailable` before changing state when the required audit cannot persist; durably roll back failed appends so refused mutations cannot replay after restart.
+- Share durable audit rollback with delegate rebind. If rollback fails, return `audit_indeterminate` (exit 14), leave live state unchanged and block later required audits until restart, when the journal is authoritative.
+- Audit every authenticated structured-wire refusal, including command admission and replay, subscriptions and malformed protocol frames, with bounded per-key/global budgets and exact suppression summaries.
+- Release the refusal limiter lock before journal I/O, and flush pending suppression counts on graceful shutdown.
+- Allow startup, handoff and rollback to finish replaying a near-full wire command journal while progress continues, with a separate ten-second timeout for stalled replay. Lease acquisition and shutdown remain time-bounded, and server logs report replay progress or stalls while command admission stays fenced until recovery succeeds.
+
+### Security
+- Prevent unverified peer-name claims from impersonating configured or pinned aliases across the fleet UI and switch notices; use consistent unverified wording while preserving existing identity folding for pushed claims.
+- Escape every unverified peer-name claim, compare trusted aliases using Unicode casefolding and UTS #39 confusable skeletons, retain the unverified badge in narrow/icon layouts, and protect persisted-owner notices while keeping configured legacy names.
+- Keep unverified badges and display escapes out of message destination metadata and persisted mesh payload hosts, while retaining protected directory and wait labels.
+- Compare unverified aliases with both fold-first and stable skeleton-first Unicode keys so case variants and capital-I/lowercase-l confusables are both caught.
+- Preserve trusted destination aliases in message-status details when exact local delivery-route bindings match; unmatched names retain escaped, unverified presentation. Bound Unicode normalization to eight further steps.
+- Keep hub-relayed message destinations visibly unverified and give unresolved destination labels a non-empty fallback; direct configured delivery labels retain their aliases.
+- Normalize compatibility-equivalent Unicode peer names before comparing claimed names with trusted aliases on every presentation surface.
+
 ## [3.5.0] - 2026-11-09
 
 ### Maintenance
