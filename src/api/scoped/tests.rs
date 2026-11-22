@@ -14,7 +14,7 @@ use std::{
 };
 
 pub(crate) fn live_scope() -> (SessionLeases, Lease, Scope, Credentials) {
-    live_scope_for_agent("agent_hopper_scoped")
+    live_scope_for_agent("fixture-agent")
 }
 pub(crate) fn live_scope_for_agent(agent: &str) -> (SessionLeases, Lease, Scope, Credentials) {
     let (socket, _other) = UnixStream::pair().unwrap();

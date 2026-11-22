@@ -302,16 +302,25 @@ impl Store {
         required: Scope,
         dispatch: impl for<'a> FnOnce(VerifiedToken<'a>) -> T,
     ) -> Result<T, TokenError> {
+        self.admit_command(session, required, |facts| dispatch(facts.permission()))
+    }
+    /// Seal current app identity and scopes while retaining shared admission ownership.
+    pub(crate) fn admit_command<T>(
+        &self,
+        session: &Session,
+        required: Scope,
+        dispatch: impl for<'a> FnOnce(CommandToken<'a>) -> T,
+    ) -> Result<T, TokenError> {
         let _guard = self.files.lock_with(LockFile::try_lock_shared)?;
         let current = self.current(&session.digest)?;
         if !current.info.scopes.contains(&required) {
             return Err(TokenError::Scope);
         }
-        Ok(dispatch(VerifiedToken::authenticated(
-            &current.info.principal,
-            current.info.scopes.clone(),
-            true,
-        )))
+        Ok(dispatch(CommandToken {
+            principal: &current.info.principal,
+            scopes: &current.info.scopes,
+            app: true,
+        }))
     }
     fn remove(entries: &mut Entries, digest: &[u8; 32]) -> Result<(), TokenError> {
         let entry = entries.remove(digest).ok_or(TokenError::Revoked)?;

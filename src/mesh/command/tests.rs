@@ -335,7 +335,7 @@ fn hub_preparation_returns_a_signed_refusal_instead_of_a_deferred_command() {
 
 /// Exercise the signed envelope from a real token-store admission callback.
 pub(crate) fn authenticated_token_round_trip(
-    token: &crate::structured::permissions::auth::VerifiedToken<'_>,
+    token: &crate::structured::permissions::auth::tokens::CommandToken<'_>,
     principal: &str,
     app: bool,
 ) {
@@ -422,7 +422,8 @@ fn scoped_admission_binds_profile_ceiling_identity_and_revocation() {
     let root = crate::test_support::TempDir::socket();
     let path = root.path().join("profile-bindings.json");
     let mut profiles = ProfileAdmission::load(&path);
-    let (_leases, lease, scope, _) = crate::api::scoped::tests::live_scope();
+    let (_leases, lease, scope, _) =
+        crate::api::scoped::tests::live_scope_for_agent("agent_hopper_scoped");
     let crate::structured::lease::Caller::Agent { agent, .. } = scope.caller() else {
         panic!("not authenticated")
     };

@@ -436,7 +436,7 @@ fn authenticated_app_and_file_provenance_round_trip_without_lifecycle_file_autho
     let issued = store.issue(&authority).unwrap();
     let session = store.authenticate(&issued.token).unwrap();
     store
-        .admit(&session, Scope::Operate, |token| {
+        .admit_command(&session, Scope::Operate, |token| {
             crate::mesh::command::tests::authenticated_token_round_trip(
                 &token,
                 &issued.info.principal,
@@ -453,7 +453,7 @@ fn authenticated_app_and_file_provenance_round_trip_without_lifecycle_file_autho
         .unwrap();
     let session = files.authenticate(&issued.token).unwrap();
     files
-        .admit(&session, Scope::Operate, |token| {
+        .admit_command(&session, Scope::Operate, |token| {
             crate::mesh::command::tests::authenticated_token_round_trip(
                 &token,
                 &issued.info.principal,

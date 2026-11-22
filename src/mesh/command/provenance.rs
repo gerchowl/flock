@@ -1,7 +1,7 @@
 //! Home authentication adapters. Neither identity nor ceilings come from command JSON.
 use super::*;
 use crate::structured::{
-    permissions::auth::VerifiedToken, profiles::ProfileAdmission, registry::Registry,
+    permissions::auth::tokens::CommandToken, profiles::ProfileAdmission, registry::Registry,
 };
 
 /// Sealed authenticated facts, never deserialized from requests or mesh frames.
@@ -11,11 +11,11 @@ pub(crate) struct Provenance<'a> {
     source: TokenSource,
     scopes: BTreeSet<Scope>,
     scope: Option<&'a crate::api::scoped::Scope>,
-    admission: std::marker::PhantomData<&'a VerifiedToken<'a>>,
+    admission: std::marker::PhantomData<&'a CommandToken<'a>>,
 }
 impl<'a> Provenance<'a> {
     /// Call only inside the token store's revocation-fenced admission callback.
-    pub(crate) fn from_token(token: &'a VerifiedToken<'_>) -> Self {
+    pub(crate) fn from_token(token: &'a CommandToken<'_>) -> Self {
         let (principal, app, scopes) = token.command_facts();
         Self {
             principal: principal.into(),
