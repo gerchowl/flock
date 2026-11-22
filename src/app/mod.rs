@@ -547,7 +547,7 @@ fn resolve_palette_with_legacy_accent(
             fallback = state::DEFAULT_THEME,
             "unknown theme, falling back to the default"
         );
-        state::Palette::from_name(state::DEFAULT_THEME).expect("DEFAULT_THEME is built in")
+        state::Palette::dalton()
     });
 
     // Apply custom overrides if present
